@@ -2,6 +2,8 @@
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
+import { LogicalSize } from '@tauri-apps/api/dpi'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { useArxivStore } from '../stores/arxiv'
 import { useAiStore } from '../stores/ai'
@@ -25,34 +27,37 @@ const categoryFilter = ref('')
 const showSortMenu = ref(false)
 const sortBtnRef = ref<HTMLElement | null>(null)
 const sortPopoverStyle = ref({ top: '0px', left: '0px' })
-let unlistenWindowResize: UnlistenFn | null = null
 let windowResizeTimer: ReturnType<typeof setTimeout> | null = null
 
-async function saveWindowSize() {
+const ARXIV_WIN_SIZE_KEY = 'argus:arxiv:window:size'
+
+function saveWindowSizeToStorage() {
+  if (windowResizeTimer) clearTimeout(windowResizeTimer)
+  windowResizeTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(ARXIV_WIN_SIZE_KEY, JSON.stringify({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      }))
+    } catch {}
+  }, 400)
+}
+
+async function restoreWindowSize() {
   try {
-    const appWindow = getCurrentWindow()
-    const [physSize, sf] = await Promise.all([appWindow.innerSize(), appWindow.scaleFactor()])
-    await invoke('save_arxiv_window_size', {
-      width: physSize.width / sf,
-      height: physSize.height / sf,
-    })
-  } catch {
-    // Not running inside Tauri, or the window is closing.
-  }
+    const raw = localStorage.getItem(ARXIV_WIN_SIZE_KEY)
+    if (!raw) return
+    const { width, height } = JSON.parse(raw) as { width: number; height: number }
+    if (!width || !height) return
+    await getCurrentWebviewWindow().setSize(new LogicalSize(
+      Math.max(800, width),
+      Math.max(500, height),
+    ))
+  } catch {}
 }
 
 async function watchWindowSize() {
-  try {
-    const appWindow = getCurrentWindow()
-    unlistenWindowResize = await appWindow.onResized(() => {
-      if (windowResizeTimer) clearTimeout(windowResizeTimer)
-      windowResizeTimer = setTimeout(() => {
-        saveWindowSize()
-      }, 500)
-    })
-  } catch {
-    // Not running inside Tauri.
-  }
+  window.addEventListener('resize', saveWindowSizeToStorage)
 }
 
 // Single-paper analysis
@@ -113,6 +118,7 @@ const flatCollections = computed<FlatCol[]>(() => {
 
 onMounted(async () => {
   await watchWindowSize()
+  await restoreWindowSize()
   await aiStore.load()
   await store.load()
   await store.subscribeEvents()
@@ -121,10 +127,9 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  store.unsubscribeEvents()
-  unlistenWindowResize?.()
+  ;(store as any).unsubscribeEvents()
   if (windowResizeTimer) clearTimeout(windowResizeTimer)
-  saveWindowSize()
+  window.removeEventListener('resize', saveWindowSizeToStorage)
   window.removeEventListener('keydown', onKeydown)
 })
 
@@ -370,14 +375,14 @@ function jumpToDate(dateStr: string) {
     <!-- Top bar -->
     <div class="arxiv-topbar" data-tauri-drag-region>
       <div class="tl-space" data-tauri-drag-region />
-      <div class="topbar-left">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="topbar-icon">
+      <div class="topbar-left" data-tauri-drag-region>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="topbar-icon" data-tauri-drag-region>
           <path d="M12 2L2 7l10 5 10-5-10-5z"/>
           <path d="M2 17l10 5 10-5"/>
           <path d="M2 12l10 5 10-5"/>
         </svg>
-        <span class="topbar-title">arXiv 推荐</span>
-        <span v-if="store.loaded" class="paper-count-pill">{{ store.papers.length }} 篇</span>
+        <span class="topbar-title" data-tauri-drag-region>arXiv 推荐</span>
+        <span v-if="store.loaded" class="paper-count-pill" data-tauri-drag-region>{{ store.papers.length }} 篇</span>
       </div>
       <div class="topbar-right">
         <div v-if="store.analyzing" class="topbar-analysis-status">
@@ -388,11 +393,11 @@ function jumpToDate(dateStr: string) {
           </div>
           <button class="cancel-btn" @click="store.cancelAnalysis()">取消</button>
         </div>
-        <span v-if="store.scheduleStatus?.auto_fetch_enabled" class="auto-badge">
+        <span v-if="store.scheduleStatus?.auto_fetch_enabled" class="auto-badge" data-tauri-drag-region>
           <span class="auto-dot" />
           自动抓取已开启
         </span>
-        <span v-if="store.scheduleStatus?.next_scheduled && store.scheduleStatus?.auto_fetch_enabled" class="next-label">
+        <span v-if="store.scheduleStatus?.next_scheduled && store.scheduleStatus?.auto_fetch_enabled" class="next-label" data-tauri-drag-region>
           下次计划: {{ store.scheduleStatus.next_scheduled }}
         </span>
         <button
@@ -851,7 +856,7 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   flex-shrink: 0;
   gap: 0;
 }
-.tl-space { width: 76px; flex-shrink: 0; }
+.tl-space { width: 96px; flex-shrink: 0; }
 .topbar-left { display: flex; align-items: center; gap: 7px; min-width: 0; flex: 1; }
 .topbar-icon { color: var(--accent); flex-shrink: 0; }
 .topbar-title { font-size: 14px; font-weight: 650; white-space: nowrap; letter-spacing: -0.01em; }
@@ -1397,8 +1402,9 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   font-size: 13px; color: var(--text-secondary); line-height: 1.6;
 }
 .abstract-section { padding-top: 18px; border-top: 1px solid var(--border-subtle); }
+.abstract-section .section-label { font-size: 13px; }
 .abstract-text {
-  font-size: 13px; color: var(--text-secondary); line-height: 1.75;
+  font-size: 15px; color: var(--text-secondary); line-height: 1.75;
   margin: 0; text-align: justify;
 }
 

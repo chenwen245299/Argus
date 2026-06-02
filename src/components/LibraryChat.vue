@@ -3,7 +3,9 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { getCurrentWindow, Window } from '@tauri-apps/api/window'
+import { Window } from '@tauri-apps/api/window'
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
+import { LogicalSize } from '@tauri-apps/api/dpi'
 import { useAiStore, type ModelOption } from '../stores/ai'
 import { useRagStore } from '../stores/rag'
 import MermaidBlock from './MermaidBlock.vue'
@@ -150,10 +152,84 @@ const editingMsgId = ref<string | null>(null)
 const editingText = ref('')
 const copiedMsgIds = ref(new Set<string>())
 
+// ── Sidebar resize ─────────────────────────────────────────────────────────────
+const SIDEBAR_WIDTH_KEY = 'argus:chat:sidebar-width'
+const MIN_SIDEBAR_W = 160
+const MAX_SIDEBAR_W = 420
+const DEFAULT_SIDEBAR_W = 260
+
+function loadSidebarWidth(): number {
+  try {
+    const v = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY))
+    if (v >= MIN_SIDEBAR_W && v <= MAX_SIDEBAR_W) return v
+  } catch {}
+  return DEFAULT_SIDEBAR_W
+}
+
+const sidebarWidth = ref(loadSidebarWidth())
+watch(sidebarWidth, (val) => {
+  try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(val))) } catch {}
+})
+let dividerDragging = false
+let dividerStartX = 0
+let dividerStartW = 0
+
+function onDividerMouseDown(e: MouseEvent) {
+  dividerDragging = true
+  dividerStartX = e.clientX
+  dividerStartW = sidebarWidth.value
+  document.body.style.userSelect = 'none'
+  document.body.style.cursor = 'col-resize'
+  window.addEventListener('mousemove', onDividerMouseMove)
+  window.addEventListener('mouseup', onDividerMouseUp)
+}
+
+function onDividerMouseMove(e: MouseEvent) {
+  if (!dividerDragging) return
+  const delta = e.clientX - dividerStartX
+  sidebarWidth.value = Math.max(MIN_SIDEBAR_W, Math.min(MAX_SIDEBAR_W, dividerStartW + delta))
+}
+
+function onDividerMouseUp() {
+  if (!dividerDragging) return
+  dividerDragging = false
+  document.body.style.userSelect = ''
+  document.body.style.cursor = ''
+  window.removeEventListener('mousemove', onDividerMouseMove)
+  window.removeEventListener('mouseup', onDividerMouseUp)
+  try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(sidebarWidth.value))) } catch {}
+}
+
 let unlistenChat: UnlistenFn | null = null
 let unlistenSources: UnlistenFn | null = null
-let unlistenResize: UnlistenFn | null = null
 let resizeTimer: ReturnType<typeof setTimeout> | null = null
+
+const CHAT_WIN_SIZE_KEY = 'argus:chat:window:size'
+
+function saveChatWindowSize() {
+  if (resizeTimer) clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(CHAT_WIN_SIZE_KEY, JSON.stringify({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      }))
+    } catch {}
+  }, 400)
+}
+
+async function restoreChatWindowSize() {
+  try {
+    const raw = localStorage.getItem(CHAT_WIN_SIZE_KEY)
+    if (!raw) return
+    const { width, height } = JSON.parse(raw) as { width: number; height: number }
+    if (!width || !height) return
+    await getCurrentWebviewWindow().setSize(new LogicalSize(
+      Math.max(560, width),
+      Math.max(400, height),
+    ))
+  } catch {}
+}
 let pendingSources: RetrievedChunk[] = []
 let _compositionEndedAt = 0
 
@@ -191,6 +267,25 @@ for (const [path, mod] of Object.entries(modelSvgModules)) {
 function deriveTitleFromMsg(text: string): string {
   const clean = text.replace(/\s+/g, ' ').trim()
   return clean.length > 42 ? clean.slice(0, 42) + '…' : clean
+}
+
+async function generateAiTitle(conv: LibraryConversation) {
+  const userMsgs = conv.messages.filter((m: LibraryUiMessage) => m.role === 'user')
+  const assistantMsgs = conv.messages.filter((m: LibraryUiMessage) => m.role === 'assistant')
+  if (userMsgs.length !== 1 || assistantMsgs.length < 1) return
+  const assistantMsg = assistantMsgs[0] as LibraryUiMessage
+  const aiContent = activeAnswer(assistantMsg)?.content ?? assistantMsg.content
+  if (!aiContent) return
+  try {
+    const title = await invoke<string>('generate_conversation_title', {
+      userMsg: userMsgs[0].content,
+      aiMsg: aiContent.slice(0, 400),
+    })
+    if (title?.trim()) {
+      conv.title = title.trim().slice(0, 60)
+      persistActive()
+    }
+  } catch { /* silently keep the derived title */ }
 }
 
 function formatDate(iso: string): string {
@@ -489,6 +584,10 @@ async function runAssistantRequest(
     assistantMsg.streaming = false
     if (pendingSources.length > 0) target.sources = [...pendingSources]
     persistActive()
+    // Auto-generate title after the first exchange (fire-and-forget)
+    if (conv.messages.filter((m: LibraryUiMessage) => m.role === 'user').length === 1) {
+      generateAiTitle(conv)
+    }
   } catch (e) {
     target.content = String(e)
     target.error = true
@@ -651,29 +750,18 @@ onMounted(async () => {
     navigator.clipboard.writeText((e.target as HTMLElement).textContent ?? '').catch(() => {})
   })
 
-  // Persist window size on resize (debounced 600ms)
-  try {
-    const appWindow = getCurrentWindow()
-    unlistenResize = await appWindow.onResized(async () => {
-      if (resizeTimer) clearTimeout(resizeTimer)
-      resizeTimer = setTimeout(async () => {
-        try {
-          const [physSize, sf] = await Promise.all([appWindow.innerSize(), appWindow.scaleFactor()])
-          await invoke('save_chat_window_size', {
-            width: physSize.width / sf,
-            height: physSize.height / sf,
-          })
-        } catch {}
-      }, 600)
-    })
-  } catch {}
+  // Persist window size on resize (localStorage, same pattern as MainView)
+  window.addEventListener('resize', saveChatWindowSize)
+  restoreChatWindowSize()
 })
 
 onUnmounted(() => {
   document.removeEventListener('mousedown', closeModelMenu)
+  window.removeEventListener('resize', saveChatWindowSize)
+  window.removeEventListener('mousemove', onDividerMouseMove)
+  window.removeEventListener('mouseup', onDividerMouseUp)
   if (unlistenChat) unlistenChat()
   if (unlistenSources) unlistenSources()
-  if (unlistenResize) unlistenResize()
   if (resizeTimer) clearTimeout(resizeTimer)
 })
 </script>
@@ -685,63 +773,59 @@ onUnmounted(() => {
     <div class="lc-titlebar" data-tauri-drag-region>
       <div class="tl-space" data-tauri-drag-region />
       <template v-if="ai.loaded && ai.isConfigured">
-        <button class="sidebar-toggle-btn" @click="sidebarOpen = !sidebarOpen" :title="sidebarOpen ? '收起' : '展开'">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="3" y="3" width="18" height="18" rx="2"/>
-            <line x1="9" y1="3" x2="9" y2="21"/>
-          </svg>
-        </button>
-        <div class="header-avatar">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+        <div class="header-avatar" data-tauri-drag-region>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" data-tauri-drag-region>
             <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
             <path d="M8 9h8"/><path d="M8 13h5"/>
           </svg>
         </div>
-        <div class="header-title-block">
-          <span class="header-conv-title">{{ activeConv?.title || t('libraryChat.untitled') }}</span>
-          <span class="header-subtitle">{{ conversationSubtitle }}</span>
+        <div class="header-title-block" data-tauri-drag-region>
+          <span class="header-conv-title" data-tauri-drag-region>{{ activeConv?.title || t('libraryChat.untitled') }}</span>
+          <span class="header-subtitle" data-tauri-drag-region>{{ conversationSubtitle }}</span>
         </div>
         <div class="lc-titlebar-fill" data-tauri-drag-region />
-        <!-- RAG not configured -->
-        <button v-if="!ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-          RAG
-        </button>
-        <!-- RAG configured -->
-        <template v-else>
-          <span v-if="syncingMissing" class="rag-sync-progress">{{ syncProgress.done }}/{{ syncProgress.total }}</span>
-          <button class="rag-refresh-btn" :class="{ refreshing: refreshingCounts || syncingMissing }" title="刷新嵌入状态" :disabled="refreshingCounts || syncingMissing" @click="refreshCounts">
-            <svg width="13" height="13" viewBox="-1 -1 26 26" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="overflow:visible"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15A9 9 0 1 1 23 10"/></svg>
-          </button>
-          <div class="rag-counter" title="向量库：已嵌入论文 / 总论文数">
+        <div class="lc-titlebar-actions">
+          <!-- RAG not configured -->
+          <button v-if="!ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-            <span class="rag-counter-text">{{ vectorizedCount }}/{{ allPapers.length }}</span>
-          </div>
-          <template v-if="syncingMissing">
-            <button class="rag-sync-cancel" @click="syncCancelRequested = true" title="取消同步"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+            RAG
+          </button>
+          <!-- RAG configured -->
+          <template v-else>
+            <span v-if="syncingMissing" class="rag-sync-progress">{{ syncProgress.done }}/{{ syncProgress.total }}</span>
+            <button class="rag-refresh-btn" :class="{ refreshing: refreshingCounts || syncingMissing }" title="刷新嵌入状态" :disabled="refreshingCounts || syncingMissing" @click="refreshCounts">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+            </button>
+            <div class="rag-counter" title="向量库：已嵌入论文 / 总论文数">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+              <span class="rag-counter-text">{{ vectorizedCount }}/{{ allPapers.length }}</span>
+            </div>
+            <template v-if="syncingMissing">
+              <button class="rag-sync-cancel" @click="syncCancelRequested = true" title="取消同步"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+            </template>
+            <button v-else class="rag-sync-btn" :class="{ 'all-done': unvectorizedPapers.length === 0 }" :title="unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇未向量化的论文` : '所有论文已嵌入'" :disabled="unvectorizedPapers.length === 0" @click="syncMissing">
+              <svg v-if="unvectorizedPapers.length > 0" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+              <svg v-else width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              {{ unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇` : '已全部嵌入' }}
+            </button>
           </template>
-          <button v-else class="rag-sync-btn" :class="{ 'all-done': unvectorizedPapers.length === 0 }" :title="unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇未向量化的论文` : '所有论文已嵌入'" :disabled="unvectorizedPapers.length === 0" @click="syncMissing">
-            <svg v-if="unvectorizedPapers.length > 0" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
-            <svg v-else width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-            {{ unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇` : '已全部嵌入' }}
-          </button>
-        </template>
-        <div ref="modelMenuRoot" class="lc-model-picker">
-          <button class="lc-model-trigger" @click.stop="modelMenuOpen = !modelMenuOpen">
-            <span class="lc-model-icon">
-              <img v-if="modelLogo(selectedModelOption)" :src="modelLogo(selectedModelOption)" alt="" />
-              <span v-else>{{ selectedModelLabel().charAt(0).toUpperCase() }}</span>
-            </span>
-            <span class="lc-model-label">{{ selectedModelLabel() }}</span>
-            <svg class="chevron" :class="{ open: modelMenuOpen }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"/></svg>
-          </button>
-          <div v-if="modelMenuOpen" class="lc-model-menu">
-            <div v-for="group in ai.groupedModels" :key="group.id" class="lc-model-group">
-              <div class="lc-model-group-name">{{ group.name }}</div>
-              <button v-for="model in group.models" :key="selectionKey(model)" class="lc-model-row" :class="{ active: selectionKey(model) === selectionKey(effectiveModel()) }" @click="selectModel(model)">
-                <span class="lc-model-row-icon"><img v-if="modelLogo(model)" :src="modelLogo(model)" alt="" /><span v-else>{{ model.displayName.charAt(0).toUpperCase() }}</span></span>
-                <span class="lc-model-row-text"><span class="lc-model-row-name">{{ model.displayName }}</span><span class="lc-model-row-meta">{{ modelCapabilityText(model) || model.modelId }}</span></span>
-              </button>
+          <div ref="modelMenuRoot" class="lc-model-picker">
+            <button class="lc-model-trigger" @click.stop="modelMenuOpen = !modelMenuOpen">
+              <span class="lc-model-icon">
+                <img v-if="modelLogo(selectedModelOption)" :src="modelLogo(selectedModelOption)" alt="" />
+                <span v-else>{{ selectedModelLabel().charAt(0).toUpperCase() }}</span>
+              </span>
+              <span class="lc-model-label">{{ selectedModelLabel() }}</span>
+              <svg class="chevron" :class="{ open: modelMenuOpen }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+            <div v-if="modelMenuOpen" class="lc-model-menu">
+              <div v-for="group in ai.groupedModels" :key="group.id" class="lc-model-group">
+                <div class="lc-model-group-name">{{ group.name }}</div>
+                <button v-for="model in group.models" :key="selectionKey(model)" class="lc-model-row" :class="{ active: selectionKey(model) === selectionKey(effectiveModel()) }" @click="selectModel(model)">
+                  <span class="lc-model-row-icon"><img v-if="modelLogo(model)" :src="modelLogo(model)" alt="" /><span v-else>{{ model.displayName.charAt(0).toUpperCase() }}</span></span>
+                  <span class="lc-model-row-text"><span class="lc-model-row-name">{{ model.displayName }}</span><span class="lc-model-row-meta">{{ modelCapabilityText(model) || model.modelId }}</span></span>
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -767,7 +851,7 @@ onUnmounted(() => {
       <!-- ── Body: sidebar + main ───────────────────────────────────────────── -->
       <div class="lc-body">
       <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
-      <aside class="lc-sidebar" :class="{ collapsed: !sidebarOpen }">
+      <aside class="lc-sidebar" :style="{ width: sidebarWidth + 'px', minWidth: sidebarWidth + 'px' }">
         <div class="sidebar-header">
           <div class="sidebar-heading">
             <span class="sidebar-title">{{ t('libraryChat.historyTitle') }}</span>
@@ -810,6 +894,9 @@ onUnmounted(() => {
           </div>
         </div>
       </aside>
+
+      <!-- ── Resize divider ────────────────────────────────────────────────────── -->
+      <div class="chat-divider" @mousedown.prevent="onDividerMouseDown" />
 
       <!-- ── Main area ───────────────────────────────────────────────────────── -->
       <div class="lc-main">
@@ -866,7 +953,7 @@ onUnmounted(() => {
                 :disabled="refreshingCounts || syncingMissing"
                 @click="refreshCounts"
               >
-                <svg width="13" height="13" viewBox="-1 -1 26 26" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="overflow:visible">
+                <svg width="15" height="15" viewBox="-2 -2 28 28" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
                   <polyline points="23 4 23 10 17 10"/>
                   <path d="M20.49 15A9 9 0 1 1 23 10"/>
                 </svg>
@@ -1185,15 +1272,30 @@ onUnmounted(() => {
 .lc-titlebar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   height: 52px;
   flex-shrink: 0;
   padding: 0 14px 0 0;
   border-bottom: 1px solid var(--border-subtle);
-  background: color-mix(in srgb, var(--bg-primary) 88%, var(--bg-secondary));
+  background: color-mix(in srgb, var(--bg-primary) 85%, var(--bg-secondary));
 }
-.lc-titlebar .tl-space { width: 76px; flex-shrink: 0; }
-.lc-titlebar-fill { flex: 1; }
+.lc-titlebar .tl-space { width: 96px; flex-shrink: 0; }
+.lc-titlebar-fill {
+  flex: 1 1 auto;
+  min-width: 12px;
+}
+.lc-titlebar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+.lc-titlebar-actions button {
+  margin: 0;
+  -webkit-appearance: none;
+  appearance: none;
+}
 
 /* ── Body (sidebar + main) ────────────────────────────────────────────────── */
 
@@ -1207,19 +1309,39 @@ onUnmounted(() => {
 /* ── Sidebar ─────────────────────────────────────────────────────────────── */
 
 .lc-sidebar {
-  width: 260px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--border-subtle);
   background: color-mix(in srgb, var(--bg-secondary) 82%, var(--bg-primary));
   overflow: hidden;
-  transition: width 0.18s ease;
 }
 
-.lc-sidebar.collapsed {
-  width: 0;
-  border-right: none;
+.chat-divider {
+  width: 1px;
+  flex-shrink: 0;
+  background: transparent;
+  cursor: col-resize;
+  position: relative;
+}
+.chat-divider::before {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--border-default);
+  transition: width 0.12s ease, background 0.12s ease;
+}
+.chat-divider::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0;
+  left: -3px; right: -3px;
+}
+.chat-divider:hover::before {
+  width: 3px;
+  background: var(--accent);
 }
 
 .sidebar-header {
@@ -1401,27 +1523,24 @@ onUnmounted(() => {
 .sidebar-toggle-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 
 .header-avatar {
-  width: 34px;
-  height: 34px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
   color: var(--accent);
   flex-shrink: 0;
 }
 
 .header-title-block {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
 }
 
 .header-conv-title {
-  font-size: 15px;
-  font-weight: 750;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
@@ -1430,12 +1549,13 @@ onUnmounted(() => {
 }
 
 .header-subtitle {
-  min-height: 15px;
   font-size: 11px;
   color: var(--text-tertiary);
+  background: var(--bg-tertiary);
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex-shrink: 0;
 }
 
 .header-right {
@@ -1451,8 +1571,8 @@ onUnmounted(() => {
 }
 
 .lc-model-trigger {
-  height: 34px;
-  min-width: 208px;
+  height: 32px;
+  min-width: 190px;
   max-width: 260px;
   padding: 0 10px 0 8px;
   display: inline-flex;
@@ -1610,14 +1730,12 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  height: 28px;
-  padding: 0 9px;
-  border-radius: var(--radius-md);
-  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
   font-weight: 600;
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
   flex-shrink: 0;
   user-select: none;
 }
@@ -1628,22 +1746,18 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  height: 28px;
-  padding: 0 10px;
+  padding: 5px 10px;
   border-radius: var(--radius-md);
   font-size: 12px;
   font-weight: 500;
   color: var(--text-secondary);
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border-subtle);
   cursor: pointer;
   flex-shrink: 0;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  transition: background 0.12s, color 0.12s;
 }
 .rag-sync-btn:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
-  border-color: var(--border-default);
 }
 
 /* All-done state for sync button */
@@ -1663,20 +1777,27 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  padding: 0;
+  line-height: 0;
+  overflow: visible;
   border-radius: var(--radius-md);
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   background: transparent;
-  border: 1px solid transparent;
   cursor: pointer;
   flex-shrink: 0;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  transition: background 0.12s, color 0.12s;
+}
+.rag-refresh-btn svg {
+  display: block;
+  flex-shrink: 0;
+  overflow: visible;
 }
 .rag-refresh-btn:hover:not(:disabled) {
   background: var(--bg-hover);
   color: var(--text-primary);
-  border-color: var(--border-subtle);
 }
 .rag-refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .rag-refresh-btn.refreshing svg {
@@ -2396,7 +2517,7 @@ onUnmounted(() => {
 }
 
 @media (max-width: 860px) {
-  .lc-sidebar { width: 230px; }
+  .lc-sidebar { min-width: 160px; }
   .new-chat-btn span { display: none; }
   .header-avatar { display: none; }
   .lc-model-trigger { min-width: 160px; max-width: 190px; }

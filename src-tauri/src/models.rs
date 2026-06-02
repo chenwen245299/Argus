@@ -217,6 +217,15 @@ pub struct AppSettings {
     /// User-editable prompt for inline text translation.
     #[serde(default = "default_translate_ai_prompt")]
     pub translate_ai_prompt: String,
+    /// AI provider ID for chat conversation title generation (None = default)
+    #[serde(default)]
+    pub title_ai_provider_id: Option<String>,
+    /// AI model ID for chat conversation title generation (None = default)
+    #[serde(default)]
+    pub title_ai_model_id: Option<String>,
+    /// User-editable prompt for chat title generation.
+    #[serde(default = "default_title_ai_prompt")]
+    pub title_ai_prompt: String,
 }
 
 pub fn default_metadata_ai_prompt() -> String {
@@ -334,6 +343,11 @@ pub fn is_legacy_abstract_ai_prompt(prompt: &str) -> bool {
     prompt.trim() == legacy_abstract_ai_prompt_generated().trim()
 }
 
+pub fn default_title_ai_prompt() -> String {
+    "请根据以下对话内容生成一个简洁的标题（不超过20字，直接输出标题文字，不要引号和多余说明）：\n\n用户：{user_msg}\n\nAI：{ai_msg}"
+        .to_string()
+}
+
 pub fn default_translate_ai_prompt() -> String {
     "请将以下英文文本翻译成中文，保持学术风格，直接输出翻译结果，不需要任何额外说明：\n\n{text}"
         .to_string()
@@ -363,6 +377,9 @@ impl Default for AppSettings {
             translate_ai_provider_id: None,
             translate_ai_model_id: None,
             translate_ai_prompt: default_translate_ai_prompt(),
+            title_ai_provider_id: None,
+            title_ai_model_id: None,
+            title_ai_prompt: default_title_ai_prompt(),
         }
     }
 }
@@ -833,6 +850,33 @@ pub struct CanvasNode {
     /// Node-level override for hover content source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hover_source: Option<String>,
+    /// "paper" (default/None), "text", or "shape"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_type: Option<String>,
+    /// Text content for text/shape nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Font size in px for text nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f64>,
+    /// Font bold for text nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_bold: Option<bool>,
+    /// Font italic for text nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_italic: Option<bool>,
+    /// Width for shape nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    /// Height for shape nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CanvasEdgePoint {
+    pub x: f64,
+    pub y: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -852,6 +896,12 @@ pub struct CanvasEdge {
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stroke_width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_points: Vec<CanvasEdgePoint>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

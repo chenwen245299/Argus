@@ -72,6 +72,16 @@ function showHome() {
   reader.showList()
 }
 
+function showCanvas() {
+  canvasStore.isShown = true
+  reader.showList()
+}
+
+function closeCanvasTab() {
+  void canvasStore.closeCurrentCanvas()
+  reader.showList()
+}
+
 function switchTab(slug: string) {
   canvasStore.isShown = false
   reader.switchTab(slug)
@@ -144,11 +154,13 @@ onUnmounted(() => {
         <span class="tab-title">{{ homeTitle }}</span>
       </div>
 
-      <!-- Canvas tab (shown when a canvas is open) -->
+      <!-- Canvas tab (always shown while a canvas is loaded, regardless of active state) -->
       <div
-        v-if="canvasStore.isShown && canvasStore.currentCanvas"
-        class="tab tab-canvas active"
+        v-if="canvasStore.currentCanvas"
+        class="tab tab-canvas"
+        :class="{ active: canvasStore.isShown }"
         :title="canvasStore.currentCanvas.name"
+        @click="showCanvas()"
       >
         <svg class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
           <circle cx="8" cy="8" r="2.5"/><circle cx="16" cy="16" r="2.5"/>
@@ -157,7 +169,7 @@ onUnmounted(() => {
           <line x1="10" y1="9" x2="14" y2="15"/>
         </svg>
         <span class="tab-title">{{ canvasStore.currentCanvas.name }}</span>
-        <button class="tab-close" @click.stop="canvasStore.isShown = false">
+        <button class="tab-close" @click.stop="closeCanvasTab">
           <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8">
             <line x1="18" y1="6" x2="6" y2="18"/>
             <line x1="6" y1="6" x2="18" y2="18"/>

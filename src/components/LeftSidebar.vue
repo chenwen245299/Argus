@@ -465,21 +465,22 @@ onUnmounted(() => {
     <div
       v-if="library.currentPath"
       class="canvas-section"
-      :style="canvasCollapsed ? {} : { height: `${canvasPanelHeight}px` }"
+      :class="{ 'canvas-section--collapsed': canvasCollapsed }"
+      :style="{ height: `${canvasPanelHeight}px` }"
     >
       <div v-if="!canvasCollapsed" class="canvas-resize-handle" @mousedown.stop.prevent="startResizeCanvas" />
 
       <div class="section-header" @click.stop="canvasCollapsed = !canvasCollapsed">
         <span class="section-title">{{ t('sidebar.canvas') }}</span>
         <div class="section-header-right">
-          <button class="icon-action" :title="t('toolbar.refreshTitle')" @click.stop="canvasStore.loadList()">
+          <button v-if="!canvasCollapsed" class="icon-action" :title="t('toolbar.refreshTitle')" @click.stop="canvasStore.loadList()">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               :class="{ spin: canvasStore.loading }">
               <polyline points="23 4 23 10 17 10"/>
               <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
             </svg>
           </button>
-          <button class="icon-action" :title="t('canvas.newCanvas')" @click.stop="startNewCanvas()">
+          <button v-if="!canvasCollapsed" class="icon-action" :title="t('canvas.newCanvas')" @click.stop="startNewCanvas()">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
               <line x1="12" y1="5" x2="12" y2="19"/>
               <line x1="5" y1="12" x2="19" y2="12"/>

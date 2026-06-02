@@ -4,10 +4,12 @@ import { currentTranslation, translationHistory, clearTranslationHistory, delete
 
 type View = 'current' | 'history'
 const view = ref<View>('current')
+const sourceExpanded = ref(false)
 
-// When a new translation starts, switch back to current view
+// When a new translation starts, switch back to current view and reset expand state.
 watch(() => currentTranslation.sourceText, () => {
   view.value = 'current'
+  sourceExpanded.value = false
 })
 
 function fmtTime(iso: string) {
@@ -71,8 +73,22 @@ function fmtTime(iso: string) {
 
       <template v-else>
         <!-- Source text -->
-        <div class="section-label">原文</div>
-        <div class="source-text selectable-text">{{ currentTranslation.sourceText }}</div>
+        <div class="section-label source-label">
+          <span>原文</span>
+          <button
+            type="button"
+            class="source-toggle-btn"
+            @click="sourceExpanded = !sourceExpanded"
+          >
+            <svg v-if="!sourceExpanded" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+            <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"/></svg>
+            {{ sourceExpanded ? '折叠原文' : '展开原文' }}
+          </button>
+        </div>
+        <div
+          class="source-text selectable-text"
+          :class="{ 'source-collapsed': !sourceExpanded }"
+        >{{ currentTranslation.sourceText }}</div>
 
         <div class="divider" />
 
@@ -188,11 +204,32 @@ function fmtTime(iso: string) {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 11px;
+  font-size: var(--font-size-sm);
   font-weight: 600;
   color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+.source-label {
+  justify-content: space-between;
+}
+.source-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  transition: background 0.1s, color 0.1s;
+}
+.source-toggle-btn:hover {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
 }
 
 .loading-dot {
@@ -204,7 +241,7 @@ function fmtTime(iso: string) {
 }
 
 .source-text {
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-md);
   color: var(--text-secondary);
   line-height: 1.6;
   white-space: pre-wrap;
@@ -212,6 +249,11 @@ function fmtTime(iso: string) {
   border-radius: var(--radius-md);
   padding: 10px 12px;
   border: 1px solid var(--border-subtle);
+  overflow-y: auto;
+}
+.source-text.source-collapsed {
+  /* ~10 lines: 14px * 1.6 * 10 + 20px padding */
+  max-height: 244px;
 }
 
 .divider {
@@ -221,7 +263,7 @@ function fmtTime(iso: string) {
 }
 
 .result-text {
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-md);
   color: var(--text-primary);
   line-height: 1.7;
   white-space: pre-wrap;
@@ -283,7 +325,7 @@ function fmtTime(iso: string) {
 .entry-delete-btn:hover { background: var(--bg-hover); color: #e53e3e; }
 
 .entry-source {
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-md);
   color: var(--text-secondary);
   line-height: 1.5;
   white-space: pre-wrap;
@@ -295,7 +337,7 @@ function fmtTime(iso: string) {
 }
 
 .entry-result {
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-md);
   color: var(--text-primary);
   line-height: 1.6;
   white-space: pre-wrap;

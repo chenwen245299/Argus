@@ -121,9 +121,9 @@ const showLibraryLoading = computed(() =>
 )
 
 function onOpenCanvas() {
+  readerStore.showList()   // clear activeSlug so PdfViewer v-if yields to CanvasPanel
   showCanvas.value = true
   canvasStore.isShown = true
-  rightSidebarVisible.value = true
 }
 
 function closeCanvas() {
@@ -360,6 +360,7 @@ watch(
     }
     if (showCanvas.value) {
       showCanvas.value = false
+      canvasStore.isShown = false
     }
   }
 )

@@ -58,6 +58,9 @@ async function onCanvasNotesUpdated(noteIds: string[]) {
   if (!activePaperSlug.value || !meta.value) return
   await invoke('set_canvas_notes', { slug: activePaperSlug.value, noteIds })
   meta.value = { ...meta.value, canvas_notes: noteIds }
+  window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', {
+    detail: { slug: activePaperSlug.value, noteIds },
+  }))
 }
 
 async function onSlugChanged(newSlug: string) {

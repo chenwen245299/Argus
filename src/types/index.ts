@@ -128,6 +128,9 @@ export interface AppSettings {
   translate_ai_provider_id?: string
   translate_ai_model_id?: string
   translate_ai_prompt?: string
+  title_ai_provider_id?: string
+  title_ai_model_id?: string
+  title_ai_prompt?: string
 }
 
 // ── M4: Search ────────────────────────────────────────────────────────────────
@@ -364,6 +367,13 @@ export interface CanvasNode {
   y: number
   color?: string
   hover_source?: string
+  node_type?: 'paper' | 'text' | 'shape'
+  content?: string
+  font_size?: number
+  font_bold?: boolean
+  font_italic?: boolean
+  width?: number
+  height?: number
 }
 
 export interface CanvasEdge {
@@ -375,6 +385,9 @@ export interface CanvasEdge {
   label?: string
   color?: string
   stroke_width?: number
+  control_x?: number
+  control_y?: number
+  control_points?: Array<{ x: number; y: number }>
 }
 
 export interface Canvas {

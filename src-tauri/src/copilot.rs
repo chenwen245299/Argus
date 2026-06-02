@@ -447,8 +447,7 @@ pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
     let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
-        // Center traffic lights in the 52px titlebar
-        .traffic_light_position(tauri::LogicalPosition { x: 14.0, y: 20.0 });
+        .traffic_light_position(tauri::LogicalPosition { x: 14.0, y: 28.0 });
 
     let win = builder
         .build()

@@ -28,6 +28,7 @@ import { marked } from 'marked'
 import { useCanvasStore } from '../stores/canvas'
 import { useLibraryStore } from '../stores/library'
 import PaperNode from '../components/canvas/PaperNode.vue'
+import AdjustableEdge from '../components/canvas/AdjustableEdge.vue'
 import SuggestPanel from '../components/canvas/SuggestPanel.vue'
 import ExportDialog from '../components/canvas/ExportDialog.vue'
 import type { PaperIndexEntry, CanvasNode as CNode, CanvasEdge as CEdge, Canvas, SuggestedEdge, NodePosition } from '../types'
@@ -69,6 +70,7 @@ async function watchWindowSize() {
 // ── Vue Flow setup ────────────────────────────────────────────────────────────
 
 const nodeTypes = markRaw({ paper: PaperNode })
+const edgeTypes = markRaw({ adjustable: AdjustableEdge })
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const nodes = ref<any[]>([])
@@ -77,6 +79,8 @@ const edges = ref<any[]>([])
 
 const {
   onConnect,
+  onConnectStart,
+  onConnectEnd,
   addEdges,
   addNodes,
   removeNodes,
@@ -89,6 +93,48 @@ const {
   setViewport,
   fitView,
 } = useVueFlow()
+
+type ConnectStartInfo = { nodeId?: string; handleId: string | null }
+const connectStart = ref<ConnectStartInfo | null>(null)
+
+function handleSide(handleId?: string | null) {
+  return handleId?.replace(/^(src|tgt)-/, '') || null
+}
+
+function sourceHandleFor(handleId?: string | null) {
+  const side = handleSide(handleId)
+  return side ? `src-${side}` : (handleId ?? undefined)
+}
+
+function targetHandleFor(handleId?: string | null) {
+  const side = handleSide(handleId)
+  return side ? `tgt-${side}` : (handleId ?? undefined)
+}
+
+function normalizeDirectedConnection(params: Connection): Connection {
+  const start = connectStart.value
+  if (!start?.nodeId) return params
+
+  if (start.nodeId === params.source) {
+    return {
+      source: params.source,
+      target: params.target,
+      sourceHandle: sourceHandleFor(start.handleId ?? params.sourceHandle),
+      targetHandle: targetHandleFor(params.targetHandle),
+    }
+  }
+
+  if (start.nodeId === params.target) {
+    return {
+      source: params.target,
+      target: params.source,
+      sourceHandle: sourceHandleFor(start.handleId ?? params.targetHandle),
+      targetHandle: targetHandleFor(params.sourceHandle),
+    }
+  }
+
+  return params
+}
 
 // ── Sidebar state ─────────────────────────────────────────────────────────────
 
@@ -211,6 +257,11 @@ function buildVfEdges(cedges: CEdge[]): VfEdge[] {
     const sw = ce.stroke_width ?? 1.8
     const style: { strokeWidth: number; stroke?: string } = { strokeWidth: sw }
     if (ce.color) style.stroke = ce.color
+    const hasLegacyControlPoint = typeof ce.control_x === 'number' && Number.isFinite(ce.control_x) &&
+      typeof ce.control_y === 'number' && Number.isFinite(ce.control_y)
+    const controlPoints = ce.control_points?.length
+      ? ce.control_points
+      : (hasLegacyControlPoint ? [{ x: ce.control_x as number, y: ce.control_y as number }] : undefined)
     return {
       id: ce.edge_id,
       source: ce.from_node_id,
@@ -222,8 +273,12 @@ function buildVfEdges(cedges: CEdge[]): VfEdge[] {
       style,
       labelStyle: { fontSize: '11px' },
       labelBgStyle: { fill: 'var(--bg-primary)', fillOpacity: 0.9 },
-      type: 'smoothstep',
-      data: { edgeColor: ce.color, edgeStrokeWidth: sw },
+      type: 'adjustable',
+      data: {
+        edgeColor: ce.color,
+        edgeStrokeWidth: sw,
+        controlPoints,
+      },
     } satisfies VfEdge
   })
 }
@@ -243,6 +298,14 @@ function extractCanvasEdges(): CEdge[] {
   return (edges.value as VfEdge[]).map((e): CEdge => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const d = e.data as any
+    const controlPoints = Array.isArray(d?.controlPoints)
+      ? d.controlPoints.filter((point: unknown) => {
+          if (!point || typeof point !== 'object') return false
+          const maybe = point as { x?: unknown; y?: unknown }
+          return typeof maybe.x === 'number' && Number.isFinite(maybe.x) &&
+            typeof maybe.y === 'number' && Number.isFinite(maybe.y)
+        })
+      : []
     return {
       edge_id: e.id,
       from_node_id: e.source,
@@ -252,6 +315,7 @@ function extractCanvasEdges(): CEdge[] {
       label: typeof e.label === 'string' ? e.label || undefined : undefined,
       color: d?.edgeColor || undefined,
       stroke_width: d?.edgeStrokeWidth !== 1.8 ? d?.edgeStrokeWidth : undefined,
+      control_points: controlPoints.length ? controlPoints : undefined,
     }
   })
 }
@@ -302,23 +366,33 @@ function triggerSave() {
 
 // ── Vue Flow event handlers ───────────────────────────────────────────────────
 
+onConnectStart(({ nodeId, handleId }) => {
+  connectStart.value = { nodeId, handleId }
+})
+
+onConnectEnd(() => {
+  connectStart.value = null
+})
+
 onConnect((params: Connection) => {
-  if (!params.source || !params.target) return
+  const directed = normalizeDirectedConnection(params)
+  connectStart.value = null
+  if (!directed.source || !directed.target) return
   // Prevent duplicate edges
   const exists = edges.value.some(
-    e => e.source === params.source && e.target === params.target
+    e => e.source === directed.source && e.target === directed.target
   )
   if (exists) return
 
   const newEdge: VfEdge = {
     id: `e-${Date.now()}`,
-    source: params.source,
-    target: params.target,
-    sourceHandle: params.sourceHandle,
-    targetHandle: params.targetHandle,
+    source: directed.source,
+    target: directed.target,
+    sourceHandle: directed.sourceHandle,
+    targetHandle: directed.targetHandle,
     markerEnd: MarkerType.ArrowClosed,
     style: { strokeWidth: 1.8 },
-    type: 'smoothstep',
+    type: 'adjustable',
     labelStyle: { fontSize: '11px' },
     labelBgStyle: { fill: 'var(--bg-primary)', fillOpacity: 0.9 },
     data: { edgeStrokeWidth: 1.8 },
@@ -660,7 +734,7 @@ function acceptSuggestion(s: SuggestedEdge) {
     id: `edge-${Date.now()}`,
     source: fromNode.id,
     target: toNode.id,
-    type: 'smoothstep',
+    type: 'adjustable',
     markerEnd: MarkerType.ArrowClosed,
     style: { strokeWidth: 1.8 },
     labelStyle: { fontSize: '11px' },
@@ -819,6 +893,10 @@ function onDocClick(e: MouseEvent) {
   }
 }
 
+function onEdgeControlChanged() {
+  triggerSave()
+}
+
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 let unlisten: UnlistenFn | null = null
@@ -848,6 +926,7 @@ onMounted(async () => {
 
   document.addEventListener('keydown', onKeydown)
   document.addEventListener('pointerdown', onDocClick)
+  window.addEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
 })
 
 onUnmounted(() => {
@@ -856,6 +935,7 @@ onUnmounted(() => {
   unlistenWindowResize?.()
   document.removeEventListener('keydown', onKeydown)
   document.removeEventListener('pointerdown', onDocClick)
+  window.removeEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
   if (hoverTimer) clearTimeout(hoverTimer)
   if (windowResizeTimer) clearTimeout(windowResizeTimer)
   saveWindowSize()
@@ -1055,8 +1135,9 @@ watch(() => library.papers, () => {
           v-model:nodes="nodes"
           v-model:edges="edges"
           :node-types="nodeTypes"
+          :edge-types="edgeTypes"
           :connection-mode="ConnectionMode.Loose"
-          :default-edge-options="{ type: 'smoothstep', markerEnd: MarkerType.ArrowClosed }"
+          :default-edge-options="{ type: 'adjustable', markerEnd: MarkerType.ArrowClosed }"
           :snap-to-grid="false"
           fit-view-on-init
           class="canvas-flow"

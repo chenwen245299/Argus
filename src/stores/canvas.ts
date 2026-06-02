@@ -50,6 +50,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     await invoke('delete_canvas', { id })
     if (currentCanvas.value?.id === id) {
       currentCanvas.value = null
+      isShown.value = false
     }
     await loadList()
   }
@@ -75,6 +76,16 @@ export const useCanvasStore = defineStore('canvas', () => {
     } catch (e) {
       console.error('save_canvas:', e)
     }
+  }
+
+  async function closeCurrentCanvas() {
+    if (saveTimer) {
+      clearTimeout(saveTimer)
+      saveTimer = null
+    }
+    await persistCanvas()
+    currentCanvas.value = null
+    isShown.value = false
   }
 
   async function getNodeDisplayContent(paperId: string, source: string): Promise<string> {
@@ -119,6 +130,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     deleteCanvas,
     scheduleSave,
     persistCanvas,
+    closeCurrentCanvas,
     getNodeDisplayContent,
     loadSettings,
     saveSettings,

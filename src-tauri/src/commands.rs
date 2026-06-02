@@ -393,6 +393,34 @@ pub async fn translate_text_stream(
     Ok(())
 }
 
+/// Generate a conversation title from the first user message and AI response.
+#[tauri::command]
+pub async fn generate_conversation_title(
+    user_msg: String,
+    ai_msg: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<String, String> {
+    let root = get_root(&state)?;
+    let s = settings::read_settings(&root);
+
+    let (provider, api_key, model) = ai_manager::resolve_provider_model(
+        &root,
+        s.title_ai_provider_id.as_deref(),
+        s.title_ai_model_id.as_deref(),
+    )?;
+
+    let prompt = s.title_ai_prompt
+        .replace("{user_msg}", &user_msg)
+        .replace("{ai_msg}", &ai_msg);
+    let messages = vec![crate::models::ChatMessage {
+        role: "user".to_string(),
+        content: prompt,
+    }];
+
+    let result = crate::llm::chat_completion(&provider, &api_key, &model, &messages, "title").await?;
+    Ok(result.trim().to_string())
+}
+
 /// Update the user-controlled reading status: "unread" | "reading" | "read"
 #[tauri::command]
 pub async fn set_reading_status(

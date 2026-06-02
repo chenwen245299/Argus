@@ -38,6 +38,23 @@ const nodeStyle = computed(() => {
 const accentBarStyle = computed(() =>
   props.data.color ? { background: props.data.color } : null
 )
+
+const NOTE_BADGE_STYLES = [
+  { backgroundColor: '#eef6ff', borderColor: '#bfdbfe', color: '#1d4ed8' },
+  { backgroundColor: '#f0fdf4', borderColor: '#bbf7d0', color: '#15803d' },
+  { backgroundColor: '#fff7ed', borderColor: '#fed7aa', color: '#c2410c' },
+  { backgroundColor: '#f5f3ff', borderColor: '#ddd6fe', color: '#6d28d9' },
+  { backgroundColor: '#fdf2f8', borderColor: '#fbcfe8', color: '#be185d' },
+  { backgroundColor: '#ecfeff', borderColor: '#a5f3fc', color: '#0e7490' },
+]
+
+function noteBadgeStyle(title: string, index: number) {
+  let hash = index
+  for (let i = 0; i < title.length; i += 1) {
+    hash = (hash * 31 + title.charCodeAt(i)) >>> 0
+  }
+  return NOTE_BADGE_STYLES[hash % NOTE_BADGE_STYLES.length]
+}
 </script>
 
 <template>
@@ -49,23 +66,38 @@ const accentBarStyle = computed(() =>
     <!-- Color accent bar -->
     <div v-if="accentBarStyle" class="node-color-bar" :style="accentBarStyle" />
 
-    <!-- Source handles: right + bottom (this node as upstream) -->
+    <!-- Source handles: any anchor can be the drag start. -->
+    <Handle id="src-left" type="source" :position="Position.Left" class="node-handle" />
+    <Handle id="src-top" type="source" :position="Position.Top" class="node-handle" />
     <Handle id="src-right" type="source" :position="Position.Right" class="node-handle" />
     <Handle id="src-bottom" type="source" :position="Position.Bottom" class="node-handle" />
-    <!-- Target handles: left + top (this node as downstream) -->
+
+    <!-- Target handles: any anchor can be the drop end. -->
     <Handle id="tgt-left" type="target" :position="Position.Left" class="node-handle" />
     <Handle id="tgt-top" type="target" :position="Position.Top" class="node-handle" />
+    <Handle id="tgt-right" type="target" :position="Position.Right" class="node-handle" />
+    <Handle id="tgt-bottom" type="target" :position="Position.Bottom" class="node-handle" />
 
-    <div v-if="!data.valid" class="node-invalid-badge">已删除</div>
+    <div class="node-content">
+      <div v-if="!data.valid" class="node-invalid-badge">已删除</div>
 
-    <div class="node-title" :title="data.title">{{ data.title || '未知论文' }}</div>
-    <div class="node-meta">
-      <span v-if="authorsShort" class="node-authors">{{ authorsShort }}</span>
-      <span v-if="data.year" class="node-year">{{ data.year }}</span>
-    </div>
-    <div v-if="data.venue" class="node-venue" :title="data.venue">{{ data.venue }}</div>
-    <div v-if="data.noteTitles && data.noteTitles.length > 0" class="node-notes">
-      <span v-for="title in data.noteTitles" :key="title" class="node-note-badge" :title="title">{{ title }}</span>
+      <div class="node-title" :title="data.title">{{ data.title || '未知论文' }}</div>
+      <div class="node-meta">
+        <span v-if="authorsShort" class="node-authors">{{ authorsShort }}</span>
+        <span v-if="data.year" class="node-year">{{ data.year }}</span>
+      </div>
+      <div v-if="data.noteTitles && data.noteTitles.length > 0" class="node-notes">
+        <span
+          v-for="(title, index) in data.noteTitles"
+          :key="title"
+          class="node-note-badge"
+          :title="title"
+          :style="noteBadgeStyle(title, index)"
+        >
+          {{ title }}
+        </span>
+      </div>
+      <div v-if="data.venue" class="node-venue" :title="data.venue">{{ data.venue }}</div>
     </div>
   </div>
 </template>
@@ -77,12 +109,17 @@ const accentBarStyle = computed(() =>
   background: var(--bg-primary, #fff);
   border: 1.5px solid var(--border-default, #d1d5db);
   border-radius: 10px;
-  padding: 10px 12px 10px 16px;
-  overflow: hidden;
+  overflow: visible;
   cursor: default;
   box-shadow: 0 1px 4px rgba(0,0,0,0.08);
   transition: border-color 0.15s, box-shadow 0.15s;
   user-select: none;
+}
+
+.node-content {
+  padding: 10px 12px 10px 16px;
+  overflow: hidden;
+  border-radius: 10px;
 }
 
 .paper-node:hover {
@@ -178,15 +215,15 @@ const accentBarStyle = computed(() =>
 .node-note-badge {
   display: inline-block;
   max-width: 160px;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: var(--bg-hover, #f3f4f6);
-  border: 1px solid var(--border-default, #e5e7eb);
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid transparent;
   font-size: 10px;
-  color: var(--text-secondary, #6b7280);
+  font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
 
 /* Vue Flow handle overrides */

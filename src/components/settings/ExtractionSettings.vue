@@ -112,8 +112,11 @@ const abstractPromptDraft = ref('')
 const abstractPromptSaved = ref(false)
 const translatePromptDraft = ref('')
 const translatePromptSaved = ref(false)
+const titlePromptDraft = ref('')
+const titlePromptSaved = ref(false)
 
 const DEFAULT_TRANSLATE_AI_PROMPT = '请将以下英文文本翻译成中文，保持学术风格，直接输出翻译结果，不需要任何额外说明：\n\n{text}'
+const DEFAULT_TITLE_AI_PROMPT = '请根据以下对话内容生成一个简洁的标题（不超过20字，直接输出标题文字，不要引号和多余说明）：\n\n用户：{user_msg}\n\nAI：{ai_msg}'
 
 function normalizeMetadataPrompt(prompt?: string) {
   const trimmed = prompt?.trim()
@@ -262,6 +265,39 @@ const selectedTranslateProvider = computed(() =>
 )
 const availableTranslateModels = computed(() => selectedTranslateProvider.value?.models ?? [])
 
+async function setTitleProvider(providerId: string) {
+  const id = providerId || undefined
+  await settingsStore.save({ title_ai_provider_id: id, title_ai_model_id: undefined })
+}
+
+async function setTitleModel(modelId: string) {
+  await settingsStore.save({ title_ai_model_id: modelId || undefined })
+}
+
+async function setTitlePrompt(prompt: string) {
+  const val = prompt.trim() || DEFAULT_TITLE_AI_PROMPT
+  await settingsStore.save({ title_ai_prompt: val })
+  titlePromptDraft.value = val
+  titlePromptSaved.value = true
+  setTimeout(() => { titlePromptSaved.value = false }, 1800)
+}
+
+async function resetTitlePrompt() {
+  await settingsStore.save({ title_ai_prompt: DEFAULT_TITLE_AI_PROMPT })
+  titlePromptDraft.value = DEFAULT_TITLE_AI_PROMPT
+  titlePromptSaved.value = true
+  setTimeout(() => { titlePromptSaved.value = false }, 1800)
+}
+
+const selectedTitleProvider = computed(() =>
+  aiStore.settings.providers.find(p => p.id === settingsStore.settings.title_ai_provider_id)
+)
+const availableTitleModels = computed(() => selectedTitleProvider.value?.models ?? [])
+
+const titlePromptValue = computed(() =>
+  (settingsStore.settings.title_ai_prompt?.trim() || DEFAULT_TITLE_AI_PROMPT)
+)
+
 const metadataPromptValue = computed(() =>
   normalizeMetadataPrompt(settingsStore.settings.metadata_ai_prompt)
 )
@@ -320,6 +356,21 @@ let metaPromptTimer: ReturnType<typeof setTimeout> | null = null
 let summaryPromptTimer: ReturnType<typeof setTimeout> | null = null
 let abstractPromptTimer: ReturnType<typeof setTimeout> | null = null
 let translatePromptTimer: ReturnType<typeof setTimeout> | null = null
+let titlePromptTimer: ReturnType<typeof setTimeout> | null = null
+
+watch(
+  titlePromptValue,
+  (value) => {
+    if (titlePromptDraft.value !== value) titlePromptDraft.value = value
+  },
+  { immediate: true }
+)
+
+watch(titlePromptDraft, (val) => {
+  if (val === titlePromptValue.value) return
+  if (titlePromptTimer) clearTimeout(titlePromptTimer)
+  titlePromptTimer = setTimeout(() => setTitlePrompt(val), 800)
+})
 
 watch(metadataPromptDraft, (val) => {
   if (val === metadataPromptValue.value) return
@@ -412,6 +463,69 @@ watch(translatePromptDraft, (val) => {
         v-model="translatePromptDraft"
         spellcheck="false"
         @blur="setTranslatePrompt(translatePromptDraft)"
+      />
+    </div>
+
+    <!-- Chat title generation -->
+    <div class="setting-group">
+      <div class="setting-label">{{ t('settings.titleAiSection') }}</div>
+      <div class="setting-hint" style="margin-bottom: 10px">{{ t('settings.titleAiDesc') }}</div>
+
+      <div v-if="aiStore.settings.providers.length === 0" class="no-providers">
+        {{ t('settings.metaAiNoProviders') }}
+      </div>
+      <template v-else>
+        <div class="field-row">
+          <label class="field-label">{{ t('settings.metaAiProvider') }}</label>
+          <select
+            class="field-select"
+            :value="settingsStore.settings.title_ai_provider_id ?? ''"
+            @change="setTitleProvider(($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">{{ t('settings.metaAiDefault') }}</option>
+            <option
+              v-for="p in aiStore.settings.providers.filter(p => p.enabled)"
+              :key="p.id"
+              :value="p.id"
+            >{{ p.name }}</option>
+          </select>
+        </div>
+
+        <div v-if="selectedTitleProvider && availableTitleModels.length > 0" class="field-row">
+          <label class="field-label">{{ t('settings.metaAiModel') }}</label>
+          <select
+            class="field-select"
+            :value="settingsStore.settings.title_ai_model_id ?? ''"
+            @change="setTitleModel(($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">{{ t('settings.metaAiDefault') }}</option>
+            <option
+              v-for="m in availableTitleModels"
+              :key="m.id"
+              :value="m.id"
+            >{{ m.display_name || m.id }}</option>
+          </select>
+        </div>
+      </template>
+
+      <div class="prompt-head">
+        <div>
+          <label class="field-label prompt-label">{{ t('settings.titlePrompt') }}</label>
+          <div class="setting-hint">{{ t('settings.titlePromptHint') }}</div>
+        </div>
+        <div class="prompt-actions">
+          <span v-if="titlePromptSaved" class="saved-pill">{{ t('settings.saved') }}</span>
+          <button class="text-btn" @click="resetTitlePrompt">{{ t('settings.titlePromptReset') }}</button>
+          <button class="prompt-save-btn" @click="setTitlePrompt(titlePromptDraft)">
+            {{ t('settings.save') }}
+          </button>
+        </div>
+      </div>
+      <textarea
+        class="prompt-textarea"
+        v-model="titlePromptDraft"
+        spellcheck="false"
+        @blur="setTitlePrompt(titlePromptDraft)"
       />
     </div>
 

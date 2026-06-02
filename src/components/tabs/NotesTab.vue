@@ -104,6 +104,7 @@ async function deleteNote(note: Note, e: MouseEvent) {
   try {
     await invoke('delete_note', { slug: props.slug, noteId: note.id })
     notes.value = notes.value.filter(n => n.id !== note.id)
+    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: props.slug } }))
     if (activeNote.value?.id === note.id) {
       activeNote.value = null
       view.value = 'list'
@@ -122,6 +123,7 @@ async function commitTitle() {
   activeNote.value.title = trimmed
   try {
     await invoke('rename_note', { slug: props.slug, noteId: activeNote.value.id, title: trimmed })
+    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: props.slug } }))
   } catch (e) {
     console.error('Failed to rename note:', e)
   }
@@ -446,7 +448,7 @@ function fmtDate(iso: string) {
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-secondary);
   flex-shrink: 0;
-  height: 28px;
+  height: 40px;
 }
 
 .back-btn {

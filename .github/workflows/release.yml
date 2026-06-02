@@ -139,80 +139,8 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     needs: [create-release, build-tauri]
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ needs.create-release.outputs.tag_name }}
-      RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
     steps:
-      - name: Generate latest.json
-        env:
-          RELEASE_BODY: ${{ needs.create-release.outputs.release_body }}
-        run: |
-          python3 << 'PYEOF'
-          import json, os, subprocess, urllib.request, datetime
-
-          tag        = os.environ['TAG']
-          version    = tag.lstrip('v')
-          token      = os.environ['GH_TOKEN']
-          notes      = os.environ.get('RELEASE_BODY', '')
-          release_id = os.environ['RELEASE_ID']
-          repo       = os.environ['GITHUB_REPOSITORY']
-
-          # Fetch all release assets via GitHub REST API (works for draft releases too)
-          req = urllib.request.Request(
-              f'https://api.github.com/repos/{repo}/releases/{release_id}/assets',
-              headers={'Authorization': f'token {token}', 'Accept': 'application/vnd.github+json'}
-          )
-          with urllib.request.urlopen(req) as r:
-              assets = json.loads(r.read())
-
-          # Download every .sig file
-          sigs = {}
-          for a in assets:
-              if not a['name'].endswith('.sig'):
-                  continue
-              base = a['name'][:-4]
-              req = urllib.request.Request(
-                  a['browser_download_url'],
-                  headers={'Authorization': f'token {token}', 'Accept': 'application/octet-stream'}
-              )
-              with urllib.request.urlopen(req) as r:
-                  sigs[base] = r.read().decode().strip()
-
-          if not sigs:
-              print('::warning::No .sig files found — TAURI_SIGNING_PRIVATE_KEY may not be set in GitHub Secrets.')
-
-          # Match bundles to signatures
-          platforms = {}
-          for a in assets:
-              name = a['name']
-              url  = a['browser_download_url']
-              if name not in sigs:
-                  continue
-              sig = sigs[name]
-              if name.endswith('.app.tar.gz'):
-                  key = 'darwin-aarch64' if 'aarch64' in name else 'darwin-x86_64'
-                  platforms[key] = {'signature': sig, 'url': url}
-              elif name.endswith('.nsis.zip'):
-                  platforms['windows-x86_64'] = {'signature': sig, 'url': url}
-              elif name.endswith('.msi.zip'):
-                  platforms.setdefault('windows-x86_64', {'signature': sig, 'url': url})
-
-          manifest = {
-              'version': version,
-              'notes':   notes,
-              'pub_date': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-              'platforms': platforms,
-          }
-          with open('latest.json', 'w') as f:
-              json.dump(manifest, f, indent=2, ensure_ascii=False)
-
-          print(json.dumps(manifest, indent=2, ensure_ascii=False))
-          PYEOF
-
-          gh release upload "$TAG" latest.json --clobber
-
-      - name: Publish release
+      - name: publish release
         uses: actions/github-script@v7
         with:
           script: |

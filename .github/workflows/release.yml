@@ -142,6 +142,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.create-release.outputs.tag_name }}
+      RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
     steps:
       - name: Generate latest.json
         env:
@@ -150,17 +151,20 @@ jobs:
           python3 << 'PYEOF'
           import json, os, subprocess, urllib.request, datetime
 
-          tag     = os.environ['TAG']
-          version = tag.lstrip('v')
-          token   = os.environ['GH_TOKEN']
-          notes   = os.environ.get('RELEASE_BODY', '')
+          tag        = os.environ['TAG']
+          version    = tag.lstrip('v')
+          token      = os.environ['GH_TOKEN']
+          notes      = os.environ.get('RELEASE_BODY', '')
+          release_id = os.environ['RELEASE_ID']
+          repo       = os.environ['GITHUB_REPOSITORY']
 
-          # Fetch all release assets via gh CLI
-          result = subprocess.run(
-              ['gh', 'release', 'view', tag, '--json', 'assets'],
-              capture_output=True, text=True, check=True
+          # Fetch all release assets via GitHub REST API (works for draft releases too)
+          req = urllib.request.Request(
+              f'https://api.github.com/repos/{repo}/releases/{release_id}/assets',
+              headers={'Authorization': f'token {token}', 'Accept': 'application/vnd.github+json'}
           )
-          assets = json.loads(result.stdout)['assets']
+          with urllib.request.urlopen(req) as r:
+              assets = json.loads(r.read())
 
           # Download every .sig file
           sigs = {}

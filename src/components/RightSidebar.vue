@@ -9,6 +9,7 @@ import MetadataTab from './tabs/MetadataTab.vue'
 import NotesTab from './tabs/NotesTab.vue'
 import HighlightsTab from './tabs/HighlightsTab.vue'
 import AnalysisTab from './tabs/AnalysisTab.vue'
+import TranslationHistoryTab from './tabs/TranslationHistoryTab.vue'
 import type { PaperMeta } from '../types'
 
 const props = defineProps<{ activeTab: string }>()
@@ -78,14 +79,19 @@ async function onSlugChanged(newSlug: string) {
 
 <template>
   <div class="right-sidebar">
-    <!-- No paper selected -->
-    <div v-if="!activePaperSlug" class="no-selection">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-      </svg>
-      <p>{{ t('sidebar.selectPaper') }}</p>
-    </div>
+    <!-- Translation history: always available regardless of paper selection -->
+    <TranslationHistoryTab v-if="paperTab === 'translations'" />
+
+    <template v-else-if="!activePaperSlug">
+      <!-- No paper selected -->
+      <div class="no-selection">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+        </svg>
+        <p>{{ t('sidebar.selectPaper') }}</p>
+      </div>
+    </template>
 
     <!-- Paper selected -->
     <template v-else>

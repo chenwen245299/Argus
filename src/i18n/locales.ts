@@ -61,6 +61,7 @@ export const zh = {
     highlights: '批注',
     ai: 'AI',
     metadata: '信息',
+    translations: '翻译',
   },
   // Notes tab
   notes: {
@@ -789,6 +790,7 @@ export const en: typeof zh = {
     highlights: 'Annot.',
     ai: 'AI',
     metadata: 'Info',
+    translations: 'Trans.',
   },
   notes: {
     selectHint: 'Select a paper to view notes',

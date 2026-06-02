@@ -2,6 +2,8 @@
 import { ref, shallowRef, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { startTranslation, appendTranslationChunk, finishTranslation, failTranslation } from '../stores/translationHistory'
 import * as pdfjsLib from 'pdfjs-dist'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { useReaderStore } from '../stores/reader'
@@ -112,37 +114,46 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onKeyDown)
   observer?.disconnect()
   if (progressDebounce) clearTimeout(progressDebounce)
+  _translateUnlisten?.()
   pdfDoc.value?.destroy()
 })
 
 // ── Inline translation ────────────────────────────────────────────────────────
-interface TranslatePopup {
-  x: number
-  y: number
-  sourceText: string
-  loading: boolean
-  result: string
-  error: string
+let _translateUnlisten: UnlistenFn | null = null
+
+async function startStreamTranslate(text: string) {
+  _translateUnlisten?.()
+  _translateUnlisten = null
+
+  const eventId = crypto.randomUUID()
+  startTranslation(text)
+
+  try {
+    _translateUnlisten = await listen<{ delta: string; done: boolean }>(
+      `translate-stream-${eventId}`,
+      ({ payload }) => {
+        if (payload.done) {
+          finishTranslation()
+          _translateUnlisten?.()
+          _translateUnlisten = null
+          return
+        }
+        appendTranslationChunk(payload.delta)
+      },
+    )
+    await invoke('translate_text_stream', { text, eventId })
+  } catch (e) {
+    failTranslation(String(e))
+    _translateUnlisten?.()
+    _translateUnlisten = null
+  }
 }
-const translatePopup = ref<TranslatePopup | null>(null)
 
 async function translateSelection() {
   if (!selectionPopup.value) return
-  const { x, y, text } = selectionPopup.value
+  const { text } = selectionPopup.value
   selectionPopup.value = null
-  translatePopup.value = { x, y, sourceText: text, loading: true, result: '', error: '' }
-  try {
-    const result = await invoke<string>('translate_text', { text })
-    if (translatePopup.value) {
-      translatePopup.value.loading = false
-      translatePopup.value.result = result
-    }
-  } catch (e) {
-    if (translatePopup.value) {
-      translatePopup.value.loading = false
-      translatePopup.value.error = String(e)
-    }
-  }
+  await startStreamTranslate(text)
 }
 
 // ── fulltext extraction (pdfjs text → OCR fallback) ──────────────────────────
@@ -837,7 +848,7 @@ function onKeyDown(e: KeyboardEvent) {
   }
   if (e.key === 'Escape') {
     if (searchOpen.value) { closeSearch(); return }
-    hlNotePopup.value = null; hlColorPopup.value = null; selectionPopup.value = null; translatePopup.value = null
+    hlNotePopup.value = null; hlColorPopup.value = null; selectionPopup.value = null
   }
 }
 
@@ -851,9 +862,8 @@ function onWheel(e: WheelEvent) {
 // ── Text selection → highlight creation ──────────────────────────────────────
 function onWindowMouseUp(e: MouseEvent) {
   // Dismiss popups on outside click
-  if ((e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup, .translate-popup')) return
+  if ((e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup')) return
   hlNotePopup.value = null
-  translatePopup.value = null
   // Right-click releases the contextmenu that just opened hlColorPopup — don't dismiss it
   if (e.button !== 2) hlColorPopup.value = null
 
@@ -919,16 +929,9 @@ function createHighlight(color?: string) {
 // ── Highlight popup actions ───────────────────────────────────────────────────
 async function translateHighlight(hlId: string) {
   const hl = reader.highlights.find(h => h.id === hlId)
-  if (!hl || !hlColorPopup.value) return
-  const { x, y } = hlColorPopup.value
+  if (!hl) return
   hlColorPopup.value = null
-  translatePopup.value = { x, y: y + 4, sourceText: hl.text, loading: true, result: '', error: '' }
-  try {
-    const result = await invoke<string>('translate_text', { text: hl.text })
-    if (translatePopup.value) { translatePopup.value.loading = false; translatePopup.value.result = result }
-  } catch (e) {
-    if (translatePopup.value) { translatePopup.value.loading = false; translatePopup.value.error = String(e) }
-  }
+  await startStreamTranslate(hl.text)
 }
 
 function deleteHighlight(id: string) {
@@ -1082,8 +1085,8 @@ function hexToRgba(hex: string, alpha: number): string {
         />
       </div>
       <div class="sel-sep" />
-      <button class="sel-translate-btn" :title="t('pdf.translate')" @click="translateSelection">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <button class="sel-translate-btn" @click="translateSelection">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M5 8l6 6"/>
           <path d="M4 14l6-6 2-3"/>
           <path d="M2 5h12"/>
@@ -1091,32 +1094,8 @@ function hexToRgba(hex: string, alpha: number): string {
           <path d="M22 22l-5-10-5 10"/>
           <path d="M14 18h6"/>
         </svg>
+        <span class="sel-translate-label">{{ t('pdf.translate') }}</span>
       </button>
-    </div>
-
-    <!-- Translation result popup -->
-    <div
-      v-if="translatePopup"
-      class="translate-popup"
-      :style="{ left: `${translatePopup.x}px`, top: `${translatePopup.y}px` }"
-      @click.stop
-    >
-      <div class="translate-popup-header">
-        <span class="translate-popup-label">{{ t('pdf.translation') }}</span>
-        <button class="translate-close-btn" @click="translatePopup = null">
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-        </button>
-      </div>
-      <div v-if="translatePopup.loading" class="translate-loading">
-        <svg class="translate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-        </svg>
-        <span>{{ t('pdf.translating') }}</span>
-      </div>
-      <div v-else-if="translatePopup.error" class="translate-error">{{ translatePopup.error }}</div>
-      <div v-else class="translate-result">{{ translatePopup.result }}</div>
     </div>
 
     <!-- Highlight note popup: left-click → view; double-click → edit; blur → auto-save -->
@@ -1471,8 +1450,8 @@ function hexToRgba(hex: string, alpha: number): string {
 .sel-translate-btn {
   display: flex;
   align-items: center;
-  justify-content: center;
-  width: 26px;
+  gap: 4px;
+  padding: 0 8px;
   height: 26px;
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
@@ -1480,71 +1459,10 @@ function hexToRgba(hex: string, alpha: number): string {
   flex-shrink: 0;
 }
 .sel-translate-btn:hover { background: var(--bg-hover); color: var(--accent); }
-
-/* ── Translation result popup ── */
-.translate-popup {
-  position: fixed;
-  z-index: 1002;
-  background: var(--bg-primary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-md);
-  width: 320px;
-  max-width: calc(100vw - 20px);
-}
-.translate-popup-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 10px 6px;
-  border-bottom: 1px solid var(--border-subtle);
-}
-.translate-popup-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-tertiary);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.translate-close-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 3px;
-  color: var(--text-tertiary);
-  transition: background 0.1s;
-}
-.translate-close-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
-.translate-loading {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 12px;
+.sel-translate-label {
   font-size: 12px;
-  color: var(--text-secondary);
-}
-.translate-spin {
-  animation: ocr-rotate 0.9s linear infinite;
-  color: var(--accent);
-  flex-shrink: 0;
-}
-.translate-result {
-  padding: 10px 12px;
-  font-size: 13px;
-  line-height: 1.65;
-  color: var(--text-primary);
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 260px;
-  overflow-y: auto;
-}
-.translate-error {
-  padding: 10px 12px;
-  font-size: 12px;
-  color: #cc3333;
-  word-break: break-word;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 /* ── Highlight popups ── */

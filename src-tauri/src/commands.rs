@@ -358,6 +358,41 @@ pub async fn translate_text(
     .map_err(|e| e.to_string())?
 }
 
+/// Streaming variant: emits `translate-stream-{event_id}` events with `{delta, done}`.
+#[tauri::command]
+pub async fn translate_text_stream(
+    text: String,
+    event_id: String,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    let s = settings::read_settings(&root);
+
+    let (provider, api_key, model) = ai_manager::resolve_provider_model(
+        &root,
+        s.translate_ai_provider_id.as_deref(),
+        s.translate_ai_model_id.as_deref(),
+    )?;
+
+    let prompt = s.translate_ai_prompt.replace("{text}", &text);
+    let messages = vec![crate::models::ChatMessage {
+        role: "user".to_string(),
+        content: prompt,
+    }];
+    let event_name = format!("translate-stream-{}", event_id);
+
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::llm::chat_completion_stream(
+            &provider, &api_key, &model, &messages,
+            &event_name, &app, false, None, "translate",
+        )
+        .await;
+    });
+
+    Ok(())
+}
+
 /// Update the user-controlled reading status: "unread" | "reading" | "read"
 #[tauri::command]
 pub async fn set_reading_status(

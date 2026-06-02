@@ -506,7 +506,7 @@ function fmtDate(iso: string) {
   min-height: 100%;
   padding: 14px 16px;
   color: var(--text-primary);
-  font-size: 18px;
+  font-size: 16px;
   line-height: 1.7;
   font-family: var(--font-sans);
 }
@@ -521,7 +521,7 @@ function fmtDate(iso: string) {
   padding: 14px 16px;
   min-height: 100%;
   color: var(--text-primary);
-  font-size: 18px;
+  font-size: 16px;
   line-height: 1.7;
 }
 

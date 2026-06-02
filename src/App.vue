@@ -71,7 +71,8 @@ select,
 .argus-md-editor,
 .argus-md-editor *,
 .textLayer,
-.textLayer * {
+.textLayer *,
+.selectable-text {
   user-select: text;
   -webkit-user-select: text;
 }

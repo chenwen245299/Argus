@@ -93,6 +93,7 @@ pub fn run() {
             commands::save_pdfjs_fulltext,
             commands::ocr_page_base64,
             commands::translate_text,
+            commands::translate_text_stream,
             commands::set_reading_status,
             commands::delete_paper,
             commands::copy_paper_pdf,

@@ -13,6 +13,7 @@ import { useAiStore } from '../stores/ai'
 import { useCliStore } from '../stores/cli'
 import { useSelectionStore } from '../stores/selection'
 import { useCanvasStore } from '../stores/canvas'
+import { switchToTranslationsTab } from '../stores/translationHistory'
 import Toolbar from '../components/Toolbar.vue'
 import LeftSidebar from '../components/LeftSidebar.vue'
 import PaperList from '../components/PaperList.vue'
@@ -72,7 +73,7 @@ const PAPER_TABS = ['notes', 'highlights', 'ai', 'metadata']
 const MIN_LEFT_WIDTH = 140
 const MAX_LEFT_WIDTH = 360
 const DEFAULT_LEFT_WIDTH = 200
-const MIN_RIGHT_WIDTH = 300
+const MIN_RIGHT_WIDTH = 350
 const MAX_RIGHT_WIDTH = 560
 const DEFAULT_RIGHT_WIDTH = MIN_RIGHT_WIDTH
 
@@ -329,6 +330,13 @@ watch(sidebarTab, (tab) => {
   try {
     localStorage.setItem(MAIN_RIGHT_TAB_KEY, tab)
   } catch {}
+})
+
+watch(switchToTranslationsTab, (val) => {
+  if (!val) return
+  switchToTranslationsTab.value = false
+  sidebarTab.value = 'translations'
+  if (!rightSidebarVisible.value) rightSidebarVisible.value = true
 })
 
 // Auto-save tabs whenever they change (length, order, or active)

@@ -315,6 +315,49 @@ pub async fn save_pdfjs_fulltext(
     paper::write_status(&root, &slug, &status)
 }
 
+/// OCR a single page image (base64-encoded JPEG).
+/// Uses macOS Vision framework if available, otherwise falls back to the `tesseract` CLI.
+/// Returns the recognized text, or an error string (e.g. "tesseract not installed").
+#[tauri::command]
+pub async fn ocr_page_base64(page_base64: String) -> Result<String, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&page_base64)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || crate::ocr::ocr_jpeg_bytes(&bytes))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Translate a text snippet using the configured AI provider and translate prompt.
+/// Replaces `{text}` in the prompt template with the supplied text.
+#[tauri::command]
+pub async fn translate_text(
+    text: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<String, String> {
+    let root = get_root(&state)?;
+    let s = settings::read_settings(&root);
+
+    let (provider, api_key, model) = ai_manager::resolve_provider_model(
+        &root,
+        s.translate_ai_provider_id.as_deref(),
+        s.translate_ai_model_id.as_deref(),
+    )?;
+
+    let prompt = s.translate_ai_prompt.replace("{text}", &text);
+    let messages = vec![crate::models::ChatMessage {
+        role: "user".to_string(),
+        content: prompt,
+    }];
+
+    tauri::async_runtime::spawn(async move {
+        crate::llm::chat_completion(&provider, &api_key, &model, &messages, "translate").await
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Update the user-controlled reading status: "unread" | "reading" | "read"
 #[tauri::command]
 pub async fn set_reading_status(

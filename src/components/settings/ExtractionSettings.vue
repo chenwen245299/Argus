@@ -110,6 +110,10 @@ const summaryPromptDraft = ref('')
 const summaryPromptSaved = ref(false)
 const abstractPromptDraft = ref('')
 const abstractPromptSaved = ref(false)
+const translatePromptDraft = ref('')
+const translatePromptSaved = ref(false)
+
+const DEFAULT_TRANSLATE_AI_PROMPT = '请将以下英文文本翻译成中文，保持学术风格，直接输出翻译结果，不需要任何额外说明：\n\n{text}'
 
 function normalizeMetadataPrompt(prompt?: string) {
   const trimmed = prompt?.trim()
@@ -229,6 +233,35 @@ const selectedAbstractProvider = computed(() =>
 
 const availableAbstractModels = computed(() => selectedAbstractProvider.value?.models ?? [])
 
+async function setTranslateProvider(providerId: string) {
+  const id = providerId || undefined
+  await settingsStore.save({ translate_ai_provider_id: id, translate_ai_model_id: undefined })
+}
+
+async function setTranslateModel(modelId: string) {
+  await settingsStore.save({ translate_ai_model_id: modelId || undefined })
+}
+
+async function setTranslatePrompt(prompt: string) {
+  const val = prompt.trim() || DEFAULT_TRANSLATE_AI_PROMPT
+  await settingsStore.save({ translate_ai_prompt: val })
+  translatePromptDraft.value = val
+  translatePromptSaved.value = true
+  setTimeout(() => { translatePromptSaved.value = false }, 1800)
+}
+
+async function resetTranslatePrompt() {
+  await settingsStore.save({ translate_ai_prompt: DEFAULT_TRANSLATE_AI_PROMPT })
+  translatePromptDraft.value = DEFAULT_TRANSLATE_AI_PROMPT
+  translatePromptSaved.value = true
+  setTimeout(() => { translatePromptSaved.value = false }, 1800)
+}
+
+const selectedTranslateProvider = computed(() =>
+  aiStore.settings.providers.find(p => p.id === settingsStore.settings.translate_ai_provider_id)
+)
+const availableTranslateModels = computed(() => selectedTranslateProvider.value?.models ?? [])
+
 const metadataPromptValue = computed(() =>
   normalizeMetadataPrompt(settingsStore.settings.metadata_ai_prompt)
 )
@@ -271,9 +304,22 @@ watch(
   { immediate: true }
 )
 
+const translatePromptValue = computed(() =>
+  (settingsStore.settings.translate_ai_prompt?.trim() || DEFAULT_TRANSLATE_AI_PROMPT)
+)
+
+watch(
+  translatePromptValue,
+  (value) => {
+    if (translatePromptDraft.value !== value) translatePromptDraft.value = value
+  },
+  { immediate: true }
+)
+
 let metaPromptTimer: ReturnType<typeof setTimeout> | null = null
 let summaryPromptTimer: ReturnType<typeof setTimeout> | null = null
 let abstractPromptTimer: ReturnType<typeof setTimeout> | null = null
+let translatePromptTimer: ReturnType<typeof setTimeout> | null = null
 
 watch(metadataPromptDraft, (val) => {
   if (val === metadataPromptValue.value) return
@@ -293,12 +339,81 @@ watch(abstractPromptDraft, (val) => {
   abstractPromptTimer = setTimeout(() => setAbstractPrompt(val), 800)
 })
 
+watch(translatePromptDraft, (val) => {
+  if (val === translatePromptValue.value) return
+  if (translatePromptTimer) clearTimeout(translatePromptTimer)
+  translatePromptTimer = setTimeout(() => setTranslatePrompt(val), 800)
+})
+
 </script>
 
 <template>
   <div class="settings-panel">
     <h2>{{ t('settings.extraction') }}</h2>
     <p class="desc">{{ t('settings.extractionDesc') }}</p>
+
+    <!-- Translate model and prompt -->
+    <div class="setting-group">
+      <div class="setting-label">{{ t('settings.translateAiSection') }}</div>
+      <div class="setting-hint" style="margin-bottom: 10px">{{ t('settings.translateAiDesc') }}</div>
+
+      <div v-if="aiStore.settings.providers.length === 0" class="no-providers">
+        {{ t('settings.metaAiNoProviders') }}
+      </div>
+      <template v-else>
+        <div class="field-row">
+          <label class="field-label">{{ t('settings.metaAiProvider') }}</label>
+          <select
+            class="field-select"
+            :value="settingsStore.settings.translate_ai_provider_id ?? ''"
+            @change="setTranslateProvider(($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">{{ t('settings.metaAiDefault') }}</option>
+            <option
+              v-for="p in aiStore.settings.providers.filter(p => p.enabled)"
+              :key="p.id"
+              :value="p.id"
+            >{{ p.name }}</option>
+          </select>
+        </div>
+
+        <div v-if="selectedTranslateProvider && availableTranslateModels.length > 0" class="field-row">
+          <label class="field-label">{{ t('settings.metaAiModel') }}</label>
+          <select
+            class="field-select"
+            :value="settingsStore.settings.translate_ai_model_id ?? ''"
+            @change="setTranslateModel(($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">{{ t('settings.metaAiDefault') }}</option>
+            <option
+              v-for="m in availableTranslateModels"
+              :key="m.id"
+              :value="m.id"
+            >{{ m.display_name || m.id }}</option>
+          </select>
+        </div>
+      </template>
+
+      <div class="prompt-head">
+        <div>
+          <label class="field-label prompt-label">{{ t('settings.translatePrompt') }}</label>
+          <div class="setting-hint">{{ t('settings.translatePromptHint') }}</div>
+        </div>
+        <div class="prompt-actions">
+          <span v-if="translatePromptSaved" class="saved-pill">{{ t('settings.saved') }}</span>
+          <button class="text-btn" @click="resetTranslatePrompt">{{ t('settings.translatePromptReset') }}</button>
+          <button class="prompt-save-btn" @click="setTranslatePrompt(translatePromptDraft)">
+            {{ t('settings.save') }}
+          </button>
+        </div>
+      </div>
+      <textarea
+        class="prompt-textarea translate-prompt"
+        v-model="translatePromptDraft"
+        spellcheck="false"
+        @blur="setTranslatePrompt(translatePromptDraft)"
+      />
+    </div>
 
     <!-- Metadata AI model -->
     <div class="setting-group">
@@ -599,6 +714,9 @@ h2 { font-size: 18px; font-weight: 600; margin-bottom: 8px; color: var(--text-pr
 }
 .abstract-prompt {
   min-height: 160px;
+}
+.translate-prompt {
+  min-height: 100px;
 }
 .prompt-textarea:focus {
   border-color: var(--accent);

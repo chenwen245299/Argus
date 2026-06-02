@@ -672,11 +672,14 @@ watch(
   min-width: 301px;
   overflow: hidden;
   will-change: width, min-width, opacity;
+  align-self: stretch;
+  height: 100%;
 }
 
 .right-sidebar-panel {
   flex: 1;
   min-width: 0;
+  height: 100%;
 }
 
 .right-panel-enter-active,
@@ -716,7 +719,7 @@ watch(
   left: 50%;
   width: 1px;
   transform: translateX(-50%);
-  background: var(--border-subtle);
+  background: var(--border-default);
   transition: width 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
 }
 .divider:hover::before,

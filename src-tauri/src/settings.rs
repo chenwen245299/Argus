@@ -18,6 +18,10 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
         settings.abstract_ai_prompt = crate::models::default_abstract_ai_prompt();
     }
 
+    if settings.translate_ai_prompt.trim().is_empty() {
+        settings.translate_ai_prompt = crate::models::default_translate_ai_prompt();
+    }
+
     settings
 }
 

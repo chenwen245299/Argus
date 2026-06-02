@@ -378,7 +378,7 @@ function fmtDate(iso: string) {
 .note-item:hover .note-pin-btn:not(.pinned) { opacity: 1; }
 
 .note-item-title {
-  font-size: var(--font-size-sm);
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-primary);
   overflow: hidden;
@@ -462,7 +462,7 @@ function fmtDate(iso: string) {
 
 .editor-title {
   flex: 1;
-  font-size: var(--font-size-sm);
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-primary);
   overflow: hidden;
@@ -475,7 +475,7 @@ function fmtDate(iso: string) {
 
 .title-input {
   flex: 1;
-  font-size: var(--font-size-sm);
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-primary);
   background: var(--bg-secondary);
@@ -504,7 +504,7 @@ function fmtDate(iso: string) {
   min-height: 100%;
   padding: 14px 16px;
   color: var(--text-primary);
-  font-size: var(--font-size-sm);
+  font-size: 18px;
   line-height: 1.7;
   font-family: var(--font-sans);
 }
@@ -519,7 +519,7 @@ function fmtDate(iso: string) {
   padding: 14px 16px;
   min-height: 100%;
   color: var(--text-primary);
-  font-size: var(--font-size-sm);
+  font-size: 18px;
   line-height: 1.7;
 }
 

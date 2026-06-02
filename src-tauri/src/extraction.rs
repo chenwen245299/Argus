@@ -69,7 +69,7 @@ pub enum ExtractionResult {
 }
 
 /// Extract digital PDF text.
-/// Tries lopdf first; falls back to pdftotext if lopdf yields insufficient text.
+/// Stage 1: lopdf  →  Stage 2: pdftotext  →  Stage 3: OCR (pdftoppm + tesseract).
 /// Writes `fulltext.txt` and updates `.status.json` on success.
 pub fn extract_and_write(root: &str, slug: &str, _settings: &AppSettings) -> ExtractionResult {
     let pdf_path = crate::metadata::find_pdf_in_dir(root, slug);
@@ -78,12 +78,24 @@ pub fn extract_and_write(root: &str, slug: &str, _settings: &AppSettings) -> Ext
         return ExtractionResult::Failed("PDF file not found".to_string());
     }
 
-    // Stage 1: lopdf
-    let (lopdf_text, page_count) = match extract_all_pages(&pdf_path) {
-        Ok(r) => r,
-        Err(e) => return ExtractionResult::Failed(e),
-    };
+    // Early exit: fulltext.txt already has sufficient content (e.g. saved by pdfjs or a prior OCR).
+    let fulltext_path = crate::paper::paper_dir(root, slug).join("fulltext.txt");
+    if fulltext_path.exists() {
+        if let Ok(existing) = std::fs::read_to_string(&fulltext_path) {
+            if existing.chars().filter(|c| !c.is_whitespace()).count() > 200 {
+                let mut status = crate::paper::read_status_for(root, slug);
+                if !status.text_extracted {
+                    status.text_extracted = true;
+                    status.last_updated = chrono::Utc::now().to_rfc3339();
+                    let _ = crate::paper::write_status(root, slug, &status);
+                }
+                return ExtractionResult::Text;
+            }
+        }
+    }
 
+    // Stage 1: lopdf (treat load failure as empty text — later stages may still succeed)
+    let (lopdf_text, page_count) = extract_all_pages(&pdf_path).unwrap_or_default();
     if is_sufficient(&lopdf_text, page_count) {
         if let Err(e) = write_fulltext_and_status(root, slug, &lopdf_text) {
             return ExtractionResult::Failed(e);
@@ -99,6 +111,15 @@ pub fn extract_and_write(root: &str, slug: &str, _settings: &AppSettings) -> Ext
             }
             return ExtractionResult::Text;
         }
+    }
+
+    // Stage 3: OCR fallback via pdftoppm + tesseract (or macOS Vision).
+    // Requires `brew install tesseract` (+ `poppler` for pdftoppm).
+    if let Some(text) = crate::ocr::ocr_pdf_file(&pdf_path) {
+        if let Err(e) = write_fulltext_and_status(root, slug, &text) {
+            return ExtractionResult::Failed(e);
+        }
+        return ExtractionResult::Text;
     }
 
     let mut status = crate::paper::read_status_for(root, slug);

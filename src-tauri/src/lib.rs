@@ -14,6 +14,7 @@ mod library;
 mod llm;
 mod metadata;
 mod models;
+mod ocr;
 mod paper;
 mod rag;
 mod search;
@@ -37,6 +38,8 @@ pub fn run() {
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
                 .skip_initial_state("paper-ai")
+                .skip_initial_state("arxiv")
+                .skip_initial_state("library-chat")
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -88,6 +91,8 @@ pub fn run() {
             commands::update_reading_state,
             commands::get_paper_status,
             commands::save_pdfjs_fulltext,
+            commands::ocr_page_base64,
+            commands::translate_text,
             commands::set_reading_status,
             commands::delete_paper,
             commands::copy_paper_pdf,

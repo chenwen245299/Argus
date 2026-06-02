@@ -125,6 +125,9 @@ export interface AppSettings {
   abstract_ai_provider_id?: string
   abstract_ai_model_id?: string
   abstract_ai_prompt?: string
+  translate_ai_provider_id?: string
+  translate_ai_model_id?: string
+  translate_ai_prompt?: string
 }
 
 // ── M4: Search ────────────────────────────────────────────────────────────────

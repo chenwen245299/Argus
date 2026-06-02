@@ -678,7 +678,7 @@ onUnmounted(() => {
   min-width: 0;
   height: 100%;
   padding: 0 10px 0 14px;
-  border-right: 1px solid var(--border-subtle);
+  border-right: 1px solid var(--border-default);
   box-sizing: border-box;
 }
 
@@ -1037,7 +1037,7 @@ onUnmounted(() => {
   justify-content: flex-end;
   flex-shrink: 0;
   height: 100%;
-  border-left: 1px solid var(--border-subtle);
+  border-left: 1px solid var(--border-default);
   padding-left: 8px;
   padding-right: 10px;
   box-sizing: border-box;

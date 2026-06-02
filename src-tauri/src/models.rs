@@ -208,6 +208,15 @@ pub struct AppSettings {
     /// User-editable prompt for AI abstract extraction.
     #[serde(default = "default_abstract_ai_prompt")]
     pub abstract_ai_prompt: String,
+    /// AI provider ID to use for inline translation (None = default)
+    #[serde(default)]
+    pub translate_ai_provider_id: Option<String>,
+    /// AI model ID to use for inline translation (None = default)
+    #[serde(default)]
+    pub translate_ai_model_id: Option<String>,
+    /// User-editable prompt for inline text translation.
+    #[serde(default = "default_translate_ai_prompt")]
+    pub translate_ai_prompt: String,
 }
 
 pub fn default_metadata_ai_prompt() -> String {
@@ -325,6 +334,11 @@ pub fn is_legacy_abstract_ai_prompt(prompt: &str) -> bool {
     prompt.trim() == legacy_abstract_ai_prompt_generated().trim()
 }
 
+pub fn default_translate_ai_prompt() -> String {
+    "请将以下英文文本翻译成中文，保持学术风格，直接输出翻译结果，不需要任何额外说明：\n\n{text}"
+        .to_string()
+}
+
 pub fn is_legacy_ai_summary_prompt(prompt: &str) -> bool {
     let prompt = prompt.trim();
     prompt == legacy_ai_summary_prompt_with_metadata().trim()
@@ -346,6 +360,9 @@ impl Default for AppSettings {
             abstract_ai_provider_id: None,
             abstract_ai_model_id: None,
             abstract_ai_prompt: default_abstract_ai_prompt(),
+            translate_ai_provider_id: None,
+            translate_ai_model_id: None,
+            translate_ai_prompt: default_translate_ai_prompt(),
         }
     }
 }

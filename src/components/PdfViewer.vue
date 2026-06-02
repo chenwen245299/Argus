@@ -115,13 +115,46 @@ onUnmounted(() => {
   pdfDoc.value?.destroy()
 })
 
-// ── pdfjs fulltext extraction (fallback when lopdf/pdftotext fail) ───────────
+// ── Inline translation ────────────────────────────────────────────────────────
+interface TranslatePopup {
+  x: number
+  y: number
+  sourceText: string
+  loading: boolean
+  result: string
+  error: string
+}
+const translatePopup = ref<TranslatePopup | null>(null)
+
+async function translateSelection() {
+  if (!selectionPopup.value) return
+  const { x, y, text } = selectionPopup.value
+  selectionPopup.value = null
+  translatePopup.value = { x, y: y + 44, sourceText: text, loading: true, result: '', error: '' }
+  try {
+    const result = await invoke<string>('translate_text', { text })
+    if (translatePopup.value) {
+      translatePopup.value.loading = false
+      translatePopup.value.result = result
+    }
+  } catch (e) {
+    if (translatePopup.value) {
+      translatePopup.value.loading = false
+      translatePopup.value.error = String(e)
+    }
+  }
+}
+
+// ── fulltext extraction (pdfjs text → OCR fallback) ──────────────────────────
+const ocrProgress = ref<{ page: number; total: number } | null>(null)
+
 async function extractFulltextIfNeeded(doc: PDFDocumentProxy, slug: string) {
   try {
     const status = await invoke<{ text_extracted: boolean }>('get_paper_status', { slug })
     if (status.text_extracted) return
   } catch { return }
 
+  // Stage 1: pdfjs embedded text
   try {
     const parts: string[] = []
     for (let i = 1; i <= doc.numPages; i++) {
@@ -135,9 +168,45 @@ async function extractFulltextIfNeeded(doc: PDFDocumentProxy, slug: string) {
     const fullText = parts.join('\n\n')
     if (fullText.trim().length > 200) {
       await invoke('save_pdfjs_fulltext', { slug, text: fullText })
+      return
+    }
+  } catch { return }
+
+  // Stage 2: OCR — render each page to canvas, send JPEG to backend
+  try {
+    const PAGE_SCALE = 2.0
+    const pageTexts: string[] = []
+
+    for (let i = 1; i <= doc.numPages; i++) {
+      ocrProgress.value = { page: i, total: doc.numPages }
+
+      const page = await doc.getPage(i)
+      const viewport = page.getViewport({ scale: PAGE_SCALE })
+      const canvas = document.createElement('canvas')
+      canvas.width = viewport.width
+      canvas.height = viewport.height
+      await page.render({ canvas, viewport }).promise
+      page.cleanup()
+
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.85)
+      const base64 = dataUrl.split(',')[1]
+
+      try {
+        const text = await invoke<string>('ocr_page_base64', { pageBase64: base64 })
+        pageTexts.push(text)
+      } catch {
+        pageTexts.push('')
+      }
+    }
+
+    ocrProgress.value = null
+
+    const combined = pageTexts.join('\n\n')
+    if (combined.trim().length > 50) {
+      await invoke('save_pdfjs_fulltext', { slug, text: combined })
     }
   } catch {
-    // Non-fatal — extraction is best-effort
+    ocrProgress.value = null
   }
 }
 
@@ -768,7 +837,7 @@ function onKeyDown(e: KeyboardEvent) {
   }
   if (e.key === 'Escape') {
     if (searchOpen.value) { closeSearch(); return }
-    hlNotePopup.value = null; hlColorPopup.value = null; selectionPopup.value = null
+    hlNotePopup.value = null; hlColorPopup.value = null; selectionPopup.value = null; translatePopup.value = null
   }
 }
 
@@ -996,6 +1065,42 @@ function hexToRgba(hex: string, alpha: number): string {
           @click="createHighlight(c.value)"
         />
       </div>
+      <div class="sel-sep" />
+      <button class="sel-translate-btn" :title="t('pdf.translate')" @click="translateSelection">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M5 8l6 6"/>
+          <path d="M4 14l6-6 2-3"/>
+          <path d="M2 5h12"/>
+          <path d="M7 2h1"/>
+          <path d="M22 22l-5-10-5 10"/>
+          <path d="M14 18h6"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Translation result popup -->
+    <div
+      v-if="translatePopup"
+      class="translate-popup"
+      :style="{ left: `${translatePopup.x}px`, top: `${translatePopup.y}px` }"
+      @click.stop
+    >
+      <div class="translate-popup-header">
+        <span class="translate-popup-label">{{ t('pdf.translation') }}</span>
+        <button class="translate-close-btn" @click="translatePopup = null">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div v-if="translatePopup.loading" class="translate-loading">
+        <svg class="translate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+        </svg>
+        <span>{{ t('pdf.translating') }}</span>
+      </div>
+      <div v-else-if="translatePopup.error" class="translate-error">{{ translatePopup.error }}</div>
+      <div v-else class="translate-result">{{ translatePopup.result }}</div>
     </div>
 
     <!-- Highlight note popup: left-click → view; double-click → edit; blur → auto-save -->
@@ -1043,6 +1148,14 @@ function hexToRgba(hex: string, alpha: number): string {
       </div>
       <div class="hl-popup-divider" />
       <button class="hl-action-btn danger" @click="deleteHighlight(hlColorPopup!.hlId)">{{ t('pdf.delete') }}</button>
+    </div>
+
+    <!-- OCR progress overlay -->
+    <div v-if="ocrProgress" class="ocr-status">
+      <svg class="ocr-spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+      </svg>
+      <span>{{ t('extraction.stageOcrPage', { page: ocrProgress.page, total: ocrProgress.total }) }}</span>
     </div>
 
     <!-- Search bar (Cmd+F) -->
@@ -1331,6 +1444,92 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 .sel-color-dot:hover { transform: scale(1.25); }
 
+.sel-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--border-default);
+  flex-shrink: 0;
+}
+
+.sel-translate-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  transition: background 0.1s, color 0.1s;
+  flex-shrink: 0;
+}
+.sel-translate-btn:hover { background: var(--bg-hover); color: var(--accent); }
+
+/* ── Translation result popup ── */
+.translate-popup {
+  position: fixed;
+  z-index: 1002;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  width: 320px;
+  max-width: calc(100vw - 20px);
+}
+.translate-popup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.translate-popup-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.translate-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  color: var(--text-tertiary);
+  transition: background 0.1s;
+}
+.translate-close-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.translate-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.translate-spin {
+  animation: ocr-rotate 0.9s linear infinite;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.translate-result {
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.translate-error {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: #cc3333;
+  word-break: break-word;
+}
+
 /* ── Highlight popups ── */
 .hl-note-popup {
   position: fixed;
@@ -1521,4 +1720,30 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 .search-opt input[type="checkbox"] { accent-color: var(--accent, #6366f1); margin: 0; }
 .search-opt:hover { color: var(--text-primary); }
+
+/* OCR progress */
+.ocr-status {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 14px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+  pointer-events: none;
+  z-index: 30;
+}
+.ocr-spin {
+  animation: ocr-rotate 0.9s linear infinite;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+@keyframes ocr-rotate { to { transform: rotate(360deg); } }
 </style>

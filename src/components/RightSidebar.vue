@@ -120,6 +120,7 @@ async function onSlugChanged(newSlug: string) {
   flex-direction: column;
   background: var(--bg-primary);
   overflow: hidden;
+  height: 100%;
 }
 
 .no-selection {

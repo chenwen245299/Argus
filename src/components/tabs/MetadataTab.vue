@@ -321,7 +321,7 @@ async function extractAbstract() {
           <div class="label bibtex-label-row">
             <span>BibTeX</span>
             <div class="section-actions">
-              <button class="abstract-btn" @click="startBibtexEdit">
+              <button class="copy-section-btn" @click="startBibtexEdit">
                 {{ meta.bibtex ? '编辑' : '导入' }}
               </button>
               <button
@@ -591,7 +591,7 @@ async function extractAbstract() {
   margin-bottom: 3px;
 }
 
-.value { font-size: var(--font-size-sm); color: var(--text-primary); line-height: 1.5; word-break: break-word; }
+.value { font-size: var(--font-size-sm); color: var(--text-primary); line-height: 1.5; word-break: break-word; user-select: text; -webkit-user-select: text; }
 .value.mono { font-family: var(--font-mono); font-size: var(--font-size-xs); }
 .value.small { font-size: var(--font-size-xs); }
 .value.muted { color: var(--text-secondary); }

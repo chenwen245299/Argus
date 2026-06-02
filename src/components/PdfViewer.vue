@@ -115,6 +115,32 @@ onUnmounted(() => {
   pdfDoc.value?.destroy()
 })
 
+// ── pdfjs fulltext extraction (fallback when lopdf/pdftotext fail) ───────────
+async function extractFulltextIfNeeded(doc: PDFDocumentProxy, slug: string) {
+  try {
+    const status = await invoke<{ text_extracted: boolean }>('get_paper_status', { slug })
+    if (status.text_extracted) return
+  } catch { return }
+
+  try {
+    const parts: string[] = []
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i)
+      const tc = await page.getTextContent()
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const pageText = (tc.items as any[]).map((item: any) => item.str ?? '').join(' ')
+      parts.push(pageText)
+      page.cleanup()
+    }
+    const fullText = parts.join('\n\n')
+    if (fullText.trim().length > 200) {
+      await invoke('save_pdfjs_fulltext', { slug, text: fullText })
+    }
+  } catch {
+    // Non-fatal — extraction is best-effort
+  }
+}
+
 // ── Load PDF ──────────────────────────────────────────────────────────────────
 async function loadPdf() {
   loading.value = true
@@ -179,6 +205,9 @@ async function loadPdf() {
     setupObserver()
     await restorePosition()
     triggerInitialRender()
+
+    // Auto-extract fulltext via pdfjs if lopdf/pdftotext extraction previously failed
+    extractFulltextIfNeeded(doc, slug)
 
     // Auto-update reading status: unread → reading when PDF is opened
     const entry = library.papers.find(p => p.slug === slug)
@@ -506,9 +535,241 @@ function scrollToPageIndex(pageIndex: number, offsetYAtScale1 = 0) {
   containerRef.value.scrollTop = Math.max(0, cumY - 60)
 }
 
+// ── Search ────────────────────────────────────────────────────────────────────
+
+interface SearchMatch { pageIndex: number; rects: Rect[] }
+
+const searchOpen          = ref(false)
+const searchQuery         = ref('')
+const searchCaseSensitive = ref(false)
+const searchWholeWord     = ref(false)
+const searchHighlightAll  = ref(true)
+const searchMatches       = ref<SearchMatch[]>([])
+const searchMatchIndex    = ref(0)
+const searchBusy          = ref(false)
+const searchInputRef      = ref<HTMLInputElement | null>(null)
+
+const pageTextCache = new Map<number, string>()
+
+async function fetchPageText(pageIndex: number): Promise<string> {
+  if (pageTextCache.has(pageIndex)) return pageTextCache.get(pageIndex)!
+  if (!pdfDoc.value) return ''
+  try {
+    const page = await pdfDoc.value.getPage(pageIndex + 1)
+    const tc = await page.getTextContent()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const text = (tc.items as any[]).map((it: any) => it.str ?? '').join('')
+    pageTextCache.set(pageIndex, text)
+    return text
+  } catch { return '' }
+}
+
+function buildSearchRegex(): RegExp | null {
+  const q = searchQuery.value.trim()
+  if (!q) return null
+  try {
+    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const pattern = searchWholeWord.value ? `\\b${escaped}\\b` : escaped
+    return new RegExp(pattern, searchCaseSensitive.value ? 'g' : 'gi')
+  } catch { return null }
+}
+
+function findPageMatchRects(pageIndex: number, regex: RegExp): Rect[] {
+  const el = pageRefs.value[pageIndex]
+  if (!el) return []
+  const textLayer = el.querySelector('.textLayer')
+  if (!textLayer) return []
+
+  // Collect leaf spans (pdfjs renders each text item as a direct-child span)
+  const spans = Array.from(textLayer.querySelectorAll('span')).filter(
+    s => !s.querySelector('span')
+  ) as HTMLSpanElement[]
+  const pageRect = el.getBoundingClientRect()
+
+  let fullText = ''
+  const map: { span: HTMLSpanElement; start: number; end: number }[] = []
+  for (const span of spans) {
+    const t = span.textContent ?? ''
+    if (!t) continue
+    map.push({ span, start: fullText.length, end: fullText.length + t.length })
+    fullText += t
+  }
+
+  const rects: Rect[] = []
+  regex.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = regex.exec(fullText)) !== null) {
+    const ms = m.index, me = ms + m[0].length
+    for (const { span, start, end } of map) {
+      if (end <= ms || start >= me) continue
+      const textNode = Array.from(span.childNodes).find(n => n.nodeType === Node.TEXT_NODE)
+      if (!textNode) continue
+      const rs = Math.max(ms, start) - start
+      const re = Math.min(me, end) - start
+      if (rs >= re) continue
+      try {
+        const range = document.createRange()
+        range.setStart(textNode, rs)
+        range.setEnd(textNode, re)
+        for (const cr of range.getClientRects()) {
+          if (cr.width > 0 && cr.height > 0) {
+            rects.push({
+              x: (cr.left - pageRect.left) / scale.value,
+              y: (cr.top  - pageRect.top)  / scale.value,
+              width:  cr.width  / scale.value,
+              height: cr.height / scale.value,
+            })
+          }
+        }
+      } catch { /* ignore */ }
+    }
+    if (m[0].length === 0) regex.lastIndex++
+  }
+  return rects
+}
+
+function refreshSearchOverlays() {
+  // Remove stale overlays
+  pageRefs.value.forEach(el => { if (el) el.querySelector('.search-overlay')?.remove() })
+  if (!searchOpen.value || !searchQuery.value.trim()) return
+
+  const byPage = new Map<number, { match: SearchMatch; idx: number }[]>()
+  searchMatches.value.forEach((m, i) => {
+    if (!byPage.has(m.pageIndex)) byPage.set(m.pageIndex, [])
+    byPage.get(m.pageIndex)!.push({ match: m, idx: i })
+  })
+
+  byPage.forEach((entries, pageIndex) => {
+    const el = pageRefs.value[pageIndex]
+    if (!el || entries.every(e => e.match.rects.length === 0)) return
+    const overlay = document.createElement('div')
+    overlay.className = 'search-overlay'
+    entries.forEach(({ match, idx }) => {
+      const isCurrent = idx === searchMatchIndex.value
+      if (!searchHighlightAll.value && !isCurrent) return
+      match.rects.forEach(rect => {
+        const div = document.createElement('div')
+        div.style.cssText = `
+          position:absolute;
+          left:${rect.x * scale.value}px;
+          top:${rect.y * scale.value}px;
+          width:${rect.width * scale.value}px;
+          height:${rect.height * scale.value}px;
+          background:${isCurrent ? 'rgba(255,165,0,0.6)' : 'rgba(255,220,0,0.38)'};
+          border-radius:2px;pointer-events:none;
+        `
+        overlay.appendChild(div)
+      })
+    })
+    el.appendChild(overlay)
+  })
+}
+
+async function runSearch() {
+  const q = searchQuery.value.trim()
+  if (!q || !pdfDoc.value) {
+    searchMatches.value = []; searchMatchIndex.value = 0; refreshSearchOverlays(); return
+  }
+  searchBusy.value = true
+  const regex = buildSearchRegex()
+  if (!regex) { searchBusy.value = false; return }
+
+  const matches: SearchMatch[] = []
+  for (let i = 0; i < pageCount.value; i++) {
+    regex.lastIndex = 0
+    if (renderedPages.value.has(i)) {
+      const rects = findPageMatchRects(i, regex)
+      if (rects.length > 0) matches.push({ pageIndex: i, rects })
+    } else {
+      const text = await fetchPageText(i)
+      regex.lastIndex = 0
+      if (regex.test(text)) matches.push({ pageIndex: i, rects: [] })
+    }
+  }
+  searchMatches.value = matches
+  searchMatchIndex.value = 0
+  searchBusy.value = false
+  await navigateToSearchMatch(0)
+}
+
+async function navigateToSearchMatch(idx: number) {
+  if (searchMatches.value.length === 0) { refreshSearchOverlays(); return }
+  const n = searchMatches.value.length
+  const i = ((idx % n) + n) % n
+  searchMatchIndex.value = i
+
+  const match = searchMatches.value[i]
+  if (match.rects.length === 0) {
+    await ensurePageRendered(match.pageIndex)
+    const regex = buildSearchRegex()
+    if (regex) match.rects = findPageMatchRects(match.pageIndex, regex)
+  }
+  scrollToPageIndex(match.pageIndex, match.rects[0]?.y ?? 0)
+  refreshSearchOverlays()
+}
+
+function openSearch() {
+  searchOpen.value = true
+  nextTick(() => { searchInputRef.value?.select(); searchInputRef.value?.focus() })
+}
+
+function closeSearch() {
+  searchOpen.value = false
+  searchQuery.value = ''
+  searchMatches.value = []
+  searchMatchIndex.value = 0
+  refreshSearchOverlays()
+}
+
+// When a page newly renders, populate its match rects and refresh
+watch(renderedPages, async () => {
+  if (!searchOpen.value || !searchQuery.value.trim()) return
+  const regex = buildSearchRegex()
+  if (!regex) return
+  let changed = false
+  for (const match of searchMatches.value) {
+    if (renderedPages.value.has(match.pageIndex) && match.rects.length === 0) {
+      regex.lastIndex = 0
+      match.rects = findPageMatchRects(match.pageIndex, regex)
+      changed = true
+    }
+  }
+  if (changed) refreshSearchOverlays()
+})
+
+// Re-apply overlays on scale change (page re-renders handled by unrender→render cycle)
+watch(scale, () => { if (searchOpen.value) nextTick(refreshSearchOverlays) })
+
+// Live search as user types (debounced)
+let searchDebounce: ReturnType<typeof setTimeout> | null = null
+watch(searchQuery, () => {
+  if (searchDebounce) clearTimeout(searchDebounce)
+  searchDebounce = setTimeout(runSearch, 250)
+})
+watch([searchCaseSensitive, searchWholeWord, searchHighlightAll], () => {
+  if (searchOpen.value) runSearch()
+})
+
+const searchCountText = computed(() => {
+  const n = searchMatches.value.length
+  if (!searchQuery.value.trim()) return ''
+  if (n === 0) return searchBusy.value ? '…' : '无结果'
+  return `${searchMatchIndex.value + 1} / ${n}`
+})
+
 // ── Keyboard navigation ───────────────────────────────────────────────────────
 function onKeyDown(e: KeyboardEvent) {
-  if (e.key === 'Escape') { hlNotePopup.value = null; hlColorPopup.value = null; selectionPopup.value = null }
+  const mod = e.metaKey || e.ctrlKey
+  if (mod && e.key === 'f') { e.preventDefault(); openSearch(); return }
+  if (mod && e.key === 'g' && searchOpen.value) {
+    e.preventDefault()
+    navigateToSearchMatch(searchMatchIndex.value + (e.shiftKey ? -1 : 1))
+    return
+  }
+  if (e.key === 'Escape') {
+    if (searchOpen.value) { closeSearch(); return }
+    hlNotePopup.value = null; hlColorPopup.value = null; selectionPopup.value = null
+  }
 }
 
 function onWheel(e: WheelEvent) {
@@ -782,6 +1043,49 @@ function hexToRgba(hex: string, alpha: number): string {
       </div>
       <div class="hl-popup-divider" />
       <button class="hl-action-btn danger" @click="deleteHighlight(hlColorPopup!.hlId)">{{ t('pdf.delete') }}</button>
+    </div>
+
+    <!-- Search bar (Cmd+F) -->
+    <div v-if="searchOpen" class="search-bar" @click.stop>
+      <div class="search-input-row">
+        <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input
+          ref="searchInputRef"
+          v-model="searchQuery"
+          class="search-input"
+          placeholder="搜索…"
+          @keydown.enter.prevent="navigateToSearchMatch(searchMatchIndex + 1)"
+          @keydown.shift.enter.prevent="navigateToSearchMatch(searchMatchIndex - 1)"
+          @keydown.esc.stop="closeSearch"
+        />
+        <span class="search-count" :class="{ 'no-match': searchQuery && !searchBusy && searchMatches.length === 0 }">
+          {{ searchCountText }}
+        </span>
+        <button class="search-nav-btn" :disabled="searchMatches.length === 0" @click="navigateToSearchMatch(searchMatchIndex - 1)" title="上一个 (Shift+Enter)">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"/></svg>
+        </button>
+        <button class="search-nav-btn" :disabled="searchMatches.length === 0" @click="navigateToSearchMatch(searchMatchIndex + 1)" title="下一个 (Enter)">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="search-divider" />
+        <button class="search-close-btn" @click="closeSearch" title="关闭 (Esc)">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="search-options-row">
+        <label class="search-opt">
+          <input type="checkbox" v-model="searchHighlightAll" @change="refreshSearchOverlays" />
+          <span>高亮所有</span>
+        </label>
+        <label class="search-opt">
+          <input type="checkbox" v-model="searchCaseSensitive" />
+          <span>区分大小写</span>
+        </label>
+        <label class="search-opt">
+          <input type="checkbox" v-model="searchWholeWord" />
+          <span>整词</span>
+        </label>
+      </div>
     </div>
   </div>
 </template>
@@ -1107,4 +1411,114 @@ function hexToRgba(hex: string, alpha: number): string {
 .hl-action-btn:hover { background: var(--bg-tertiary); }
 .hl-action-btn.danger { color: #cc3333; }
 .hl-action-btn.danger:hover { background: #fff0f0; }
+
+/* ── Search overlay ── */
+:deep(.search-overlay) {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+  z-index: 4;
+}
+
+/* ── Search bar ── */
+.search-bar {
+  position: absolute;
+  top: 52px;
+  right: 18px;
+  z-index: 100;
+  background: var(--bg-primary, #fff);
+  border: 1px solid var(--border-default, #d1d5db);
+  border-radius: 10px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.13);
+  padding: 8px 10px 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 300px;
+  user-select: none;
+}
+
+.search-input-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.search-icon {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  margin-right: 2px;
+}
+
+.search-input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 13px;
+  color: var(--text-primary);
+  min-width: 0;
+}
+
+.search-count {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  min-width: 44px;
+  text-align: right;
+}
+.search-count.no-match { color: #ef4444; }
+
+.search-nav-btn {
+  width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 5px;
+  border: 1px solid var(--border-default, #d1d5db);
+  background: var(--bg-secondary, #f9fafb);
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.1s;
+}
+.search-nav-btn:hover:not(:disabled) { background: var(--bg-hover, #f3f4f6); color: var(--text-primary); }
+.search-nav-btn:disabled { opacity: 0.4; cursor: default; }
+
+.search-divider {
+  width: 1px; height: 16px;
+  background: var(--border-default, #d1d5db);
+  margin: 0 2px; flex-shrink: 0;
+}
+
+.search-close-btn {
+  width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  flex-shrink: 0;
+  border: none;
+  transition: background 0.1s, color 0.1s;
+}
+.search-close-btn:hover { background: var(--bg-hover, #f3f4f6); color: var(--text-primary); }
+
+.search-options-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 2px;
+}
+
+.search-opt {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.search-opt input[type="checkbox"] { accent-color: var(--accent, #6366f1); margin: 0; }
+.search-opt:hover { color: var(--text-primary); }
 </style>

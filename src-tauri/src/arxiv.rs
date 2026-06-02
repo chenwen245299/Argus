@@ -1284,14 +1284,23 @@ pub fn open_arxiv_window(app: &tauri::AppHandle) -> Result<(), String> {
         .build()
         .map_err(|e| format!("Open arXiv window: {e}"))?;
 
+    // Save size on every resize and on close.
+    // Using win.clone() avoids a lookup that can fail during macOS close animation.
+    let win_ref = win.clone();
     let app_handle = app.clone();
     win.on_window_event(move |event| {
-        if let tauri::WindowEvent::CloseRequested { .. } = event {
-            if let Some(w) = app_handle.get_webview_window("arxiv") {
-                if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+        let save = |w: &tauri::WebviewWindow| {
+            if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+                if phys.width > 0 && phys.height > 0 {
                     save_arxiv_window_size(&app_handle, phys.width as f64 / sf, phys.height as f64 / sf);
                 }
             }
+        };
+        match event {
+            tauri::WindowEvent::Resized(_) | tauri::WindowEvent::CloseRequested { .. } => {
+                save(&win_ref);
+            }
+            _ => {}
         }
     });
 

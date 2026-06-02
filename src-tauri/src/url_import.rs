@@ -409,40 +409,72 @@ mod openreview {
         abstract_text: Option<String>,
     }
 
-    async fn fetch_meta(client: &reqwest::Client, id: &str) -> Result<Meta, String> {
-        let url = format!("https://api2.openreview.net/notes?id={id}");
-        let resp = client
+    /// Extract a string field that may be either `{"value": "..."}` (v2) or `"..."` (v1).
+    fn str_field<'a>(content: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        let f = &content[key];
+        f["value"].as_str().or_else(|| f.as_str())
+    }
+
+    /// Extract an array of strings that may be `{"value": [...]}` (v2) or `[...]` (v1).
+    fn str_array_field(content: &serde_json::Value, key: &str) -> Vec<String> {
+        let f = &content[key];
+        let arr = if f.is_array() { f } else { &f["value"] };
+        arr.as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    fn parse_note(note: &serde_json::Value) -> Option<Meta> {
+        let content = &note["content"];
+        let title = str_field(content, "title")?.trim().to_string();
+        if title.is_empty() { return None; }
+        let authors = str_array_field(content, "authors");
+        let venue_raw = str_field(content, "venue").map(|s| s.trim().to_string());
+        let year = venue_raw.as_deref().and_then(extract_year_from_venue).or_else(|| {
+            let ms = note["cdate"].as_i64().or_else(|| note["tcdate"].as_i64())?;
+            let dt = chrono::DateTime::from_timestamp(ms / 1000, 0)?;
+            dt.format("%Y").to_string().parse::<u32>().ok()
+        });
+        let abstract_text = str_field(content, "abstract")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Some(Meta { title, authors, year, venue: venue_raw, abstract_text })
+    }
+
+    async fn fetch_notes(client: &reqwest::Client, param: &str, value: &str) -> Result<Vec<serde_json::Value>, String> {
+        let url = format!("https://api2.openreview.net/notes?{param}={value}&limit=10");
+        let json: serde_json::Value = client
             .get(&url)
             .send()
             .await
             .map_err(|e| format!("Fetch OpenReview API: {e}"))?
-            .text()
+            .json()
             .await
-            .map_err(|e| format!("Read API response: {e}"))?;
+            .map_err(|e| format!("Parse JSON: {e}"))?;
+        Ok(json["notes"].as_array().cloned().unwrap_or_default())
+    }
 
-        let json: serde_json::Value =
-            serde_json::from_str(&resp).map_err(|e| format!("Parse JSON: {e}"))?;
-        let note = json["notes"]
-            .as_array()
-            .and_then(|a| a.first())
-            .ok_or_else(|| format!("OpenReview: paper '{id}' not found"))?;
-        let content = &note["content"];
+    async fn fetch_meta(client: &reqwest::Client, id: &str) -> Result<Meta, String> {
+        // Try ?id= first (usually the paper note ID = forum ID)
+        let notes_by_id = fetch_notes(client, "id", id).await?;
+        if let Some(meta) = notes_by_id.first().and_then(|n| parse_note(n)) {
+            return Ok(meta);
+        }
 
-        let title = content["title"]["value"].as_str().unwrap_or("Untitled").trim().to_string();
-        let authors: Vec<String> = content["authors"]["value"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+        // Fall back to ?forum= — returns all notes in the thread; find the submission
+        let notes_by_forum = fetch_notes(client, "forum", id).await
             .unwrap_or_default();
-        let venue_raw = content["venue"]["value"].as_str().map(|s| s.trim().to_string());
-        let year = venue_raw.as_deref().and_then(extract_year_from_venue).or_else(|| {
-            note["cdate"].as_i64().map(|ms| {
-                let dt = chrono::DateTime::from_timestamp(ms / 1000, 0)?;
-                Some(dt.format("%Y").to_string().parse::<u32>().ok()?)
-            }).flatten()
-        });
-        let abstract_text = content["abstract"]["value"].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
-        Ok(Meta { title, authors, year, venue: venue_raw, abstract_text })
+        // Prefer a note whose invitation mentions "Submission"
+        let submission_note = notes_by_forum.iter().find(|n| {
+            n["invitation"].as_str()
+                .map(|inv| inv.contains("Submission") || inv.contains("submission"))
+                .unwrap_or(false)
+        }).or_else(|| notes_by_forum.first());
+
+        submission_note
+            .and_then(|n| parse_note(n))
+            .ok_or_else(|| format!("OpenReview: paper '{id}' not found or has no accessible metadata"))
     }
 
     fn extract_year_from_venue(venue: &str) -> Option<u32> {

@@ -81,6 +81,7 @@ const {
   addNodes,
   removeNodes,
   removeEdges,
+  onNodeDrag,
   onNodeDragStop,
   onEdgesChange,
   onNodesChange,
@@ -104,9 +105,11 @@ const pickerSearch = ref('')
 const pickerError = ref('')
 
 const filteredPapers = computed(() => {
+  const addedIds = new Set(nodes.value.map(n => n.data.paperId))
   const q = pickerSearch.value.trim().toLowerCase()
-  if (!q) return library.papers
-  return library.papers.filter(p =>
+  const base = library.papers.filter(p => !addedIds.has(p.id))
+  if (!q) return base
+  return base.filter(p =>
     p.title.toLowerCase().includes(q) ||
     p.authors.some(a => a.toLowerCase().includes(q)) ||
     String(p.year ?? '').includes(q)
@@ -162,6 +165,24 @@ function paperById(paperId: string): PaperIndexEntry | undefined {
   return library.papers.find(p => p.id === paperId)
 }
 
+const noteTitlesMap = ref<Map<string, string[]>>(new Map())
+
+async function loadNoteTitles(cnodes: CNode[]) {
+  const results = await Promise.allSettled(
+    cnodes.map(async cn => {
+      const paper = paperById(cn.paper_id)
+      if (!paper) return
+      const titles = await invoke<string[]>('get_canvas_note_titles', { slug: paper.slug })
+      if (titles.length > 0) noteTitlesMap.value.set(cn.paper_id, titles)
+    })
+  )
+  // Patch existing nodes with fresh note titles
+  nodes.value = nodes.value.map(n => ({
+    ...n,
+    data: { ...n.data, noteTitles: noteTitlesMap.value.get(n.data.paperId as string) ?? [] },
+  }))
+}
+
 function buildVfNodes(cnodes: CNode[]): VfNode[] {
   return cnodes.map(cn => {
     const paper = paperById(cn.paper_id)
@@ -179,6 +200,7 @@ function buildVfNodes(cnodes: CNode[]): VfNode[] {
         valid: !!paper,
         color: cn.color,
         hoverSource: cn.hover_source,
+        noteTitles: noteTitlesMap.value.get(cn.paper_id) ?? [],
       },
     } satisfies VfNode
   })
@@ -193,6 +215,8 @@ function buildVfEdges(cedges: CEdge[]): VfEdge[] {
       id: ce.edge_id,
       source: ce.from_node_id,
       target: ce.to_node_id,
+      sourceHandle: ce.source_handle,
+      targetHandle: ce.target_handle,
       label: ce.label,
       markerEnd: ce.color ? { type: MarkerType.ArrowClosed, color: ce.color } : MarkerType.ArrowClosed,
       style,
@@ -223,6 +247,8 @@ function extractCanvasEdges(): CEdge[] {
       edge_id: e.id,
       from_node_id: e.source,
       to_node_id: e.target,
+      source_handle: e.sourceHandle ?? undefined,
+      target_handle: e.targetHandle ?? undefined,
       label: typeof e.label === 'string' ? e.label || undefined : undefined,
       color: d?.edgeColor || undefined,
       stroke_width: d?.edgeStrokeWidth !== 1.8 ? d?.edgeStrokeWidth : undefined,
@@ -237,8 +263,11 @@ async function loadCanvas(id: string) {
   const cv = canvasStore.currentCanvas
   if (!cv) return
 
+  noteTitlesMap.value = new Map()
   nodes.value = buildVfNodes(cv.nodes)
   edges.value = buildVfEdges(cv.edges)
+
+  loadNoteTitles(cv.nodes)
 
   await nextTick()
   if (cv.viewport.zoom) {
@@ -285,6 +314,8 @@ onConnect((params: Connection) => {
     id: `e-${Date.now()}`,
     source: params.source,
     target: params.target,
+    sourceHandle: params.sourceHandle,
+    targetHandle: params.targetHandle,
     markerEnd: MarkerType.ArrowClosed,
     style: { strokeWidth: 1.8 },
     type: 'smoothstep',
@@ -296,7 +327,18 @@ onConnect((params: Connection) => {
   triggerSave()
 })
 
+const isDraggingNode = ref(false)
+
+onNodeDrag(() => {
+  isDraggingNode.value = true
+  if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null }
+  hoverNodeId.value = null
+  hoverContent.value = ''
+  hoverLoading.value = false
+})
+
 onNodeDragStop(() => {
+  isDraggingNode.value = false
   triggerSave()
 })
 
@@ -384,8 +426,12 @@ function addPaperToCanvas(paper: PaperIndexEntry) {
   }
 
   const nodeId = `node-${Date.now()}`
-  const x = 100 + (nodes.value.length % 5) * 240
-  const y = 100 + Math.floor(nodes.value.length / 5) * 180
+  const vp = getViewport()
+  const el = flowContainerRef.value
+  const w = el ? el.clientWidth : 800
+  const h = el ? el.clientHeight : 600
+  const x = (-vp.x + w / 2) / vp.zoom - 100
+  const y = (-vp.y + h / 2) / vp.zoom - 60
 
   const newNode: VfNode = {
     id: nodeId,
@@ -416,6 +462,7 @@ function onNodeMouseEnter(event: NodeMouseEvent) {
 
   if (hoverTimer) clearTimeout(hoverTimer)
   hoverTimer = setTimeout(async () => {
+    if (isDraggingNode.value) return
     hoverNodeId.value = nd.id
 
     const source = nd.data.hoverSource ?? canvasStore.settings.hover_content_source
@@ -1093,7 +1140,6 @@ watch(() => library.papers, () => {
               v-for="paper in filteredPapers"
               :key="paper.id"
               class="picker-item"
-              :class="{ 'picker-item--taken': nodes.some(n => n.data.paperId === paper.id) }"
               @click="addPaperToCanvas(paper)"
             >
               <div class="picker-item-title">{{ paper.title }}</div>
@@ -1101,7 +1147,6 @@ watch(() => library.papers, () => {
                 <span>{{ paper.authors.slice(0, 2).join(', ') }}{{ paper.authors.length > 2 ? ' 等' : '' }}</span>
                 <span v-if="paper.year">{{ paper.year }}</span>
               </div>
-              <span v-if="nodes.some(n => n.data.paperId === paper.id)" class="picker-item-badge">已添加</span>
             </div>
           </div>
         </div>

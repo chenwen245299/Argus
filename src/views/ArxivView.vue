@@ -844,32 +844,43 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 .arxiv-topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   padding: 0 14px 0 0;
-  height: 46px;
+  height: 52px;
   border-bottom: 1px solid var(--border-subtle);
-  background: var(--bg-secondary);
+  background: color-mix(in srgb, var(--bg-primary) 85%, var(--bg-secondary));
   flex-shrink: 0;
-  gap: 12px;
+  gap: 0;
 }
 .tl-space { width: 76px; flex-shrink: 0; }
-.topbar-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.topbar-left { display: flex; align-items: center; gap: 7px; min-width: 0; flex: 1; }
 .topbar-icon { color: var(--accent); flex-shrink: 0; }
-.topbar-title { font-size: 14px; font-weight: 600; white-space: nowrap; }
-.topbar-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.topbar-title { font-size: 14px; font-weight: 650; white-space: nowrap; letter-spacing: -0.01em; }
+.topbar-right {
+  display: flex; align-items: center; gap: 2px; flex-shrink: 0;
+  border-left: 1px solid var(--border-subtle);
+  padding-left: 10px;
+  margin-left: 8px;
+}
 
 .auto-badge {
   display: flex; align-items: center; gap: 5px;
   font-size: 11px; color: var(--accent);
   background: var(--accent-light);
-  padding: 2px 8px; border-radius: var(--radius-pill);
+  padding: 3px 10px; border-radius: var(--radius-pill);
+  white-space: nowrap;
 }
 .auto-dot {
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--accent); animation: pulse 2s infinite;
 }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-.next-label { font-size: 11px; color: var(--text-tertiary); }
+.next-label { font-size: 11px; color: var(--text-tertiary); white-space: nowrap; }
+.paper-count-pill {
+  font-size: 11px; color: var(--text-tertiary);
+  background: var(--bg-tertiary);
+  padding: 2px 8px; border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
 
 .topbar-analysis-status {
   display: flex;
@@ -905,20 +916,15 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 }
 
 .tb-btn {
-  display: flex; align-items: center; gap: 4px;
+  display: flex; align-items: center; gap: 5px;
   font-size: 12px; color: var(--text-secondary);
-  padding: 5px 9px; border-radius: var(--radius-md);
+  padding: 5px 10px; border-radius: var(--radius-md);
   transition: background 0.12s, color 0.12s;
+  white-space: nowrap;
 }
 .tb-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
-.tb-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.tb-btn:disabled:hover {
-  background: transparent;
-  color: var(--text-secondary);
-}
+.tb-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.tb-btn:disabled:hover { background: transparent; color: var(--text-secondary); }
 
 .fetch-btn {
   display: flex; align-items: center; gap: 5px;
@@ -1145,12 +1151,10 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   border-radius: var(--radius-md);
   margin: 0 4px;
   transition: background 0.1s;
-  border-left: 2px solid transparent;
 }
 .paper-item:hover { background: var(--bg-hover); }
 .paper-item.selected {
   background: var(--accent-light);
-  border-left-color: var(--accent);
 }
 .paper-item.dimmed { opacity: 0.45; }
 .paper-item.unread:not(.selected):not(:hover)::after {
@@ -1615,7 +1619,6 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 .paper-item.selected {
   background: color-mix(in srgb, var(--accent) 11%, var(--bg-primary));
   border-color: color-mix(in srgb, var(--accent) 26%, var(--border-subtle));
-  box-shadow: inset 3px 0 0 var(--accent);
 }
 .paper-item.unread:not(.selected):not(:hover)::after {
   content: '';

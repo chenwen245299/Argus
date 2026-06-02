@@ -12,6 +12,7 @@ export interface PaperNodeData {
   nodeId: string
   valid: boolean
   color?: string
+  noteTitles?: string[]
 }
 
 const props = defineProps<NodeProps<PaperNodeData>>()
@@ -63,6 +64,9 @@ const accentBarStyle = computed(() =>
       <span v-if="data.year" class="node-year">{{ data.year }}</span>
     </div>
     <div v-if="data.venue" class="node-venue" :title="data.venue">{{ data.venue }}</div>
+    <div v-if="data.noteTitles && data.noteTitles.length > 0" class="node-notes">
+      <span v-for="title in data.noteTitles" :key="title" class="node-note-badge" :title="title">{{ title }}</span>
+    </div>
   </div>
 </template>
 
@@ -162,6 +166,27 @@ const accentBarStyle = computed(() =>
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.node-notes {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.node-note-badge {
+  display: inline-block;
+  max-width: 160px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-hover, #f3f4f6);
+  border: 1px solid var(--border-default, #e5e7eb);
+  font-size: 10px;
+  color: var(--text-secondary, #6b7280);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Vue Flow handle overrides */

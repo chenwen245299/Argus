@@ -359,6 +359,16 @@ async fn stream_openrouter_with_pdf(
         "stream_options": {"include_usage": true}
     });
 
+    {
+        let order: Vec<&str> = provider.models.iter()
+            .find(|m| m.id == model)
+            .map(|m| m.provider_order.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        if !order.is_empty() {
+            body["provider"] = serde_json::json!({ "order": order, "allow_fallbacks": false });
+        }
+    }
+
     if use_reasoning {
         body["reasoning"] = serde_json::json!({
             "effort": reasoning_effort.unwrap_or("high"),
@@ -466,11 +476,22 @@ async fn chat_openai_compat(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
     );
+    let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
     let msgs: Vec<serde_json::Value> = messages
         .iter()
         .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
         .collect();
-    let body = serde_json::json!({"model": model, "messages": msgs});
+    let mut body = serde_json::json!({"model": model, "messages": msgs});
+
+    if is_openrouter {
+        let order: Vec<&str> = provider.models.iter()
+            .find(|m| m.id == model)
+            .map(|m| m.provider_order.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        if !order.is_empty() {
+            body["provider"] = serde_json::json!({ "order": order, "allow_fallbacks": false });
+        }
+    }
 
     let resp = client
         .post(&url)
@@ -527,6 +548,16 @@ async fn stream_openai_compat(
         "model": model, "messages": msgs, "stream": true,
         "stream_options": {"include_usage": true}
     });
+
+    if is_openrouter {
+        let order: Vec<&str> = provider.models.iter()
+            .find(|m| m.id == model)
+            .map(|m| m.provider_order.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        if !order.is_empty() {
+            body["provider"] = serde_json::json!({ "order": order, "allow_fallbacks": false });
+        }
+    }
 
     if use_reasoning {
         if is_deepseek {
@@ -910,6 +941,7 @@ fn parse_model_item(item: &serde_json::Value) -> Option<AiModel> {
         enabled: true,
         input_price_per_million: None,
         output_price_per_million: None,
+        provider_order: vec![],
     })
 }
 
@@ -1079,6 +1111,7 @@ fn anthropic_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            provider_order: vec![],
         },
         AiModel {
             id: "claude-sonnet-4-5".to_string(),
@@ -1088,6 +1121,7 @@ fn anthropic_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            provider_order: vec![],
         },
         AiModel {
             id: "claude-haiku-4-5-20251001".to_string(),
@@ -1097,6 +1131,7 @@ fn anthropic_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            provider_order: vec![],
         },
     ]
 }

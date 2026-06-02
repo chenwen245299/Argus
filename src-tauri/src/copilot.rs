@@ -452,18 +452,21 @@ pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
         .build()
         .map_err(|e| format!("Open library chat window: {e}"))?;
 
+    let win_ref = win.clone();
     let app_handle = app.clone();
     win.on_window_event(move |event| {
-        if let WindowEvent::CloseRequested { .. } = event {
-            if let Some(w) = app_handle.get_webview_window("library-chat") {
-                if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
-                    save_library_chat_window_size(
-                        &app_handle,
-                        phys.width as f64 / sf,
-                        phys.height as f64 / sf,
-                    );
+        let save = |w: &tauri::WebviewWindow| {
+            if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+                if phys.width > 0 && phys.height > 0 {
+                    save_library_chat_window_size(&app_handle, phys.width as f64 / sf, phys.height as f64 / sf);
                 }
             }
+        };
+        match event {
+            WindowEvent::Resized(_) | WindowEvent::CloseRequested { .. } => {
+                save(&win_ref);
+            }
+            _ => {}
         }
     });
 

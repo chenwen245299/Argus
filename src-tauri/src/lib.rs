@@ -76,6 +76,7 @@ pub fn run() {
             commands::get_notes,
             commands::save_notes,
             commands::list_notes,
+            commands::get_canvas_note_titles,
             commands::get_note,
             commands::create_note,
             commands::save_note,
@@ -86,6 +87,7 @@ pub fn run() {
             commands::get_reading_state,
             commands::update_reading_state,
             commands::get_paper_status,
+            commands::save_pdfjs_fulltext,
             commands::set_reading_status,
             commands::delete_paper,
             commands::copy_paper_pdf,
@@ -225,6 +227,7 @@ pub fn run() {
             commands::get_canvas_settings,
             commands::save_canvas_settings,
             commands::set_canvas_notes,
+            commands::fetch_openrouter_endpoints,
             // ── M10: Canvas Enhance ──
             commands::suggest_canvas_edges,
             commands::compute_canvas_layout,

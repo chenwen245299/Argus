@@ -168,6 +168,26 @@ pub async fn list_notes(slug: String, state: State<'_, LibraryRoot>) -> Result<V
 }
 
 #[tauri::command]
+pub async fn get_canvas_note_titles(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<Vec<String>, String> {
+    let root = get_root(&state)?;
+    let meta = paper::read_meta(&root, &slug)?;
+    if meta.canvas_notes.is_empty() {
+        return Ok(vec![]);
+    }
+    let pinned: std::collections::HashSet<&str> =
+        meta.canvas_notes.iter().map(|s| s.as_str()).collect();
+    let titles = paper::list_notes(&root, &slug)
+        .into_iter()
+        .filter(|n| pinned.contains(n.id.as_str()))
+        .map(|n| n.title)
+        .collect();
+    Ok(titles)
+}
+
+#[tauri::command]
 pub async fn get_note(
     slug: String,
     note_id: String,
@@ -268,6 +288,31 @@ pub async fn get_paper_status(
 ) -> Result<PaperStatus, String> {
     let root = get_root(&state)?;
     Ok(paper::read_status_for(&root, &slug))
+}
+
+/// Save fulltext extracted by pdfjs in the frontend (fallback when lopdf/pdftotext fail).
+/// Only writes if text is non-trivially long and the paper exists.
+#[tauri::command]
+pub async fn save_pdfjs_fulltext(
+    slug: String,
+    text: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let dir = paper::paper_dir(&root, &slug);
+    if !dir.exists() {
+        return Err(format!("Paper not found: {slug}"));
+    }
+    std::fs::write(dir.join("fulltext.txt"), &text)
+        .map_err(|e| format!("Write fulltext: {e}"))?;
+    let _ = search::index_paper(&root, &slug);
+    let mut status = paper::read_status_for(&root, &slug);
+    status.text_extracted = true;
+    status.last_updated = chrono::Utc::now().to_rfc3339();
+    paper::write_status(&root, &slug, &status)
 }
 
 /// Update the user-controlled reading status: "unread" | "reading" | "read"
@@ -1919,6 +1964,39 @@ pub async fn get_node_display_content(
 ) -> Result<String, String> {
     let root = get_root(&state)?;
     canvas::get_node_display_content(&root, &paper_id, &source)
+}
+
+/// Fetch available endpoints (providers) for an OpenRouter model.
+/// Returns raw JSON from GET https://openrouter.ai/api/v1/models/{model_id}/endpoints
+#[tauri::command]
+pub async fn fetch_openrouter_endpoints(
+    state: State<'_, LibraryRoot>,
+    provider_id: String,
+    model_id: String,
+) -> Result<serde_json::Value, String> {
+    let root = get_root(&state)?;
+    let api_key = ai_manager::get_api_key(&root, &provider_id)
+        .ok_or_else(|| "No API key configured for this provider".to_string())?;
+    let url = format!(
+        "https://openrouter.ai/api/v1/models/{}/endpoints",
+        model_id.trim()
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Build client: {e}"))?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if status >= 400 {
+        return Err(format!("OpenRouter API error {status}: {text}"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("Invalid JSON: {e}"))
 }
 
 #[tauri::command]

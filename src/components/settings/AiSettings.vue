@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { invoke } from '@tauri-apps/api/core'
 import { useAiStore } from '../../stores/ai'
 import { useCliStore } from '../../stores/cli'
 import type { AiModel, AiProviderInfo, AiProviderInput, CliOutputPolish, CliTool, ModelSelection } from '../../types'
@@ -40,10 +41,17 @@ type ModelForm = {
   capabilities: string[]
   input_price: string   // CNY per 1M input tokens, empty = not set
   output_price: string  // CNY per 1M output tokens, empty = not set
+  provider_order: string[] // OpenRouter provider preference order
+}
+
+interface OrEndpoint {
+  name: string
+  quantization: string | null
+  context_length?: number
 }
 
 function emptyModelForm(): ModelForm {
-  return { id: '', display_name: '', context_length: '', capabilities: [], input_price: '', output_price: '' }
+  return { id: '', display_name: '', context_length: '', capabilities: [], input_price: '', output_price: '', provider_order: [] }
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -84,6 +92,11 @@ const newModel      = ref<ModelForm>(emptyModelForm())
 // Edit model inline
 const editModelIdx  = ref<number | null>(null)
 const editModelForm = ref<ModelForm>(emptyModelForm())
+
+// OpenRouter endpoint fetch (per model being edited)
+const orEndpoints       = ref<OrEndpoint[]>([])
+const orEndpointStatus  = ref<'' | 'fetching' | 'ok' | 'fail'>('')
+const orEndpointErr     = ref('')
 
 // Default model selection
 const defaultSel    = ref<ModelSelection | null>(null)
@@ -504,7 +517,7 @@ function parsePrice(s: string): number | undefined {
 }
 
 function submitAddModel() {
-  const { id, display_name, context_length, capabilities, input_price, output_price } = newModel.value
+  const { id, display_name, context_length, capabilities, input_price, output_price, provider_order } = newModel.value
   if (!id) return
   editModels.value.push({
     id,
@@ -514,6 +527,7 @@ function submitAddModel() {
     enabled: true,
     input_price_per_million: parsePrice(input_price),
     output_price_per_million: parsePrice(output_price),
+    provider_order: [...provider_order],
   })
   newModel.value = emptyModelForm()
   showAddModel.value = false
@@ -529,12 +543,16 @@ function startEditModel(idx: number) {
     capabilities: [...m.capabilities],
     input_price: m.input_price_per_million?.toString() ?? '',
     output_price: m.output_price_per_million?.toString() ?? '',
+    provider_order: [...(m.provider_order ?? [])],
+  }
+  if (isOpenRouterProvider.value && orEndpoints.value.length === 0 && orEndpointStatus.value !== 'fetching') {
+    fetchOrEndpoints(m.id)
   }
 }
 
 function submitEditModel() {
   if (editModelIdx.value === null) return
-  const { id, display_name, context_length, capabilities, input_price, output_price } = editModelForm.value
+  const { id, display_name, context_length, capabilities, input_price, output_price, provider_order } = editModelForm.value
   editModels.value[editModelIdx.value] = {
     ...editModels.value[editModelIdx.value],
     id,
@@ -544,6 +562,7 @@ function submitEditModel() {
     enabled: true,
     input_price_per_million: parsePrice(input_price),
     output_price_per_million: parsePrice(output_price),
+    provider_order: [...provider_order],
   }
   editModelIdx.value = null
 }
@@ -554,6 +573,51 @@ async function saveEditModel() {
 }
 
 function removeModel(idx: number) { editModels.value.splice(idx, 1) }
+
+// ── OpenRouter provider selection ─────────────────────────────────────────────
+
+const isOpenRouterProvider = computed(() => editKind.value === 'openrouter')
+
+async function fetchOrEndpoints(modelId: string) {
+  if (!selectedId.value || !modelId.trim()) return
+  orEndpointStatus.value = 'fetching'
+  orEndpointErr.value = ''
+  orEndpoints.value = []
+  try {
+    const raw = await invoke<Record<string, unknown>>('fetch_openrouter_endpoints', {
+      providerId: selectedId.value,
+      modelId: modelId.trim(),
+    })
+    // Response: { data: { endpoints: [...] } }
+    const eps = (raw?.data as Record<string, unknown>)?.endpoints as unknown[] | undefined
+    if (Array.isArray(eps) && eps.length > 0) {
+      orEndpoints.value = eps.map((e: unknown) => {
+        const ep = e as Record<string, unknown>
+        return {
+          name: String(ep.name ?? ep.provider_name ?? ''),
+          quantization: ep.quantization ? String(ep.quantization) : null,
+          context_length: ep.context_length as number | undefined,
+        }
+      }).filter(ep => ep.name)
+      orEndpointStatus.value = 'ok'
+    } else {
+      orEndpointStatus.value = 'fail'
+      orEndpointErr.value = '未找到 provider 数据，请手动输入'
+    }
+  } catch (e) {
+    orEndpointStatus.value = 'fail'
+    orEndpointErr.value = `获取失败，请手动输入（${e}）`
+  }
+}
+
+function toggleOrProvider(name: string, form: ModelForm) {
+  const idx = form.provider_order.indexOf(name)
+  if (idx >= 0) {
+    form.provider_order.splice(idx, 1)
+  } else {
+    form.provider_order.push(name)
+  }
+}
 
 // ── Default model ─────────────────────────────────────────────────────────────
 
@@ -1209,6 +1273,53 @@ function inputValue(e: Event): string {
                         </button>
                       </div>
                     </div>
+
+                    <!-- OpenRouter provider selection -->
+                    <div v-if="isOpenRouterProvider" class="or-provider-section">
+                      <div class="or-provider-header">
+                        <span class="capability-label">Provider 偏好</span>
+                        <button
+                          class="btn-ghost xs"
+                          :disabled="orEndpointStatus === 'fetching'"
+                          @click="fetchOrEndpoints(editModelForm.id)"
+                        >{{ orEndpointStatus === 'fetching' ? '获取中…' : '从 OpenRouter 获取' }}</button>
+                      </div>
+                      <!-- Fetched endpoint list -->
+                      <template v-if="orEndpointStatus === 'ok' && orEndpoints.length > 0">
+                        <div class="or-provider-hint">勾选并排序：排在前面的优先使用（不勾则 OpenRouter 自动选择）</div>
+                        <div class="or-endpoint-list">
+                          <label
+                            v-for="ep in orEndpoints"
+                            :key="ep.name"
+                            class="or-endpoint-item"
+                            :class="{ active: editModelForm.provider_order.includes(ep.name) }"
+                          >
+                            <input
+                              type="checkbox"
+                              :checked="editModelForm.provider_order.includes(ep.name)"
+                              @change="toggleOrProvider(ep.name, editModelForm)"
+                            />
+                            <span class="or-ep-name">{{ ep.name }}</span>
+                            <span v-if="ep.quantization" class="or-ep-quant">{{ ep.quantization.toUpperCase() }}</span>
+                            <span v-if="editModelForm.provider_order.includes(ep.name)" class="or-ep-rank">
+                              #{{ editModelForm.provider_order.indexOf(ep.name) + 1 }}
+                            </span>
+                          </label>
+                        </div>
+                      </template>
+                      <!-- Fetch failed / not tried: text input fallback -->
+                      <template v-else>
+                        <div v-if="orEndpointErr" class="or-endpoint-err">{{ orEndpointErr }}</div>
+                        <div class="or-provider-manual">
+                          <input
+                            class="text-input sm"
+                            placeholder="Anthropic, Together, … （逗号分隔，按优先级排列）"
+                            :value="editModelForm.provider_order.join(', ')"
+                            @change="(e) => editModelForm.provider_order = (e.target as HTMLInputElement).value.split(',').map(s => s.trim()).filter(Boolean)"
+                          />
+                        </div>
+                      </template>
+                    </div>
                   </div>
                 </div>
               </template>
@@ -1229,6 +1340,9 @@ function inputValue(e: Event): string {
                       <span v-if="m.input_price_per_million != null || m.output_price_per_million != null" class="price-hint">
                         <span v-if="m.input_price_per_million != null">入 ¥{{ m.input_price_per_million }}/M</span>
                         <span v-if="m.output_price_per_million != null">出 ¥{{ m.output_price_per_million }}/M</span>
+                      </span>
+                      <span v-if="m.provider_order && m.provider_order.length > 0" class="provider-order-hint" :title="m.provider_order.join(' → ')">
+                        Provider: {{ m.provider_order.slice(0, 2).join(' → ') }}{{ m.provider_order.length > 2 ? ' …' : '' }}
                       </span>
                     </div>
                   </div>
@@ -2093,6 +2207,81 @@ function inputValue(e: Event): string {
   font-size: 11px; color: var(--text-tertiary);
 }
 .price-hint span { white-space: nowrap; }
+
+.provider-order-hint {
+  font-size: 11px;
+  color: var(--accent, #6366f1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.or-provider-section {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-default, #e5e7eb);
+  padding-top: 10px;
+}
+.or-provider-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.btn-ghost.xs {
+  font-size: 11px;
+  padding: 2px 8px;
+  height: auto;
+}
+.or-provider-hint {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-bottom: 6px;
+}
+.or-endpoint-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.or-endpoint-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  border: 1px solid transparent;
+  transition: background 0.1s;
+}
+.or-endpoint-item:hover { background: var(--bg-hover, #f3f4f6); }
+.or-endpoint-item.active { border-color: var(--accent, #6366f1); background: var(--accent-light, #eef2ff); }
+.or-endpoint-item input[type="checkbox"] { flex-shrink: 0; accent-color: var(--accent, #6366f1); }
+.or-ep-name { flex: 1; font-weight: 500; color: var(--text-primary); }
+.or-ep-quant {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-secondary, #f9fafb);
+  border: 1px solid var(--border-default, #e5e7eb);
+  color: var(--text-secondary);
+  font-family: monospace;
+}
+.or-ep-rank {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent, #6366f1);
+  min-width: 20px;
+  text-align: right;
+}
+.or-endpoint-err {
+  font-size: 11px;
+  color: var(--error, #ef4444);
+  margin-bottom: 6px;
+}
+.or-provider-manual input { width: 100%; }
 
 .cap-badge {
   font-size: 11px;

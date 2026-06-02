@@ -382,6 +382,9 @@ pub struct AiModel {
     /// CNY price per 1 million output tokens
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_price_per_million: Option<f64>,
+    /// OpenRouter provider preference order (slugs like "Anthropic", "Together", etc.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_order: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -823,7 +826,15 @@ pub struct CanvasEdge {
     /// Downstream node (arrow tip).
     pub to_node_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_width: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

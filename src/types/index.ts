@@ -147,6 +147,7 @@ export interface AiModel {
   enabled: boolean
   input_price_per_million?: number   // CNY per 1M input tokens
   output_price_per_million?: number  // CNY per 1M output tokens
+  provider_order?: string[]          // OpenRouter provider preference order
 }
 
 export interface AiProviderInfo {
@@ -366,6 +367,8 @@ export interface CanvasEdge {
   edge_id: string
   from_node_id: string
   to_node_id: string
+  source_handle?: string
+  target_handle?: string
   label?: string
   color?: string
   stroke_width?: number

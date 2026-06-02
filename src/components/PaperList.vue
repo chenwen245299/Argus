@@ -1234,7 +1234,7 @@ async function reExtract(item: PaperIndexEntry) {
 /* ── Column header ─────────────────────────────────────────────────────────── */
 .header-shell {
   position: relative;
-  height: 28px;
+  height: 40px;
   flex-shrink: 0;
   padding-right: 70px;
   background: var(--bg-secondary);
@@ -1252,7 +1252,7 @@ async function reExtract(item: PaperIndexEntry) {
   display: grid;
   grid-template-columns: v-bind(gridCols);
   align-items: stretch;
-  height: 28px;
+  height: 40px;
   min-width: v-bind(tableWidthPx);
   width: max(100%, v-bind(tableWidthPx));
   background: var(--bg-secondary);

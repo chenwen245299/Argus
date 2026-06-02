@@ -130,7 +130,7 @@ async function translateSelection() {
   if (!selectionPopup.value) return
   const { x, y, text } = selectionPopup.value
   selectionPopup.value = null
-  translatePopup.value = { x, y: y + 44, sourceText: text, loading: true, result: '', error: '' }
+  translatePopup.value = { x, y, sourceText: text, loading: true, result: '', error: '' }
   try {
     const result = await invoke<string>('translate_text', { text })
     if (translatePopup.value) {
@@ -851,9 +851,11 @@ function onWheel(e: WheelEvent) {
 // ── Text selection → highlight creation ──────────────────────────────────────
 function onWindowMouseUp(e: MouseEvent) {
   // Dismiss popups on outside click
-  if ((e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup')) return
+  if ((e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup, .translate-popup')) return
   hlNotePopup.value = null
-  hlColorPopup.value = null
+  translatePopup.value = null
+  // Right-click releases the contextmenu that just opened hlColorPopup — don't dismiss it
+  if (e.button !== 2) hlColorPopup.value = null
 
   const sel = window.getSelection()
   if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
@@ -915,6 +917,20 @@ function createHighlight(color?: string) {
 }
 
 // ── Highlight popup actions ───────────────────────────────────────────────────
+async function translateHighlight(hlId: string) {
+  const hl = reader.highlights.find(h => h.id === hlId)
+  if (!hl || !hlColorPopup.value) return
+  const { x, y } = hlColorPopup.value
+  hlColorPopup.value = null
+  translatePopup.value = { x, y: y + 4, sourceText: hl.text, loading: true, result: '', error: '' }
+  try {
+    const result = await invoke<string>('translate_text', { text: hl.text })
+    if (translatePopup.value) { translatePopup.value.loading = false; translatePopup.value.result = result }
+  } catch (e) {
+    if (translatePopup.value) { translatePopup.value.loading = false; translatePopup.value.error = String(e) }
+  }
+}
+
 function deleteHighlight(id: string) {
   reader.removeHighlight(id)
   hlColorPopup.value = null
@@ -1147,6 +1163,7 @@ function hexToRgba(hex: string, alpha: number): string {
         />
       </div>
       <div class="hl-popup-divider" />
+      <button class="hl-action-btn" @click="translateHighlight(hlColorPopup!.hlId)">{{ t('pdf.translate') }}</button>
       <button class="hl-action-btn danger" @click="deleteHighlight(hlColorPopup!.hlId)">{{ t('pdf.delete') }}</button>
     </div>
 

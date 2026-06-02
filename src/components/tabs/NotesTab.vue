@@ -318,7 +318,9 @@ function fmtDate(iso: string) {
 .list-toolbar {
   display: flex;
   align-items: center;
-  padding: 6px 10px 6px 12px;
+  height: 40px;
+  padding: 0 10px 0 12px;
+  background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
   gap: 6px;

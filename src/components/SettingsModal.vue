@@ -258,6 +258,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
   overflow-y: auto;
   min-width: 0;
   position: relative;
+  display: flex;
+  flex-direction: column;
   background: color-mix(in srgb, var(--bg-primary) 96%, var(--bg-secondary));
   color: var(--text-primary);
 }

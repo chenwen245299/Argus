@@ -1,0 +1,887 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PaperMeta {
+    pub id: String,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub year: Option<u32>,
+    pub doi: Option<String>,
+    pub arxiv_id: Option<String>,
+    pub venue: Option<String>,
+    pub tags: Vec<String>,
+    pub added_at: String,
+    pub original_filename: Option<String>,
+    /// User-controlled reading status: "unread" | "reading" | "read"
+    #[serde(default = "default_reading_status")]
+    pub reading_status: String,
+    /// AI-generated short abstract for this paper.
+    #[serde(rename = "abstract", default, skip_serializing_if = "Option::is_none")]
+    pub paper_abstract: Option<String>,
+    /// User-provided BibTeX citation entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bibtex: Option<String>,
+    /// Note IDs pinned to canvas hover for this paper (empty = show most recent).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub canvas_notes: Vec<String>,
+}
+
+fn default_reading_status() -> String {
+    "unread".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PaperStatus {
+    pub text_extracted: bool,
+    pub ai_summary_done: bool,
+    pub vectorized: bool,
+    pub metadata_fetched: bool,
+    pub last_updated: String,
+    #[serde(default)]
+    pub cli_analyzed: bool,
+}
+
+impl Default for PaperStatus {
+    fn default() -> Self {
+        PaperStatus {
+            text_extracted: false,
+            ai_summary_done: false,
+            vectorized: false,
+            metadata_fetched: false,
+            last_updated: chrono::Utc::now().to_rfc3339(),
+            cli_analyzed: false,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ReadingState {
+    pub page: u32,
+    pub scroll_ratio: f32,
+    pub updated_at: String,
+}
+
+impl Default for ReadingState {
+    fn default() -> Self {
+        ReadingState {
+            page: 1,
+            scroll_ratio: 0.0,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Highlight {
+    pub id: String,
+    pub page: u32,
+    pub rects: Vec<Rect>,
+    pub text: String,
+    pub color: String,
+    pub note: Option<String>,
+    pub created_at: String,
+    #[serde(default = "default_highlight_style")]
+    pub style: String,
+}
+
+fn default_highlight_style() -> String {
+    "highlight".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Cached index entry — index.json is a rebuildable cache, so extra fields like `tags` are fine.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PaperIndexEntry {
+    pub slug: String,
+    pub id: String,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub year: Option<u32>,
+    #[serde(default)]
+    pub venue: Option<String>,
+    pub tags: Vec<String>,
+    pub status: PaperStatus,
+    pub added_at: String,
+    #[serde(default = "default_reading_status_entry")]
+    pub reading_status: String,
+    /// Unix seconds of meta.json when last indexed — used by incremental scan to skip unchanged files.
+    /// Old index.json files deserialize this as 0, causing a one-time re-read to populate it.
+    #[serde(default)]
+    pub meta_mtime: u64,
+}
+
+fn default_reading_status_entry() -> String {
+    "unread".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LibraryConfig {
+    pub version: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IndexFile {
+    pub papers: Vec<PaperIndexEntry>,
+}
+
+// ── Multi-Notes ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Note {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ── M4: Collections ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Collection {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    pub parent_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Assignment {
+    pub paper_id: String,
+    pub collection_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CollectionsFile {
+    pub collections: Vec<Collection>,
+    pub assignments: Vec<Assignment>,
+}
+
+impl Default for CollectionsFile {
+    fn default() -> Self {
+        CollectionsFile {
+            collections: vec![],
+            assignments: vec![],
+        }
+    }
+}
+
+// ── M4: App Settings ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AppSettings {
+    pub appearance: String,
+    pub extraction_default: String,
+    /// AI provider ID to use for metadata extraction (None = default)
+    #[serde(default)]
+    pub metadata_ai_provider_id: Option<String>,
+    /// AI model ID to use for metadata extraction (None = default)
+    #[serde(default)]
+    pub metadata_ai_model_id: Option<String>,
+    /// User-editable prompt template for AI metadata extraction.
+    #[serde(default = "default_metadata_ai_prompt")]
+    pub metadata_ai_prompt: String,
+    /// AI provider ID to use for paper summaries (None = default)
+    #[serde(default)]
+    pub ai_summary_provider_id: Option<String>,
+    /// AI model ID to use for paper summaries (None = default)
+    #[serde(default)]
+    pub ai_summary_model_id: Option<String>,
+    /// User-editable prompt template for AI paper summaries.
+    #[serde(default = "default_ai_summary_prompt")]
+    pub ai_summary_prompt: String,
+    /// AI provider ID to use for abstract extraction (None = default)
+    #[serde(default)]
+    pub abstract_ai_provider_id: Option<String>,
+    /// AI model ID to use for abstract extraction (None = default)
+    #[serde(default)]
+    pub abstract_ai_model_id: Option<String>,
+    /// User-editable prompt for AI abstract extraction.
+    #[serde(default = "default_abstract_ai_prompt")]
+    pub abstract_ai_prompt: String,
+}
+
+pub fn default_metadata_ai_prompt() -> String {
+    r#"Extract academic paper metadata from the text below.
+Do NOT guess or infer missing fields — use null for anything not explicitly found in the text.
+Reply with a JSON code block in exactly this format:
+
+```json
+{"title": "...", "authors": ["First Last", "First Last"], "year": 2024, "venue": "...", "doi": "...", "arxiv_id": "..."}
+```
+
+Text:
+{text}"#
+        .to_string()
+}
+
+pub fn default_ai_summary_prompt() -> String {
+    "帮我用中文讲一下这篇论文，讲的越详细越好，我有这个领域的通用基础，但是没有这个小方向的基础。输出的时候只包含关于论文的讲解，不要包含寒暄的内容。开始时先用一段话总结这篇论文的核心内容。请用markdown形式输出你的讲解内容。"
+        .to_string()
+}
+
+pub fn legacy_ai_summary_prompt_plain_detail() -> String {
+    "帮我用中文讲一下这篇论文，讲的越详细越好，我有这个领域的通用基础，但是没有这个小方向的基础。输出的时候只包含关于论文的讲解，不要包含寒暄的内容。开始时先用一段话总结这篇论文的核心内容。"
+        .to_string()
+}
+
+pub fn legacy_ai_summary_prompt_fulltext_detail() -> String {
+    r#"你是一名严谨的研究助理。请只根据下面的论文全文，用中文写一份 Markdown 格式的 AI 总结。
+
+目标读者是没有读过这篇论文的人；读完后应能完整理解这篇论文做了什么、为什么重要、怎么做、实验结果如何、有什么局限和可借鉴点。
+
+要求：
+- 不要编造全文中没有的信息；如果某项信息在论文全文中没有找到，请明确写“论文中未找到明确说明”
+- 保留关键术语、方法名、数据集名和指标名
+- 结论要具体，避免泛泛而谈
+- 如果全文被截断，请基于可见内容总结，并说明可能不完整
+
+请使用以下结构：
+# AI 总结
+## 一句话概括
+## 研究背景与问题
+## 核心创新点
+- 列出 3-5 点，并解释每一点为什么重要
+## 方法详解
+- 详细说明模型、算法、系统设计、数据流程或理论推导
+- 解释关键公式、模块或实验设计背后的直觉
+## 实验设置
+- 数据集、基线方法、评价指标、训练/实现细节
+## 主要结果
+- 总结最关键的定量和定性结果
+- 对比基线，解释结果说明了什么
+## 局限与注意点
+## 适合引用的结论
+## 延伸阅读或实践启发
+
+论文全文：
+{fulltext}"#
+        .to_string()
+}
+
+pub fn legacy_ai_summary_prompt_with_metadata() -> String {
+    r#"你是一名严谨的研究助理。请根据下面的论文全文和元数据，用中文写一份 Markdown 格式的 AI 总结。
+
+目标读者是没有读过这篇论文的人；读完后应能完整理解这篇论文做了什么、为什么重要、怎么做、实验结果如何、有什么局限和可借鉴点。不要编造文本中没有的信息；如果某项信息在论文中没有找到，请明确写“论文中未找到明确说明”。
+
+请使用以下结构：
+# AI 总结
+## 一句话概括
+## 研究背景与问题
+## 核心创新点
+- 列出 3-5 点，并解释每一点为什么重要
+## 方法详解
+- 详细说明模型、算法、系统设计、数据流程或理论推导
+- 解释关键公式、模块或实验设计背后的直觉
+## 实验设置
+- 数据集、基线方法、评价指标、训练/实现细节
+## 主要结果
+- 总结最关键的定量和定性结果
+- 对比基线，解释结果说明了什么
+## 局限与注意点
+## 适合引用的结论
+## 延伸阅读或实践启发
+
+论文元数据：
+标题：{title}
+作者：{authors}
+年份：{year}
+期刊/会议：{venue}
+DOI：{doi}
+arXiv：{arxiv_id}
+摘要：{abstract}
+
+论文全文：
+{fulltext}"#
+        .to_string()
+}
+
+pub fn default_abstract_ai_prompt() -> String {
+    "请只从下面给定的论文原文片段中抽取作者原文的 Abstract/摘要段落。\n\
+要求：\n\
+- 只输出从原文中找到的摘要正文，不要生成、改写、翻译或概括\n\
+- 去掉“Abstract”“摘要”等标题词，只保留摘要正文\n\
+- 如果给定文本中没有明确的摘要段落，请只输出 NOT_FOUND\n\
+- 不要输出解释、Markdown、代码块或额外格式\n\n\
+论文原文片段：\n{fulltext}"
+        .to_string()
+}
+
+pub fn legacy_abstract_ai_prompt_generated() -> String {
+    "请根据以下论文全文，用中文写一段简洁的摘要（3-5句话），概括论文的研究问题、核心方法和主要发现。只输出摘要正文，不要包含标题或额外格式。\n\n论文全文：\n{fulltext}"
+        .to_string()
+}
+
+pub fn is_legacy_abstract_ai_prompt(prompt: &str) -> bool {
+    prompt.trim() == legacy_abstract_ai_prompt_generated().trim()
+}
+
+pub fn is_legacy_ai_summary_prompt(prompt: &str) -> bool {
+    let prompt = prompt.trim();
+    prompt == legacy_ai_summary_prompt_with_metadata().trim()
+        || prompt == legacy_ai_summary_prompt_fulltext_detail().trim()
+        || prompt == legacy_ai_summary_prompt_plain_detail().trim()
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        AppSettings {
+            appearance: "system".to_string(),
+            extraction_default: "lopdf".to_string(),
+            metadata_ai_provider_id: None,
+            metadata_ai_model_id: None,
+            metadata_ai_prompt: default_metadata_ai_prompt(),
+            ai_summary_provider_id: None,
+            ai_summary_model_id: None,
+            ai_summary_prompt: default_ai_summary_prompt(),
+            abstract_ai_provider_id: None,
+            abstract_ai_model_id: None,
+            abstract_ai_prompt: default_abstract_ai_prompt(),
+        }
+    }
+}
+
+// ── M4: Search ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SearchHit {
+    pub paper_id: String,
+    pub slug: String,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub snippet: String,
+}
+
+// ── M5: AI Service Center ─────────────────────────────────────────────────────
+
+fn bool_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AiModel {
+    pub id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub context_length: Option<u64>,
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// CNY price per 1 million input tokens
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_price_per_million: Option<f64>,
+    /// CNY price per 1 million output tokens
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_price_per_million: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AiProvider {
+    pub id: String,
+    pub name: String,
+    pub kind: String, // "openai_compatible" | "anthropic"
+    pub base_url: String,
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub models: Vec<AiModel>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AiSettings {
+    #[serde(default)]
+    pub providers: Vec<AiProvider>,
+    pub default_provider_id: Option<String>,
+    pub default_model_id: Option<String>,
+}
+
+/// Returned to frontend — never includes the raw API key.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AiProviderInfo {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub enabled: bool,
+    pub has_key: bool,
+    pub models: Vec<AiModel>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AiSettingsInfo {
+    pub providers: Vec<AiProviderInfo>,
+    pub default_provider_id: Option<String>,
+    pub default_model_id: Option<String>,
+}
+
+/// Input struct for add/update (id = None means new provider).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AiProviderInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub enabled: bool,
+    pub models: Vec<AiModel>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+// ── M6: CLI Tools ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CliTool {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args_template: Vec<String>,
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub detected: bool,
+    pub version: Option<String>,
+}
+
+fn default_polish_prompt() -> String {
+    "以下是 CLI 工具的原始输出内容。请将其转换为整洁的 Markdown 格式。\
+     保持所有内容完全一致，不要新增、删除或修改任何信息。\
+     只进行格式优化：代码片段用正确语言标签的围栏代码块包裹，\
+     数学公式用 LaTeX 格式表示（行内用 $...$，独立公式用 $$...$$）。\
+     只输出格式化后的 Markdown，不要输出其他任何内容。".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CliOutputPolish {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default = "default_polish_prompt")]
+    pub prompt: String,
+}
+
+impl Default for CliOutputPolish {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider_id: String::new(),
+            model_id: String::new(),
+            prompt: default_polish_prompt(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct CliSettings {
+    #[serde(default)]
+    pub tools: Vec<CliTool>,
+    #[serde(default)]
+    pub prompt_templates: Vec<CliPromptTemplate>,
+    #[serde(default)]
+    pub polish: CliOutputPolish,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CliPromptTemplate {
+    pub id: String,
+    pub name: String,
+    pub prompt_template: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CliAnalysisEntry {
+    pub filename: String,
+    pub name: String,
+    pub created_at: String,
+    pub path: String,
+}
+
+// ── M7: RAG / Vectorization ──────────────────────────────────────────────────
+
+/// RAG configuration. Both `provider_id` and `embedding_model` must be `Some` and non-empty
+/// before any vectorization or retrieval can proceed — the app never substitutes a default.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RagSettings {
+    pub provider_id: Option<String>,
+    pub embedding_model: Option<String>,
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size: usize,
+    #[serde(default = "default_chunk_overlap")]
+    pub chunk_overlap: usize,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+}
+
+fn default_chunk_size() -> usize {
+    1024
+}
+fn default_chunk_overlap() -> usize {
+    200
+}
+fn default_top_k() -> usize {
+    5
+}
+
+impl RagSettings {
+    pub fn is_configured(&self) -> bool {
+        self.enabled
+            && self
+                .provider_id
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+            && self
+                .embedding_model
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+    }
+}
+
+impl Default for RagSettings {
+    fn default() -> Self {
+        RagSettings {
+            provider_id: None,
+            embedding_model: None,
+            chunk_size: 1024,
+            chunk_overlap: 200,
+            top_k: 5,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VectorsMeta {
+    pub provider_id: String,
+    pub embedding_model: String,
+    pub dimension: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VectorStoreInfo {
+    pub total_chunks: usize,
+    pub unique_papers: usize,
+    pub dimension: Option<usize>,
+    pub provider_id: Option<String>,
+    pub embedding_model: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetrievedChunk {
+    pub chunk_id: String,
+    pub paper_id: String,
+    pub slug: String,
+    pub chunk_index: u32,
+    pub text: String,
+    pub score: f32,
+    pub paper_title: String,
+    /// "text" | "metadata" | "highlight" | "note"
+    pub source_type: String,
+    pub source_id: Option<String>,
+    /// Human-readable label, e.g. "第3页批注" or "笔记: 我的想法"
+    pub source_label: Option<String>,
+}
+
+// ── Vectorize pipeline (frontend-orchestrated) ───────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HighlightInput {
+    pub id: String,
+    pub page: u32,
+    pub text: String,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NoteInput {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+}
+
+/// Raw content returned to frontend so it can chunk via LlamaIndex SentenceSplitter.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PaperVectorizeInput {
+    pub paper_id: String,
+    pub paper_title: String,
+    /// Pre-formatted metadata string ready to embed as a single chunk.
+    pub meta_text: String,
+    /// Full extracted text (may be empty if not extracted yet).
+    pub fulltext: String,
+    pub highlights: Vec<HighlightInput>,
+    pub notes: Vec<NoteInput>,
+}
+
+/// A single pre-chunked piece of text sent from frontend back to Rust for embedding.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChunkInput {
+    pub text: String,
+    pub source_type: String,
+    pub source_id: Option<String>,
+    pub source_label: Option<String>,
+}
+
+// ── M8: arXiv Auto-Tracking ──────────────────────────────────────────────────
+
+pub const DEFAULT_ARXIV_ANALYSIS_PROMPT: &str = r#"你是一名研究助理。根据以下论文元数据，评估其与这些主题的相关性：{topics}。
+
+论文标题：{title}
+作者：{authors}
+摘要：{abstract}
+
+提供（所有文字字段必须使用中文）：
+1. relevance_score：整数 0-10（10 = 高度相关），有一个话题符合就算是相关了，也就是至少要6分以上
+2. relevance_reason：一句话解释评分原因
+3. key_contributions：2-3 个主要贡献的要点列表
+4. summary：2-3 句通俗易懂的总结
+5. matched_topics：从上方主题列表中选出与本文最匹配的主题，返回中文列表（无匹配则返回空列表）
+
+仅回复符合此模式的有效 JSON：
+{"relevance_score": 0, "relevance_reason": "", "key_contributions": [], "summary": "", "matched_topics": []}"#;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ArxivConfig {
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub auto_fetch_enabled: bool,
+    #[serde(default = "default_interval_days")]
+    pub interval_days: u32,
+    #[serde(default = "default_fetch_time")]
+    pub fetch_time: String,
+    #[serde(default = "default_days_back")]
+    pub days_back: u32,
+    #[serde(default = "default_max_fetch")]
+    pub max_fetch: u32,
+    #[serde(default)]
+    pub ai_analysis_enabled: bool,
+    #[serde(default = "default_arxiv_analysis_prompt")]
+    pub ai_analysis_prompt: String,
+    #[serde(default = "default_ai_filter_enabled")]
+    pub ai_filter_enabled: bool,
+    #[serde(default = "default_ai_filter_threshold")]
+    pub ai_filter_threshold: f32,
+    pub ai_provider_id: Option<String>,
+    pub ai_model_id: Option<String>,
+    pub last_fetch_date: Option<String>,
+}
+
+fn default_interval_days() -> u32 {
+    1
+}
+fn default_fetch_time() -> String {
+    "09:00".to_string()
+}
+fn default_days_back() -> u32 {
+    5
+}
+fn default_max_fetch() -> u32 {
+    100
+}
+fn default_arxiv_analysis_prompt() -> String {
+    DEFAULT_ARXIV_ANALYSIS_PROMPT.to_string()
+}
+fn default_ai_filter_enabled() -> bool {
+    true
+}
+fn default_ai_filter_threshold() -> f32 {
+    6.0
+}
+
+impl Default for ArxivConfig {
+    fn default() -> Self {
+        ArxivConfig {
+            categories: vec![],
+            keywords: vec![],
+            auto_fetch_enabled: false,
+            interval_days: 1,
+            fetch_time: "09:00".to_string(),
+            days_back: 5,
+            max_fetch: 100,
+            ai_analysis_enabled: false,
+            ai_analysis_prompt: DEFAULT_ARXIV_ANALYSIS_PROMPT.to_string(),
+            ai_filter_enabled: true,
+            ai_filter_threshold: 6.0,
+            ai_provider_id: None,
+            ai_model_id: None,
+            last_fetch_date: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ArxivPaper {
+    pub arxiv_id: String,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub summary: String,
+    pub categories: Vec<String>,
+    pub published: String,
+    pub updated: String,
+    pub pdf_url: String,
+    pub abs_url: String,
+    pub relevance_score: Option<f32>,
+    pub relevance_reason: Option<String>,
+    #[serde(default)]
+    pub key_contributions: Vec<String>,
+    #[serde(default)]
+    pub analysis_summary: Option<String>,
+    #[serde(default)]
+    pub matched_topics: Vec<String>,
+    #[serde(default = "default_analysis_status")]
+    pub analysis_status: String,
+    #[serde(default)]
+    pub in_library: bool,
+    pub fetched_at: String,
+    #[serde(default)]
+    pub read: bool,
+    #[serde(default)]
+    pub rating: u8,
+}
+
+fn default_analysis_status() -> String {
+    "pending".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ArxivScheduleStatus {
+    pub auto_fetch_enabled: bool,
+    pub last_fetch_date: Option<String>,
+    pub next_scheduled: Option<String>,
+    pub fetching: bool,
+    pub analyzing: bool,
+    pub analyzed_count: u32,
+    pub total_pending: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ArxivInbox {
+    #[serde(default)]
+    pub papers: Vec<ArxivPaper>,
+    pub last_updated: String,
+}
+
+// ── M9: Canvas ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Viewport {
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub zoom: f64,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Viewport {
+            offset_x: 0.0,
+            offset_y: 0.0,
+            zoom: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CanvasNode {
+    pub node_id: String,
+    pub paper_id: String,
+    pub x: f64,
+    pub y: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Node-level override for hover content source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hover_source: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CanvasEdge {
+    pub edge_id: String,
+    /// Upstream node (arrow origin).
+    pub from_node_id: String,
+    /// Downstream node (arrow tip).
+    pub to_node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Canvas {
+    pub id: String,
+    pub name: String,
+    pub nodes: Vec<CanvasNode>,
+    pub edges: Vec<CanvasEdge>,
+    #[serde(default)]
+    pub viewport: Viewport,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CanvasIndexEntry {
+    pub id: String,
+    pub name: String,
+    pub node_count: u32,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CanvasSettings {
+    /// Global default hover content source:
+    /// "notes" | "summary" | "abstract" | "none"
+    #[serde(default = "default_hover_content_source")]
+    pub hover_content_source: String,
+}
+
+fn default_hover_content_source() -> String {
+    "notes".to_string()
+}
+
+impl Default for CanvasSettings {
+    fn default() -> Self {
+        CanvasSettings {
+            hover_content_source: default_hover_content_source(),
+        }
+    }
+}
+
+// ── M10: Canvas Enhance ────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SuggestedEdge {
+    pub from_paper_id: String,
+    pub to_paper_id: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NodePosition {
+    pub node_id: String,
+    pub x: f64,
+    pub y: f64,
+}

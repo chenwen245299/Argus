@@ -1,0 +1,20 @@
+node_modules/
+dist/
+.DS_Store
+
+src-tauri/target/
+src-tauri/gen/
+
+# Claude Code memory (local AI assistant context — not for public repo)
+.claude/
+
+# Stray duplicate lock files
+package-lock\ 2.json
+
+# Environment variables (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# macOS
+__MACOSX/

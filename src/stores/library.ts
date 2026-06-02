@@ -1,0 +1,129 @@
+import { defineStore } from 'pinia'
+import { ref, computed } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import type { LibraryConfig, PaperIndexEntry } from '../types'
+import { useReaderStore } from './reader'
+
+export const useLibraryStore = defineStore('library', () => {
+  const currentPath = ref<string | null>(null)
+  const papers = ref<PaperIndexEntry[]>([])
+  const isCheckingLibrary = ref(true)
+  const isRestoringLibrary = ref(false)
+  const isLoading = ref(false)
+  const isRefreshing = ref(false)
+  const error = ref<string | null>(null)
+
+  const allTags = computed(() => {
+    const set = new Set<string>()
+    papers.value.forEach(p => p.tags?.forEach(t => set.add(t)))
+    return [...set].sort()
+  })
+
+  async function initialize() {
+    isCheckingLibrary.value = true
+    isRestoringLibrary.value = false
+    try {
+      const path = await invoke<string | null>('get_current_library')
+      isCheckingLibrary.value = false
+      if (path) {
+        isRestoringLibrary.value = true
+        await openLibrary(path)
+      }
+    } catch (e) {
+      console.error('Failed to restore last library:', e)
+    } finally {
+      isCheckingLibrary.value = false
+      isRestoringLibrary.value = false
+    }
+  }
+
+  async function pickAndOpen() {
+    try {
+      const path = await invoke<string>('pick_library_folder')
+      await openLibrary(path)
+    } catch (e: unknown) {
+      const msg = e as string
+      if (msg !== 'cancelled') error.value = msg
+    }
+  }
+
+  async function openLibrary(path: string) {
+    isLoading.value = true
+    error.value = null
+    try {
+      await invoke<LibraryConfig>('open_library', { root: path })
+      currentPath.value = path
+
+      // Phase 1: instant display from index.json cache (best-effort — silently skipped if unavailable)
+      try {
+        const cached = await invoke<PaperIndexEntry[]>('load_library_cache')
+        if (cached.length > 0) {
+          papers.value = cached
+          isLoading.value = false  // UI usable immediately
+        }
+      } catch {
+        // No cache yet or command unavailable — Phase 2 will do a full scan
+      }
+
+      // Phase 2: incremental background scan (always runs, updates any changes)
+      _backgroundScan()
+    } catch (e) {
+      error.value = String(e)
+      isLoading.value = false
+    }
+  }
+
+  async function _backgroundScan() {
+    if (!currentPath.value) return
+    isRefreshing.value = true
+    try {
+      const fresh = await invoke<PaperIndexEntry[]>('scan_library')
+      papers.value = fresh
+      const reader = useReaderStore()
+      const slugs = new Set(fresh.map(p => p.slug))
+      reader.pruneStaleTabs(slugs)
+    } catch (e) {
+      console.error('[library] background scan failed:', e)
+    } finally {
+      isRefreshing.value = false
+      isLoading.value = false
+    }
+  }
+
+  function removePaper(slug: string) {
+    papers.value = papers.value.filter(p => p.slug !== slug)
+  }
+
+  async function refresh() {
+    if (!currentPath.value) return
+    isRefreshing.value = true
+    try {
+      const fresh = await invoke<PaperIndexEntry[]>('scan_library')
+      papers.value = fresh
+      const reader = useReaderStore()
+      const slugs = new Set(fresh.map(p => p.slug))
+      reader.pruneStaleTabs(slugs)
+    } catch (e) {
+      error.value = String(e)
+    } finally {
+      isRefreshing.value = false
+      isLoading.value = false
+    }
+  }
+
+  return {
+    currentPath,
+    papers,
+    isCheckingLibrary,
+    isRestoringLibrary,
+    isLoading,
+    isRefreshing,
+    error,
+    allTags,
+    initialize,
+    pickAndOpen,
+    openLibrary,
+    removePaper,
+    refresh,
+  }
+})

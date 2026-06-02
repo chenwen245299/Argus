@@ -1,0 +1,26 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Argus default capability",
+  "windows": ["main", "arxiv", "canvas", "library-chat", "paper-ai"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-size",
+    "dialog:default",
+    "dialog:allow-open",
+    "store:default",
+    "store:allow-get",
+    "store:allow-set",
+    "store:allow-save",
+    "store:allow-load",
+    "http:default",
+    {
+      "identifier": "http:allow-fetch",
+      "allow": [{ "url": "https://export.arxiv.org/**" }]
+    },
+    "updater:default",
+    "updater:allow-check",
+    "updater:allow-download-and-install"
+  ]
+}

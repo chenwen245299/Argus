@@ -1,0 +1,21 @@
+Argus
+Copyright (c) 2026 chenwen245299
+
+This software includes third-party components with the following licenses:
+
+--------------------------------------------------------------------------------
+AI Provider & Model Icons
+--------------------------------------------------------------------------------
+The SVG icons under src/assets/providers/ and src/assets/models/ are derived
+from @lobehub/icons (https://github.com/lobehub/lobe-icons).
+
+Copyright (c) 2023 LobeHub (https://github.com/lobehub)
+Licensed under the Apache License, Version 2.0
+https://github.com/lobehub/lobe-icons/blob/master/LICENSE
+
+The icons are trademarks or registered trademarks of their respective owners
+(OpenAI, Anthropic, Google, Microsoft, ByteDance, Alibaba, Tencent, etc.).
+They are used here solely to identify the corresponding AI services and do not
+imply endorsement by or affiliation with those companies.
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,220 @@
+name: Release App
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不含 v 前缀，如 1.2.0）'
+        required: true
+        type: string
+
+jobs:
+  create-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create-release.outputs.result }}
+      release_body: ${{ steps.tag-message.outputs.message }}
+      tag_name: ${{ steps.tag-name.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine tag name
+        id: tag-name
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get tag message
+        id: tag-message
+        shell: bash
+        run: |
+          TAG_NAME=${{ steps.tag-name.outputs.tag }}
+          MESSAGE=$(git tag -l --format='%(contents)' "$TAG_NAME")
+          if [ -z "$MESSAGE" ]; then
+            MESSAGE="See commit history for changes."
+          fi
+          {
+            echo "message<<EOF"
+            echo "$MESSAGE"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create release
+        id: create-release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_BODY: ${{ steps.tag-message.outputs.message }}
+          TAG_NAME: ${{ steps.tag-name.outputs.tag }}
+        with:
+          script: |
+            const tagName = process.env.TAG_NAME;
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tagName,
+              name: tagName,
+              body: process.env.RELEASE_BODY,
+              draft: true,
+              prerelease: false,
+              target_commitish: context.sha,
+            })
+            return data.id
+
+  build-tauri:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Sync version and enable bundle
+        shell: bash
+        run: |
+          TAG=${{ needs.create-release.outputs.tag_name }}
+          VERSION=${TAG#v}
+          tmp=$(mktemp)
+          jq --arg v "$VERSION" '.version = $v | .bundle.active = true | .bundle.createUpdaterArtifacts = true' src-tauri/tauri.conf.json > "$tmp" && mv "$tmp" src-tauri/tauri.conf.json
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Remove lock file and node_modules (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: rm -rf node_modules package-lock.json
+
+      - name: Ensure icon.ico exists (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "src-tauri/icons/icon.ico")) {
+            Write-Host "icon.ico missing, generating from icon.png..."
+            magick "src-tauri/icons/icon.png" -define icon:auto-resize="256,128,64,48,32,16" "src-tauri/icons/icon.ico"
+          } else {
+            Write-Host "icon.ico OK"
+          }
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: npm install
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          releaseBody: ${{ needs.create-release.outputs.release_body }}
+
+  publish-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    needs: [create-release, build-tauri]
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.create-release.outputs.tag_name }}
+    steps:
+      - name: Generate latest.json
+        env:
+          RELEASE_BODY: ${{ needs.create-release.outputs.release_body }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess, urllib.request, datetime
+
+          tag     = os.environ['TAG']
+          version = tag.lstrip('v')
+          token   = os.environ['GH_TOKEN']
+          notes   = os.environ.get('RELEASE_BODY', '')
+
+          # Fetch all release assets via gh CLI
+          result = subprocess.run(
+              ['gh', 'release', 'view', tag, '--json', 'assets'],
+              capture_output=True, text=True, check=True
+          )
+          assets = json.loads(result.stdout)['assets']
+
+          # Download every .sig file
+          sigs = {}
+          for a in assets:
+              if not a['name'].endswith('.sig'):
+                  continue
+              base = a['name'][:-4]
+              req = urllib.request.Request(
+                  a['browser_download_url'],
+                  headers={'Authorization': f'token {token}', 'Accept': 'application/octet-stream'}
+              )
+              with urllib.request.urlopen(req) as r:
+                  sigs[base] = r.read().decode().strip()
+
+          if not sigs:
+              print('::warning::No .sig files found — TAURI_SIGNING_PRIVATE_KEY may not be set in GitHub Secrets.')
+
+          # Match bundles to signatures
+          platforms = {}
+          for a in assets:
+              name = a['name']
+              url  = a['browser_download_url']
+              if name not in sigs:
+                  continue
+              sig = sigs[name]
+              if name.endswith('.app.tar.gz'):
+                  key = 'darwin-aarch64' if 'aarch64' in name else 'darwin-x86_64'
+                  platforms[key] = {'signature': sig, 'url': url}
+              elif name.endswith('.nsis.zip'):
+                  platforms['windows-x86_64'] = {'signature': sig, 'url': url}
+              elif name.endswith('.msi.zip'):
+                  platforms.setdefault('windows-x86_64', {'signature': sig, 'url': url})
+
+          manifest = {
+              'version': version,
+              'notes':   notes,
+              'pub_date': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'platforms': platforms,
+          }
+          with open('latest.json', 'w') as f:
+              json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+          print(json.dumps(manifest, indent=2, ensure_ascii=False))
+          PYEOF
+
+          gh release upload "$TAG" latest.json --clobber
+
+      - name: Publish release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: ${{ needs.create-release.outputs.release_id }},
+              draft: false,
+            })

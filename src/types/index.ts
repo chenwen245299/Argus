@@ -367,6 +367,8 @@ export interface CanvasEdge {
   from_node_id: string
   to_node_id: string
   label?: string
+  color?: string
+  stroke_width?: number
 }
 
 export interface Canvas {

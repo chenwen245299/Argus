@@ -14,12 +14,12 @@ mod library;
 mod llm;
 mod metadata;
 mod models;
-mod openreview;
 mod paper;
 mod rag;
 mod search;
 mod settings;
 mod token_usage;
+mod url_import;
 
 use std::sync::Mutex;
 use tauri::Manager;

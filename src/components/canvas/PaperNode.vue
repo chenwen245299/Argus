@@ -25,10 +25,18 @@ const authorsShort = computed(() => {
 
 const nodeStyle = computed(() => {
   if (props.data.color) {
-    return { borderColor: props.data.color, boxShadow: `0 0 0 2px ${props.data.color}22` }
+    return {
+      borderColor: props.data.color,
+      background: `${props.data.color}18`,
+      boxShadow: `0 0 0 2px ${props.data.color}28`,
+    }
   }
   return {}
 })
+
+const accentBarStyle = computed(() =>
+  props.data.color ? { background: props.data.color } : null
+)
 </script>
 
 <template>
@@ -37,6 +45,9 @@ const nodeStyle = computed(() => {
     :class="{ 'paper-node--selected': selected, 'paper-node--invalid': !data.valid }"
     :style="nodeStyle"
   >
+    <!-- Color accent bar -->
+    <div v-if="accentBarStyle" class="node-color-bar" :style="accentBarStyle" />
+
     <!-- Source handles: right + bottom (this node as upstream) -->
     <Handle id="src-right" type="source" :position="Position.Right" class="node-handle" />
     <Handle id="src-bottom" type="source" :position="Position.Bottom" class="node-handle" />
@@ -62,7 +73,8 @@ const nodeStyle = computed(() => {
   background: var(--bg-primary, #fff);
   border: 1.5px solid var(--border-default, #d1d5db);
   border-radius: 10px;
-  padding: 10px 12px;
+  padding: 10px 12px 10px 16px;
+  overflow: hidden;
   cursor: default;
   box-shadow: 0 1px 4px rgba(0,0,0,0.08);
   transition: border-color 0.15s, box-shadow 0.15s;
@@ -83,6 +95,15 @@ const nodeStyle = computed(() => {
   opacity: 0.55;
   border-color: #ef4444 !important;
   background: #fef2f2;
+}
+
+.node-color-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: 10px 0 0 10px;
 }
 
 .node-invalid-badge {

@@ -1270,12 +1270,17 @@ pub fn open_arxiv_window(app: &tauri::AppHandle) -> Result<(), String> {
     let (width, height) =
         load_arxiv_window_size(app).unwrap_or((ARXIV_DEFAULT_WINDOW_W, ARXIV_DEFAULT_WINDOW_H));
 
-    let win = WebviewWindowBuilder::new(app, "arxiv", WebviewUrl::App(std::path::PathBuf::from("/")))
+    let builder = WebviewWindowBuilder::new(app, "arxiv", WebviewUrl::App(std::path::PathBuf::from("/")))
         .title("Argus — arXiv")
-        .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .hidden_title(true)
         .inner_size(width, height)
-        .min_inner_size(ARXIV_MIN_WINDOW_W, ARXIV_MIN_WINDOW_H)
+        .min_inner_size(ARXIV_MIN_WINDOW_W, ARXIV_MIN_WINDOW_H);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
+
+    let win = builder
         .build()
         .map_err(|e| format!("Open arXiv window: {e}"))?;
 

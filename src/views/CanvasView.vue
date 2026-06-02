@@ -185,17 +185,23 @@ function buildVfNodes(cnodes: CNode[]): VfNode[] {
 }
 
 function buildVfEdges(cedges: CEdge[]): VfEdge[] {
-  return cedges.map(ce => ({
-    id: ce.edge_id,
-    source: ce.from_node_id,
-    target: ce.to_node_id,
-    label: ce.label,
-    markerEnd: MarkerType.ArrowClosed,
-    style: { strokeWidth: 1.8 },
-    labelStyle: { fontSize: '11px' },
-    labelBgStyle: { fill: 'var(--bg-primary)', fillOpacity: 0.9 },
-    type: 'smoothstep',
-  } satisfies VfEdge))
+  return cedges.map(ce => {
+    const sw = ce.stroke_width ?? 1.8
+    const style: { strokeWidth: number; stroke?: string } = { strokeWidth: sw }
+    if (ce.color) style.stroke = ce.color
+    return {
+      id: ce.edge_id,
+      source: ce.from_node_id,
+      target: ce.to_node_id,
+      label: ce.label,
+      markerEnd: ce.color ? { type: MarkerType.ArrowClosed, color: ce.color } : MarkerType.ArrowClosed,
+      style,
+      labelStyle: { fontSize: '11px' },
+      labelBgStyle: { fill: 'var(--bg-primary)', fillOpacity: 0.9 },
+      type: 'smoothstep',
+      data: { edgeColor: ce.color, edgeStrokeWidth: sw },
+    } satisfies VfEdge
+  })
 }
 
 function extractCanvasNodes(): CNode[] {
@@ -210,12 +216,18 @@ function extractCanvasNodes(): CNode[] {
 }
 
 function extractCanvasEdges(): CEdge[] {
-  return (edges.value as VfEdge[]).map((e): CEdge => ({
-    edge_id: e.id,
-    from_node_id: e.source,
-    to_node_id: e.target,
-    label: typeof e.label === 'string' ? e.label || undefined : undefined,
-  }))
+  return (edges.value as VfEdge[]).map((e): CEdge => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const d = e.data as any
+    return {
+      edge_id: e.id,
+      from_node_id: e.source,
+      to_node_id: e.target,
+      label: typeof e.label === 'string' ? e.label || undefined : undefined,
+      color: d?.edgeColor || undefined,
+      stroke_width: d?.edgeStrokeWidth !== 1.8 ? d?.edgeStrokeWidth : undefined,
+    }
+  })
 }
 
 // ── Load canvas ───────────────────────────────────────────────────────────────
@@ -278,6 +290,7 @@ onConnect((params: Connection) => {
     type: 'smoothstep',
     labelStyle: { fontSize: '11px' },
     labelBgStyle: { fill: 'var(--bg-primary)', fillOpacity: 0.9 },
+    data: { edgeStrokeWidth: 1.8 },
   }
   addEdges([newEdge])
   triggerSave()
@@ -508,6 +521,88 @@ function commitEdgeLabel() {
   triggerSave()
 }
 
+// ── Node / Edge shared color palette ─────────────────────────────────────────
+
+const COLOR_PALETTE = [
+  { label: '默认', value: undefined as string | undefined },
+  { label: '蓝色', value: '#3b82f6' },
+  { label: '绿色', value: '#22c55e' },
+  { label: '琥珀', value: '#f59e0b' },
+  { label: '红色', value: '#ef4444' },
+  { label: '紫色', value: '#a855f7' },
+  { label: '灰色', value: '#9ca3af' },
+]
+
+const EDGE_WIDTHS = [
+  { label: '细', value: 1 },
+  { label: '中', value: 1.8 },
+  { label: '粗', value: 3.5 },
+]
+
+const ctxCurrentEdgeData = computed(() => {
+  const id = ctxMenu.value.edgeId
+  if (!id) return { color: undefined as string | undefined, strokeWidth: 1.8 }
+  const edge = edges.value.find(e => e.id === id)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const d = edge?.data as any
+  return { color: d?.edgeColor as string | undefined, strokeWidth: d?.edgeStrokeWidth ?? 1.8 }
+})
+
+function ctxSetEdgeColor(color: string | undefined) {
+  const edgeId = ctxMenu.value.edgeId
+  if (!edgeId) return
+  edges.value = edges.value.map(e => {
+    if (e.id !== edgeId) return e
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const style = { ...(e.style as any) }
+    if (color) style.stroke = color
+    else delete style.stroke
+    return {
+      ...e,
+      style,
+      markerEnd: color ? { type: MarkerType.ArrowClosed, color } : MarkerType.ArrowClosed,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      data: { ...(e.data as any), edgeColor: color },
+    }
+  })
+  triggerSave()
+}
+
+function ctxSetEdgeStrokeWidth(w: number) {
+  const edgeId = ctxMenu.value.edgeId
+  if (!edgeId) return
+  edges.value = edges.value.map(e => {
+    if (e.id !== edgeId) return e
+    return {
+      ...e,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      style: { ...(e.style as any), strokeWidth: w },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      data: { ...(e.data as any), edgeStrokeWidth: w },
+    }
+  })
+  triggerSave()
+}
+
+// ── Node color ────────────────────────────────────────────────────────────────
+
+const ctxCurrentNodeColor = computed(() => {
+  const id = ctxMenu.value.nodeId
+  if (!id) return undefined as string | undefined
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (nodes.value.find(n => n.id === id)?.data as any)?.color as string | undefined
+})
+
+function ctxSetNodeColor(color: string | undefined) {
+  const nodeId = ctxMenu.value.nodeId
+  if (!nodeId) return
+  nodes.value = nodes.value.map(n => {
+    if (n.id !== nodeId) return n
+    return { ...n, data: { ...n.data, color } }
+  })
+  triggerSave()
+}
+
 // ── M10: Accept suggestion as real edge ───────────────────────────────────────
 function acceptSuggestion(s: SuggestedEdge) {
   const fromNode = (nodes.value as any[]).find(n => n.data?.paperId === s.from_paper_id)
@@ -524,7 +619,7 @@ function acceptSuggestion(s: SuggestedEdge) {
     labelStyle: { fontSize: '11px' },
     labelBgStyle: { fill: 'var(--bg-primary)', fillOpacity: 0.9 },
     label: '',
-    data: {},
+    data: { edgeStrokeWidth: 1.8 },
   }
   addEdges([newEdge])
   triggerSave()
@@ -1022,6 +1117,29 @@ watch(() => library.papers, () => {
       >
         <!-- Node context -->
         <template v-if="ctxMenu.nodeId">
+          <!-- Node color picker -->
+          <div class="ctx-style-section">
+            <span class="ctx-style-label">颜色</span>
+            <div class="ctx-color-row">
+              <button
+                v-for="c in COLOR_PALETTE"
+                :key="String(c.value)"
+                class="ctx-color-swatch"
+                :class="{ 'ctx-color-swatch--active': ctxCurrentNodeColor === c.value }"
+                :title="c.label"
+                :style="c.value ? { background: c.value } : {}"
+                @click="ctxSetNodeColor(c.value)"
+              >
+                <template v-if="!c.value">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                    <circle cx="8" cy="8" r="6" stroke="var(--accent)" stroke-width="1.5"/>
+                    <line x1="3" y1="3" x2="13" y2="13" stroke="var(--accent)" stroke-width="1.5"/>
+                  </svg>
+                </template>
+              </button>
+            </div>
+          </div>
+          <div class="ctx-divider" />
           <button class="ctx-item" @click="ctxOpenInMain">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
@@ -1040,6 +1158,42 @@ watch(() => library.papers, () => {
         </template>
         <!-- Edge context -->
         <template v-if="ctxMenu.edgeId">
+          <!-- Color swatches -->
+          <div class="ctx-style-section">
+            <span class="ctx-style-label">颜色</span>
+            <div class="ctx-color-row">
+              <button
+                v-for="c in COLOR_PALETTE"
+                :key="String(c.value)"
+                class="ctx-color-swatch"
+                :class="{ 'ctx-color-swatch--active': ctxCurrentEdgeData.color === c.value }"
+                :title="c.label"
+                :style="c.value ? { background: c.value } : {}"
+                @click="ctxSetEdgeColor(c.value)"
+              >
+                <template v-if="!c.value">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                    <circle cx="8" cy="8" r="6" stroke="var(--accent)" stroke-width="1.5"/>
+                    <line x1="3" y1="3" x2="13" y2="13" stroke="var(--accent)" stroke-width="1.5"/>
+                  </svg>
+                </template>
+              </button>
+            </div>
+          </div>
+          <!-- Stroke width -->
+          <div class="ctx-style-section">
+            <span class="ctx-style-label">粗细</span>
+            <div class="ctx-width-row">
+              <button
+                v-for="w in EDGE_WIDTHS"
+                :key="w.value"
+                class="ctx-width-btn"
+                :class="{ 'ctx-width-btn--active': Math.abs(ctxCurrentEdgeData.strokeWidth - w.value) < 0.1 }"
+                @click="ctxSetEdgeStrokeWidth(w.value)"
+              >{{ w.label }}</button>
+            </div>
+          </div>
+          <div class="ctx-divider" />
           <button class="ctx-item" @click="ctxEditEdgeLabel">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
@@ -1612,6 +1766,63 @@ watch(() => library.papers, () => {
   height: 1px;
   background: var(--border-subtle, #e5e7eb);
   margin: 3px 0;
+}
+
+/* Edge style controls inside context menu */
+.ctx-style-section {
+  padding: 5px 10px 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ctx-style-label {
+  font-size: 11px;
+  color: var(--text-tertiary, #9ca3af);
+  width: 24px;
+  flex-shrink: 0;
+}
+
+.ctx-color-row {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.ctx-color-swatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.1s, border-color 0.1s;
+  flex-shrink: 0;
+  background: var(--bg-secondary, #f3f4f6);
+}
+.ctx-color-swatch:hover { transform: scale(1.2); }
+.ctx-color-swatch--active { border-color: var(--text-primary, #111); }
+
+.ctx-width-row {
+  display: flex;
+  gap: 4px;
+}
+
+.ctx-width-btn {
+  padding: 2px 9px;
+  font-size: 11px;
+  border: 1px solid var(--border-default, #d1d5db);
+  border-radius: 4px;
+  color: var(--text-secondary, #6b7280);
+  background: var(--bg-primary, #fff);
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.ctx-width-btn:hover { background: var(--bg-hover, #f3f4f6); color: var(--text-primary, #111); }
+.ctx-width-btn--active {
+  background: var(--accent-light, #e0e7ff);
+  color: var(--accent, #6366f1);
+  border-color: var(--accent, #6366f1);
 }
 
 /* ── Edge label dialog ────────────────────────────────── */

@@ -10,8 +10,8 @@ use crate::models::{
 use crate::LibraryRoot;
 use crate::{
     ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas, canvas_enhance, cli_manager,
-    cli_runner, collections, copilot, extraction, library, llm, metadata, openreview, paper, rag,
-    search, settings,
+    cli_runner, collections, copilot, extraction, library, llm, metadata, paper, rag,
+    search, settings, url_import,
 };
 // ── Library management ────────────────────────────────────────────────────────
 
@@ -1769,14 +1769,7 @@ pub async fn import_paper_url(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
-    let u = url.trim().to_lowercase();
-
-    if u.contains("openreview.net") {
-        openreview::import_by_url(&root, &url, &collection_id, &app).await
-    } else {
-        // Default: arXiv (handles arxiv.org URLs and bare IDs)
-        arxiv::import_by_url(&root, &url, &collection_id, &app).await
-    }
+    url_import::import_by_url(&root, &url, &collection_id, &app).await
 }
 
 // Keep old command for backward compat

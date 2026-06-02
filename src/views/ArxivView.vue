@@ -368,7 +368,8 @@ function jumpToDate(dateStr: string) {
 <template>
   <div class="arxiv-view">
     <!-- Top bar -->
-    <div class="arxiv-topbar">
+    <div class="arxiv-topbar" data-tauri-drag-region>
+      <div class="tl-space" data-tauri-drag-region />
       <div class="topbar-left">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="topbar-icon">
           <path d="M12 2L2 7l10 5 10-5-10-5z"/>
@@ -844,13 +845,14 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 14px;
+  padding: 0 14px 0 0;
   height: 46px;
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-secondary);
   flex-shrink: 0;
   gap: 12px;
 }
+.tl-space { width: 76px; flex-shrink: 0; }
 .topbar-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .topbar-icon { color: var(--accent); flex-shrink: 0; }
 .topbar-title { font-size: 14px; font-weight: 600; white-space: nowrap; }
@@ -1435,7 +1437,7 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 
 .arxiv-topbar {
   height: 52px;
-  padding: 0 18px;
+  padding: 0 18px 0 0;
   background: color-mix(in srgb, var(--bg-primary) 88%, var(--bg-secondary));
   border-bottom-color: color-mix(in srgb, var(--border-subtle) 72%, var(--text-tertiary));
 }

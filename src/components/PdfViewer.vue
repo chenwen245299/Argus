@@ -37,14 +37,14 @@ function zoomStorageKey(slug: string) {
   return `argus:pdf-zoom:${slug}`
 }
 
-function loadSavedZoom(slug: string): number {
+function loadSavedZoom(slug: string): number | null {
   try {
     const saved = Number(localStorage.getItem(zoomStorageKey(slug)))
-    if (Number.isFinite(saved)) return Math.max(0.5, Math.min(4, saved))
+    if (Number.isFinite(saved) && saved > 0) return Math.max(0.5, Math.min(4, saved))
   } catch {
-    // Ignore storage errors and keep the default zoom.
+    // Ignore storage errors.
   }
-  return 1.25
+  return null // no saved zoom → caller should fitWidth
 }
 
 function saveZoom() {
@@ -76,6 +76,7 @@ const COLORS = computed(() => [
   { label: t('pdf.blue'),   value: '#90CAF9' },
   { label: t('pdf.pink'),   value: '#F48FB1' },
   { label: t('pdf.orange'), value: '#FFCC80' },
+  { label: t('pdf.purple'), value: '#CE93D8' },
 ])
 
 // Debounce timer for reading state
@@ -120,7 +121,7 @@ async function loadPdf() {
   error.value = null
   const slug = reader.openSlug
   if (!slug) return
-  scale.value = loadSavedZoom(slug)
+  scale.value = loadSavedZoom(slug) ?? 1.0 // temporary; replaced by fitWidth below if no saved zoom
 
   // Load highlights and reading state
   try {
@@ -171,6 +172,9 @@ async function loadPdf() {
 
     loading.value = false
     await nextTick()
+
+    // If no saved zoom, default to fit-width instead of a fixed scale
+    if (loadSavedZoom(slug) === null) fitWidth()
 
     setupObserver()
     await restorePosition()

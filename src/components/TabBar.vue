@@ -17,46 +17,47 @@ const appWindow = getCurrentWebviewWindow()
 let unlistenResize: UnlistenFn | null = null
 let refreshTimers: number[] = []
 
-// ── Tab drag-and-drop ─────────────────────────────────────────────────────────
+// ── Tab drag-and-drop (pointer-based, avoids macOS native DnD green +) ────────
 const dragFrom = ref<number | null>(null)
-const dropAt = ref<number | null>(null) // insert-before index
+const dropAt = ref<number | null>(null)
+const tabsScrollRef = ref<HTMLElement | null>(null)
 
-function onDragStart(e: DragEvent, idx: number) {
-  dragFrom.value = idx
-  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
-}
+function onTabMouseDown(e: MouseEvent, idx: number) {
+  if (e.button !== 0) return
+  if ((e.target as HTMLElement).closest('.tab-close')) return
 
-function onDragOver(e: DragEvent, idx: number) {
-  e.preventDefault()
-  if (dragFrom.value === null) return
-  const el = e.currentTarget as HTMLElement
-  const { left, width } = el.getBoundingClientRect()
-  dropAt.value = e.clientX < left + width / 2 ? idx : idx + 1
-}
+  const startX = e.clientX
+  let dragging = false
 
-function onScrollDragOver(e: DragEvent) {
-  e.preventDefault()
-}
-
-function onDrop(e: DragEvent) {
-  e.preventDefault()
-  if (dragFrom.value !== null && dropAt.value !== null) {
-    reader.reorderTabs(dragFrom.value, dropAt.value)
+  const onMove = (ev: MouseEvent) => {
+    if (!dragging) {
+      if (Math.abs(ev.clientX - startX) < 5) return
+      dragging = true
+      dragFrom.value = idx
+    }
+    // Find drop position from live tab positions
+    const tabs = tabsScrollRef.value?.querySelectorAll<HTMLElement>('.tab:not(.tab-home)')
+    if (!tabs) return
+    let di = reader.tabs.length
+    tabs.forEach((el, i) => {
+      const { left, width } = el.getBoundingClientRect()
+      if (ev.clientX < left + width / 2 && i < di) di = i
+    })
+    dropAt.value = di
   }
-  dragFrom.value = null
-  dropAt.value = null
-}
 
-function onDragEnd() {
-  dragFrom.value = null
-  dropAt.value = null
-}
-
-function onScrollDragLeave(e: DragEvent) {
-  const el = e.currentTarget as HTMLElement
-  if (!el.contains(e.relatedTarget as Node)) {
+  const onUp = () => {
+    document.removeEventListener('mousemove', onMove)
+    document.removeEventListener('mouseup', onUp)
+    if (dragging && dragFrom.value !== null && dropAt.value !== null) {
+      reader.reorderTabs(dragFrom.value, dropAt.value)
+    }
+    dragFrom.value = null
     dropAt.value = null
   }
+
+  document.addEventListener('mousemove', onMove)
+  document.addEventListener('mouseup', onUp)
 }
 
 const homeTitle = computed(() => {
@@ -114,12 +115,7 @@ onUnmounted(() => {
     <div class="tl-space" data-tauri-drag-region @mousedown="startDrag" />
 
     <!-- Tabs -->
-    <div
-      class="tabs-scroll"
-      @dragover="onScrollDragOver"
-      @drop="onDrop"
-      @dragleave="onScrollDragLeave"
-    >
+    <div ref="tabsScrollRef" class="tabs-scroll">
       <!-- Permanent home tab (current collection, cannot be closed) -->
       <div
         class="tab tab-home"
@@ -147,13 +143,9 @@ onUnmounted(() => {
           'drop-before': dropAt === idx && dragFrom !== idx,
           'drop-after': dropAt === idx + 1 && dragFrom !== idx,
         }"
-        draggable="true"
         :title="titleInitialCaps(tab.title)"
         @click="reader.switchTab(tab.slug)"
-        @dragstart="onDragStart($event, idx)"
-        @dragover.stop="onDragOver($event, idx)"
-        @drop.stop="onDrop"
-        @dragend="onDragEnd"
+        @mousedown="onTabMouseDown($event, idx)"
       >
         <svg class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>

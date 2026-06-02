@@ -405,11 +405,26 @@ pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: Option<&str>) -> Resul
         let _ = win.emit("paper-ai-slug", slug.to_string());
     }
 
+    let app_handle = app.clone();
+    win.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let Some(w) = app_handle.get_webview_window("paper-ai") {
+                if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+                    save_paper_ai_window_size(
+                        &app_handle,
+                        phys.width as f64 / sf,
+                        phys.height as f64 / sf,
+                    );
+                }
+            }
+        }
+    });
+
     Ok(())
 }
 
 pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
-    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
     if let Some(win) = app.get_webview_window("library-chat") {
         let _ = win.set_focus();
@@ -419,16 +434,38 @@ pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
     let (width, height) =
         load_library_chat_window_size(app).unwrap_or((DEFAULT_WINDOW_W, DEFAULT_WINDOW_H));
 
-    WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         "library-chat",
         WebviewUrl::App(std::path::PathBuf::from("/")),
     )
     .title("Argus — 智能问答")
     .inner_size(width, height)
-    .min_inner_size(560.0, 400.0)
-    .build()
-    .map_err(|e| format!("Open library chat window: {e}"))?;
+    .min_inner_size(560.0, 400.0);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
+
+    let win = builder
+        .build()
+        .map_err(|e| format!("Open library chat window: {e}"))?;
+
+    let app_handle = app.clone();
+    win.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { .. } = event {
+            if let Some(w) = app_handle.get_webview_window("library-chat") {
+                if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+                    save_library_chat_window_size(
+                        &app_handle,
+                        phys.width as f64 / sf,
+                        phys.height as f64 / sf,
+                    );
+                }
+            }
+        }
+    });
 
     Ok(())
 }

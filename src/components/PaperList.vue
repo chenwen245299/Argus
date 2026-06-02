@@ -376,10 +376,10 @@ watch(() => selection.activeCollectionId, async (id) => {
   collectionPapers.value = await collectionsStore.listPapersInCollection(id)
 }, { immediate: true })
 
-watch(() => collectionsStore.file.assignments.length, async () => {
+watch(() => collectionsStore.file.assignments, async () => {
   if (selection.activeCollectionId)
     collectionPapers.value = await collectionsStore.listPapersInCollection(selection.activeCollectionId)
-})
+}, { deep: true })
 
 // ── Filtered / sorted list ────────────────────────────────────────────────────
 const filtered = computed<PaperIndexEntry[]>(() => {
@@ -598,6 +598,8 @@ async function deletePaper(item: PaperIndexEntry) {
   try {
     await invoke('delete_paper', { slug: item.slug })
     library.removePaper(item.slug)
+    collectionsStore.file.assignments = collectionsStore.file.assignments.filter(a => a.paper_id !== item.id)
+    collectionPapers.value = collectionPapers.value.filter(p => p.slug !== item.slug)
     if (selection.selectedSlug === item.slug) selection.selectPaper('')
     if (reader.openSlug === item.slug) reader.closePaper()
     library.refresh()

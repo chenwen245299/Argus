@@ -50,6 +50,7 @@ async function syncMissing() {
   syncCancelRequested = false
   const papers = unvectorizedPapers.value.slice()
   syncProgress.value = { done: 0, total: papers.length, failed: 0 }
+  emitTo('main', 'rag-embed-progress', { syncing: true, done: 0, total: papers.length }).catch(() => {})
 
   const s = ragStore.settings
   let done = 0, failed = 0
@@ -66,8 +67,10 @@ async function syncMissing() {
       done++
     } catch { failed++ }
     syncProgress.value = { done, total: papers.length, failed }
+    emitTo('main', 'rag-embed-progress', { syncing: true, done, total: papers.length }).catch(() => {})
   }
   syncingMissing.value = false
+  emitTo('main', 'rag-embed-progress', { syncing: false, done, total: papers.length }).catch(() => {})
   await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts()])
 }
 
@@ -371,15 +374,15 @@ function toggleSources(msgId: string) {
 function isSourcesExpanded(msgId: string) { return expandedSources.value.includes(msgId) }
 
 async function openSourcePaper(group: GroupedSource) {
-  await emitTo('main', 'argus-open-paper', {
-    slug: group.slug,
-    title: group.paper_title,
-  }).catch(() => {})
   try {
     const mainWindow = await Window.getByLabel('main')
     await mainWindow?.show()
     await mainWindow?.setFocus()
   } catch {}
+  await emitTo('main', 'argus-open-paper', {
+    slug: group.slug,
+    title: group.paper_title,
+  }).catch(() => {})
 }
 
 function userMsgCount(conv: LibraryConversation) {
@@ -740,7 +743,8 @@ onUnmounted(() => {
       <div class="lc-main">
 
         <!-- Header -->
-        <div class="chat-header">
+        <div class="chat-header" data-tauri-drag-region>
+          <div class="tl-space" data-tauri-drag-region />
           <div class="header-left">
             <button class="sidebar-toggle-btn" @click="sidebarOpen = !sidebarOpen" :title="sidebarOpen ? '收起' : '展开'">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -777,6 +781,25 @@ onUnmounted(() => {
 
             <!-- RAG configured: show vectorization status + sync button -->
             <template v-else>
+              <!-- Syncing progress (left of refresh button) -->
+              <span v-if="syncingMissing" class="rag-sync-progress">
+                {{ syncProgress.done }}/{{ syncProgress.total }}
+              </span>
+
+              <!-- Refresh button (moved to left) -->
+              <button
+                class="rag-refresh-btn"
+                :class="{ refreshing: refreshingCounts || syncingMissing }"
+                title="刷新嵌入状态"
+                :disabled="refreshingCounts || syncingMissing"
+                @click="refreshCounts"
+              >
+                <svg width="13" height="13" viewBox="-1 -1 26 26" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="overflow:visible">
+                  <polyline points="23 4 23 10 17 10"/>
+                  <path d="M20.49 15A9 9 0 1 1 23 10"/>
+                </svg>
+              </button>
+
               <div class="rag-counter" title="向量库：已嵌入论文 / 总论文数">
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
                   <ellipse cx="12" cy="5" rx="9" ry="3"/>
@@ -786,11 +809,8 @@ onUnmounted(() => {
                 <span class="rag-counter-text">{{ vectorizedCount }}/{{ allPapers.length }}</span>
               </div>
 
-              <!-- Syncing in progress -->
+              <!-- Syncing: cancel button -->
               <template v-if="syncingMissing">
-                <span class="rag-sync-progress">
-                  {{ syncProgress.done }}/{{ syncProgress.total }}
-                </span>
                 <button class="rag-sync-cancel" @click="syncCancelRequested = true" title="取消同步">
                   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                     <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
@@ -798,7 +818,7 @@ onUnmounted(() => {
                 </button>
               </template>
 
-              <!-- Sync missing / all-done button (always visible when not syncing) -->
+              <!-- Sync missing / all-done button -->
               <button
                 v-else
                 class="rag-sync-btn"
@@ -807,7 +827,6 @@ onUnmounted(() => {
                 :disabled="unvectorizedPapers.length === 0"
                 @click="syncMissing"
               >
-                <!-- upload cloud icon when pending; check icon when all done -->
                 <svg v-if="unvectorizedPapers.length > 0" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                   <polyline points="16 16 12 12 8 16"/>
                   <line x1="12" y1="12" x2="12" y2="21"/>
@@ -817,20 +836,6 @@ onUnmounted(() => {
                   <polyline points="20 6 9 17 4 12"/>
                 </svg>
                 {{ unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇` : '已全部嵌入' }}
-              </button>
-
-              <!-- Refresh button -->
-              <button
-                class="rag-refresh-btn"
-                :class="{ refreshing: refreshingCounts }"
-                title="刷新嵌入状态"
-                :disabled="refreshingCounts"
-                @click="refreshCounts"
-              >
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                  <polyline points="23 4 23 10 17 10"/>
-                  <path d="M20.49 15A9 9 0 1 1 23 10"/>
-                </svg>
               </button>
             </template>
 
@@ -1279,11 +1284,12 @@ onUnmounted(() => {
   justify-content: space-between;
   gap: 12px;
   min-height: 64px;
-  padding: 0 22px;
+  padding: 0 22px 0 0;
   border-bottom: 1px solid var(--border-subtle);
   background: color-mix(in srgb, var(--bg-primary) 88%, var(--bg-secondary));
   flex-shrink: 0;
 }
+.chat-header .tl-space { width: 76px; flex-shrink: 0; }
 
 .header-left {
   display: flex;

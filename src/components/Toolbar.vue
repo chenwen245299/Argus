@@ -289,6 +289,27 @@ let unlistenArxivFetch: UnlistenFn | null = null
 let labelToggleTimer: ReturnType<typeof setInterval> | null = null
 let statusPollTimer: ReturnType<typeof setInterval> | null = null
 
+// RAG embed progress state
+const ragEmbedSyncing = ref(false)
+const ragEmbedProgress = ref({ done: 0, total: 0 })
+const ragLabelMode = ref<'name' | 'progress'>('name')
+let ragLabelToggleTimer: ReturnType<typeof setInterval> | null = null
+let unlistenRagEmbed: UnlistenFn | null = null
+
+watch(ragEmbedSyncing, (syncing) => {
+  if (syncing) {
+    if (!ragLabelToggleTimer) {
+      ragLabelMode.value = 'name'
+      ragLabelToggleTimer = setInterval(() => {
+        ragLabelMode.value = ragLabelMode.value === 'name' ? 'progress' : 'name'
+      }, 2200)
+    }
+  } else {
+    if (ragLabelToggleTimer) { clearInterval(ragLabelToggleTimer); ragLabelToggleTimer = null }
+    ragLabelMode.value = 'name'
+  }
+})
+
 const arxivBusy = computed(() => arxivAnalyzing.value || arxivFetching.value)
 
 watch(arxivBusy, (busy) => {
@@ -363,6 +384,10 @@ onMounted(async () => {
   })
   paperTasks.startListening()
   document.addEventListener('pointerdown', onDocClick, true)
+  unlistenRagEmbed = await listen<{ syncing: boolean; done: number; total: number }>('rag-embed-progress', (e) => {
+    ragEmbedSyncing.value = e.payload.syncing
+    ragEmbedProgress.value = { done: e.payload.done, total: e.payload.total }
+  })
   // Sync current analysis state immediately on mount (handles missed events)
   await syncArxivStatus()
   // Poll every 5 s so the indicator stays correct even if events were missed
@@ -373,7 +398,9 @@ onUnmounted(() => {
   if (unlistenArxiv) unlistenArxiv()
   if (unlistenArxivAnalysis) unlistenArxivAnalysis()
   if (unlistenArxivFetch) unlistenArxivFetch()
+  if (unlistenRagEmbed) unlistenRagEmbed()
   if (labelToggleTimer) { clearInterval(labelToggleTimer); labelToggleTimer = null }
+  if (ragLabelToggleTimer) { clearInterval(ragLabelToggleTimer); ragLabelToggleTimer = null }
   if (statusPollTimer) { clearInterval(statusPollTimer); statusPollTimer = null }
   document.removeEventListener('pointerdown', onDocClick, true)
 })
@@ -545,15 +572,28 @@ onUnmounted(() => {
     <button
       v-if="library.currentPath"
       class="tb-btn library-chat-btn rainbow-chip"
+      :class="{ 'rag-busy': ragEmbedSyncing }"
       :title="t('toolbar.libraryChatTitle')"
       @click="openLibraryChat"
     >
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
-        <path d="M8 9h8"/>
-        <path d="M8 13h5"/>
-      </svg>
-      <span class="rainbow-chip-label">{{ t('toolbar.libraryChat') }}</span>
+      <span v-if="ragEmbedSyncing" class="arxiv-pulse-dot" />
+      <Transition name="arxiv-flip" mode="out-in">
+        <span
+          v-if="ragLabelMode === 'name' || ragEmbedProgress.total === 0"
+          key="name"
+          class="arxiv-label-inner"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
+            <path d="M8 9h8"/>
+            <path d="M8 13h5"/>
+          </svg>
+          <span class="rainbow-chip-label">{{ t('toolbar.libraryChat') }}</span>
+        </span>
+        <span v-else key="progress" class="arxiv-label-inner arxiv-progress-text">
+          {{ ragEmbedProgress.done }}/{{ ragEmbedProgress.total }}
+        </span>
+      </Transition>
     </button>
 
     <div v-if="library.currentPath" class="tb-sep global-feature-sep" />
@@ -874,6 +914,9 @@ onUnmounted(() => {
 }
 
 .arxiv-btn.arxiv-busy {
+  animation: arxiv-breathe 1.8s ease-in-out infinite;
+}
+.library-chat-btn.rag-busy {
   animation: arxiv-breathe 1.8s ease-in-out infinite;
 }
 @keyframes arxiv-breathe {

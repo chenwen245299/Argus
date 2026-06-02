@@ -1114,14 +1114,15 @@ function inputValue(e: Event): string {
               </label>
             </div>
             <div class="model-form-price-row">
-              <label class="model-form-field">
-                <span>输入价格 <small>（元/百万tokens）</small></span>
+              <label class="model-form-field" :class="{ 'full-width': newModel.capabilities.includes('embedding') }">
+                <span>{{ newModel.capabilities.includes('embedding') ? '向量化价格' : '输入价格' }} <small>（元/百万tokens）</small></span>
                 <input v-model="newModel.input_price" class="text-input sm" placeholder="如 2.0" type="number" min="0" step="0.01" />
               </label>
-              <label class="model-form-field">
+              <label v-if="!newModel.capabilities.includes('embedding')" class="model-form-field">
                 <span>输出价格 <small>（元/百万tokens）</small></span>
                 <input v-model="newModel.output_price" class="text-input sm" placeholder="如 8.0" type="number" min="0" step="0.01" />
               </label>
+              <p v-else class="embedding-price-note">Embedding 模型仅计算输入 token，无输出费用</p>
             </div>
             <div class="capability-editor">
               <span class="capability-label">{{ t('aiService.capabilities') }}</span>
@@ -1184,14 +1185,15 @@ function inputValue(e: Event): string {
                       </label>
                     </div>
                     <div class="model-form-price-row">
-                      <label class="model-form-field">
-                        <span>输入价格 <small>（元/百万tokens）</small></span>
+                      <label class="model-form-field" :class="{ 'full-width': editModelForm.capabilities.includes('embedding') }">
+                        <span>{{ editModelForm.capabilities.includes('embedding') ? '向量化价格' : '输入价格' }} <small>（元/百万tokens）</small></span>
                         <input v-model="editModelForm.input_price" class="text-input sm" placeholder="如 2.0" type="number" min="0" step="0.01" />
                       </label>
-                      <label class="model-form-field">
+                      <label v-if="!editModelForm.capabilities.includes('embedding')" class="model-form-field">
                         <span>输出价格 <small>（元/百万tokens）</small></span>
                         <input v-model="editModelForm.output_price" class="text-input sm" placeholder="如 8.0" type="number" min="0" step="0.01" />
                       </label>
+                      <p v-else class="embedding-price-note">Embedding 模型仅计算输入 token，无输出费用</p>
                     </div>
                     <div class="capability-editor">
                       <span class="capability-label">{{ t('aiService.capabilities') }}</span>
@@ -1947,6 +1949,15 @@ function inputValue(e: Event): string {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   margin-top: 0;
+  align-items: end;
+}
+.model-form-field.full-width { grid-column: 1 / -1; }
+.embedding-price-note {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  align-self: center;
+  padding-bottom: 2px;
 }
 .model-form-field small { font-weight: 400; opacity: 0.72; }
 

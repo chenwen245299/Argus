@@ -708,9 +708,9 @@ watch(
 }
 .divider:hover::before,
 .divider.active::before {
-  width: 2px;
+  width: 3px;
   background: var(--accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 /* Drag overlay */

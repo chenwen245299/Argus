@@ -397,7 +397,7 @@ pub fn open_canvas_window(app: &tauri::AppHandle) -> Result<(), String> {
     let (width, height) =
         load_canvas_window_size(app).unwrap_or((CANVAS_DEFAULT_WINDOW_W, CANVAS_DEFAULT_WINDOW_H));
 
-    WebviewWindowBuilder::new(
+    let win = WebviewWindowBuilder::new(
         app,
         "canvas",
         WebviewUrl::App(std::path::PathBuf::from("/")),
@@ -407,6 +407,17 @@ pub fn open_canvas_window(app: &tauri::AppHandle) -> Result<(), String> {
     .min_inner_size(CANVAS_MIN_WINDOW_W, CANVAS_MIN_WINDOW_H)
     .build()
     .map_err(|e| format!("Open canvas window: {e}"))?;
+
+    let app_handle = app.clone();
+    win.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let Some(w) = app_handle.get_webview_window("canvas") {
+                if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+                    save_canvas_window_size(&app_handle, phys.width as f64 / sf, phys.height as f64 / sf);
+                }
+            }
+        }
+    });
 
     Ok(())
 }

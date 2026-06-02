@@ -440,10 +440,11 @@ function fmtDate(iso: string) {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 10px;
+  padding: 0 10px;
   border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
   flex-shrink: 0;
-  min-height: 36px;
+  height: 28px;
 }
 
 .back-btn {

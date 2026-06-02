@@ -6,12 +6,14 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import { useReaderStore } from '../stores/reader'
 import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
+import { useCanvasStore } from '../stores/canvas'
 import { titleInitialCaps } from '../utils/text'
 
 const { t } = useI18n()
 const reader = useReaderStore()
 const selection = useSelectionStore()
 const collections = useCollectionsStore()
+const canvasStore = useCanvasStore()
 const isFullscreenLayout = ref(false)
 const appWindow = getCurrentWebviewWindow()
 let unlistenResize: UnlistenFn | null = null
@@ -64,6 +66,16 @@ const homeTitle = computed(() => {
   if (!selection.activeCollectionId) return t('sidebar.allPapers')
   return collections.collectionById(selection.activeCollectionId)?.name ?? t('sidebar.allPapers')
 })
+
+function showHome() {
+  canvasStore.isShown = false
+  reader.showList()
+}
+
+function switchTab(slug: string) {
+  canvasStore.isShown = false
+  reader.switchTab(slug)
+}
 
 function startDrag(e: MouseEvent) {
   if (e.button === 0) appWindow.startDragging()
@@ -119,9 +131,9 @@ onUnmounted(() => {
       <!-- Permanent home tab (current collection, cannot be closed) -->
       <div
         class="tab tab-home"
-        :class="{ active: !reader.activeSlug }"
+        :class="{ active: !reader.activeSlug && !canvasStore.isShown }"
         :title="homeTitle"
-        @click="reader.showList()"
+        @click="showHome()"
       >
         <svg class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
           <rect x="3" y="3" width="8" height="8" rx="1"/>
@@ -132,19 +144,40 @@ onUnmounted(() => {
         <span class="tab-title">{{ homeTitle }}</span>
       </div>
 
+      <!-- Canvas tab (shown when a canvas is open) -->
+      <div
+        v-if="canvasStore.isShown && canvasStore.currentCanvas"
+        class="tab tab-canvas active"
+        :title="canvasStore.currentCanvas.name"
+      >
+        <svg class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <circle cx="8" cy="8" r="2.5"/><circle cx="16" cy="16" r="2.5"/>
+          <line x1="10" y1="8" x2="14" y2="16"/>
+          <circle cx="16" cy="8" r="2.5"/>
+          <line x1="10" y1="9" x2="14" y2="15"/>
+        </svg>
+        <span class="tab-title">{{ canvasStore.currentCanvas.name }}</span>
+        <button class="tab-close" @click.stop="canvasStore.isShown = false">
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
       <!-- PDF tabs -->
       <div
         v-for="(tab, idx) in reader.tabs"
         :key="tab.slug"
         class="tab"
         :class="{
-          active: tab.slug === reader.activeSlug,
+          active: tab.slug === reader.activeSlug && !canvasStore.isShown,
           'tab-dragging': dragFrom === idx,
           'drop-before': dropAt === idx && dragFrom !== idx,
           'drop-after': dropAt === idx + 1 && dragFrom !== idx,
         }"
         :title="titleInitialCaps(tab.title)"
-        @click="reader.switchTab(tab.slug)"
+        @click="switchTab(tab.slug)"
         @mousedown="onTabMouseDown($event, idx)"
       >
         <svg class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">

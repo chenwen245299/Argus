@@ -6,6 +6,7 @@ import type { Canvas, CanvasIndexEntry, CanvasSettings } from '../types'
 export const useCanvasStore = defineStore('canvas', () => {
   const canvasList = ref<CanvasIndexEntry[]>([])
   const currentCanvas = ref<Canvas | null>(null)
+  const isShown = ref(false)      // whether canvas panel is currently in the center pane
   const settings = ref<CanvasSettings>({ hover_content_source: 'notes' })
   const loading = ref(false)
   const settingsSaving = ref(false)
@@ -106,6 +107,7 @@ export const useCanvasStore = defineStore('canvas', () => {
   return {
     canvasList,
     currentCanvas,
+    isShown,
     settings,
     loading,
     settingsSaving,

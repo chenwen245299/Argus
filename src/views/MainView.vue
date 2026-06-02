@@ -12,6 +12,7 @@ import { useCollectionsStore } from '../stores/collections'
 import { useAiStore } from '../stores/ai'
 import { useCliStore } from '../stores/cli'
 import { useSelectionStore } from '../stores/selection'
+import { useCanvasStore } from '../stores/canvas'
 import Toolbar from '../components/Toolbar.vue'
 import LeftSidebar from '../components/LeftSidebar.vue'
 import PaperList from '../components/PaperList.vue'
@@ -30,6 +31,7 @@ const collectionsStore = useCollectionsStore()
 const aiStore = useAiStore()
 const cliStore = useCliStore()
 const selectionStore = useSelectionStore()
+const canvasStore = useCanvasStore()
 
 // ── Window size persistence ────────────────────────────────────────────────────
 const WIN_SIZE_KEY = 'argus:window:size'
@@ -109,13 +111,23 @@ const rightSidebarVisible = ref(loadLayoutBoolean(MAIN_RIGHT_VISIBLE_KEY, true))
 const sidebarTab = ref<string>(loadSidebarTab())
 const pdfViewerRef = ref<{ closeToList: () => void } | null>(null)
 const showCanvas = ref(false)
+
+// Sync showCanvas with canvasStore.isShown so TabBar close button works
+watch(() => canvasStore.isShown, (v) => { showCanvas.value = v })
+
 const showLibraryLoading = computed(() =>
   libraryStore.isRestoringLibrary || (!libraryStore.currentPath && libraryStore.isLoading)
 )
 
 function onOpenCanvas() {
   showCanvas.value = true
+  canvasStore.isShown = true
   rightSidebarVisible.value = true
+}
+
+function closeCanvas() {
+  showCanvas.value = false
+  canvasStore.isShown = false
 }
 
 function onCanvasSelectPaper(slug: string) {
@@ -187,6 +199,7 @@ onMounted(async () => {
     const paper = libraryStore.papers.find(p => p.slug === slug)
     selectionStore.selectPaper(slug)
     showCanvas.value = false
+    canvasStore.isShown = false
     readerStore.openPaper(slug, event.payload.title || paper?.title || slug)
     rightSidebarVisible.value = true
     if (!PAPER_TABS.includes(sidebarTab.value)) {
@@ -425,7 +438,7 @@ watch(
           v-else-if="showCanvas"
           class="center-fill"
           @select-paper="onCanvasSelectPaper"
-          @close="showCanvas = false"
+          @close="closeCanvas()"
         />
         <div v-else class="center-fill">
           <PaperList />

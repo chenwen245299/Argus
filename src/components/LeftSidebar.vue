@@ -517,7 +517,7 @@ onUnmounted(() => {
             v-for="cv in canvasStore.canvasList"
             :key="cv.id"
             class="nav-item"
-            :class="{ active: canvasStore.currentCanvas?.id === cv.id }"
+            :class="{ active: canvasStore.isShown && canvasStore.currentCanvas?.id === cv.id }"
             @click="openSpecificCanvas(cv.id)"
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

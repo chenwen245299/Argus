@@ -38,6 +38,12 @@
     "vue-router": "^4.5.0",
     "vue-virtual-scroller": "^2.0.0-beta.8"
   },
+  "overrides": {
+    "@milkdown/core": "^7.21.1",
+    "@milkdown/ctx": "^7.21.1",
+    "@milkdown/transformer": "^7.21.1",
+    "@milkdown/prose": "^7.21.1"
+  },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "@vitejs/plugin-vue": "^5.2.1",

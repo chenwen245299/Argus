@@ -295,7 +295,7 @@ fn build_openrouter_messages_with_pdf(
             "type": "file",
             "file": {
                 "filename": filename,
-                "fileData": format!("data:application/pdf;base64,{b64}")
+                "file_data": format!("data:application/pdf;base64,{b64}")
             }
         })
     });

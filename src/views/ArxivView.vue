@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalSize } from '@tauri-apps/api/dpi'
-import type { UnlistenFn } from '@tauri-apps/api/event'
+import { emitTo, type UnlistenFn } from '@tauri-apps/api/event'
 import { useArxivStore } from '../stores/arxiv'
 import { useAiStore } from '../stores/ai'
 import { useCollectionsStore } from '../stores/collections'
@@ -97,6 +97,7 @@ function openColPicker(e: MouseEvent) {
   const r = btn.getBoundingClientRect()
   colPickerStyle.value = { top: `${r.bottom + 4}px`, left: `${r.left}px` }
   showColPicker.value = true
+  collectionsStore.load()
 }
 
 // Flatten collection tree depth-first for the picker list
@@ -198,6 +199,7 @@ async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
       : ''
     addMsg.value = colName ? `已添加到「${colName}」` : '已添加到文库'
     setTimeout(() => addMsg.value = '', 3000)
+    emitTo('main', 'library-paper-added').catch(() => {})
   } catch (e) {
     addMsg.value = String(e)
   } finally {
@@ -383,8 +385,6 @@ function jumpToDate(dateStr: string) {
         </svg>
         <span class="topbar-title" data-tauri-drag-region>arXiv 推荐</span>
         <span v-if="store.loaded" class="paper-count-pill" data-tauri-drag-region>{{ store.papers.length }} 篇</span>
-      </div>
-      <div class="topbar-right">
         <div v-if="store.analyzing" class="topbar-analysis-status">
           <span class="spinner" />
           <span class="analysis-progress-text">AI 分析中 {{ store.analyzeProgress.done }}/{{ store.analyzeProgress.total }}</span>
@@ -393,6 +393,8 @@ function jumpToDate(dateStr: string) {
           </div>
           <button class="cancel-btn" @click="store.cancelAnalysis()">取消</button>
         </div>
+      </div>
+      <div class="topbar-right">
         <span v-if="store.scheduleStatus?.auto_fetch_enabled" class="auto-badge" data-tauri-drag-region>
           <span class="auto-dot" />
           自动抓取已开启
@@ -850,7 +852,7 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   display: flex;
   align-items: center;
   padding: 0 14px 0 0;
-  height: 52px;
+  height: 44px;
   border-bottom: 1px solid var(--border-subtle);
   background: color-mix(in srgb, var(--bg-primary) 85%, var(--bg-secondary));
   flex-shrink: 0;
@@ -1446,7 +1448,7 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 }
 
 .arxiv-topbar {
-  height: 52px;
+  height: 44px;
   padding: 0 18px 0 0;
   background: color-mix(in srgb, var(--bg-primary) 88%, var(--bg-secondary));
   border-bottom-color: color-mix(in srgb, var(--border-subtle) 72%, var(--text-tertiary));

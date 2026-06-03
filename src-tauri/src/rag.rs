@@ -602,54 +602,61 @@ pub async fn embed_and_store_chunks(
     let paper_title_str = paper_title.to_string();
 
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let conn = open_db(&root_str)?;
-        conn.execute(
+        let mut conn = open_db(&root_str)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Begin transaction: {e}"))?;
+
+        tx.execute(
             "DELETE FROM chunks WHERE paper_id = ?1",
             params![paper_id_str],
         )
         .map_err(|e| format!("Delete old chunks: {e}"))?;
 
-        let mut stmt = conn
-            .prepare(
-                "INSERT OR REPLACE INTO chunks \
-                 (chunk_id, paper_id, slug, chunk_index, text, vector, \
-                  source_type, source_id, source_label, paper_title) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )
-            .map_err(|e| format!("Prepare insert: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO chunks \
+                     (chunk_id, paper_id, slug, chunk_index, text, vector, \
+                      source_type, source_id, source_label, paper_title) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )
+                .map_err(|e| format!("Prepare insert: {e}"))?;
 
-        for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
-            let chunk_id = match chunk.source_type.as_str() {
-                "metadata" => format!("{}-meta", paper_id_str),
-                "highlight" => format!(
-                    "{}-hl-{}",
+            for (i, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
+                let chunk_id = match chunk.source_type.as_str() {
+                    "metadata" => format!("{}-meta", paper_id_str),
+                    "highlight" => format!(
+                        "{}-hl-{}",
+                        paper_id_str,
+                        chunk.source_id.as_deref().unwrap_or(&i.to_string())
+                    ),
+                    "note" => format!(
+                        "{}-note-{}-{}",
+                        paper_id_str,
+                        chunk.source_id.as_deref().unwrap_or(""),
+                        i
+                    ),
+                    _ => format!("{}-text-{}", paper_id_str, i),
+                };
+                let blob = vec_to_blob(emb);
+                stmt.execute(params![
+                    chunk_id,
                     paper_id_str,
-                    chunk.source_id.as_deref().unwrap_or(&i.to_string())
-                ),
-                "note" => format!(
-                    "{}-note-{}-{}",
-                    paper_id_str,
-                    chunk.source_id.as_deref().unwrap_or(""),
-                    i
-                ),
-                _ => format!("{}-text-{}", paper_id_str, i),
-            };
-            let blob = vec_to_blob(emb);
-            stmt.execute(params![
-                chunk_id,
-                paper_id_str,
-                slug_str,
-                i as i64,
-                chunk.text,
-                blob,
-                chunk.source_type,
-                chunk.source_id,
-                chunk.source_label,
-                paper_title_str,
-            ])
-            .map_err(|e| format!("Insert chunk {i}: {e}"))?;
+                    slug_str,
+                    i as i64,
+                    chunk.text,
+                    blob,
+                    chunk.source_type,
+                    chunk.source_id,
+                    chunk.source_label,
+                    paper_title_str,
+                ])
+                .map_err(|e| format!("Insert chunk {i}: {e}"))?;
+            }
         }
-        Ok(())
+
+        tx.commit().map_err(|e| format!("Commit transaction: {e}"))
     })
     .await
     .map_err(|e| format!("Spawn blocking: {e}"))??;
@@ -668,6 +675,48 @@ pub async fn embed_and_store_chunks(
         serde_json::json!({"status": "done", "chunks": total}),
     );
     Ok(total)
+}
+
+// ── Reconcile vectorized flags with DB ───────────────────────────────────────
+
+/// Compares each paper's `vectorized` status flag against the actual DB.
+/// Papers marked as vectorized but missing from the DB are reset to false,
+/// and vice versa. Returns (fixed_count, total_count).
+pub async fn sync_vectorized_flags(root: &str) -> Result<(usize, usize), String> {
+    let embedded_ids: std::collections::HashSet<String> = if db_path(root).exists() {
+        let root_str = root.to_string();
+        tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<String>, String> {
+            let conn = open_db(&root_str)?;
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT paper_id FROM chunks")
+                .map_err(|e| e.to_string())?;
+            let ids = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| format!("Spawn blocking: {e}"))??
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let entries = crate::library::scan_library(root).unwrap_or_default();
+    let total = entries.len();
+    let mut fixed = 0usize;
+
+    for entry in &entries {
+        let status = paper::read_status_for(root, &entry.slug);
+        let in_db = embedded_ids.contains(&entry.id);
+        if status.vectorized != in_db {
+            let _ = update_vectorized(root, &entry.slug, in_db);
+            fixed += 1;
+        }
+    }
+
+    Ok((fixed, total))
 }
 
 // ── Delete paper chunks ───────────────────────────────────────────────────────

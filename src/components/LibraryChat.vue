@@ -40,6 +40,7 @@ async function refreshCounts() {
   if (refreshingCounts.value) return
   refreshingCounts.value = true
   try {
+    await invoke('sync_vectorized_flags')
     await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts()])
   } finally {
     refreshingCounts.value = false
@@ -1273,7 +1274,7 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 52px;
+  height: 44px;
   flex-shrink: 0;
   padding: 0 14px 0 0;
   border-bottom: 1px solid var(--border-subtle);

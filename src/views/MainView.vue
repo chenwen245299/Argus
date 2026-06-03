@@ -174,6 +174,7 @@ const isDragging = ref(false)
 const isPaperDragging = ref(false)
 let unlistenDragDrop: (() => void) | null = null
 let unlistenOpenPaper: UnlistenFn | null = null
+let unlistenLibraryPaperAdded: UnlistenFn | null = null
 
 function onPaperDragStart() {
   isPaperDragging.value = true
@@ -193,6 +194,10 @@ onMounted(async () => {
   document.addEventListener('argus-paper-drag-end', onPaperDragEnd)
   window.addEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)
   restoreWindowSize()
+
+  unlistenLibraryPaperAdded = await listen('library-paper-added', () => {
+    Promise.all([libraryStore.refresh(), collectionsStore.load()])
+  })
 
   unlistenOpenPaper = await listen<{ slug: string; title?: string }>('argus-open-paper', (event) => {
     const slug = event.payload?.slug
@@ -258,6 +263,7 @@ onUnmounted(() => {
   window.removeEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)
   unlistenOpenPaper?.()
   unlistenDragDrop?.()
+  unlistenLibraryPaperAdded?.()
 })
 
 // ── Resizable columns ─────────────────────────────────────────────────────────

@@ -1279,7 +1279,7 @@ pub fn open_arxiv_window(app: &tauri::AppHandle) -> Result<(), String> {
     let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
-        .traffic_light_position(tauri::LogicalPosition { x: 14.0, y: 28.0 });
+        .traffic_light_position(tauri::LogicalPosition { x: 14.0, y: 22.0 });
 
     let win = builder
         .build()

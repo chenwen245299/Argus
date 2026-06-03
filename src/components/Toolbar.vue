@@ -909,12 +909,11 @@ onUnmounted(() => {
 
 /* arXiv button */
 .arxiv-btn {
-  width: auto;
+  width: 82px;
   padding: 0 12px;
   gap: 5px;
   position: relative;
   color: var(--text-secondary);
-  min-width: 82px;
   overflow: hidden;
 }
 
@@ -958,10 +957,11 @@ onUnmounted(() => {
 .arxiv-flip-enter-from   { opacity: 0; transform: translateY(6px); }
 .arxiv-flip-leave-to     { opacity: 0; transform: translateY(-6px); }
 .library-chat-btn {
-  width: auto;
+  width: 104px;
   padding: 0 12px;
   gap: 5px;
   color: var(--text-secondary);
+  overflow: hidden;
 }
 .usage-btn {
   width: auto;

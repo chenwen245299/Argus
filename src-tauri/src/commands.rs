@@ -1565,6 +1565,14 @@ pub async fn get_vector_store_info(
     rag::get_vector_store_info(&root).await
 }
 
+#[tauri::command]
+pub async fn sync_vectorized_flags(
+    state: State<'_, LibraryRoot>,
+) -> Result<(usize, usize), String> {
+    let root = get_root(&state)?;
+    rag::sync_vectorized_flags(&root).await
+}
+
 // ── M7: Vectorization ─────────────────────────────────────────────────────────
 
 #[tauri::command]

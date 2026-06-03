@@ -179,6 +179,7 @@ pub fn run() {
             commands::get_rag_settings,
             commands::save_rag_settings,
             commands::get_vector_store_info,
+            commands::sync_vectorized_flags,
             // ── M7: Vectorization ──
             commands::vectorize_paper,
             commands::rebuild_vector_store,

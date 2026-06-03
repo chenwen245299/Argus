@@ -1,5 +1,15 @@
 use std::path::Path;
 
+pub(crate) fn find_bin(name: &str) -> std::ffi::OsString {
+    for prefix in &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+        let p = std::path::Path::new(prefix).join(name);
+        if p.exists() {
+            return p.into_os_string();
+        }
+    }
+    name.into()
+}
+
 /// OCR a single JPEG image (raw bytes).
 /// On macOS, tries the Vision framework first (via a lazily compiled Swift helper).
 /// Falls back to the external `tesseract` binary on all platforms.
@@ -20,7 +30,7 @@ pub fn ocr_pdf_file(pdf_path: &Path) -> Option<String> {
     let temp_dir = std::env::temp_dir().join(format!("argus_ocr_{uid}"));
     std::fs::create_dir_all(&temp_dir).ok()?;
 
-    let ok = std::process::Command::new("pdftoppm")
+    let ok = std::process::Command::new(find_bin("pdftoppm"))
         .arg("-jpeg")
         .arg("-r")
         .arg("150")
@@ -61,7 +71,7 @@ pub fn ocr_pdf_file(pdf_path: &Path) -> Option<String> {
                     page_texts.push(t);
                     any_ok = true;
                 }
-                Err(_) => page_texts.push(String::new()),
+                Err(_) => {} // skip unreadable pages rather than adding blank entries
             }
         }
     }
@@ -86,7 +96,7 @@ fn ocr_via_tesseract(jpeg_bytes: &[u8]) -> Result<String, String> {
     let tmp = std::env::temp_dir().join(format!("argus_ocr_{uid}.jpg"));
     std::fs::write(&tmp, jpeg_bytes).map_err(|e| format!("write tmp: {e}"))?;
 
-    let result = std::process::Command::new("tesseract")
+    let result = std::process::Command::new(find_bin("tesseract"))
         .arg(tmp.as_os_str())
         .arg("stdout")
         .arg("--oem")
@@ -100,9 +110,9 @@ fn ocr_via_tesseract(jpeg_bytes: &[u8]) -> Result<String, String> {
     match result {
         Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
         Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
-            "tesseract not installed (macOS: brew install tesseract)".into(),
-        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err("tesseract not installed (macOS: brew install tesseract)".into())
+        }
         Err(e) => Err(format!("tesseract: {e}")),
     }
 }

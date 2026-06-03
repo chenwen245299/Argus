@@ -394,7 +394,11 @@ pub fn open_canvas_window(app: &tauri::AppHandle) -> Result<(), String> {
         if let tauri::WindowEvent::CloseRequested { .. } = event {
             if let Some(w) = app_handle.get_webview_window("canvas") {
                 if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
-                    save_canvas_window_size(&app_handle, phys.width as f64 / sf, phys.height as f64 / sf);
+                    save_canvas_window_size(
+                        &app_handle,
+                        phys.width as f64 / sf,
+                        phys.height as f64 / sf,
+                    );
                 }
             }
         }

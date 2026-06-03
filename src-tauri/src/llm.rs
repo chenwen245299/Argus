@@ -263,10 +263,7 @@ fn parse_embedding_data(data: &[serde_json::Value]) -> Result<Vec<Vec<f32>>, Str
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         } else {
-            return Err(format!(
-                "Unexpected embedding field type: {}",
-                emb
-            ));
+            return Err(format!("Unexpected embedding field type: {}", emb));
         };
 
         if vec.is_empty() {
@@ -360,7 +357,9 @@ async fn stream_openrouter_with_pdf(
     });
 
     {
-        let order: Vec<&str> = provider.models.iter()
+        let order: Vec<&str> = provider
+            .models
+            .iter()
             .find(|m| m.id == model)
             .map(|m| m.provider_order.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();
@@ -484,7 +483,9 @@ async fn chat_openai_compat(
     let mut body = serde_json::json!({"model": model, "messages": msgs});
 
     if is_openrouter {
-        let order: Vec<&str> = provider.models.iter()
+        let order: Vec<&str> = provider
+            .models
+            .iter()
             .find(|m| m.id == model)
             .map(|m| m.provider_order.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();
@@ -550,7 +551,9 @@ async fn stream_openai_compat(
     });
 
     if is_openrouter {
-        let order: Vec<&str> = provider.models.iter()
+        let order: Vec<&str> = provider
+            .models
+            .iter()
             .find(|m| m.id == model)
             .map(|m| m.provider_order.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();

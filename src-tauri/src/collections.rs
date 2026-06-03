@@ -225,11 +225,7 @@ pub fn rename_collection(root: &str, id: &str, new_name: String) -> Result<(), S
     write_collections(root, &file)
 }
 
-pub fn move_collection(
-    root: &str,
-    id: &str,
-    new_parent_id: Option<String>,
-) -> Result<(), String> {
+pub fn move_collection(root: &str, id: &str, new_parent_id: Option<String>) -> Result<(), String> {
     let mut file = read_collections(root);
 
     if !file.collections.iter().any(|c| c.id == id) {

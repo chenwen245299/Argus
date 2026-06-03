@@ -80,7 +80,7 @@ pub fn extract_text_sync(root: &str, slug: &str) -> Result<String, String> {
     extract_text_from_bytes(&bytes)
 }
 
-pub fn extract_text_from_bytes(bytes: &[u8]) -> Result<String, String> {
+fn extract_text_from_bytes(bytes: &[u8]) -> Result<String, String> {
     let doc = lopdf::Document::load_mem(bytes).map_err(|e| format!("lopdf: {e}"))?;
     let pages = doc.get_pages();
     // Take first 2 pages only (fast and sufficient for metadata)

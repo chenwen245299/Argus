@@ -966,7 +966,10 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
         // Get paper content from the in-memory snapshot (content fields don't change).
         let paper = match inbox.papers.iter().find(|p| p.arxiv_id == id).cloned() {
             Some(p) => p,
-            None => { done += 1; continue; }
+            None => {
+                done += 1;
+                continue;
+            }
         };
 
         match call_ai_single(
@@ -1330,10 +1333,11 @@ pub fn open_arxiv_window(app: &tauri::AppHandle) -> Result<(), String> {
     let (width, height) =
         load_arxiv_window_size(app).unwrap_or((ARXIV_DEFAULT_WINDOW_W, ARXIV_DEFAULT_WINDOW_H));
 
-    let builder = WebviewWindowBuilder::new(app, "arxiv", WebviewUrl::App(std::path::PathBuf::from("/")))
-        .title("Argus — arXiv")
-        .inner_size(width, height)
-        .min_inner_size(ARXIV_MIN_WINDOW_W, ARXIV_MIN_WINDOW_H);
+    let builder =
+        WebviewWindowBuilder::new(app, "arxiv", WebviewUrl::App(std::path::PathBuf::from("/")))
+            .title("Argus — arXiv")
+            .inner_size(width, height)
+            .min_inner_size(ARXIV_MIN_WINDOW_W, ARXIV_MIN_WINDOW_H);
 
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -1353,7 +1357,11 @@ pub fn open_arxiv_window(app: &tauri::AppHandle) -> Result<(), String> {
         let save = |w: &tauri::WebviewWindow| {
             if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
                 if phys.width > 0 && phys.height > 0 {
-                    save_arxiv_window_size(&app_handle, phys.width as f64 / sf, phys.height as f64 / sf);
+                    save_arxiv_window_size(
+                        &app_handle,
+                        phys.width as f64 / sf,
+                        phys.height as f64 / sf,
+                    );
                 }
             }
         };

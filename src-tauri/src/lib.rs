@@ -16,6 +16,7 @@ mod ocr;
 mod paper;
 mod rag;
 mod search;
+mod security_bookmark;
 mod settings;
 mod token_usage;
 mod url_import;
@@ -51,6 +52,7 @@ pub fn run() {
                     .get("last_library")
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                 {
+                    let path = security_bookmark::ensure_library_access(app.handle(), &path);
                     let state: tauri::State<LibraryRoot> = app.state();
                     let mut guard = state.0.lock().unwrap();
                     *guard = Some(path.clone());

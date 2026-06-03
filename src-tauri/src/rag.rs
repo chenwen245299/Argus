@@ -685,18 +685,20 @@ pub async fn embed_and_store_chunks(
 pub async fn sync_vectorized_flags(root: &str) -> Result<(usize, usize), String> {
     let embedded_ids: std::collections::HashSet<String> = if db_path(root).exists() {
         let root_str = root.to_string();
-        tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<String>, String> {
-            let conn = open_db(&root_str)?;
-            let mut stmt = conn
-                .prepare("SELECT DISTINCT paper_id FROM chunks")
-                .map_err(|e| e.to_string())?;
-            let ids = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(|e| e.to_string())?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok(ids)
-        })
+        tokio::task::spawn_blocking(
+            move || -> Result<std::collections::HashSet<String>, String> {
+                let conn = open_db(&root_str)?;
+                let mut stmt = conn
+                    .prepare("SELECT DISTINCT paper_id FROM chunks")
+                    .map_err(|e| e.to_string())?;
+                let ids = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(ids)
+            },
+        )
         .await
         .map_err(|e| format!("Spawn blocking: {e}"))??
     } else {

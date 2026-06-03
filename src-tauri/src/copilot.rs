@@ -461,7 +461,11 @@ pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
         let save = |w: &tauri::WebviewWindow| {
             if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
                 if phys.width > 0 && phys.height > 0 {
-                    save_library_chat_window_size(&app_handle, phys.width as f64 / sf, phys.height as f64 / sf);
+                    save_library_chat_window_size(
+                        &app_handle,
+                        phys.width as f64 / sf,
+                        phys.height as f64 / sf,
+                    );
                 }
             }
         };

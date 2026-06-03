@@ -29,10 +29,10 @@ pub async fn import_by_url(
 // Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::path::Path;
-use tauri::Emitter;
 use crate::models::{PaperMeta, PaperStatus};
 use crate::{collections, extraction, paper, search, settings};
+use std::path::Path;
+use tauri::Emitter;
 
 fn sanitize(s: &str) -> String {
     s.chars()
@@ -104,13 +104,17 @@ async fn finalize_paper(
     let s = settings::read_settings(root);
     let root_c = root.to_string();
     let slug_c = final_slug.to_string();
-    if let Ok(result) =
-        tauri::async_runtime::spawn_blocking(move || extraction::extract_and_write(&root_c, &slug_c, &s)).await
+    if let Ok(result) = tauri::async_runtime::spawn_blocking(move || {
+        extraction::extract_and_write(&root_c, &slug_c, &s)
+    })
+    .await
     {
         if matches!(result, extraction::ExtractionResult::Text) {
             let root_c = root.to_string();
             let slug_c = final_slug.to_string();
-            let _ = tauri::async_runtime::spawn_blocking(move || search::index_paper(&root_c, &slug_c)).await;
+            let _ =
+                tauri::async_runtime::spawn_blocking(move || search::index_paper(&root_c, &slug_c))
+                    .await;
         }
     }
 
@@ -279,13 +283,18 @@ mod acl {
             .unwrap_or_else(|| "Unknown Title".to_string())
             .replace(['{', '}'], "");
         let authors = parse_authors(&extract_field(bib, "author").unwrap_or_default());
-        let year = extract_field(bib, "year")
-            .and_then(|y| y.trim_matches('"').parse::<u32>().ok());
-        let venue = extract_field(bib, "booktitle")
-            .or_else(|| extract_field(bib, "journal"));
+        let year = extract_field(bib, "year").and_then(|y| y.trim_matches('"').parse::<u32>().ok());
+        let venue = extract_field(bib, "booktitle").or_else(|| extract_field(bib, "journal"));
         let doi = extract_field(bib, "doi");
         let abstract_text = extract_field(bib, "abstract").filter(|s| !s.is_empty());
-        Ok(Meta { title, authors, year, venue, abstract_text, doi })
+        Ok(Meta {
+            title,
+            authors,
+            year,
+            venue,
+            abstract_text,
+            doi,
+        })
     }
 
     pub async fn import(
@@ -333,12 +342,21 @@ mod acl {
         let papers_dir = Path::new(root).join("papers");
         let final_dir = {
             let c = papers_dir.join(&slug_base);
-            if c.exists() { papers_dir.join(format!("{slug_base}-2")) } else { c }
+            if c.exists() {
+                papers_dir.join(format!("{slug_base}-2"))
+            } else {
+                c
+            }
         };
-        let final_slug = final_dir.file_name().and_then(|n| n.to_str()).unwrap_or(&slug_base).to_string();
+        let final_slug = final_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&slug_base)
+            .to_string();
 
         std::fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir: {e}"))?;
-        std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes).map_err(|e| format!("write PDF: {e}"))?;
+        std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
+            .map_err(|e| format!("write PDF: {e}"))?;
 
         let paper_meta = PaperMeta {
             id: uuid::Uuid::new_v4().to_string(),
@@ -358,7 +376,16 @@ mod acl {
             import_source: Some("url".to_string()),
         };
 
-        super::finalize_paper(root, &final_dir, &final_slug, paper_meta, collection_id, app, "acl").await?;
+        super::finalize_paper(
+            root,
+            &final_dir,
+            &final_slug,
+            paper_meta,
+            collection_id,
+            app,
+            "acl",
+        )
+        .await?;
         Ok(final_slug)
     }
 }
@@ -397,7 +424,8 @@ mod openreview {
         let len = s.len();
         len >= 6
             && len <= 32
-            && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
             && s.chars().any(|c| c.is_uppercase() || c.is_lowercase())
             && !s.contains('.')
     }
@@ -421,28 +449,48 @@ mod openreview {
         let f = &content[key];
         let arr = if f.is_array() { f } else { &f["value"] };
         arr.as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     fn parse_note(note: &serde_json::Value) -> Option<Meta> {
         let content = &note["content"];
         let title = str_field(content, "title")?.trim().to_string();
-        if title.is_empty() { return None; }
+        if title.is_empty() {
+            return None;
+        }
         let authors = str_array_field(content, "authors");
         let venue_raw = str_field(content, "venue").map(|s| s.trim().to_string());
-        let year = venue_raw.as_deref().and_then(extract_year_from_venue).or_else(|| {
-            let ms = note["cdate"].as_i64().or_else(|| note["tcdate"].as_i64())?;
-            let dt = chrono::DateTime::from_timestamp(ms / 1000, 0)?;
-            dt.format("%Y").to_string().parse::<u32>().ok()
-        });
+        let year = venue_raw
+            .as_deref()
+            .and_then(extract_year_from_venue)
+            .or_else(|| {
+                let ms = note["cdate"].as_i64().or_else(|| note["tcdate"].as_i64())?;
+                let dt = chrono::DateTime::from_timestamp(ms / 1000, 0)?;
+                dt.format("%Y").to_string().parse::<u32>().ok()
+            });
         let abstract_text = str_field(content, "abstract")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        Some(Meta { title, authors, year, venue: venue_raw, abstract_text })
+        Some(Meta {
+            title,
+            authors,
+            year,
+            venue: venue_raw,
+            abstract_text,
+        })
     }
 
-    async fn fetch_notes(client: &reqwest::Client, param: &str, value: &str) -> Result<Vec<serde_json::Value>, String> {
+    async fn fetch_notes(
+        client: &reqwest::Client,
+        param: &str,
+        value: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let url = format!("https://api2.openreview.net/notes?{param}={value}&limit=10");
         let json: serde_json::Value = client
             .get(&url)
@@ -463,19 +511,22 @@ mod openreview {
         }
 
         // Fall back to ?forum= — returns all notes in the thread; find the submission
-        let notes_by_forum = fetch_notes(client, "forum", id).await
-            .unwrap_or_default();
+        let notes_by_forum = fetch_notes(client, "forum", id).await.unwrap_or_default();
 
         // Prefer a note whose invitation mentions "Submission"
-        let submission_note = notes_by_forum.iter().find(|n| {
-            n["invitation"].as_str()
-                .map(|inv| inv.contains("Submission") || inv.contains("submission"))
-                .unwrap_or(false)
-        }).or_else(|| notes_by_forum.first());
+        let submission_note = notes_by_forum
+            .iter()
+            .find(|n| {
+                n["invitation"]
+                    .as_str()
+                    .map(|inv| inv.contains("Submission") || inv.contains("submission"))
+                    .unwrap_or(false)
+            })
+            .or_else(|| notes_by_forum.first());
 
-        submission_note
-            .and_then(|n| parse_note(n))
-            .ok_or_else(|| format!("OpenReview: paper '{id}' not found or has no accessible metadata"))
+        submission_note.and_then(|n| parse_note(n)).ok_or_else(|| {
+            format!("OpenReview: paper '{id}' not found or has no accessible metadata")
+        })
     }
 
     fn extract_year_from_venue(venue: &str) -> Option<u32> {
@@ -483,7 +534,11 @@ mod openreview {
             let digits: String = w.chars().filter(|c| c.is_ascii_digit()).collect();
             if digits.len() == 4 {
                 let y: u32 = digits.parse().ok()?;
-                if (2000..=2099).contains(&y) { Some(y) } else { None }
+                if (2000..=2099).contains(&y) {
+                    Some(y)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -531,12 +586,21 @@ mod openreview {
         let papers_dir = Path::new(root).join("papers");
         let final_dir = {
             let c = papers_dir.join(&slug_base);
-            if c.exists() { papers_dir.join(format!("{slug_base}-2")) } else { c }
+            if c.exists() {
+                papers_dir.join(format!("{slug_base}-2"))
+            } else {
+                c
+            }
         };
-        let final_slug = final_dir.file_name().and_then(|n| n.to_str()).unwrap_or(&slug_base).to_string();
+        let final_slug = final_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&slug_base)
+            .to_string();
 
         std::fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir: {e}"))?;
-        std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes).map_err(|e| format!("write PDF: {e}"))?;
+        std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
+            .map_err(|e| format!("write PDF: {e}"))?;
 
         let paper_meta = PaperMeta {
             id: uuid::Uuid::new_v4().to_string(),
@@ -556,7 +620,16 @@ mod openreview {
             import_source: Some("url".to_string()),
         };
 
-        super::finalize_paper(root, &final_dir, &final_slug, paper_meta, collection_id, app, "openreview").await?;
+        super::finalize_paper(
+            root,
+            &final_dir,
+            &final_slug,
+            paper_meta,
+            collection_id,
+            app,
+            "openreview",
+        )
+        .await?;
         Ok(final_slug)
     }
 }

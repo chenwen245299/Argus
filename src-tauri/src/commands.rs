@@ -10,7 +10,7 @@ use crate::models::{
 use crate::LibraryRoot;
 use crate::{
     ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas, canvas_enhance, collections, copilot,
-    extraction, library, llm, metadata, paper, rag, search, settings, url_import,
+    extraction, library, llm, metadata, paper, rag, search, security_bookmark, settings, url_import,
 };
 // ── Library management ────────────────────────────────────────────────────────
 
@@ -56,6 +56,7 @@ pub async fn open_library(
     }
 
     persist_library_path(&app, &root);
+    security_bookmark::persist_library_bookmark(&app, &root);
 
     // Track current root for token usage recording.
     crate::token_usage::set_root(&root);
@@ -88,7 +89,8 @@ pub async fn get_current_library(
     }
 
     // Fall back to persisted store.
-    let stored = load_stored_library_path(&app);
+    let stored = load_stored_library_path(&app)
+        .map(|path| security_bookmark::ensure_library_access(&app, &path));
     if let Some(ref path) = stored {
         let mut guard = state.0.lock().map_err(|e| e.to_string())?;
         *guard = Some(path.clone());

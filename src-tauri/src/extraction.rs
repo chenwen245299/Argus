@@ -36,7 +36,7 @@ fn is_sufficient(text: &str, page_count: usize) -> bool {
 /// Try to extract text via the system `pdftotext` (poppler-utils).
 /// Returns None if the binary is not installed or extraction fails.
 fn try_pdftotext(pdf_path: &Path) -> Option<String> {
-    let output = std::process::Command::new("pdftotext")
+    let output = std::process::Command::new(crate::ocr::find_bin("pdftotext"))
         .arg("-enc")
         .arg("UTF-8")
         .arg(pdf_path.as_os_str())

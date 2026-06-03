@@ -1,4 +1,4 @@
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 use crate::models::{
     AiModel, AiProviderInfo, AiProviderInput, AiSettingsInfo, AppSettings, ArxivConfig, ArxivInbox,
@@ -523,6 +523,7 @@ pub async fn import_pdf(
         paper_abstract: None,
         bibtex: None,
         canvas_notes: vec![],
+        import_source: Some("file".to_string()),
     };
     paper::write_meta(&root, &temp_slug, &meta)?;
 
@@ -681,6 +682,16 @@ pub async fn rename_collection(
 ) -> Result<(), String> {
     let root = get_root(&state)?;
     collections::rename_collection(&root, &id, new_name)
+}
+
+#[tauri::command]
+pub async fn move_collection(
+    id: String,
+    new_parent_id: Option<String>,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    collections::move_collection(&root, &id, new_parent_id)
 }
 
 #[tauri::command]
@@ -1661,15 +1672,22 @@ pub async fn chat_with_library(
     messages: Vec<ChatMessage>,
     provider_id: Option<String>,
     model_id: Option<String>,
+    event_name: Option<String>,
+    sources_event_name: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
+    let event_name = event_name.unwrap_or_else(|| "library-chat".to_string());
+    let sources_event_name =
+        sources_event_name.unwrap_or_else(|| "library-chat-sources".to_string());
     copilot::chat_with_library(
         &root,
         messages,
         provider_id.as_deref(),
         model_id.as_deref(),
+        &event_name,
+        &sources_event_name,
         &app,
     )
     .await
@@ -1686,6 +1704,52 @@ pub async fn open_paper_ai_window(
 #[tauri::command]
 pub async fn open_library_chat_window(app: tauri::AppHandle) -> Result<(), String> {
     copilot::open_library_chat_window(&app)
+}
+
+#[tauri::command]
+pub async fn focus_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window not found".to_string())?;
+
+    if let Some(chat) = app.get_webview_window("library-chat") {
+        let _ = chat.set_always_on_top(false);
+        let _ = chat.set_focusable(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+    }
+
+    let _ = main.show();
+    let _ = main.unminimize();
+    let _ = main.set_always_on_top(true);
+    let _ = main.set_focus();
+
+    let app_for_retry = app.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+        if let Some(main) = app_for_retry.get_webview_window("main") {
+            let _ = main.show();
+            let _ = main.unminimize();
+            let _ = main.set_focus();
+        }
+    });
+
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        if let Some(main) = app.get_webview_window("main") {
+            let _ = main.set_focus();
+            let _ = main.set_always_on_top(false);
+            let _ = main.set_focus();
+        }
+        if let Some(chat) = app.get_webview_window("library-chat") {
+            let _ = chat.set_focusable(true);
+        }
+    });
+
+    Ok(())
 }
 
 #[tauri::command]

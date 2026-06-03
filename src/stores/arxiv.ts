@@ -102,7 +102,13 @@ export const useArxivStore = defineStore('arxiv', () => {
   async function loadInbox() {
     try {
       const inbox = await invoke<{ papers: ArxivPaper[]; last_updated: string }>('get_arxiv_inbox')
-      papers.value = inbox.papers
+      // Preserve read=true from current frontend state to guard against in-flight
+      // mark_paper_read calls being overtaken by a concurrent loadInbox.
+      const knownRead = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
+      papers.value = inbox.papers.map(p => ({
+        ...p,
+        read: p.read || knownRead.has(p.arxiv_id),
+      }))
     } catch { papers.value = [] }
   }
 
@@ -143,7 +149,8 @@ export const useArxivStore = defineStore('arxiv', () => {
       const from = new Date(Date.now() - config.value.days_back * 86400000).toISOString().slice(0, 10)
       const fetched = await fetchArxivCategories(config.value, from, today)
       const result = await invoke<ArxivPaper[]>('store_arxiv_papers', { papers: fetched, updateLastFetch: true })
-      papers.value = result
+      const knownRead = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
+      papers.value = result.map(p => ({ ...p, read: p.read || knownRead.has(p.arxiv_id) }))
       await loadScheduleStatus()
     } catch (e) {
       fetchMessage.value = String(e)
@@ -170,7 +177,8 @@ export const useArxivStore = defineStore('arxiv', () => {
       }
       const fetched = await fetchArxivCategories(config.value, dateFrom, today)
       const result = await invoke<ArxivPaper[]>('store_arxiv_papers', { papers: fetched, updateLastFetch: true })
-      papers.value = result
+      const knownRead2 = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
+      papers.value = result.map(p => ({ ...p, read: p.read || knownRead2.has(p.arxiv_id) }))
       await loadScheduleStatus()
     } catch (e) {
       fetchMessage.value = String(e)

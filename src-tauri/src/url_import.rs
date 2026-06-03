@@ -355,6 +355,7 @@ mod acl {
             paper_abstract: meta.abstract_text,
             bibtex: None,
             canvas_notes: vec![],
+            import_source: Some("url".to_string()),
         };
 
         super::finalize_paper(root, &final_dir, &final_slug, paper_meta, collection_id, app, "acl").await?;
@@ -552,6 +553,7 @@ mod openreview {
             paper_abstract: meta.abstract_text,
             bibtex: None,
             canvas_notes: vec![],
+            import_source: Some("url".to_string()),
         };
 
         super::finalize_paper(root, &final_dir, &final_slug, paper_meta, collection_id, app, "openreview").await?;

@@ -250,5 +250,6 @@ fn default_meta() -> PaperMeta {
         paper_abstract: None,
         bibtex: None,
         canvas_notes: vec![],
+        import_source: None,
     }
 }

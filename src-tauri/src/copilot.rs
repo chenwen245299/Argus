@@ -253,6 +253,8 @@ pub async fn chat_with_library(
     messages: Vec<ChatMessage>,
     provider_id: Option<&str>,
     model_id: Option<&str>,
+    event_name: &str,
+    sources_event_name: &str,
     app: &tauri::AppHandle,
 ) -> Result<String, String> {
     use tauri::Emitter;
@@ -285,7 +287,7 @@ pub async fn chat_with_library(
 
     // Emit retrieved chunks so the UI can display source citations.
     let _ = app.emit(
-        "library-chat-sources",
+        sources_event_name,
         rag_chunks.as_deref().unwrap_or(&[]).to_vec(),
     );
 
@@ -302,7 +304,7 @@ pub async fn chat_with_library(
         &api_key,
         &model,
         &all_messages,
-        "library-chat",
+        event_name,
         app,
         false,
         None,

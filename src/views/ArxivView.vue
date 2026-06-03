@@ -89,31 +89,71 @@ watch(() => {
 
 // Collection picker
 const showColPicker = ref(false)
-const colPickerBtnRef = ref<HTMLElement | null>(null)
-const colPickerStyle = ref({ top: '0px', left: '0px' })
+const colPickerPos = ref({ top: 0, left: 0 })
+
+const PICKER_PANEL_W = 196
+const PICKER_PANEL_GAP = 3
 
 function openColPicker(e: MouseEvent) {
   const btn = e.currentTarget as HTMLElement
   const r = btn.getBoundingClientRect()
-  colPickerStyle.value = { top: `${r.bottom + 4}px`, left: `${r.left}px` }
+  colPickerPos.value = { top: r.bottom + 4, left: r.left }
   showColPicker.value = true
+  hoveredPath.value = []
+  subPanelTops.value = []
   collectionsStore.load()
 }
 
-// Flatten collection tree depth-first for the picker list
-interface FlatCol { col: Collection; depth: number }
-const flatCollections = computed<FlatCol[]>(() => {
-  const result: FlatCol[] = []
-  function walk(parentId: string | null, depth: number) {
-    const items = collectionsStore.file.collections
-      .filter(c => (c.parent_id ?? null) === parentId)
-      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }))
-    for (const col of items) {
-      result.push({ col, depth })
-      walk(col.id, depth + 1)
-    }
+// Cascading collection picker
+const colsByParent = computed(() => {
+  const map = new Map<string | null, Collection[]>()
+  for (const col of collectionsStore.file.collections) {
+    const pid = col.parent_id ?? null
+    if (!map.has(pid)) map.set(pid, [])
+    map.get(pid)!.push(col)
   }
-  walk(null, 0)
+  for (const items of map.values()) {
+    items.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }))
+  }
+  return map
+})
+
+function colChildren(parentId: string | null): Collection[] {
+  return colsByParent.value.get(parentId) ?? []
+}
+
+function colHasChildren(colId: string): boolean {
+  return (colsByParent.value.get(colId)?.length ?? 0) > 0
+}
+
+const hoveredPath = ref<string[]>([])
+const subPanelTops = ref<number[]>([])
+
+function onColHover(col: Collection, level: number, e: MouseEvent) {
+  hoveredPath.value = [...hoveredPath.value.slice(0, level), col.id]
+  if (colHasChildren(col.id)) {
+    const el = e.currentTarget as HTMLElement
+    const itemTop = el.getBoundingClientRect().top - colPickerPos.value.top
+    subPanelTops.value = [...subPanelTops.value.slice(0, level), itemTop]
+  } else {
+    subPanelTops.value = subPanelTops.value.slice(0, level)
+  }
+}
+
+interface CascadePanel { items: Collection[]; left: number; top: number }
+
+const cascadePanels = computed<CascadePanel[]>(() => {
+  const { left, top } = colPickerPos.value
+  const result: CascadePanel[] = [{ items: colChildren(null), left, top }]
+  for (let i = 0; i < hoveredPath.value.length; i++) {
+    const children = colChildren(hoveredPath.value[i])
+    if (children.length === 0) break
+    result.push({
+      items: children,
+      left: left + (i + 1) * (PICKER_PANEL_W + PICKER_PANEL_GAP),
+      top: top + (subPanelTops.value[i] ?? 0),
+    })
+  }
   return result
 })
 
@@ -125,6 +165,7 @@ onMounted(async () => {
   await store.subscribeEvents()
   await collectionsStore.load()
   window.addEventListener('keydown', onKeydown)
+  emitTo('main', 'arxiv-window-opened').catch(() => {})
 })
 
 onUnmounted(() => {
@@ -132,6 +173,7 @@ onUnmounted(() => {
   if (windowResizeTimer) clearTimeout(windowResizeTimer)
   window.removeEventListener('resize', saveWindowSizeToStorage)
   window.removeEventListener('keydown', onKeydown)
+  emitTo('main', 'arxiv-window-closed').catch(() => {})
 })
 
 function onKeydown(e: KeyboardEvent) {
@@ -718,30 +760,61 @@ function jumpToDate(dateStr: string) {
                 {{ addingId === selectedPaper.arxiv_id ? '添加中...' : '添加到文库' }}
               </button>
 
-              <!-- Collection picker popover -->
+              <!-- Collection picker: cascading flyout -->
               <Teleport to="body">
                 <div v-if="showColPicker" class="col-picker-backdrop" @click="showColPicker = false" />
-                <Transition name="col-pop" appear>
-                  <div v-if="showColPicker" class="col-picker-popover" :style="colPickerStyle">
-                    <div class="col-picker-header">选择分类</div>
+                <template v-if="showColPicker">
+                  <Transition name="col-pop" appear>
+                    <!-- Level 0: animated -->
+                    <div
+                      class="col-cascade-panel"
+                      :style="{ left: cascadePanels[0].left + 'px', top: cascadePanels[0].top + 'px' }"
+                    >
+                      <div class="col-picker-header">选择分类</div>
+                      <div class="col-picker-list">
+                        <div v-if="cascadePanels[0].items.length === 0" class="col-picker-empty">暂无分类，请先在文库中创建</div>
+                        <button
+                          v-for="col in cascadePanels[0].items"
+                          :key="col.id"
+                          class="col-picker-item"
+                          :class="{ 'col-item-open': hoveredPath[0] === col.id }"
+                          @mouseenter="onColHover(col, 0, $event)"
+                          @click="addToLibrary(selectedPaper, col.id)"
+                        >
+                          <span class="col-emoji">{{ col.emoji ?? '📁' }}</span>
+                          <span class="col-name">{{ col.name }}</span>
+                          <svg v-if="colHasChildren(col.id)" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="col-chevron-right">
+                            <polyline points="9 18 15 12 9 6"/>
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                  </Transition>
+                  <!-- Level 1+: appear instantly, aligned to hovered row -->
+                  <div
+                    v-for="(panel, idx) in cascadePanels.slice(1)"
+                    :key="idx + 1"
+                    class="col-cascade-panel"
+                    :style="{ left: panel.left + 'px', top: panel.top + 'px' }"
+                  >
                     <div class="col-picker-list">
-                      <div
-                        v-if="flatCollections.length === 0"
-                        class="col-picker-empty"
-                      >暂无分类，请先在文库中创建</div>
                       <button
-                        v-for="{ col, depth } in flatCollections"
+                        v-for="col in panel.items"
                         :key="col.id"
                         class="col-picker-item"
-                        :style="{ paddingLeft: `${10 + depth * 14}px` }"
+                        :class="{ 'col-item-open': hoveredPath[idx + 1] === col.id }"
+                        @mouseenter="onColHover(col, idx + 1, $event)"
                         @click="addToLibrary(selectedPaper, col.id)"
                       >
                         <span class="col-emoji">{{ col.emoji ?? '📁' }}</span>
                         <span class="col-name">{{ col.name }}</span>
+                        <svg v-if="colHasChildren(col.id)" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="col-chevron-right">
+                          <polyline points="9 18 15 12 9 6"/>
+                        </svg>
                       </button>
                     </div>
                   </div>
-                </Transition>
+                </template>
               </Teleport>
             </template>
 
@@ -901,6 +974,7 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   color: var(--text-secondary);
   font-size: 12px;
   white-space: nowrap;
+  margin-left: auto;
 }
 .topbar-analysis-status .spinner {
   width: 11px;
@@ -1292,24 +1366,23 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 .btn-add-main:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-add-main:disabled { opacity: 0.5; cursor: not-allowed; }
 
-/* Collection picker popover */
+/* Collection picker: cascading flyout */
 .col-picker-backdrop {
   position: fixed; inset: 0; z-index: 999;
 }
-.col-picker-popover {
+.col-cascade-panel {
   position: fixed; z-index: 1000;
   background: var(--bg-primary);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
-  width: 220px;
+  width: 196px;
   overflow: hidden;
 }
 .col-pop-enter-active { transition: opacity 0.14s ease, transform 0.14s ease; }
 .col-pop-leave-active { transition: opacity 0.1s ease, transform 0.1s ease; }
 .col-pop-enter-from { opacity: 0; transform: translateY(-5px) scale(0.97); }
 .col-pop-leave-to   { opacity: 0; transform: translateY(-5px) scale(0.97); }
-
 .col-picker-header {
   padding: 9px 12px 7px;
   font-size: 11px; font-weight: 600;
@@ -1317,7 +1390,7 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   border-bottom: 1px solid var(--border-subtle);
 }
 .col-picker-list {
-  max-height: 220px; overflow-y: auto;
+  max-height: 240px; overflow-y: auto;
   padding: 4px 0;
 }
 .col-picker-list::-webkit-scrollbar { width: 3px; }
@@ -1329,9 +1402,11 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   font-size: 12px; color: var(--text-primary);
   text-align: left; transition: background 0.1s;
 }
-.col-picker-item:hover { background: var(--bg-hover); }
+.col-picker-item:hover,
+.col-picker-item.col-item-open { background: var(--bg-hover); }
 .col-emoji { font-size: 13px; flex-shrink: 0; }
 .col-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-chevron-right { flex-shrink: 0; color: var(--text-tertiary); }
 
 .in-lib-tag {
   display: inline-flex; align-items: center; gap: 4px;

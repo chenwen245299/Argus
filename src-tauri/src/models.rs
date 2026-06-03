@@ -24,6 +24,9 @@ pub struct PaperMeta {
     /// Note IDs pinned to canvas hover for this paper (empty = show most recent).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub canvas_notes: Vec<String>,
+    /// How the paper was imported: "file" | "arxiv" | "url". None for legacy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_source: Option<String>,
 }
 
 fn default_reading_status() -> String {
@@ -115,6 +118,9 @@ pub struct PaperIndexEntry {
     /// Old index.json files deserialize this as 0, causing a one-time re-read to populate it.
     #[serde(default)]
     pub meta_mtime: u64,
+    /// Import source: "file" | "arxiv" | "url". None for legacy entries (inferred on frontend).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_source: Option<String>,
 }
 
 fn default_reading_status_entry() -> String {

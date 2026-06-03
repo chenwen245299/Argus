@@ -236,6 +236,46 @@ pub fn get_inbox(root: &str) -> ArxivInbox {
     }
 }
 
+/// Collect arxiv_ids of all papers already in the library (checks meta.json arxiv_id field).
+fn collect_library_arxiv_ids(root: &str) -> std::collections::HashSet<String> {
+    let papers_dir = std::path::Path::new(root).join("papers");
+    let mut ids = std::collections::HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(&papers_dir) {
+        for entry in entries.flatten() {
+            let meta_path = entry.path().join("meta.json");
+            if let Ok(text) = std::fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(id) = meta.get("arxiv_id").and_then(|v| v.as_str()) {
+                        if !id.is_empty() {
+                            ids.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Update a single paper's fields in the appropriate day file without touching other papers.
+/// Returns true if the paper was found and updated; false if the paper no longer exists in any
+/// day file (e.g., it was already added to library or pruned).
+fn update_paper_in_day_files(
+    root: &str,
+    arxiv_id: &str,
+    updater: impl Fn(&mut ArxivPaper),
+) -> bool {
+    for date in list_day_dates(root) {
+        let mut papers = read_day_papers(root, &date);
+        if let Some(p) = papers.iter_mut().find(|p| p.arxiv_id == arxiv_id) {
+            updater(p);
+            let _ = write_day_papers(root, &date, &papers);
+            return true;
+        }
+    }
+    false // Paper not found – was removed from inbox
+}
+
 /// Persist the inbox by re-bucketing papers into per-day files.
 /// Day files whose papers have all been removed (filtered) are deleted.
 fn save_inbox(root: &str, inbox: &ArxivInbox) -> Result<(), String> {
@@ -552,6 +592,9 @@ pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<Arxiv
         }
     }
 
+    // Pre-collect library arxiv_ids once so we never re-add a paper the user already imported.
+    let library_ids = collect_library_arxiv_ids(root);
+
     let mut changed_dates: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for new_p in new_papers {
@@ -581,11 +624,12 @@ pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<Arxiv
                 };
             }
             changed_dates.insert(existing_date.clone());
-        } else {
-            // New paper — add to today's bucket
+        } else if !library_ids.contains(&new_p.arxiv_id) {
+            // Truly new paper not already in the library — add to today's bucket.
             day_buckets.entry(today.clone()).or_default().push(new_p);
             changed_dates.insert(today.clone());
         }
+        // If the paper is in library_ids, skip it silently (user already imported it).
     }
 
     // Write only modified day files
@@ -737,7 +781,8 @@ pub async fn analyze_single(
         config.ai_analysis_prompt.clone()
     };
 
-    let mut inbox = get_inbox(root);
+    let inbox = get_inbox(root);
+    // Read paper data from inbox (for AI prompt content only — read-only use).
     let paper = inbox
         .papers
         .iter()
@@ -745,11 +790,10 @@ pub async fn analyze_single(
         .cloned()
         .ok_or_else(|| format!("Paper {} not found in inbox", arxiv_id))?;
 
-    // Mark as analyzing
-    if let Some(p) = inbox.papers.iter_mut().find(|p| p.arxiv_id == arxiv_id) {
+    // Mark as analyzing using targeted update (does not disturb other papers).
+    update_paper_in_day_files(root, arxiv_id, |p| {
         p.analysis_status = "analyzing".to_string();
-    }
-    let _ = save_inbox(root, &inbox);
+    });
     let _ = app.emit(
         "arxiv-analysis",
         serde_json::json!({
@@ -769,15 +813,18 @@ pub async fn analyze_single(
     {
         Ok(result) => {
             let score = result.relevance_score.clamp(0.0, 10.0);
-            if let Some(p) = inbox.papers.iter_mut().find(|p| p.arxiv_id == arxiv_id) {
+            let reason = result.relevance_reason.clone();
+            let contributions = result.key_contributions.clone();
+            let summary = result.summary.clone();
+            let topics = result.matched_topics.clone();
+            update_paper_in_day_files(root, arxiv_id, |p| {
                 p.relevance_score = Some(score);
-                p.relevance_reason = Some(result.relevance_reason.clone());
-                p.key_contributions = result.key_contributions.clone();
-                p.analysis_summary = result.summary.clone();
-                p.matched_topics = result.matched_topics.clone();
+                p.relevance_reason = Some(reason.clone());
+                p.key_contributions = contributions.clone();
+                p.analysis_summary = summary.clone();
+                p.matched_topics = topics.clone();
                 p.analysis_status = "done".to_string();
-            }
-            let _ = save_inbox(root, &inbox);
+            });
             let _ = app.emit(
                 "arxiv-analysis",
                 serde_json::json!({
@@ -791,10 +838,9 @@ pub async fn analyze_single(
             );
         }
         Err(e) => {
-            if let Some(p) = inbox.papers.iter_mut().find(|p| p.arxiv_id == arxiv_id) {
+            update_paper_in_day_files(root, arxiv_id, |p| {
                 p.analysis_status = "failed".to_string();
-            }
-            let _ = save_inbox(root, &inbox);
+            });
             let _ = app.emit(
                 "arxiv-analysis",
                 serde_json::json!({
@@ -900,21 +946,27 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
             break;
         }
 
-        if let Some(p) = inbox.papers.iter_mut().find(|p| p.arxiv_id == id) {
+        // Mark as "analyzing" with a targeted per-paper write.
+        // If the paper is no longer in any day file (e.g., added to library), skip it.
+        let found = update_paper_in_day_files(root, &id, |p| {
             p.analysis_status = "analyzing".to_string();
-            let _ = app.emit(
-                "arxiv-analysis",
-                serde_json::json!({
-                    "done": done, "total": total,
-                    "arxiv_id": &id, "status": "analyzing"
-                }),
-            );
+        });
+        if !found {
+            done += 1;
+            continue;
         }
-        let _ = save_inbox(root, &inbox);
+        let _ = app.emit(
+            "arxiv-analysis",
+            serde_json::json!({
+                "done": done, "total": total,
+                "arxiv_id": &id, "status": "analyzing"
+            }),
+        );
 
+        // Get paper content from the in-memory snapshot (content fields don't change).
         let paper = match inbox.papers.iter().find(|p| p.arxiv_id == id).cloned() {
             Some(p) => p,
-            None => continue,
+            None => { done += 1; continue; }
         };
 
         match call_ai_single(
@@ -932,7 +984,10 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
                 done += 1;
 
                 if config.ai_filter_enabled && score < filter_threshold {
-                    inbox.papers.retain(|p| p.arxiv_id != id);
+                    // Remove from inbox: load fresh state to avoid overwriting concurrent changes.
+                    let mut fresh = get_inbox(root);
+                    fresh.papers.retain(|p| p.arxiv_id != id);
+                    let _ = save_inbox(root, &fresh);
                     let _ = app.emit(
                         "arxiv-analysis",
                         serde_json::json!({
@@ -946,13 +1001,19 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
                             "matched_topics": &result.matched_topics
                         }),
                     );
-                } else if let Some(p) = inbox.papers.iter_mut().find(|p| p.arxiv_id == id) {
-                    p.relevance_score = Some(score);
-                    p.relevance_reason = Some(result.relevance_reason.clone());
-                    p.key_contributions = result.key_contributions.clone();
-                    p.analysis_summary = result.summary.clone();
-                    p.matched_topics = result.matched_topics.clone();
-                    p.analysis_status = "done".to_string();
+                } else {
+                    let reason = result.relevance_reason.clone();
+                    let contributions = result.key_contributions.clone();
+                    let summary = result.summary.clone();
+                    let topics = result.matched_topics.clone();
+                    update_paper_in_day_files(root, &id, |p| {
+                        p.relevance_score = Some(score);
+                        p.relevance_reason = Some(reason.clone());
+                        p.key_contributions = contributions.clone();
+                        p.analysis_summary = summary.clone();
+                        p.matched_topics = topics.clone();
+                        p.analysis_status = "done".to_string();
+                    });
                     let _ = app.emit(
                         "arxiv-analysis",
                         serde_json::json!({
@@ -969,22 +1030,20 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
             }
             Err(e) => {
                 eprintln!("Analysis error for {}: {}", id, e);
-                if let Some(p) = inbox.papers.iter_mut().find(|p| p.arxiv_id == id) {
+                done += 1;
+                update_paper_in_day_files(root, &id, |p| {
                     p.analysis_status = "failed".to_string();
-                    done += 1;
-                    let _ = app.emit(
-                        "arxiv-analysis",
-                        serde_json::json!({
-                            "done": done, "total": total,
-                            "arxiv_id": &id, "status": "failed",
-                            "message": e
-                        }),
-                    );
-                }
+                });
+                let _ = app.emit(
+                    "arxiv-analysis",
+                    serde_json::json!({
+                        "done": done, "total": total,
+                        "arxiv_id": &id, "status": "failed",
+                        "message": e
+                    }),
+                );
             }
         }
-
-        let _ = save_inbox(root, &inbox);
 
         // Polite delay between model calls.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1162,6 +1221,7 @@ pub async fn add_to_library(
         paper_abstract: Some(paper.summary.clone()).filter(|s| !s.trim().is_empty()),
         bibtex: None,
         canvas_notes: vec![],
+        import_source: Some("arxiv".to_string()),
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);
@@ -1190,9 +1250,9 @@ pub async fn add_to_library(
         }),
     );
 
-    // Assign to collection if requested
+    // Assign to collection and physically move folder into it
     if let Some(cid) = collection_id.filter(|s| !s.is_empty()) {
-        let _ = crate::collections::add_paper_to_collection(root, &meta.id, cid);
+        let _ = crate::collections::move_paper_to_collection(root, &meta.id, cid);
     }
 
     // Fulltext extraction + FTS indexing in background
@@ -1578,6 +1638,7 @@ pub async fn import_by_url(
         paper_abstract: Some(paper_info.summary.clone()).filter(|s| !s.trim().is_empty()),
         bibtex: None,
         canvas_notes: vec![],
+        import_source: Some("arxiv".to_string()),
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);

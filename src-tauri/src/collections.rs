@@ -225,6 +225,88 @@ pub fn rename_collection(root: &str, id: &str, new_name: String) -> Result<(), S
     write_collections(root, &file)
 }
 
+pub fn move_collection(
+    root: &str,
+    id: &str,
+    new_parent_id: Option<String>,
+) -> Result<(), String> {
+    let mut file = read_collections(root);
+
+    if !file.collections.iter().any(|c| c.id == id) {
+        return Err(format!("Collection {id} not found"));
+    }
+
+    let new_parent_id = new_parent_id.filter(|parent| !parent.trim().is_empty());
+    if new_parent_id.as_deref() == Some(id) {
+        return Err("Cannot move a collection into itself".to_string());
+    }
+
+    if let Some(parent_id) = new_parent_id.as_deref() {
+        if !file.collections.iter().any(|c| c.id == parent_id) {
+            return Err(format!("Target collection {parent_id} not found"));
+        }
+        if collect_subtree(&file.collections, id).contains(parent_id) {
+            return Err("Cannot move a collection into one of its descendants".to_string());
+        }
+    }
+
+    let old_folder = collection_folder_path(root, &file.collections, id);
+    let current_parent_id = file
+        .collections
+        .iter()
+        .find(|c| c.id == id)
+        .and_then(|c| c.parent_id.clone());
+
+    if current_parent_id == new_parent_id {
+        if !old_folder.exists() {
+            std::fs::create_dir_all(&old_folder)
+                .map_err(|e| format!("Create collection folder: {e}"))?;
+        }
+        return Ok(());
+    }
+
+    {
+        let col = file
+            .collections
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or_else(|| format!("Collection {id} not found"))?;
+        col.parent_id = new_parent_id;
+    }
+
+    let new_folder = collection_folder_path(root, &file.collections, id);
+    if old_folder != new_folder {
+        if let Some(parent) = new_folder.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Create target parent folder: {e}"))?;
+        }
+
+        if old_folder.exists() {
+            if new_folder.exists() {
+                let same_target = old_folder
+                    .canonicalize()
+                    .ok()
+                    .zip(new_folder.canonicalize().ok())
+                    .is_some_and(|(a, b)| a == b);
+                if !same_target {
+                    return Err(format!(
+                        "Target collection folder already exists: {}",
+                        new_folder.display()
+                    ));
+                }
+            } else {
+                std::fs::rename(&old_folder, &new_folder)
+                    .map_err(|e| format!("Move collection folder: {e}"))?;
+            }
+        } else {
+            std::fs::create_dir_all(&new_folder)
+                .map_err(|e| format!("Create collection folder: {e}"))?;
+        }
+    }
+
+    write_collections(root, &file)
+}
+
 pub fn set_collection_emoji(root: &str, id: &str, emoji: Option<String>) -> Result<(), String> {
     let mut file = read_collections(root);
     let col = file
@@ -395,6 +477,7 @@ pub fn list_papers_in_collection(
             added_at: meta.added_at,
             reading_status: meta.reading_status,
             meta_mtime: 0,
+            import_source: meta.import_source,
         });
     }
 

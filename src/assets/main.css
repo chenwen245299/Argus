@@ -45,6 +45,13 @@
   --shadow-nav-active: none;
   --gradient-accent:   none;
 
+  --source-arxiv-bg:   #fde8d8;
+  --source-arxiv-text: #9c3a10;
+  --source-file-bg:    #dbeafe;
+  --source-file-text:  #1e4e8c;
+  --source-url-bg:     #d1fae5;
+  --source-url-text:   #155a35;
+
   --badge-extracted-bg: #e6f4ea;
   --badge-extracted-fg: #1e7e34;
   --badge-summary-bg:   #e8f0fe;

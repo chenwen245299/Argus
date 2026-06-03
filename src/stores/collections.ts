@@ -125,6 +125,16 @@ export const useCollectionsStore = defineStore('collections', () => {
     }
   }
 
+  async function moveCollection(id: string, newParentId: string | null) {
+    try {
+      await invoke('move_collection', { id, newParentId })
+      await load()
+    } catch (e) {
+      console.error('move_collection:', e)
+      throw e
+    }
+  }
+
   async function remove(id: string) {
     try {
       await invoke('delete_collection', { id })
@@ -190,6 +200,7 @@ export const useCollectionsStore = defineStore('collections', () => {
     load,
     create,
     rename,
+    moveCollection,
     setEmoji,
     remove,
     addPaper,

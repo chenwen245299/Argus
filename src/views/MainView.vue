@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { Window as TauriWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalSize } from '@tauri-apps/api/dpi'
 import { useLibraryStore } from '../stores/library'
@@ -175,6 +176,26 @@ const isPaperDragging = ref(false)
 let unlistenDragDrop: (() => void) | null = null
 let unlistenOpenPaper: UnlistenFn | null = null
 let unlistenLibraryPaperAdded: UnlistenFn | null = null
+let mainFocusRetryTimer: number | null = null
+
+async function focusMainWindowNow() {
+  const mainWindow = TauriWindow.getCurrent()
+  await mainWindow.show().catch(() => {})
+  await mainWindow.unminimize().catch(() => {})
+  await mainWindow.setFocus().catch(() => {})
+}
+
+function scheduleMainWindowFocus() {
+  if (mainFocusRetryTimer) clearTimeout(mainFocusRetryTimer)
+
+  void nextTick(async () => {
+    await focusMainWindowNow()
+    mainFocusRetryTimer = window.setTimeout(() => {
+      focusMainWindowNow().catch(() => {})
+      mainFocusRetryTimer = null
+    }, 180)
+  })
+}
 
 function onPaperDragStart() {
   isPaperDragging.value = true
@@ -211,6 +232,7 @@ onMounted(async () => {
     if (!PAPER_TABS.includes(sidebarTab.value)) {
       sidebarTab.value = 'metadata'
     }
+    scheduleMainWindowFocus()
   })
 
   // Load settings and collections on startup.
@@ -258,6 +280,7 @@ onUnmounted(() => {
   window.removeEventListener('mouseup', onMouseUp)
   window.removeEventListener('resize', onWinResize)
   if (winResizeTimer) clearTimeout(winResizeTimer)
+  if (mainFocusRetryTimer) clearTimeout(mainFocusRetryTimer)
   document.removeEventListener('argus-paper-drag-start', onPaperDragStart)
   document.removeEventListener('argus-paper-drag-end', onPaperDragEnd)
   window.removeEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)

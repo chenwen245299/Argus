@@ -79,7 +79,7 @@ function compareValue(a: PaperIndexEntry, b: PaperIndexEntry): number {
 }
 
 // ── Column configuration ──────────────────────────────────────────────────────
-type ColId = 'title' | 'authors' | 'venue' | 'year' | 'added_at' | 'status' | 'tags'
+type ColId = 'title' | 'authors' | 'venue' | 'year' | 'added_at' | 'status' | 'tags' | 'source'
 
 const COL_META: Record<ColId, {
   id: ColId; labelKey: string; defaultWidth: number; minWidth: number; sortField?: SortField
@@ -91,8 +91,33 @@ const COL_META: Record<ColId, {
   added_at: { id: 'added_at', labelKey: 'list.addedAt', defaultWidth: 90,  minWidth: 78,  sortField: 'added_at' },
   status:   { id: 'status',   labelKey: 'list.status',  defaultWidth: 160, minWidth: 120 },
   tags:     { id: 'tags',     labelKey: 'list.tags',    defaultWidth: 160, minWidth: 80 },
+  source:   { id: 'source',   labelKey: 'list.source',  defaultWidth: 72,  minWidth: 60 },
 }
-const ALL_COL_IDS: ColId[] = ['title', 'authors', 'venue', 'year', 'added_at', 'status', 'tags']
+const ALL_COL_IDS: ColId[] = ['title', 'authors', 'venue', 'year', 'added_at', 'status', 'tags', 'source']
+
+// ── Import source helpers ─────────────────────────────────────────────────────
+function inferSource(item: PaperIndexEntry): string {
+  if (item.import_source) return item.import_source
+  // Legacy: infer from meta fields
+  if (item.status?.metadata_fetched && !item.status?.text_extracted) return 'arxiv'
+  return 'file'
+}
+
+const SOURCE_LABEL: Record<string, string> = {
+  arxiv: 'ArXiv',
+  file:  '文件',
+  url:   '链接',
+}
+const SOURCE_BG: Record<string, string> = {
+  arxiv: 'var(--source-arxiv-bg)',
+  file:  'var(--source-file-bg)',
+  url:   'var(--source-url-bg)',
+}
+const SOURCE_TEXT: Record<string, string> = {
+  arxiv: 'var(--source-arxiv-text)',
+  file:  'var(--source-file-text)',
+  url:   'var(--source-url-text)',
+}
 
 // ── Persist / restore column state ───────────────────────────────────────────
 function loadColState() {
@@ -102,7 +127,7 @@ function loadColState() {
     widths:  Object.fromEntries(ALL_COL_IDS.map(id => [id, COL_META[id].defaultWidth])) as Record<ColId, number>,
   }
   try {
-    const raw = localStorage.getItem('argus:col-state-v5')
+    const raw = localStorage.getItem('argus:col-state-v6')
     if (!raw) return defaults
     const p = JSON.parse(raw)
     const saved: ColId[] = (p.order ?? []).filter((id: string) => (ALL_COL_IDS as string[]).includes(id))
@@ -126,7 +151,7 @@ const bodyScrollRef = ref<HTMLElement | null>(null)
 const bottomScrollRef = ref<HTMLElement | null>(null)
 
 function saveColState() {
-  localStorage.setItem('argus:col-state-v5', JSON.stringify({
+  localStorage.setItem('argus:col-state-v6', JSON.stringify({
     order:   colOrder.value,
     visible: [...visibleCols.value],
     widths:  colWidths.value,
@@ -144,15 +169,18 @@ const orderedVisibleCols = computed(() =>
   colOrder.value.filter(id => visibleCols.value.has(id)).map(id => COL_META[id])
 )
 
+const TRAILING_SPACER = 80 // reserves space so hdr-controls never covers the last column
+
 const gridCols = computed(() => {
   const parts = ['28px']
   for (const col of orderedVisibleCols.value) parts.push(colWidths.value[col.id] + 'px')
+  parts.push(`${TRAILING_SPACER}px`)
   return parts.join(' ')
 })
 
 const tableWidthPx = computed(() => {
   const width = orderedVisibleCols.value.reduce((sum, col) => sum + colWidths.value[col.id], 28)
-  return `${width}px`
+  return `${width + TRAILING_SPACER}px`
 })
 
 function bodyScrollEl(): HTMLElement | null {
@@ -865,6 +893,8 @@ async function reExtract(item: PaperIndexEntry) {
             />
           </div>
 
+          <div class="hdr-trail" />
+
           <div
             v-if="isColumnDragging"
             class="col-insert-line"
@@ -1020,7 +1050,14 @@ async function reExtract(item: PaperIndexEntry) {
                     <span v-if="item.tags.length > 3" class="tag-more">+{{ item.tags.length - 3 }}</span>
                   </template>
                 </div>
+                <div v-else-if="col.id === 'source'" class="row-cell row-source">
+                  <span
+                    class="source-chip"
+                    :style="{ background: SOURCE_BG[inferSource(item)] ?? SOURCE_BG.file, color: SOURCE_TEXT[inferSource(item)] ?? SOURCE_TEXT.file }"
+                  >{{ SOURCE_LABEL[inferSource(item)] ?? '文件' }}</span>
+                </div>
               </template>
+              <div class="hdr-trail" />
             </div>
           </template>
         </RecycleScroller>
@@ -1236,12 +1273,14 @@ async function reExtract(item: PaperIndexEntry) {
   position: relative;
   height: 40px;
   flex-shrink: 0;
-  padding-right: 70px;
+  display: flex;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-subtle);
 }
 
 .header-scroll {
+  flex: 1;
+  min-width: 0;
   height: 100%;
   overflow-x: hidden;
   overflow-y: hidden;
@@ -1261,6 +1300,7 @@ async function reExtract(item: PaperIndexEntry) {
 }
 
 .hdr-spc { /* empty grid cell for reading status dot */ }
+.hdr-trail { /* trailing spacer so hdr-controls never overlaps the last column */ }
 
 .hdr-col {
   position: relative;   /* contain the resize handle */
@@ -1335,17 +1375,13 @@ async function reExtract(item: PaperIndexEntry) {
 
 /* Controls: count + picker */
 .hdr-controls {
-  position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
   display: flex;
   align-items: center;
   gap: 5px;
   padding: 0 6px 0 8px;
   border-left: 1px solid var(--border-subtle);
   background: var(--bg-secondary);
-  z-index: 30;
+  flex-shrink: 0;
 }
 
 .list-count {
@@ -1528,6 +1564,18 @@ async function reExtract(item: PaperIndexEntry) {
   font-size: 10px;
   color: var(--text-tertiary);
   flex-shrink: 0;
+}
+
+.row-source { justify-content: flex-start; }
+.source-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+  letter-spacing: 0.01em;
 }
 
 /* ── Empty states ──────────────────────────────────────────────────────────── */

@@ -67,6 +67,7 @@ export interface PaperIndexEntry {
   added_at: string
   reading_status: string
   meta_mtime?: number
+  import_source?: string
 }
 
 export interface LibraryConfig {

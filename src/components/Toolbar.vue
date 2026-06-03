@@ -284,6 +284,7 @@ const hiddenPaperTaskCount = computed(() => Math.max(0, paperTaskItems.value.len
 
 // arXiv button state
 const arxivNewCount = ref(0)
+const arxivWindowOpen = ref(false)
 const arxivAnalyzing = ref(false)
 const arxivFetching = ref(false)
 const arxivProgress = ref({ done: 0, total: 0 })
@@ -291,6 +292,8 @@ const arxivLabelMode = ref<'name' | 'progress'>('name')
 let unlistenArxiv: UnlistenFn | null = null
 let unlistenArxivAnalysis: UnlistenFn | null = null
 let unlistenArxivFetch: UnlistenFn | null = null
+let unlistenArxivWinOpen: UnlistenFn | null = null
+let unlistenArxivWinClose: UnlistenFn | null = null
 let labelToggleTimer: ReturnType<typeof setInterval> | null = null
 let statusPollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -334,6 +337,7 @@ watch(arxivBusy, (busy) => {
 async function openArxiv() {
   try {
     await invoke('open_arxiv_window')
+    arxivWindowOpen.value = true
     arxivNewCount.value = 0
   } catch (e) {
     console.error('Open arXiv window:', e)
@@ -393,6 +397,12 @@ onMounted(async () => {
     ragEmbedSyncing.value = e.payload.syncing
     ragEmbedProgress.value = { done: e.payload.done, total: e.payload.total }
   })
+  unlistenArxivWinOpen = await listen('arxiv-window-opened', () => {
+    arxivWindowOpen.value = true
+  })
+  unlistenArxivWinClose = await listen('arxiv-window-closed', () => {
+    arxivWindowOpen.value = false
+  })
   // Sync current analysis state immediately on mount (handles missed events)
   await syncArxivStatus()
   // Poll every 5 s so the indicator stays correct even if events were missed
@@ -404,6 +414,8 @@ onUnmounted(() => {
   if (unlistenArxivAnalysis) unlistenArxivAnalysis()
   if (unlistenArxivFetch) unlistenArxivFetch()
   if (unlistenRagEmbed) unlistenRagEmbed()
+  if (unlistenArxivWinOpen) unlistenArxivWinOpen()
+  if (unlistenArxivWinClose) unlistenArxivWinClose()
   if (labelToggleTimer) { clearInterval(labelToggleTimer); labelToggleTimer = null }
   if (ragLabelToggleTimer) { clearInterval(ragLabelToggleTimer); ragLabelToggleTimer = null }
   if (statusPollTimer) { clearInterval(statusPollTimer); statusPollTimer = null }
@@ -571,7 +583,7 @@ onUnmounted(() => {
           {{ arxivProgress.done }}/{{ arxivProgress.total }}
         </span>
       </Transition>
-      <span v-if="arxivNewCount > 0" class="arxiv-badge">{{ arxivNewCount }}</span>
+      <span v-if="!arxivWindowOpen && arxivNewCount > 0" class="arxiv-badge">{{ arxivNewCount }}</span>
     </button>
 
     <button

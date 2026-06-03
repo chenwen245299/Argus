@@ -11,6 +11,8 @@ const props = defineProps<{
   renamingId: string | null
   renameValue: string
   dragOverId: string | null
+  collectionDragOverId: string | null
+  collectionDraggingId: string | null
   showNewInput: boolean
   newCollParent: string | undefined
   newCollName: string
@@ -23,6 +25,7 @@ const emit = defineEmits<{
   submitRename: [id: string]
   delete: [col: Collection]
   startNew: [parentId: string]
+  collectionDragStart: [e: MouseEvent, col: Collection]
   submitNew: []
   'update:renameValue': [val: string]
   'update:newCollName': [val: string]
@@ -36,11 +39,20 @@ const children = computed(() => cStore.childrenOf(props.collection.id))
 const isExpanded = computed(() => props.expanded.has(props.collection.id))
 const isActive = computed(() => selection.activeCollectionId === props.collection.id)
 const isDragOver = computed(() => props.dragOverId === props.collection.id)
+const isCollectionDragOver = computed(() => props.collectionDragOverId === props.collection.id)
+const isCollectionDragging = computed(() => props.collectionDraggingId === props.collection.id)
 const paperCount = computed(() => cStore.collectionPaperCount(props.collection.id))
 const displayEmoji = computed(() => props.collection.emoji?.trim() || '📚')
 
 function selectCollection() {
   selection.selectNav(`collection:${props.collection.id}` as any)
+}
+
+function onCollectionMouseDown(e: MouseEvent) {
+  if (props.renamingId === props.collection.id) return
+  const target = e.target as HTMLElement | null
+  if (target?.closest('button, input, textarea, select')) return
+  emit('collectionDragStart', e, props.collection)
 }
 </script>
 
@@ -48,9 +60,15 @@ function selectCollection() {
   <div class="coll-node">
     <div
       class="nav-item coll-item"
-      :class="{ active: isActive, 'drag-over': isDragOver }"
+      :class="{
+        active: isActive,
+        'drag-over': isDragOver,
+        'collection-drag-over': isCollectionDragOver,
+        'collection-dragging': isCollectionDragging
+      }"
       :style="{ paddingLeft: (9 + depth * 16) + 'px' }"
       :data-collection-id="collection.id"
+      @mousedown="onCollectionMouseDown"
       @click="selectCollection"
       @contextmenu.prevent="$emit('openCtx', $event, collection)"
     >
@@ -118,6 +136,8 @@ function selectCollection() {
         :renamingId="renamingId"
         :renameValue="renameValue"
         :dragOverId="dragOverId"
+        :collectionDragOverId="collectionDragOverId"
+        :collectionDraggingId="collectionDraggingId"
         :showNewInput="showNewInput"
         :newCollParent="newCollParent"
         :newCollName="newCollName"
@@ -127,6 +147,7 @@ function selectCollection() {
         @submit-rename="(id: string) => $emit('submitRename', id)"
         @delete="(col: Collection) => $emit('delete', col)"
         @start-new="(id: string) => $emit('startNew', id)"
+        @collection-drag-start="(e: MouseEvent, col: Collection) => $emit('collectionDragStart', e, col)"
         @submit-new="() => $emit('submitNew')"
         @update:renameValue="(v: string) => $emit('update:renameValue', v)"
         @update:newCollName="(v: string) => $emit('update:newCollName', v)"
@@ -164,6 +185,15 @@ function selectCollection() {
   outline: 1.5px dashed var(--accent);
   outline-offset: -2px;
   color: var(--accent);
+}
+.nav-item.collection-drag-over {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  outline: 1.5px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: -2px;
+  color: var(--accent);
+}
+.nav-item.collection-dragging {
+  opacity: 0.52;
 }
 
 .collection-emoji {

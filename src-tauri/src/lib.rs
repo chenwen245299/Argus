@@ -114,6 +114,7 @@ pub fn run() {
             commands::get_collections,
             commands::create_collection,
             commands::rename_collection,
+            commands::move_collection,
             commands::set_collection_emoji,
             commands::delete_collection,
             commands::add_paper_to_collection,
@@ -194,6 +195,7 @@ pub fn run() {
             commands::chat_with_library,
             commands::open_paper_ai_window,
             commands::open_library_chat_window,
+            commands::focus_main_window,
             commands::save_chat_window_size,
             commands::save_paper_ai_window_size,
             // ── M8: arXiv window ──

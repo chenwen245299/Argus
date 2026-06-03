@@ -3,7 +3,6 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Window } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalSize } from '@tauri-apps/api/dpi'
 import { useAiStore, type ModelOption } from '../stores/ai'
@@ -39,10 +38,13 @@ async function loadPaperCounts() {
 async function refreshCounts() {
   if (refreshingCounts.value) return
   refreshingCounts.value = true
+  const t0 = Date.now()
   try {
     await invoke('sync_vectorized_flags')
     await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts()])
   } finally {
+    const remaining = 700 - (Date.now() - t0)
+    if (remaining > 0) await new Promise(r => setTimeout(r, remaining))
     refreshingCounts.value = false
   }
 }
@@ -152,6 +154,7 @@ const sidebarOpen = ref(true)
 const editingMsgId = ref<string | null>(null)
 const editingText = ref('')
 const copiedMsgIds = ref(new Set<string>())
+const modelPickerMsgId = ref<string | null>(null)
 
 // ── Sidebar resize ─────────────────────────────────────────────────────────────
 const SIDEBAR_WIDTH_KEY = 'argus:chat:sidebar-width'
@@ -470,15 +473,14 @@ function toggleSources(msgId: string) {
 function isSourcesExpanded(msgId: string) { return expandedSources.value.includes(msgId) }
 
 async function openSourcePaper(group: GroupedSource) {
-  try {
-    const mainWindow = await Window.getByLabel('main')
-    await mainWindow?.show()
-    await mainWindow?.setFocus()
-  } catch {}
   await emitTo('main', 'argus-open-paper', {
     slug: group.slug,
     title: group.paper_title,
   }).catch(() => {})
+  await invoke('focus_main_window').catch(() => {})
+  window.setTimeout(() => {
+    invoke('focus_main_window').catch(() => {})
+  }, 120)
 }
 
 function userMsgCount(conv: LibraryConversation) {
@@ -554,6 +556,9 @@ async function runAssistantRequest(
   history: ChatMessage[],
   sel: ModelSelection | null,
 ) {
+  const eventSafeId = target.id.replace(/[^A-Za-z0-9:_/-]/g, '-')
+  const eventName = `library-chat-${eventSafeId}`
+  const sourcesEventName = `${eventName}-sources`
   target.content = ''
   target.error = false
   target.streaming = true
@@ -566,21 +571,28 @@ async function runAssistantRequest(
   scrollToBottom()
 
   if (unlistenSources) { unlistenSources(); unlistenSources = null }
-  unlistenSources = await listen<RetrievedChunk[]>('library-chat-sources', (e) => {
+  unlistenSources = await listen<RetrievedChunk[]>(sourcesEventName, (e) => {
     pendingSources = e.payload ?? []
   })
 
   if (unlistenChat) { unlistenChat(); unlistenChat = null }
-  unlistenChat = await listen<{ delta: string; done: boolean }>('library-chat', (e) => {
-    if (!e.payload.done) { target.content += e.payload.delta; scrollToBottom() }
+  unlistenChat = await listen<{ delta?: string; done?: boolean }>(eventName, (e) => {
+    if (e.payload.done) return
+    const delta = e.payload.delta ?? ''
+    if (!delta) return
+    target.content += delta
+    scrollToBottom()
   })
 
   try {
-    await invoke<string>('chat_with_library', {
+    const finalText = await invoke<string>('chat_with_library', {
       messages: history,
       providerId: sel?.providerId ?? null,
       modelId: sel?.modelId ?? null,
+      eventName,
+      sourcesEventName,
     })
+    if (!target.content && finalText) target.content = finalText
     target.streaming = false
     assistantMsg.streaming = false
     if (pendingSources.length > 0) target.sources = [...pendingSources]
@@ -632,29 +644,48 @@ async function sendMessage() {
   conv.messages.push({
     id: genId(), role: 'user', content: text, createdAt: new Date().toISOString(),
   })
-  const assistantMsg = createAssistantMessage(sel)
-  conv.messages.push(assistantMsg)
-  const history = buildHistoryBeforeMessage(conv, assistantMsg.id)
-  await runAssistantRequest(conv, assistantMsg, assistantMsg, history, sel)
+  conv.messages.push(createAssistantMessage(sel))
+  // Use the reactive reference from the array so Vue tracks mutations during streaming
+  const reactiveMsg = conv.messages[conv.messages.length - 1] as LibraryUiMessage
+  const history = buildHistoryBeforeMessage(conv, reactiveMsg.id)
+  await runAssistantRequest(conv, reactiveMsg, reactiveMsg, history, sel)
 }
 
-async function regenerateAssistant(msg: LibraryUiMessage, useCurrentModel = false) {
+// Regenerate = REPLACE current answer in place (same model, no new variant)
+async function regenerateAssistant(msg: LibraryUiMessage) {
   if (loading.value || msg.role !== 'assistant' || !activeConv.value) return
-  const variants = ensureAnswerVariants(msg)
-  const current = activeAnswer(msg)
-  const sel = useCurrentModel ? effectiveModel() : (current.model ?? msg.model ?? effectiveModel())
-  const variant: LibraryAnswerVariant = {
+  const conv = activeConv.value
+  const reactiveMsg = conv.messages.find(m => m.id === msg.id) as LibraryUiMessage | undefined
+  if (!reactiveMsg) return
+  const sel = effectiveModel()
+  reactiveMsg.variants = []
+  reactiveMsg.activeVariantId = undefined
+  const history = buildHistoryBeforeMessage(conv, msg.id)
+  await runAssistantRequest(conv, reactiveMsg, reactiveMsg, history, sel)
+}
+
+// @ model = generate NEW variant with selected model (for comparison)
+async function regenerateWithModel(msg: LibraryUiMessage, modelSel: ModelOption) {
+  if (loading.value || msg.role !== 'assistant' || !activeConv.value) return
+  modelPickerMsgId.value = null
+  const conv = activeConv.value
+  const reactiveMsg = conv.messages.find(m => m.id === msg.id) as LibraryUiMessage | undefined
+  if (!reactiveMsg) return
+  const sel: ModelSelection = { providerId: modelSel.providerId, modelId: modelSel.modelId }
+  const variants = ensureAnswerVariants(reactiveMsg)
+  variants.push({
     id: `${msg.id}:v${variants.length}`,
     content: '',
     createdAt: new Date().toISOString(),
     streaming: true,
     model: sel,
     modelLabel: modelLabel(sel),
-  }
-  variants.push(variant)
-  msg.activeVariantId = variant.id
-  const history = buildHistoryBeforeMessage(activeConv.value, msg.id)
-  await runAssistantRequest(activeConv.value, msg, variant, history, sel)
+  })
+  reactiveMsg.activeVariantId = variants[variants.length - 1].id
+  // Get reactive reference from array so streaming triggers Vue updates
+  const reactiveVariant = variants[variants.length - 1]
+  const history = buildHistoryBeforeMessage(conv, msg.id)
+  await runAssistantRequest(conv, reactiveMsg, reactiveVariant, history, sel)
 }
 
 function startEditUser(msg: LibraryUiMessage) {
@@ -683,10 +714,10 @@ async function submitUserEdit(msg: LibraryUiMessage) {
   if (idx === 0) conv.title = deriveTitleFromMsg(text)
   cancelEdit()
   const sel = effectiveModel()
-  const assistantMsg = createAssistantMessage(sel)
-  conv.messages.push(assistantMsg)
-  const history = buildHistoryBeforeMessage(conv, assistantMsg.id)
-  await runAssistantRequest(conv, assistantMsg, assistantMsg, history, sel)
+  conv.messages.push(createAssistantMessage(sel))
+  const reactiveMsg = conv.messages[conv.messages.length - 1] as LibraryUiMessage
+  const history = buildHistoryBeforeMessage(conv, reactiveMsg.id)
+  await runAssistantRequest(conv, reactiveMsg, reactiveMsg, history, sel)
 }
 
 async function copyMessage(msg: LibraryUiMessage) {
@@ -723,6 +754,9 @@ function onMsgContainerClick(e: MouseEvent) {
 function closeModelMenu(e: MouseEvent) {
   if (modelMenuRoot.value && !modelMenuRoot.value.contains(e.target as Node)) {
     modelMenuOpen.value = false
+  }
+  if (!(e.target as HTMLElement).closest('.msg-model-picker')) {
+    modelPickerMsgId.value = null
   }
 }
 
@@ -1100,18 +1134,20 @@ onUnmounted(() => {
                 </div>
               </div>
               <template v-else>
-                <div class="user-bubble">{{ msg.content }}</div>
-                <div class="message-actions user-actions">
-                  <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                    </svg>
-                  </button>
-                  <button title="编辑并重发" :disabled="loading" @click="startEditUser(msg)">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>
-                    </svg>
-                  </button>
+                <div class="user-message-stack">
+                  <div class="user-bubble">{{ msg.content }}</div>
+                  <div class="message-actions user-actions">
+                    <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                      </svg>
+                    </button>
+                    <button title="编辑并重发" :disabled="loading" @click="startEditUser(msg)">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               </template>
             </div>
@@ -1125,24 +1161,6 @@ onUnmounted(() => {
                   </svg>
                 </div>
                 <div class="assistant-content">
-                  <div class="message-actions assistant-actions">
-                    <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                      </svg>
-                    </button>
-                    <button title="重新生成" :disabled="loading" @click="regenerateAssistant(msg, false)">
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polyline points="23 4 23 10 17 10"/><path d="M20.49 15A9 9 0 1 1 23 10"/>
-                      </svg>
-                    </button>
-                    <button title="用右上角模型重答" :disabled="loading" @click="regenerateAssistant(msg, true)">
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M7 7h10"/><path d="M7 12h7"/><path d="M7 17h4"/><path d="m16 14 3 3-3 3"/>
-                      </svg>
-                    </button>
-                  </div>
-
                   <div
                     class="assistant-bubble markdown-body"
                     :class="{ streaming: activeAnswer(msg).streaming, error: activeAnswer(msg).error }"
@@ -1161,21 +1179,82 @@ onUnmounted(() => {
                     </template>
                   </div>
 
-                  <div v-if="answerVariants(msg).length > 1" class="answer-tabs">
-                    <button
-                      v-for="(variant, index) in answerVariants(msg)"
-                      :key="variant.id"
-                      class="answer-tab"
-                      :class="{ active: variant.id === msg.activeVariantId }"
-                      @click="msg.activeVariantId = variant.id"
-                    >
-                      {{ variant.modelLabel || `回答 ${index + 1}` }}
+                  <!-- Action buttons -->
+                  <div v-if="!activeAnswer(msg).streaming" class="message-actions assistant-actions">
+                    <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                      </svg>
                     </button>
+                    <button title="重新生成" :disabled="loading" @click="regenerateAssistant(msg)">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M1 4v6h6"/><path d="M23 20v-6h-6"/>
+                        <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10"/>
+                        <path d="M3.51 15a9 9 0 0 0 14.85 3.36L23 14"/>
+                      </svg>
+                    </button>
+                    <!-- @ button: pick another model and add as a variant -->
+                    <div class="msg-model-picker" @click.stop>
+                      <button
+                        class="at-btn"
+                        title="用其他模型回答"
+                        :disabled="loading"
+                        :class="{ active: modelPickerMsgId === msg.id }"
+                        @click.stop="modelPickerMsgId = modelPickerMsgId === msg.id ? null : msg.id"
+                      >
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/>
+                        </svg>
+                      </button>
+                      <div v-if="modelPickerMsgId === msg.id" class="msg-model-menu">
+                        <div v-for="group in ai.groupedModels" :key="group.id" class="msg-model-group">
+                          <div class="msg-model-group-name">{{ group.name }}</div>
+                          <button
+                            v-for="model in group.models"
+                            :key="selectionKey(model)"
+                            class="msg-model-row"
+                            @click="regenerateWithModel(msg, model)"
+                          >
+                            <span class="msg-model-icon">
+                              <img v-if="modelLogo(model)" :src="modelLogo(model)" alt="" />
+                              <span v-else>{{ model.displayName.charAt(0) }}</span>
+                            </span>
+                            <span class="msg-model-name">{{ model.displayName }}</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
                   </div>
 
-                  <!-- Sources -->
-                  <div v-if="!activeAnswer(msg).streaming && answerSources(msg).length > 0" class="sources-wrap">
-                    <button class="sources-toggle" @click="toggleSources(msg.id)">
+                  <!-- Meta row: variant tabs (left) + sources toggle (right) -->
+                  <div
+                    v-if="answerVariants(msg).length > 1 || (!activeAnswer(msg).streaming && answerSources(msg).length > 0)"
+                    class="meta-row"
+                  >
+                    <div v-if="answerVariants(msg).length > 1" class="answer-tabs">
+                      <button
+                        v-for="(variant, index) in answerVariants(msg)"
+                        :key="variant.id"
+                        class="answer-tab"
+                        :class="{ active: variant.id === msg.activeVariantId }"
+                        @click="msg.activeVariantId = variant.id"
+                      >
+                        <span class="tab-model-icon">
+                          <img
+                            v-if="variant.model && modelLogo(ai.findModel(variant.model))"
+                            :src="modelLogo(ai.findModel(variant.model))"
+                            alt=""
+                          />
+                          <span v-else class="tab-icon-fallback">{{ (variant.modelLabel || `${index + 1}`).charAt(0) }}</span>
+                        </span>
+                        <span>{{ variant.modelLabel || `回答 ${index + 1}` }}</span>
+                      </button>
+                    </div>
+                    <button
+                      v-if="!activeAnswer(msg).streaming && answerSources(msg).length > 0"
+                      class="sources-toggle"
+                      @click="toggleSources(msg.id)"
+                    >
                       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <ellipse cx="12" cy="5" rx="9" ry="3"/>
                         <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
@@ -1186,27 +1265,28 @@ onUnmounted(() => {
                         <polyline points="6 9 12 15 18 9"/>
                       </svg>
                     </button>
+                  </div>
 
-                    <div v-if="isSourcesExpanded(msg.id)" class="sources-list">
-                      <div v-for="group in groupedSources(answerSources(msg))" :key="group.paper_id" class="source-group">
-                        <button class="source-paper-name" @click="openSourcePaper(group)">
-                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                            <polyline points="14 2 14 8 20 8"/>
-                          </svg>
-                          <span>{{ group.paper_title }}</span>
-                        </button>
-                        <div class="source-chips">
-                          <span
-                            v-for="chunk in group.chunks"
-                            :key="chunk.chunk_id"
-                            class="source-chip"
-                            :class="`st-${chunk.source_type}`"
-                          >
-                            {{ sourceTypeLabel(chunk.source_type) }}
-                            <span class="chip-score">{{ formatScore(chunk.score) }}</span>
-                          </span>
-                        </div>
+                  <!-- Sources list (expanded) -->
+                  <div v-if="isSourcesExpanded(msg.id) && answerSources(msg).length > 0" class="sources-list">
+                    <div v-for="group in groupedSources(answerSources(msg))" :key="group.paper_id" class="source-group">
+                      <button class="source-paper-name" @click="openSourcePaper(group)">
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                          <polyline points="14 2 14 8 20 8"/>
+                        </svg>
+                        <span>{{ group.paper_title }}</span>
+                      </button>
+                      <div class="source-chips">
+                        <span
+                          v-for="chunk in group.chunks"
+                          :key="chunk.chunk_id"
+                          class="source-chip"
+                          :class="`st-${chunk.source_type}`"
+                        >
+                          {{ sourceTypeLabel(chunk.source_type) }}
+                          <span class="chip-score">{{ formatScore(chunk.score) }}</span>
+                        </span>
                       </div>
                     </div>
                   </div>
@@ -1974,12 +2054,20 @@ onUnmounted(() => {
 .msg-row.user {
   display: flex;
   justify-content: flex-end;
-  align-items: flex-start;
-  gap: 8px;
+  align-items: flex-end;
+}
+
+.user-message-stack {
+  max-width: min(76%, 680px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+  min-width: 0;
 }
 
 .user-bubble {
-  max-width: min(76%, 680px);
+  max-width: 100%;
   padding: 11px 15px;
   background: color-mix(in srgb, var(--accent) 92%, #ffffff);
   color: #fff;
@@ -2070,17 +2158,14 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--bg-primary) 92%, var(--bg-secondary));
+  background: transparent;
   color: var(--text-tertiary);
-  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
 }
 
 .message-actions button:hover:not(:disabled) {
   color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 28%, var(--border-subtle));
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-primary));
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
 .message-actions button:disabled {
@@ -2089,15 +2174,11 @@ onUnmounted(() => {
 }
 
 .user-actions {
-  order: -1;
-  margin-top: 4px;
+  justify-content: flex-end;
 }
 
 .assistant-actions {
-  position: absolute;
-  top: -30px;
-  left: 0;
-  z-index: 2;
+  margin-top: 2px;
 }
 
 .user-edit-card {
@@ -2153,26 +2234,118 @@ onUnmounted(() => {
   cursor: not-allowed;
 }
 
+/* ── @ model picker (per-message) ─────────────────────────────────────────── */
+
+.msg-model-picker { position: relative; }
+
+.at-btn {
+  width: 27px;
+  height: 27px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-tertiary);
+}
+.at-btn:hover:not(:disabled),
+.at-btn.active { color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.at-btn:disabled { opacity: 0.42; cursor: not-allowed; }
+
+.msg-model-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 50;
+  width: 260px;
+  max-height: min(380px, 60vh);
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: var(--bg-primary);
+  box-shadow: 0 12px 36px rgba(15,23,42,0.16);
+}
+
+.msg-model-group + .msg-model-group {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.msg-model-group-name {
+  padding: 2px 8px 5px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.msg-model-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+}
+.msg-model-row:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+.msg-model-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
+  overflow: hidden;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.msg-model-icon img { width: 100%; height: 100%; object-fit: contain; }
+.msg-model-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Meta row: variant tabs + sources on same line ─────────────────────────── */
+
+.meta-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
 .answer-tabs {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 2px;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
 }
 
 .answer-tab {
   max-width: 180px;
   height: 25px;
-  padding: 0 9px;
+  padding: 0 8px 0 6px;
   border-radius: var(--radius-pill);
   border: 1px solid var(--border-subtle);
   background: var(--bg-secondary);
   color: var(--text-tertiary);
   font-size: 11px;
   font-weight: 650;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   white-space: nowrap;
+  overflow: hidden;
 }
 
 .answer-tab.active {
@@ -2180,6 +2353,20 @@ onUnmounted(() => {
   border-color: color-mix(in srgb, var(--accent) 28%, var(--border-subtle));
   background: color-mix(in srgb, var(--accent) 9%, var(--bg-primary));
 }
+
+.tab-model-icon {
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.tab-model-icon img { width: 100%; height: 100%; object-fit: contain; }
+.tab-icon-fallback { font-size: 9px; font-weight: 700; color: var(--accent); }
 
 /* Streaming cursor */
 .cursor-blink {
@@ -2196,12 +2383,6 @@ onUnmounted(() => {
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
 /* ── Sources ─────────────────────────────────────────────────────────────── */
-
-.sources-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-}
 
 .sources-toggle {
   display: inline-flex;

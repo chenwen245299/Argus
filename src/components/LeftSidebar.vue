@@ -121,6 +121,21 @@ watch(
 )
 
 // ── New collection ─────────────────────────────────────────────────────────────
+const refreshSpinning = ref(false)
+
+async function handleLibraryRefresh() {
+  if (refreshSpinning.value) return
+  refreshSpinning.value = true
+  const t0 = Date.now()
+  try {
+    await library.refresh()
+  } finally {
+    const remaining = 700 - (Date.now() - t0)
+    if (remaining > 0) await new Promise(r => setTimeout(r, remaining))
+    refreshSpinning.value = false
+  }
+}
+
 const showNewInput = ref(false)
 const newCollName = ref('')
 const newCollParent = ref<string | undefined>(undefined)
@@ -352,12 +367,117 @@ function closeCtx() {
 
 // ── Drag-drop targets (driven by pointer-based drag in PaperList) ─────────────
 const dragOverId = ref<string | null>(null)
+const collectionDraggingId = ref<string | null>(null)
+const collectionDragOverId = ref<string | null>(null)
+const collectionRootDragOver = ref(false)
+const collectionDragGhost = ref<Collection | null>(null)
+const collectionDragGhostPos = ref({ x: 0, y: 0 })
+let collectionDragCleanup: (() => void) | null = null
 
 function onPaperDragOver(e: Event) {
   dragOverId.value = (e as CustomEvent<{ collectionId: string | null }>).detail.collectionId
 }
 
 onMounted(() => document.addEventListener('argus-paper-drag-over', onPaperDragOver))
+
+function isCollectionDescendant(collectionId: string, ancestorId: string) {
+  let cur = collectionsStore.collectionById(collectionId)
+  const visited = new Set<string>()
+  while (cur?.parent_id) {
+    if (cur.parent_id === ancestorId) return true
+    if (visited.has(cur.parent_id)) return false
+    visited.add(cur.parent_id)
+    cur = collectionsStore.collectionById(cur.parent_id)
+  }
+  return false
+}
+
+function findCollectionDropTarget(x: number, y: number): string | null | undefined {
+  for (const el of document.elementsFromPoint(x, y)) {
+    const dataset = (el as HTMLElement).dataset
+    if (dataset?.collectionId) return dataset.collectionId
+    if (dataset?.collectionRoot === 'true') return null
+  }
+  return undefined
+}
+
+function validCollectionDropTarget(source: Collection, rawTarget: string | null | undefined) {
+  if (rawTarget === undefined) return undefined
+  if (rawTarget === source.id) return undefined
+  if (rawTarget && isCollectionDescendant(rawTarget, source.id)) return undefined
+  if ((source.parent_id ?? null) === (rawTarget ?? null)) return undefined
+  return rawTarget ?? null
+}
+
+function setCollectionDropHover(target: string | null | undefined) {
+  collectionDragOverId.value = typeof target === 'string' ? target : null
+  collectionRootDragOver.value = target === null
+}
+
+function clearCollectionDragState() {
+  collectionDraggingId.value = null
+  collectionDragOverId.value = null
+  collectionRootDragOver.value = false
+  collectionDragGhost.value = null
+  document.body.style.cursor = ''
+}
+
+function startCollectionDrag(e: MouseEvent, col: Collection) {
+  if (e.button !== 0 || renamingId.value === col.id) return
+  collectionDragCleanup?.()
+  const startX = e.clientX
+  const startY = e.clientY
+  let dragging = false
+
+  function onMove(ev: MouseEvent) {
+    if (!dragging && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 6) return
+    if (!dragging) {
+      dragging = true
+      closeCtx()
+      collectionDraggingId.value = col.id
+      collectionDragGhost.value = col
+      document.body.style.cursor = 'grabbing'
+    }
+
+    ev.preventDefault()
+    collectionDragGhostPos.value = { x: ev.clientX + 14, y: ev.clientY + 10 }
+    const rawTarget = findCollectionDropTarget(ev.clientX, ev.clientY)
+    setCollectionDropHover(validCollectionDropTarget(col, rawTarget))
+  }
+
+  async function onUp(ev: MouseEvent) {
+    collectionDragCleanup?.()
+    collectionDragCleanup = null
+
+    if (!dragging) {
+      clearCollectionDragState()
+      return
+    }
+
+    const rawTarget = findCollectionDropTarget(ev.clientX, ev.clientY)
+    const target = validCollectionDropTarget(col, rawTarget)
+    clearCollectionDragState()
+    if (target === undefined) return
+
+    try {
+      await collectionsStore.moveCollection(col.id, target)
+      if (target) {
+        expanded.value.add(target)
+        saveExpandedCollections()
+      }
+      await library.refresh()
+    } catch (err) {
+      console.error('move_collection:', err)
+    }
+  }
+
+  window.addEventListener('mousemove', onMove)
+  window.addEventListener('mouseup', onUp)
+  collectionDragCleanup = () => {
+    window.removeEventListener('mousemove', onMove)
+    window.removeEventListener('mouseup', onUp)
+  }
+}
 
 // ── Tags panel resize ─────────────────────────────────────────────────────────
 let tagResizeStartY = 0
@@ -394,6 +514,9 @@ function stopResizeTags() {
 }
 
 onUnmounted(() => {
+  collectionDragCleanup?.()
+  collectionDragCleanup = null
+  clearCollectionDragState()
   document.removeEventListener('argus-paper-drag-over', onPaperDragOver)
   window.removeEventListener('mousemove', onResizeTagsMove)
   window.removeEventListener('mouseup', stopResizeTags)
@@ -404,17 +527,21 @@ onUnmounted(() => {
 
 <template>
   <div class="left-sidebar" @click="closeCtx">
-    <div class="sidebar-scroll">
+    <div
+      class="sidebar-scroll"
+      :class="{ 'collection-root-drop-zone': collectionRootDragOver }"
+      data-collection-root="true"
+    >
       <!-- Library section (collapsible) -->
       <div class="section">
         <!-- Section header: click to collapse, + to new collection -->
         <div class="section-header" @click.stop="libraryCollapsed = !libraryCollapsed">
           <span class="section-title">{{ t('sidebar.library') }}</span>
           <div class="section-header-right">
-            <button class="icon-action" :title="t('toolbar.refreshTitle')" :disabled="library.isRefreshing" @click.stop="library.refresh()">
+            <button class="icon-action" :title="t('toolbar.refreshTitle')" :disabled="refreshSpinning" @click.stop="handleLibraryRefresh()">
               <svg
                 width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                :class="{ spin: library.isRefreshing || library.isLoading }"
+                :class="{ spin: refreshSpinning }"
               >
                 <polyline points="23 4 23 10 17 10"/>
                 <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
@@ -438,7 +565,11 @@ onUnmounted(() => {
 
         <template v-if="!libraryCollapsed">
           <!-- All Papers -->
-          <div class="all-papers-section">
+          <div
+            class="all-papers-section"
+            :class="{ 'collection-root-drop-over': collectionRootDragOver }"
+            data-collection-root="true"
+          >
             <button
               class="nav-item"
               :class="{ active: selection.activeNav === 'all' }"
@@ -457,7 +588,11 @@ onUnmounted(() => {
           </div>
 
           <!-- Collections directly below All Papers -->
-          <div class="coll-list">
+          <div
+            class="coll-list"
+            :class="{ 'collection-root-drop-over': collectionRootDragOver }"
+            data-collection-root="true"
+          >
             <!-- New top-level collection input -->
             <div v-if="showNewInput && !newCollParent" class="new-coll-row">
               <input
@@ -484,6 +619,8 @@ onUnmounted(() => {
               :renaming-id="renamingId"
               :rename-value="renameValue"
               :drag-over-id="dragOverId"
+              :collection-drag-over-id="collectionDragOverId"
+              :collection-dragging-id="collectionDraggingId"
               :show-new-input="showNewInput"
               :new-coll-parent="newCollParent"
               :new-coll-name="newCollName"
@@ -493,6 +630,7 @@ onUnmounted(() => {
               @submit-rename="submitRename"
               @delete="deleteCollection"
               @start-new="startNew"
+              @collection-drag-start="startCollectionDrag"
               @submit-new="submitNew"
               @update:renameValue="renameValue = $event"
               @update:newCollName="newCollName = $event"
@@ -628,6 +766,17 @@ onUnmounted(() => {
         <span>{{ t('settings.title') }}</span>
       </button>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="collectionDragGhost"
+        class="collection-drag-ghost"
+        :style="{ left: `${collectionDragGhostPos.x}px`, top: `${collectionDragGhostPos.y}px` }"
+      >
+        <span>{{ collectionDragGhost.emoji?.trim() || '📚' }}</span>
+        <span>{{ collectionDragGhost.name }}</span>
+      </div>
+    </Teleport>
 
     <!-- Context menu (collection) -->
     <Teleport to="body">
@@ -774,6 +923,15 @@ onUnmounted(() => {
   overflow-y: auto;
   padding: 0 0 10px;
 }
+.sidebar-scroll.collection-root-drop-zone {
+  background: linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 72px,
+    color-mix(in srgb, var(--accent) 4%, transparent) 72px,
+    color-mix(in srgb, var(--accent) 4%, transparent) 100%
+  );
+}
 
 .section { margin-bottom: 4px; }
 
@@ -844,6 +1002,16 @@ onUnmounted(() => {
   margin-top: 0;
   margin-bottom: 0;
 }
+.all-papers-section.collection-root-drop-over .nav-item {
+  outline: 1.5px solid color-mix(in srgb, var(--accent) 72%, transparent);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-primary));
+  color: var(--accent);
+}
+
+.coll-list.collection-root-drop-over {
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
 
 /* macOS Finder-style nav items */
 .nav-item {
@@ -891,6 +1059,30 @@ onUnmounted(() => {
   font-size: var(--font-size-xs);
   color: var(--text-tertiary);
   padding: 4px 14px 6px 20px;
+}
+
+.collection-drag-ghost {
+  position: fixed;
+  z-index: 100000;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 240px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border-subtle));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-primary) 94%, var(--accent));
+  color: var(--text-primary);
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
+  font-size: 13px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.collection-drag-ghost span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .new-coll-row { padding: 3px 6px 3px 12px; }

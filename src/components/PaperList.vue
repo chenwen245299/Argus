@@ -780,7 +780,8 @@ async function generateAiSummary(item: PaperIndexEntry) {
   setAiSummaryJob(item.slug, { kind: 'summary', stage: 'queued', generatedChars: 0, message: undefined })
   cleanupAiSummaryStream(item.slug)
   try {
-    const unlistenStream = await listen<{ delta?: string; done?: boolean }>(`ai-summary-${item.slug}`, (ev) => {
+    const eventSafeSlug = item.slug.replace(/[^A-Za-z0-9:_/-]/g, '-')
+    const unlistenStream = await listen<{ delta?: string; done?: boolean }>(`ai-summary-${eventSafeSlug}`, (ev) => {
       const job = aiSummaryJobs.value[item.slug]
       if (!job) return
       if (ev.payload.delta) {

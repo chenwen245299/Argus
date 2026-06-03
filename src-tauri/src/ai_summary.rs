@@ -71,7 +71,7 @@ pub async fn generate_summary(
         user.push_str("\n\n> 注：由于模型上下文限制，本次摘要基于截断后的论文全文生成。");
     }
 
-    let event_name = format!("ai-summary-{}", slug);
+    let event_name = format!("ai-summary-{}", slug_to_event_id(slug));
     emit_progress(
         app,
         slug,
@@ -232,6 +232,12 @@ fn context_budget(provider: &crate::models::AiProvider, model_id: &str) -> usize
         })
         .unwrap_or(60_000)
         .saturating_sub(CONTEXT_OVERHEAD)
+}
+
+fn slug_to_event_id(slug: &str) -> String {
+    slug.chars()
+        .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | ':') { c } else { '-' })
+        .collect()
 }
 
 fn default_meta() -> PaperMeta {

@@ -7,7 +7,7 @@ import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
 import { useCanvasStore } from '../stores/canvas'
 import CollectionNode from './CollectionNode.vue'
-import type { Collection, NavItem } from '../types'
+import type { CanvasIndexEntry, Collection, NavItem } from '../types'
 import { updateStore } from '../stores/update'
 
 const { t } = useI18n()
@@ -253,6 +253,37 @@ async function openSpecificCanvas(canvasId?: string) {
   }
 }
 
+const canvasRenamingId = ref<string | null>(null)
+const canvasRenameValue = ref('')
+
+function startRenameCanvas(entry: CanvasIndexEntry) {
+  closeCtx()
+  canvasRenamingId.value = entry.id
+  canvasRenameValue.value = entry.name
+  nextTick(() => {
+    const el = document.getElementById(`canvas-rename-${entry.id}`) as HTMLInputElement | null
+    el?.focus()
+    el?.select()
+  })
+}
+
+function cancelRenameCanvas() {
+  canvasRenamingId.value = null
+  canvasRenameValue.value = ''
+}
+
+async function submitRenameCanvas(id: string) {
+  const name = canvasRenameValue.value.trim()
+  if (name) await canvasStore.renameCanvas(id, name)
+  cancelRenameCanvas()
+}
+
+async function deleteCanvas(entry: CanvasIndexEntry) {
+  const confirmMsg = t('canvas.deleteConfirm').replace('{name}', entry.name)
+  if (!window.confirm(confirmMsg)) return
+  await canvasStore.deleteCanvas(entry.id)
+}
+
 let canvasResizeStartY = 0
 let canvasResizeStartH = 0
 let isResizingCanvas = false
@@ -287,11 +318,20 @@ function stopResizeCanvas() {
 
 // ── Context menu (collections) ────────────────────────────────────────────────
 const ctxMenu = ref<{ x: number; y: number; col: Collection } | null>(null)
+const canvasCtxMenu = ref<{ x: number; y: number; entry: CanvasIndexEntry } | null>(null)
 
 function openCtx(e: MouseEvent, col: Collection) {
   e.preventDefault()
   libCtxMenu.value = null
+  canvasCtxMenu.value = null
   ctxMenu.value = { x: e.clientX, y: e.clientY, col }
+}
+
+function openCanvasCtx(e: MouseEvent, entry: CanvasIndexEntry) {
+  e.preventDefault()
+  ctxMenu.value = null
+  libCtxMenu.value = null
+  canvasCtxMenu.value = { x: e.clientX, y: e.clientY, entry }
 }
 
 // ── Context menu (All Papers / library root) ──────────────────────────────────
@@ -300,12 +340,14 @@ const libCtxMenu = ref<{ x: number; y: number } | null>(null)
 function openLibCtx(e: MouseEvent) {
   e.preventDefault()
   ctxMenu.value = null
+  canvasCtxMenu.value = null
   libCtxMenu.value = { x: e.clientX, y: e.clientY }
 }
 
 function closeCtx() {
   ctxMenu.value = null
   libCtxMenu.value = null
+  canvasCtxMenu.value = null
 }
 
 // ── Drag-drop targets (driven by pointer-based drag in PaperList) ─────────────
@@ -514,23 +556,40 @@ onUnmounted(() => {
             {{ t('canvas.noCanvases') }}
           </div>
 
-          <button
+          <div
             v-for="cv in canvasStore.canvasList"
             :key="cv.id"
             class="nav-item"
             :class="{ active: canvasStore.isShown && canvasStore.currentCanvas?.id === cv.id }"
+            role="button"
+            tabindex="0"
             @click="openSpecificCanvas(cv.id)"
+            @keydown.enter.prevent="openSpecificCanvas(cv.id)"
+            @contextmenu.prevent.stop="openCanvasCtx($event, cv)"
           >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="8" cy="8" r="2"/><circle cx="16" cy="8" r="2"/>
-              <circle cx="12" cy="17" r="2"/>
-              <line x1="9.8" y1="8.8" x2="13.2" y2="15.4"/>
-              <line x1="14.2" y1="8.8" x2="10.8" y2="15.4"/>
-              <line x1="10" y1="8" x2="14" y2="8"/>
-            </svg>
-            <span class="canvas-name-text">{{ cv.name }}</span>
-            <span v-if="cv.node_count > 0" class="badge">{{ cv.node_count }}</span>
-          </button>
+            <template v-if="canvasRenamingId === cv.id">
+              <input
+                :id="`canvas-rename-${cv.id}`"
+                v-model="canvasRenameValue"
+                class="coll-name-input canvas-rename-input"
+                @click.stop
+                @keydown.enter.stop.prevent="submitRenameCanvas(cv.id)"
+                @keydown.escape.stop.prevent="cancelRenameCanvas"
+                @blur="submitRenameCanvas(cv.id)"
+              />
+            </template>
+            <template v-else>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="8" cy="8" r="2"/><circle cx="16" cy="8" r="2"/>
+                <circle cx="12" cy="17" r="2"/>
+                <line x1="9.8" y1="8.8" x2="13.2" y2="15.4"/>
+                <line x1="14.2" y1="8.8" x2="10.8" y2="15.4"/>
+                <line x1="10" y1="8" x2="14" y2="8"/>
+              </svg>
+              <span class="canvas-name-text">{{ cv.name }}</span>
+              <span v-if="cv.node_count > 0" class="badge">{{ cv.node_count }}</span>
+            </template>
+          </div>
         </div>
       </template>
     </div>
@@ -593,6 +652,24 @@ onUnmounted(() => {
         <div class="ctx-sep" />
         <button class="ctx-item danger" @click="deleteCollection(ctxMenu!.col); closeCtx()">
           {{ t('collections.delete') }}
+        </button>
+      </div>
+    </Teleport>
+
+    <!-- Context menu (canvas item) -->
+    <Teleport to="body">
+      <div
+        v-if="canvasCtxMenu"
+        class="ctx-menu"
+        :style="{ left: canvasCtxMenu.x + 'px', top: canvasCtxMenu.y + 'px' }"
+        @click.stop
+      >
+        <button class="ctx-item" @click="startRenameCanvas(canvasCtxMenu!.entry)">
+          {{ t('canvas.rename') }}
+        </button>
+        <div class="ctx-sep" />
+        <button class="ctx-item danger" @click="deleteCanvas(canvasCtxMenu!.entry); closeCtx()">
+          {{ t('canvas.delete') }}
         </button>
       </div>
     </Teleport>
@@ -780,6 +857,7 @@ onUnmounted(() => {
   color: var(--text-secondary);
   border-radius: var(--radius-md);
   text-align: left;
+  cursor: pointer;
   transition: background 0.1s, color 0.1s;
   white-space: nowrap;
   overflow: hidden;
@@ -826,6 +904,12 @@ onUnmounted(() => {
   color: var(--text-primary);
   box-sizing: border-box;
   box-shadow: 0 0 0 3px var(--accent-light);
+}
+
+.canvas-rename-input {
+  min-width: 0;
+  padding: 3px 7px;
+  font-size: 13px;
 }
 
 .canvas-section {

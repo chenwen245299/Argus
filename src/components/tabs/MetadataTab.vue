@@ -18,6 +18,14 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const library = useLibraryStore()
 
+// ── Source options ────────────────────────────────────────────────────────────
+const SOURCE_LABEL: Record<string, string> = { arxiv: 'ArXiv', file: '文件', url: '链接' }
+const SOURCE_OPTIONS = [
+  { value: 'file',  label: '文件' },
+  { value: 'arxiv', label: 'ArXiv' },
+  { value: 'url',   label: '链接' },
+]
+
 // ── Edit state ────────────────────────────────────────────────────────────────
 const editing = ref(false)
 const draft = ref<PaperMeta | null>(null)
@@ -434,6 +442,16 @@ async function extractAbstract() {
           <div v-else class="abstract-text">{{ abstractText }}</div>
         </div>
 
+        <!-- Source (来源) -->
+        <div class="field source-field">
+          <div class="label">来源</div>
+          <div class="value source-val">
+            <span class="src-chip" :class="'src-' + (meta.import_source ?? 'file')">
+              {{ SOURCE_LABEL[meta.import_source ?? 'file'] }}
+            </span>
+          </div>
+        </div>
+
         <!-- Full text -->
         <div class="field fulltext-field">
           <div class="label fulltext-label-row">
@@ -580,6 +598,19 @@ async function extractAbstract() {
               :class="{ active: draft.reading_status === s }"
               @click="draft.reading_status = s"
             >{{ t('readingStatus.' + s) }}</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="label">来源</div>
+          <div class="source-btns">
+            <button
+              v-for="s in SOURCE_OPTIONS"
+              :key="s.value"
+              class="source-btn"
+              :class="{ active: (draft.import_source ?? 'file') === s.value }"
+              @click="draft.import_source = s.value"
+            >{{ s.label }}</button>
           </div>
         </div>
 
@@ -877,6 +908,28 @@ async function extractAbstract() {
 .abstract-error { font-size: var(--font-size-xs); color: #dc2626; word-break: break-word; }
 @keyframes spin-xs-anim { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .spin-xs { animation: spin-xs-anim 0.8s linear infinite; flex-shrink: 0; }
+
+/* Source field */
+.source-field { }
+.source-val { display: flex; align-items: center; }
+.src-chip {
+  display: inline-flex; align-items: center;
+  padding: 2px 10px; border-radius: var(--radius-pill);
+  font-size: var(--font-size-xs); font-weight: 500;
+}
+.src-arxiv { background: var(--source-arxiv-bg); color: var(--source-arxiv-text); }
+.src-file  { background: var(--source-file-bg);  color: var(--source-file-text);  }
+.src-url   { background: var(--source-url-bg);   color: var(--source-url-text);   }
+
+.source-btns { display: flex; gap: 5px; }
+.source-btn {
+  flex: 1; padding: 4px 8px; font-size: var(--font-size-xs);
+  border: 1px solid var(--border-default); border-radius: var(--radius-sm);
+  background: var(--bg-secondary); color: var(--text-secondary); cursor: pointer;
+  transition: all 0.1s;
+}
+.source-btn:hover { border-color: var(--accent); color: var(--accent); }
+.source-btn.active { background: var(--accent); color: #fff; border-color: transparent; }
 
 /* Fulltext section */
 .fulltext-field { margin-top: 4px; border-top: 1px solid var(--border-default); padding-top: 10px; }

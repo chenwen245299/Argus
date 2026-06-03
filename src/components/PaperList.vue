@@ -98,8 +98,8 @@ const ALL_COL_IDS: ColId[] = ['title', 'authors', 'venue', 'year', 'added_at', '
 // ── Import source helpers ─────────────────────────────────────────────────────
 function inferSource(item: PaperIndexEntry): string {
   if (item.import_source) return item.import_source
-  // Legacy: infer from meta fields
-  if (item.status?.metadata_fetched && !item.status?.text_extracted) return 'arxiv'
+  // Legacy fallback: papers with metadata_fetched were likely from ArXiv.
+  if (item.status?.metadata_fetched) return 'arxiv'
   return 'file'
 }
 

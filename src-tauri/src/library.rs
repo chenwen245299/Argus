@@ -150,7 +150,10 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
             added_at: meta.added_at,
             reading_status: meta.reading_status,
             meta_mtime: current_mtime,
-            import_source: meta.import_source,
+            import_source: meta.import_source.or_else(|| {
+                // Backfill for legacy entries: infer "arxiv" if arxiv_id is present.
+                meta.arxiv_id.as_ref().map(|_| "arxiv".to_string())
+            }),
         });
     }
 

@@ -13,6 +13,7 @@ export interface PaperMeta {
   abstract?: string
   bibtex?: string
   canvas_notes?: string[]
+  import_source?: string
 }
 
 export interface PaperStatus {

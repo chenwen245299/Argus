@@ -4,8 +4,6 @@ mod arxiv;
 mod arxiv_scheduler;
 mod canvas;
 mod canvas_enhance;
-mod cli_manager;
-mod cli_runner;
 mod collections;
 mod commands;
 mod copilot;
@@ -91,6 +89,7 @@ pub fn run() {
             commands::update_reading_state,
             commands::get_paper_status,
             commands::save_pdfjs_fulltext,
+            commands::save_fulltext,
             commands::ocr_page_base64,
             commands::translate_text,
             commands::translate_text_stream,
@@ -147,8 +146,6 @@ pub fn run() {
             commands::extract_abstract_ai,
             // ── M5: Copilot ──
             commands::chat_with_paper,
-            commands::check_codex_available,
-            commands::chat_paper_with_codex,
             commands::chat_with_paper_event,
             commands::get_chat_history,
             commands::save_chat_history,
@@ -158,24 +155,6 @@ pub fn run() {
             commands::get_library_chat_history,
             commands::save_library_chat_history,
             commands::clear_library_chat_history,
-            // ── M6: CLI Tools config ──
-            commands::get_cli_settings,
-            commands::save_cli_polish,
-            commands::detect_cli_tools,
-            commands::save_cli_tool,
-            commands::delete_cli_tool,
-            commands::test_cli_tool,
-            // ── M6: Prompt templates ──
-            commands::get_cli_prompt_templates,
-            commands::save_cli_prompt_template,
-            commands::delete_cli_prompt_template,
-            // ── M6: Analysis execution ──
-            commands::run_cli_analysis,
-            commands::cancel_cli_analysis,
-            // ── M6: Analysis results ──
-            commands::save_cli_analysis_result,
-            commands::list_cli_analyses,
-            commands::get_cli_analysis,
             // ── M7: RAG Settings ──
             commands::get_rag_settings,
             commands::save_rag_settings,

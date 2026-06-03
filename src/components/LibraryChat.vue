@@ -155,6 +155,24 @@ const editingMsgId = ref<string | null>(null)
 const editingText = ref('')
 const copiedMsgIds = ref(new Set<string>())
 const modelPickerMsgId = ref<string | null>(null)
+const modelPickerPos = ref<{ top: number; left: number }>({ top: 0, left: 0 })
+
+const modelPickerMsg = computed(() =>
+  modelPickerMsgId.value
+    ? (activeConv.value?.messages.find(m => m.id === modelPickerMsgId.value) as LibraryUiMessage | undefined)
+    : undefined
+)
+
+function openModelPicker(msgId: string, e: MouseEvent) {
+  if (modelPickerMsgId.value === msgId) {
+    modelPickerMsgId.value = null
+    return
+  }
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  // Store the top of the button; popup uses translateY(-100%) to appear above it
+  modelPickerPos.value = { top: rect.top - 6, left: rect.left }
+  modelPickerMsgId.value = msgId
+}
 
 // ── Sidebar resize ─────────────────────────────────────────────────────────────
 const SIDEBAR_WIDTH_KEY = 'argus:chat:sidebar-width'
@@ -1200,71 +1218,57 @@ onUnmounted(() => {
                         title="用其他模型回答"
                         :disabled="loading"
                         :class="{ active: modelPickerMsgId === msg.id }"
-                        @click.stop="modelPickerMsgId = modelPickerMsgId === msg.id ? null : msg.id"
+                        @click.stop="openModelPicker(msg.id, $event)"
                       >
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                           <circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/>
                         </svg>
                       </button>
-                      <div v-if="modelPickerMsgId === msg.id" class="msg-model-menu">
-                        <div v-for="group in ai.groupedModels" :key="group.id" class="msg-model-group">
-                          <div class="msg-model-group-name">{{ group.name }}</div>
-                          <button
-                            v-for="model in group.models"
-                            :key="selectionKey(model)"
-                            class="msg-model-row"
-                            @click="regenerateWithModel(msg, model)"
-                          >
-                            <span class="msg-model-icon">
-                              <img v-if="modelLogo(model)" :src="modelLogo(model)" alt="" />
-                              <span v-else>{{ model.displayName.charAt(0) }}</span>
-                            </span>
-                            <span class="msg-model-name">{{ model.displayName }}</span>
-                          </button>
-                        </div>
-                      </div>
                     </div>
                   </div>
 
-                  <!-- Meta row: variant tabs (left) + sources toggle (right) -->
+                  <!-- Divider + meta row -->
                   <div
                     v-if="answerVariants(msg).length > 1 || (!activeAnswer(msg).streaming && answerSources(msg).length > 0)"
                     class="meta-row"
                   >
-                    <div v-if="answerVariants(msg).length > 1" class="answer-tabs">
+                    <div class="meta-divider" />
+                    <div class="meta-content">
+                      <!-- Sources toggle on the LEFT -->
                       <button
-                        v-for="(variant, index) in answerVariants(msg)"
-                        :key="variant.id"
-                        class="answer-tab"
-                        :class="{ active: variant.id === msg.activeVariantId }"
-                        @click="msg.activeVariantId = variant.id"
+                        v-if="!activeAnswer(msg).streaming && answerSources(msg).length > 0"
+                        class="sources-toggle"
+                        @click="toggleSources(msg.id)"
                       >
-                        <span class="tab-model-icon">
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <ellipse cx="12" cy="5" rx="9" ry="3"/>
+                          <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+                          <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+                        </svg>
+                        <span>{{ isSourcesExpanded(msg.id) ? t('libraryChat.hideSources') : t('libraryChat.sources', { n: groupedSources(answerSources(msg)).length }) }}</span>
+                        <svg class="chevron" :class="{ open: isSourcesExpanded(msg.id) }" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                          <polyline points="6 9 12 15 18 9"/>
+                        </svg>
+                      </button>
+                      <!-- Model variant tabs to the RIGHT of sources -->
+                      <div v-if="answerVariants(msg).length > 1" class="answer-tabs">
+                        <button
+                          v-for="(variant, index) in answerVariants(msg)"
+                          :key="variant.id"
+                          class="answer-tab"
+                          :class="{ active: variant.id === msg.activeVariantId }"
+                          :title="variant.modelLabel || `回答 ${index + 1}`"
+                          @click="msg.activeVariantId = variant.id"
+                        >
                           <img
                             v-if="variant.model && modelLogo(ai.findModel(variant.model))"
                             :src="modelLogo(ai.findModel(variant.model))"
                             alt=""
                           />
                           <span v-else class="tab-icon-fallback">{{ (variant.modelLabel || `${index + 1}`).charAt(0) }}</span>
-                        </span>
-                        <span>{{ variant.modelLabel || `回答 ${index + 1}` }}</span>
-                      </button>
+                        </button>
+                      </div>
                     </div>
-                    <button
-                      v-if="!activeAnswer(msg).streaming && answerSources(msg).length > 0"
-                      class="sources-toggle"
-                      @click="toggleSources(msg.id)"
-                    >
-                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <ellipse cx="12" cy="5" rx="9" ry="3"/>
-                        <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
-                        <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
-                      </svg>
-                      <span>{{ isSourcesExpanded(msg.id) ? t('libraryChat.hideSources') : t('libraryChat.sources', { n: groupedSources(answerSources(msg)).length }) }}</span>
-                      <svg class="chevron" :class="{ open: isSourcesExpanded(msg.id) }" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                        <polyline points="6 9 12 15 18 9"/>
-                      </svg>
-                    </button>
                   </div>
 
                   <!-- Sources list (expanded) -->
@@ -1335,6 +1339,26 @@ onUnmounted(() => {
       </div><!-- /lc-body -->
     </template>
   </div>
+
+  <!-- Model picker teleported to body to escape overflow clipping -->
+  <Teleport to="body">
+    <div
+      v-if="modelPickerMsgId && modelPickerMsg"
+      class="msg-model-menu-teleport"
+      :style="{ top: modelPickerPos.top + 'px', left: modelPickerPos.left + 'px' }"
+      @click.stop
+    >
+      <div v-for="group in ai.groupedModels" :key="group.id" class="msg-model-group">
+        <div class="msg-model-group-name">{{ group.name }}</div>
+        <button
+          v-for="model in group.models"
+          :key="selectionKey(model)"
+          class="msg-model-row"
+          @click="regenerateWithModel(modelPickerMsg!, model)"
+        >{{ model.displayName }}</button>
+      </div>
+    </div>
+  </Teleport>
 </template>
 
 <style scoped>
@@ -2112,7 +2136,7 @@ onUnmounted(() => {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 3px;
 }
 
 .assistant-bubble {
@@ -2252,20 +2276,7 @@ onUnmounted(() => {
 .at-btn.active { color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .at-btn:disabled { opacity: 0.42; cursor: not-allowed; }
 
-.msg-model-menu {
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 0;
-  z-index: 50;
-  width: 260px;
-  max-height: min(380px, 60vh);
-  overflow-y: auto;
-  padding: 6px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 12px;
-  background: var(--bg-primary);
-  box-shadow: 0 12px 36px rgba(15,23,42,0.16);
-}
+/* .msg-model-menu is no longer used (replaced by teleport) */
 
 .msg-model-group + .msg-model-group {
   margin-top: 6px;
@@ -2284,43 +2295,36 @@ onUnmounted(() => {
 
 .msg-model-row {
   width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
+  padding: 7px 10px;
   border-radius: 8px;
   color: var(--text-secondary);
   font-size: 13px;
-  font-weight: 500;
   text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .msg-model-row:hover { background: var(--bg-hover); color: var(--text-primary); }
-
-.msg-model-icon {
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
-  overflow: hidden;
-  font-size: 10px;
-  font-weight: 700;
-  color: var(--accent);
-}
-.msg-model-icon img { width: 100%; height: 100%; object-fit: contain; }
-.msg-model-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── Meta row: variant tabs + sources on same line ─────────────────────────── */
 
 .meta-row {
   display: flex;
+  flex-direction: column;
+  margin-top: 4px;
+}
+
+.meta-divider {
+  height: 1px;
+  background: var(--border-subtle);
+  margin-bottom: 8px;
+}
+
+.meta-content {
+  display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  margin-top: 4px;
 }
 
 .answer-tabs {
@@ -2332,41 +2336,35 @@ onUnmounted(() => {
 }
 
 .answer-tab {
-  max-width: 180px;
-  height: 25px;
-  padding: 0 8px 0 6px;
-  border-radius: var(--radius-pill);
-  border: 1px solid var(--border-subtle);
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 2px solid transparent;
   background: var(--bg-secondary);
-  color: var(--text-tertiary);
-  font-size: 11px;
-  font-weight: 650;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  white-space: nowrap;
-  overflow: hidden;
-}
-
-.answer-tab.active {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 28%, var(--border-subtle));
-  background: color-mix(in srgb, var(--accent) 9%, var(--bg-primary));
-}
-
-.tab-model-icon {
-  width: 15px;
-  height: 15px;
-  border-radius: 4px;
-  flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  flex-shrink: 0;
+  transition: border-color 0.12s, box-shadow 0.12s;
 }
-.tab-model-icon img { width: 100%; height: 100%; object-fit: contain; }
-.tab-icon-fallback { font-size: 9px; font-weight: 700; color: var(--accent); }
+
+.answer-tab img { width: 20px; height: 20px; object-fit: contain; border-radius: 4px; }
+
+.answer-tab:hover {
+  border-color: var(--border-default);
+}
+
+.answer-tab.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.tab-icon-fallback {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
 
 /* Streaming cursor */
 .cursor-blink {
@@ -2656,6 +2654,7 @@ onUnmounted(() => {
 }
 
 .markdown-body :deep(p) { margin: 0.45em 0; }
+.markdown-body :deep(p:last-child) { margin-bottom: 0; }
 .markdown-body :deep(ul),
 .markdown-body :deep(ol) { padding-left: 1.4em; margin: 0.5em 0; }
 .markdown-body :deep(li) { margin: 0.2em 0; }
@@ -2720,5 +2719,55 @@ onUnmounted(() => {
 .conv-list::-webkit-scrollbar-thumb {
   background: var(--border-default);
   border-radius: 2px;
+}
+</style>
+
+<style>
+/* Global: teleported model picker (scoped doesn't reach Teleport children) */
+.msg-model-menu-teleport {
+  position: fixed;
+  transform: translateY(-100%);
+  z-index: 9999;
+  min-width: 220px;
+  max-width: 320px;
+  max-height: min(400px, 65vh);
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: var(--bg-primary);
+  box-shadow: 0 12px 36px rgba(15,23,42,0.18);
+}
+.msg-model-menu-teleport .msg-model-group + .msg-model-group {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+.msg-model-menu-teleport .msg-model-group-name {
+  padding: 2px 8px 5px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.msg-model-menu-teleport .msg-model-row {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  background: none;
+  border: none;
+}
+.msg-model-menu-teleport .msg-model-row:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }
 </style>

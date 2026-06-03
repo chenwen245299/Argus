@@ -3,15 +3,14 @@ use tauri::{Emitter, Manager, State};
 use crate::models::{
     AiModel, AiProviderInfo, AiProviderInput, AiSettingsInfo, AppSettings, ArxivConfig, ArxivInbox,
     ArxivPaper, ArxivScheduleStatus, Canvas, CanvasIndexEntry, CanvasSettings, ChatMessage,
-    CliAnalysisEntry, CliPromptTemplate, CliSettings, CliTool, Collection, CollectionsFile,
-    Highlight, LibraryConfig, NodePosition, Note, PaperIndexEntry, PaperMeta, PaperStatus,
+    Collection, CollectionsFile, Highlight, LibraryConfig, NodePosition, Note, PaperIndexEntry,
+    PaperMeta, PaperStatus,
     RagSettings, ReadingState, RetrievedChunk, SearchHit, SuggestedEdge, VectorStoreInfo,
 };
 use crate::LibraryRoot;
 use crate::{
-    ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas, canvas_enhance, cli_manager,
-    cli_runner, collections, copilot, extraction, library, llm, metadata, paper, rag,
-    search, settings, url_import,
+    ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas, canvas_enhance, collections, copilot,
+    extraction, library, llm, metadata, paper, rag, search, settings, url_import,
 };
 // ── Library management ────────────────────────────────────────────────────────
 
@@ -315,8 +314,30 @@ pub async fn save_pdfjs_fulltext(
     paper::write_status(&root, &slug, &status)
 }
 
+#[tauri::command]
+pub async fn save_fulltext(
+    slug: String,
+    text: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    let dir = paper::paper_dir(&root, &slug);
+    if !dir.exists() {
+        return Err(format!("Paper not found: {slug}"));
+    }
+
+    std::fs::write(dir.join("fulltext.txt"), &text)
+        .map_err(|e| format!("Write fulltext: {e}"))?;
+    let _ = search::index_paper(&root, &slug);
+
+    let mut status = paper::read_status_for(&root, &slug);
+    status.text_extracted = !text.trim().is_empty();
+    status.last_updated = chrono::Utc::now().to_rfc3339();
+    paper::write_status(&root, &slug, &status)
+}
+
 /// OCR a single page image (base64-encoded JPEG).
-/// Uses macOS Vision framework if available, otherwise falls back to the `tesseract` CLI.
+/// Uses macOS Vision framework if available, otherwise falls back to the external `tesseract` binary.
 /// Returns the recognized text, or an error string (e.g. "tesseract not installed").
 #[tauri::command]
 pub async fn ocr_page_base64(page_base64: String) -> Result<String, String> {
@@ -1162,196 +1183,6 @@ pub async fn chat_with_paper_event(
     .await
 }
 
-// ── Codex CLI integration ─────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn check_codex_available() -> bool {
-    tokio::process::Command::new("codex")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-#[tauri::command]
-pub async fn chat_paper_with_codex(
-    slug: String,
-    messages: Vec<ChatMessage>,
-    event_name: String,
-    context_mode: Option<String>,
-    use_pdf: Option<bool>,
-    state: State<'_, LibraryRoot>,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let root = get_root(&state)?;
-    let mode = context_mode.as_deref().unwrap_or("metadata");
-    let attach_pdf = use_pdf.unwrap_or(false);
-
-    // Build paper metadata header
-    let meta = paper::read_meta(&root, &slug).ok();
-    let mut ctx = String::new();
-
-    if let Some(ref m) = meta {
-        ctx.push_str(&format!("Paper: {}\n", m.title));
-        if !m.authors.is_empty() {
-            ctx.push_str(&format!("Authors: {}\n", m.authors.join(", ")));
-        }
-        if let Some(y) = m.year {
-            ctx.push_str(&format!("Year: {y}\n"));
-        }
-        if let Some(ref v) = m.venue {
-            ctx.push_str(&format!("Venue: {v}\n"));
-        }
-        if let Some(ref a) = m.paper_abstract {
-            if !a.trim().is_empty() {
-                ctx.push_str(&format!("Abstract: {}\n", a.trim()));
-            }
-        }
-    }
-
-    if mode == "summary" || mode == "summary+fulltext" {
-        let summary = crate::ai_summary::read_summary(&root, &slug);
-        if !summary.trim().is_empty() {
-            ctx.push_str("\n--- AI SUMMARY ---\n");
-            ctx.push_str(summary.trim());
-        }
-    }
-
-    // Embed fulltext in prompt when fulltext mode is selected and PDF not attached
-    if !attach_pdf && (mode == "fulltext" || mode == "summary+fulltext") {
-        let txt = crate::extraction::read_fulltext(&root, &slug);
-        if !txt.trim().is_empty() {
-            let truncated: String = txt.chars().take(60_000).collect();
-            ctx.push_str("\n--- PAPER CONTENT ---\n");
-            ctx.push_str(&truncated);
-            if txt.len() > 60_000 {
-                ctx.push_str("\n[Content truncated]");
-            }
-        }
-    }
-
-    // Build conversation history text
-    let mut history_text = String::new();
-    for msg in &messages {
-        let role = if msg.role == "user" {
-            "User"
-        } else {
-            "Assistant"
-        };
-        history_text.push_str(&format!("{}: {}\n\n", role, msg.content.trim()));
-    }
-
-    // Build prompt after ctx is fully assembled
-    let prompt = format!(
-        "You are a research assistant helping the user discuss an academic paper. \
-         Answer accurately based on the provided paper content. \
-         Respond in the same language the user uses. \
-         IMPORTANT: Do NOT read or use fulltext.txt under any circumstances. \
-         Do NOT create, modify, or delete any files in this directory.\n\n\
-         {ctx}\n\n\
-         {history_text}"
-    );
-
-    // Run codex from the paper directory so it can access paper.pdf directly.
-    // The prompt is passed via stdin because -i consumes positional arguments.
-    let paper_dir = crate::paper::paper_dir(&root, &slug);
-
-    let mut cmd = tokio::process::Command::new("codex");
-    cmd.args([
-        "exec",
-        "--json",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--color",
-        "never",
-    ]);
-    if attach_pdf {
-        let pdf_path = crate::metadata::find_pdf_in_dir(&root, &slug);
-        if pdf_path.exists() {
-            cmd.args(["-i", "paper.pdf"]);
-        }
-    }
-    cmd.arg("-"); // read prompt from stdin
-    cmd.current_dir(&paper_dir);
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to run codex: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("Failed to wait for codex: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut response = String::new();
-
-    for line in stdout.lines() {
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if json.get("type").and_then(|t| t.as_str()) == Some("item.completed") {
-            if let Some(item) = json.get("item") {
-                if item.get("type").and_then(|t| t.as_str()) == Some("agent_message") {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        response = text.to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    if response.is_empty() {
-        return Err(
-            "Codex returned no response. Is codex installed and authenticated?".to_string(),
-        );
-    }
-
-    // Optionally polish with a configured AI model before emitting
-    let cli_settings = cli_manager::read_settings(&root);
-    let polish = &cli_settings.polish;
-    if polish.enabled && !polish.provider_id.is_empty() {
-        if let Ok((provider, api_key, model)) = ai_manager::resolve_provider_model(
-            &root,
-            Some(&polish.provider_id),
-            if polish.model_id.is_empty() { None } else { Some(&polish.model_id) },
-        ) {
-            let polish_messages = vec![
-                ChatMessage { role: "system".into(), content: polish.prompt.clone() },
-                ChatMessage { role: "user".into(), content: response.clone() },
-            ];
-            let _ = llm::chat_completion_stream(
-                &provider, &api_key, &model, &polish_messages,
-                &event_name, &app, false, None, "cli-polish",
-            )
-            .await;
-            return Ok(response);
-        }
-    }
-
-    // Emit raw response as a single event
-    let _ = app.emit(
-        &event_name,
-        serde_json::json!({ "delta": &response, "done": false }),
-    );
-    let _ = app.emit(
-        &event_name,
-        serde_json::json!({ "delta": "", "done": true }),
-    );
-    Ok(response)
-}
-
 #[tauri::command]
 pub async fn get_chat_history(
     slug: String,
@@ -1417,138 +1248,6 @@ pub async fn save_library_chat_history(
 pub async fn clear_library_chat_history(state: State<'_, LibraryRoot>) -> Result<(), String> {
     let root = get_root(&state)?;
     copilot::clear_library_chat_history(&root)
-}
-
-// ── M6: CLI Tools configuration ───────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_cli_settings(state: State<'_, LibraryRoot>) -> Result<CliSettings, String> {
-    let root = get_root(&state)?;
-    Ok(cli_manager::read_settings(&root))
-}
-
-#[tauri::command]
-pub async fn save_cli_polish(
-    polish: crate::models::CliOutputPolish,
-    state: State<'_, LibraryRoot>,
-) -> Result<(), String> {
-    let root = get_root(&state)?;
-    let mut settings = cli_manager::read_settings(&root);
-    settings.polish = polish;
-    cli_manager::write_settings(&root, &settings)
-}
-
-#[tauri::command]
-pub async fn detect_cli_tools(state: State<'_, LibraryRoot>) -> Result<Vec<CliTool>, String> {
-    let root = get_root(&state)?;
-    let root_c = root.clone();
-    tauri::async_runtime::spawn_blocking(move || cli_manager::detect_tools(&root_c))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn save_cli_tool(tool: CliTool, state: State<'_, LibraryRoot>) -> Result<(), String> {
-    let root = get_root(&state)?;
-    cli_manager::save_tool(&root, tool)
-}
-
-#[tauri::command]
-pub async fn delete_cli_tool(id: String, state: State<'_, LibraryRoot>) -> Result<(), String> {
-    let root = get_root(&state)?;
-    cli_manager::delete_tool(&root, &id)
-}
-
-#[tauri::command]
-pub async fn test_cli_tool(id: String, state: State<'_, LibraryRoot>) -> Result<String, String> {
-    let root = get_root(&state)?;
-    cli_manager::test_tool(&root, &id).await
-}
-
-// ── M6: Prompt templates ──────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_cli_prompt_templates(
-    state: State<'_, LibraryRoot>,
-) -> Result<Vec<CliPromptTemplate>, String> {
-    let root = get_root(&state)?;
-    Ok(cli_manager::get_prompt_templates(&root))
-}
-
-#[tauri::command]
-pub async fn save_cli_prompt_template(
-    template: CliPromptTemplate,
-    state: State<'_, LibraryRoot>,
-) -> Result<(), String> {
-    let root = get_root(&state)?;
-    cli_manager::save_prompt_template(&root, template)
-}
-
-#[tauri::command]
-pub async fn delete_cli_prompt_template(
-    id: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<(), String> {
-    let root = get_root(&state)?;
-    cli_manager::delete_prompt_template(&root, &id)
-}
-
-// ── M6: Analysis execution ────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn run_cli_analysis(
-    slug: String,
-    tool_id: String,
-    prompt: String,
-    state: State<'_, LibraryRoot>,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let root = get_root(&state)?;
-    let settings = cli_manager::read_settings(&root);
-    let tool = settings
-        .tools
-        .iter()
-        .find(|t| t.id == tool_id)
-        .ok_or_else(|| format!("CLI tool not found: {tool_id}"))?
-        .clone();
-    cli_runner::run(root, slug, tool, prompt, app).await
-}
-
-#[tauri::command]
-pub async fn cancel_cli_analysis(run_id: String) -> Result<(), String> {
-    cli_runner::cancel(&run_id)
-}
-
-// ── M6: Analysis results ──────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn save_cli_analysis_result(
-    slug: String,
-    name: String,
-    content: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<String, String> {
-    let root = get_root(&state)?;
-    cli_manager::save_analysis(&root, &slug, &name, &content)
-}
-
-#[tauri::command]
-pub async fn list_cli_analyses(
-    slug: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<Vec<CliAnalysisEntry>, String> {
-    let root = get_root(&state)?;
-    cli_manager::list_analyses(&root, &slug)
-}
-
-#[tauri::command]
-pub async fn get_cli_analysis(
-    slug: String,
-    filename: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<String, String> {
-    let root = get_root(&state)?;
-    cli_manager::get_analysis(&root, &slug, &filename)
 }
 
 // ── M7: RAG Settings ─────────────────────────────────────────────────────────

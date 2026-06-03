@@ -2,7 +2,7 @@ use std::path::Path;
 
 /// OCR a single JPEG image (raw bytes).
 /// On macOS, tries the Vision framework first (via a lazily compiled Swift helper).
-/// Falls back to the `tesseract` CLI on all platforms.
+/// Falls back to the external `tesseract` binary on all platforms.
 pub fn ocr_jpeg_bytes(jpeg_bytes: &[u8]) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     if let Ok(text) = ocr_via_vision(jpeg_bytes) {
@@ -79,7 +79,7 @@ pub fn ocr_pdf_file(pdf_path: &Path) -> Option<String> {
     }
 }
 
-// ── tesseract CLI ─────────────────────────────────────────────────────────────
+// ── tesseract OCR ─────────────────────────────────────────────────────────────
 
 fn ocr_via_tesseract(jpeg_bytes: &[u8]) -> Result<String, String> {
     let uid = uuid::Uuid::new_v4().to_string();

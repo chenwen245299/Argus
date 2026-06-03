@@ -21,7 +21,6 @@ export interface PaperStatus {
   vectorized: boolean
   metadata_fetched: boolean
   last_updated: string
-  cli_analyzed?: boolean
 }
 
 export interface ReadingState {
@@ -190,52 +189,6 @@ export interface ChatMessage {
 export interface ModelSelection {
   providerId: string
   modelId: string
-}
-
-// ── M6: CLI Tools ─────────────────────────────────────────────────────────────
-
-export interface CliTool {
-  id: string
-  name: string
-  command: string
-  args_template: string[]
-  enabled: boolean
-  detected: boolean
-  version?: string
-}
-
-export interface CliOutputPolish {
-  enabled: boolean
-  provider_id: string
-  model_id: string
-  prompt: string
-}
-
-export interface CliSettings {
-  tools: CliTool[]
-  prompt_templates: CliPromptTemplate[]
-  polish: CliOutputPolish
-}
-
-export interface CliPromptTemplate {
-  id: string
-  name: string
-  prompt_template: string
-}
-
-export interface CliAnalysisEntry {
-  filename: string
-  name: string
-  created_at: string
-  path: string
-}
-
-export interface CliAnalysisEvent {
-  chunk: string
-  source: 'stdout' | 'stderr' | 'error'
-  done: boolean
-  exit_code: number | null
-  cancelled: boolean
 }
 
 // ── M7: RAG / Vectorization ───────────────────────────────────────────────────

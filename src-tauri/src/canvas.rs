@@ -274,25 +274,6 @@ pub fn get_node_display_content(
             }
             Ok(String::new())
         }
-        s if s.starts_with("cli:") => {
-            let filename = &s[4..];
-            let analysis_dir = paper_dir.join("analysis");
-            if analysis_dir.exists() {
-                for entry in std::fs::read_dir(&analysis_dir)
-                    .map_err(|e| e.to_string())?
-                    .flatten()
-                {
-                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        let file_path = entry.path().join(filename);
-                        if file_path.exists() {
-                            return std::fs::read_to_string(&file_path)
-                                .map_err(|e| format!("Read CLI analysis: {e}"));
-                        }
-                    }
-                }
-            }
-            Ok(String::new())
-        }
         _ => Ok(String::new()),
     }
 }

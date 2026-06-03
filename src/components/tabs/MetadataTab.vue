@@ -58,6 +58,9 @@ watch(() => props.slug, () => {
   copiedKind.value = null
   bibtexEditing.value = false
   bibtexDraft.value = ''
+  fulltextEditing.value = false
+  fulltextDraft.value = ''
+  fulltextError.value = ''
 })
 
 // ── BibTeX inline edit ────────────────────────────────────────────────────────
@@ -180,6 +183,10 @@ function fmtDate(iso: string) {
 // ── Fulltext ──────────────────────────────────────────────────────────────────
 const fulltext = ref('')
 const fulltextLoading = ref(false)
+const fulltextEditing = ref(false)
+const fulltextDraft = ref('')
+const fulltextSaving = ref(false)
+const fulltextError = ref('')
 
 async function loadFulltext(slug: string | null) {
   if (!slug) { fulltext.value = ''; return }
@@ -190,6 +197,38 @@ async function loadFulltext(slug: string | null) {
     fulltext.value = ''
   } finally {
     fulltextLoading.value = false
+  }
+}
+
+function startFulltextEdit() {
+  fulltextDraft.value = fulltext.value
+  fulltextError.value = ''
+  fulltextEditing.value = true
+}
+
+function cancelFulltextEdit() {
+  fulltextEditing.value = false
+  fulltextDraft.value = ''
+  fulltextError.value = ''
+}
+
+async function saveFulltext() {
+  if (!props.slug) return
+  fulltextSaving.value = true
+  fulltextError.value = ''
+  try {
+    await invoke('save_fulltext', { slug: props.slug, text: fulltextDraft.value })
+    fulltext.value = fulltextDraft.value
+    fulltextEditing.value = false
+    fulltextDraft.value = ''
+    await library.refresh()
+    window.dispatchEvent(new CustomEvent('argus-paper-fulltext-updated', {
+      detail: { slug: props.slug },
+    }))
+  } catch (e) {
+    fulltextError.value = String(e)
+  } finally {
+    fulltextSaving.value = false
   }
 }
 
@@ -403,6 +442,13 @@ async function extractAbstract() {
               <span v-if="fulltext" class="fulltext-chars">{{ t('meta.fulltextWords', { n: fulltext.trim().split(/\s+/).length.toLocaleString() }) }}</span>
               <button
                 class="copy-section-btn"
+                :disabled="fulltextLoading || fulltextSaving"
+                @click="startFulltextEdit"
+              >
+                {{ t('meta.fulltextEdit') }}
+              </button>
+              <button
+                class="copy-section-btn"
                 :class="{ done: copiedKind === 'fulltext' }"
                 :disabled="!fulltext"
                 title="复制全文"
@@ -419,9 +465,28 @@ async function extractAbstract() {
               </button>
             </div>
           </div>
-          <div v-if="fulltextLoading" class="fulltext-placeholder muted">…</div>
-          <div v-else-if="!fulltext" class="fulltext-placeholder muted">{{ t('meta.fulltextNone') }}</div>
-          <textarea v-else class="fulltext-box" readonly :value="fulltext" />
+          <template v-if="fulltextEditing">
+            <textarea
+              v-model="fulltextDraft"
+              class="fulltext-box fulltext-editor"
+              :placeholder="t('meta.fulltextPlaceholder')"
+              autofocus
+            />
+            <div v-if="fulltextError" class="fulltext-error">{{ fulltextError }}</div>
+            <div class="fulltext-edit-actions">
+              <button class="act-btn primary" :disabled="fulltextSaving" @click="saveFulltext">
+                {{ fulltextSaving ? t('meta.fulltextSaving') : t('meta.fulltextSave') }}
+              </button>
+              <button class="act-btn" :disabled="fulltextSaving" @click="cancelFulltextEdit">
+                {{ t('meta.fulltextCancel') }}
+              </button>
+            </div>
+          </template>
+          <template v-else>
+            <div v-if="fulltextLoading" class="fulltext-placeholder muted">…</div>
+            <div v-else-if="!fulltext" class="fulltext-placeholder muted">{{ t('meta.fulltextNone') }}</div>
+            <textarea v-else class="fulltext-box" readonly :value="fulltext" />
+          </template>
         </div>
       </template>
 
@@ -840,4 +905,25 @@ async function extractAbstract() {
   word-break: break-word;
 }
 .fulltext-box:focus { outline: none; border-color: var(--border-default); }
+.fulltext-editor {
+  height: 280px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border-color: var(--accent-light);
+}
+.fulltext-editor:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.fulltext-edit-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.fulltext-error {
+  margin-top: 6px;
+  font-size: var(--font-size-xs);
+  color: #dc2626;
+  word-break: break-word;
+}
 </style>

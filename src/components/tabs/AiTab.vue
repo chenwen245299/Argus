@@ -65,19 +65,9 @@ interface ExtractionProgressPayload {
 }
 
 const STORAGE_PREFIX = 'argus.paper-ai-conversations.v2'
-const CODEX_PROVIDER_ID = '__codex__'
-
-const codexModelOption: ModelOption = {
-  providerId: CODEX_PROVIDER_ID,
-  providerName: 'Codex',
-  modelId: 'codex-mini-latest',
-  displayName: 'Codex',
-  label: 'Codex',
-  capabilities: [],
-}
 
 const allSelectableModels = computed<ModelOption[]>(() =>
-  [...ai.chatModels, codexModelOption]
+  ai.chatModels
 )
 
 const conversations = ref<Conversation[]>([])
@@ -131,14 +121,10 @@ const contextMode = ref<'none' | 'metadata' | 'summary' | 'fulltext' | 'summary+
 const usePdf = ref(false)
 const summaryAvailable = ref(false)
 
-// PDF mode is only supported by OpenRouter providers and Codex
+// PDF mode is only supported by OpenRouter providers
 const pdfSupported = computed(() =>
   selectedModels.value.some(m =>
-    m.providerId === CODEX_PROVIDER_ID ||
-    (() => {
-      const p = ai.settings.providers.find(p => p.id === m.providerId)
-      return p?.kind === 'openrouter'
-    })()
+    ai.settings.providers.find(p => p.id === m.providerId)?.kind === 'openrouter'
   )
 )
 
@@ -556,7 +542,6 @@ function selectedModelLabel() {
 }
 
 function modelLogo(modelId: string, providerName = '', providerId = '') {
-  if (providerId === CODEX_PROVIDER_ID) return modelIconMap.openai
   const haystack = `${modelId} ${providerName} ${providerId}`.toLowerCase()
   if (haystack.includes('deepseek')) return modelIconMap.deepseek
   if (haystack.includes('claude') || haystack.includes('anthropic')) return modelIconMap.claude
@@ -781,28 +766,17 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     : reasoningLevel.value
 
   try {
-    let finalText: string
-    if (answer.providerId === CODEX_PROVIDER_ID) {
-      finalText = await invoke<string>('chat_paper_with_codex', {
-        slug: props.slug,
-        messages: history,
-        eventName,
-        contextMode: effectiveContextMode.value,
-        usePdf: usePdf.value,
-      })
-    } else {
-      finalText = await invoke<string>('chat_with_paper_event', {
-        slug: props.slug,
-        messages: history,
-        providerId: answer.providerId || null,
-        modelId: answer.modelId || null,
-        eventName,
-        useReasoning: useReasoning.value,
-        reasoningEffort: useReasoning.value ? effortToSend : null,
-        contextMode: effectiveContextMode.value,
-        usePdf: usePdf.value,
-      })
-    }
+    const finalText = await invoke<string>('chat_with_paper_event', {
+      slug: props.slug,
+      messages: history,
+      providerId: answer.providerId || null,
+      modelId: answer.modelId || null,
+      eventName,
+      useReasoning: useReasoning.value,
+      reasoningEffort: useReasoning.value ? effortToSend : null,
+      contextMode: effectiveContextMode.value,
+      usePdf: usePdf.value,
+    })
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) {
       if (!reactiveAns.content && finalText) reactiveAns.content = finalText
@@ -1162,21 +1136,6 @@ onUnmounted(() => {
                 </span>
               </button>
             </div>
-            <div class="model-group">
-              <div class="group-label">Codex CLI</div>
-              <button
-                class="model-row"
-                :class="{ active: selectedModelKeys.includes(modelKey(codexModelOption)) }"
-                @click="toggleModel(codexModelOption)"
-                @dblclick="selectOnly(codexModelOption)"
-              >
-                <img v-if="modelLogo('', 'Codex', CODEX_PROVIDER_ID)" :src="modelLogo('', 'Codex', CODEX_PROVIDER_ID)" class="model-logo" alt="" />
-                <span v-else class="model-logo fallback">C</span>
-                <span class="model-info">
-                  <span class="model-name">Codex</span>
-                </span>
-              </button>
-            </div>
             <div class="menu-foot">点击切换模型。</div>
           </div>
         </div>
@@ -1384,7 +1343,7 @@ onUnmounted(() => {
             class="context-btn context-btn-pdf"
             :class="{ active: usePdf }"
             :disabled="!pdfSupported"
-            :title="pdfSupported ? 'PDF（直接将 PDF 文件发给模型，仅 OpenRouter / Codex 支持）' : '当前模型不支持直接上传 PDF'"
+            :title="pdfSupported ? 'PDF（直接将 PDF 文件发给模型，仅 OpenRouter 支持）' : '当前模型不支持直接上传 PDF'"
             @click="usePdf = pdfSupported ? !usePdf : usePdf"
           >PDF</button>
           <span v-if="!fulltextReady && !fulltextChecking" class="context-hint">请先获取全文</span>
@@ -1823,16 +1782,6 @@ onUnmounted(() => {
   background: var(--bg-secondary);
   font-weight: 700;
   font-size: 11px;
-}
-.model-logo.codex-logo {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: #1a1a2e;
-  color: #ffffff;
-  font-size: 13px;
-  font-weight: 700;
-  border-radius: 6px;
 }
 .model-info {
   min-width: 0;

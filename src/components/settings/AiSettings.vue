@@ -3,12 +3,10 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { useAiStore } from '../../stores/ai'
-import { useCliStore } from '../../stores/cli'
-import type { AiModel, AiProviderInfo, AiProviderInput, CliOutputPolish, CliTool, ModelSelection } from '../../types'
+import type { AiModel, AiProviderInfo, AiProviderInput, ModelSelection } from '../../types'
 
 const { t } = useI18n()
 const ai = useAiStore()
-const cliStore = useCliStore()
 
 // ── Presets ───────────────────────────────────────────────────────────────────
 
@@ -58,7 +56,6 @@ function emptyModelForm(): ModelForm {
 
 const selectedId    = ref<string | null>(null)
 const isAdding      = ref(false)
-const activeSource  = ref<'provider' | 'cli' | 'polish'>('provider')
 
 // Add-provider form
 const addForm = ref({ name: '', base_url: '', kind: 'openai_compatible', enabled: true, api_key: '' })
@@ -105,55 +102,11 @@ const defaultSel    = ref<ModelSelection | null>(null)
 const saveStatus    = ref<'' | 'saving' | 'saved'>('')
 const providerCtxMenu = ref<{ x: number; y: number; provider: AiProviderInfo } | null>(null)
 
-// ── CLI tools ────────────────────────────────────────────────────────────────
-
-const cliSelectedId  = ref<string | null>(null)
-const cliDetecting   = ref(false)
-const cliTestResult  = ref<Record<string, { ok: boolean; msg: string }>>({})
-const cliTestingId   = ref<string | null>(null)
-const cliShowAddForm = ref(false)
-const cliSavingId    = ref<string | null>(null)
-
-const newCliTool = ref<Omit<CliTool, 'id' | 'detected' | 'version'>>({
-  name: '', command: '', args_template: ['-p', '{prompt}'], enabled: false,
-})
-const newCliArgsRaw = ref('-p {prompt}')
-const editCliArgsRaw = ref('')
-
-const selectedCliTool = computed(() =>
-  cliStore.settings.tools.find(t => t.id === cliSelectedId.value) ?? null
-)
-
-// ── CLI output polish ─────────────────────────────────────────────────────────
-
-const polishForm = ref<CliOutputPolish>({ ...cliStore.settings.polish })
-const polishSaving = ref(false)
-
-async function savePolish() {
-  polishSaving.value = true
-  try {
-    await cliStore.savePolish({ ...polishForm.value })
-  } finally {
-    polishSaving.value = false
-  }
-}
-
-function openPolish() {
-  polishForm.value = { ...cliStore.settings.polish }
-  activeSource.value = 'polish'
-  cliSelectedId.value = null
-  cliShowAddForm.value = false
-  selectedId.value = null
-  isAdding.value = false
-}
-
 onMounted(async () => {
-  await Promise.all([ai.load(), cliStore.load()])
+  await ai.load()
   defaultSel.value = ai.defaultSelection
   if (ai.settings.providers.length > 0) {
     selectProvider(ai.settings.providers[0].id)
-  } else if (cliStore.settings.tools.length > 0) {
-    selectCliTool(cliStore.settings.tools[0].id)
   }
 })
 
@@ -201,9 +154,7 @@ const fetchAvailableVisibleCount = computed(() => {
 
 function selectProvider(id: string) {
   closeProviderCtx()
-  activeSource.value = 'provider'
   isAdding.value = false
-  cliShowAddForm.value = false
   selectedId.value = id
   const p = ai.settings.providers.find(x => x.id === id)
   if (!p) return
@@ -231,9 +182,7 @@ watch(() => ai.settings.providers, (providers) => {
 // ── Add provider ──────────────────────────────────────────────────────────────
 
 function startAdd() {
-  activeSource.value = 'provider'
   isAdding.value = true
-  cliShowAddForm.value = false
   selectedId.value = null
   addForm.value = { name: '', base_url: '', kind: 'openai_compatible', enabled: true, api_key: '' }
 }
@@ -312,7 +261,6 @@ async function deleteProviderById(provider: AiProviderInfo) {
   await ai.deleteProvider(provider.id)
   selectedId.value = ai.settings.providers[0]?.id ?? null
   if (selectedId.value) selectProvider(selectedId.value)
-  else if (cliStore.settings.tools.length > 0) selectCliTool(cliStore.settings.tools[0].id)
   else { isAdding.value = false }
 }
 
@@ -335,113 +283,6 @@ function onGlobalPointerDown(e: PointerEvent) {
 
 function onGlobalKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') closeProviderCtx()
-}
-
-// ── CLI tools ────────────────────────────────────────────────────────────────
-
-function selectCliTool(id: string) {
-  closeProviderCtx()
-  activeSource.value = 'cli'
-  isAdding.value = false
-  cliSelectedId.value = id
-  cliShowAddForm.value = false
-  cliTestResult.value = {}
-  const tool = cliStore.settings.tools.find(t => t.id === id)
-  editCliArgsRaw.value = tool ? tool.args_template.join(' ') : ''
-}
-
-function startCliAdd() {
-  closeProviderCtx()
-  activeSource.value = 'cli'
-  isAdding.value = false
-  cliSelectedId.value = null
-  cliShowAddForm.value = true
-  cliTestResult.value = {}
-  newCliTool.value = { name: '', command: '', args_template: ['-p', '{prompt}'], enabled: false }
-  newCliArgsRaw.value = '-p {prompt}'
-}
-
-async function detectCliTools() {
-  closeProviderCtx()
-  activeSource.value = 'cli'
-  isAdding.value = false
-  cliDetecting.value = true
-  try {
-    await cliStore.detect()
-  } finally {
-    cliDetecting.value = false
-  }
-  if (cliStore.settings.tools.length > 0 && !cliSelectedId.value) {
-    selectCliTool(cliStore.settings.tools[0].id)
-  }
-}
-
-async function testCliTool(id: string) {
-  cliTestingId.value = id
-  cliTestResult.value[id] = { ok: false, msg: '' }
-  try {
-    const msg = await cliStore.testTool(id)
-    cliTestResult.value[id] = { ok: true, msg }
-  } catch (e: unknown) {
-    cliTestResult.value[id] = { ok: false, msg: String(e) }
-  } finally {
-    cliTestingId.value = null
-  }
-}
-
-async function toggleCliEnabled(tool: CliTool) {
-  await cliStore.saveTool({ ...tool, enabled: !tool.enabled })
-}
-
-async function saveCliField(tool: CliTool, field: keyof CliTool, value: unknown) {
-  cliSavingId.value = tool.id
-  await cliStore.saveTool({ ...tool, [field]: value })
-  cliSavingId.value = null
-}
-
-async function saveCliArgs(tool: CliTool) {
-  const parsed = editCliArgsRaw.value
-    .split(/\s+/)
-    .filter(s => s.length > 0)
-  await saveCliField(tool, 'args_template', parsed)
-}
-
-async function deleteCliTool(id: string) {
-  if (!confirm(t('cliSettings.deleteConfirm'))) return
-  await cliStore.deleteTool(id)
-  cliSelectedId.value = null
-  if (cliStore.settings.tools.length > 0) {
-    selectCliTool(cliStore.settings.tools[0].id)
-  }
-}
-
-async function addCliTool() {
-  if (!newCliTool.value.name || !newCliTool.value.command) return
-  const parsed = newCliArgsRaw.value.split(/\s+/).filter(s => s.length > 0)
-  const id = crypto.randomUUID()
-  await cliStore.saveTool({
-    id,
-    name: newCliTool.value.name,
-    command: newCliTool.value.command,
-    args_template: parsed,
-    enabled: false,
-    detected: false,
-    version: undefined,
-  })
-  cliShowAddForm.value = false
-  selectCliTool(id)
-}
-
-function applyCliPreset(preset: 'claude' | 'codex') {
-  if (preset === 'claude') {
-    newCliTool.value.name = 'Claude Code'
-    newCliTool.value.command = 'claude'
-    newCliArgsRaw.value = '-p {prompt}'
-  } else {
-    newCliTool.value.name = 'Codex CLI'
-    newCliTool.value.command = 'codex'
-    newCliArgsRaw.value = '-q {prompt}'
-  }
 }
 
 // ── Test connection ───────────────────────────────────────────────────────────
@@ -662,31 +503,6 @@ function providerLogoUrl(name: string, baseUrl: string): string | null {
   return null
 }
 
-function cliBrand(tool: CliTool): 'claude' | 'codex' | null {
-  const haystack = `${tool.name} ${tool.command}`.toLowerCase()
-  if (haystack.includes('claude') || haystack.includes('anthropic')) return 'claude'
-  if (haystack.includes('codex') || haystack.includes('openai')) return 'codex'
-  return null
-}
-
-function cliLogoUrl(tool: CliTool): string | null {
-  const brand = cliBrand(tool)
-  if (brand === 'claude') {
-    return new URL('../../assets/providers/claude.svg', import.meta.url).href
-  }
-  if (brand === 'codex') {
-    return new URL('../../assets/providers/openai.svg', import.meta.url).href
-  }
-  return null
-}
-
-function cliDisplayName(tool: CliTool): string {
-  const brand = cliBrand(tool)
-  if (brand === 'claude') return 'Claude Code'
-  if (brand === 'codex') return 'Codex'
-  return tool.name
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function formatCtx(n: number | undefined): string {
@@ -791,14 +607,11 @@ function toggleCapability(form: ModelForm, cap: string) {
     : [...form.capabilities, cap]
 }
 
-function inputValue(e: Event): string {
-  return (e.target as HTMLInputElement).value
-}
 </script>
 
 <template>
   <div class="ai-settings">
-    <!-- Left: providers and CLI tools -->
+    <!-- Left: providers -->
     <div class="provider-list">
       <section class="source-section api-source-section">
         <div class="list-header">
@@ -819,7 +632,7 @@ function inputValue(e: Event): string {
             v-for="p in ai.settings.providers"
             :key="p.id"
             class="provider-item"
-            :class="{ active: activeSource === 'provider' && selectedId === p.id }"
+            :class="{ active: selectedId === p.id }"
             @click="selectProvider(p.id)"
             @contextmenu.prevent="openProviderCtx($event, p)"
           >
@@ -846,85 +659,10 @@ function inputValue(e: Event): string {
         </div>
       </section>
 
-      <section class="source-section cli-source-section">
-        <div class="list-header">
-          <span class="list-title">{{ t('aiService.cliToolsLabel') }}</span>
-          <div class="list-actions">
-            <button class="add-btn" @click="detectCliTools" :disabled="cliDetecting" :title="t('cliSettings.detect')">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-                <path d="M3 3v5h5"/>
-                <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
-                <path d="M16 16h5v5"/>
-              </svg>
-            </button>
-            <button class="add-btn" @click="startCliAdd" :title="t('cliSettings.addTool')">
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        <div class="section-scroll">
-          <div v-if="cliStore.settings.tools.length === 0 && !cliShowAddForm" class="no-providers">
-            {{ t('cliSettings.noTools') }}
-          </div>
-
-          <button
-            v-for="tool in cliStore.settings.tools"
-            :key="tool.id"
-            class="provider-item"
-            :class="{ active: activeSource === 'cli' && cliSelectedId === tool.id }"
-            @click="selectCliTool(tool.id)"
-          >
-            <span class="provider-initial">
-              <img v-if="cliLogoUrl(tool)" :src="cliLogoUrl(tool)!" class="provider-logo" alt="" />
-              <template v-else>{{ cliDisplayName(tool)[0]?.toUpperCase() ?? 'C' }}</template>
-            </span>
-            <span class="provider-name">{{ cliDisplayName(tool) }}</span>
-            <span
-              class="provider-switch"
-              :class="{ on: tool.enabled && tool.detected, disabled: !tool.detected }"
-              role="switch"
-              :aria-checked="tool.enabled && tool.detected"
-              :aria-disabled="!tool.detected"
-              :title="!tool.detected ? t('cliSettings.notDetected') : (tool.enabled ? t('cliSettings.on') : t('cliSettings.off'))"
-              @click.stop="tool.detected && toggleCliEnabled(tool)"
-            >
-              <span class="switch-knob" />
-            </span>
-          </button>
-
-          <button v-if="cliShowAddForm" class="provider-item active adding">
-            <span class="provider-initial">+</span>
-            <span class="provider-name">{{ t('cliSettings.addTool') }}</span>
-          </button>
-        </div>
-
-        <!-- Polish entry -->
-        <button
-          class="provider-item polish-item"
-          :class="{ active: activeSource === 'polish' }"
-          @click="openPolish"
-        >
-          <span class="provider-initial">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="m9.06 11.9 8.07-8.06a2.85 2.85 0 1 1 4.03 4.03l-8.06 8.08"/>
-              <path d="M7.07 14.94c-1.66 0-3 1.35-3 3.02 0 1.33-2.5 1.52-2 2.02 1.08 1.1 2.49 2.02 4 2.02 2.2 0 4-1.8 4-4.04a3.01 3.01 0 0 0-3-3.02z"/>
-            </svg>
-          </span>
-          <span class="provider-name">AI 润色</span>
-          <span class="provider-switch" :class="{ on: cliStore.settings.polish.enabled }" style="pointer-events:none">
-            <span class="switch-knob" />
-          </span>
-        </button>
-      </section>
     </div>
 
     <!-- Right: detail panel -->
     <div class="provider-detail">
-      <template v-if="activeSource === 'provider'">
       <!-- Add provider form -->
       <template v-if="isAdding">
         <div class="detail-header">
@@ -1373,187 +1111,7 @@ function inputValue(e: Event): string {
           </div>
         </div>
       </template>
-      </template>
 
-      <template v-else-if="activeSource === 'cli'">
-        <template v-if="cliShowAddForm">
-          <div class="detail-header">
-            <span class="detail-title">{{ t('cliSettings.addTool') }}</span>
-          </div>
-
-          <div class="presets-row">
-            <span class="field-label">{{ t('cliSettings.presets') }}</span>
-            <div class="preset-btns">
-              <button class="preset-btn" @click="applyCliPreset('claude')">Claude Code</button>
-              <button class="preset-btn" @click="applyCliPreset('codex')">Codex CLI</button>
-            </div>
-          </div>
-
-          <div class="field-group">
-            <div class="field-label">{{ t('cliSettings.toolName') }}</div>
-            <input v-model="newCliTool.name" class="text-input" :placeholder="t('cliSettings.toolNamePh')" />
-          </div>
-
-          <div class="field-group">
-            <div class="field-label">{{ t('cliSettings.command') }}</div>
-            <input v-model="newCliTool.command" class="text-input mono" placeholder="claude" />
-          </div>
-
-          <div class="field-group">
-            <div class="field-label">{{ t('cliSettings.argsTemplate') }}</div>
-            <input v-model="newCliArgsRaw" class="text-input mono" placeholder="-p {prompt}" />
-            <div class="field-note">{{ t('cliSettings.argsHint') }}</div>
-          </div>
-
-          <div class="action-row">
-            <button class="btn-primary" @click="addCliTool" :disabled="!newCliTool.name || !newCliTool.command">
-              {{ t('cliSettings.add') }}
-            </button>
-            <button class="btn-ghost" @click="cliShowAddForm = false">{{ t('cliSettings.cancel') }}</button>
-          </div>
-        </template>
-
-        <div v-else-if="!selectedCliTool" class="empty-hint">
-          <p>{{ t('cliSettings.selectOrAdd') }}</p>
-          <button class="btn-primary" @click="startCliAdd">{{ t('cliSettings.addTool') }}</button>
-        </div>
-
-        <template v-else>
-          <div class="detail-header">
-            <img v-if="cliLogoUrl(selectedCliTool)" :src="cliLogoUrl(selectedCliTool)!" class="detail-logo" alt="" />
-            <span v-else class="detail-initial">{{ cliDisplayName(selectedCliTool)[0]?.toUpperCase() ?? 'C' }}</span>
-            <span class="detail-title">{{ cliDisplayName(selectedCliTool) }}</span>
-            <div class="header-actions">
-              <button
-                class="btn-ghost sm"
-                :disabled="cliTestingId === selectedCliTool.id"
-                @click="testCliTool(selectedCliTool.id)"
-              >
-                {{ cliTestingId === selectedCliTool.id ? t('cliSettings.testing') : t('cliSettings.test') }}
-              </button>
-              <button
-                class="toggle-switch detail-switch"
-                :class="{ on: selectedCliTool.enabled && selectedCliTool.detected, disabled: !selectedCliTool.detected }"
-                role="switch"
-                :aria-checked="selectedCliTool.enabled && selectedCliTool.detected"
-                :aria-disabled="!selectedCliTool.detected"
-                :title="!selectedCliTool.detected ? t('cliSettings.notDetected') : (selectedCliTool.enabled ? t('cliSettings.on') : t('cliSettings.off'))"
-                :disabled="!selectedCliTool.detected"
-                @click="toggleCliEnabled(selectedCliTool)"
-              >
-                <span class="switch-knob" />
-              </button>
-            </div>
-          </div>
-
-          <div class="status-row">
-            <span class="mini-badge" :class="selectedCliTool.detected ? 'badge-ok' : 'badge-warn'">
-              {{ selectedCliTool.detected ? t('cliSettings.detected') : t('cliSettings.notDetected') }}
-              <span v-if="selectedCliTool.version" class="version-text"> · {{ selectedCliTool.version }}</span>
-            </span>
-          </div>
-
-          <div
-            v-if="cliTestResult[selectedCliTool.id]?.msg"
-            class="test-result"
-            :class="cliTestResult[selectedCliTool.id].ok ? 'ok' : 'fail'"
-          >
-            {{ cliTestResult[selectedCliTool.id].msg }}
-          </div>
-
-          <div v-if="!selectedCliTool.detected" class="not-detected-hint">
-            {{ t('cliSettings.notDetectedHint', { cmd: selectedCliTool.command }) }}
-          </div>
-
-          <div class="field-group">
-            <div class="field-label">{{ t('cliSettings.toolName') }}</div>
-            <input
-              :value="selectedCliTool.name"
-              class="text-input"
-              @blur="saveCliField(selectedCliTool, 'name', inputValue($event))"
-            />
-          </div>
-
-          <div class="field-group">
-            <div class="field-label">{{ t('cliSettings.command') }}</div>
-            <input
-              :value="selectedCliTool.command"
-              class="text-input mono"
-              @blur="saveCliField(selectedCliTool, 'command', inputValue($event))"
-            />
-          </div>
-
-          <div class="field-group">
-            <div class="field-label">{{ t('cliSettings.argsTemplate') }}</div>
-            <input
-              v-model="editCliArgsRaw"
-              class="text-input mono"
-              placeholder="-p {prompt}"
-              @blur="saveCliArgs(selectedCliTool)"
-            />
-            <div class="field-note">{{ t('cliSettings.argsHint') }}</div>
-          </div>
-
-          <div class="danger-zone">
-            <button class="btn-ghost danger" @click="deleteCliTool(selectedCliTool.id)">
-              {{ t('cliSettings.delete') }}
-            </button>
-            <span v-if="cliSavingId === selectedCliTool.id" class="saving-text">…</span>
-          </div>
-        </template>
-      </template>
-
-      <!-- Polish config panel -->
-      <template v-if="activeSource === 'polish'">
-        <div class="detail-header">
-          <span class="detail-initial">✦</span>
-          <span class="detail-title">CLI 输出 AI 润色</span>
-          <div class="header-actions">
-            <button
-              class="toggle-switch detail-switch"
-              :class="{ on: polishForm.enabled }"
-              role="switch"
-              :aria-checked="polishForm.enabled"
-              @click="polishForm.enabled = !polishForm.enabled"
-            >
-              <span class="switch-knob" />
-            </button>
-          </div>
-        </div>
-
-        <div class="field-group">
-          <div class="field-label">润色模型</div>
-          <select class="select-input" v-model="polishForm.provider_id" @change="polishForm.model_id = ''">
-            <option value="">— 选择服务商 —</option>
-            <option v-for="p in ai.settings.providers.filter(p => p.enabled)" :key="p.id" :value="p.id">{{ p.name }}</option>
-          </select>
-          <select class="select-input" style="margin-top:6px" v-model="polishForm.model_id" :disabled="!polishForm.provider_id">
-            <option value="">— 选择模型（留空使用默认）—</option>
-            <option
-              v-for="m in ai.settings.providers.find(p => p.id === polishForm.provider_id)?.models ?? []"
-              :key="m.id"
-              :value="m.id"
-            >{{ m.display_name }}</option>
-          </select>
-        </div>
-
-        <div class="field-group">
-          <div class="field-label">润色提示词</div>
-          <textarea
-            class="text-input mono"
-            v-model="polishForm.prompt"
-            rows="7"
-            style="resize:vertical;line-height:1.5"
-          />
-          <div class="field-note">AI 会将 Codex 原始输出追加在提示词后发送。建议只调整格式，不修改内容。</div>
-        </div>
-
-        <div class="action-row">
-          <button class="btn-primary" :disabled="polishSaving" @click="savePolish">
-            {{ polishSaving ? '保存中…' : '保存' }}
-          </button>
-        </div>
-      </template>
     </div>
 
     <Teleport to="body">
@@ -1601,12 +1159,7 @@ function inputValue(e: Event): string {
 }
 
 .api-source-section {
-  flex: 1 1 48%;
-  border-bottom: 1px solid var(--border-subtle);
-}
-
-.cli-source-section {
-  flex: 1 1 52%;
+  flex: 1 1 auto;
 }
 
 .section-scroll {
@@ -1630,12 +1183,6 @@ function inputValue(e: Event): string {
   line-height: 1.35;
   color: var(--text-secondary);
   letter-spacing: 0;
-}
-
-.list-actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
 }
 
 .add-btn {
@@ -1706,34 +1253,6 @@ function inputValue(e: Event): string {
 }
 
 .provider-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.mini-badge {
-  display: inline-flex;
-  align-items: center;
-  min-height: 18px;
-  max-width: 100%;
-  padding: 1px 6px;
-  border-radius: var(--radius-pill);
-  font-size: 10px;
-  line-height: 1.3;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.badge-ok {
-  color: #2e7d32;
-  background: color-mix(in srgb, #2e7d32 13%, transparent);
-}
-
-.badge-warn {
-  color: #c56a10;
-  background: color-mix(in srgb, #f59e0b 16%, transparent);
-}
-
-.badge-muted {
-  color: var(--text-tertiary);
-  background: var(--bg-tertiary);
-}
 
 .detail-logo {
   width: 26px;
@@ -1942,43 +1461,6 @@ function inputValue(e: Event): string {
 }
 
 .action-row { display: flex; gap: 8px; margin-top: 8px; }
-
-.status-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: -8px 0 16px;
-}
-
-.version-text {
-  color: var(--text-tertiary);
-  font-weight: 500;
-}
-
-.not-detected-hint {
-  font-size: 12px;
-  line-height: 1.5;
-  color: #c56a10;
-  padding: 8px 10px;
-  background: color-mix(in srgb, #f59e0b 12%, transparent);
-  border: 1px solid color-mix(in srgb, #f59e0b 18%, transparent);
-  border-radius: var(--radius-md);
-  margin-bottom: 16px;
-}
-
-.danger-zone {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 22px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border-subtle);
-}
-
-.saving-text {
-  font-size: 12px;
-  color: var(--text-tertiary);
-}
 
 /* Test result */
 .test-result {
@@ -2677,12 +2159,6 @@ function inputValue(e: Event): string {
 .fetch-dialog-leave-to .fetch-dialog {
   transform: scale(0.96);
   opacity: 0;
-}
-
-.polish-item {
-  border-top: 1px solid var(--border-subtle);
-  margin-top: 4px;
-  padding-top: 4px;
 }
 
 :global(.provider-ctx-menu) {

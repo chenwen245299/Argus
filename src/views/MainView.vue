@@ -11,7 +11,6 @@ import { useImportStore } from '../stores/import'
 import { useSettingsStore } from '../stores/settings'
 import { useCollectionsStore } from '../stores/collections'
 import { useAiStore } from '../stores/ai'
-import { useCliStore } from '../stores/cli'
 import { useSelectionStore } from '../stores/selection'
 import { useCanvasStore } from '../stores/canvas'
 import { switchToTranslationsTab } from '../stores/translationHistory'
@@ -31,7 +30,6 @@ const importStore = useImportStore()
 const settingsStore = useSettingsStore()
 const collectionsStore = useCollectionsStore()
 const aiStore = useAiStore()
-const cliStore = useCliStore()
 const selectionStore = useSelectionStore()
 const canvasStore = useCanvasStore()
 
@@ -240,7 +238,6 @@ onMounted(async () => {
     await settingsStore.load()
     await collectionsStore.load()
     await aiStore.load()
-    await cliStore.load()
     readerStore.loadTabs(libraryStore.currentPath)
   }
 
@@ -334,7 +331,6 @@ async function onLibraryOpened() {
   await settingsStore.load()
   await collectionsStore.load()
   await aiStore.load()
-  await cliStore.load()
   readerStore.loadTabs(libraryStore.currentPath!)
 }
 

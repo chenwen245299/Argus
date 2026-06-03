@@ -40,8 +40,6 @@ pub struct PaperStatus {
     pub vectorized: bool,
     pub metadata_fetched: bool,
     pub last_updated: String,
-    #[serde(default)]
-    pub cli_analyzed: bool,
 }
 
 impl Default for PaperStatus {
@@ -52,7 +50,6 @@ impl Default for PaperStatus {
             vectorized: false,
             metadata_fetched: false,
             last_updated: chrono::Utc::now().to_rfc3339(),
-            cli_analyzed: false,
         }
     }
 }
@@ -482,78 +479,6 @@ pub struct AiProviderInput {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
-}
-
-// ── M6: CLI Tools ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CliTool {
-    pub id: String,
-    pub name: String,
-    pub command: String,
-    #[serde(default)]
-    pub args_template: Vec<String>,
-    #[serde(default = "bool_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub detected: bool,
-    pub version: Option<String>,
-}
-
-fn default_polish_prompt() -> String {
-    "以下是 CLI 工具的原始输出内容。请将其转换为整洁的 Markdown 格式。\
-     保持所有内容完全一致，不要新增、删除或修改任何信息。\
-     只进行格式优化：代码片段用正确语言标签的围栏代码块包裹，\
-     数学公式用 LaTeX 格式表示（行内用 $...$，独立公式用 $$...$$）。\
-     只输出格式化后的 Markdown，不要输出其他任何内容。".to_string()
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CliOutputPolish {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub provider_id: String,
-    #[serde(default)]
-    pub model_id: String,
-    #[serde(default = "default_polish_prompt")]
-    pub prompt: String,
-}
-
-impl Default for CliOutputPolish {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            provider_id: String::new(),
-            model_id: String::new(),
-            prompt: default_polish_prompt(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-pub struct CliSettings {
-    #[serde(default)]
-    pub tools: Vec<CliTool>,
-    #[serde(default)]
-    pub prompt_templates: Vec<CliPromptTemplate>,
-    #[serde(default)]
-    pub polish: CliOutputPolish,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CliPromptTemplate {
-    pub id: String,
-    pub name: String,
-    pub prompt_template: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CliAnalysisEntry {
-    pub filename: String,
-    pub name: String,
-    pub created_at: String,
-    pub path: String,
 }
 
 // ── M7: RAG / Vectorization ──────────────────────────────────────────────────

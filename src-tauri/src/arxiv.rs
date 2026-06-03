@@ -1444,6 +1444,176 @@ fn compute_next_scheduled(config: &ArxivConfig) -> Option<String> {
     Some(next_dt.format("%Y-%m-%dT%H:%M").to_string())
 }
 
+// ── HTML scraping fallback ────────────────────────────────────────────────────
+
+/// Strip HTML tags and decode common entities from a fragment.
+fn strip_html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Derive approximate submission year from an arXiv ID ("YYMM.NNNNN" format).
+fn year_from_arxiv_id(arxiv_id: &str) -> Option<u32> {
+    let left = arxiv_id.split('.').next()?;
+    if left.len() == 4 && left.chars().all(|c| c.is_ascii_digit()) {
+        let yy: u32 = left[..2].parse().ok()?;
+        Some(if yy >= 91 { 1900 + yy } else { 2000 + yy })
+    } else {
+        None
+    }
+}
+
+/// Parse title, authors, and abstract from an arxiv.org/abs/* HTML page.
+///
+/// arxiv HTML structure (stable for many years):
+///   <h1 class="title mathjax"><span class="descriptor">Title:</span> TITLE</h1>
+///   <div class="authors"><span class="descriptor">Authors:</span> <a>Name</a>, …</div>
+///   <blockquote class="abstract mathjax"><span class="descriptor">Abstract: </span>TEXT</blockquote>
+fn parse_arxiv_abs_html(html: &str, arxiv_id: &str, fetched_at: &str) -> Option<ArxivPaper> {
+    // ── Title ──────────────────────────────────────────────────────────────────
+    let title = {
+        let marker = "class=\"title";
+        let pos = html.find(marker)?;
+        let tag_end = html[pos..].find('>')? + pos + 1;
+        let after = &html[tag_end..];
+        // Skip "Title:" descriptor span if present
+        let content = match after.find("</span>") {
+            Some(span_end) => after[span_end + 7..].trim_start(),
+            None => after.trim_start(),
+        };
+        let end = content.find("</h1>")?;
+        let raw = strip_html_text(&content[..end]);
+        let t = raw.trim().to_string();
+        if t.is_empty() {
+            return None;
+        }
+        t
+    };
+
+    // ── Authors ────────────────────────────────────────────────────────────────
+    let authors = {
+        let mut result = Vec::new();
+        if let Some(pos) = html.find("class=\"authors\"") {
+            let after = &html[pos..];
+            let div_end = after.find("</div>").unwrap_or(after.len());
+            let div = &after[..div_end];
+            let mut cursor = div;
+            loop {
+                // Find next <a … > anchor
+                let a_pos = match cursor.find("<a ").or_else(|| cursor.find("<a>")) {
+                    Some(p) => p,
+                    None => break,
+                };
+                let after_a = &cursor[a_pos..];
+                let tag_end = match after_a.find('>') {
+                    Some(p) => p + 1,
+                    None => break,
+                };
+                let content = &after_a[tag_end..];
+                match content.find("</a>") {
+                    Some(close) => {
+                        let name = strip_html_text(&content[..close]);
+                        let name = name.trim().to_string();
+                        if !name.is_empty() {
+                            result.push(name);
+                        }
+                        cursor = &content[close + 4..];
+                    }
+                    None => break,
+                }
+            }
+        }
+        result
+    };
+
+    // ── Abstract ───────────────────────────────────────────────────────────────
+    let abstract_text = {
+        let marker = "class=\"abstract";
+        if let Some(pos) = html.find(marker) {
+            let tag_end = html[pos..].find('>').map(|p| p + pos + 1).unwrap_or(pos + marker.len());
+            let after = &html[tag_end..];
+            let content = match after.find("</span>") {
+                Some(span_end) => &after[span_end + 7..],
+                None => after,
+            };
+            match content.find("</blockquote>") {
+                Some(end) => strip_html_text(&content[..end]).trim().to_string(),
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        }
+    };
+
+    // ── Synthetic published date from ID ────────────────────────────────────
+    let year = year_from_arxiv_id(arxiv_id);
+    let published = year
+        .map(|y| format!("{}-01-01T00:00:00Z", y))
+        .unwrap_or_default();
+
+    Some(ArxivPaper {
+        arxiv_id: arxiv_id.to_string(),
+        title,
+        authors,
+        summary: abstract_text,
+        categories: vec![],
+        published,
+        updated: String::new(),
+        pdf_url: format!("https://arxiv.org/pdf/{arxiv_id}"),
+        abs_url: format!("https://arxiv.org/abs/{arxiv_id}"),
+        relevance_score: None,
+        relevance_reason: None,
+        key_contributions: vec![],
+        analysis_summary: None,
+        matched_topics: vec![],
+        analysis_status: "pending".to_string(),
+        in_library: false,
+        fetched_at: fetched_at.to_string(),
+        read: false,
+        rating: 0,
+    })
+}
+
+/// Scrape the arxiv abs page directly when the Atom API returns no results.
+async fn fetch_arxiv_html_fallback(
+    client: &reqwest::Client,
+    arxiv_id: &str,
+    fetched_at: &str,
+) -> Result<ArxivPaper, String> {
+    let url = format!("https://arxiv.org/abs/{arxiv_id}");
+    let html = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch arxiv page: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("Read arxiv page: {e}"))?;
+
+    parse_arxiv_abs_html(&html, arxiv_id, fetched_at)
+        .ok_or_else(|| format!("Could not parse title/authors from arxiv.org/abs/{arxiv_id}"))
+}
+
 // ── URL-based arXiv import ────────────────────────────────────────────────────
 
 /// Extract an arXiv ID from a URL or bare ID string.
@@ -1563,10 +1733,13 @@ pub async fn import_by_url(
 
     let fetched_at = chrono::Utc::now().to_rfc3339();
     let papers = parse_atom_xml(&xml, &fetched_at);
-    let paper_info = papers
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("arXiv ID {arxiv_id} not found or API returned no results."))?;
+    let paper_info = match papers.into_iter().next() {
+        Some(p) => p,
+        None => {
+            // Atom API returned no entries — scrape the abs page directly
+            fetch_arxiv_html_fallback(&client, &arxiv_id, &fetched_at).await?
+        }
+    };
 
     // Check if already in library by title + first author (after fetching so we have the title)
     if check_in_library(root, &paper_info.title, &paper_info.authors) {

@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { MilkdownProvider } from '@milkdown/vue'
 import MilkdownEditor from '../MilkdownEditor.vue'
+import { renderMarkdown } from '../../utils/renderMarkdown'
 import type { Note } from '../../types'
 
 const props = defineProps<{
@@ -29,6 +30,8 @@ function togglePin(note: { id: string }, e: MouseEvent) {
 // ── View state ────────────────────────────────────────────────────────────────
 type View = 'list' | 'editor'
 const view = ref<View>('list')
+const previewMode = ref(false)
+const previewHtml = ref('')
 
 // ── List state ────────────────────────────────────────────────────────────────
 const notes = ref<Note[]>([])
@@ -81,6 +84,8 @@ async function goBack() {
   await maybeSave()
   activeNote.value = null
   view.value = 'list'
+  previewMode.value = false
+  previewHtml.value = ''
   if (props.slug) await loadList(props.slug)
 }
 
@@ -158,6 +163,27 @@ function onContentChange(markdown: string) {
   const slug = props.slug
   const noteId = activeNote.value.id
   debounceTimer = setTimeout(() => flushSave(slug, noteId, markdown), 1500)
+}
+
+// ── Preview mode ──────────────────────────────────────────────────────────────
+async function togglePreview() {
+  if (previewMode.value) {
+    previewMode.value = false
+    return
+  }
+  // Read raw file content so \[...\] and \(...\) delimiters are intact
+  // (Milkdown's commonmark parser strips these backslashes in its exported markdown)
+  if (props.slug && activeNote.value) {
+    try {
+      const md = await invoke<string>('get_note', { slug: props.slug, noteId: activeNote.value.id })
+      previewHtml.value = renderMarkdown(md)
+    } catch {
+      previewHtml.value = renderMarkdown(currentContent.value)
+    }
+  } else {
+    previewHtml.value = renderMarkdown(currentContent.value)
+  }
+  previewMode.value = true
 }
 
 // ── Watch slug changes ────────────────────────────────────────────────────────
@@ -285,10 +311,31 @@ function fmtDate(iso: string) {
 
         <span v-if="saving" class="status">{{ t('notes.saving') }}</span>
         <span v-else-if="saveError" class="status error">{{ saveError }}</span>
+
+        <button
+          class="preview-toggle-btn"
+          :title="previewMode ? t('notes.edit') : t('notes.preview')"
+          @click="togglePreview"
+        >
+          <!-- eye icon = preview mode active; pencil icon = edit mode active -->
+          <svg v-if="previewMode" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+          <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </button>
       </div>
 
       <div class="editor-wrap">
-        <MilkdownProvider :key="editorKey">
+        <div
+          v-if="previewMode"
+          class="notes-preview markdown-body"
+          v-html="previewHtml"
+        />
+        <MilkdownProvider v-else :key="editorKey">
           <MilkdownEditor
             :initial-content="loadedContent"
             @change="onContentChange"
@@ -493,11 +540,31 @@ function fmtDate(iso: string) {
 .status { font-size: var(--font-size-xs); color: var(--text-tertiary); flex-shrink: 0; }
 .status.error { color: #cc3333; }
 
+.preview-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  transition: background 0.1s, color 0.1s;
+}
+.preview-toggle-btn:hover { background: var(--bg-hover); color: var(--accent); }
+
 /* ── Editor ── */
 .editor-wrap {
   flex: 1;
   overflow-y: auto;
   background: var(--bg-primary);
+}
+
+.notes-preview {
+  padding: 14px 16px;
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--text-primary);
 }
 </style>
 
@@ -597,5 +664,11 @@ function fmtDate(iso: string) {
   border: none;
   border-top: 1px solid var(--border-subtle);
   margin: 14px 0;
+}
+
+/* math overflow in preview */
+.notes-preview .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 </style>

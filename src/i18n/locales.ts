@@ -79,6 +79,8 @@ export const zh = {
     untitled: '无标题',
     pinToCanvas: '固定到画布悬浮显示',
     unpinFromCanvas: '取消固定',
+    preview: '预览',
+    edit: '编辑',
   },
   // Metadata tab
   meta: {
@@ -759,6 +761,8 @@ export const en: typeof zh = {
     untitled: 'Untitled',
     pinToCanvas: 'Pin to canvas hover',
     unpinFromCanvas: 'Unpin from canvas',
+    preview: 'Preview',
+    edit: 'Edit',
   },
   meta: {
     noSelection: 'No paper selected',

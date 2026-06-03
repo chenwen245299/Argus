@@ -19,21 +19,34 @@ const { t } = useI18n()
 const library = useLibraryStore()
 
 // ── Source options ────────────────────────────────────────────────────────────
-const SOURCE_LABEL: Record<string, string> = { arxiv: 'ArXiv', file: '文件', url: '链接' }
+type ImportSource = 'file' | 'arxiv' | 'url'
+
+const SOURCE_LABEL: Record<ImportSource, string> = { arxiv: 'ArXiv', file: '文件', url: '链接' }
 const SOURCE_OPTIONS = [
-  { value: 'file',  label: '文件' },
-  { value: 'arxiv', label: 'ArXiv' },
-  { value: 'url',   label: '链接' },
+  { value: 'file' as const,  label: '文件' },
+  { value: 'arxiv' as const, label: 'ArXiv' },
+  { value: 'url' as const,   label: '链接' },
 ]
+
+function importSource(value?: string | null, arxivId?: string | null): ImportSource {
+  if (value === 'arxiv' || value === 'url' || value === 'file') return value
+  if (arxivId?.trim()) return 'arxiv'
+  return 'file'
+}
 
 // ── Edit state ────────────────────────────────────────────────────────────────
 const editing = ref(false)
 const draft = ref<PaperMeta | null>(null)
 const copiedKind = ref<'abstract' | 'fulltext' | 'bibtex' | null>(null)
+const sourceEditing = ref(false)
+const sourceDraft = ref<ImportSource>('file')
+const sourceSaving = ref(false)
 
 function startEdit() {
   if (!props.meta) return
+  sourceEditing.value = false
   draft.value = JSON.parse(JSON.stringify(props.meta)) // deep clone
+  draft.value!.import_source = importSource(draft.value!.import_source, draft.value!.arxiv_id)
   editing.value = true
 }
 
@@ -46,6 +59,7 @@ async function saveEdit() {
   if (!props.slug || !draft.value) return
   saving.value = true
   try {
+    draft.value.import_source = importSource(draft.value.import_source, draft.value.arxiv_id)
     await invoke('save_paper_meta', { slug: props.slug, meta: draft.value })
     emit('saved', { ...draft.value })
     editing.value = false
@@ -64,12 +78,39 @@ watch(() => props.slug, () => {
   refetchOk.value = false
   renameOk.value = false
   copiedKind.value = null
+  sourceEditing.value = false
+  sourceDraft.value = 'file'
   bibtexEditing.value = false
   bibtexDraft.value = ''
   fulltextEditing.value = false
   fulltextDraft.value = ''
   fulltextError.value = ''
 })
+
+function startSourceEdit() {
+  sourceDraft.value = importSource(props.meta?.import_source, props.meta?.arxiv_id)
+  sourceEditing.value = true
+}
+
+function cancelSourceEdit() {
+  sourceEditing.value = false
+  sourceDraft.value = 'file'
+}
+
+async function saveSource() {
+  if (!props.slug || !props.meta) return
+  sourceSaving.value = true
+  try {
+    const updated: PaperMeta = { ...props.meta, import_source: sourceDraft.value }
+    await invoke('save_paper_meta', { slug: props.slug, meta: updated })
+    emit('saved', updated)
+    sourceEditing.value = false
+  } catch (e) {
+    console.error('Failed to save source:', e)
+  } finally {
+    sourceSaving.value = false
+  }
+}
 
 // ── BibTeX inline edit ────────────────────────────────────────────────────────
 const bibtexEditing = ref(false)
@@ -442,16 +483,6 @@ async function extractAbstract() {
           <div v-else class="abstract-text">{{ abstractText }}</div>
         </div>
 
-        <!-- Source (来源) -->
-        <div class="field source-field">
-          <div class="label">来源</div>
-          <div class="value source-val">
-            <span class="src-chip" :class="'src-' + (meta.import_source ?? 'file')">
-              {{ SOURCE_LABEL[meta.import_source ?? 'file'] }}
-            </span>
-          </div>
-        </div>
-
         <!-- Full text -->
         <div class="field fulltext-field">
           <div class="label fulltext-label-row">
@@ -505,6 +536,44 @@ async function extractAbstract() {
             <div v-else-if="!fulltext" class="fulltext-placeholder muted">{{ t('meta.fulltextNone') }}</div>
             <textarea v-else class="fulltext-box" readonly :value="fulltext" />
           </template>
+        </div>
+
+        <!-- Source (来源) -->
+        <div class="field source-field">
+          <div class="label source-label-row">
+            <span>{{ t('list.source') }}</span>
+            <button
+              v-if="!sourceEditing"
+              class="copy-section-btn"
+              @click="startSourceEdit"
+            >
+              {{ t('metaEdit.edit') }}
+            </button>
+          </div>
+          <template v-if="sourceEditing">
+            <div class="source-btns">
+              <button
+                v-for="s in SOURCE_OPTIONS"
+                :key="s.value"
+                class="source-btn"
+                :class="{ active: sourceDraft === s.value }"
+                @click="sourceDraft = s.value"
+              >{{ s.label }}</button>
+            </div>
+            <div class="source-edit-actions">
+              <button class="act-btn primary" :disabled="sourceSaving" @click="saveSource">
+                {{ sourceSaving ? t('meta.fulltextSaving') : t('metaEdit.save') }}
+              </button>
+              <button class="act-btn" :disabled="sourceSaving" @click="cancelSourceEdit">
+                {{ t('metaEdit.cancel') }}
+              </button>
+            </div>
+          </template>
+          <div v-else class="value source-val">
+            <span class="src-chip" :class="'src-' + importSource(meta.import_source, meta.arxiv_id)">
+              {{ SOURCE_LABEL[importSource(meta.import_source, meta.arxiv_id)] }}
+            </span>
+          </div>
         </div>
       </template>
 
@@ -602,13 +671,13 @@ async function extractAbstract() {
         </div>
 
         <div class="field">
-          <div class="label">来源</div>
+          <div class="label">{{ t('list.source') }}</div>
           <div class="source-btns">
             <button
               v-for="s in SOURCE_OPTIONS"
               :key="s.value"
               class="source-btn"
-              :class="{ active: (draft.import_source ?? 'file') === s.value }"
+              :class="{ active: importSource(draft.import_source) === s.value }"
               @click="draft.import_source = s.value"
             >{{ s.label }}</button>
           </div>
@@ -911,6 +980,13 @@ async function extractAbstract() {
 
 /* Source field */
 .source-field { }
+.source-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
 .source-val { display: flex; align-items: center; }
 .src-chip {
   display: inline-flex; align-items: center;
@@ -930,6 +1006,11 @@ async function extractAbstract() {
 }
 .source-btn:hover { border-color: var(--accent); color: var(--accent); }
 .source-btn.active { background: var(--accent); color: #fff; border-color: transparent; }
+.source-edit-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
 
 /* Fulltext section */
 .fulltext-field { margin-top: 4px; border-top: 1px solid var(--border-default); padding-top: 10px; }

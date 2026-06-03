@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    models::{Assignment, Collection, CollectionsFile, PaperIndexEntry},
+    models::{normalize_import_source, Assignment, Collection, CollectionsFile, PaperIndexEntry},
     paper,
 };
 
@@ -461,6 +461,8 @@ pub fn list_papers_in_collection(
         }
 
         let status = crate::paper::read_status(&path);
+        let import_source =
+            normalize_import_source(meta.import_source.as_deref(), meta.arxiv_id.as_deref());
         entries.push(PaperIndexEntry {
             slug,
             id: meta.id,
@@ -473,7 +475,7 @@ pub fn list_papers_in_collection(
             added_at: meta.added_at,
             reading_status: meta.reading_status,
             meta_mtime: 0,
-            import_source: meta.import_source,
+            import_source: Some(import_source),
         });
     }
 

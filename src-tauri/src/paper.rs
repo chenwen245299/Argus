@@ -82,8 +82,13 @@ pub fn read_meta(root: &str, slug: &str) -> Result<PaperMeta, String> {
 
 pub fn write_meta(root: &str, slug: &str, meta: &PaperMeta) -> Result<(), String> {
     let path = paper_dir(root, slug).join("meta.json");
+    let mut meta = meta.clone();
+    meta.import_source = Some(crate::models::normalize_import_source(
+        meta.import_source.as_deref(),
+        meta.arxiv_id.as_deref(),
+    ));
     let content =
-        serde_json::to_string_pretty(meta).map_err(|e| format!("Failed to serialize meta: {e}"))?;
+        serde_json::to_string_pretty(&meta).map_err(|e| format!("Failed to serialize meta: {e}"))?;
     atomic_write(&path, &content)
 }
 

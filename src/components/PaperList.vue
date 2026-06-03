@@ -94,26 +94,30 @@ const COL_META: Record<ColId, {
   source:   { id: 'source',   labelKey: 'list.source',  defaultWidth: 72,  minWidth: 60 },
 }
 const ALL_COL_IDS: ColId[] = ['title', 'authors', 'venue', 'year', 'added_at', 'status', 'tags', 'source']
+const COL_STATE_KEY = 'argus:col-state-v7'
 
 // ── Import source helpers ─────────────────────────────────────────────────────
-function inferSource(item: PaperIndexEntry): string {
-  if (item.import_source) return item.import_source
-  // Legacy fallback: papers with metadata_fetched were likely from ArXiv.
-  if (item.status?.metadata_fetched) return 'arxiv'
-  return 'file'
+type ImportSource = 'file' | 'arxiv' | 'url'
+
+function normalizeSource(source?: string | null): ImportSource {
+  return source === 'arxiv' || source === 'url' || source === 'file' ? source : 'file'
 }
 
-const SOURCE_LABEL: Record<string, string> = {
+function paperSource(item: PaperIndexEntry): ImportSource {
+  return normalizeSource(item.import_source)
+}
+
+const SOURCE_LABEL: Record<ImportSource, string> = {
   arxiv: 'ArXiv',
   file:  '文件',
   url:   '链接',
 }
-const SOURCE_BG: Record<string, string> = {
+const SOURCE_BG: Record<ImportSource, string> = {
   arxiv: 'var(--source-arxiv-bg)',
   file:  'var(--source-file-bg)',
   url:   'var(--source-url-bg)',
 }
-const SOURCE_TEXT: Record<string, string> = {
+const SOURCE_TEXT: Record<ImportSource, string> = {
   arxiv: 'var(--source-arxiv-text)',
   file:  'var(--source-file-text)',
   url:   'var(--source-url-text)',
@@ -123,11 +127,11 @@ const SOURCE_TEXT: Record<string, string> = {
 function loadColState() {
   const defaults = {
     order:   [...ALL_COL_IDS] as ColId[],
-    visible: new Set<ColId>(['title', 'authors', 'venue', 'year', 'tags', 'status']),
+    visible: new Set<ColId>(['title', 'authors', 'venue', 'year', 'tags', 'status', 'source']),
     widths:  Object.fromEntries(ALL_COL_IDS.map(id => [id, COL_META[id].defaultWidth])) as Record<ColId, number>,
   }
   try {
-    const raw = localStorage.getItem('argus:col-state-v6')
+    const raw = localStorage.getItem(COL_STATE_KEY)
     if (!raw) return defaults
     const p = JSON.parse(raw)
     const saved: ColId[] = (p.order ?? []).filter((id: string) => (ALL_COL_IDS as string[]).includes(id))
@@ -151,7 +155,7 @@ const bodyScrollRef = ref<HTMLElement | null>(null)
 const bottomScrollRef = ref<HTMLElement | null>(null)
 
 function saveColState() {
-  localStorage.setItem('argus:col-state-v6', JSON.stringify({
+  localStorage.setItem(COL_STATE_KEY, JSON.stringify({
     order:   colOrder.value,
     visible: [...visibleCols.value],
     widths:  colWidths.value,
@@ -1053,8 +1057,8 @@ async function reExtract(item: PaperIndexEntry) {
                 <div v-else-if="col.id === 'source'" class="row-cell row-source">
                   <span
                     class="source-chip"
-                    :style="{ background: SOURCE_BG[inferSource(item)] ?? SOURCE_BG.file, color: SOURCE_TEXT[inferSource(item)] ?? SOURCE_TEXT.file }"
-                  >{{ SOURCE_LABEL[inferSource(item)] ?? '文件' }}</span>
+                    :style="{ background: SOURCE_BG[paperSource(item)], color: SOURCE_TEXT[paperSource(item)] }"
+                  >{{ SOURCE_LABEL[paperSource(item)] }}</span>
                 </div>
               </template>
               <div class="hdr-trail" />

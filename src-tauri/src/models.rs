@@ -29,6 +29,22 @@ pub struct PaperMeta {
     pub import_source: Option<String>,
 }
 
+pub fn normalize_import_source(import_source: Option<&str>, arxiv_id: Option<&str>) -> String {
+    match import_source
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("file") | Some("arxiv") | Some("url") => import_source
+            .unwrap_or("file")
+            .trim()
+            .to_ascii_lowercase(),
+        _ if arxiv_id.is_some_and(|id| !id.trim().is_empty()) => "arxiv".to_string(),
+        _ => "file".to_string(),
+    }
+}
+
 fn default_reading_status() -> String {
     "unread".to_string()
 }

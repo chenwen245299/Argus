@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use crate::ai_summary;
-use crate::models::{IndexFile, LibraryConfig, PaperIndexEntry};
+use crate::models::{normalize_import_source, IndexFile, LibraryConfig, PaperIndexEntry};
 use crate::paper;
 
 fn mkdir_if_missing(path: &std::path::Path) -> Result<(), String> {
@@ -109,11 +109,18 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
 
     for (slug, path) in paper::list_paper_dirs(root)? {
         let meta_path = path.join("meta.json");
-        let current_mtime = file_mtime(&meta_path);
+        let mut current_mtime = file_mtime(&meta_path);
 
         // ── Step 3a: Cache hit — meta unchanged, refresh status only ─────────
         if let Some(cached) = cache.get(&slug) {
-            if cached.meta_mtime > 0 && cached.meta_mtime == current_mtime {
+            let cached_source_valid = matches!(
+                cached.import_source.as_deref(),
+                Some("file") | Some("arxiv") | Some("url")
+            );
+            if cached.meta_mtime > 0
+                && cached.meta_mtime == current_mtime
+                && cached_source_valid
+            {
                 let mut entry = cached.clone();
                 entry.status = synced_status(root, &slug, &path);
                 entries.push(entry);
@@ -129,13 +136,23 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
                 continue;
             }
         };
-        let meta: crate::models::PaperMeta = match serde_json::from_str(&meta_content) {
+        let mut meta: crate::models::PaperMeta = match serde_json::from_str(&meta_content) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("[scan] corrupt meta.json for {slug}: {e}");
                 continue;
             }
         };
+        let import_source =
+            normalize_import_source(meta.import_source.as_deref(), meta.arxiv_id.as_deref());
+        if meta.import_source.as_deref() != Some(import_source.as_str()) {
+            meta.import_source = Some(import_source.clone());
+            if let Err(e) = paper::write_meta(root, &slug, &meta) {
+                eprintln!("[scan] failed to backfill import_source for {slug}: {e}");
+            } else {
+                current_mtime = file_mtime(&meta_path);
+            }
+        }
 
         let status = synced_status(root, &slug, &path);
         entries.push(PaperIndexEntry {
@@ -150,10 +167,7 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
             added_at: meta.added_at,
             reading_status: meta.reading_status,
             meta_mtime: current_mtime,
-            import_source: meta.import_source.or_else(|| {
-                // Backfill for legacy entries: infer "arxiv" if arxiv_id is present.
-                meta.arxiv_id.as_ref().map(|_| "arxiv".to_string())
-            }),
+            import_source: Some(import_source),
         });
     }
 

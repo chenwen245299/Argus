@@ -20,6 +20,13 @@ export const zh = {
     libraryChatTitle: '打开文献库智能问答',
     aiUsage: 'AI 用量',
     aiUsageTitle: '查看 AI Token 用量',
+    batchAnalysis: '一键分析',
+    batchAnalysisTitle: '对当前视图下所有未分析论文批量生成 AI 分析',
+    batchStop: '停止',
+    batchStopTitle: '停止批量分析',
+    batchAnalysisRunning: '批量分析',
+    batchAnalysisNone: '当前视图下所有论文已有 AI 分析',
+    batchStopping: '停止中…',
   },
   // Left sidebar
   sidebar: {
@@ -172,6 +179,8 @@ export const zh = {
     translating: '翻译中…',
     save: '保存',
     cancel: '取消',
+    switchUnderline: '切换为下划线模式',
+    switchHighlight: '切换为整块高亮模式',
   },
   // Import
   import: {
@@ -706,6 +715,13 @@ export const en: typeof zh = {
     libraryChatTitle: 'Open library-wide RAG chat',
     aiUsage: 'AI Usage',
     aiUsageTitle: 'View AI token usage',
+    batchAnalysis: 'Batch Analysis',
+    batchAnalysisTitle: 'Generate AI analysis for all unanalyzed papers in current view',
+    batchStop: 'Stop',
+    batchStopTitle: 'Stop batch analysis',
+    batchAnalysisRunning: 'Batch Analysis',
+    batchAnalysisNone: 'All papers in current view already have AI analysis',
+    batchStopping: 'Stopping…',
   },
   sidebar: {
     library: 'Library',
@@ -849,6 +865,8 @@ export const en: typeof zh = {
     translating: 'Translating…',
     save: 'Save',
     cancel: 'Cancel',
+    switchUnderline: 'Switch to underline mode',
+    switchHighlight: 'Switch to block highlight mode',
   },
   import: {
     btn: 'Import',

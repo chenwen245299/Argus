@@ -15,7 +15,7 @@
         "title": "Argus",
         "width": 1280,
         "height": 800,
-        "minWidth": 900,
+        "minWidth": 1600,
         "minHeight": 600,
         "maximizable": true,
         "titleBarStyle": "Overlay",

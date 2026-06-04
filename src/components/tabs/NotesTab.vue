@@ -5,7 +5,10 @@ import { invoke } from '@tauri-apps/api/core'
 import { MilkdownProvider } from '@milkdown/vue'
 import MilkdownEditor from '../MilkdownEditor.vue'
 import { renderMarkdown } from '../../utils/renderMarkdown'
+import { useLibraryStore } from '../../stores/library'
 import type { Note } from '../../types'
+
+const library = useLibraryStore()
 
 const props = defineProps<{
   slug: string | null
@@ -110,6 +113,7 @@ async function deleteNote(note: Note, e: MouseEvent) {
     await invoke('delete_note', { slug: props.slug, noteId: note.id })
     notes.value = notes.value.filter(n => n.id !== note.id)
     window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: props.slug } }))
+    library.refresh()
     if (activeNote.value?.id === note.id) {
       activeNote.value = null
       view.value = 'list'

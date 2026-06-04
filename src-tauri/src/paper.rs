@@ -262,8 +262,16 @@ pub fn delete_note(root: &str, slug: &str, note_id: &str) -> Result<(), String> 
         std::fs::remove_file(&note_file).map_err(|e| format!("Failed to delete note file: {e}"))?;
     }
     let mut notes = read_notes_index(root, slug);
+    let was_ai_summary = notes.iter().any(|n| n.id == note_id && n.title == "AI总结");
     notes.retain(|n| n.id != note_id);
-    write_notes_index(root, slug, &notes)
+    write_notes_index(root, slug, &notes)?;
+    if was_ai_summary {
+        let mut status = read_status_for(root, slug);
+        status.ai_summary_done = false;
+        status.last_updated = chrono::Utc::now().to_rfc3339();
+        write_status(root, slug, &status)?;
+    }
+    Ok(())
 }
 
 // ── Highlights ────────────────────────────────────────────────────────────────

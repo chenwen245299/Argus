@@ -8,8 +8,9 @@ import { useLibraryStore } from '../stores/library'
 import { useImportStore } from '../stores/import'
 import { useSelectionStore } from '../stores/selection'
 import { usePaperTasksStore, type AiSummaryJob } from '../stores/paperTasks'
+import { useCollectionsStore } from '../stores/collections'
 import { titleInitialCaps } from '../utils/text'
-import type { SearchHit } from '../types'
+import type { SearchHit, Note } from '../types'
 import TokenUsageModal from './TokenUsageModal.vue'
 
 const { t } = useI18n()
@@ -17,6 +18,7 @@ const library = useLibraryStore()
 const importStore = useImportStore()
 const selection = useSelectionStore()
 const paperTasks = usePaperTasksStore()
+const collectionsStore = useCollectionsStore()
 const { aiSummaryJobs, aiMetaSlug, aiMetaStage, abstractSlug } = storeToRefs(paperTasks)
 
 const props = defineProps<{
@@ -121,9 +123,14 @@ function closeUrlPopover() {
 }
 
 function onDocClick(e: MouseEvent) {
-  if (!showUrlPopover.value) return
-  const wrap = document.querySelector('.url-import-wrap')
-  if (wrap && !wrap.contains(e.target as Node)) closeUrlPopover()
+  if (showUrlPopover.value) {
+    const wrap = document.querySelector('.url-import-wrap')
+    if (wrap && !wrap.contains(e.target as Node)) closeUrlPopover()
+  }
+  if (showBatchDetail.value) {
+    const strip = document.querySelector('.batch-progress-strip')
+    if (strip && !strip.contains(e.target as Node)) showBatchDetail.value = false
+  }
 }
 
 function submitUrl() {
@@ -175,6 +182,108 @@ async function runSearch(q: string) {
 function clearSearch() {
   searchQuery.value = ''
   selection.clearSearch()
+}
+
+// ── Batch AI analysis ────────────────────────────────────────────────────────
+const batchRunning = ref(false)
+const batchStopping = ref(false) // queue cleared, waiting for in-flight to finish
+const batchDone = ref(0)
+const batchTotal = ref(0)
+const showBatchDetail = ref(false)
+let batchCancelled = false
+
+watch(batchRunning, (running) => {
+  if (!running) showBatchDetail.value = false
+})
+
+async function analyzeOnePaper(slug: string): Promise<void> {
+  if (batchCancelled) return
+  paperTasks.setAiSummaryJob(slug, { kind: 'summary', stage: 'queued', generatedChars: 0, message: undefined })
+
+  const eventSafeSlug = slug.replace(/[^A-Za-z0-9:_/-]/g, '-')
+  const unlistenStream = await listen<{ delta?: string; done?: boolean }>(`ai-summary-${eventSafeSlug}`, (ev) => {
+    const job = aiSummaryJobs.value[slug]
+    if (!job) return
+    if (ev.payload.delta) {
+      paperTasks.setAiSummaryJob(slug, {
+        stage: 'ai',
+        generatedChars: job.generatedChars + ev.payload.delta.length,
+      })
+    }
+    if (ev.payload.done && job.stage === 'ai') {
+      paperTasks.setAiSummaryJob(slug, { stage: 'saving' })
+    }
+  })
+
+  try {
+    await invoke<Note>('generate_summary', { slug, providerId: null, modelId: null })
+    paperTasks.setAiSummaryJob(slug, { stage: 'done' })
+    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug } }))
+  } catch (e: unknown) {
+    paperTasks.setAiSummaryJob(slug, { stage: 'error', message: String(e) })
+  } finally {
+    unlistenStream()
+    const delay = aiSummaryJobs.value[slug]?.stage === 'error' ? 5000 : 1800
+    setTimeout(() => {
+      const job = aiSummaryJobs.value[slug]
+      if (job?.stage === 'done' || job?.stage === 'error') paperTasks.removeAiSummaryJob(slug)
+    }, delay)
+  }
+}
+
+async function startBatchAnalysis() {
+  if (batchRunning.value) {
+    if (!batchStopping.value) {
+      batchCancelled = true
+      batchStopping.value = true
+    }
+    return
+  }
+
+  // Get papers for current view
+  const collId = selection.activeCollectionId
+  let papers = collId
+    ? await collectionsStore.listPapersInCollection(collId).catch(() => [] as typeof library.papers)
+    : [...library.papers]
+
+  // Apply tag filter consistent with PaperList
+  const nav = selection.activeNav
+  const activeTag = selection.tagFilter ?? (nav.startsWith('tag:') ? nav.slice(4) : null)
+  if (activeTag) papers = papers.filter(p => p.tags?.includes(activeTag))
+
+  const toAnalyze = papers.filter(p => !p.status.ai_summary_done && !paperTasks.isAiSummaryActive(p.slug))
+  if (toAnalyze.length === 0) return
+
+  batchRunning.value = true
+  batchStopping.value = false
+  batchCancelled = false
+  batchDone.value = 0
+  batchTotal.value = toAnalyze.length
+
+  const CONCURRENCY = 5
+  const queue = [...toAnalyze]
+  let active = 0
+
+  await new Promise<void>((resolve) => {
+    function drain() {
+      if (active === 0 && (queue.length === 0 || batchCancelled)) { resolve(); return }
+      while (active < CONCURRENCY && queue.length > 0 && !batchCancelled) {
+        const paper = queue.shift()!
+        active++
+        analyzeOnePaper(paper.slug).finally(() => {
+          active--
+          batchDone.value++
+          drain()
+        })
+      }
+    }
+    drain()
+  })
+
+  batchRunning.value = false
+  batchStopping.value = false
+  batchCancelled = false
+  await library.refresh()
 }
 
 // Token usage modal
@@ -467,7 +576,45 @@ onUnmounted(() => {
 
     <div class="spacer" />
 
-    <div v-if="paperTaskItems.length" class="paper-task-strip">
+    <!-- Batch analysis progress chip + detail popover -->
+    <div v-if="batchRunning" class="batch-progress-strip">
+      <span
+        class="paper-task-chip is-active batch-chip-clickable"
+        @click.stop="showBatchDetail = !showBatchDetail"
+      >
+        <span class="paper-task-spinner" />
+        <span class="paper-task-label">{{ batchStopping ? t('toolbar.batchStopping') : t('toolbar.batchAnalysisRunning') }} {{ batchDone }}/{{ batchTotal }}</span>
+        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
+          <polyline :points="showBatchDetail ? '18 15 12 9 6 15' : '6 9 12 15 18 9'"/>
+        </svg>
+      </span>
+
+      <Transition name="batch-detail">
+        <div v-if="showBatchDetail" class="batch-detail-popover" @click.stop>
+          <div class="batch-detail-header">
+            <span class="batch-detail-title-text">{{ t('toolbar.batchAnalysisRunning') }}</span>
+            <span class="batch-detail-count">{{ batchDone }}/{{ batchTotal }}</span>
+          </div>
+          <div class="batch-detail-list">
+            <div
+              v-for="item in paperTaskItems"
+              :key="item.id"
+              class="batch-detail-item"
+            >
+              <span v-if="item.active" class="paper-task-spinner batch-item-spinner" />
+              <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"/>
+              </svg>
+              <span class="batch-item-name">{{ item.detail?.split('\n')[0] ?? item.id }}</span>
+              <span class="batch-item-stage">{{ aiSummaryStageLabel(aiSummaryJobs[item.id.replace(/^[^:]+:/, '')]) }}</span>
+            </div>
+            <div v-if="!paperTaskItems.length" class="batch-detail-empty">正在准备…</div>
+          </div>
+        </div>
+      </Transition>
+    </div>
+
+    <div v-if="paperTaskItems.length && !batchRunning" class="paper-task-strip">
       <span
         v-for="item in visiblePaperTaskItems"
         :key="item.id"
@@ -614,6 +761,32 @@ onUnmounted(() => {
     </button>
 
     <div v-if="library.currentPath" class="tb-sep global-feature-sep" />
+
+    <!-- Batch analysis button -->
+    <button
+      v-if="library.currentPath"
+      class="tb-btn batch-btn"
+      :class="{ 'batch-running': batchRunning, 'batch-stopping': batchStopping }"
+      :disabled="batchStopping"
+      :title="batchStopping ? t('toolbar.batchStopping') : batchRunning ? t('toolbar.batchStopTitle') : t('toolbar.batchAnalysisTitle')"
+      @click="startBatchAnalysis"
+    >
+      <!-- Sparkle icon when idle -->
+      <svg v-if="!batchRunning" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3 13.7 8.3 19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z"/>
+        <path d="M19 15v4"/>
+        <path d="M17 17h4"/>
+      </svg>
+      <!-- Spinner when stopping -->
+      <span v-else-if="batchStopping" class="paper-task-spinner" />
+      <!-- Stop icon when running -->
+      <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+        <rect x="4" y="4" width="16" height="16" rx="2"/>
+      </svg>
+      <span class="batch-btn-label">{{ batchStopping ? t('toolbar.batchStopping') : batchRunning ? t('toolbar.batchStop') : t('toolbar.batchAnalysis') }}</span>
+    </button>
+
+    <div v-if="library.currentPath" class="tb-sep" />
 
     <!-- Token usage button -->
     <button
@@ -975,6 +1148,147 @@ onUnmounted(() => {
   color: var(--text-secondary);
   overflow: hidden;
 }
+.batch-progress-strip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.batch-chip-clickable {
+  cursor: pointer;
+  user-select: none;
+}
+.batch-chip-clickable:hover {
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-primary));
+}
+
+.batch-detail-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 300;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  min-width: 320px;
+  max-width: 440px;
+  max-height: 360px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.batch-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px 9px;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+.batch-detail-title-text {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.batch-detail-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+}
+
+.batch-detail-list {
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.batch-detail-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  font-size: 12px;
+  min-width: 0;
+}
+.batch-item-spinner {
+  flex-shrink: 0;
+}
+.batch-item-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+.batch-item-stage {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.batch-detail-empty {
+  padding: 14px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.batch-detail-enter-active,
+.batch-detail-leave-active { transition: opacity 0.15s ease, transform 0.15s ease; }
+.batch-detail-enter-from,
+.batch-detail-leave-to { opacity: 0; transform: translateY(-4px); }
+
+.batch-btn {
+  width: auto;
+  min-width: 0;
+  height: auto;
+  min-height: 0;
+  box-sizing: border-box;
+  padding: 4px 11px;
+  gap: 5px;
+  line-height: normal;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border-default));
+  border-radius: var(--radius-pill);
+  background: var(--bg-secondary);
+  color: color-mix(in srgb, var(--accent) 76%, #64748b);
+  flex-shrink: 0;
+}
+.batch-btn:hover {
+  color: color-mix(in srgb, var(--accent) 82%, #475569);
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--border-default));
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-secondary));
+}
+.batch-btn.batch-running {
+  color: #ef4444;
+  border-color: color-mix(in srgb, #ef4444 40%, var(--border-default));
+  animation: batch-breathe 1.8s ease-in-out infinite;
+}
+.batch-btn.batch-stopping,
+.batch-btn.batch-stopping:hover {
+  color: var(--text-tertiary);
+  border-color: var(--border-default);
+  background: var(--bg-secondary);
+  animation: none;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.batch-btn.batch-running:hover {
+  background: color-mix(in srgb, #ef4444 9%, var(--bg-secondary));
+  border-color: color-mix(in srgb, #ef4444 55%, var(--border-default));
+}
+@keyframes batch-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+  50%       { box-shadow: 0 0 8px 2px rgba(239, 68, 68, 0.22); }
+}
+.batch-btn-label {
+  font-weight: 600;
+  white-space: nowrap;
+  font-size: var(--font-size-sm);
+}
+
 .usage-btn {
   width: auto;
   min-width: 0;

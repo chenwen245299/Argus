@@ -66,6 +66,15 @@ const loading = ref(true)
 // rects/text stored at popup-open time so mousedown on color dot can't clear the selection
 const selectionPopup = ref<{ x: number; y: number; pageIndex: number; rects: Rect[]; text: string } | null>(null)
 const activeColor = ref('#FFEB3B') // default yellow
+
+const HIGHLIGHT_STYLE_KEY = 'argus:highlight-style'
+const highlightStyle = ref<'highlight' | 'underline'>(
+  (localStorage.getItem(HIGHLIGHT_STYLE_KEY) as 'highlight' | 'underline' | null) ?? 'highlight'
+)
+function toggleHighlightStyle() {
+  highlightStyle.value = highlightStyle.value === 'highlight' ? 'underline' : 'highlight'
+  localStorage.setItem(HIGHLIGHT_STYLE_KEY, highlightStyle.value)
+}
 const hlNotePopup = ref<{ x: number; y: number; hlId: string } | null>(null)   // left-click: note view/edit
 const hlNoteText = ref('')
 const hlNoteEditing = ref(false)   // false = view mode, true = edit mode
@@ -918,7 +927,7 @@ function createHighlight(color?: string) {
     text: popup.text,
     color: color ?? activeColor.value,
     created_at: new Date().toISOString(),
-    style: 'highlight',
+    style: highlightStyle.value,
   }
 
   reader.addHighlight(hl)
@@ -1084,6 +1093,22 @@ function hexToRgba(hex: string, alpha: number): string {
           @click="createHighlight(c.value)"
         />
       </div>
+      <div class="sel-sep" />
+      <button
+        class="sel-style-btn"
+        :class="{ active: highlightStyle === 'underline' }"
+        :title="highlightStyle === 'highlight' ? t('pdf.switchUnderline') : t('pdf.switchHighlight')"
+        @click="toggleHighlightStyle"
+      >
+        <svg v-if="highlightStyle === 'highlight'" width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <rect x="1" y="5" width="14" height="6" rx="1" opacity="0.7"/>
+          <rect x="1" y="13" width="14" height="1.5" rx="0.75"/>
+        </svg>
+        <svg v-else width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <text x="2" y="11" font-size="11" font-weight="bold" font-family="serif">A</text>
+          <rect x="1" y="13" width="14" height="1.5" rx="0.75"/>
+        </svg>
+      </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="translateSelection">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1446,6 +1471,20 @@ function hexToRgba(hex: string, alpha: number): string {
   background: var(--border-default);
   flex-shrink: 0;
 }
+
+.sel-style-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  transition: background 0.1s, color 0.1s;
+  flex-shrink: 0;
+}
+.sel-style-btn:hover { background: var(--bg-hover); color: var(--accent); }
+.sel-style-btn.active { color: var(--accent); background: var(--bg-hover); }
 
 .sel-translate-btn {
   display: flex;

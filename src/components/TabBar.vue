@@ -93,11 +93,8 @@ function startDrag(e: MouseEvent) {
 
 async function refreshWindowLayout() {
   try {
-    const [fullscreen, maximized] = await Promise.all([
-      appWindow.isFullscreen(),
-      appWindow.isMaximized(),
-    ])
-    isFullscreenLayout.value = fullscreen || maximized
+    const fullscreen = await appWindow.isFullscreen()
+    isFullscreenLayout.value = fullscreen
   } catch {
     isFullscreenLayout.value = false
   }

@@ -24,6 +24,7 @@ const addingId = ref<string | null>(null)
 const addMsg = ref('')
 const selectedId = ref<string | null>(null)
 const categoryFilter = ref('')
+const collapsedDates = ref<Set<string>>(new Set())
 const showSortMenu = ref(false)
 const sortBtnRef = ref<HTMLElement | null>(null)
 const sortPopoverStyle = ref({ top: '0px', left: '0px' })
@@ -234,6 +235,17 @@ async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
   showColPicker.value = false
   addingId.value = paper.arxiv_id
   addMsg.value = ''
+
+  // Remember which paper to select next before the store removes the current one.
+  const list = filteredPapers.value
+  const idx = list.findIndex(p => p.arxiv_id === paper.arxiv_id)
+  const nextId = idx !== -1
+    ? (list[idx + 1]?.arxiv_id ?? list[idx - 1]?.arxiv_id ?? null)
+    : null
+
+  // Switch selection before the store removes the paper so the watcher sees a valid selectedId.
+  if (nextId) selectedId.value = nextId
+
   try {
     await store.addToLibrary(paper.arxiv_id, collectionId)
     const colName = collectionId
@@ -657,33 +669,44 @@ function jumpToDate(dateStr: string) {
           </div>
 
           <template v-for="group in groupedPapers" :key="group.date">
-            <div class="date-header">
+            <div
+              class="date-header"
+              :class="{ collapsed: collapsedDates.has(group.date) }"
+              @click="collapsedDates.has(group.date) ? collapsedDates.delete(group.date) : collapsedDates.add(group.date)"
+            >
+              <svg class="date-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polyline points="6 9 12 15 18 9"/>
+              </svg>
               <span class="date-text">{{ formatDateLabel(group.date) }}</span>
               <span class="date-count">{{ group.papers.length }}</span>
             </div>
-            <div
-              v-for="paper in group.papers"
-              :key="paper.arxiv_id"
-              class="paper-item"
-              :class="{ selected: selectedId === paper.arxiv_id, unread: !paper.read }"
-              @click="selectPaper(paper.arxiv_id)"
-            >
-              <div
-                class="item-score"
-                :style="{ color: scoreColor(paper.relevance_score), background: scoreBackground(paper.relevance_score) }"
-              >{{ formatScore(paper.relevance_score) }}</div>
-              <div class="item-body">
-                <div class="item-title">{{ paper.title }}</div>
-                <div class="item-footer">
-                  <div class="item-meta" v-if="paper.in_library || paper.analysis_status === 'failed'">
-                    <span v-if="paper.in_library" class="item-state in-library">已入库</span>
-                    <span v-else-if="paper.analysis_status === 'failed'" class="item-state failed">失败</span>
-                  </div>
-                  <div class="item-tags">
-                    <span v-for="topic in (paper.matched_topics ?? [])" :key="topic" class="tag-topic" :style="tagStyle(topic)">{{ topic }}</span>
-                  </div>
-                  <div v-if="paper.rating > 0" class="item-rating-mini">
-                    <span v-for="i in 5" :key="i" class="star-mini" :class="{ filled: i <= paper.rating }">★</span>
+            <div class="group-papers" :class="{ collapsed: collapsedDates.has(group.date) }">
+              <div class="group-papers-inner">
+                <div
+                  v-for="paper in group.papers"
+                  :key="paper.arxiv_id"
+                  class="paper-item"
+                  :class="{ selected: selectedId === paper.arxiv_id, unread: !paper.read }"
+                  @click="selectPaper(paper.arxiv_id)"
+                >
+                  <div
+                    class="item-score"
+                    :style="{ color: scoreColor(paper.relevance_score), background: scoreBackground(paper.relevance_score) }"
+                  >{{ formatScore(paper.relevance_score) }}</div>
+                  <div class="item-body">
+                    <div class="item-title">{{ paper.title }}</div>
+                    <div class="item-footer">
+                      <div class="item-meta" v-if="paper.in_library || paper.analysis_status === 'failed'">
+                        <span v-if="paper.in_library" class="item-state in-library">已入库</span>
+                        <span v-else-if="paper.analysis_status === 'failed'" class="item-state failed">失败</span>
+                      </div>
+                      <div class="item-tags">
+                        <span v-for="topic in (paper.matched_topics ?? [])" :key="topic" class="tag-topic" :style="tagStyle(topic)">{{ topic }}</span>
+                      </div>
+                      <div v-if="paper.rating > 0" class="item-rating-mini">
+                        <span v-for="i in 5" :key="i" class="star-mini" :class="{ filled: i <= paper.rating }">★</span>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1211,16 +1234,41 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 
 /* Date group header */
 .date-header {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; gap: 5px;
   padding: 8px 12px 4px;
   position: sticky; top: 0; background: var(--bg-primary); z-index: 1;
+  cursor: pointer; user-select: none;
 }
-.date-text { font-size: 11px; font-weight: 600; color: var(--text-tertiary); letter-spacing: 0.03em; }
+.date-header:hover .date-text { color: var(--text-secondary); }
+.date-chevron {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  transition: transform 0.18s ease;
+}
+.date-header.collapsed .date-chevron { transform: rotate(-90deg); }
+.date-text {
+  font-size: 11px; font-weight: 600; color: var(--text-tertiary);
+  letter-spacing: 0.03em; flex: 1;
+  transition: color 0.12s;
+}
 .date-count {
   font-size: 10px; font-weight: 600;
   background: var(--bg-tertiary); color: var(--text-tertiary);
   padding: 1px 6px; border-radius: var(--radius-pill);
   min-width: 18px; text-align: center;
+}
+
+/* Collapsible group */
+.group-papers {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.45s ease;
+}
+.group-papers.collapsed {
+  grid-template-rows: 0fr;
+}
+.group-papers-inner {
+  overflow: hidden;
 }
 
 /* Paper item */
@@ -1667,9 +1715,11 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 .date-header {
   padding: 9px 8px 5px;
   margin: 4px 0;
+  gap: 5px;
   background: color-mix(in srgb, var(--bg-primary) 90%, var(--bg-secondary));
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
+  cursor: pointer;
 }
 
 .date-text {

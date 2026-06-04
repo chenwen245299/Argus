@@ -226,6 +226,8 @@ pub fn run() {
             // ── Shell ──
             commands::open_url,
             commands::open_in_finder,
+            // ── Library size ──
+            commands::get_library_size,
             // ── Token usage ──
             commands::get_token_usage,
             commands::clear_token_usage,

@@ -413,6 +413,13 @@ watch(() => collectionsStore.file.assignments, async () => {
     collectionPapers.value = await collectionsStore.listPapersInCollection(selection.activeCollectionId)
 }, { deep: true })
 
+// After a library refresh (e.g. paper rename during import), re-sync collection papers
+// so stale slugs (tempSlug → finalSlug) don't break the right-panel meta load.
+watch(() => library.papers, async () => {
+  if (selection.activeCollectionId)
+    collectionPapers.value = await collectionsStore.listPapersInCollection(selection.activeCollectionId)
+})
+
 // ── Filtered / sorted list ────────────────────────────────────────────────────
 const filtered = computed<PaperIndexEntry[]>(() => {
   const nav = selection.activeNav

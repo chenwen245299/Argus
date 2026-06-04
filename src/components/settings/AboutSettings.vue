@@ -1,11 +1,26 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { marked } from 'marked'
 import { invoke } from '@tauri-apps/api/core'
 import { updateStore, initUpdateStore, checkForUpdates, startUpdate } from '../../stores/update'
 
-onMounted(() => {
+const librarySize = ref<string | null>(null)
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+onMounted(async () => {
   initUpdateStore()
+  try {
+    const bytes = await invoke<number>('get_library_size')
+    librarySize.value = formatBytes(bytes)
+  } catch {
+    librarySize.value = null
+  }
 })
 
 function openGitHub() {
@@ -70,6 +85,10 @@ const renderedNotes = computed(() => {
       <div class="info-row">
         <span class="row-label">存储</span>
         <span class="row-val">本地文件系统 + SQLite</span>
+      </div>
+      <div class="info-row">
+        <span class="row-label">占用空间</span>
+        <span class="row-val">{{ librarySize ?? '计算中…' }}</span>
       </div>
       <div class="info-row">
         <span class="row-label">许可</span>
@@ -226,7 +245,7 @@ const renderedNotes = computed(() => {
 .row-label {
   font-size: var(--font-size-sm);
   color: var(--text-tertiary);
-  width: 66px;
+  width: 72px;
   flex-shrink: 0;
 }
 

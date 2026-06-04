@@ -1975,6 +1975,22 @@ fn load_stored_library_path(app: &tauri::AppHandle) -> Option<String> {
         .and_then(|v| v.as_str().map(|s| s.to_string()))
 }
 
+// ── Library size ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_library_size(state: State<'_, LibraryRoot>) -> Result<u64, String> {
+    let root = get_root(&state)?;
+    fn dir_size(path: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+        entries.flatten().fold(0u64, |acc, entry| {
+            let p = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else { return acc };
+            if meta.is_dir() { acc + dir_size(&p) } else { acc + meta.len() }
+        })
+    }
+    Ok(dir_size(std::path::Path::new(&root)))
+}
+
 // ── Token usage ───────────────────────────────────────────────────────────────
 
 #[tauri::command]

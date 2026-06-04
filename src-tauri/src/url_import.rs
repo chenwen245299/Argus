@@ -15,6 +15,11 @@ pub async fn import_by_url(
 ) -> Result<String, String> {
     let u = url.trim().to_ascii_lowercase();
 
+    if u.ends_with(".pdf") || u.contains(".pdf?") {
+        // Direct PDF link — download and add with filename-derived title
+        return pdf_url::import(root, url, collection_id, app).await;
+    }
+
     if u.contains("aclanthology.org") {
         acl::import(root, url, collection_id, app).await
     } else if u.contains("openreview.net") {
@@ -22,6 +27,120 @@ pub async fn import_by_url(
     } else {
         // Default: arXiv (handles arxiv.org URLs and bare IDs)
         crate::arxiv::import_by_url(root, url, collection_id, app).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Direct PDF URL import
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod pdf_url {
+    use super::*;
+
+    /// Derive a human-readable title from the last path segment of a URL.
+    fn title_from_url(url: &str) -> String {
+        let path = url.split('?').next().unwrap_or(url);
+        let last = path.split('/').last().unwrap_or("paper");
+        let stem = last.trim_end_matches(".pdf").trim_end_matches(".PDF");
+        // Replace common separators with spaces and title-case
+        let readable = stem
+            .replace(['-', '_', '+'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if readable.is_empty() {
+            "Imported Paper".to_string()
+        } else {
+            readable
+        }
+    }
+
+    pub async fn import(
+        root: &str,
+        url: &str,
+        collection_id: &str,
+        app: &tauri::AppHandle,
+    ) -> Result<String, String> {
+        use tauri::Emitter;
+
+        let emit = |s: &str| {
+            let _ = app.emit(
+                "paper-url-import",
+                serde_json::json!({ "source": "pdf", "status": s }),
+            );
+        };
+        emit("downloading");
+
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; Argus/1.0)")
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| format!("HTTP client: {e}"))?;
+
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Download PDF: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {} from {url}", resp.status()));
+        }
+
+        let pdf_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Read PDF bytes: {e}"))?;
+
+        if !pdf_bytes.starts_with(b"%PDF") {
+            return Err(format!("URL did not return a valid PDF: {url}"));
+        }
+
+        emit("importing");
+
+        let title = title_from_url(url);
+        let slug_base = super::build_slug(&[], None, &title);
+        let papers_dir = Path::new(root).join("papers");
+        let final_dir = {
+            let c = papers_dir.join(&slug_base);
+            if c.exists() { papers_dir.join(format!("{slug_base}-2")) } else { c }
+        };
+        let final_slug = final_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&slug_base)
+            .to_string();
+
+        std::fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir: {e}"))?;
+        std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
+            .map_err(|e| format!("write PDF: {e}"))?;
+
+        // Derive an original filename from the URL
+        let original_filename = url
+            .split('?').next().unwrap_or(url)
+            .split('/').last()
+            .map(|s| s.to_string());
+
+        let paper_meta = PaperMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            title,
+            authors: vec![],
+            year: None,
+            doi: None,
+            arxiv_id: None,
+            venue: None,
+            tags: vec![],
+            added_at: chrono::Utc::now().to_rfc3339(),
+            original_filename,
+            reading_status: "unread".to_string(),
+            paper_abstract: None,
+            bibtex: None,
+            canvas_notes: vec![],
+            import_source: Some("url".to_string()),
+        };
+
+        super::finalize_paper(root, &final_dir, &final_slug, paper_meta, collection_id, app, "pdf").await?;
+        Ok(final_slug)
     }
 }
 

@@ -10,7 +10,8 @@ use crate::models::{
 use crate::LibraryRoot;
 use crate::{
     ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas, canvas_enhance, collections, copilot,
-    extraction, library, llm, metadata, paper, rag, search, security_bookmark, settings, url_import,
+    extraction, library, llm, metadata, paper, rag, search, security_bookmark, settings, snippets,
+    url_import,
 };
 // ── Library management ────────────────────────────────────────────────────────
 
@@ -2005,4 +2006,121 @@ pub fn get_token_usage(
 pub fn clear_token_usage(state: State<'_, LibraryRoot>) -> Result<(), String> {
     let root = get_root(&state)?;
     crate::token_usage::clear(&root)
+}
+
+// ── Folder paths ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_canvases_folder_path(state: State<'_, LibraryRoot>) -> Result<String, String> {
+    let root = get_root(&state)?;
+    let path = std::path::Path::new(&root).join("canvases");
+    std::fs::create_dir_all(&path).map_err(|e| format!("Create canvases folder: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn get_snippets_folder_path(state: State<'_, LibraryRoot>) -> Result<String, String> {
+    let root = get_root(&state)?;
+    let path = std::path::Path::new(&root).join("snippets");
+    std::fs::create_dir_all(&path).map_err(|e| format!("Create snippets folder: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+// ── Snippet Library ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn list_snippet_libraries(
+    state: State<'_, LibraryRoot>,
+) -> Result<Vec<crate::models::SnippetLibrary>, String> {
+    let root = get_root(&state)?;
+    snippets::list_snippet_libraries(&root)
+}
+
+#[tauri::command]
+pub fn create_snippet_library(
+    state: State<'_, LibraryRoot>,
+    name: String,
+    emoji: Option<String>,
+) -> Result<crate::models::SnippetLibrary, String> {
+    let root = get_root(&state)?;
+    snippets::create_snippet_library(&root, name, emoji)
+}
+
+#[tauri::command]
+pub fn rename_snippet_library(
+    state: State<'_, LibraryRoot>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    snippets::rename_snippet_library(&root, &id, name)
+}
+
+#[tauri::command]
+pub fn update_snippet_library_emoji(
+    state: State<'_, LibraryRoot>,
+    id: String,
+    emoji: Option<String>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    snippets::update_snippet_library_emoji(&root, &id, emoji)
+}
+
+#[tauri::command]
+pub fn delete_snippet_library(
+    state: State<'_, LibraryRoot>,
+    id: String,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    snippets::delete_snippet_library(&root, &id)
+}
+
+#[tauri::command]
+pub fn get_snippets(
+    state: State<'_, LibraryRoot>,
+    library_id: String,
+) -> Result<Vec<crate::models::Snippet>, String> {
+    let root = get_root(&state)?;
+    snippets::get_snippets(&root, &library_id)
+}
+
+#[tauri::command]
+pub fn add_snippet(
+    state: State<'_, LibraryRoot>,
+    input: snippets::AddSnippetInput,
+) -> Result<crate::models::Snippet, String> {
+    let root = get_root(&state)?;
+    snippets::add_snippet(&root, input)
+}
+
+#[tauri::command]
+pub fn update_snippet(
+    state: State<'_, LibraryRoot>,
+    library_id: String,
+    id: String,
+    tags: Option<Vec<String>>,
+    note: Option<String>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    snippets::update_snippet(&root, &library_id, &id, tags, note)
+}
+
+#[tauri::command]
+pub fn delete_snippet(
+    state: State<'_, LibraryRoot>,
+    library_id: String,
+    id: String,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    snippets::delete_snippet(&root, &library_id, &id)
+}
+
+#[tauri::command]
+pub fn migrate_snippets_from_localstorage(
+    state: State<'_, LibraryRoot>,
+    libraries: Vec<crate::models::SnippetLibrary>,
+    snippets_by_library: Vec<(String, Vec<crate::models::Snippet>)>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    snippets::migrate_from_localstorage(&root, libraries, snippets_by_library)
 }

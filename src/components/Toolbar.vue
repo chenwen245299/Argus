@@ -141,6 +141,7 @@ function submitUrl() {
     urlImportError.value = t('import.selectCollectionFirst')
     return
   }
+  importStore.clearUrlError()
   importStore.importPaperUrl(url, collectionId)
   closeUrlPopover()
 }
@@ -637,6 +638,22 @@ onUnmounted(() => {
       <span>{{ importStatusLabel }}</span>
     </div>
 
+    <!-- Import error toast -->
+    <div
+      v-if="importStore.lastUrlError"
+      class="import-error-toast"
+      :title="importStore.lastUrlError"
+      @click="importStore.clearUrlError()"
+    >
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+      </svg>
+      <span class="import-error-text">导入失败：{{ importStore.lastUrlError }}</span>
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </div>
+
     <!-- Import PDF -->
     <button
       v-if="library.currentPath"
@@ -1032,6 +1049,27 @@ onUnmounted(() => {
   font-size: var(--font-size-xs);
   color: var(--text-tertiary);
   flex-shrink: 0;
+}
+
+.import-error-toast {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 320px;
+  padding: 4px 8px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, #cc3333 10%, var(--bg-primary));
+  border: 1px solid color-mix(in srgb, #cc3333 30%, transparent);
+  color: #cc3333;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.import-error-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
 }
 
 .spinner {

@@ -64,6 +64,17 @@ export const useSelectionStore = defineStore('selection', () => {
     }
   }
 
+  // Update the sidebar highlight only — does NOT change the center view or selectedSlug
+  function highlightCollection(collectionId: string | null) {
+    if (collectionId) {
+      activeNav.value = `collection:${collectionId}` as NavItem
+      activeCollectionId.value = collectionId
+    } else {
+      activeNav.value = 'all'
+      activeCollectionId.value = null
+    }
+  }
+
   return {
     selectedSlug,
     activeNav,
@@ -77,5 +88,6 @@ export const useSelectionStore = defineStore('selection', () => {
     toggleTagFilter,
     setSearchResults,
     clearSearch,
+    highlightCollection,
   }
 })

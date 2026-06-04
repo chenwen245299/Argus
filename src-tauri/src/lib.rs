@@ -18,6 +18,7 @@ mod rag;
 mod search;
 mod security_bookmark;
 mod settings;
+mod snippets;
 mod token_usage;
 mod url_import;
 
@@ -226,11 +227,25 @@ pub fn run() {
             // ── Shell ──
             commands::open_url,
             commands::open_in_finder,
+            // ── Folder paths ──
+            commands::get_canvases_folder_path,
+            commands::get_snippets_folder_path,
             // ── Library size ──
             commands::get_library_size,
             // ── Token usage ──
             commands::get_token_usage,
             commands::clear_token_usage,
+            // ── Snippet Library ──
+            commands::list_snippet_libraries,
+            commands::create_snippet_library,
+            commands::rename_snippet_library,
+            commands::update_snippet_library_emoji,
+            commands::delete_snippet_library,
+            commands::get_snippets,
+            commands::add_snippet,
+            commands::update_snippet,
+            commands::delete_snippet,
+            commands::migrate_snippets_from_localstorage,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

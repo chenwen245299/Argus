@@ -9,6 +9,7 @@ import { useCollectionsStore } from './collections'
 
 export const useImportStore = defineStore('import', () => {
   const jobs = ref<ImportJob[]>([])
+  const lastUrlError = ref<string | null>(null)
 
   function _addJob(slug: string, filename: string): ImportJob {
     const job: ImportJob = {
@@ -164,6 +165,7 @@ export const useImportStore = defineStore('import', () => {
         j.status = 'error'
         j.error = String(e)
       }
+      lastUrlError.value = String(e)
     }
   }
 
@@ -185,5 +187,7 @@ export const useImportStore = defineStore('import', () => {
 
   const activeCount = computed(() => jobs.value.filter(j => j.status !== 'done' && j.status !== 'error').length)
 
-  return { jobs, importFile, importFiles, importPaperUrl, clearDone, activeCount }
+  function clearUrlError() { lastUrlError.value = null }
+
+  return { jobs, importFile, importFiles, importPaperUrl, clearDone, activeCount, lastUrlError, clearUrlError }
 })

@@ -2,9 +2,7 @@
 import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
-import { MilkdownProvider } from '@milkdown/vue'
 import MilkdownEditor from '../MilkdownEditor.vue'
-import { renderMarkdown } from '../../utils/renderMarkdown'
 import { useLibraryStore } from '../../stores/library'
 import type { Note } from '../../types'
 
@@ -33,8 +31,6 @@ function togglePin(note: { id: string }, e: MouseEvent) {
 // ── View state ────────────────────────────────────────────────────────────────
 type View = 'list' | 'editor'
 const view = ref<View>('list')
-const previewMode = ref(false)
-const previewHtml = ref('')
 
 // ── List state ────────────────────────────────────────────────────────────────
 const notes = ref<Note[]>([])
@@ -44,12 +40,16 @@ const loadingList = ref(false)
 const activeNote = ref<Note | null>(null)
 const editingTitle = ref(false)
 const titleDraft = ref('')
+let _titleCompositionEndedAt = 0
+function onTitleCompositionEnd() { _titleCompositionEndedAt = Date.now() }
+function isTitleIMEActive() { return Date.now() - _titleCompositionEndedAt < 100 }
 const loadedContent = ref('')
 const editorKey = ref(0)
 const currentContent = ref('')
 const saving = ref(false)
 const saveError = ref('')
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
+let openNoteSeq = 0
 
 // ── Load note list ─────────────────────────────────────────────────────────────
 async function loadList(slug: string) {
@@ -65,31 +65,57 @@ async function loadList(slug: string) {
 
 // ── Open a note in the editor ─────────────────────────────────────────────────
 async function openNote(note: Note) {
+  const seq = ++openNoteSeq
   // Flush any pending save first
   await maybeSave()
+  if (seq !== openNoteSeq) return
+
+  let md = ''
+  try {
+    md = await invoke<string>('get_note', { slug: props.slug, noteId: note.id })
+  } catch {
+    md = ''
+  }
+  if (seq !== openNoteSeq) return
+
   activeNote.value = note
   titleDraft.value = note.title
   editingTitle.value = false
-  view.value = 'editor'
-  try {
-    const md = await invoke<string>('get_note', { slug: props.slug, noteId: note.id })
-    loadedContent.value = md
-    currentContent.value = md
-  } catch {
-    loadedContent.value = ''
-    currentContent.value = ''
-  }
+  loadedContent.value = md
+  currentContent.value = md
   editorKey.value++
+  view.value = 'editor'
 }
 
 // ── Back to list ──────────────────────────────────────────────────────────────
 async function goBack() {
-  await maybeSave()
+  openNoteSeq++
+  const slug = props.slug
+  const note = activeNote.value
+  const content = currentContent.value
+  const loaded = loadedContent.value
+
+  clearTimeout(debounceTimer!)
+  debounceTimer = null
+  editingTitle.value = false
   activeNote.value = null
   view.value = 'list'
-  previewMode.value = false
-  previewHtml.value = ''
-  if (props.slug) await loadList(props.slug)
+
+  if (!slug || !note) return
+
+  if (content !== loaded) {
+    await flushSave(slug, note.id, content)
+    if (saveError.value) {
+      activeNote.value = note
+      loadedContent.value = loaded
+      currentContent.value = content
+      view.value = 'editor'
+      editorKey.value++
+      return
+    }
+  }
+
+  await loadList(slug)
 }
 
 // ── Create a new note ─────────────────────────────────────────────────────────
@@ -169,29 +195,9 @@ function onContentChange(markdown: string) {
   debounceTimer = setTimeout(() => flushSave(slug, noteId, markdown), 1500)
 }
 
-// ── Preview mode ──────────────────────────────────────────────────────────────
-async function togglePreview() {
-  if (previewMode.value) {
-    previewMode.value = false
-    return
-  }
-  // Read raw file content so \[...\] and \(...\) delimiters are intact
-  // (Milkdown's commonmark parser strips these backslashes in its exported markdown)
-  if (props.slug && activeNote.value) {
-    try {
-      const md = await invoke<string>('get_note', { slug: props.slug, noteId: activeNote.value.id })
-      previewHtml.value = renderMarkdown(md)
-    } catch {
-      previewHtml.value = renderMarkdown(currentContent.value)
-    }
-  } else {
-    previewHtml.value = renderMarkdown(currentContent.value)
-  }
-  previewMode.value = true
-}
-
 // ── Watch slug changes ────────────────────────────────────────────────────────
 watch(() => props.slug, async (newSlug) => {
+  openNoteSeq++
   await maybeSave()
   activeNote.value = null
   view.value = 'list'
@@ -289,7 +295,7 @@ function fmtDate(iso: string) {
     <!-- Note editor -->
     <template v-else-if="view === 'editor' && activeNote">
       <div class="editor-toolbar">
-        <button class="back-btn" @click="goBack">
+        <button class="back-btn" type="button" :title="t('notes.back')" @click.stop="goBack">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
             <polyline points="15 18 9 12 15 6"/>
           </svg>
@@ -301,8 +307,9 @@ function fmtDate(iso: string) {
           class="title-input"
           v-model="titleDraft"
           :placeholder="t('notes.titlePlaceholder')"
+          @compositionend="onTitleCompositionEnd"
           @blur="commitTitle"
-          @keydown.enter="commitTitle"
+          @keydown.enter="() => { if (!isTitleIMEActive()) commitTitle() }"
           @keydown.esc="editingTitle = false; titleDraft = activeNote.title"
           ref="titleInputRef"
         />
@@ -315,36 +322,14 @@ function fmtDate(iso: string) {
 
         <span v-if="saving" class="status">{{ t('notes.saving') }}</span>
         <span v-else-if="saveError" class="status error">{{ saveError }}</span>
-
-        <button
-          class="preview-toggle-btn"
-          :title="previewMode ? t('notes.edit') : t('notes.preview')"
-          @click="togglePreview"
-        >
-          <!-- eye icon = preview mode active; pencil icon = edit mode active -->
-          <svg v-if="previewMode" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-          </svg>
-          <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-            <circle cx="12" cy="12" r="3"/>
-          </svg>
-        </button>
       </div>
 
       <div class="editor-wrap">
-        <div
-          v-if="previewMode"
-          class="notes-preview markdown-body"
-          v-html="previewHtml"
+        <MilkdownEditor
+          :key="editorKey"
+          :initial-content="loadedContent"
+          @change="onContentChange"
         />
-        <MilkdownProvider v-else :key="editorKey">
-          <MilkdownEditor
-            :initial-content="loadedContent"
-            @change="onContentChange"
-          />
-        </MilkdownProvider>
       </div>
     </template>
   </div>
@@ -500,6 +485,8 @@ function fmtDate(iso: string) {
   background: var(--bg-secondary);
   flex-shrink: 0;
   height: 40px;
+  position: relative;
+  z-index: 2;
 }
 
 .back-btn {
@@ -544,133 +531,123 @@ function fmtDate(iso: string) {
 .status { font-size: var(--font-size-xs); color: var(--text-tertiary); flex-shrink: 0; }
 .status.error { color: #cc3333; }
 
-.preview-toggle-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  flex-shrink: 0;
-  transition: background 0.1s, color 0.1s;
-}
-.preview-toggle-btn:hover { background: var(--bg-hover); color: var(--accent); }
-
 /* ── Editor ── */
 .editor-wrap {
   flex: 1;
-  overflow-y: auto;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
   background: var(--bg-primary);
-}
-
-.notes-preview {
-  padding: 14px 16px;
-  font-size: 15px;
-  line-height: 1.7;
-  color: var(--text-primary);
 }
 </style>
 
-<!-- Global styles for Milkdown editor content inside this tab -->
+<!-- Global Vditor overrides to match the app theme -->
 <style>
-.argus-md-editor {
-  outline: none;
-  min-height: 100%;
-  padding: 14px 16px;
-  color: var(--text-primary);
-  font-size: 16px;
-  line-height: 1.7;
-  font-family: var(--font-sans);
+/* Strip Vditor's default chrome inside the notes panel */
+.editor-wrap .vditor {
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  background: var(--bg-primary) !important;
+  min-height: 100% !important;
 }
 
-/* Milkdown wraps content in .milkdown > .ProseMirror */
-.editor-wrap .milkdown {
-  height: 100%;
+.editor-wrap .vditor-toolbar { display: none !important; }
+
+.editor-wrap .vditor-content,
+.editor-wrap .vditor-ir {
+  background: var(--bg-primary) !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  height: 100% !important;
+  padding: 0 !important;
 }
 
-.editor-wrap .milkdown .ProseMirror {
-  outline: none;
-  padding: 14px 16px;
-  min-height: 100%;
-  color: var(--text-primary);
-  font-size: 16px;
-  line-height: 1.7;
+.editor-wrap .vditor-ir pre.vditor-reset {
+  margin: 0 !important;
+  padding: 14px 16px !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  box-sizing: border-box;
+  font-size: 16px !important;
+  line-height: 1.7 !important;
+  color: var(--text-primary) !important;
+  background: var(--bg-primary) !important;
+  font-family: var(--font-sans) !important;
+  caret-color: var(--accent);
+  min-height: 100% !important;
 }
 
-.editor-wrap .milkdown h1,
-.editor-wrap .milkdown h2,
-.editor-wrap .milkdown h3 {
-  color: var(--text-primary);
-  font-weight: 600;
-  margin: 16px 0 6px;
-  line-height: 1.3;
+/* Headings */
+.editor-wrap .vditor-ir h1,
+.editor-wrap .vditor-ir h2,
+.editor-wrap .vditor-ir h3,
+.editor-wrap .vditor-ir h4 {
+  color: var(--text-primary) !important;
+  font-weight: 600 !important;
 }
 
-.editor-wrap .milkdown h1 { font-size: 1.25em; }
-.editor-wrap .milkdown h2 { font-size: 1.1em; }
-.editor-wrap .milkdown h3 { font-size: 1em; }
-
-.editor-wrap .milkdown p { margin: 0 0 8px; }
-
-.editor-wrap .milkdown strong { font-weight: 600; color: var(--text-primary); }
-.editor-wrap .milkdown em { font-style: italic; }
-
-.editor-wrap .milkdown ul,
-.editor-wrap .milkdown ol {
-  padding-left: 20px;
-  margin: 0 0 8px;
+.editor-wrap .vditor-ir .vditor-reset > h1::before,
+.editor-wrap .vditor-ir .vditor-reset > h2::before,
+.editor-wrap .vditor-ir .vditor-reset > h3::before,
+.editor-wrap .vditor-ir .vditor-reset > h4::before,
+.editor-wrap .vditor-ir .vditor-reset > h5::before,
+.editor-wrap .vditor-ir .vditor-reset > h6::before {
+  content: none !important;
+  display: none !important;
 }
 
-.editor-wrap .milkdown li { margin-bottom: 3px; }
-
-.editor-wrap .milkdown blockquote {
-  border-left: 3px solid var(--accent);
-  margin: 0 0 8px;
-  padding: 4px 12px;
-  color: var(--text-secondary);
-  background: var(--bg-secondary);
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+/* Inline code */
+.editor-wrap .vditor-ir code:not(.hljs) {
+  background: var(--bg-secondary) !important;
+  border: 1px solid var(--border-subtle) !important;
+  border-radius: 3px !important;
+  font-family: var(--font-mono) !important;
 }
 
-.editor-wrap .milkdown code {
-  font-family: var(--font-mono);
-  font-size: 0.9em;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-subtle);
-  border-radius: 3px;
-  padding: 1px 4px;
+/* Code blocks */
+.editor-wrap .vditor-ir .vditor-ir__preview[data-render] {
+  min-height: 0 !important;
 }
 
-.editor-wrap .milkdown pre {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
-  overflow-x: auto;
-  margin: 0 0 10px;
+.editor-wrap .vditor-ir .vditor-ir__preview pre {
+  margin: 8px 0 12px !important;
+  padding: 12px 14px !important;
+  background: var(--bg-secondary) !important;
+  border: 1px solid var(--border-subtle) !important;
+  border-radius: var(--radius-sm) !important;
+  box-sizing: border-box;
 }
 
-.editor-wrap .milkdown pre code {
-  background: none;
-  border: none;
-  padding: 0;
-  font-size: var(--font-size-xs);
+.editor-wrap .vditor-ir .vditor-ir__preview pre > code {
+  padding: 0 !important;
+  font-size: 0.95em !important;
+  line-height: 1.55 !important;
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  font-family: var(--font-mono) !important;
 }
 
-.editor-wrap .milkdown a {
-  color: var(--accent);
-  text-decoration: underline;
-  text-underline-offset: 2px;
+/* Blockquote */
+.editor-wrap .vditor-ir blockquote {
+  border-left: 3px solid var(--accent) !important;
+  background: var(--bg-secondary) !important;
+  color: var(--text-secondary) !important;
 }
 
-.editor-wrap .milkdown hr {
-  border: none;
-  border-top: 1px solid var(--border-subtle);
-  margin: 14px 0;
+/* Links */
+.editor-wrap .vditor-ir a {
+  color: var(--accent) !important;
 }
 
-/* math overflow in preview */
+/* Hide bottom info bar */
+.editor-wrap .vditor__tip { display: none !important; }
+
+/* Math blocks: full width scroll */
+.editor-wrap .vditor-ir .katex-display,
 .notes-preview .katex-display {
   overflow-x: auto;
   overflow-y: hidden;

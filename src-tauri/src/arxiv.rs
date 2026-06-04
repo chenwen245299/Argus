@@ -411,166 +411,6 @@ fn mark_in_library_statuses(root: &str, papers: &mut Vec<ArxivPaper>) {
     }
 }
 
-// ── arXiv Atom XML parsing ────────────────────────────────────────────────────
-
-fn parse_atom_xml(xml: &str, fetched_at: &str) -> Vec<ArxivPaper> {
-    let mut papers = Vec::new();
-    let parts: Vec<&str> = xml.split("<entry>").collect();
-    for part in parts.iter().skip(1) {
-        let block = match part.split("</entry>").next() {
-            Some(b) => b,
-            None => continue,
-        };
-        let arxiv_id = extract_arxiv_id(block);
-        if arxiv_id.is_empty() {
-            continue;
-        }
-        let title = extract_tag(block, "title")
-            .trim()
-            .replace('\n', " ")
-            .replace("  ", " ");
-        let summary = extract_tag(block, "summary").trim().to_string();
-        let published = extract_tag(block, "published");
-        let updated = extract_tag(block, "updated");
-        let authors = extract_authors(block);
-        let categories = extract_categories(block);
-        let (pdf_url, abs_url) = extract_links(block, &arxiv_id);
-        papers.push(ArxivPaper {
-            arxiv_id,
-            title,
-            authors,
-            summary,
-            categories,
-            published,
-            updated,
-            pdf_url,
-            abs_url,
-            relevance_score: None,
-            relevance_reason: None,
-            key_contributions: vec![],
-            analysis_summary: None,
-            matched_topics: vec![],
-            analysis_status: "pending".to_string(),
-            in_library: false,
-            fetched_at: fetched_at.to_string(),
-            read: false,
-            rating: 0,
-        });
-    }
-    papers
-}
-
-fn extract_arxiv_id(block: &str) -> String {
-    extract_tag(block, "id")
-        .split("/abs/")
-        .nth(1)
-        .unwrap_or("")
-        .trim()
-        .split('v')
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-fn extract_tag(block: &str, tag: &str) -> String {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    if let Some(start) = block.find(&open) {
-        let after = &block[start + open.len()..];
-        if let Some(end) = after.find(&close) {
-            return after[..end].to_string();
-        }
-    }
-    String::new()
-}
-
-fn extract_authors(block: &str) -> Vec<String> {
-    let mut authors = Vec::new();
-    let mut remaining = block;
-    while let Some(start) = remaining.find("<author>") {
-        let after = &remaining[start + 8..];
-        if let Some(end) = after.find("</author>") {
-            let name = extract_tag(&after[..end], "name");
-            if !name.is_empty() {
-                authors.push(name.trim().to_string());
-            }
-            remaining = &after[end + 9..];
-        } else {
-            break;
-        }
-    }
-    authors
-}
-
-fn extract_categories(block: &str) -> Vec<String> {
-    let mut cats = Vec::new();
-    let mut remaining = block;
-    while let Some(start) = remaining.find("<category ") {
-        let after = &remaining[start..];
-        let end = after
-            .find("/>")
-            .or_else(|| after.find(">"))
-            .unwrap_or(after.len());
-        let tag_str = &after[..end];
-        if let Some(term_start) = tag_str.find("term=\"") {
-            let term_after = &tag_str[term_start + 6..];
-            if let Some(term_end) = term_after.find('"') {
-                let term = &term_after[..term_end];
-                if !term.is_empty() {
-                    cats.push(term.to_string());
-                }
-            }
-        }
-        remaining = &after[end.min(after.len())..];
-        if remaining.starts_with("/>") {
-            remaining = &remaining[2..];
-        } else if !remaining.is_empty() {
-            remaining = &remaining[1..];
-        }
-    }
-    cats.dedup();
-    cats
-}
-
-fn extract_links(block: &str, arxiv_id: &str) -> (String, String) {
-    let mut found_pdf = format!("https://arxiv.org/pdf/{}", arxiv_id);
-    let mut found_abs = format!("https://arxiv.org/abs/{}", arxiv_id);
-    let mut remaining = block;
-    while let Some(start) = remaining.find("<link ") {
-        let after = &remaining[start..];
-        let end = after
-            .find("/>")
-            .or_else(|| after.find(">"))
-            .unwrap_or(after.len());
-        let tag_str = &after[..end];
-        let href = extract_attr(tag_str, "href");
-        let title = extract_attr(tag_str, "title");
-        let link_type = extract_attr(tag_str, "type");
-        if title == "pdf" || href.contains("/pdf/") {
-            found_pdf = href;
-        } else if link_type.contains("text/html") || href.contains("/abs/") {
-            found_abs = href;
-        }
-        remaining = &after[end.min(after.len())..];
-        if remaining.starts_with("/>") {
-            remaining = &remaining[2..];
-        } else if !remaining.is_empty() {
-            remaining = &remaining[1..];
-        }
-    }
-    (found_pdf, found_abs)
-}
-
-fn extract_attr(tag: &str, attr: &str) -> String {
-    let pattern = format!("{}=\"", attr);
-    if let Some(start) = tag.find(&pattern) {
-        let after = &tag[start + pattern.len()..];
-        if let Some(end) = after.find('"') {
-            return after[..end].to_string();
-        }
-    }
-    String::new()
-}
 
 /// Merge new papers into today's day file (dedup against all existing day files).
 pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<ArxivInbox, String> {
@@ -1444,34 +1284,6 @@ fn compute_next_scheduled(config: &ArxivConfig) -> Option<String> {
     Some(next_dt.format("%Y-%m-%dT%H:%M").to_string())
 }
 
-// ── HTML scraping fallback ────────────────────────────────────────────────────
-
-/// Strip HTML tags and decode common entities from a fragment.
-fn strip_html_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                out.push(' ');
-            }
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    out.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Derive approximate submission year from an arXiv ID ("YYMM.NNNNN" format).
 fn year_from_arxiv_id(arxiv_id: &str) -> Option<u32> {
     let left = arxiv_id.split('.').next()?;
@@ -1483,136 +1295,6 @@ fn year_from_arxiv_id(arxiv_id: &str) -> Option<u32> {
     }
 }
 
-/// Parse title, authors, and abstract from an arxiv.org/abs/* HTML page.
-///
-/// arxiv HTML structure (stable for many years):
-///   <h1 class="title mathjax"><span class="descriptor">Title:</span> TITLE</h1>
-///   <div class="authors"><span class="descriptor">Authors:</span> <a>Name</a>, …</div>
-///   <blockquote class="abstract mathjax"><span class="descriptor">Abstract: </span>TEXT</blockquote>
-fn parse_arxiv_abs_html(html: &str, arxiv_id: &str, fetched_at: &str) -> Option<ArxivPaper> {
-    // ── Title ──────────────────────────────────────────────────────────────────
-    let title = {
-        let marker = "class=\"title";
-        let pos = html.find(marker)?;
-        let tag_end = html[pos..].find('>')? + pos + 1;
-        let after = &html[tag_end..];
-        // Skip "Title:" descriptor span if present
-        let content = match after.find("</span>") {
-            Some(span_end) => after[span_end + 7..].trim_start(),
-            None => after.trim_start(),
-        };
-        let end = content.find("</h1>")?;
-        let raw = strip_html_text(&content[..end]);
-        let t = raw.trim().to_string();
-        if t.is_empty() {
-            return None;
-        }
-        t
-    };
-
-    // ── Authors ────────────────────────────────────────────────────────────────
-    let authors = {
-        let mut result = Vec::new();
-        if let Some(pos) = html.find("class=\"authors\"") {
-            let after = &html[pos..];
-            let div_end = after.find("</div>").unwrap_or(after.len());
-            let div = &after[..div_end];
-            let mut cursor = div;
-            loop {
-                // Find next <a … > anchor
-                let a_pos = match cursor.find("<a ").or_else(|| cursor.find("<a>")) {
-                    Some(p) => p,
-                    None => break,
-                };
-                let after_a = &cursor[a_pos..];
-                let tag_end = match after_a.find('>') {
-                    Some(p) => p + 1,
-                    None => break,
-                };
-                let content = &after_a[tag_end..];
-                match content.find("</a>") {
-                    Some(close) => {
-                        let name = strip_html_text(&content[..close]);
-                        let name = name.trim().to_string();
-                        if !name.is_empty() {
-                            result.push(name);
-                        }
-                        cursor = &content[close + 4..];
-                    }
-                    None => break,
-                }
-            }
-        }
-        result
-    };
-
-    // ── Abstract ───────────────────────────────────────────────────────────────
-    let abstract_text = {
-        let marker = "class=\"abstract";
-        if let Some(pos) = html.find(marker) {
-            let tag_end = html[pos..].find('>').map(|p| p + pos + 1).unwrap_or(pos + marker.len());
-            let after = &html[tag_end..];
-            let content = match after.find("</span>") {
-                Some(span_end) => &after[span_end + 7..],
-                None => after,
-            };
-            match content.find("</blockquote>") {
-                Some(end) => strip_html_text(&content[..end]).trim().to_string(),
-                None => String::new(),
-            }
-        } else {
-            String::new()
-        }
-    };
-
-    // ── Synthetic published date from ID ────────────────────────────────────
-    let year = year_from_arxiv_id(arxiv_id);
-    let published = year
-        .map(|y| format!("{}-01-01T00:00:00Z", y))
-        .unwrap_or_default();
-
-    Some(ArxivPaper {
-        arxiv_id: arxiv_id.to_string(),
-        title,
-        authors,
-        summary: abstract_text,
-        categories: vec![],
-        published,
-        updated: String::new(),
-        pdf_url: format!("https://arxiv.org/pdf/{arxiv_id}"),
-        abs_url: format!("https://arxiv.org/abs/{arxiv_id}"),
-        relevance_score: None,
-        relevance_reason: None,
-        key_contributions: vec![],
-        analysis_summary: None,
-        matched_topics: vec![],
-        analysis_status: "pending".to_string(),
-        in_library: false,
-        fetched_at: fetched_at.to_string(),
-        read: false,
-        rating: 0,
-    })
-}
-
-/// Scrape the arxiv abs page directly when the Atom API returns no results.
-async fn fetch_arxiv_html_fallback(
-    client: &reqwest::Client,
-    arxiv_id: &str,
-    fetched_at: &str,
-) -> Result<ArxivPaper, String> {
-    let url = format!("https://arxiv.org/abs/{arxiv_id}");
-    let html = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Fetch arxiv page: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("Read arxiv page: {e}"))?;
-
-    parse_arxiv_abs_html(&html, arxiv_id, fetched_at)
-        .ok_or_else(|| format!("Could not parse title/authors from arxiv.org/abs/{arxiv_id}"))
-}
 
 // ── URL-based arXiv import ────────────────────────────────────────────────────
 
@@ -1691,9 +1373,185 @@ fn is_arxiv_id(s: &str) -> bool {
     false
 }
 
-/// Import an arXiv paper directly from a URL or ID, fetching metadata from the
-/// arXiv API and downloading the PDF. Assigns to `collection_id` if non-empty.
-/// Returns the final paper slug.
+// ── HTML meta-tag helpers ─────────────────────────────────────────────────────
+
+/// Decode common HTML entities in a meta content string.
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+}
+
+/// Extract the `content="..."` value of the first `<meta name="NAME" ...>` tag.
+fn meta_tag_first(html: &str, name: &str) -> String {
+    let needle = format!("name=\"{name}\"");
+    let pos = match html.find(&needle) {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    // Find the boundaries of this <meta ...> tag
+    let tag_start = html[..pos].rfind('<').unwrap_or(0);
+    let tag_end = html[pos..]
+        .find('>')
+        .map(|p| p + pos + 1)
+        .unwrap_or(html.len());
+    let tag = &html[tag_start..tag_end];
+    // Extract content="..."
+    if let Some(cp) = tag.find("content=\"") {
+        let after = &tag[cp + 9..];
+        if let Some(end) = after.find('"') {
+            return decode_html_entities(&after[..end]);
+        }
+    }
+    String::new()
+}
+
+/// Extract all `content="..."` values from `<meta name="NAME" ...>` tags.
+fn meta_tag_all(html: &str, name: &str) -> Vec<String> {
+    let needle = format!("name=\"{name}\"");
+    let mut results = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = html[from..].find(&needle) {
+        let pos = from + rel;
+        let tag_start = html[..pos].rfind('<').unwrap_or(0);
+        let tag_end = html[pos..]
+            .find('>')
+            .map(|p| p + pos + 1)
+            .unwrap_or(html.len());
+        let tag = &html[tag_start..tag_end];
+        if let Some(cp) = tag.find("content=\"") {
+            let after = &tag[cp + 9..];
+            if let Some(end) = after.find('"') {
+                let val = decode_html_entities(&after[..end]);
+                if !val.is_empty() {
+                    results.push(val);
+                }
+            }
+        }
+        from = tag_end;
+    }
+    results
+}
+
+/// Parse ArXiv page HTML and extract paper metadata from `<meta citation_*>` tags.
+/// Returns (title, authors, abstract, pdf_url, year).
+fn parse_arxiv_html_meta(
+    html: &str,
+    arxiv_id: &str,
+) -> Result<(String, Vec<String>, String, String, Option<u32>), String> {
+    let title = meta_tag_first(html, "citation_title");
+    if title.is_empty() {
+        return Err(format!(
+            "Could not parse metadata from arxiv.org/abs/{arxiv_id} — page structure may have changed"
+        ));
+    }
+
+    // Authors are in "Last, First" format; convert to "First Last"
+    let authors: Vec<String> = meta_tag_all(html, "citation_author")
+        .into_iter()
+        .map(|a| {
+            if let Some(comma) = a.find(',') {
+                let last = a[..comma].trim();
+                let first = a[comma + 1..].trim();
+                if first.is_empty() {
+                    last.to_string()
+                } else {
+                    format!("{first} {last}")
+                }
+            } else {
+                a
+            }
+        })
+        .collect();
+
+    let abstract_text = meta_tag_first(html, "citation_abstract");
+
+    // citation_pdf_url gives the direct PDF link (e.g. https://arxiv.org/pdf/2505.20278v1)
+    let pdf_url = {
+        let u = meta_tag_first(html, "citation_pdf_url");
+        if u.is_empty() {
+            format!("https://arxiv.org/pdf/{arxiv_id}")
+        } else {
+            u
+        }
+    };
+
+    // citation_date is "YYYY/MM/DD"
+    let year: Option<u32> = meta_tag_first(html, "citation_date")
+        .split('/')
+        .next()
+        .and_then(|y| y.parse().ok())
+        .or_else(|| year_from_arxiv_id(arxiv_id));
+
+    Ok((title, authors, abstract_text, pdf_url, year))
+}
+
+/// Download PDF bytes, verifying the response is an actual PDF (`%PDF` magic).
+/// Tries `primary_url` first, then each entry in `fallbacks`.
+async fn download_pdf(
+    client: &reqwest::Client,
+    primary_url: &str,
+    fallbacks: &[String],
+) -> Result<Vec<u8>, String> {
+    let urls: Vec<&str> = std::iter::once(primary_url)
+        .chain(fallbacks.iter().map(String::as_str))
+        .collect();
+    let mut last_err = String::new();
+    for url in urls {
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(b) if b.starts_with(b"%PDF") => return Ok(b.to_vec()),
+                Ok(_) => last_err = format!("Not a PDF: {url}"),
+                Err(e) => last_err = format!("Read error from {url}: {e}"),
+            },
+            Ok(resp) => last_err = format!("HTTP {} from {url}", resp.status()),
+            Err(e) => last_err = format!("Request failed for {url}: {e}"),
+        }
+    }
+    Err(if last_err.is_empty() {
+        "No PDF URLs available".into()
+    } else {
+        last_err
+    })
+}
+
+/// Find the slug of a paper already in the library by its arXiv ID.
+fn find_paper_slug_by_arxiv_id(root: &str, arxiv_id: &str) -> Option<String> {
+    let papers_dir = Path::new(root).join("papers");
+    for entry in std::fs::read_dir(&papers_dir).ok()?.flatten() {
+        let meta_path = entry.path().join("meta.json");
+        if let Ok(text) = std::fs::read_to_string(&meta_path) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) {
+                let stored = meta
+                    .get("arxiv_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                // Match both "2505.20278" and "2505.20278v1" style
+                if !stored.is_empty() {
+                    let base_stored = stored.split('v').next().unwrap_or(stored);
+                    let base_input = arxiv_id.split('v').next().unwrap_or(arxiv_id);
+                    if base_stored == base_input {
+                        let slug = entry
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned();
+                        return Some(slug);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Import an arXiv paper by URL or bare ID.
+/// Fetches metadata by scraping the abs page HTML (no API calls — they time out).
+/// Downloads the PDF from the link found in the page.
 pub async fn import_by_url(
     root: &str,
     url: &str,
@@ -1708,80 +1566,80 @@ pub async fn import_by_url(
     let emit = |status: &str| {
         let _ = app.emit(
             "arxiv-url-import",
-            serde_json::json!({ "arxiv_id": arxiv_id, "status": status }),
+            serde_json::json!({ "arxiv_id": &arxiv_id, "status": status }),
         );
     };
 
     emit("fetching");
 
-    // ── Fetch metadata from arXiv Atom API ───────────────────────────────────
     let client = reqwest::Client::builder()
-        .user_agent("Argus/0.1")
-        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("Build HTTP client: {e}"))?;
 
-    let api_url = format!("https://export.arxiv.org/api/query?id_list={}", arxiv_id);
-    let xml = client
-        .get(&api_url)
-        .send()
-        .await
-        .map_err(|e| format!("Fetch arXiv metadata: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("Read API response: {e}"))?;
-
-    let fetched_at = chrono::Utc::now().to_rfc3339();
-    let papers = parse_atom_xml(&xml, &fetched_at);
-    let paper_info = match papers.into_iter().next() {
-        Some(p) => p,
-        None => {
-            // Atom API returned no entries — scrape the abs page directly
-            fetch_arxiv_html_fallback(&client, &arxiv_id, &fetched_at).await?
+    // ── Scrape the abs page for metadata ─────────────────────────────────────
+    // Use the original URL if it already points to abs/, otherwise construct it.
+    let abs_url = if url.contains("arxiv.org/abs/") {
+        // Normalise to https
+        if url.starts_with("http://") {
+            url.replacen("http://", "https://", 1)
+        } else {
+            url.to_string()
         }
+    } else {
+        format!("https://arxiv.org/abs/{arxiv_id}")
     };
 
-    // Check if already in library by title + first author (after fetching so we have the title)
-    if check_in_library(root, &paper_info.title, &paper_info.authors) {
-        return Err(format!(
-            "「{}」already exists in your library.",
-            paper_info.title
-        ));
+    let html = client
+        .get(&abs_url)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch arXiv page: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("Read arXiv page: {e}"))?;
+
+    let (title, authors, abstract_text, pdf_url, year) =
+        parse_arxiv_html_meta(&html, &arxiv_id)?;
+
+    // ── Already in library? Return existing slug so the frontend can navigate ──
+    if let Some(existing_slug) = find_paper_slug_by_arxiv_id(root, &arxiv_id) {
+        return Ok(existing_slug);
     }
 
     emit("downloading");
 
     // ── Download PDF ─────────────────────────────────────────────────────────
-    let pdf_url = if paper_info.pdf_url.is_empty() {
-        format!("https://arxiv.org/pdf/{arxiv_id}")
-    } else {
-        paper_info.pdf_url.clone()
-    };
-
-    let pdf_bytes = client
-        .get(&pdf_url)
-        .send()
+    let fallbacks = vec![
+        format!("https://arxiv.org/pdf/{arxiv_id}"),
+        format!("https://export.arxiv.org/pdf/{arxiv_id}"),
+    ];
+    let pdf_bytes = download_pdf(&client, &pdf_url, &fallbacks)
         .await
-        .map_err(|e| format!("Download PDF: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("Read PDF bytes: {e}"))?;
+        .map_err(|e| format!("PDF download failed for {arxiv_id}: {e}"))?;
 
     emit("importing");
 
     // ── Create paper directory ────────────────────────────────────────────────
-    let slug_base = make_slug(
-        &paper_info.authors,
-        &paper_info.published,
-        &paper_info.title,
-    );
+    let year_str = year.map(|y| y.to_string()).unwrap_or_default();
+    let slug_base = make_slug(&authors, &format!("{year_str}-01-01"), &title);
     let papers_dir = Path::new(root).join("papers");
+    // Find a non-conflicting directory name (skip orphaned dirs with no meta.json)
     let final_dir = {
         let candidate = papers_dir.join(&slug_base);
-        if candidate.exists() {
-            papers_dir.join(format!("{slug_base}-2"))
-        } else {
+        if !candidate.exists() {
             candidate
+        } else if !candidate.join("meta.json").exists() {
+            // Orphaned dir from a previous failed import — reuse it
+            candidate
+        } else {
+            let mut n = 2u32;
+            loop {
+                let c = papers_dir.join(format!("{slug_base}-{n}"));
+                if !c.exists() || !c.join("meta.json").exists() { break c; }
+                n += 1;
+            }
         }
     };
     let final_slug = final_dir
@@ -1790,24 +1648,16 @@ pub async fn import_by_url(
         .unwrap_or(&slug_base)
         .to_string();
 
-    std::fs::create_dir_all(&final_dir).map_err(|e| format!("Create paper directory: {e}"))?;
+    std::fs::create_dir_all(&final_dir).map_err(|e| format!("Create paper dir: {e}"))?;
     std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
         .map_err(|e| format!("Write PDF: {e}"))?;
 
     // ── Write metadata ────────────────────────────────────────────────────────
-    let year: Option<u32> = paper_info
-        .published
-        .chars()
-        .take(4)
-        .collect::<String>()
-        .parse()
-        .ok();
-
     let paper_id = uuid::Uuid::new_v4().to_string();
     let meta = PaperMeta {
         id: paper_id.clone(),
-        title: paper_info.title.clone(),
-        authors: paper_info.authors.clone(),
+        title: title.clone(),
+        authors: authors.clone(),
         year,
         doi: None,
         arxiv_id: Some(arxiv_id.clone()),
@@ -1816,10 +1666,10 @@ pub async fn import_by_url(
         added_at: chrono::Utc::now().to_rfc3339(),
         original_filename: Some(format!("{arxiv_id}.pdf")),
         reading_status: "unread".to_string(),
-        paper_abstract: Some(paper_info.summary.clone()).filter(|s| !s.trim().is_empty()),
+        paper_abstract: Some(abstract_text).filter(|s| !s.trim().is_empty()),
         bibtex: None,
         canvas_notes: vec![],
-        import_source: Some("arxiv".to_string()),
+        import_source: Some("url".to_string()),
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);

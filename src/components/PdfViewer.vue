@@ -500,35 +500,80 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
   const hls = pageHighlights(pageIndex)
   const s = scale.value
   hls.forEach(hl => {
-    hl.rects.forEach(rect => {
-      if (!isFinite(rect.x) || !isFinite(rect.y)) return
-      const div = document.createElement('div')
-      div.className = 'hl-rect'
-      div.style.left   = `${rect.x * s}px`
-      div.style.top    = `${rect.y * s}px`
-      div.style.width  = `${rect.width * s}px`
-      div.style.height = `${rect.height * s}px`
-      div.style.background = hl.style === 'underline' ? 'transparent' : hexToRgba(hl.color, 0.35)
-      div.style.borderBottom = hl.style === 'underline'
-        ? `2px solid ${hl.color}`
-        : 'none'
-      div.dataset.hlId = hl.id
-      div.addEventListener('click', (e) => {
-        e.stopPropagation()
-        const bounding = div.getBoundingClientRect()
-        hlNoteText.value = reader.highlights.find(h => h.id === hl.id)?.note ?? ''
-        hlNoteEditing.value = false   // always start in view mode
-        hlNotePopup.value = { x: bounding.left, y: bounding.bottom + 4, hlId: hl.id }
-        hlColorPopup.value = null
+    const validRects = hl.rects.filter(r => isFinite(r.x) && isFinite(r.y))
+    if (validRects.length === 0) return
+
+    if (hl.style === 'underline') {
+      validRects.forEach(rect => {
+        const div = document.createElement('div')
+        div.className = 'hl-rect'
+        div.style.left   = `${rect.x * s}px`
+        div.style.top    = `${rect.y * s}px`
+        div.style.width  = `${rect.width * s}px`
+        div.style.height = `${rect.height * s}px`
+        div.style.background = 'transparent'
+        div.style.borderBottom = `2px solid ${hl.color}`
+        div.dataset.hlId = hl.id
+        div.addEventListener('click', (e) => {
+          e.stopPropagation()
+          const bounding = div.getBoundingClientRect()
+          hlNoteText.value = reader.highlights.find(h => h.id === hl.id)?.note ?? ''
+          hlNoteEditing.value = false
+          hlNotePopup.value = { x: bounding.left, y: bounding.bottom + 4, hlId: hl.id }
+          hlColorPopup.value = null
+        })
+        div.addEventListener('contextmenu', (e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          hlColorPopup.value = { x: e.clientX, y: e.clientY + 4, hlId: hl.id }
+          hlNotePopup.value = null
+        })
+        container.appendChild(div)
       })
-      div.addEventListener('contextmenu', (e) => {
-        e.preventDefault()
-        e.stopPropagation()
-        hlColorPopup.value = { x: e.clientX, y: e.clientY + 4, hlId: hl.id }
-        hlNotePopup.value = null
+    } else {
+      // Use SVG <g opacity> so overlapping rects within the same highlight
+      // are composited as a unit — no alpha stacking between them.
+      const NS = 'http://www.w3.org/2000/svg'
+      const svg = document.createElementNS(NS, 'svg') as SVGSVGElement
+      svg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;overflow:visible;pointer-events:none'
+      svg.dataset.hlId = hl.id
+
+      const g = document.createElementNS(NS, 'g') as SVGGElement
+      g.setAttribute('fill', hl.color)
+      g.setAttribute('opacity', '0.35')
+      g.style.transition = 'opacity 0.15s'
+
+      validRects.forEach(rect => {
+        const r = document.createElementNS(NS, 'rect') as SVGRectElement
+        r.setAttribute('x', String(rect.x * s))
+        r.setAttribute('y', String(rect.y * s))
+        r.setAttribute('width', String(rect.width * s))
+        r.setAttribute('height', String(rect.height * s))
+        r.style.pointerEvents = 'auto'
+        r.style.cursor = 'pointer'
+        r.addEventListener('click', (e) => {
+          e.stopPropagation()
+          const bounding = r.getBoundingClientRect()
+          hlNoteText.value = reader.highlights.find(h => h.id === hl.id)?.note ?? ''
+          hlNoteEditing.value = false
+          hlNotePopup.value = { x: bounding.left, y: bounding.bottom + 4, hlId: hl.id }
+          hlColorPopup.value = null
+        })
+        r.addEventListener('contextmenu', (e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          hlColorPopup.value = { x: e.clientX, y: e.clientY + 4, hlId: hl.id }
+          hlNotePopup.value = null
+        })
+        g.appendChild(r)
       })
-      container.appendChild(div)
-    })
+
+      g.addEventListener('mouseenter', () => { g.setAttribute('opacity', '0.6') })
+      g.addEventListener('mouseleave', () => { g.setAttribute('opacity', '0.35') })
+
+      svg.appendChild(g)
+      container.appendChild(svg)
+    }
   })
 }
 
@@ -1053,13 +1098,7 @@ function triggerInitialRender() {
 }
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
-function hexToRgba(hex: string, alpha: number): string {
-  const h = hex.replace('#', '')
-  const r = parseInt(h.substring(0, 2), 16)
-  const g = parseInt(h.substring(2, 4), 16)
-  const b = parseInt(h.substring(4, 6), 16)
-  return `rgba(${r},${g},${b},${alpha})`
-}
+
 </script>
 
 <template>
@@ -1503,7 +1542,6 @@ function hexToRgba(hex: string, alpha: number): string {
   position: absolute;
   pointer-events: auto;
   cursor: pointer;
-  mix-blend-mode: multiply;
   transition: opacity 0.15s;
 }
 

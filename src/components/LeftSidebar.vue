@@ -6,6 +6,7 @@ import { useLibraryStore } from '../stores/library'
 import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
 import { useCanvasStore } from '../stores/canvas'
+import { useReaderStore } from '../stores/reader'
 import CollectionNode from './CollectionNode.vue'
 import type { CanvasIndexEntry, Collection, NavItem } from '../types'
 import { updateStore } from '../stores/update'
@@ -16,8 +17,10 @@ const library = useLibraryStore()
 const selection = useSelectionStore()
 const collectionsStore = useCollectionsStore()
 const canvasStore = useCanvasStore()
+const readerStore = useReaderStore()
 
 const showSettings = defineModel<boolean>('showSettings', { default: false })
+const props = defineProps<{ snippetLibraryVisible?: boolean }>()
 const emit = defineEmits<{ 'open-canvas': [canvasId: string]; 'open-snippet-library': [libraryId: string] }>()
 
 const expanded = ref<Set<string>>(new Set())
@@ -97,7 +100,16 @@ onMounted(async () => {
     expanded.value = loadExpandedCollections(library.currentPath)
     await Promise.all([collectionsStore.load(), canvasStore.loadList()])
   }
+  window.addEventListener('mousedown', onGlobalMousedown)
 })
+
+function onGlobalMousedown(e: MouseEvent) {
+  const anyMenuOpen = ctxMenu.value || canvasCtxMenu.value || libCtxMenu.value || snippetCtxMenu.value
+  if (!anyMenuOpen) return
+  const target = e.target as Element | null
+  if (target?.closest('.ctx-menu')) return
+  closeCtx()
+}
 
 function select(item: NavItem) {
   selection.selectNav(item)
@@ -119,6 +131,41 @@ watch(
     expanded.value = path ? loadExpandedCollections(path) : new Set()
   },
   { immediate: true }
+)
+
+// ── Sync sidebar selection to active tab ──────────────────────────────────────
+watch(
+  () => readerStore.activeSlug,
+  (slug) => {
+    if (!slug) return
+    const paper = library.papers.find(p => p.slug === slug)
+    if (!paper) return
+
+    // Find direct assignment for this paper
+    const assignment = collectionsStore.file.assignments.find(a => a.paper_id === paper.id)
+    if (!assignment) {
+      // Paper not in any collection — highlight "all papers"
+      selection.highlightCollection(null)
+      libraryCollapsed.value = false
+      return
+    }
+
+    const collectionId = assignment.collection_id
+
+    // Expand all ancestors so the collection is visible
+    libraryCollapsed.value = false
+    let cur = collectionsStore.collectionById(collectionId)
+    const toExpand: string[] = []
+    while (cur?.parent_id) {
+      toExpand.push(cur.parent_id)
+      cur = collectionsStore.collectionById(cur.parent_id)
+    }
+    toExpand.forEach(id => expanded.value.add(id))
+    if (toExpand.length) saveExpandedCollections()
+
+    // Only update the sidebar highlight — center view keeps showing the PDF
+    selection.highlightCollection(collectionId)
+  }
 )
 
 // ── New collection ─────────────────────────────────────────────────────────────
@@ -358,11 +405,11 @@ function startNewSnippetLib() {
   setTimeout(() => (document.getElementById('new-snippet-lib-input') as HTMLInputElement)?.focus(), 50)
 }
 
-function submitNewSnippetLib() {
+async function submitNewSnippetLib() {
   const name = newSnippetLibName.value.trim()
   showNewSnippetLibInput.value = false
   if (!name) return
-  const lib = createSnippetLibrary(name)
+  const lib = await createSnippetLibrary(name)
   openSnippetLibrary(lib.id)
 }
 
@@ -382,27 +429,39 @@ function startRenameSnippetLib(id: string, name: string) {
   })
 }
 
-function submitRenameSnippetLib(id: string) {
+async function submitRenameSnippetLib(id: string) {
   const name = snippetRenameValue.value.trim()
-  if (name) renameSnippetLibrary(id, name)
+  if (name) await renameSnippetLibrary(id, name)
   snippetRenamingId.value = null
   snippetRenameValue.value = ''
 }
 
-function handleDeleteSnippetLib(id: string, name: string) {
+async function handleDeleteSnippetLib(id: string, name: string) {
   closeSnippetCtx()
   if (!window.confirm(`删除素材库"${name}"及其所有素材？`)) return
-  deleteSnippetLibrary(id)
+  await deleteSnippetLibrary(id)
   if (activeSnippetLibraryId.value === id) activeSnippetLibraryId.value = null
 }
 
 function openSnippetCtx(e: MouseEvent, id: string, name: string) {
   e.preventDefault()
+  ctxMenu.value = null
+  libCtxMenu.value = null
+  canvasCtxMenu.value = null
   snippetCtxMenu.value = { x: e.clientX, y: e.clientY, id, name }
 }
 
 function closeSnippetCtx() {
   snippetCtxMenu.value = null
+}
+
+async function openSnippetLibInFinder() {
+  try {
+    const path = await invoke<string>('get_snippets_folder_path')
+    await invoke('open_in_finder', { path })
+  } catch (e) {
+    console.error('Open snippets in finder failed:', e)
+  }
 }
 
 function snippetCountFor(id: string) {
@@ -445,6 +504,7 @@ function openCtx(e: MouseEvent, col: Collection) {
   e.preventDefault()
   libCtxMenu.value = null
   canvasCtxMenu.value = null
+  snippetCtxMenu.value = null
   ctxMenu.value = { x: e.clientX, y: e.clientY, col }
 }
 
@@ -452,7 +512,17 @@ function openCanvasCtx(e: MouseEvent, entry: CanvasIndexEntry) {
   e.preventDefault()
   ctxMenu.value = null
   libCtxMenu.value = null
+  snippetCtxMenu.value = null
   canvasCtxMenu.value = { x: e.clientX, y: e.clientY, entry }
+}
+
+async function openCanvasesInFinder() {
+  try {
+    const path = await invoke<string>('get_canvases_folder_path')
+    await invoke('open_in_finder', { path })
+  } catch (e) {
+    console.error('Open canvases in finder failed:', e)
+  }
 }
 
 // ── Context menu (All Papers / library root) ──────────────────────────────────
@@ -462,6 +532,7 @@ function openLibCtx(e: MouseEvent) {
   e.preventDefault()
   ctxMenu.value = null
   canvasCtxMenu.value = null
+  snippetCtxMenu.value = null
   libCtxMenu.value = { x: e.clientX, y: e.clientY }
 }
 
@@ -629,6 +700,7 @@ onUnmounted(() => {
   window.removeEventListener('mouseup', stopResizeTags)
   window.removeEventListener('mousemove', onResizeCanvasMove)
   window.removeEventListener('mouseup', stopResizeCanvas)
+  window.removeEventListener('mousedown', onGlobalMousedown)
 })
 </script>
 
@@ -889,7 +961,7 @@ onUnmounted(() => {
             v-for="lib in snippetLibraries"
             :key="lib.id"
             class="nav-item"
-            :class="{ active: activeSnippetLibraryId === lib.id }"
+            :class="{ active: props.snippetLibraryVisible && activeSnippetLibraryId === lib.id }"
             role="button"
             tabindex="0"
             @click="openSnippetLibrary(lib.id)"
@@ -977,7 +1049,11 @@ onUnmounted(() => {
         <button class="ctx-item" @click="startRename(ctxMenu!.col); closeCtx()">
           {{ t('collections.rename') }}
         </button>
-        <button class="ctx-item" @click="openEmojiPicker(ctxMenu!.col)">
+        <button
+          v-if="!ctxMenu!.col.parent_id"
+          class="ctx-item"
+          @click="openEmojiPicker(ctxMenu!.col)"
+        >
           {{ t('collections.setEmoji') }}
         </button>
         <button class="ctx-item" @click="startNew(ctxMenu!.col.id); closeCtx()">
@@ -1003,6 +1079,9 @@ onUnmounted(() => {
       >
         <button class="ctx-item" @click="startRenameCanvas(canvasCtxMenu!.entry)">
           {{ t('canvas.rename') }}
+        </button>
+        <button class="ctx-item" @click="openCanvasesInFinder(); closeCtx()">
+          {{ t('collections.openInFinder') }}
         </button>
         <div class="ctx-sep" />
         <button class="ctx-item danger" @click="deleteCanvas(canvasCtxMenu!.entry); closeCtx()">
@@ -1102,6 +1181,10 @@ onUnmounted(() => {
         <button class="ctx-item" @click="startRenameSnippetLib(snippetCtxMenu!.id, snippetCtxMenu!.name); closeSnippetCtx()">
           重命名
         </button>
+        <button class="ctx-item" @click="openSnippetLibInFinder(); closeSnippetCtx()">
+          {{ t('collections.openInFinder') }}
+        </button>
+        <div class="ctx-sep" />
         <button class="ctx-item danger" @click="handleDeleteSnippetLib(snippetCtxMenu!.id, snippetCtxMenu!.name)">
           删除
         </button>

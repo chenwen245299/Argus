@@ -74,10 +74,10 @@ function startNewLib() {
   newLibName.value = ''
 }
 
-function submitNewLib() {
+async function submitNewLib() {
   const name = newLibName.value.trim()
   if (!name) { showNewLibInput.value = false; return }
-  const lib = createLibrary(name)
+  const lib = await createLibrary(name)
   selectedLibraryId.value = lib.id
   showNewLibInput.value = false
   newLibName.value = ''
@@ -104,26 +104,27 @@ function removeTag(tag: string) {
   tags.value = tags.value.filter(t => t !== tag)
 }
 
-function confirm() {
+async function confirm() {
   if (!selectedLibraryId.value || !pendingSnippet.value) return
   commitTag()
-  addSnippet({
+  const pending = pendingSnippet.value
+  await addSnippet({
     libraryId: selectedLibraryId.value,
-    text: pendingSnippet.value.text,
+    text: pending.text,
     tags: tags.value,
     note: note.value.trim(),
-    paperId: pendingSnippet.value.paperId,
-    paperTitle: pendingSnippet.value.paperTitle,
-    page: pendingSnippet.value.page,
+    paperId: pending.paperId,
+    paperTitle: pending.paperTitle,
+    page: pending.page,
     color: selectedColor.value,
   })
   // Trigger highlight creation in PdfViewer after successful save
-  if (pendingSnippet.value.rects?.length && pendingSnippet.value.pageIndex !== undefined) {
+  if (pending.rects?.length && pending.pageIndex !== undefined) {
     window.dispatchEvent(new CustomEvent('argus-snippet-highlight', {
       detail: {
-        rects: pendingSnippet.value.rects,
-        pageIndex: pendingSnippet.value.pageIndex,
-        text: pendingSnippet.value.text,
+        rects: pending.rects,
+        pageIndex: pending.pageIndex,
+        text: pending.text,
         color: selectedColor.value,
       }
     }))

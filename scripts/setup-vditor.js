@@ -1,0 +1,7 @@
+const { cpSync, mkdirSync } = require('fs')
+const path = require('path')
+const src = path.join(__dirname, '../node_modules/vditor/dist')
+const dest = path.join(__dirname, '../public/vditor/dist')
+mkdirSync(dest, { recursive: true })
+cpSync(src, dest, { recursive: true, force: true })
+console.log('vditor assets copied → public/vditor/dist')

@@ -1892,10 +1892,12 @@ onUnmounted(() => {
   border-radius: 14px 14px 4px 14px;
   color: #fff;
   background: var(--accent);
-  font-size: var(--font-size-sm);
+  font-size: 14px;
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .user-edit-textarea {
@@ -1907,7 +1909,7 @@ onUnmounted(() => {
   border: 2px solid var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, var(--bg-primary));
   color: var(--text-primary);
-  font-size: var(--font-size-sm);
+  font-size: 14px;
   line-height: 1.45;
   resize: none;
   overflow-y: auto;
@@ -2048,10 +2050,12 @@ onUnmounted(() => {
 
 .answer-body {
   padding: 10px 11px 8px;
-  font-size: var(--font-size-sm);
+  font-size: 14px;
   line-height: 1.58;
   color: var(--text-primary);
   word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
 }
 .answer-body.pending {
   color: var(--text-tertiary);
@@ -2310,7 +2314,7 @@ onUnmounted(() => {
   color: var(--text-primary);
   background: transparent;
   font: inherit;
-  font-size: var(--font-size-sm);
+  font-size: 14px;
   line-height: 1.45;
 }
 .composer-input:disabled { opacity: .65; }

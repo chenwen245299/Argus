@@ -72,7 +72,7 @@ function onCollectionMouseDown(e: MouseEvent) {
       @click="selectCollection"
       @contextmenu.prevent="$emit('openCtx', $event, collection)"
     >
-      <span class="collection-emoji" aria-hidden="true">{{ displayEmoji }}</span>
+      <span v-if="depth === 0" class="collection-emoji" aria-hidden="true">{{ displayEmoji }}</span>
 
       <!-- Rename input or label -->
       <template v-if="renamingId === collection.id">
@@ -88,7 +88,7 @@ function onCollectionMouseDown(e: MouseEvent) {
         />
       </template>
       <template v-else>
-        <span class="coll-name">{{ collection.name }}</span>
+        <span class="coll-name" :class="{ 'coll-name--top': depth === 0 }">{{ collection.name }}</span>
       </template>
 
       <!-- Expand toggle if has children -->
@@ -232,6 +232,12 @@ function onCollectionMouseDown(e: MouseEvent) {
   white-space: nowrap;
   user-select: none;
   -webkit-user-select: none;
+}
+
+.coll-name--top {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text-primary);
 }
 
 .badge {

@@ -1,33 +1,65 @@
 <script setup lang="ts">
-import { Editor, rootCtx, defaultValueCtx, editorViewOptionsCtx } from '@milkdown/core'
-import { commonmark } from '@milkdown/preset-commonmark'
-import { Milkdown, useEditor } from '@milkdown/vue'
-import { listener, listenerCtx } from '@milkdown/plugin-listener'
-import { history } from '@milkdown/plugin-history'
+import { onMounted, onBeforeUnmount, ref, nextTick } from 'vue'
+import Vditor from 'vditor'
+import 'vditor/dist/index.css'
 
 const props = defineProps<{ initialContent: string }>()
 const emit = defineEmits<{ change: [markdown: string] }>()
 
-// This component MUST be rendered inside <MilkdownProvider>.
-useEditor((root) =>
-  Editor.make()
-    .config((ctx) => {
-      ctx.set(rootCtx, root)
-      ctx.set(defaultValueCtx, props.initialContent)
-      ctx.update(editorViewOptionsCtx, (prev) => ({
-        ...prev,
-        attributes: { class: 'argus-md-editor', spellcheck: 'false' },
-      }))
-      ctx.get(listenerCtx).markdownUpdated((_, markdown) => {
-        emit('change', markdown)
+const containerEl = ref<HTMLDivElement | null>(null)
+let vd: Vditor | null = null
+
+onMounted(async () => {
+  await nextTick()
+  if (!containerEl.value) return
+
+  const content = props.initialContent
+
+  vd = new Vditor(containerEl.value, {
+    mode: 'ir',
+    cdn: '/vditor',
+    value: content,
+    minHeight: 200,
+    toolbarConfig: { hide: true },
+    preview: {
+      math: {
+        engine: 'KaTeX',
+        inlineDigit: true,
+      },
+    },
+    counter: { enable: false },
+    resize: { enable: false },
+    cache: { enable: false },
+    after() {
+      // Vditor normally consumes `value` during init. This catches the rare
+      // first-mount case where async IR rendering leaves the editor empty.
+      requestAnimationFrame(() => {
+        if (content && vd?.getValue().trim() === '') {
+          vd.setValue(content, true)
+        }
       })
-    })
-    .use(commonmark)
-    .use(listener)
-    .use(history)
-)
+    },
+    input(val) {
+      emit('change', val)
+    },
+  })
+})
+
+onBeforeUnmount(() => {
+  vd?.destroy()
+  vd = null
+})
 </script>
 
 <template>
-  <Milkdown />
+  <div ref="containerEl" class="vditor-host" />
 </template>
+
+<style scoped>
+/* Absolutely fill editor-wrap so Vditor can never escape and cover the toolbar */
+.vditor-host {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+}
+</style>

@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import type { Rect } from '../types'
 
 export interface SnippetLibrary {
@@ -41,72 +42,85 @@ export interface PendingHighlight {
 // Signal PdfViewer to create a highlight after snippet is confirmed
 export const pendingHighlight = ref<PendingHighlight | null>(null)
 
-const LIBRARIES_KEY = 'argus:snippet-libraries'
-const SNIPPETS_KEY = 'argus:snippets'
+// Global signal to open the "Add to Snippet Library" modal from anywhere
+export const pendingSnippet = ref<PendingSnippet | null>(null)
 
-function nowIso() {
-  return new Date().toISOString()
+export const libraries = ref<SnippetLibrary[]>([])
+export const snippets = ref<Snippet[]>([])
+
+let initialized = false
+
+export async function initSnippetStore() {
+  if (initialized) return
+  initialized = true
+
+  // Migrate localStorage data on first run (one-time)
+  const LS_LIBS = 'argus:snippet-libraries'
+  const LS_SNIPS = 'argus:snippets'
+  const lsLibsRaw = localStorage.getItem(LS_LIBS)
+  const lsSnipsRaw = localStorage.getItem(LS_SNIPS)
+  if (lsLibsRaw) {
+    try {
+      const lsLibs: SnippetLibrary[] = JSON.parse(lsLibsRaw) ?? []
+      const lsSnips: Snippet[] = lsSnipsRaw ? (JSON.parse(lsSnipsRaw) ?? []) : []
+      const snippetsByLibrary: [string, Snippet[]][] = lsLibs.map(lib => [
+        lib.id,
+        lsSnips.filter(s => s.libraryId === lib.id),
+      ])
+      await invoke('migrate_snippets_from_localstorage', {
+        libraries: lsLibs,
+        snippetsByLibrary,
+      })
+      localStorage.removeItem(LS_LIBS)
+      localStorage.removeItem(LS_SNIPS)
+    } catch (e) {
+      console.error('Snippet migration failed:', e)
+    }
+  }
+
+  await loadAll()
 }
 
-function newId() {
-  return crypto.randomUUID()
-}
-
-function loadLibraries(): SnippetLibrary[] {
+async function loadAll() {
   try {
-    const raw = localStorage.getItem(LIBRARIES_KEY)
-    if (!raw) return []
-    return JSON.parse(raw) as SnippetLibrary[]
-  } catch {
-    return []
+    const libs = await invoke<SnippetLibrary[]>('list_snippet_libraries')
+    libraries.value = libs
+    const allSnips: Snippet[] = []
+    await Promise.all(
+      libs.map(async lib => {
+        const snips = await invoke<Snippet[]>('get_snippets', { libraryId: lib.id })
+        allSnips.push(...snips)
+      })
+    )
+    snippets.value = allSnips
+  } catch (e) {
+    console.error('Failed to load snippet libraries:', e)
   }
 }
 
-function saveLibraries(libs: SnippetLibrary[]) {
-  try {
-    localStorage.setItem(LIBRARIES_KEY, JSON.stringify(libs))
-  } catch {}
-}
-
-function loadSnippets(): Snippet[] {
-  try {
-    const raw = localStorage.getItem(SNIPPETS_KEY)
-    if (!raw) return []
-    return JSON.parse(raw) as Snippet[]
-  } catch {
-    return []
-  }
-}
-
-function saveSnippets(snips: Snippet[]) {
-  try {
-    localStorage.setItem(SNIPPETS_KEY, JSON.stringify(snips))
-  } catch {}
-}
-
-export const libraries = ref<SnippetLibrary[]>(loadLibraries())
-export const snippets = ref<Snippet[]>(loadSnippets())
-
-export function createLibrary(name: string, emoji?: string): SnippetLibrary {
-  const lib: SnippetLibrary = { id: newId(), name: name.trim(), emoji, createdAt: nowIso() }
+export async function createLibrary(name: string, emoji?: string): Promise<SnippetLibrary> {
+  const lib = await invoke<SnippetLibrary>('create_snippet_library', { name, emoji: emoji ?? null })
   libraries.value = [...libraries.value, lib]
-  saveLibraries(libraries.value)
   return lib
 }
 
-export function renameLibrary(id: string, name: string) {
-  libraries.value = libraries.value.map(l => l.id === id ? { ...l, name: name.trim() } : l)
-  saveLibraries(libraries.value)
+export async function renameLibrary(id: string, name: string) {
+  await invoke('rename_snippet_library', { id, name })
+  libraries.value = libraries.value.map(l => l.id === id ? { ...l, name } : l)
 }
 
-export function deleteLibrary(id: string) {
+export async function updateLibraryEmoji(id: string, emoji: string | null) {
+  await invoke('update_snippet_library_emoji', { id, emoji })
+  libraries.value = libraries.value.map(l => l.id === id ? { ...l, emoji: emoji ?? undefined } : l)
+}
+
+export async function deleteLibrary(id: string) {
+  await invoke('delete_snippet_library', { id })
   libraries.value = libraries.value.filter(l => l.id !== id)
-  saveLibraries(libraries.value)
   snippets.value = snippets.value.filter(s => s.libraryId !== id)
-  saveSnippets(snippets.value)
 }
 
-export function addSnippet(data: {
+export async function addSnippet(data: {
   libraryId: string
   text: string
   tags: string[]
@@ -115,29 +129,34 @@ export function addSnippet(data: {
   paperTitle: string
   page: number
   color?: string
-}): Snippet {
-  const s: Snippet = { id: newId(), ...data, createdAt: nowIso() }
+}): Promise<Snippet> {
+  const s = await invoke<Snippet>('add_snippet', { input: data })
   snippets.value = [...snippets.value, s]
-  saveSnippets(snippets.value)
   return s
 }
 
-export function deleteSnippet(id: string) {
+export async function deleteSnippet(id: string) {
+  const s = snippets.value.find(s => s.id === id)
+  if (!s) return
+  await invoke('delete_snippet', { libraryId: s.libraryId, id })
   snippets.value = snippets.value.filter(s => s.id !== id)
-  saveSnippets(snippets.value)
 }
 
-export function updateSnippet(id: string, changes: Partial<Pick<Snippet, 'tags' | 'note'>>) {
+export async function updateSnippet(id: string, changes: Partial<Pick<Snippet, 'tags' | 'note'>>) {
+  const s = snippets.value.find(s => s.id === id)
+  if (!s) return
+  await invoke('update_snippet', {
+    libraryId: s.libraryId,
+    id,
+    tags: changes.tags ?? null,
+    note: changes.note ?? null,
+  })
   snippets.value = snippets.value.map(s => s.id === id ? { ...s, ...changes } : s)
-  saveSnippets(snippets.value)
 }
 
 export function snippetsForLibrary(libraryId: string): Snippet[] {
   return snippets.value.filter(s => s.libraryId === libraryId)
 }
-
-// Global signal to open the "Add to Snippet Library" modal from anywhere
-export const pendingSnippet = ref<PendingSnippet | null>(null)
 
 export function openAddSnippetModal(data: PendingSnippet) {
   pendingSnippet.value = data

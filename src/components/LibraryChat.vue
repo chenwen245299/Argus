@@ -2097,11 +2097,13 @@ onUnmounted(() => {
   color: #fff;
   border-radius: 16px;
   border-bottom-right-radius: 4px;
-  font-size: 14px;
+  font-size: 16px;
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
   box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 18%, transparent);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* Assistant message */
@@ -2144,11 +2146,13 @@ onUnmounted(() => {
   background: transparent;
   border: none;
   border-radius: 0;
-  font-size: 14px;
+  font-size: 16px;
   line-height: 1.72;
   color: var(--text-primary);
   word-break: break-word;
   overflow-x: auto;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .assistant-bubble.streaming { opacity: 0.88; }
@@ -2523,7 +2527,7 @@ onUnmounted(() => {
   min-height: 50px;
   max-height: 160px;
   padding: 2px 0 6px;
-  font-size: 14px;
+  font-size: 16px;
   border: 0;
   background: transparent;
   color: var(--text-primary);

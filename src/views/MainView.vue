@@ -14,7 +14,7 @@ import { useAiStore } from '../stores/ai'
 import { useSelectionStore } from '../stores/selection'
 import { useCanvasStore } from '../stores/canvas'
 import { switchToTranslationsTab, askAiText } from '../stores/translationHistory'
-import { pendingSnippet } from '../stores/snippetLibrary'
+import { pendingSnippet, initSnippetStore } from '../stores/snippetLibrary'
 import Toolbar from '../components/Toolbar.vue'
 import LeftSidebar from '../components/LeftSidebar.vue'
 import PaperList from '../components/PaperList.vue'
@@ -72,9 +72,9 @@ const MAIN_RIGHT_WIDTH_KEY = 'argus:layout:right-width'
 const MAIN_RIGHT_VISIBLE_KEY = 'argus:layout:right-visible'
 const MAIN_RIGHT_TAB_KEY = 'argus:layout:right-tab'
 const PAPER_TABS = ['notes', 'highlights', 'ai', 'metadata']
-const MIN_LEFT_WIDTH = 140
+const MIN_LEFT_WIDTH = 240
 const MAX_LEFT_WIDTH = 360
-const DEFAULT_LEFT_WIDTH = 200
+const DEFAULT_LEFT_WIDTH = 220
 const MIN_RIGHT_WIDTH = 350
 const MAX_RIGHT_WIDTH = 560
 const DEFAULT_RIGHT_WIDTH = MIN_RIGHT_WIDTH
@@ -264,6 +264,7 @@ onMounted(async () => {
     await collectionsStore.load()
     await aiStore.load()
     readerStore.loadTabs(libraryStore.currentPath)
+    initSnippetStore()
   }
 
   // Tauri 2 file drag-drop
@@ -406,6 +407,14 @@ watch(
   { deep: true }
 )
 
+// Switching to a paper tab should close the snippet library panel
+watch(
+  () => readerStore.activeSlug,
+  (slug) => {
+    if (slug) showSnippetLibrary.value = false
+  }
+)
+
 // Sidebar navigation should always bring the main area back to the library list
 // tab. The opened PDF tab stays open; it just stops being the active tab.
 watch(
@@ -482,6 +491,7 @@ watch(
     <div class="columns">
       <LeftSidebar
         v-model:show-settings="showSettings"
+        :snippet-library-visible="showSnippetLibrary"
         :style="{ width: leftWidth + 'px', minWidth: leftWidth + 'px' }"
         @open-canvas="onOpenCanvas"
         @open-snippet-library="onOpenSnippetLibrary"

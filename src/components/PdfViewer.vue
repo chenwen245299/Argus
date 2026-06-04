@@ -3,7 +3,8 @@ import { ref, shallowRef, computed, watch, onMounted, onUnmounted, nextTick } fr
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { startTranslation, appendTranslationChunk, finishTranslation, failTranslation } from '../stores/translationHistory'
+import { startTranslation, appendTranslationChunk, finishTranslation, failTranslation, triggerAskAi } from '../stores/translationHistory'
+import { openAddSnippetModal } from '../stores/snippetLibrary'
 import * as pdfjsLib from 'pdfjs-dist'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { useReaderStore } from '../stores/reader'
@@ -116,11 +117,13 @@ onMounted(async () => {
   await loadPdf()
   window.addEventListener('mouseup', onWindowMouseUp)
   window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('argus-snippet-highlight', onSnippetHighlight)
 })
 
 onUnmounted(() => {
   window.removeEventListener('mouseup', onWindowMouseUp)
   window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('argus-snippet-highlight', onSnippetHighlight)
   observer?.disconnect()
   if (progressDebounce) clearTimeout(progressDebounce)
   _translateUnlisten?.()
@@ -163,6 +166,61 @@ async function translateSelection() {
   const { text } = selectionPopup.value
   selectionPopup.value = null
   await startStreamTranslate(text)
+}
+
+function askAiWithSelection() {
+  if (!selectionPopup.value) return
+  const { text } = selectionPopup.value
+  selectionPopup.value = null
+  triggerAskAi(text)
+}
+
+const SNIPPET_HIGHLIGHT_COLOR = '#CE93D8'
+
+function addToSnippetLibrary() {
+  const popup = selectionPopup.value
+  if (!popup || popup.rects.length === 0) { selectionPopup.value = null; return }
+  window.getSelection()?.removeAllRanges()
+  selectionPopup.value = null
+  const paper = library.papers.find(p => p.slug === reader.activeSlug)
+  openAddSnippetModal({
+    text: popup.text,
+    paperId: reader.activeSlug ?? '',
+    paperTitle: paper?.title ?? reader.activeSlug ?? '',
+    page: popup.pageIndex + 1,
+    color: SNIPPET_HIGHLIGHT_COLOR,
+    rects: popup.rects,
+    pageIndex: popup.pageIndex,
+  })
+}
+
+function onSnippetHighlight(e: Event) {
+  const { rects, pageIndex, text, color } = (e as CustomEvent).detail
+  if (!rects?.length) return
+  const hl: Highlight = {
+    id: crypto.randomUUID(),
+    page: pageIndex + 1,
+    rects,
+    text,
+    color,
+    created_at: new Date().toISOString(),
+    style: 'highlight',
+  }
+  reader.addHighlight(hl)
+}
+
+function addHighlightToSnippetLibrary(hlId: string) {
+  const hl = reader.highlights.find(h => h.id === hlId)
+  if (!hl) return
+  hlColorPopup.value = null
+  const paper = library.papers.find(p => p.slug === reader.activeSlug)
+  openAddSnippetModal({
+    text: hl.text,
+    paperId: reader.activeSlug ?? '',
+    paperTitle: paper?.title ?? reader.activeSlug ?? '',
+    page: hl.page,
+    color: hl.color,
+  })
 }
 
 // ── fulltext extraction (pdfjs text → OCR fallback) ──────────────────────────
@@ -450,7 +508,7 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
       div.style.top    = `${rect.y * s}px`
       div.style.width  = `${rect.width * s}px`
       div.style.height = `${rect.height * s}px`
-      div.style.background = hexToRgba(hl.color, 0.35)
+      div.style.background = hl.style === 'underline' ? 'transparent' : hexToRgba(hl.color, 0.35)
       div.style.borderBottom = hl.style === 'underline'
         ? `2px solid ${hl.color}`
         : 'none'
@@ -487,6 +545,14 @@ watch(() => reader.highlights, () => {
 // Re-render highlight overlays when scale changes (handled by full page re-render above)
 
 // ── Jump to highlight ─────────────────────────────────────────────────────────
+watch(() => reader.pendingPageJump, async (page) => {
+  if (page === null) return
+  reader.pendingPageJump = null
+  const pageIndex = page - 1
+  await ensurePageRendered(pageIndex)
+  scrollToPageIndex(pageIndex, 0)
+})
+
 watch(() => reader.scrollToHighlightId, async (id) => {
   if (!id) return
   const hl = reader.highlights.find(h => h.id === id)
@@ -1101,13 +1167,20 @@ function hexToRgba(hex: string, alpha: number): string {
         @click="toggleHighlightStyle"
       >
         <svg v-if="highlightStyle === 'highlight'" width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-          <rect x="1" y="5" width="14" height="6" rx="1" opacity="0.7"/>
-          <rect x="1" y="13" width="14" height="1.5" rx="0.75"/>
+          <rect x="1.5" y="1.5" width="13" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+          <text x="8" y="12" text-anchor="middle" font-size="10" font-weight="bold" font-family="serif">A</text>
         </svg>
         <svg v-else width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-          <text x="2" y="11" font-size="11" font-weight="bold" font-family="serif">A</text>
+          <text x="8" y="11" text-anchor="middle" font-size="11" font-weight="bold" font-family="serif">A</text>
           <rect x="1" y="13" width="14" height="1.5" rx="0.75"/>
         </svg>
+      </button>
+      <div class="sel-sep" />
+      <button class="sel-translate-btn" @click="addToSnippetLibrary" :title="t('snippets.addToLibrary')">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span class="sel-translate-label">{{ t('pdf.snippet') }}</span>
       </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="translateSelection">
@@ -1120,6 +1193,15 @@ function hexToRgba(hex: string, alpha: number): string {
           <path d="M14 18h6"/>
         </svg>
         <span class="sel-translate-label">{{ t('pdf.translate') }}</span>
+      </button>
+      <div class="sel-sep" />
+      <button class="sel-translate-btn" @click="askAiWithSelection" :title="t('pdf.askAi')">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 2l2.09 6.26L20 10l-5.91 1.74L12 18l-2.09-6.26L4 10l5.91-1.74L12 2z"/>
+          <path d="M19 14l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z"/>
+          <path d="M4 18l.6 1.8 1.8.6-1.8.6-.6 1.8-.6-1.8-1.8-.6 1.8-.6.6-1.8z"/>
+        </svg>
+        <span class="sel-translate-label">{{ t('pdf.askAi') }}</span>
       </button>
     </div>
 
@@ -1167,6 +1249,7 @@ function hexToRgba(hex: string, alpha: number): string {
         />
       </div>
       <div class="hl-popup-divider" />
+      <button class="hl-action-btn" @click="addHighlightToSnippetLibrary(hlColorPopup!.hlId)">{{ t('pdf.snippet') }}</button>
       <button class="hl-action-btn" @click="translateHighlight(hlColorPopup!.hlId)">{{ t('pdf.translate') }}</button>
       <button class="hl-action-btn danger" @click="deleteHighlight(hlColorPopup!.hlId)">{{ t('pdf.delete') }}</button>
     </div>
@@ -1443,15 +1526,15 @@ function hexToRgba(hex: string, alpha: number): string {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
-  padding: 6px 8px;
+  padding: 4px 6px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
 }
 
 .sel-colors, .hl-popup-colors {
   display: flex;
-  gap: 5px;
+  gap: 4px;
   align-items: center;
 }
 
@@ -1476,8 +1559,8 @@ function hexToRgba(hex: string, alpha: number): string {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   transition: background 0.1s, color 0.1s;
@@ -1489,9 +1572,9 @@ function hexToRgba(hex: string, alpha: number): string {
 .sel-translate-btn {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 0 8px;
-  height: 26px;
+  gap: 3px;
+  padding: 0 6px;
+  height: 24px;
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   transition: background 0.1s, color 0.1s;
@@ -1499,7 +1582,7 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 .sel-translate-btn:hover { background: var(--bg-hover); color: var(--accent); }
 .sel-translate-label {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 500;
   white-space: nowrap;
 }

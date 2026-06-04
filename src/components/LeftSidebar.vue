@@ -9,6 +9,7 @@ import { useCanvasStore } from '../stores/canvas'
 import CollectionNode from './CollectionNode.vue'
 import type { CanvasIndexEntry, Collection, NavItem } from '../types'
 import { updateStore } from '../stores/update'
+import { libraries as snippetLibraries, snippets as allSnippets, createLibrary as createSnippetLibrary, deleteLibrary as deleteSnippetLibrary, renameLibrary as renameSnippetLibrary } from '../stores/snippetLibrary'
 
 const { t } = useI18n()
 const library = useLibraryStore()
@@ -17,7 +18,7 @@ const collectionsStore = useCollectionsStore()
 const canvasStore = useCanvasStore()
 
 const showSettings = defineModel<boolean>('showSettings', { default: false })
-const emit = defineEmits<{ 'open-canvas': [canvasId: string] }>()
+const emit = defineEmits<{ 'open-canvas': [canvasId: string]; 'open-snippet-library': [libraryId: string] }>()
 
 const expanded = ref<Set<string>>(new Set())
 const libraryCollapsed = ref(false)
@@ -331,6 +332,111 @@ function stopResizeCanvas() {
   window.removeEventListener('mousemove', onResizeCanvasMove)
 }
 
+// ── Snippet Library panel ─────────────────────────────────────────────────────
+const SNIPPET_HEIGHT_KEY = 'argus:sidebar:snippet-height'
+const snippetPanelHeight = ref(loadSnippetPanelHeight())
+const snippetCollapsed = ref(false)
+const showNewSnippetLibInput = ref(false)
+const newSnippetLibName = ref('')
+const snippetRenamingId = ref<string | null>(null)
+const snippetRenameValue = ref('')
+const snippetCtxMenu = ref<{ x: number; y: number; id: string; name: string } | null>(null)
+const activeSnippetLibraryId = ref<string | null>(null)
+
+function loadSnippetPanelHeight() {
+  try {
+    const raw = Number(localStorage.getItem(SNIPPET_HEIGHT_KEY))
+    if (Number.isFinite(raw) && raw > 0) return Math.min(400, Math.max(72, raw))
+  } catch {}
+  return 160
+}
+
+function startNewSnippetLib() {
+  newSnippetLibName.value = ''
+  showNewSnippetLibInput.value = true
+  snippetCollapsed.value = false
+  setTimeout(() => (document.getElementById('new-snippet-lib-input') as HTMLInputElement)?.focus(), 50)
+}
+
+function submitNewSnippetLib() {
+  const name = newSnippetLibName.value.trim()
+  showNewSnippetLibInput.value = false
+  if (!name) return
+  const lib = createSnippetLibrary(name)
+  openSnippetLibrary(lib.id)
+}
+
+function openSnippetLibrary(id: string) {
+  activeSnippetLibraryId.value = id
+  emit('open-snippet-library', id)
+}
+
+function startRenameSnippetLib(id: string, name: string) {
+  closeSnippetCtx()
+  snippetRenamingId.value = id
+  snippetRenameValue.value = name
+  nextTick(() => {
+    const el = document.getElementById(`snippet-lib-rename-${id}`) as HTMLInputElement | null
+    el?.focus()
+    el?.select()
+  })
+}
+
+function submitRenameSnippetLib(id: string) {
+  const name = snippetRenameValue.value.trim()
+  if (name) renameSnippetLibrary(id, name)
+  snippetRenamingId.value = null
+  snippetRenameValue.value = ''
+}
+
+function handleDeleteSnippetLib(id: string, name: string) {
+  closeSnippetCtx()
+  if (!window.confirm(`删除素材库"${name}"及其所有素材？`)) return
+  deleteSnippetLibrary(id)
+  if (activeSnippetLibraryId.value === id) activeSnippetLibraryId.value = null
+}
+
+function openSnippetCtx(e: MouseEvent, id: string, name: string) {
+  e.preventDefault()
+  snippetCtxMenu.value = { x: e.clientX, y: e.clientY, id, name }
+}
+
+function closeSnippetCtx() {
+  snippetCtxMenu.value = null
+}
+
+function snippetCountFor(id: string) {
+  return allSnippets.value.filter(s => s.libraryId === id).length
+}
+
+let snippetResizeStartY = 0
+let snippetResizeStartH = 0
+let isResizingSnippet = false
+
+function startResizeSnippet(e: MouseEvent) {
+  isResizingSnippet = true
+  snippetResizeStartY = e.clientY
+  snippetResizeStartH = snippetPanelHeight.value
+  document.body.style.cursor = 'row-resize'
+  document.body.style.userSelect = 'none'
+  window.addEventListener('mousemove', onResizeSnippetMove)
+  window.addEventListener('mouseup', stopResizeSnippet, { once: true })
+}
+
+function onResizeSnippetMove(e: MouseEvent) {
+  if (!isResizingSnippet) return
+  snippetPanelHeight.value = Math.min(400, Math.max(72, snippetResizeStartH + (snippetResizeStartY - e.clientY)))
+}
+
+function stopResizeSnippet() {
+  if (!isResizingSnippet) return
+  isResizingSnippet = false
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  localStorage.setItem(SNIPPET_HEIGHT_KEY, String(Math.round(snippetPanelHeight.value)))
+  window.removeEventListener('mousemove', onResizeSnippetMove)
+}
+
 // ── Context menu (collections) ────────────────────────────────────────────────
 const ctxMenu = ref<{ x: number; y: number; col: Collection } | null>(null)
 const canvasCtxMenu = ref<{ x: number; y: number; entry: CanvasIndexEntry } | null>(null)
@@ -363,6 +469,7 @@ function closeCtx() {
   ctxMenu.value = null
   libCtxMenu.value = null
   canvasCtxMenu.value = null
+  snippetCtxMenu.value = null
 }
 
 // ── Drag-drop targets (driven by pointer-based drag in PaperList) ─────────────
@@ -732,6 +839,87 @@ onUnmounted(() => {
       </template>
     </div>
 
+    <!-- Snippet Library section -->
+    <div
+      v-if="library.currentPath"
+      class="canvas-section"
+      :class="{ 'canvas-section--collapsed': snippetCollapsed }"
+      :style="{ height: `${snippetPanelHeight}px` }"
+    >
+      <div v-if="!snippetCollapsed" class="canvas-resize-handle" @mousedown.stop.prevent="startResizeSnippet" />
+
+      <div class="section-header" @click.stop="snippetCollapsed = !snippetCollapsed">
+        <span class="section-title">{{ t('snippets.title') }}</span>
+        <div class="section-header-right">
+          <button v-if="!snippetCollapsed" class="icon-action" :title="t('snippets.newLibrary')" @click.stop="startNewSnippetLib()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </button>
+          <svg
+            width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+            class="collapse-chevron"
+            :class="{ 'is-collapsed': snippetCollapsed }"
+          >
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </div>
+      </div>
+
+      <template v-if="!snippetCollapsed">
+        <div class="canvas-list">
+          <div v-if="showNewSnippetLibInput" class="new-coll-row">
+            <input
+              id="new-snippet-lib-input"
+              v-model="newSnippetLibName"
+              class="coll-name-input"
+              :placeholder="t('snippets.libraryName')"
+              @keydown.enter="submitNewSnippetLib"
+              @keydown.escape="showNewSnippetLibInput = false"
+              @blur="submitNewSnippetLib"
+            />
+          </div>
+
+          <div v-if="snippetLibraries.length === 0 && !showNewSnippetLibInput" class="no-collections">
+            {{ t('snippets.noLibraries') }}
+          </div>
+
+          <div
+            v-for="lib in snippetLibraries"
+            :key="lib.id"
+            class="nav-item"
+            :class="{ active: activeSnippetLibraryId === lib.id }"
+            role="button"
+            tabindex="0"
+            @click="openSnippetLibrary(lib.id)"
+            @keydown.enter.prevent="openSnippetLibrary(lib.id)"
+            @contextmenu.prevent.stop="openSnippetCtx($event, lib.id, lib.name)"
+          >
+            <template v-if="snippetRenamingId === lib.id">
+              <input
+                :id="`snippet-lib-rename-${lib.id}`"
+                v-model="snippetRenameValue"
+                class="coll-name-input canvas-rename-input"
+                @click.stop
+                @keydown.enter.stop.prevent="submitRenameSnippetLib(lib.id)"
+                @keydown.escape.stop.prevent="snippetRenamingId = null"
+                @blur="submitRenameSnippetLib(lib.id)"
+              />
+            </template>
+            <template v-else>
+              <span v-if="lib.emoji" style="font-size:12px">{{ lib.emoji }}</span>
+              <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              </svg>
+              <span class="canvas-name-text">{{ lib.name }}</span>
+              <span v-if="snippetCountFor(lib.id) > 0" class="badge">{{ snippetCountFor(lib.id) }}</span>
+            </template>
+          </div>
+        </div>
+      </template>
+    </div>
+
     <!-- Tags section -->
     <div
       v-if="library.allTags.length > 0"
@@ -900,6 +1088,22 @@ onUnmounted(() => {
         </button>
         <button class="ctx-item" @click="openInFinder(); closeCtx()">
           {{ t('collections.openInFinder') }}
+        </button>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div
+        v-if="snippetCtxMenu"
+        class="ctx-menu"
+        :style="{ left: snippetCtxMenu.x + 'px', top: snippetCtxMenu.y + 'px' }"
+        @click.stop
+      >
+        <button class="ctx-item" @click="startRenameSnippetLib(snippetCtxMenu!.id, snippetCtxMenu!.name); closeSnippetCtx()">
+          重命名
+        </button>
+        <button class="ctx-item danger" @click="handleDeleteSnippetLib(snippetCtxMenu!.id, snippetCtxMenu!.name)">
+          删除
         </button>
       </div>
     </Teleport>

@@ -41,6 +41,13 @@ export const currentTranslation = reactive({
 // Signal MainView to switch to translations tab
 export const switchToTranslationsTab = ref(false)
 
+// Signal MainView + AiTab to open AI chat with pre-filled text
+export const askAiText = ref<string | null>(null)
+
+export function triggerAskAi(text: string) {
+  askAiText.value = text
+}
+
 export function startTranslation(sourceText: string) {
   currentTranslation.sourceText = sourceText
   currentTranslation.result = ''

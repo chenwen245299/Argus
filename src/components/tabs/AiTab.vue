@@ -9,6 +9,7 @@ import { renderMarkdown, getSegments } from '../../utils/renderMarkdown'
 import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
 import type { ChatMessage, PaperMeta, PaperStatus } from '../../types'
+import { askAiText } from '../../stores/translationHistory'
 
 const props = withDefaults(defineProps<{ slug: string | null; standalone?: boolean }>(), {
   standalone: false,
@@ -420,6 +421,18 @@ function startNewConversation(closeHistory = true) {
   if (closeHistory) showHistory.value = false
   nextTick(() => textareaEl.value?.focus())
 }
+
+watch(askAiText, (text) => {
+  if (text === null) return
+  startNewConversation(true)
+  input.value = text + '\n\n'
+  nextTick(() => {
+    const el = textareaEl.value
+    if (!el) return
+    el.focus()
+    el.setSelectionRange(el.value.length, el.value.length)
+  })
+}, { flush: 'post' })
 
 function openConversation(id: string) {
   const conv = conversations.value.find(c => c.id === id)
@@ -837,8 +850,13 @@ function resizeTextarea() {
   nextTick(() => {
     const el = textareaEl.value
     if (!el) return
+    const lineH = parseFloat(getComputedStyle(el).lineHeight) || 19
+    const padTop = parseFloat(getComputedStyle(el).paddingTop) || 10
     el.style.height = 'auto'
-    el.style.height = `${Math.min(120, el.scrollHeight)}px`
+    const lines = Math.ceil((el.scrollHeight - padTop) / lineH)
+    const maxLines = 6
+    const snapped = Math.min(maxLines, lines) * lineH + padTop
+    el.style.height = `${snapped}px`
   })
 }
 
@@ -2284,8 +2302,7 @@ onUnmounted(() => {
 
 .composer-input {
   flex: 1;
-  min-height: 38px;
-  max-height: 160px;
+  min-height: 68px;
   resize: none;
   padding: 10px 12px 0;
   border: none;

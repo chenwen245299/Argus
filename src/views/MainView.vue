@@ -13,7 +13,8 @@ import { useCollectionsStore } from '../stores/collections'
 import { useAiStore } from '../stores/ai'
 import { useSelectionStore } from '../stores/selection'
 import { useCanvasStore } from '../stores/canvas'
-import { switchToTranslationsTab } from '../stores/translationHistory'
+import { switchToTranslationsTab, askAiText } from '../stores/translationHistory'
+import { pendingSnippet } from '../stores/snippetLibrary'
 import Toolbar from '../components/Toolbar.vue'
 import LeftSidebar from '../components/LeftSidebar.vue'
 import PaperList from '../components/PaperList.vue'
@@ -22,6 +23,8 @@ import CanvasPanel from '../components/CanvasPanel.vue'
 import TabBar from '../components/TabBar.vue'
 import RightSidebar from '../components/RightSidebar.vue'
 import SettingsModal from '../components/SettingsModal.vue'
+import AddSnippetModal from '../components/AddSnippetModal.vue'
+import SnippetLibraryView from '../components/SnippetLibraryView.vue'
 
 const { t } = useI18n()
 const libraryStore = useLibraryStore()
@@ -111,6 +114,8 @@ const rightSidebarVisible = ref(loadLayoutBoolean(MAIN_RIGHT_VISIBLE_KEY, true))
 const sidebarTab = ref<string>(loadSidebarTab())
 const pdfViewerRef = ref<{ closeToList: () => void } | null>(null)
 const showCanvas = ref(false)
+const showSnippetLibrary = ref(false)
+const activeSnippetLibraryId = ref<string | null>(null)
 
 // Sync showCanvas with canvasStore.isShown so TabBar close button works
 watch(() => canvasStore.isShown, (v) => { showCanvas.value = v })
@@ -123,11 +128,31 @@ function onOpenCanvas() {
   readerStore.showList()   // clear activeSlug so PdfViewer v-if yields to CanvasPanel
   showCanvas.value = true
   canvasStore.isShown = true
+  showSnippetLibrary.value = false
 }
 
 function closeCanvas() {
   showCanvas.value = false
   canvasStore.isShown = false
+}
+
+function onOpenSnippetLibrary(libraryId: string) {
+  readerStore.showList()
+  showCanvas.value = false
+  canvasStore.isShown = false
+  activeSnippetLibraryId.value = libraryId
+  showSnippetLibrary.value = true
+}
+
+function closeSnippetLibrary() {
+  showSnippetLibrary.value = false
+  activeSnippetLibraryId.value = null
+}
+
+function onSnippetOpenPaper(slug: string, page: number, title: string) {
+  showSnippetLibrary.value = false
+  readerStore.openPaper(slug, title)
+  readerStore.pendingPageJump = page
 }
 
 function onCanvasSelectPaper(slug: string) {
@@ -364,6 +389,12 @@ watch(switchToTranslationsTab, (val) => {
   if (!rightSidebarVisible.value) rightSidebarVisible.value = true
 })
 
+watch(askAiText, (val) => {
+  if (val === null) return
+  sidebarTab.value = 'ai'
+  if (!rightSidebarVisible.value) rightSidebarVisible.value = true
+})
+
 // Auto-save tabs whenever they change (length, order, or active)
 watch(
   [() => [...readerStore.tabs], () => readerStore.activeSlug],
@@ -386,6 +417,9 @@ watch(
     if (showCanvas.value) {
       showCanvas.value = false
       canvasStore.isShown = false
+    }
+    if (showSnippetLibrary.value) {
+      showSnippetLibrary.value = false
     }
   }
 )
@@ -450,6 +484,7 @@ watch(
         v-model:show-settings="showSettings"
         :style="{ width: leftWidth + 'px', minWidth: leftWidth + 'px' }"
         @open-canvas="onOpenCanvas"
+        @open-snippet-library="onOpenSnippetLibrary"
       />
 
       <div
@@ -473,6 +508,12 @@ watch(
           class="center-fill"
           @select-paper="onCanvasSelectPaper"
           @close="closeCanvas()"
+        />
+        <SnippetLibraryView
+          v-else-if="showSnippetLibrary && activeSnippetLibraryId"
+          :library-id="activeSnippetLibraryId"
+          class="center-fill"
+          @open-paper="onSnippetOpenPaper"
         />
         <div v-else class="center-fill">
           <PaperList />
@@ -522,6 +563,13 @@ watch(
       v-if="showSettings"
       :initial-section="settingsAiSection ? 'ai' : undefined"
       @close="showSettings = false; settingsAiSection = false"
+    />
+
+    <!-- Add to Snippet Library modal -->
+    <AddSnippetModal
+      v-if="pendingSnippet"
+      :pending="pendingSnippet"
+      @close="pendingSnippet = null"
     />
   </div>
 </template>

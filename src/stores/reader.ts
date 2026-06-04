@@ -22,12 +22,14 @@ export const useReaderStore = defineStore('reader', () => {
   const highlights          = ref<Highlight[]>([])
   const readingState        = ref<ReadingState | null>(null)
   const scrollToHighlightId = ref<string | null>(null)
+  const pendingPageJump     = ref<number | null>(null)
 
   function _resetTabState() {
     pdfDoc.value              = null
     highlights.value          = []
     readingState.value        = null
     scrollToHighlightId.value = null
+    pendingPageJump.value     = null
   }
 
   function openPaper(slug: string, title: string) {
@@ -183,6 +185,7 @@ export const useReaderStore = defineStore('reader', () => {
     highlights,
     readingState,
     scrollToHighlightId,
+    pendingPageJump,
     openPaper,
     replacePaperSlug,
     pruneStaleTabs,

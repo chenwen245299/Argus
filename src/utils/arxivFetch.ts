@@ -40,27 +40,58 @@ function parseAtomXml(xml: string, fetchedAt: string): ArxivPaper[] {
   })
 }
 
-async function fetchCategory(cat: string, dateFrom: string, dateTo: string, maxResults: number): Promise<ArxivPaper[]> {
-  const from = dateFrom.replace(/-/g, '') + '0000'
-  const to = dateTo.replace(/-/g, '') + '2359'
-  const url = `https://export.arxiv.org/api/query?search_query=(cat:${cat})AND+submittedDate:[${from}+TO+${to}]&start=0&max_results=${maxResults}&sortBy=submittedDate&sortOrder=descending`
+const PAGE_SIZE = 500
+const TIMEOUT_MS = 120_000
 
+async function fetchPage(url: string, cat: string): Promise<ArxivPaper[]> {
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { 'User-Agent': 'Argus/0.1 (local research tool)' },
-    })
-    if (res.status === 429) {
-      if (attempt >= 3) throw new Error(`arXiv rate-limited on category ${cat}`)
-      const wait = parseInt(res.headers.get('retry-after') ?? '') || 60 * attempt
+    let res: Response
+    try {
+      res = await Promise.race([
+        fetch(url, {
+          method: 'GET',
+          headers: { 'User-Agent': 'Argus/0.1 (mailto:chengwen@comp.nus.edu.sg)' },
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`arXiv request timed out after ${TIMEOUT_MS / 1000}s`)), TIMEOUT_MS)
+        ),
+      ])
+    } catch (e) {
+      if (attempt >= 3) throw e
+      await new Promise(r => setTimeout(r, 5000 * attempt))
+      continue
+    }
+
+    if (res.status === 429 || res.status === 503) {
+      if (attempt >= 3) throw new Error(`arXiv returned ${res.status} for ${cat} after 3 attempts`)
+      const wait = parseInt(res.headers.get('retry-after') ?? '') || 30 * attempt
       await new Promise(r => setTimeout(r, wait * 1000))
       continue
     }
     if (!res.ok) throw new Error(`arXiv API returned ${res.status} for ${cat}`)
-    const xml = await res.text()
-    return parseAtomXml(xml, new Date().toISOString())
+    return parseAtomXml(await res.text(), new Date().toISOString())
   }
   return []
+}
+
+async function fetchCategory(cat: string, dateFrom: string, dateTo: string): Promise<ArxivPaper[]> {
+  const from = dateFrom.replace(/-/g, '') + '0000'
+  const to = dateTo.replace(/-/g, '') + '2359'
+  const base = `https://export.arxiv.org/api/query?search_query=(cat:${cat})+AND+submittedDate:[${from}+TO+${to}]&sortBy=submittedDate&sortOrder=descending`
+
+  const all: ArxivPaper[] = []
+  let start = 0
+
+  while (true) {
+    const url = `${base}&start=${start}&max_results=${PAGE_SIZE}`
+    const page = await fetchPage(url, cat)
+    all.push(...page)
+    if (page.length < PAGE_SIZE) break  // no more results
+    start += PAGE_SIZE
+    await new Promise(r => setTimeout(r, 3000))  // polite delay between pages
+  }
+
+  return all
 }
 
 export async function fetchArxivCategories(
@@ -77,7 +108,7 @@ export async function fetchArxivCategories(
       status: 'fetching', done: i, total: cats.length,
       message: `正在抓取 ${cats[i]} (${i + 1}/${cats.length})`,
     })
-    const papers = await fetchCategory(cats[i], dateFrom, dateTo, config.max_fetch)
+    const papers = await fetchCategory(cats[i], dateFrom, dateTo)
     for (const p of papers) {
       if (!seen.has(p.arxiv_id)) { seen.add(p.arxiv_id); all.push(p) }
     }

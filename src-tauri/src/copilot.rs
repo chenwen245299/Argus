@@ -324,8 +324,12 @@ const WINDOW_SIZE_STORE_KEY: &str = "library_chat_window_size";
 const PAPER_AI_WINDOW_SIZE_STORE_KEY: &str = "paper_ai_window_size_v3";
 const DEFAULT_WINDOW_W: f64 = 760.0;
 const DEFAULT_WINDOW_H: f64 = 560.0;
+const LIBRARY_CHAT_MIN_WINDOW_W: f64 = 560.0;
+const LIBRARY_CHAT_MIN_WINDOW_H: f64 = 400.0;
 const PAPER_AI_DEFAULT_WINDOW_W: f64 = 540.0;
 const PAPER_AI_DEFAULT_WINDOW_H: f64 = 660.0;
+const PAPER_AI_MIN_WINDOW_W: f64 = 400.0;
+const PAPER_AI_MIN_WINDOW_H: f64 = 500.0;
 
 fn load_library_chat_window_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
     use tauri_plugin_store::StoreExt;
@@ -334,7 +338,11 @@ fn load_library_chat_window_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
     let w = v.get("w")?.as_f64()?;
     let h = v.get("h")?.as_f64()?;
     // Sanity check: ignore absurdly small/large values
-    if w >= 400.0 && h >= 300.0 && w <= 4000.0 && h <= 3000.0 {
+    if w >= LIBRARY_CHAT_MIN_WINDOW_W
+        && h >= LIBRARY_CHAT_MIN_WINDOW_H
+        && w <= 4000.0
+        && h <= 3000.0
+    {
         Some((w, h))
     } else {
         None
@@ -343,6 +351,9 @@ fn load_library_chat_window_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
 
 pub fn save_library_chat_window_size(app: &tauri::AppHandle, width: f64, height: f64) {
     use tauri_plugin_store::StoreExt;
+    if width < LIBRARY_CHAT_MIN_WINDOW_W || height < LIBRARY_CHAT_MIN_WINDOW_H {
+        return;
+    }
     if let Ok(store) = app.store("settings.json") {
         store.set(
             WINDOW_SIZE_STORE_KEY,
@@ -358,7 +369,7 @@ fn load_paper_ai_window_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
     let v = store.get(PAPER_AI_WINDOW_SIZE_STORE_KEY)?;
     let w = v.get("w")?.as_f64()?;
     let h = v.get("h")?.as_f64()?;
-    if w >= 400.0 && h >= 500.0 && w <= 4000.0 && h <= 3000.0 {
+    if w >= PAPER_AI_MIN_WINDOW_W && h >= PAPER_AI_MIN_WINDOW_H && w <= 4000.0 && h <= 3000.0 {
         Some((w, h))
     } else {
         None
@@ -367,6 +378,9 @@ fn load_paper_ai_window_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
 
 pub fn save_paper_ai_window_size(app: &tauri::AppHandle, width: f64, height: f64) {
     use tauri_plugin_store::StoreExt;
+    if width < PAPER_AI_MIN_WINDOW_W || height < PAPER_AI_MIN_WINDOW_H {
+        return;
+    }
     if let Ok(store) = app.store("settings.json") {
         store.set(
             PAPER_AI_WINDOW_SIZE_STORE_KEY,
@@ -377,7 +391,7 @@ pub fn save_paper_ai_window_size(app: &tauri::AppHandle, width: f64, height: f64
 }
 
 pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: Option<&str>) -> Result<(), String> {
-    use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+    use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
     if let Some(win) = app.get_webview_window("paper-ai") {
         let _ = win.set_focus();
@@ -397,7 +411,7 @@ pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: Option<&str>) -> Resul
     )
     .title("Argus — 论文 AI")
     .inner_size(width, height)
-    .min_inner_size(400.0, 500.0);
+    .min_inner_size(PAPER_AI_MIN_WINDOW_W, PAPER_AI_MIN_WINDOW_H);
 
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -408,15 +422,12 @@ pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: Option<&str>) -> Resul
         .build()
         .map_err(|e| format!("Open paper AI window: {e}"))?;
 
-    if let Some(slug) = slug {
-        let _ = win.emit("paper-ai-slug", slug.to_string());
-    }
-
+    let win_ref = win.clone();
     let app_handle = app.clone();
     win.on_window_event(move |event| {
-        if let tauri::WindowEvent::CloseRequested { .. } = event {
-            if let Some(w) = app_handle.get_webview_window("paper-ai") {
-                if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+        let save = |w: &tauri::WebviewWindow| {
+            if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+                if phys.width > 0 && phys.height > 0 {
                     save_paper_ai_window_size(
                         &app_handle,
                         phys.width as f64 / sf,
@@ -424,6 +435,21 @@ pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: Option<&str>) -> Resul
                     );
                 }
             }
+        };
+        match event {
+            WindowEvent::Resized(_) | WindowEvent::CloseRequested { .. } => save(&win_ref),
+            _ => {}
+        }
+    });
+
+    let win_c = win.clone();
+    let slug = slug.map(|s| s.to_string());
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = win_c.unmaximize();
+        let _ = win_c.set_size(tauri::LogicalSize::new(width, height));
+        if let Some(slug) = slug {
+            let _ = win_c.emit("paper-ai-slug", slug);
         }
     });
 
@@ -448,7 +474,7 @@ pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
     )
     .title("Argus — 智能问答")
     .inner_size(width, height)
-    .min_inner_size(560.0, 400.0);
+    .min_inner_size(LIBRARY_CHAT_MIN_WINDOW_W, LIBRARY_CHAT_MIN_WINDOW_H);
 
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -480,6 +506,13 @@ pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
             }
             _ => {}
         }
+    });
+
+    let win_c = win.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = win_c.unmaximize();
+        let _ = win_c.set_size(tauri::LogicalSize::new(width, height));
     });
 
     Ok(())

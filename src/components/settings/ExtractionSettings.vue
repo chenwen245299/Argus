@@ -19,7 +19,7 @@ Reply with a JSON code block in exactly this format:
 Text:
 {text}`
 
-const DEFAULT_AI_SUMMARY_PROMPT = '帮我用中文讲一下这篇论文，讲的越详细越好，我有这个领域的通用基础，但是没有这个小方向的基础。输出的时候只包含关于论文的讲解，不要包含寒暄的内容。开始时先用一段话总结这篇论文的核心内容。请用markdown形式输出你的讲解内容。'
+const DEFAULT_AI_SUMMARY_PROMPT = '帮我用中文讲一下这篇论文，讲的越详细越好，我有这个领域的通用基础，但是没有这个小方向的基础。输出的时候只包含关于论文的讲解，不要包含寒暄的内容。开始时先用一段话总结这篇论文的核心内容。请用标准markdown形式输出你的讲解内容，数学公式要用$$包裹，不要出现\\(\\)这和[]格式的数学公式。'
 
 const DEFAULT_ABSTRACT_AI_PROMPT = `请只从下面给定的论文原文片段中抽取作者原文的 Abstract/摘要段落。
 要求：

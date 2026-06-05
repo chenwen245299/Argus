@@ -12,11 +12,21 @@ import ArxivView from './views/ArxivView.vue'
 import CanvasView from './views/CanvasView.vue'
 import LibraryChatView from './views/LibraryChatView.vue'
 import PaperAiView from './views/PaperAiView.vue'
+import NoteWindowView from './views/NoteWindowView.vue'
 
 const libraryStore = useLibraryStore()
 const arxivStore = useArxivStore()
 const settingsStore = useSettingsStore()
-const windowLabel = ref('main')
+
+function getInitialWindowLabel() {
+  try {
+    return getCurrentWebviewWindow().label
+  } catch {
+    return 'main'
+  }
+}
+
+const windowLabel = ref(getInitialWindowLabel())
 
 onMounted(async () => {
   try {
@@ -44,6 +54,7 @@ onMounted(async () => {
     <CanvasView v-else-if="windowLabel === 'canvas'" />
     <LibraryChatView v-else-if="windowLabel === 'library-chat'" />
     <PaperAiView v-else-if="windowLabel === 'paper-ai'" />
+    <NoteWindowView v-else-if="windowLabel === 'note-window'" />
     <MainView v-else />
   </div>
 </template>

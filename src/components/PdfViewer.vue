@@ -35,6 +35,17 @@ const scale = ref(1.25)
 const displayPage = ref(1) // shown in toolbar (1-based)
 const pageInputValue = ref('1')
 const displayOpenTitle = computed(() => titleInitialCaps(reader.openTitle))
+const PDF_PAGE_MARGIN = 3
+const SCROLL_THUMB_INSET = 4
+const SCROLL_THUMB_MIN_SIZE = 32
+const SCROLL_THUMB_HIDE_DELAY = 650
+
+const scrollThumbs = ref({
+  vertical: { visible: false, size: 0, offset: 0 },
+  horizontal: { visible: false, size: 0, offset: 0 },
+})
+const scrollThumbsActive = ref(false)
+let scrollThumbHideTimer: ReturnType<typeof setTimeout> | null = null
 
 function zoomStorageKey(slug: string) {
   return `argus:pdf-zoom:${slug}`
@@ -118,14 +129,17 @@ onMounted(async () => {
   window.addEventListener('mouseup', onWindowMouseUp)
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('argus-snippet-highlight', onSnippetHighlight)
+  window.addEventListener('resize', updateScrollThumbs)
 })
 
 onUnmounted(() => {
   window.removeEventListener('mouseup', onWindowMouseUp)
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('argus-snippet-highlight', onSnippetHighlight)
+  window.removeEventListener('resize', updateScrollThumbs)
   observer?.disconnect()
   if (progressDebounce) clearTimeout(progressDebounce)
+  if (scrollThumbHideTimer) clearTimeout(scrollThumbHideTimer)
   if (searchDebounce) clearTimeout(searchDebounce)
   pageTextCache.clear()
   _translateUnlisten?.()
@@ -354,6 +368,7 @@ async function loadPdf() {
     setupObserver()
     await restorePosition()
     triggerInitialRender()
+    updateScrollThumbs()
 
     // Auto-extract fulltext via pdfjs if lopdf/pdftotext extraction previously failed
     extractFulltextIfNeeded(doc, slug)
@@ -489,6 +504,7 @@ watch(scale, async () => {
   const toEvict = [...renderedPages.value]
   toEvict.forEach(unrenderPage)
   await nextTick()
+  updateScrollThumbs()
   // Force observer to fire by briefly disconnecting & reconnecting
   if (observer && containerRef.value) {
     observer.disconnect()
@@ -629,8 +645,38 @@ async function ensurePageRendered(pageIndex: number) {
 // ── Progress tracking ─────────────────────────────────────────────────────────
 function onScroll() {
   updateDisplayPage()
+  showScrollThumbs()
   if (progressDebounce) clearTimeout(progressDebounce)
   progressDebounce = setTimeout(flushReadingState, 700)
+}
+
+function measureScrollThumb(clientSize: number, scrollSize: number, scrollOffset: number) {
+  const trackSize = Math.max(0, clientSize - SCROLL_THUMB_INSET * 2)
+  const maxScroll = scrollSize - clientSize
+  if (trackSize <= 0 || maxScroll <= 0) return { visible: false, size: 0, offset: 0 }
+
+  const size = Math.max(SCROLL_THUMB_MIN_SIZE, trackSize * (clientSize / scrollSize))
+  const offset = SCROLL_THUMB_INSET + (trackSize - size) * (scrollOffset / maxScroll)
+  return { visible: true, size, offset }
+}
+
+function updateScrollThumbs() {
+  const el = containerRef.value
+  if (!el) return
+  scrollThumbs.value = {
+    vertical: measureScrollThumb(el.clientHeight, el.scrollHeight, el.scrollTop),
+    horizontal: measureScrollThumb(el.clientWidth, el.scrollWidth, el.scrollLeft),
+  }
+}
+
+function showScrollThumbs() {
+  updateScrollThumbs()
+  const hasScrollableAxis = scrollThumbs.value.vertical.visible || scrollThumbs.value.horizontal.visible
+  scrollThumbsActive.value = hasScrollableAxis
+  if (scrollThumbHideTimer) clearTimeout(scrollThumbHideTimer)
+  scrollThumbHideTimer = setTimeout(() => {
+    scrollThumbsActive.value = false
+  }, SCROLL_THUMB_HIDE_DELAY)
 }
 
 function updateDisplayPage() {
@@ -705,7 +751,7 @@ function zoomIn()  { scale.value = Math.min(4, +(scale.value + 0.25).toFixed(2))
 function zoomOut() { scale.value = Math.max(0.5, +(scale.value - 0.25).toFixed(2)) }
 function fitWidth() {
   if (!containerRef.value || pageSizes.value.length === 0) return
-  const containerW = containerRef.value.clientWidth - 32 // 16px padding each side
+  const containerW = containerRef.value.clientWidth - PDF_PAGE_MARGIN * 2
   const pageW = pageSizes.value[0].width
   scale.value = Math.max(0.5, Math.min(4, +(containerW / pageW).toFixed(3)))
 }
@@ -1161,27 +1207,47 @@ function triggerInitialRender() {
     </div>
 
     <!-- PDF container -->
-    <div
-      v-else-if="pageSizes.length > 0"
-      ref="containerRef"
-      class="pdf-container"
-      @scroll.passive="onScroll"
-      @click="hlNotePopup = null; hlColorPopup = null"
-      @wheel="onWheel"
-    >
-      <div class="pdf-pages">
-        <div
-          v-for="(size, idx) in pageSizes"
-          :key="idx"
-          :ref="(el) => observePage(el as HTMLDivElement | null, idx)"
-          class="page-wrapper"
-          :data-page-index="idx"
-          :style="{
-            width: `${Math.round(size.width * scale)}px`,
-            height: `${Math.round(size.height * scale)}px`,
-          }"
-        />
+    <div v-else-if="pageSizes.length > 0" class="pdf-scroll-frame">
+      <div
+        ref="containerRef"
+        class="pdf-container"
+        @scroll.passive="onScroll"
+        @click="hlNotePopup = null; hlColorPopup = null"
+        @wheel="onWheel"
+      >
+        <div class="pdf-pages">
+          <div
+            v-for="(size, idx) in pageSizes"
+            :key="idx"
+            :ref="(el) => observePage(el as HTMLDivElement | null, idx)"
+            class="page-wrapper"
+            :data-page-index="idx"
+            :style="{
+              width: `${Math.round(size.width * scale)}px`,
+              height: `${Math.round(size.height * scale)}px`,
+            }"
+          />
+        </div>
       </div>
+
+      <div
+        v-if="scrollThumbs.vertical.visible"
+        class="pdf-scroll-thumb pdf-scroll-thumb-y"
+        :class="{ visible: scrollThumbsActive }"
+        :style="{
+          height: `${scrollThumbs.vertical.size}px`,
+          transform: `translateY(${scrollThumbs.vertical.offset}px)`,
+        }"
+      />
+      <div
+        v-if="scrollThumbs.horizontal.visible"
+        class="pdf-scroll-thumb pdf-scroll-thumb-x"
+        :class="{ visible: scrollThumbsActive }"
+        :style="{
+          width: `${scrollThumbs.horizontal.size}px`,
+          transform: `translateX(${scrollThumbs.horizontal.offset}px)`,
+        }"
+      />
     </div>
 
     <!-- Selection popup: click a color to immediately highlight -->
@@ -1490,18 +1556,65 @@ function triggerInitialRender() {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ── PDF container ── */
-.pdf-container {
+.pdf-scroll-frame {
   flex: 1;
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-secondary);
+}
+
+.pdf-container {
+  width: 100%;
+  height: 100%;
   overflow-y: auto;
   overflow-x: auto;
+  background: var(--bg-secondary);
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.pdf-container::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.pdf-scroll-thumb {
+  position: absolute;
+  z-index: 8;
+  pointer-events: none;
+  opacity: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-tertiary) 58%, transparent);
+  transition: opacity 180ms ease;
+}
+
+.pdf-scroll-thumb.visible {
+  opacity: 1;
+}
+
+.pdf-scroll-thumb-y {
+  top: 0;
+  right: 4px;
+  width: 5px;
+}
+
+.pdf-scroll-thumb-x {
+  left: 0;
+  bottom: 4px;
+  height: 5px;
 }
 
 .pdf-pages {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  padding: 16px;
+  align-items: stretch;
+  width: 100%;
+  min-width: max-content;
+  padding: 3px;
   gap: 12px;
+  background: var(--bg-secondary);
 }
 
 /* ── Page wrapper ── */
@@ -1510,6 +1623,7 @@ function triggerInitialRender() {
   background: white;
   box-shadow: var(--shadow-md);
   flex-shrink: 0;
+  margin-inline: auto;
 }
 
 /* ── Canvas (injected dynamically) ── */

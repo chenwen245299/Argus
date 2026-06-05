@@ -41,6 +41,7 @@ pub fn run() {
                 .skip_initial_state("paper-ai")
                 .skip_initial_state("arxiv")
                 .skip_initial_state("library-chat")
+                .skip_initial_state("note-window")
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -176,6 +177,7 @@ pub fn run() {
             commands::search_library_chunks,
             // ── M7: Library chat ──
             commands::chat_with_library,
+            commands::open_note_window,
             commands::open_paper_ai_window,
             commands::open_library_chat_window,
             commands::focus_main_window,

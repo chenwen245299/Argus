@@ -1396,6 +1396,118 @@ pub async fn chat_with_library(
 }
 
 #[tauri::command]
+pub async fn open_note_window(
+    app: tauri::AppHandle,
+    slug: String,
+    note_id: String,
+    title: String,
+) -> Result<(), String> {
+    use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+    if let Some(win) = app.get_webview_window("note-window") {
+        let _ = win.set_focus();
+        let _ = win.emit(
+            "note-window-data",
+            serde_json::json!({
+                "slug": slug, "noteId": note_id, "title": title
+            }),
+        );
+        return Ok(());
+    }
+
+    let (width, height) =
+        load_note_window_size(&app).unwrap_or((NOTE_DEFAULT_WINDOW_W, NOTE_DEFAULT_WINDOW_H));
+
+    let builder = WebviewWindowBuilder::new(
+        &app,
+        "note-window",
+        WebviewUrl::App(std::path::PathBuf::from("/")),
+    )
+    .title(&format!("{} — Argus 笔记", title))
+    .inner_size(width, height)
+    .min_inner_size(NOTE_MIN_WINDOW_W, NOTE_MIN_WINDOW_H);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
+
+    let win = builder
+        .build()
+        .map_err(|e| format!("Open note window: {e}"))?;
+
+    let win_ref = win.clone();
+    let app_handle = app.clone();
+    win.on_window_event(move |event| {
+        let save = |w: &tauri::WebviewWindow| {
+            if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+                if phys.width > 0 && phys.height > 0 {
+                    save_note_window_size(
+                        &app_handle,
+                        phys.width as f64 / sf,
+                        phys.height as f64 / sf,
+                    );
+                }
+            }
+        };
+        match event {
+            WindowEvent::Resized(_) | WindowEvent::CloseRequested { .. } => save(&win_ref),
+            _ => {}
+        }
+    });
+
+    let win_c = win.clone();
+    let data = serde_json::json!({ "slug": slug, "noteId": note_id, "title": title });
+    tauri::async_runtime::spawn(async move {
+        // Wait for macOS frame restoration to settle, then re-apply the saved size.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = win_c.unmaximize();
+        let _ = win_c.set_size(tauri::LogicalSize::new(width, height));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = win_c.emit("note-window-data", data);
+    });
+
+    Ok(())
+}
+
+const NOTE_WINDOW_SIZE_STORE_KEY: &str = "note_window_size_v1";
+const NOTE_DEFAULT_WINDOW_W: f64 = 680.0;
+const NOTE_DEFAULT_WINDOW_H: f64 = 760.0;
+const NOTE_MIN_WINDOW_W: f64 = 400.0;
+const NOTE_MIN_WINDOW_H: f64 = 400.0;
+
+fn load_note_window_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
+    use tauri_plugin_store::StoreExt;
+    let store = app.store("settings.json").ok()?;
+    let value = store.get(NOTE_WINDOW_SIZE_STORE_KEY)?;
+    let width = value.get("w")?.as_f64()?;
+    let height = value.get("h")?.as_f64()?;
+    if width >= NOTE_MIN_WINDOW_W
+        && height >= NOTE_MIN_WINDOW_H
+        && width <= 4000.0
+        && height <= 3000.0
+    {
+        Some((width, height))
+    } else {
+        None
+    }
+}
+
+fn save_note_window_size(app: &tauri::AppHandle, width: f64, height: f64) {
+    use tauri_plugin_store::StoreExt;
+    if width < NOTE_MIN_WINDOW_W || height < NOTE_MIN_WINDOW_H {
+        return;
+    }
+    if let Ok(store) = app.store("settings.json") {
+        store.set(
+            NOTE_WINDOW_SIZE_STORE_KEY,
+            serde_json::json!({ "w": width, "h": height }),
+        );
+        let _ = store.save();
+    }
+}
+
+#[tauri::command]
 pub async fn open_paper_ai_window(
     slug: Option<String>,
     app: tauri::AppHandle,

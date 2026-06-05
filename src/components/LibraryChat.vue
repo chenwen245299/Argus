@@ -3,8 +3,6 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
-import { LogicalSize } from '@tauri-apps/api/dpi'
 import { useAiStore, type ModelOption } from '../stores/ai'
 import { useRagStore } from '../stores/rag'
 import MermaidBlock from './MermaidBlock.vue'
@@ -224,34 +222,6 @@ function onDividerMouseUp() {
 
 let unlistenChat: UnlistenFn | null = null
 let unlistenSources: UnlistenFn | null = null
-let resizeTimer: ReturnType<typeof setTimeout> | null = null
-
-const CHAT_WIN_SIZE_KEY = 'argus:chat:window:size'
-
-function saveChatWindowSize() {
-  if (resizeTimer) clearTimeout(resizeTimer)
-  resizeTimer = setTimeout(() => {
-    try {
-      localStorage.setItem(CHAT_WIN_SIZE_KEY, JSON.stringify({
-        width: window.innerWidth,
-        height: window.innerHeight,
-      }))
-    } catch {}
-  }, 400)
-}
-
-async function restoreChatWindowSize() {
-  try {
-    const raw = localStorage.getItem(CHAT_WIN_SIZE_KEY)
-    if (!raw) return
-    const { width, height } = JSON.parse(raw) as { width: number; height: number }
-    if (!width || !height) return
-    await getCurrentWebviewWindow().setSize(new LogicalSize(
-      Math.max(560, width),
-      Math.max(400, height),
-    ))
-  } catch {}
-}
 let pendingSources: RetrievedChunk[] = []
 let _compositionEndedAt = 0
 
@@ -805,20 +775,16 @@ onMounted(async () => {
 
   messagesEl.value?.addEventListener('copy-code', onCopyCode)
 
-  // Persist window size on resize (localStorage, same pattern as MainView)
-  window.addEventListener('resize', saveChatWindowSize)
-  restoreChatWindowSize()
+  // Window size is persisted by the Tauri window event handler.
 })
 
 onUnmounted(() => {
   document.removeEventListener('mousedown', closeModelMenu)
-  window.removeEventListener('resize', saveChatWindowSize)
   window.removeEventListener('mousemove', onDividerMouseMove)
   window.removeEventListener('mouseup', onDividerMouseUp)
   messagesEl.value?.removeEventListener('copy-code', onCopyCode)
   if (unlistenChat) unlistenChat()
   if (unlistenSources) unlistenSources()
-  if (resizeTimer) clearTimeout(resizeTimer)
 })
 </script>
 

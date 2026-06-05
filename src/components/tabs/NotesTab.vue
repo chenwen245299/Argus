@@ -2,7 +2,7 @@
 import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
-import MilkdownEditor from '../MilkdownEditor.vue'
+import VditorEditor from '../VditorEditor.vue'
 import { useLibraryStore } from '../../stores/library'
 import type { Note } from '../../types'
 
@@ -224,6 +224,22 @@ onBeforeUnmount(async () => {
   await maybeSave()
 })
 
+// ── Open note in standalone window ────────────────────────────────────────────
+async function openInWindow() {
+  if (!props.slug || !activeNote.value) return
+  await maybeSave()
+  localStorage.setItem('argus:note-window', JSON.stringify({
+    slug: props.slug, noteId: activeNote.value.id, title: activeNote.value.title,
+  }))
+  try {
+    await invoke('open_note_window', {
+      slug: props.slug, noteId: activeNote.value.id, title: activeNote.value.title,
+    })
+  } catch (e) {
+    console.error('Failed to open note window:', e)
+  }
+}
+
 // ── Format date ───────────────────────────────────────────────────────────────
 function fmtDate(iso: string) {
   return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
@@ -322,10 +338,16 @@ function fmtDate(iso: string) {
 
         <span v-if="saving" class="status">{{ t('notes.saving') }}</span>
         <span v-else-if="saveError" class="status error">{{ saveError }}</span>
+
+        <button class="popout-btn" :title="t('notes.openInWindow')" @click="openInWindow">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+          </svg>
+        </button>
       </div>
 
       <div class="editor-wrap">
-        <MilkdownEditor
+        <VditorEditor
           :key="editorKey"
           :initial-content="loadedContent"
           @change="onContentChange"
@@ -530,6 +552,19 @@ function fmtDate(iso: string) {
 
 .status { font-size: var(--font-size-xs); color: var(--text-tertiary); flex-shrink: 0; }
 .status.error { color: #cc3333; }
+
+.popout-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  transition: background 0.1s, color 0.1s;
+}
+.popout-btn:hover { background: var(--bg-hover); color: var(--accent); }
 
 /* ── Editor ── */
 .editor-wrap {

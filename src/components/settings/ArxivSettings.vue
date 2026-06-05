@@ -211,11 +211,6 @@ const PRESETS = ['cs.AI', 'cs.CL', 'cs.LG', 'cs.CV', 'cs.NE', 'cs.RO', 'stat.ML'
       <input type="number" v-model.number="form.days_back" min="1" max="30" class="field-input sm" />
     </div>
 
-    <!-- Max fetch -->
-    <div class="field-row">
-      <label class="field-label">{{ t('arxivSettings.maxFetch') }}</label>
-      <input type="number" v-model.number="form.max_fetch" min="10" max="500" class="field-input sm" />
-    </div>
 
     <!-- AI analysis -->
     <div class="section-sep">{{ t('arxivSettings.aiSection') }}</div>

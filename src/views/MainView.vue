@@ -358,6 +358,7 @@ async function onLibraryOpened() {
   await collectionsStore.load()
   await aiStore.load()
   readerStore.loadTabs(libraryStore.currentPath!)
+  initSnippetStore()
 }
 
 // Load all stores when library path becomes available (handles auto-restore on startup).

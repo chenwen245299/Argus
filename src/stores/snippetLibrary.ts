@@ -48,40 +48,40 @@ export const pendingSnippet = ref<PendingSnippet | null>(null)
 export const libraries = ref<SnippetLibrary[]>([])
 export const snippets = ref<Snippet[]>([])
 
-let initialized = false
+let migrationDone = false
 
 export async function initSnippetStore() {
-  if (initialized) return
-  initialized = true
-
-  // Migrate localStorage data on first run (one-time)
-  const LS_LIBS = 'argus:snippet-libraries'
-  const LS_SNIPS = 'argus:snippets'
-  const lsLibsRaw = localStorage.getItem(LS_LIBS)
-  const lsSnipsRaw = localStorage.getItem(LS_SNIPS)
-  if (lsLibsRaw) {
-    try {
-      const lsLibs: SnippetLibrary[] = JSON.parse(lsLibsRaw) ?? []
-      const lsSnips: Snippet[] = lsSnipsRaw ? (JSON.parse(lsSnipsRaw) ?? []) : []
-      const snippetsByLibrary: [string, Snippet[]][] = lsLibs.map(lib => [
-        lib.id,
-        lsSnips.filter(s => s.libraryId === lib.id),
-      ])
-      await invoke('migrate_snippets_from_localstorage', {
-        libraries: lsLibs,
-        snippetsByLibrary,
-      })
-      localStorage.removeItem(LS_LIBS)
-      localStorage.removeItem(LS_SNIPS)
-    } catch (e) {
-      console.error('Snippet migration failed:', e)
+  // Migration only runs once per session; loadAll always runs to pick up the current library.
+  if (!migrationDone) {
+    migrationDone = true
+    const LS_LIBS = 'argus:snippet-libraries'
+    const LS_SNIPS = 'argus:snippets'
+    const lsLibsRaw = localStorage.getItem(LS_LIBS)
+    const lsSnipsRaw = localStorage.getItem(LS_SNIPS)
+    if (lsLibsRaw) {
+      try {
+        const lsLibs: SnippetLibrary[] = JSON.parse(lsLibsRaw) ?? []
+        const lsSnips: Snippet[] = lsSnipsRaw ? (JSON.parse(lsSnipsRaw) ?? []) : []
+        const snippetsByLibrary: [string, Snippet[]][] = lsLibs.map(lib => [
+          lib.id,
+          lsSnips.filter(s => s.libraryId === lib.id),
+        ])
+        await invoke('migrate_snippets_from_localstorage', {
+          libraries: lsLibs,
+          snippetsByLibrary,
+        })
+        localStorage.removeItem(LS_LIBS)
+        localStorage.removeItem(LS_SNIPS)
+      } catch (e) {
+        console.error('Snippet migration failed:', e)
+      }
     }
   }
 
   await loadAll()
 }
 
-async function loadAll() {
+export async function loadAll() {
   try {
     const libs = await invoke<SnippetLibrary[]>('list_snippet_libraries')
     libraries.value = libs

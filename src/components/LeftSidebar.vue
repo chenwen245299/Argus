@@ -10,7 +10,7 @@ import { useReaderStore } from '../stores/reader'
 import CollectionNode from './CollectionNode.vue'
 import type { CanvasIndexEntry, Collection, NavItem } from '../types'
 import { updateStore } from '../stores/update'
-import { libraries as snippetLibraries, snippets as allSnippets, createLibrary as createSnippetLibrary, deleteLibrary as deleteSnippetLibrary, renameLibrary as renameSnippetLibrary } from '../stores/snippetLibrary'
+import { libraries as snippetLibraries, snippets as allSnippets, createLibrary as createSnippetLibrary, deleteLibrary as deleteSnippetLibrary, renameLibrary as renameSnippetLibrary, loadAll as reloadSnippets } from '../stores/snippetLibrary'
 
 const { t } = useI18n()
 const library = useLibraryStore()
@@ -181,6 +181,36 @@ async function handleLibraryRefresh() {
     const remaining = 700 - (Date.now() - t0)
     if (remaining > 0) await new Promise(r => setTimeout(r, remaining))
     refreshSpinning.value = false
+  }
+}
+
+const canvasRefreshSpinning = ref(false)
+
+async function handleCanvasRefresh() {
+  if (canvasRefreshSpinning.value) return
+  canvasRefreshSpinning.value = true
+  const t0 = Date.now()
+  try {
+    await canvasStore.loadList()
+  } finally {
+    const remaining = 700 - (Date.now() - t0)
+    if (remaining > 0) await new Promise(r => setTimeout(r, remaining))
+    canvasRefreshSpinning.value = false
+  }
+}
+
+const snippetRefreshSpinning = ref(false)
+
+async function handleSnippetRefresh() {
+  if (snippetRefreshSpinning.value) return
+  snippetRefreshSpinning.value = true
+  const t0 = Date.now()
+  try {
+    await reloadSnippets()
+  } finally {
+    const remaining = 700 - (Date.now() - t0)
+    if (remaining > 0) await new Promise(r => setTimeout(r, remaining))
+    snippetRefreshSpinning.value = false
   }
 }
 
@@ -832,9 +862,9 @@ onUnmounted(() => {
       <div class="section-header" @click.stop="canvasCollapsed = !canvasCollapsed">
         <span class="section-title">{{ t('sidebar.canvas') }}</span>
         <div class="section-header-right">
-          <button v-if="!canvasCollapsed" class="icon-action" :title="t('toolbar.refreshTitle')" @click.stop="canvasStore.loadList()">
+          <button v-if="!canvasCollapsed" class="icon-action" :title="t('toolbar.refreshTitle')" :disabled="canvasRefreshSpinning" @click.stop="handleCanvasRefresh()">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-              :class="{ spin: canvasStore.loading }">
+              :class="{ spin: canvasRefreshSpinning }">
               <polyline points="23 4 23 10 17 10"/>
               <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
             </svg>
@@ -923,6 +953,13 @@ onUnmounted(() => {
       <div class="section-header" @click.stop="snippetCollapsed = !snippetCollapsed">
         <span class="section-title">{{ t('snippets.title') }}</span>
         <div class="section-header-right">
+          <button v-if="!snippetCollapsed" class="icon-action" :title="t('toolbar.refreshTitle')" :disabled="snippetRefreshSpinning" @click.stop="handleSnippetRefresh()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              :class="{ spin: snippetRefreshSpinning }">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
           <button v-if="!snippetCollapsed" class="icon-action" :title="t('snippets.newLibrary')" @click.stop="startNewSnippetLib()">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
               <line x1="12" y1="5" x2="12" y2="19"/>

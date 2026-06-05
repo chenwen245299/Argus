@@ -249,6 +249,8 @@ pub fn run() {
             commands::update_snippet,
             commands::delete_snippet,
             commands::migrate_snippets_from_localstorage,
+            // ── File export ──
+            commands::write_bytes_to_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

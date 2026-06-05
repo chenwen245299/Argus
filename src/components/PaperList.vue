@@ -5,6 +5,8 @@ import { useI18n } from 'vue-i18n'
 import { storeToRefs } from 'pinia'
 import { RecycleScroller } from 'vue-virtual-scroller'
 import { invoke } from '@tauri-apps/api/core'
+import { save as dialogSave } from '@tauri-apps/plugin-dialog'
+import { jsPDF } from 'jspdf'
 import { useLibraryStore } from '../stores/library'
 import { useSelectionStore } from '../stores/selection'
 import { useReaderStore } from '../stores/reader'
@@ -403,21 +405,25 @@ onBeforeUnmount(() => {
 // ── Collection papers ─────────────────────────────────────────────────────────
 const collectionPapers = ref<PaperIndexEntry[]>([])
 
-watch(() => selection.activeCollectionId, async (id) => {
+async function refreshCollectionPapers(id: string | null) {
   if (!id) { collectionPapers.value = []; return }
-  collectionPapers.value = await collectionsStore.listPapersInCollection(id)
-}, { immediate: true })
+  if (collectionsStore.isTopLevel(id)) {
+    collectionPapers.value = collectionsStore.listAllPapersInTree(id)
+  } else {
+    collectionPapers.value = await collectionsStore.listPapersInCollection(id)
+  }
+}
 
-watch(() => collectionsStore.file.assignments, async () => {
-  if (selection.activeCollectionId)
-    collectionPapers.value = await collectionsStore.listPapersInCollection(selection.activeCollectionId)
+watch(() => selection.activeCollectionId, (id) => refreshCollectionPapers(id ?? null), { immediate: true })
+
+watch(() => collectionsStore.file.assignments, () => {
+  refreshCollectionPapers(selection.activeCollectionId ?? null)
 }, { deep: true })
 
 // After a library refresh (e.g. paper rename during import), re-sync collection papers
 // so stale slugs (tempSlug → finalSlug) don't break the right-panel meta load.
-watch(() => library.papers, async () => {
-  if (selection.activeCollectionId)
-    collectionPapers.value = await collectionsStore.listPapersInCollection(selection.activeCollectionId)
+watch(() => library.papers, () => {
+  refreshCollectionPapers(selection.activeCollectionId ?? null)
 })
 
 // ── Filtered / sorted list ────────────────────────────────────────────────────
@@ -472,6 +478,12 @@ function onRowMouseDown(e: MouseEvent, item: PaperIndexEntry) {
     return null
   }
 
+  function effectiveDragTarget(x: number, y: number): string | null {
+    const id = findCollId(x, y)
+    if (!id || collectionsStore.isTopLevel(id)) return null
+    return id
+  }
+
   function onMove(e: MouseEvent) {
     if (!dragging && Math.hypot(e.clientX - startX, e.clientY - startY) < 6) return
     if (!dragging) {
@@ -480,7 +492,7 @@ function onRowMouseDown(e: MouseEvent, item: PaperIndexEntry) {
       document.body.style.cursor = 'grabbing'
     }
     dragGhostPos.value = { x: e.clientX + 16, y: e.clientY + 10 }
-    const collId = findCollId(e.clientX, e.clientY)
+    const collId = effectiveDragTarget(e.clientX, e.clientY)
     if (collId !== hoverCollId) {
       hoverCollId = collId
       document.dispatchEvent(new CustomEvent('argus-paper-drag-over', { detail: { collectionId: collId } }))
@@ -494,7 +506,7 @@ function onRowMouseDown(e: MouseEvent, item: PaperIndexEntry) {
     if (!dragging) return
     dragGhostItem.value = null
     document.dispatchEvent(new CustomEvent('argus-paper-drag-over', { detail: { collectionId: null } }))
-    const collId = findCollId(e.clientX, e.clientY)
+    const collId = effectiveDragTarget(e.clientX, e.clientY)
     if (collId) await collectionsStore.movePaper(item.id, collId)
   }
 
@@ -671,6 +683,133 @@ function showError(msg: string) {
   if (errorTimer) clearTimeout(errorTimer)
   actionError.value = msg
   errorTimer = setTimeout(() => { actionError.value = null }, 6000)
+}
+
+// ── Export literature list as PDF ─────────────────────────────────────────────
+const exportBusy = ref(false)
+const exportDone = ref(false)
+let exportDoneTimer: ReturnType<typeof setTimeout> | null = null
+
+async function exportToPdf() {
+  if (exportBusy.value) return
+  const papers = sorted.value
+  if (papers.length === 0) return
+
+  const savePath = await dialogSave({
+    title: t('list.exportList'),
+    defaultPath: 'literature-list.pdf',
+    filters: [{ name: 'PDF', extensions: ['pdf'] }],
+  })
+  if (!savePath) return
+
+  exportBusy.value = true
+  try {
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
+    const pageW = doc.internal.pageSize.getWidth()
+    const pageH = doc.internal.pageSize.getHeight()
+    const margin = 36
+    const contentW = pageW - margin * 2
+
+    // Title
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(16)
+    doc.text('Literature List', margin, margin + 12)
+    doc.setFont('helvetica', 'normal')
+    doc.setFontSize(9)
+    doc.setTextColor(130)
+    const d = new Date()
+    const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    doc.text(`${papers.length} papers  ${dateStr}`, margin, margin + 28)
+    doc.setTextColor(0)
+
+    // Column layout
+    const colW = {
+      num:     24,
+      title:   contentW * 0.46,
+      authors: contentW * 0.22,
+      venue:   contentW * 0.22,
+      year:    contentW * 0.10 - 24,
+    }
+    const colX = {
+      num:     margin,
+      title:   margin + 24,
+      authors: margin + 24 + colW.title,
+      venue:   margin + 24 + colW.title + colW.authors,
+      year:    margin + 24 + colW.title + colW.authors + colW.venue,
+    }
+    const lineH = 11   // line height in pt for font-size 8
+    const cellPadV = 6 // top/bottom padding inside each row
+    let y = margin + 50
+
+    // Header row
+    doc.setFillColor(238, 238, 244)
+    doc.rect(margin, y, contentW, lineH + cellPadV * 2, 'F')
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(8)
+    doc.setTextColor(90)
+    const hdrY = y + cellPadV + lineH - 2
+    doc.text('#',       colX.num + 2,     hdrY)
+    doc.text('Title',   colX.title + 2,   hdrY)
+    doc.text('Authors', colX.authors + 2, hdrY)
+    doc.text('Venue',   colX.venue + 2,   hdrY)
+    doc.text('Year',    colX.year + 2,    hdrY)
+    y += lineH + cellPadV * 2
+
+    // Data rows
+    doc.setFont('helvetica', 'normal')
+    doc.setFontSize(8)
+
+    for (let i = 0; i < papers.length; i++) {
+      const p = papers[i]
+      const authors = p.authors.length === 0 ? '-'
+        : p.authors.length <= 2 ? p.authors.join(', ')
+        : p.authors[0] + ' et al.'
+
+      const titleLines  = doc.splitTextToSize(p.title, colW.title - 4) as string[]
+      const authorLines = doc.splitTextToSize(authors, colW.authors - 4) as string[]
+      const venueLines  = doc.splitTextToSize(p.venue || '-', colW.venue - 4) as string[]
+
+      const rowH = Math.max(titleLines.length, authorLines.length, venueLines.length) * lineH + cellPadV * 2
+
+      if (y + rowH > pageH - margin) {
+        doc.addPage()
+        y = margin
+      }
+
+      if (i % 2 === 1) {
+        doc.setFillColor(249, 249, 252)
+        doc.rect(margin, y, contentW, rowH, 'F')
+      }
+
+      const textY = y + cellPadV + lineH - 2
+
+      doc.setTextColor(150)
+      doc.text(String(i + 1), colX.num + 2, textY)
+
+      doc.setTextColor(20)
+      doc.text(titleLines, colX.title + 2, textY, { lineHeightFactor: lineH / 8 })
+
+      doc.setTextColor(80)
+      doc.text(authorLines, colX.authors + 2, textY, { lineHeightFactor: lineH / 8 })
+      doc.text(venueLines,  colX.venue + 2,   textY, { lineHeightFactor: lineH / 8 })
+
+      doc.setTextColor(120)
+      doc.text(String(p.year ?? '-'), colX.year + 2, textY)
+
+      y += rowH
+    }
+
+    const pdfBytes = doc.output('arraybuffer')
+    await invoke('write_bytes_to_file', { path: savePath, bytes: Array.from(new Uint8Array(pdfBytes)) })
+
+    if (exportDoneTimer) clearTimeout(exportDoneTimer)
+    exportDone.value = true
+    exportDoneTimer = setTimeout(() => { exportDone.value = false }, 2200)
+  } catch (e) {
+    showError(String(e))
+  } finally {
+    exportBusy.value = false
+  }
 }
 
 const aiSummaryStreamUnlisteners = new Map<string, () => void>()
@@ -918,6 +1057,25 @@ async function reExtract(item: PaperIndexEntry) {
       <!-- Count + column picker (fixed on the right) -->
       <div class="hdr-controls">
         <span class="list-count">{{ sorted.length }}</span>
+        <button
+          class="col-picker-btn"
+          :class="{ active: exportDone }"
+          :disabled="exportBusy"
+          :title="exportDone ? t('list.exportListDone') : t('list.exportList')"
+          @click.stop="exportToPdf"
+        >
+          <svg v-if="exportBusy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="spin">
+            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+          </svg>
+          <svg v-else-if="exportDone" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+          <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/>
+            <polyline points="16 6 12 2 8 6"/>
+            <line x1="12" y1="2" x2="12" y2="15"/>
+          </svg>
+        </button>
         <button
           class="col-picker-btn"
           :class="{ active: showColPicker }"
@@ -1415,6 +1573,10 @@ async function reExtract(item: PaperIndexEntry) {
 }
 .col-picker-btn:hover,
 .col-picker-btn.active { background: var(--bg-hover); color: var(--text-secondary); }
+.col-picker-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.col-picker-btn:disabled:hover { background: transparent; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.9s linear infinite; }
 
 .col-picker-menu {
   position: absolute;

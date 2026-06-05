@@ -1401,26 +1401,19 @@ pub async fn open_note_window(
     slug: String,
     note_id: String,
     title: String,
+    window_label: Option<String>,
 ) -> Result<(), String> {
-    use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
-
-    if let Some(win) = app.get_webview_window("note-window") {
-        let _ = win.set_focus();
-        let _ = win.emit(
-            "note-window-data",
-            serde_json::json!({
-                "slug": slug, "noteId": note_id, "title": title
-            }),
-        );
-        return Ok(());
-    }
+    use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
     let (width, height) =
         load_note_window_size(&app).unwrap_or((NOTE_DEFAULT_WINDOW_W, NOTE_DEFAULT_WINDOW_H));
+    let window_label = window_label
+        .filter(|label| is_valid_note_window_label(label))
+        .unwrap_or_else(unique_note_window_label);
 
     let builder = WebviewWindowBuilder::new(
         &app,
-        "note-window",
+        &window_label,
         WebviewUrl::App(std::path::PathBuf::from("/")),
     )
     .title(&format!("{} — Argus 笔记", title))
@@ -1457,6 +1450,9 @@ pub async fn open_note_window(
     });
 
     let win_c = win.clone();
+    let app_c = app.clone();
+    let window_label_c = window_label.clone();
+    let data_event = note_window_data_event(&window_label_c);
     let data = serde_json::json!({ "slug": slug, "noteId": note_id, "title": title });
     tauri::async_runtime::spawn(async move {
         // Wait for macOS frame restoration to settle, then re-apply the saved size.
@@ -1464,10 +1460,34 @@ pub async fn open_note_window(
         let _ = win_c.unmaximize();
         let _ = win_c.set_size(tauri::LogicalSize::new(width, height));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let _ = win_c.emit("note-window-data", data);
+        let _ = app_c.emit_to(
+            tauri::EventTarget::webview_window(window_label_c),
+            &data_event,
+            data,
+        );
     });
 
     Ok(())
+}
+
+fn unique_note_window_label() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("note-window-{nanos}")
+}
+
+fn is_valid_note_window_label(label: &str) -> bool {
+    label.starts_with("note-window-")
+        && label.len() <= 128
+        && label
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+fn note_window_data_event(window_label: &str) -> String {
+    format!("note-window-data-{window_label}")
 }
 
 const NOTE_WINDOW_SIZE_STORE_KEY: &str = "note_window_size_v1";
@@ -2244,6 +2264,12 @@ pub fn delete_snippet(
 ) -> Result<(), String> {
     let root = get_root(&state)?;
     snippets::delete_snippet(&root, &library_id, &id)
+}
+
+// ── File export ───────────────────────────────────────────────────────────────
+#[tauri::command]
+pub fn write_bytes_to_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Argus default capability",
-  "windows": ["main", "arxiv", "canvas", "library-chat", "paper-ai", "note-window"],
+  "windows": ["main", "arxiv", "canvas", "library-chat", "paper-ai", "note-window", "note-window-*"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

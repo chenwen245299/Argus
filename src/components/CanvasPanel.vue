@@ -715,12 +715,10 @@ function onNodeMouseEnter(event: NodeMouseEvent) {
   if (hoverTimer) clearTimeout(hoverTimer)
   hoverTimer = setTimeout(async () => {
     hoverNodeId.value = nd.id
-    const source = nd.data.hoverSource ?? canvasStore.settings.hover_content_source
-    if (source === 'none') { hoverContent.value = ''; return }
     hoverLoading.value = true
     hoverContent.value = ''
     try {
-      const raw = await canvasStore.getNodeDisplayContent(nd.data.paperId, source)
+      const raw = await canvasStore.getNodeDisplayContent(nd.data.paperId, 'notes')
       hoverContent.value = raw
     } finally {
       hoverLoading.value = false

@@ -7,6 +7,15 @@ import VditorEditor from '../components/VditorEditor.vue'
 
 interface NoteWindowData { slug: string; noteId: string; title: string }
 
+function getWindowLabel() {
+  try {
+    return getCurrentWebviewWindow().label
+  } catch {
+    return 'note-window'
+  }
+}
+
+const windowLabel = getWindowLabel()
 const slug = ref<string | null>(null)
 const noteId = ref<string | null>(null)
 const noteTitle = ref('笔记')
@@ -19,6 +28,14 @@ const isMac = navigator.userAgent.toLowerCase().includes('macintosh')
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let unlisten: UnlistenFn | null = null
+
+function noteWindowStorageKey() {
+  return `argus:note-window:${windowLabel}`
+}
+
+function noteWindowDataEvent() {
+  return `note-window-data-${windowLabel}`
+}
 
 async function setWindowTitle(title: string) {
   document.title = `${title} — Argus 笔记`
@@ -62,20 +79,18 @@ function onContentChange(markdown: string) {
 }
 
 onMounted(async () => {
-  // localStorage is written by the main window before calling open_note_window
+  unlisten = await listen<NoteWindowData>(noteWindowDataEvent(), async (event) => {
+    await loadNote(event.payload)
+  })
+
+  // The main window writes per-window initial data before calling open_note_window.
   try {
-    const stored = localStorage.getItem('argus:note-window')
+    const stored = localStorage.getItem(noteWindowStorageKey())
     if (stored) {
       const data: NoteWindowData = JSON.parse(stored)
       if (data.slug && data.noteId) await loadNote(data)
     }
   } catch {}
-
-  // Listen for updates (switching notes into an already-open window)
-  unlisten = await listen<NoteWindowData>('note-window-data', async (event) => {
-    await loadNote(event.payload)
-  })
-
 })
 
 onBeforeUnmount(() => {

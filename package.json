@@ -29,6 +29,7 @@
     "dompurify": "^3.4.7",
     "highlight.js": "^11.11.1",
     "html-to-image": "^1.11.13",
+    "jspdf": "^4.2.1",
     "katex": "^0.17.0",
     "llamaindex": "^0.12.1",
     "marked": "^18.0.4",

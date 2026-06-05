@@ -54,7 +54,7 @@ onMounted(async () => {
     <CanvasView v-else-if="windowLabel === 'canvas'" />
     <LibraryChatView v-else-if="windowLabel === 'library-chat'" />
     <PaperAiView v-else-if="windowLabel === 'paper-ai'" />
-    <NoteWindowView v-else-if="windowLabel === 'note-window'" />
+    <NoteWindowView v-else-if="windowLabel.startsWith('note-window')" />
     <MainView v-else />
   </div>
 </template>

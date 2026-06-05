@@ -51,6 +51,11 @@ const saveError = ref('')
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let openNoteSeq = 0
 
+function createNoteWindowLabel() {
+  const suffix = Math.random().toString(36).slice(2, 10)
+  return `note-window-${Date.now()}-${suffix}`
+}
+
 // ── Load note list ─────────────────────────────────────────────────────────────
 async function loadList(slug: string) {
   loadingList.value = true
@@ -228,14 +233,16 @@ onBeforeUnmount(async () => {
 async function openInWindow() {
   if (!props.slug || !activeNote.value) return
   await maybeSave()
-  localStorage.setItem('argus:note-window', JSON.stringify({
-    slug: props.slug, noteId: activeNote.value.id, title: activeNote.value.title,
-  }))
+  const windowLabel = createNoteWindowLabel()
+  const data = { slug: props.slug, noteId: activeNote.value.id, title: activeNote.value.title }
+  localStorage.setItem(`argus:note-window:${windowLabel}`, JSON.stringify(data))
   try {
     await invoke('open_note_window', {
-      slug: props.slug, noteId: activeNote.value.id, title: activeNote.value.title,
+      ...data,
+      windowLabel,
     })
   } catch (e) {
+    localStorage.removeItem(`argus:note-window:${windowLabel}`)
     console.error('Failed to open note window:', e)
   }
 }

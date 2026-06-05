@@ -32,7 +32,12 @@ function childCollections(col: Collection): Collection[] {
 <template>
   <div class="ctx-submenu" :class="{ 'is-root': level === 0, 'is-nested': level > 0 }">
     <div v-for="col in collections" :key="col.id" class="ctx-folder-row-wrap">
-      <button class="ctx-item ctx-collection-item" @click.stop="emit('select', col.id)">
+      <button
+        class="ctx-item ctx-collection-item"
+        :class="{ 'ctx-toplevel-folder': level === 0 }"
+        :style="level === 0 ? 'cursor: default' : ''"
+        @click.stop="level > 0 && emit('select', col.id)"
+      >
         <span class="ctx-collection-icon" aria-hidden="true">{{ collectionEmoji(col) }}</span>
         <span class="ctx-collection-name">{{ col.name }}</span>
         <svg
@@ -59,3 +64,14 @@ function childCollections(col: Collection): Collection[] {
     </div>
   </div>
 </template>
+
+<style scoped>
+:global(.ctx-toplevel-folder) {
+  opacity: 0.6;
+  pointer-events: auto;
+}
+:global(.ctx-toplevel-folder:hover) {
+  background: transparent !important;
+  color: var(--text-primary) !important;
+}
+</style>

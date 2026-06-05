@@ -1023,8 +1023,29 @@ function onKeyDown(e: KeyboardEvent) {
 function onWheel(e: WheelEvent) {
   if (!e.metaKey && !e.ctrlKey) return
   e.preventDefault()
-  if (e.deltaY < 0) zoomIn()
-  else zoomOut()
+
+  const container = containerRef.value
+  if (!container) {
+    if (e.deltaY < 0) zoomIn(); else zoomOut()
+    return
+  }
+
+  const rect = container.getBoundingClientRect()
+  const mouseRelX = e.clientX - rect.left
+  const mouseRelY = e.clientY - rect.top
+  const oldScrollLeft = container.scrollLeft
+  const oldScrollTop  = container.scrollTop
+  const oldScale = scale.value
+
+  if (e.deltaY < 0) zoomIn(); else zoomOut()
+
+  const ratio = scale.value / oldScale
+  if (ratio === 1) return
+
+  nextTick(() => {
+    container.scrollLeft = (oldScrollLeft + mouseRelX) * ratio - mouseRelX
+    container.scrollTop  = (oldScrollTop  + mouseRelY) * ratio - mouseRelY
+  })
 }
 
 // ── Text selection → highlight creation ──────────────────────────────────────

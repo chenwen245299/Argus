@@ -28,16 +28,10 @@ const nodeStyle = computed(() => {
   if (props.data.color) {
     return {
       borderColor: props.data.color,
-      background: `${props.data.color}18`,
-      boxShadow: `0 0 0 2px ${props.data.color}28`,
     }
   }
   return {}
 })
-
-const accentBarStyle = computed(() =>
-  props.data.color ? { background: props.data.color } : null
-)
 
 const NOTE_BADGE_STYLES = [
   { backgroundColor: '#eef6ff', borderColor: '#bfdbfe', color: '#1d4ed8' },
@@ -63,9 +57,6 @@ function noteBadgeStyle(title: string, index: number) {
     :class="{ 'paper-node--selected': selected, 'paper-node--invalid': !data.valid }"
     :style="nodeStyle"
   >
-    <!-- Color accent bar -->
-    <div v-if="accentBarStyle" class="node-color-bar" :style="accentBarStyle" />
-
     <!-- Source handles: any anchor can be the drag start. -->
     <Handle id="src-left" type="source" :position="Position.Left" class="node-handle" />
     <Handle id="src-top" type="source" :position="Position.Top" class="node-handle" />
@@ -81,7 +72,7 @@ function noteBadgeStyle(title: string, index: number) {
     <div class="node-content">
       <div v-if="!data.valid" class="node-invalid-badge">已删除</div>
 
-      <div class="node-title" :title="data.title">{{ data.title || '未知论文' }}</div>
+      <div class="node-title">{{ data.title || '未知论文' }}</div>
       <div class="node-meta">
         <span v-if="authorsShort" class="node-authors">{{ authorsShort }}</span>
         <span v-if="data.year" class="node-year">{{ data.year }}</span>
@@ -91,13 +82,12 @@ function noteBadgeStyle(title: string, index: number) {
           v-for="(title, index) in data.noteTitles"
           :key="title"
           class="node-note-badge"
-          :title="title"
           :style="noteBadgeStyle(title, index)"
         >
           {{ title }}
         </span>
       </div>
-      <div v-if="data.venue" class="node-venue" :title="data.venue">{{ data.venue }}</div>
+      <div v-if="data.venue" class="node-venue">{{ data.venue }}</div>
     </div>
   </div>
 </template>
@@ -129,22 +119,13 @@ function noteBadgeStyle(title: string, index: number) {
 
 .paper-node--selected {
   border-color: var(--accent, #6366f1) !important;
-  box-shadow: 0 0 0 3px var(--accent-light, #e0e7ff) !important;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08) !important;
 }
 
 .paper-node--invalid {
   opacity: 0.55;
   border-color: #ef4444 !important;
   background: #fef2f2;
-}
-
-.node-color-bar {
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 4px;
-  border-radius: 10px 0 0 10px;
 }
 
 .node-invalid-badge {

@@ -516,37 +516,17 @@ mod acl {
 mod openreview {
     use super::*;
 
+    /// Extract the `?id=` value from any openreview.net URL (forum or pdf).
     pub fn parse_id(input: &str) -> Option<String> {
         let s = input.trim();
-
-        // ?id= query parameter
         if let Some(pos) = s.find("?id=") {
             let after = &s[pos + 4..];
             let id = after.split(|c: char| c == '&' || c == '#').next()?.trim();
-            if looks_like_id(id) {
+            if !id.is_empty() {
                 return Some(id.to_string());
             }
         }
-
-        if s.contains("openreview.net") {
-            return None;
-        }
-
-        // Bare ID
-        if looks_like_id(s) {
-            return Some(s.to_string());
-        }
         None
-    }
-
-    fn looks_like_id(s: &str) -> bool {
-        let len = s.len();
-        len >= 6
-            && len <= 32
-            && s.chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-            && s.chars().any(|c| c.is_uppercase() || c.is_lowercase())
-            && !s.contains('.')
     }
 
     struct Meta {
@@ -555,113 +535,72 @@ mod openreview {
         year: Option<u32>,
         venue: Option<String>,
         abstract_text: Option<String>,
+        pdf_url: String,
     }
 
-    /// Extract a string field that may be either `{"value": "..."}` (v2) or `"..."` (v1).
-    fn str_field<'a>(content: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-        let f = &content[key];
-        f["value"].as_str().or_else(|| f.as_str())
+    fn html_unescape(s: &str) -> String {
+        s.replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#x27;", "'")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
     }
 
-    /// Extract an array of strings that may be `{"value": [...]}` (v2) or `[...]` (v1).
-    fn str_array_field(content: &serde_json::Value, key: &str) -> Vec<String> {
-        let f = &content[key];
-        let arr = if f.is_array() { f } else { &f["value"] };
-        arr.as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Extract the `content="..."` value from the first matching `<meta name="...">` tag.
+    fn meta_content(html: &str, name: &str) -> Option<String> {
+        let pat = format!(r#"name="{name}" content=""#);
+        let pos = html.find(pat.as_str())?;
+        let after = &html[pos + pat.len()..];
+        let end = after.find('"')?;
+        let val = after[..end].trim();
+        if val.is_empty() { None } else { Some(html_unescape(val)) }
     }
 
-    fn parse_note(note: &serde_json::Value) -> Option<Meta> {
-        let content = &note["content"];
-        let title = str_field(content, "title")?.trim().to_string();
-        if title.is_empty() {
-            return None;
+    /// Extract all `content="..."` values from `<meta name="...">` tags (e.g. multiple authors).
+    fn meta_content_all(html: &str, name: &str) -> Vec<String> {
+        let pat = format!(r#"name="{name}" content=""#);
+        let mut out = vec![];
+        let mut rest = html;
+        while let Some(pos) = rest.find(pat.as_str()) {
+            let after = &rest[pos + pat.len()..];
+            if let Some(end) = after.find('"') {
+                let val = after[..end].trim();
+                if !val.is_empty() {
+                    out.push(html_unescape(val));
+                }
+            }
+            rest = &rest[pos + pat.len()..];
         }
-        let authors = str_array_field(content, "authors");
-        let venue_raw = str_field(content, "venue").map(|s| s.trim().to_string());
-        let year = venue_raw
-            .as_deref()
-            .and_then(extract_year_from_venue)
-            .or_else(|| {
-                let ms = note["cdate"].as_i64().or_else(|| note["tcdate"].as_i64())?;
-                let dt = chrono::DateTime::from_timestamp(ms / 1000, 0)?;
-                dt.format("%Y").to_string().parse::<u32>().ok()
-            });
-        let abstract_text = str_field(content, "abstract")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        Some(Meta {
-            title,
-            authors,
-            year,
-            venue: venue_raw,
-            abstract_text,
-        })
-    }
-
-    async fn fetch_notes(
-        client: &reqwest::Client,
-        param: &str,
-        value: &str,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        let url = format!("https://api2.openreview.net/notes?{param}={value}&limit=10");
-        let json: serde_json::Value = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("Fetch OpenReview API: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("Parse JSON: {e}"))?;
-        Ok(json["notes"].as_array().cloned().unwrap_or_default())
+        out
     }
 
     async fn fetch_meta(client: &reqwest::Client, id: &str) -> Result<Meta, String> {
-        // Try ?id= first (usually the paper note ID = forum ID)
-        let notes_by_id = fetch_notes(client, "id", id).await?;
-        if let Some(meta) = notes_by_id.first().and_then(|n| parse_note(n)) {
-            return Ok(meta);
-        }
+        let forum_url = format!("https://openreview.net/forum?id={id}");
+        let html = client
+            .get(&forum_url)
+            .send()
+            .await
+            .map_err(|e| format!("Fetch OpenReview page: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("Read page: {e}"))?;
 
-        // Fall back to ?forum= — returns all notes in the thread; find the submission
-        let notes_by_forum = fetch_notes(client, "forum", id).await.unwrap_or_default();
+        let title = meta_content(&html, "citation_title")
+            .ok_or_else(|| format!("OpenReview: could not find title for '{id}'"))?;
+        let authors = meta_content_all(&html, "citation_author");
+        let pdf_url = meta_content(&html, "citation_pdf_url")
+            .unwrap_or_else(|| format!("https://openreview.net/pdf?id={id}"));
+        let venue = meta_content(&html, "citation_conference_title");
+        let abstract_text = meta_content(&html, "citation_abstract")
+            .or_else(|| meta_content(&html, "description"))
+            .filter(|s| !s.is_empty());
+        // citation_online_date is "YYYY/MM/DD"
+        let year = meta_content(&html, "citation_online_date")
+            .and_then(|d| d.split('/').next().and_then(|y| y.parse::<u32>().ok()));
 
-        // Prefer a note whose invitation mentions "Submission"
-        let submission_note = notes_by_forum
-            .iter()
-            .find(|n| {
-                n["invitation"]
-                    .as_str()
-                    .map(|inv| inv.contains("Submission") || inv.contains("submission"))
-                    .unwrap_or(false)
-            })
-            .or_else(|| notes_by_forum.first());
-
-        submission_note.and_then(|n| parse_note(n)).ok_or_else(|| {
-            format!("OpenReview: paper '{id}' not found or has no accessible metadata")
-        })
-    }
-
-    fn extract_year_from_venue(venue: &str) -> Option<u32> {
-        venue.split_whitespace().find_map(|w| {
-            let digits: String = w.chars().filter(|c| c.is_ascii_digit()).collect();
-            if digits.len() == 4 {
-                let y: u32 = digits.parse().ok()?;
-                if (2000..=2099).contains(&y) {
-                    Some(y)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
+        Ok(Meta { title, authors, year, venue, abstract_text, pdf_url })
     }
 
     pub async fn import(
@@ -682,19 +621,23 @@ mod openreview {
         emit("fetching");
 
         let client = reqwest::Client::builder()
-            .user_agent("Argus/0.1")
-            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("Mozilla/5.0 (compatible; Argus/1.0)")
+            .timeout(std::time::Duration::from_secs(40))
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
 
         let meta = fetch_meta(&client, &id).await?;
 
         emit("downloading");
-        let pdf_bytes = client
-            .get(format!("https://openreview.net/pdf?id={id}"))
+        let resp = client
+            .get(&meta.pdf_url)
             .send()
             .await
-            .map_err(|e| format!("Download PDF: {e}"))?
+            .map_err(|e| format!("Download PDF: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("PDF unavailable: HTTP {}", resp.status()));
+        }
+        let pdf_bytes = resp
             .bytes()
             .await
             .map_err(|e| format!("Read PDF: {e}"))?;
@@ -705,11 +648,7 @@ mod openreview {
         let papers_dir = Path::new(root).join("papers");
         let final_dir = {
             let c = papers_dir.join(&slug_base);
-            if c.exists() {
-                papers_dir.join(format!("{slug_base}-2"))
-            } else {
-                c
-            }
+            if c.exists() { papers_dir.join(format!("{slug_base}-2")) } else { c }
         };
         let final_slug = final_dir
             .file_name()
@@ -740,13 +679,7 @@ mod openreview {
         };
 
         super::finalize_paper(
-            root,
-            &final_dir,
-            &final_slug,
-            paper_meta,
-            collection_id,
-            app,
-            "openreview",
+            root, &final_dir, &final_slug, paper_meta, collection_id, app, "openreview",
         )
         .await?;
         Ok(final_slug)

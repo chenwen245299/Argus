@@ -69,7 +69,7 @@ async function onSlugChanged(newSlug: string) {
   if (oldSlug && reader.openSlug === oldSlug) {
     reader.replacePaperSlug(oldSlug, newSlug, meta.value?.title)
   }
-  selection.selectedSlug = newSlug
+  selection.selectPaper(newSlug)
   await library.refresh()
   // Reload meta with new slug
   try {

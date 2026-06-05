@@ -14,13 +14,17 @@ fn libraries_path(root: &str) -> PathBuf {
     snippets_dir(root).join("libraries.json")
 }
 
-fn library_snippets_path(root: &str, library_id: &str) -> PathBuf {
-    snippets_dir(root).join(format!("{}.json", library_id))
+fn validate_library_id(library_id: &str) -> Result<(), String> {
+    crate::path_guard::validate_segment("snippet library id", library_id)
+}
+
+fn library_snippets_path(root: &str, library_id: &str) -> Result<PathBuf, String> {
+    validate_library_id(library_id)?;
+    Ok(snippets_dir(root).join(format!("{}.json", library_id)))
 }
 
 fn ensure_snippets_dir(root: &str) -> Result<(), String> {
-    std::fs::create_dir_all(snippets_dir(root))
-        .map_err(|e| format!("Create snippets dir: {e}"))
+    std::fs::create_dir_all(snippets_dir(root)).map_err(|e| format!("Create snippets dir: {e}"))
 }
 
 // ── Libraries ─────────────────────────────────────────────────────────────────
@@ -37,10 +41,9 @@ fn read_libraries(root: &str) -> Vec<SnippetLibrary> {
 }
 
 fn write_libraries(root: &str, libs: &[SnippetLibrary]) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(libs)
-        .map_err(|e| format!("Serialize libraries: {e}"))?;
-    std::fs::write(libraries_path(root), content)
-        .map_err(|e| format!("Write libraries: {e}"))
+    let content =
+        serde_json::to_string_pretty(libs).map_err(|e| format!("Serialize libraries: {e}"))?;
+    std::fs::write(libraries_path(root), content).map_err(|e| format!("Write libraries: {e}"))
 }
 
 pub fn list_snippet_libraries(root: &str) -> Result<Vec<SnippetLibrary>, String> {
@@ -64,16 +67,16 @@ pub fn create_snippet_library(
     libs.push(lib.clone());
     write_libraries(root, &libs)?;
     // Create empty snippets file
-    let snippets_path = library_snippets_path(root, &lib.id);
+    let snippets_path = library_snippets_path(root, &lib.id)?;
     if !snippets_path.exists() {
-        std::fs::write(&snippets_path, "[]")
-            .map_err(|e| format!("Init snippets file: {e}"))?;
+        std::fs::write(&snippets_path, "[]").map_err(|e| format!("Init snippets file: {e}"))?;
     }
     Ok(lib)
 }
 
 pub fn rename_snippet_library(root: &str, id: &str, name: String) -> Result<(), String> {
     ensure_snippets_dir(root)?;
+    validate_library_id(id)?;
     let mut libs = read_libraries(root);
     if let Some(lib) = libs.iter_mut().find(|l| l.id == id) {
         lib.name = name.trim().to_string();
@@ -87,6 +90,7 @@ pub fn update_snippet_library_emoji(
     emoji: Option<String>,
 ) -> Result<(), String> {
     ensure_snippets_dir(root)?;
+    validate_library_id(id)?;
     let mut libs = read_libraries(root);
     if let Some(lib) = libs.iter_mut().find(|l| l.id == id) {
         lib.emoji = emoji;
@@ -96,13 +100,13 @@ pub fn update_snippet_library_emoji(
 
 pub fn delete_snippet_library(root: &str, id: &str) -> Result<(), String> {
     ensure_snippets_dir(root)?;
+    validate_library_id(id)?;
     let mut libs = read_libraries(root);
     libs.retain(|l| l.id != id);
     write_libraries(root, &libs)?;
-    let snippets_path = library_snippets_path(root, id);
+    let snippets_path = library_snippets_path(root, id)?;
     if snippets_path.exists() {
-        std::fs::remove_file(&snippets_path)
-            .map_err(|e| format!("Delete snippets file: {e}"))?;
+        std::fs::remove_file(&snippets_path).map_err(|e| format!("Delete snippets file: {e}"))?;
     }
     Ok(())
 }
@@ -110,7 +114,9 @@ pub fn delete_snippet_library(root: &str, id: &str) -> Result<(), String> {
 // ── Snippets ──────────────────────────────────────────────────────────────────
 
 fn read_snippets(root: &str, library_id: &str) -> Vec<Snippet> {
-    let path = library_snippets_path(root, library_id);
+    let Ok(path) = library_snippets_path(root, library_id) else {
+        return vec![];
+    };
     if !path.exists() {
         return vec![];
     }
@@ -121,14 +127,16 @@ fn read_snippets(root: &str, library_id: &str) -> Vec<Snippet> {
 }
 
 fn write_snippets(root: &str, library_id: &str, snippets: &[Snippet]) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(snippets)
-        .map_err(|e| format!("Serialize snippets: {e}"))?;
-    std::fs::write(library_snippets_path(root, library_id), content)
+    validate_library_id(library_id)?;
+    let content =
+        serde_json::to_string_pretty(snippets).map_err(|e| format!("Serialize snippets: {e}"))?;
+    std::fs::write(library_snippets_path(root, library_id)?, content)
         .map_err(|e| format!("Write snippets: {e}"))
 }
 
 pub fn get_snippets(root: &str, library_id: &str) -> Result<Vec<Snippet>, String> {
     ensure_snippets_dir(root)?;
+    validate_library_id(library_id)?;
     Ok(read_snippets(root, library_id))
 }
 
@@ -147,6 +155,7 @@ pub struct AddSnippetInput {
 
 pub fn add_snippet(root: &str, input: AddSnippetInput) -> Result<Snippet, String> {
     ensure_snippets_dir(root)?;
+    validate_library_id(&input.library_id)?;
     let snippet = Snippet {
         id: Uuid::new_v4().to_string(),
         library_id: input.library_id.clone(),
@@ -173,6 +182,7 @@ pub fn update_snippet(
     note: Option<String>,
 ) -> Result<(), String> {
     ensure_snippets_dir(root)?;
+    validate_library_id(library_id)?;
     let mut snippets = read_snippets(root, library_id);
     if let Some(s) = snippets.iter_mut().find(|s| s.id == id) {
         if let Some(t) = tags {
@@ -187,6 +197,7 @@ pub fn update_snippet(
 
 pub fn delete_snippet(root: &str, library_id: &str, id: &str) -> Result<(), String> {
     ensure_snippets_dir(root)?;
+    validate_library_id(library_id)?;
     let mut snippets = read_snippets(root, library_id);
     snippets.retain(|s| s.id != id);
     write_snippets(root, library_id, &snippets)
@@ -204,6 +215,9 @@ pub fn migrate_from_localstorage(
     // Only migrate if the libraries file doesn't exist yet
     if libraries_path(root).exists() {
         return Ok(());
+    }
+    for lib in &libraries {
+        validate_library_id(&lib.id)?;
     }
     write_libraries(root, &libraries)?;
     for (library_id, snippets) in snippets_by_library {

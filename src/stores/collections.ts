@@ -140,6 +140,7 @@ export const useCollectionsStore = defineStore('collections', () => {
       await invoke('delete_collection', { id })
       // Remove cascade: the backend handles it; reload to be in sync.
       await load()
+      await library.refresh()
     } catch (e) {
       console.error('delete_collection:', e)
     }

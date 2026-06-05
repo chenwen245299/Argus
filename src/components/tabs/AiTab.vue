@@ -43,6 +43,8 @@ interface AssistantAnswer {
   contextMode?: string
   usedPdf?: boolean
   source?: 'chat' | 'metadataExtraction'
+  // Actual content injected into the system prompt, received via -context event
+  contextContent?: { metadata: string; summary: string; fulltext: string }
 }
 
 interface Conversation {
@@ -757,6 +759,16 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
   })
   unlisteners.set(answer.id, unlisten)
 
+  // Receive the actual context injected into the system prompt for the transparency banner
+  const unlistenCtx = await listen<{ metadata: string; summary: string; fulltext: string }>(
+    `${eventName}-context`,
+    (event) => {
+      const reactiveAns = findReactiveAnswer(answer.id)
+      if (reactiveAns) reactiveAns.contextContent = event.payload
+    },
+  )
+  unlisteners.set(`${answer.id}-context`, unlistenCtx)
+
   // Only listen to reasoning events when the user explicitly enabled the toggle.
   // Some models (e.g. DeepSeek) emit reasoning_content by default; suppress it here
   // so "思考过程" never appears unless the user opted in.
@@ -814,6 +826,9 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     const offR = unlisteners.get(`${answer.id}-reasoning`)
     if (offR) offR()
     unlisteners.delete(`${answer.id}-reasoning`)
+    const offCtx = unlisteners.get(`${answer.id}-context`)
+    if (offCtx) offCtx()
+    unlisteners.delete(`${answer.id}-context`)
     persistActiveConversation()
     scrollToBottom()
   }
@@ -1039,6 +1054,32 @@ onUnmounted(() => {
   for (const off of unlisteners.values()) off()
   unlisteners.clear()
 })
+
+// ── Context banner ────────────────────────────────────────────────────────────
+const expandedContextId = ref<string | null>(null)
+
+function getFirstAnswer(userNodeId: string): AssistantAnswer | undefined {
+  const nodes = activeConversation.value?.nodes ?? []
+  const group = nodes.find(
+    n => n.role === 'assistantGroup' && (n as AssistantGroupNode).promptId === userNodeId,
+  ) as AssistantGroupNode | undefined
+  return group?.answers[0]
+}
+
+function hasContextBanner(userNodeId: string): boolean {
+  const ans = getFirstAnswer(userNodeId)
+  if (!ans) return false
+  if (ans.contextContent) {
+    return !!(ans.contextContent.metadata || ans.contextContent.summary || ans.contextContent.fulltext) || !!ans.usedPdf
+  }
+  // Fallback for old conversations without contextContent
+  const mode = ans.contextMode ?? 'none'
+  return (mode !== 'none' && mode !== '') || !!ans.usedPdf
+}
+
+function toggleContextPanel(nodeId: string) {
+  expandedContextId.value = expandedContextId.value === nodeId ? null : nodeId
+}
 </script>
 
 <template>
@@ -1197,6 +1238,47 @@ onUnmounted(() => {
               </template>
               <!-- Normal mode -->
               <template v-else>
+                <!-- Context banner: shows what was ACTUALLY sent to the AI for this message -->
+                <div v-if="hasContextBanner(node.id)" class="context-banner">
+                  <button class="ctx-pills" @click="toggleContextPanel(node.id)" :title="expandedContextId === node.id ? '收起' : '查看发送给 AI 的上下文'">
+                    <template v-if="getFirstAnswer(node.id)?.contextContent">
+                      <span v-if="getFirstAnswer(node.id)!.contextContent!.metadata" class="ctx-pill ctx-meta">元数据</span>
+                      <span v-if="getFirstAnswer(node.id)!.contextContent!.summary" class="ctx-pill ctx-summary">AI 总结</span>
+                      <span v-if="getFirstAnswer(node.id)!.contextContent!.fulltext" class="ctx-pill ctx-fulltext">全文</span>
+                      <span v-if="getFirstAnswer(node.id)!.usedPdf" class="ctx-pill ctx-pdf">PDF</span>
+                    </template>
+                    <template v-else>
+                      <!-- contextContent not yet received or old conversation: fall back to contextMode -->
+                      <span v-if="getFirstAnswer(node.id)?.contextMode === 'metadata'" class="ctx-pill ctx-meta">元数据</span>
+                      <span v-if="getFirstAnswer(node.id)?.contextMode === 'summary' || getFirstAnswer(node.id)?.contextMode === 'summary+fulltext'" class="ctx-pill ctx-summary">AI 总结</span>
+                      <span v-if="getFirstAnswer(node.id)?.contextMode === 'fulltext' || getFirstAnswer(node.id)?.contextMode === 'summary+fulltext'" class="ctx-pill ctx-fulltext">全文</span>
+                      <span v-if="getFirstAnswer(node.id)?.usedPdf" class="ctx-pill ctx-pdf">PDF</span>
+                    </template>
+                    <svg class="ctx-chevron" :class="{ open: expandedContextId === node.id }" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                      <polyline points="6 9 12 15 18 9"/>
+                    </svg>
+                  </button>
+                  <div v-if="expandedContextId === node.id" class="ctx-preview">
+                    <template v-if="getFirstAnswer(node.id)?.contextContent">
+                      <div v-if="getFirstAnswer(node.id)!.contextContent!.metadata" class="ctx-section">
+                        <div class="ctx-section-label">元数据</div>
+                        <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.metadata }}</pre>
+                      </div>
+                      <div v-if="getFirstAnswer(node.id)!.contextContent!.summary" class="ctx-section">
+                        <div class="ctx-section-label">AI 总结</div>
+                        <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.summary }}</pre>
+                      </div>
+                      <div v-if="getFirstAnswer(node.id)!.contextContent!.fulltext" class="ctx-section">
+                        <div class="ctx-section-label">全文</div>
+                        <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.fulltext }}</pre>
+                      </div>
+                      <div v-if="getFirstAnswer(node.id)!.usedPdf && !getFirstAnswer(node.id)!.contextContent!.fulltext" class="ctx-section">
+                        <pre class="ctx-preview-text">PDF 文件已直接发送给模型</pre>
+                      </div>
+                    </template>
+                    <div v-else class="ctx-loading">{{ getFirstAnswer(node.id)?.streaming ? '等待后端响应…' : '暂无上下文记录（旧对话不支持）' }}</div>
+                  </div>
+                </div>
                 <div class="user-bubble">{{ node.content }}</div>
                 <div class="msg-footer user-footer">
                   <div class="msg-actions">
@@ -2617,5 +2699,86 @@ onUnmounted(() => {
   background: var(--accent);
   font-size: var(--font-size-xs);
   font-weight: 650;
+}
+
+/* ── Context banner ── */
+.context-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  margin-bottom: 5px;
+  width: 100%;
+}
+.ctx-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px 3px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--bg-secondary) 70%, transparent);
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-secondary);
+  transition: background 0.14s;
+  line-height: 1;
+}
+.ctx-pills:hover { background: var(--bg-hover); }
+.ctx-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+.ctx-meta    { background: color-mix(in srgb, #6b7280 15%, transparent); color: #4b5563; }
+.ctx-summary { background: color-mix(in srgb, #7c3aed 14%, transparent); color: #6d28d9; }
+.ctx-fulltext{ background: color-mix(in srgb, #059669 14%, transparent); color: #047857; }
+.ctx-pdf     { background: #fee2e2; color: #b91c1c; }
+.ctx-chevron {
+  color: var(--text-tertiary);
+  transition: transform 0.16s ease;
+  flex-shrink: 0;
+}
+.ctx-chevron.open { transform: rotate(180deg); }
+
+.ctx-preview {
+  margin-top: 4px;
+  width: 100%;
+  max-width: 340px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+.ctx-loading {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.ctx-section + .ctx-section {
+  border-top: 1px solid var(--border-subtle);
+}
+.ctx-section-label {
+  padding: 6px 12px 2px;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+}
+.ctx-preview-text {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  max-height: 260px;
+  overflow-y: auto;
 }
 </style>

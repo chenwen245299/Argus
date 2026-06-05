@@ -66,14 +66,24 @@ pub fn get_collections(root: &str) -> Result<CollectionsFile, String> {
 
 /// Strip characters that are invalid in folder names on any OS.
 fn sanitize_name(name: &str) -> String {
-    name.chars()
+    let cleaned = name
+        .chars()
         .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            c if c.is_control() => '_',
             _ => c,
         })
         .collect::<String>()
         .trim()
-        .to_string()
+        .trim_matches('.')
+        .trim()
+        .to_string();
+
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "Untitled".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Build the filesystem path for a collection folder by walking the parent chain.
@@ -322,9 +332,13 @@ pub fn set_collection_emoji(root: &str, id: &str, emoji: Option<String>) -> Resu
 /// Delete a collection and cascade-remove all descendants and their assignments.
 pub fn delete_collection(root: &str, id: &str) -> Result<(), String> {
     let mut file = read_collections(root);
+    if !file.collections.iter().any(|c| c.id == id) {
+        return Err(format!("Collection {id} not found"));
+    }
 
     // Compute folder path BEFORE removing the collection from the list.
     let folder = collection_folder_path(root, &file.collections, id);
+    move_papers_out_of_collection(root, &folder)?;
 
     let to_remove = collect_subtree(&file.collections, id);
     file.collections.retain(|c| !to_remove.contains(&c.id));
@@ -332,12 +346,104 @@ pub fn delete_collection(root: &str, id: &str) -> Result<(), String> {
         .retain(|a| !to_remove.contains(&a.collection_id));
     write_collections(root, &file)?;
 
-    // Remove the folder tree and its papers.
-    if folder.exists() {
-        std::fs::remove_dir_all(&folder).map_err(|e| format!("Remove collection folder: {e}"))?;
+    Ok(())
+}
+
+fn move_papers_out_of_collection(root: &str, folder: &Path) -> Result<(), String> {
+    if !folder.exists() {
+        return Ok(());
+    }
+
+    let papers_root = paper::papers_dir(root);
+    std::fs::create_dir_all(&papers_root).map_err(|e| format!("Create papers folder: {e}"))?;
+
+    let mut paper_dirs = Vec::new();
+    let mut visited_dirs = Vec::new();
+    collect_paper_dirs_under(folder, &mut paper_dirs, &mut visited_dirs)?;
+
+    for current_dir in paper_dirs {
+        let slug = current_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("Invalid paper folder name: {}", current_dir.display()))?
+            .to_string();
+        let target = unique_paper_target(&papers_root, &slug);
+
+        let same_target = current_dir
+            .canonicalize()
+            .ok()
+            .zip(target.canonicalize().ok())
+            .is_some_and(|(a, b)| a == b);
+        if same_target {
+            continue;
+        }
+
+        std::fs::rename(&current_dir, &target).map_err(|e| {
+            format!(
+                "Move paper out of deleted collection ({} -> {}): {e}",
+                current_dir.display(),
+                target.display()
+            )
+        })?;
+    }
+
+    // Only remove directories that became empty. Unknown user files are left in place.
+    visited_dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for dir in visited_dirs {
+        let _ = std::fs::remove_dir(&dir);
     }
 
     Ok(())
+}
+
+fn collect_paper_dirs_under(
+    dir: &Path,
+    paper_dirs: &mut Vec<PathBuf>,
+    visited_dirs: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("Read collection folder {}: {e}", dir.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Ok(());
+    }
+
+    visited_dirs.push(dir.to_path_buf());
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("Read collection folder: {e}"))? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+
+        if path.join("meta.json").exists() {
+            paper_dirs.push(path);
+        } else {
+            collect_paper_dirs_under(&path, paper_dirs, visited_dirs)?;
+        }
+    }
+    Ok(())
+}
+
+fn unique_paper_target(papers_root: &Path, slug: &str) -> PathBuf {
+    let candidate = papers_root.join(slug);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let mut n = 2u32;
+    loop {
+        let candidate = papers_root.join(format!("{slug}-moved-{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Recursively collect `root_id` and all its descendant IDs.
@@ -480,4 +586,86 @@ pub fn list_papers_in_collection(
     }
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::PaperMeta;
+
+    fn test_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "argus-collections-test-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn delete_collection_keeps_papers() {
+        let root = test_root();
+        let root_str = root.to_string_lossy().to_string();
+        std::fs::create_dir_all(root.join(".argus")).unwrap();
+        let collection_dir = root.join("papers").join("Topic");
+        let paper_dir = collection_dir.join("paper-a");
+        std::fs::create_dir_all(&paper_dir).unwrap();
+
+        let paper_id = "paper-id-1".to_string();
+        let meta = PaperMeta {
+            id: paper_id.clone(),
+            title: "Paper A".to_string(),
+            authors: vec![],
+            year: None,
+            doi: None,
+            arxiv_id: None,
+            venue: None,
+            tags: vec![],
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            original_filename: None,
+            reading_status: "unread".to_string(),
+            paper_abstract: None,
+            bibtex: None,
+            canvas_notes: vec![],
+            import_source: Some("file".to_string()),
+        };
+        std::fs::write(
+            paper_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let collection = Collection {
+            id: "collection-1".to_string(),
+            name: "Topic".to_string(),
+            emoji: None,
+            parent_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        write_collections(
+            &root_str,
+            &CollectionsFile {
+                collections: vec![collection],
+                assignments: vec![Assignment {
+                    paper_id,
+                    collection_id: "collection-1".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+
+        delete_collection(&root_str, "collection-1").unwrap();
+
+        assert!(root.join("papers").join("paper-a").join("meta.json").exists());
+        assert!(!collection_dir.exists());
+        let file = read_collections(&root_str);
+        assert!(file.collections.is_empty());
+        assert!(file.assignments.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sanitize_name_blocks_dot_segments() {
+        assert_eq!(sanitize_name(".."), "Untitled");
+        assert_eq!(sanitize_name("."), "Untitled");
+    }
 }

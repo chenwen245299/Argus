@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import { invoke } from '@tauri-apps/api/core'
 import { updateStore, initUpdateStore, checkForUpdates, startUpdate } from '../../stores/update'
 
@@ -30,9 +31,11 @@ function openGitHub() {
 const renderedNotes = computed(() => {
   if (!updateStore.releaseNotes) return ''
   try {
-    return marked.parse(updateStore.releaseNotes) as string
+    return DOMPurify.sanitize(marked.parse(updateStore.releaseNotes) as string, {
+      ADD_ATTR: ['target', 'rel', 'title'],
+    })
   } catch {
-    return updateStore.releaseNotes
+    return DOMPurify.sanitize(updateStore.releaseNotes)
   }
 })
 </script>

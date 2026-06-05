@@ -17,6 +17,37 @@ hljs.registerAliases(['c++'], { languageName: 'cpp' })
 hljs.registerAliases(['html'], { languageName: 'xml' })
 
 const COPY_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`
+let handlersInstalled = false
+
+function installMarkdownHandlers() {
+  if (handlersInstalled || typeof document === 'undefined') return
+  handlersInstalled = true
+
+  document.addEventListener('click', (event) => {
+    const target = event.target as HTMLElement | null
+    const button = target?.closest<HTMLButtonElement>('[data-md-action]')
+    if (!button) return
+
+    const action = button.dataset.mdAction
+    if (action === 'copy-code') {
+      const code = button.closest('.md-code-block')?.querySelector('code')
+      const text = code?.textContent ?? ''
+      if (!text) return
+      navigator.clipboard?.writeText(text).catch(() => {})
+      button.textContent = '已复制'
+      window.setTimeout(() => { button.innerHTML = COPY_ICON }, 2000)
+      return
+    }
+
+    if (action === 'toggle-svg-source') {
+      const pre = button.closest('.svg-code-block')?.querySelector<HTMLElement>('.svg-source-pre')
+      if (!pre) return
+      const nextVisible = pre.style.display === 'none'
+      pre.style.display = nextVisible ? 'block' : 'none'
+      button.textContent = nextVisible ? '隐藏代码' : '查看代码'
+    }
+  })
+}
 
 function escapeHtmlAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
@@ -34,14 +65,14 @@ marked.use({
       if (lang === 'svg') {
         const clean = DOMPurify.sanitize(text, { USE_PROFILES: { svg: true, svgFilters: true } })
         const highlighted = hljs.highlight(text, { language: 'xml' }).value
-        return `<div class="md-code-block svg-code-block"><div class="md-code-header"><span class="md-code-lang">svg</span><button class="svg-toggle-btn" onclick="(function(b){var p=b.closest('.svg-code-block'),pre=p.querySelector('.svg-source-pre');var h=pre.style.display==='none';pre.style.display=h?'block':'none';b.textContent=h?'隐藏代码':'查看代码'})(this)">查看代码</button><button class="md-copy-btn" data-action="copy-svg-image" title="复制图片">${COPY_ICON}</button></div><div class="svg-preview-area">${clean}</div><pre class="svg-source-pre" style="display:none"><code class="hljs xml">${highlighted}</code></pre></div>`
+        return `<div class="md-code-block svg-code-block"><div class="md-code-header"><span class="md-code-lang">svg</span><button class="svg-toggle-btn" data-md-action="toggle-svg-source" type="button">查看代码</button><button class="md-copy-btn" data-action="copy-svg-image" title="复制图片" type="button">${COPY_ICON}</button></div><div class="svg-preview-area">${clean}</div><pre class="svg-source-pre" style="display:none"><code class="hljs xml">${highlighted}</code></pre></div>`
       }
       const validLang = lang && hljs.getLanguage(lang) ? lang : 'plaintext'
       const highlighted = hljs.highlight(text, { language: validLang }).value
-      return `<div class="md-code-block"><div class="md-code-header"><span class="md-code-lang">${validLang}</span><button class="md-copy-btn" onclick="this.closest('.md-code-block').querySelector('code').dispatchEvent(new CustomEvent('copy-code',{bubbles:true}));this.innerHTML='已复制';setTimeout(()=>this.innerHTML='${COPY_ICON}',2000)">${COPY_ICON}</button></div><pre><code class="hljs ${validLang}">${highlighted}</code></pre></div>`
+      return `<div class="md-code-block"><div class="md-code-header"><span class="md-code-lang">${escapeHtml(validLang)}</span><button class="md-copy-btn" data-md-action="copy-code" type="button">${COPY_ICON}</button></div><pre><code class="hljs ${escapeHtmlAttr(validLang)}">${highlighted}</code></pre></div>`
     },
     codespan(token: Tokens.Codespan): string {
-      return `<code class="md-inline-code">${token.text}</code>`
+      return `<code class="md-inline-code">${escapeHtml(token.text)}</code>`
     },
     image(token: Tokens.Image): string {
       const safeHref = escapeHtmlAttr(token.href)
@@ -58,6 +89,7 @@ marked.use({
 
 export function renderMarkdown(content: string): string {
   try {
+    installMarkdownHandlers()
     const codeBlocks: string[] = []
     let md = content.replace(/```[\s\S]*?```/g, (m) => {
       codeBlocks.push(m)
@@ -125,11 +157,11 @@ export function renderMarkdown(content: string): string {
 
     html = html.replace(/<!--INLINE_CODE_(\d+)-->/g, (_, i) => {
       const raw = inlineCodes[+i].slice(1, -1)
-      return `<code class="md-inline-code">${raw}</code>`
+      return `<code class="md-inline-code">${escapeHtml(raw)}</code>`
     })
 
     return DOMPurify.sanitize(html, {
-      ADD_ATTR: ['onclick', 'data-action', 'target', 'rel', 'title'],
+      ADD_ATTR: ['data-action', 'data-md-action', 'target', 'rel', 'title', 'type'],
       ADD_TAGS: ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'g', 'defs', 'use', 'symbol'],
       FORCE_BODY: false,
     })

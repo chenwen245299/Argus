@@ -1636,6 +1636,13 @@ pub async fn analyze_arxiv_paper(
     tokio::spawn(async move {
         if let Err(e) = arxiv::analyze_single(&root_c, &arxiv_id, &app_c).await {
             eprintln!("Single analysis error: {}", e);
+            let _ = app_c.emit(
+                "arxiv-analysis",
+                serde_json::json!({
+                    "done": 0, "total": 0, "arxiv_id": arxiv_id,
+                    "status": "error", "message": e
+                }),
+            );
         }
     });
     Ok(())
@@ -1713,6 +1720,10 @@ pub async fn import_arxiv_url(
 
 #[tauri::command]
 pub fn open_url(url: String) -> Result<(), String> {
+    let lower = url.trim().to_lowercase();
+    if !lower.starts_with("https://") && !lower.starts_with("http://") {
+        return Err(format!("Blocked: only http/https URLs are allowed (got: {url})"));
+    }
     #[cfg(target_os = "macos")]
     std::process::Command::new("open")
         .arg(&url)
@@ -1754,7 +1765,15 @@ pub fn open_in_finder(path: String) -> Result<(), String> {
 fn copy_file_to_clipboard(path: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        // Escape characters that could break out of the AppleScript string literal.
+        // Newlines and CRs are especially important: they terminate the current
+        // `osascript -e` statement and allow injection of a second command.
+        let escaped = path
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\0', "");
         let script = format!("set the clipboard to (POSIX file \"{}\")", escaped);
         let output = std::process::Command::new("osascript")
             .arg("-e")

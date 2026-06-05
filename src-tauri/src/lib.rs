@@ -14,6 +14,7 @@ mod metadata;
 mod models;
 mod ocr;
 mod paper;
+mod path_guard;
 mod rag;
 mod search;
 mod security_bookmark;

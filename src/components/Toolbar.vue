@@ -529,6 +529,7 @@ onUnmounted(() => {
   if (labelToggleTimer) { clearInterval(labelToggleTimer); labelToggleTimer = null }
   if (ragLabelToggleTimer) { clearInterval(ragLabelToggleTimer); ragLabelToggleTimer = null }
   if (statusPollTimer) { clearInterval(statusPollTimer); statusPollTimer = null }
+  if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
   document.removeEventListener('pointerdown', onDocClick, true)
 })
 </script>

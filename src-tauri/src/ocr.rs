@@ -41,7 +41,9 @@ pub fn ocr_pdf_file(pdf_path: &Path) -> Option<String> {
         .unwrap_or(false);
 
     if !ok {
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
+            eprintln!("[ocr] failed to remove temp dir {}: {}", temp_dir.display(), e);
+        }
         return None;
     }
 
@@ -58,7 +60,9 @@ pub fn ocr_pdf_file(pdf_path: &Path) -> Option<String> {
     images.sort();
 
     if images.is_empty() {
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
+            eprintln!("[ocr] failed to remove temp dir {}: {}", temp_dir.display(), e);
+        }
         return None;
     }
 
@@ -76,7 +80,9 @@ pub fn ocr_pdf_file(pdf_path: &Path) -> Option<String> {
         }
     }
 
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
+        eprintln!("[ocr] failed to remove temp dir {}: {}", temp_dir.display(), e);
+    }
     if !any_ok {
         return None;
     }

@@ -126,6 +126,8 @@ onUnmounted(() => {
   window.removeEventListener('argus-snippet-highlight', onSnippetHighlight)
   observer?.disconnect()
   if (progressDebounce) clearTimeout(progressDebounce)
+  if (searchDebounce) clearTimeout(searchDebounce)
+  pageTextCache.clear()
   _translateUnlisten?.()
   pdfDoc.value?.destroy()
 })

@@ -20,8 +20,13 @@ fn legacy_canvases_dir(root: &str) -> PathBuf {
     Path::new(root).join(".argus").join("canvases")
 }
 
-fn canvas_path(root: &str, id: &str) -> PathBuf {
-    canvases_dir(root).join(format!("{}.json", id))
+fn validate_canvas_id(id: &str) -> Result<(), String> {
+    crate::path_guard::validate_segment("canvas id", id)
+}
+
+fn canvas_path(root: &str, id: &str) -> Result<PathBuf, String> {
+    validate_canvas_id(id)?;
+    Ok(canvases_dir(root).join(format!("{}.json", id)))
 }
 
 fn index_path(root: &str) -> PathBuf {
@@ -114,14 +119,14 @@ pub fn create_canvas(root: &str, name: String) -> Result<Canvas, String> {
     };
     let content =
         serde_json::to_string_pretty(&canvas).map_err(|e| format!("Serialize canvas: {e}"))?;
-    std::fs::write(canvas_path(root, &canvas.id), content)
+    std::fs::write(canvas_path(root, &canvas.id)?, content)
         .map_err(|e| format!("Write canvas: {e}"))?;
     upsert_index(root, &canvas);
     Ok(canvas)
 }
 
 pub fn get_canvas(root: &str, id: &str) -> Result<Canvas, String> {
-    let path = canvas_path(root, id);
+    let path = canvas_path(root, id)?;
     if !path.exists() {
         return Err(format!("Canvas not found: {id}"));
     }
@@ -131,17 +136,18 @@ pub fn get_canvas(root: &str, id: &str) -> Result<Canvas, String> {
 
 pub fn save_canvas(root: &str, mut canvas: Canvas) -> Result<(), String> {
     ensure_canvases_dir(root)?;
+    validate_canvas_id(&canvas.id)?;
     canvas.updated_at = Utc::now().to_rfc3339();
     let content =
         serde_json::to_string_pretty(&canvas).map_err(|e| format!("Serialize canvas: {e}"))?;
-    std::fs::write(canvas_path(root, &canvas.id), &content)
+    std::fs::write(canvas_path(root, &canvas.id)?, &content)
         .map_err(|e| format!("Write canvas: {e}"))?;
     upsert_index(root, &canvas);
     Ok(())
 }
 
 pub fn rename_canvas(root: &str, id: &str, new_name: String) -> Result<(), String> {
-    let path = canvas_path(root, id);
+    let path = canvas_path(root, id)?;
     let mut canvas: Canvas = {
         let c = std::fs::read_to_string(&path).map_err(|e| format!("Read canvas: {e}"))?;
         serde_json::from_str(&c).map_err(|e| format!("Parse canvas: {e}"))?
@@ -156,7 +162,7 @@ pub fn rename_canvas(root: &str, id: &str, new_name: String) -> Result<(), Strin
 }
 
 pub fn delete_canvas(root: &str, id: &str) -> Result<(), String> {
-    let path = canvas_path(root, id);
+    let path = canvas_path(root, id)?;
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| format!("Delete canvas: {e}"))?;
     }
@@ -213,9 +219,8 @@ pub fn get_node_display_content(
                 };
                 let mut parts = Vec::new();
                 for note_id in &pinned {
-                    let note_file = notes_dir.join(format!("{}.md", note_id));
-                    if note_file.exists() {
-                        let content = std::fs::read_to_string(&note_file).unwrap_or_default();
+                    let content = crate::paper::get_note(root, &slug, note_id);
+                    if !content.trim().is_empty() {
                         let title = title_of(note_id);
                         parts.push(format!("## {}\n\n{}", title, content.trim()));
                     }
@@ -235,10 +240,9 @@ pub fn get_node_display_content(
                 });
                 if let Some(first) = entries.first() {
                     if let Some(note_id) = first.get("id").and_then(|v| v.as_str()) {
-                        let note_file = notes_dir.join(format!("{}.md", note_id));
-                        if note_file.exists() {
-                            return std::fs::read_to_string(&note_file)
-                                .map_err(|e| format!("Read note: {e}"));
+                        let content = crate::paper::get_note(root, &slug, note_id);
+                        if !content.trim().is_empty() {
+                            return Ok(content);
                         }
                     }
                 }

@@ -94,7 +94,7 @@ export const useImportStore = defineStore('import', () => {
         // Update all reader tabs + selection pointing at the old slug
         reader.replacePaperSlug(tempSlug, newSlug, updatedMeta?.title)
         if (selection.selectedSlug === tempSlug) {
-          selection.selectedSlug = newSlug
+          selection.selectPaper(newSlug)
         }
         _updateSlug(tempSlug, newSlug)
         finalSlug = newSlug

@@ -17,7 +17,26 @@ pub fn papers_dir(root: &str) -> PathBuf {
     Path::new(root).join("papers")
 }
 
+fn invalid_paper_dir(root: &str) -> PathBuf {
+    papers_dir(root).join("__argus_invalid_paper_slug__")
+}
+
+fn validate_slug(slug: &str) -> Result<(), String> {
+    crate::path_guard::validate_segment("paper slug", slug)
+}
+
+fn validate_note_id(note_id: &str) -> Result<(), String> {
+    crate::path_guard::validate_segment("note id", note_id)
+}
+
+fn note_file_path(root: &str, slug: &str, note_id: &str) -> Result<PathBuf, String> {
+    validate_slug(slug)?;
+    validate_note_id(note_id)?;
+    Ok(notes_dir(root, slug).join(format!("{note_id}.md")))
+}
+
 pub fn find_paper_dir(root: &str, slug: &str) -> Option<PathBuf> {
+    validate_slug(slug).ok()?;
     let direct = papers_dir(root).join(slug);
     let direct_is_real_dir = std::fs::symlink_metadata(&direct)
         .ok()
@@ -33,6 +52,9 @@ pub fn find_paper_dir(root: &str, slug: &str) -> Option<PathBuf> {
 }
 
 pub fn paper_dir(root: &str, slug: &str) -> PathBuf {
+    if validate_slug(slug).is_err() {
+        return invalid_paper_dir(root);
+    }
     find_paper_dir(root, slug).unwrap_or_else(|| papers_dir(root).join(slug))
 }
 
@@ -74,6 +96,7 @@ fn collect_paper_dirs(dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()
 // ── PaperMeta ─────────────────────────────────────────────────────────────────
 
 pub fn read_meta(root: &str, slug: &str) -> Result<PaperMeta, String> {
+    validate_slug(slug)?;
     let path = paper_dir(root, slug).join("meta.json");
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read meta.json for {slug}: {e}"))?;
@@ -81,25 +104,30 @@ pub fn read_meta(root: &str, slug: &str) -> Result<PaperMeta, String> {
 }
 
 pub fn write_meta(root: &str, slug: &str, meta: &PaperMeta) -> Result<(), String> {
+    validate_slug(slug)?;
     let path = paper_dir(root, slug).join("meta.json");
     let mut meta = meta.clone();
     meta.import_source = Some(crate::models::normalize_import_source(
         meta.import_source.as_deref(),
         meta.arxiv_id.as_deref(),
     ));
-    let content =
-        serde_json::to_string_pretty(&meta).map_err(|e| format!("Failed to serialize meta: {e}"))?;
+    let content = serde_json::to_string_pretty(&meta)
+        .map_err(|e| format!("Failed to serialize meta: {e}"))?;
     atomic_write(&path, &content)
 }
 
 // ── Notes ─────────────────────────────────────────────────────────────────────
 
 pub fn read_notes(root: &str, slug: &str) -> String {
+    if validate_slug(slug).is_err() {
+        return String::new();
+    }
     let path = paper_dir(root, slug).join("notes.md");
     std::fs::read_to_string(&path).unwrap_or_default()
 }
 
 pub fn write_notes(root: &str, slug: &str, content: &str) -> Result<(), String> {
+    validate_slug(slug)?;
     let path = paper_dir(root, slug).join("notes.md");
     std::fs::write(&path, content).map_err(|e| format!("Failed to write notes.md: {e}"))
 }
@@ -111,6 +139,9 @@ fn notes_dir(root: &str, slug: &str) -> PathBuf {
 }
 
 fn read_notes_index(root: &str, slug: &str) -> Vec<Note> {
+    if validate_slug(slug).is_err() {
+        return Vec::new();
+    }
     let path = notes_dir(root, slug).join("index.json");
     if !path.exists() {
         return Vec::new();
@@ -122,6 +153,7 @@ fn read_notes_index(root: &str, slug: &str) -> Vec<Note> {
 }
 
 fn write_notes_index(root: &str, slug: &str, notes: &[Note]) -> Result<(), String> {
+    validate_slug(slug)?;
     let dir = notes_dir(root, slug);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create notes dir: {e}"))?;
     let path = dir.join("index.json");
@@ -132,6 +164,9 @@ fn write_notes_index(root: &str, slug: &str, notes: &[Note]) -> Result<(), Strin
 
 /// One-time migration: if notes/ doesn't exist yet but notes.md does, import it as the first note.
 fn maybe_migrate_legacy_note(root: &str, slug: &str) {
+    if validate_slug(slug).is_err() {
+        return;
+    }
     let dir = notes_dir(root, slug);
     if dir.exists() {
         return;
@@ -165,7 +200,9 @@ pub fn list_notes(root: &str, slug: &str) -> Vec<Note> {
 }
 
 pub fn get_note(root: &str, slug: &str, note_id: &str) -> String {
-    let path = notes_dir(root, slug).join(format!("{note_id}.md"));
+    let Ok(path) = note_file_path(root, slug, note_id) else {
+        return String::new();
+    };
     std::fs::read_to_string(&path).unwrap_or_default()
 }
 
@@ -178,6 +215,7 @@ pub fn get_note_by_title(root: &str, slug: &str, title: &str) -> Option<String> 
 }
 
 pub fn create_note(root: &str, slug: &str) -> Result<Note, String> {
+    validate_slug(slug)?;
     maybe_migrate_legacy_note(root, slug);
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -203,6 +241,7 @@ pub fn upsert_note_by_title(
     title: &str,
     content: &str,
 ) -> Result<Note, String> {
+    validate_slug(slug)?;
     maybe_migrate_legacy_note(root, slug);
     let dir = notes_dir(root, slug);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create notes dir: {e}"))?;
@@ -234,9 +273,11 @@ pub fn upsert_note_by_title(
 }
 
 pub fn save_note(root: &str, slug: &str, note_id: &str, content: &str) -> Result<(), String> {
+    validate_slug(slug)?;
+    validate_note_id(note_id)?;
     let dir = notes_dir(root, slug);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create notes dir: {e}"))?;
-    std::fs::write(dir.join(format!("{note_id}.md")), content)
+    std::fs::write(note_file_path(root, slug, note_id)?, content)
         .map_err(|e| format!("Failed to write note: {e}"))?;
     let mut notes = read_notes_index(root, slug);
     let now = chrono::Utc::now().to_rfc3339();
@@ -247,6 +288,8 @@ pub fn save_note(root: &str, slug: &str, note_id: &str, content: &str) -> Result
 }
 
 pub fn rename_note(root: &str, slug: &str, note_id: &str, title: &str) -> Result<(), String> {
+    validate_slug(slug)?;
+    validate_note_id(note_id)?;
     let mut notes = read_notes_index(root, slug);
     let now = chrono::Utc::now().to_rfc3339();
     if let Some(n) = notes.iter_mut().find(|n| n.id == note_id) {
@@ -257,7 +300,9 @@ pub fn rename_note(root: &str, slug: &str, note_id: &str, title: &str) -> Result
 }
 
 pub fn delete_note(root: &str, slug: &str, note_id: &str) -> Result<(), String> {
-    let note_file = notes_dir(root, slug).join(format!("{note_id}.md"));
+    validate_slug(slug)?;
+    validate_note_id(note_id)?;
+    let note_file = note_file_path(root, slug, note_id)?;
     if note_file.exists() {
         std::fs::remove_file(&note_file).map_err(|e| format!("Failed to delete note file: {e}"))?;
     }
@@ -277,6 +322,9 @@ pub fn delete_note(root: &str, slug: &str, note_id: &str) -> Result<(), String> 
 // ── Highlights ────────────────────────────────────────────────────────────────
 
 pub fn read_highlights(root: &str, slug: &str) -> Vec<Highlight> {
+    if validate_slug(slug).is_err() {
+        return Vec::new();
+    }
     let path = paper_dir(root, slug).join("highlights.json");
     if !path.exists() {
         return Vec::new();
@@ -288,6 +336,7 @@ pub fn read_highlights(root: &str, slug: &str) -> Vec<Highlight> {
 }
 
 pub fn write_highlights(root: &str, slug: &str, highlights: &[Highlight]) -> Result<(), String> {
+    validate_slug(slug)?;
     let path = paper_dir(root, slug).join("highlights.json");
     let content = serde_json::to_string_pretty(highlights)
         .map_err(|e| format!("Failed to serialize highlights: {e}"))?;
@@ -297,6 +346,9 @@ pub fn write_highlights(root: &str, slug: &str, highlights: &[Highlight]) -> Res
 // ── ReadingState ──────────────────────────────────────────────────────────────
 
 pub fn read_reading_state(root: &str, slug: &str) -> Option<ReadingState> {
+    if validate_slug(slug).is_err() {
+        return None;
+    }
     let path = paper_dir(root, slug).join("reading_state.json");
     if !path.exists() {
         return None;
@@ -308,6 +360,7 @@ pub fn read_reading_state(root: &str, slug: &str) -> Option<ReadingState> {
 }
 
 pub fn write_reading_state(root: &str, slug: &str, state: &ReadingState) -> Result<(), String> {
+    validate_slug(slug)?;
     let path = paper_dir(root, slug).join("reading_state.json");
     let content = serde_json::to_string_pretty(state)
         .map_err(|e| format!("Failed to serialize reading_state: {e}"))?;
@@ -328,10 +381,14 @@ pub fn read_status(paper_path: &Path) -> PaperStatus {
 }
 
 pub fn read_status_for(root: &str, slug: &str) -> PaperStatus {
+    if validate_slug(slug).is_err() {
+        return PaperStatus::default();
+    }
     read_status(&paper_dir(root, slug))
 }
 
 pub fn write_status(root: &str, slug: &str, status: &PaperStatus) -> Result<(), String> {
+    validate_slug(slug)?;
     let path = paper_dir(root, slug).join(".status.json");
     // Read existing, merge, then write — preserves any fields added in the future.
     let merged = if path.exists() {
@@ -352,6 +409,9 @@ pub fn write_status(root: &str, slug: &str, status: &PaperStatus) -> Result<(), 
 
 /// Ensure default companion files exist for a newly created paper dir.
 pub fn ensure_paper_files(root: &str, slug: &str) {
+    if validate_slug(slug).is_err() {
+        return;
+    }
     let dir = paper_dir(root, slug);
 
     let notes = dir.join("notes.md");

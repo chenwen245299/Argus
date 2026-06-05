@@ -16,6 +16,7 @@
 
 <script setup lang="ts">
 import { ref, watch, onMounted } from 'vue'
+import DOMPurify from 'dompurify'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
 
@@ -70,7 +71,7 @@ async function tryRender() {
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('渲染超时')), 10_000)),
       ])
       rendered  = true
-      svgHtml.value = svg
+      svgHtml.value = DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } })
       status.value  = 'done'
     } finally {
       stage.remove()

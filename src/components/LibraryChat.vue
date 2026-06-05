@@ -787,6 +787,10 @@ watch(() => ai.chatModels.map(selectionKey).join('|'), () => {
   if (!validSelection(selectedModel.value)) restoreLastModel()
 })
 
+function onCopyCode(e: Event) {
+  navigator.clipboard.writeText((e.target as HTMLElement).textContent ?? '').catch(() => {})
+}
+
 onMounted(async () => {
   const saved = loadFromStorage()
   conversations.value = saved
@@ -799,9 +803,7 @@ onMounted(async () => {
   await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts()])
   document.addEventListener('mousedown', closeModelMenu)
 
-  messagesEl.value?.addEventListener('copy-code', (e: Event) => {
-    navigator.clipboard.writeText((e.target as HTMLElement).textContent ?? '').catch(() => {})
-  })
+  messagesEl.value?.addEventListener('copy-code', onCopyCode)
 
   // Persist window size on resize (localStorage, same pattern as MainView)
   window.addEventListener('resize', saveChatWindowSize)
@@ -813,6 +815,7 @@ onUnmounted(() => {
   window.removeEventListener('resize', saveChatWindowSize)
   window.removeEventListener('mousemove', onDividerMouseMove)
   window.removeEventListener('mouseup', onDividerMouseUp)
+  messagesEl.value?.removeEventListener('copy-code', onCopyCode)
   if (unlistenChat) unlistenChat()
   if (unlistenSources) unlistenSources()
   if (resizeTimer) clearTimeout(resizeTimer)

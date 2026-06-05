@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use tauri::Emitter;
+
 use crate::models::{ChatMessage, PaperMeta, RetrievedChunk};
 use crate::{ai_manager, ai_summary, extraction, llm, paper, rag};
 
@@ -148,65 +150,68 @@ pub async fn chat_with_paper_on_event(
     let meta = paper::read_meta(root, slug).ok();
 
     let mut all_messages: Vec<ChatMessage> = Vec::new();
+    // Tracks the actual content injected per section for the transparency banner.
+    let mut sent_metadata = String::new();
+    let mut sent_summary = String::new();
+    let mut sent_fulltext = String::new();
 
     match context_mode {
         "none" => {
-            // No context injection — just a bare system message
             all_messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: "You are a research assistant. Answer the user's questions clearly and concisely.".to_string(),
             });
         }
         "metadata" => {
-            // Only inject paper metadata (title, authors, year, venue, abstract)
+            sent_metadata = build_metadata_string(meta.as_ref());
             let system = build_system_prompt(meta.as_ref(), "", false, false, None);
-            all_messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: system,
-            });
+            all_messages.push(ChatMessage { role: "system".to_string(), content: system });
         }
         "summary" => {
-            // Only inject the AI-generated summary (no fulltext)
             let summary = ai_summary::read_summary(root, slug);
-            let summary_ctx = if summary.trim().is_empty() {
-                None
-            } else {
-                Some(summary.as_str())
-            };
-            let system = build_system_prompt(meta.as_ref(), "", false, false, summary_ctx);
-            all_messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: system,
-            });
+            let summary_ctx = if summary.trim().is_empty() { None } else { Some(summary.as_str()) };
+            sent_summary = summary.clone();
+            // meta=None: user did not select 元数据
+            let system = build_system_prompt(None, "", false, false, summary_ctx);
+            all_messages.push(ChatMessage { role: "system".to_string(), content: system });
         }
         "summary+fulltext" => {
-            // Inject both the AI summary and the fulltext/RAG context
             let summary = ai_summary::read_summary(root, slug);
-            let summary_ctx = if summary.trim().is_empty() {
-                None
+            let summary_ctx = if summary.trim().is_empty() { None } else { Some(summary.as_str()) };
+            let (context, truncated) = get_fulltext_context(root, slug, &provider, &model);
+            sent_summary = summary.clone();
+            sent_fulltext = if truncated {
+                format!("{context}\n\n[内容因上下文长度限制已截断]")
             } else {
-                Some(summary.as_str())
+                context.clone()
             };
-            let (context, truncated, rag_used) =
-                build_rag_context(root, slug, &messages, &provider, &api_key, &model).await;
-            let system =
-                build_system_prompt(meta.as_ref(), &context, truncated, rag_used, summary_ctx);
-            all_messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: system,
-            });
+            // meta=None: user did not select 元数据
+            let system = build_system_prompt(None, &context, truncated, false, summary_ctx);
+            all_messages.push(ChatMessage { role: "system".to_string(), content: system });
         }
         _ => {
-            // Default: "fulltext" — RAG or truncated fulltext
-            let (context, truncated, rag_used) =
-                build_rag_context(root, slug, &messages, &provider, &api_key, &model).await;
-            let system = build_system_prompt(meta.as_ref(), &context, truncated, rag_used, None);
-            all_messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: system,
-            });
+            // "fulltext"
+            let (context, truncated) = get_fulltext_context(root, slug, &provider, &model);
+            sent_fulltext = if truncated {
+                format!("{context}\n\n[内容因上下文长度限制已截断]")
+            } else {
+                context.clone()
+            };
+            // meta=None: user did not select 元数据
+            let system = build_system_prompt(None, &context, truncated, false, None);
+            all_messages.push(ChatMessage { role: "system".to_string(), content: system });
         }
     }
+
+    // Emit the actually-sent context so the frontend can display it transparently.
+    let _ = app.emit(
+        &format!("{event_name}-context"),
+        serde_json::json!({
+            "metadata": sent_metadata,
+            "summary":  sent_summary,
+            "fulltext": sent_fulltext,
+        }),
+    );
 
     all_messages.extend_from_slice(&messages);
 
@@ -482,73 +487,18 @@ pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
 
 // ── Context building ──────────────────────────────────────────────────────────
 
-/// Try RAG first; fall back to fulltext if paper is not vectorized or RAG fails.
-async fn build_rag_context(
-    root: &str,
-    slug: &str,
-    messages: &[ChatMessage],
-    provider: &crate::models::AiProvider,
-    _api_key: &str,
-    model_id: &str,
-) -> (String, bool, bool) {
-    let status = paper::read_status_for(root, slug);
-    if !status.vectorized {
-        let (ctx, trunc) = get_fulltext_context(root, slug, provider, model_id);
-        return (ctx, trunc, false);
+fn build_metadata_string(meta: Option<&crate::models::PaperMeta>) -> String {
+    let Some(m) = meta else { return String::new() };
+    let mut s = format!("标题：{}\n", m.title);
+    if !m.authors.is_empty() {
+        s.push_str(&format!("作者：{}\n", m.authors.join(", ")));
     }
-
-    let settings = rag::get_rag_settings(root);
-    if !settings.is_configured() {
-        let (ctx, trunc) = get_fulltext_context(root, slug, provider, model_id);
-        return (ctx, trunc, false);
+    if let Some(y) = m.year { s.push_str(&format!("年份：{y}\n")); }
+    if let Some(ref v) = m.venue { s.push_str(&format!("期刊/会议：{v}\n")); }
+    if let Some(ref a) = m.paper_abstract {
+        if !a.trim().is_empty() { s.push_str(&format!("摘要：{}\n", a.trim())); }
     }
-
-    let query = messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone());
-    let query = match query {
-        Some(q) if !q.is_empty() => q,
-        _ => {
-            let (ctx, trunc) = get_fulltext_context(root, slug, provider, model_id);
-            return (ctx, trunc, false);
-        }
-    };
-
-    let query_vec = match rag::embed_query(root, &query, &settings).await {
-        Ok(v) => v,
-        Err(_) => {
-            let (ctx, trunc) = get_fulltext_context(root, slug, provider, model_id);
-            return (ctx, trunc, false);
-        }
-    };
-
-    let chunks =
-        match rag::search_paper_chunks_with_vec(root, slug, query_vec, settings.top_k).await {
-            Ok(c) if !c.is_empty() => c,
-            _ => {
-                let (ctx, trunc) = get_fulltext_context(root, slug, provider, model_id);
-                return (ctx, trunc, false);
-            }
-        };
-
-    let context = chunks
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let label = match c.source_type.as_str() {
-                "metadata" => "元数据".to_string(),
-                "highlight" => c.source_label.clone().unwrap_or_else(|| "批注".to_string()),
-                "note" => c.source_label.clone().unwrap_or_else(|| "笔记".to_string()),
-                _ => "PDF正文".to_string(),
-            };
-            format!("[片段 {} | 类型: {}]\n{}", i + 1, label, c.text)
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    (context, false, true)
+    s
 }
 
 fn get_fulltext_context(

@@ -95,7 +95,7 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   async function refresh() {
-    if (!currentPath.value) return
+    if (!currentPath.value || isRefreshing.value) return
     isRefreshing.value = true
     try {
       const fresh = await invoke<PaperIndexEntry[]>('scan_library')

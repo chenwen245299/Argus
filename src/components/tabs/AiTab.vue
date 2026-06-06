@@ -67,6 +67,9 @@ interface ExtractionProgressPayload {
   ok?: boolean
 }
 
+type PaperContextMode = 'none' | 'metadata' | 'summary' | 'fulltext' | 'summary+fulltext'
+type PaperContextSection = 'metadata' | 'summary' | 'fulltext'
+
 const STORAGE_PREFIX = 'argus.paper-ai-conversations.v2'
 
 const allSelectableModels = computed<ModelOption[]>(() =>
@@ -120,7 +123,7 @@ const reasoningRoot = ref<HTMLElement | null>(null)
 // Context mode: how much paper content to inject as system prompt context
 // Possible values: 'none' | 'metadata' | 'summary' | 'fulltext' | 'summary+fulltext'
 // All options are independent toggles; none = no context injected.
-const contextMode = ref<'none' | 'metadata' | 'summary' | 'fulltext' | 'summary+fulltext'>('none')
+const contextMode = ref<PaperContextMode>('none')
 const usePdf = ref(false)
 const summaryAvailable = ref(false)
 
@@ -145,6 +148,63 @@ const effectiveContextMode = computed(() => {
   }
   return contextMode.value
 })
+
+function contextSectionsForMode(mode?: string | null) {
+  const sections = new Set<PaperContextSection>()
+  if (mode === 'metadata') sections.add('metadata')
+  if (mode === 'summary' || mode === 'summary+fulltext') sections.add('summary')
+  if (mode === 'fulltext' || mode === 'summary+fulltext') sections.add('fulltext')
+  return sections
+}
+
+function contextModeForSections(sections: Set<PaperContextSection>): PaperContextMode {
+  if (sections.has('metadata')) return 'metadata'
+  const hasSummarySection = sections.has('summary')
+  const hasFulltextSection = sections.has('fulltext')
+  if (hasSummarySection && hasFulltextSection) return 'summary+fulltext'
+  if (hasSummarySection) return 'summary'
+  if (hasFulltextSection) return 'fulltext'
+  return 'none'
+}
+
+function answerSentContextSections(answer: AssistantAnswer) {
+  const sections = new Set<PaperContextSection>()
+  if (answer.contextContent) {
+    if (answer.contextContent.metadata?.trim()) sections.add('metadata')
+    if (answer.contextContent.summary?.trim()) sections.add('summary')
+    if (answer.contextContent.fulltext?.trim()) sections.add('fulltext')
+    if (answer.usedPdf) sections.add('fulltext')
+    return sections
+  }
+  contextSectionsForMode(answer.contextMode).forEach(section => sections.add(section))
+  if (answer.usedPdf) sections.add('fulltext')
+  return sections
+}
+
+function conversationSentContextSections(conv: Conversation) {
+  const sections = new Set<PaperContextSection>()
+  for (const node of conv.nodes) {
+    if (node.role !== 'assistantGroup') continue
+    for (const answer of node.answers) {
+      answerSentContextSections(answer).forEach(section => sections.add(section))
+    }
+  }
+  return sections
+}
+
+function contextPlanForConversation(conv: Conversation) {
+  const sentSections = conversationSentContextSections(conv)
+  const missingSections = contextSectionsForMode(effectiveContextMode.value)
+  for (const section of sentSections) missingSections.delete(section)
+
+  const usePdfForThisTurn = usePdf.value && pdfSupported.value && !sentSections.has('fulltext')
+  if (usePdfForThisTurn) missingSections.delete('fulltext')
+
+  return {
+    contextMode: contextModeForSections(missingSections),
+    usePdf: usePdfForThisTurn,
+  }
+}
 
 const modelSvgModules = import.meta.glob<{ default: string }>('/src/assets/models/*.svg', { eager: true })
 const modelIconMap: Record<string, string> = {}
@@ -614,6 +674,7 @@ async function sendMessage() {
   const text = input.value.trim()
   const conv = activeConversation.value ?? createBlankConversation(props.slug)
   activeConversation.value = conv
+  const contextPlan = contextPlanForConversation(conv)
 
   const userNode: ChatNode = { id: newId('user'), role: 'user', content: text, createdAt: nowIso() }
   const group: ChatNode = {
@@ -621,7 +682,7 @@ async function sendMessage() {
     role: 'assistantGroup',
     promptId: userNode.id,
     createdAt: nowIso(),
-    answers: selectedModels.value.map(modelToAnswer),
+    answers: selectedModels.value.map(model => modelToAnswer(model, contextPlan.contextMode, contextPlan.usePdf)),
   }
   if (group.answers[0]) setActiveAnswer(group.id, group.answers[0].id)
   conv.nodes.push(userNode, group)
@@ -636,7 +697,7 @@ async function sendMessage() {
   await Promise.all(group.answers.map(answer => streamAnswer(conv, answer, history)))
 }
 
-function modelToAnswer(model: ModelOption): AssistantAnswer {
+function modelToAnswer(model: ModelOption, contextModeToSend: PaperContextMode, usePdfToSend: boolean): AssistantAnswer {
   return {
     id: newId('answer'),
     providerId: model.providerId,
@@ -646,8 +707,8 @@ function modelToAnswer(model: ModelOption): AssistantAnswer {
     content: '',
     withReasoning: useReasoning.value,
     createdAt: nowIso(),
-    contextMode: effectiveContextMode.value,
-    usedPdf: usePdf.value && pdfSupported.value,
+    contextMode: contextModeToSend,
+    usedPdf: usePdfToSend,
   }
 }
 
@@ -693,13 +754,14 @@ async function submitEdit(node: UserNode) {
   // Truncate everything after this user node
   const idx = conv.nodes.indexOf(node)
   if (idx >= 0) conv.nodes.splice(idx + 1)
+  const contextPlan = contextPlanForConversation(conv)
 
   const group: ChatNode = {
     id: newId('group'),
     role: 'assistantGroup',
     promptId: node.id,
     createdAt: nowIso(),
-    answers: selectedModels.value.map(modelToAnswer),
+    answers: selectedModels.value.map(model => modelToAnswer(model, contextPlan.contextMode, contextPlan.usePdf)),
   }
   if (group.answers[0]) setActiveAnswer(group.id, group.answers[0].id)
   conv.nodes.push(group)
@@ -799,8 +861,8 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
       eventName,
       useReasoning: useReasoning.value,
       reasoningEffort: useReasoning.value ? effortToSend : null,
-      contextMode: effectiveContextMode.value,
-      usePdf: usePdf.value,
+      contextMode: answer.contextMode ?? 'none',
+      usePdf: !!answer.usedPdf,
     })
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) {

@@ -990,3 +990,197 @@ async fn search_chunks_internal(
     .await
     .map_err(|e| format!("Spawn blocking: {e}"))?
 }
+
+// ── Snippet vector store ──────────────────────────────────────────────────────
+
+fn open_db_with_snippet_table(root: &str) -> Result<Connection, String> {
+    let conn = open_db(root)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS snippet_chunks (
+             snippet_id  TEXT PRIMARY KEY,
+             library_id  TEXT NOT NULL DEFAULT '',
+             text        TEXT NOT NULL,
+             vector      BLOB NOT NULL,
+             paper_id    TEXT NOT NULL DEFAULT '',
+             paper_title TEXT NOT NULL DEFAULT '',
+             page        INTEGER NOT NULL DEFAULT 0,
+             note        TEXT NOT NULL DEFAULT '',
+             tags        TEXT NOT NULL DEFAULT '[]'
+         );",
+    )
+    .map_err(|e| format!("Init snippet_chunks: {e}"))?;
+    Ok(conn)
+}
+
+fn build_snippet_embed_text(s: &crate::models::Snippet) -> String {
+    let mut parts = vec![s.text.trim().to_string()];
+    if !s.note.trim().is_empty() {
+        parts.push(s.note.trim().to_string());
+    }
+    if !s.tags.is_empty() {
+        parts.push(s.tags.join(" "));
+    }
+    parts.join("\n")
+}
+
+pub async fn embed_and_store_snippets(
+    root: &str,
+    snippets: Vec<crate::models::Snippet>,
+) -> Result<(usize, usize), String> {
+    let settings = get_rag_settings(root);
+    let (provider, api_key, emb_model) = resolve_embedding_provider(root, &settings)?;
+
+    let root = root.to_string();
+    let mut done = 0usize;
+    let mut failed = 0usize;
+
+    for snippet in &snippets {
+        let text = build_snippet_embed_text(snippet);
+        let vecs = match llm::embeddings(&provider, &api_key, &emb_model, &[text], "embedding").await {
+            Ok(v) => v,
+            Err(_) => { failed += 1; continue; }
+        };
+        let Some(vec) = vecs.into_iter().next() else { failed += 1; continue; };
+        let blob = vec_to_blob(&vec);
+        let tags_json = serde_json::to_string(&snippet.tags).unwrap_or_else(|_| "[]".to_string());
+
+        let snippet_id  = snippet.id.clone();
+        let library_id  = snippet.library_id.clone();
+        let text        = snippet.text.clone();
+        let paper_id    = snippet.paper_id.clone();
+        let paper_title = snippet.paper_title.clone();
+        let page        = snippet.page;
+        let note        = snippet.note.clone();
+        let root2       = root.clone();
+
+        let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let conn = open_db_with_snippet_table(&root2)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO snippet_chunks
+                 (snippet_id, library_id, text, vector, paper_id, paper_title, page, note, tags)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![snippet_id, library_id, text, blob, paper_id, paper_title, page, note, tags_json],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        match res {
+            Ok(_)  => done += 1,
+            Err(_) => failed += 1,
+        }
+    }
+
+    Ok((done, failed))
+}
+
+pub async fn search_snippet_chunks_with_vec(
+    root: &str,
+    query_vec: Vec<f32>,
+    top_k: usize,
+) -> Result<Vec<crate::models::RetrievedSnippet>, String> {
+    let root = root.to_string();
+    tokio::task::spawn_blocking(move || -> Result<Vec<crate::models::RetrievedSnippet>, String> {
+        let conn = open_db_with_snippet_table(&root)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT snippet_id,library_id,text,vector,paper_id,paper_title,page,note,tags
+                 FROM snippet_chunks",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let mut scored: Vec<(f32, crate::models::RetrievedSnippet)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u32>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .filter_map(|(snippet_id, library_id, text, blob, paper_id, paper_title, page, note, tags_json)| {
+                let vec = blob_to_vec(&blob);
+                if vec.is_empty() { return None; }
+                let score = cosine_similarity(&query_vec, &vec);
+                let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+                Some((score, crate::models::RetrievedSnippet {
+                    snippet_id,
+                    library_id,
+                    text,
+                    score,
+                    paper_id,
+                    paper_title,
+                    page,
+                    note,
+                    tags,
+                }))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scored.into_iter().take(top_k).map(|(_, s)| s).collect())
+    })
+    .await
+    .map_err(|e| format!("Spawn blocking: {e}"))?
+}
+
+pub async fn get_snippet_store_info(root: &str) -> Result<crate::models::SnippetStoreInfo, String> {
+    let root = root.to_string();
+    tokio::task::spawn_blocking(move || -> Result<crate::models::SnippetStoreInfo, String> {
+        let conn = open_db_with_snippet_table(&root)?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snippet_chunks", [], |row| row.get(0))
+            .unwrap_or(0);
+        Ok(crate::models::SnippetStoreInfo { embedded_count: count as usize })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub async fn delete_snippet_chunk(root: &str, snippet_id: &str) -> Result<(), String> {
+    let root = root.to_string();
+    let snippet_id = snippet_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = open_db_with_snippet_table(&root)?;
+        conn.execute("DELETE FROM snippet_chunks WHERE snippet_id=?1", params![snippet_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub fn get_unembedded_snippets(root: &str) -> Result<Vec<crate::models::Snippet>, String> {
+    let libs = crate::snippets::list_snippet_libraries(root)?;
+    let mut all: Vec<crate::models::Snippet> = vec![];
+    for lib in &libs {
+        all.extend(crate::snippets::get_snippets(root, &lib.id).unwrap_or_default());
+    }
+    if all.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let embedded_ids: std::collections::HashSet<String> = (|| -> Result<_, String> {
+        let conn = open_db_with_snippet_table(root)?;
+        let mut stmt = conn.prepare("SELECT snippet_id FROM snippet_chunks")
+            .map_err(|e| e.to_string())?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    })()
+    .unwrap_or_default();
+
+    Ok(all.into_iter().filter(|s| !embedded_ids.contains(&s.id)).collect())
+}

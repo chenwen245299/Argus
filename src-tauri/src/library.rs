@@ -168,6 +168,7 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
             reading_status: meta.reading_status,
             meta_mtime: current_mtime,
             import_source: Some(import_source),
+            cite_count: meta.cite_count,
         });
     }
 

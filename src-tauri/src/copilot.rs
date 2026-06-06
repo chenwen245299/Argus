@@ -260,6 +260,7 @@ pub async fn chat_with_library(
     model_id: Option<&str>,
     event_name: &str,
     sources_event_name: &str,
+    knowledge_source: Option<&str>,
     app: &tauri::AppHandle,
 ) -> Result<String, String> {
     use tauri::Emitter;
@@ -267,36 +268,59 @@ pub async fn chat_with_library(
     let (provider, api_key, model) =
         ai_manager::resolve_provider_model(root, provider_id, model_id)?;
 
-    let settings = rag::get_rag_settings(root);
-    let rag_chunks = if settings.is_configured() {
+    let use_snippets = knowledge_source.map_or(false, |s| s == "snippets");
+
+    let system;
+
+    if use_snippets {
         let query = messages
             .iter()
             .rev()
             .find(|m| m.role == "user")
-            .map(|m| m.content.clone());
-        if let Some(q) = query {
-            if let Ok(vec) = rag::embed_query(root, &q, &settings).await {
-                rag::search_library_chunks_with_vec(root, vec, settings.top_k * 2)
-                    .await
-                    .ok()
-                    .filter(|v| !v.is_empty())
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        let settings = rag::get_rag_settings(root);
+        let retrieved = if settings.is_configured() && !query.is_empty() {
+            match rag::embed_query(root, &query, &settings).await {
+                Ok(vec) => rag::search_snippet_chunks_with_vec(root, vec, 12).await.unwrap_or_default(),
+                Err(_) => vec![],
+            }
+        } else {
+            vec![]
+        };
+
+        let _ = app.emit(sources_event_name, Vec::<crate::models::RetrievedChunk>::new());
+        system = build_snippet_system_prompt(&retrieved);
+    } else {
+        let settings = rag::get_rag_settings(root);
+        let rag_chunks = if settings.is_configured() {
+            let query = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone());
+            if let Some(q) = query {
+                if let Ok(vec) = rag::embed_query(root, &q, &settings).await {
+                    rag::search_library_chunks_with_vec(root, vec, settings.top_k * 2)
+                        .await
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                } else {
+                    None
+                }
             } else {
                 None
             }
         } else {
             None
-        }
-    } else {
-        None
-    };
-
-    // Emit retrieved chunks so the UI can display source citations.
-    let _ = app.emit(
-        sources_event_name,
-        rag_chunks.as_deref().unwrap_or(&[]).to_vec(),
-    );
-
-    let system = build_library_system_prompt(rag_chunks.as_deref());
+        };
+        let _ = app.emit(
+            sources_event_name,
+            rag_chunks.as_deref().unwrap_or(&[]).to_vec(),
+        );
+        system = build_library_system_prompt(rag_chunks.as_deref());
+    }
 
     let mut all_messages = vec![ChatMessage {
         role: "system".to_string(),
@@ -316,6 +340,46 @@ pub async fn chat_with_library(
         "library_chat",
     )
     .await
+}
+
+fn build_snippet_system_prompt(snippets: &[crate::models::RetrievedSnippet]) -> String {
+    let mut prompt = String::from(
+        "You are a research assistant helping the user explore their snippet library — \
+         a personal collection of text excerpts saved from academic papers.\n\
+         Rules:\n\
+         1. Answer ONLY from the snippets provided below — do not hallucinate.\n\
+         2. Respond in the same language the user uses (Chinese if asked in Chinese).\n\
+         3. When citing a snippet, reference the source paper title and page:\n\
+            《论文标题》第 N 页\n\
+         4. If multiple snippets are relevant, synthesize them.\n\n",
+    );
+
+    if snippets.is_empty() {
+        prompt.push_str("[未找到相关素材。请先在「素材库」中嵌入素材（设置 → RAG 配置向量化）。]\n");
+        return prompt;
+    }
+
+    prompt.push_str("--- 检索到的相关素材 ---\n\n");
+    for (i, s) in snippets.iter().enumerate() {
+        let tags = if s.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" | 标签: {}", s.tags.join(", "))
+        };
+        let note = if s.note.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" | 笔记: {}", s.note.trim())
+        };
+        prompt.push_str(&format!(
+            "[素材 {n} | 来源: 《{title}》第 {page} 页{tags}{note}]\n{text}\n\n",
+            n = i + 1,
+            title = s.paper_title,
+            page = s.page,
+            text = s.text,
+        ));
+    }
+    prompt
 }
 
 // ── Library chat window ──────────────────────────────────────────────────────

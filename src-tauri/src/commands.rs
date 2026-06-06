@@ -548,6 +548,7 @@ pub async fn import_pdf(
         bibtex: None,
         canvas_notes: vec![],
         import_source: Some("file".to_string()),
+        cite_count: None,
     };
     paper::write_meta(&root, &temp_slug, &meta)?;
 
@@ -1376,6 +1377,7 @@ pub async fn chat_with_library(
     model_id: Option<String>,
     event_name: Option<String>,
     sources_event_name: Option<String>,
+    knowledge_source: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -1390,6 +1392,7 @@ pub async fn chat_with_library(
         model_id.as_deref(),
         &event_name,
         &sources_event_name,
+        knowledge_source.as_deref(),
         &app,
     )
     .await
@@ -1604,6 +1607,48 @@ pub async fn save_paper_ai_window_size(
 ) -> Result<(), String> {
     copilot::save_paper_ai_window_size(&app, width, height);
     Ok(())
+}
+
+// ── Snippet RAG ───────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_snippet_store_info(
+    state: State<'_, LibraryRoot>,
+) -> Result<crate::models::SnippetStoreInfo, String> {
+    let root = get_root(&state)?;
+    rag::get_snippet_store_info(&root).await
+}
+
+#[tauri::command]
+pub async fn embed_all_snippets(
+    state: State<'_, LibraryRoot>,
+) -> Result<(usize, usize), String> {
+    let root = get_root(&state)?;
+    let snippets = rag::get_unembedded_snippets(&root)?;
+    rag::embed_and_store_snippets(&root, snippets).await
+}
+
+#[tauri::command]
+pub async fn embed_all_snippets_force(
+    state: State<'_, LibraryRoot>,
+) -> Result<(usize, usize), String> {
+    let root = get_root(&state)?;
+    // Collect all snippets regardless of embedding status
+    let libs = snippets::list_snippet_libraries(&root)?;
+    let mut all = vec![];
+    for lib in &libs {
+        all.extend(snippets::get_snippets(&root, &lib.id).unwrap_or_default());
+    }
+    rag::embed_and_store_snippets(&root, all).await
+}
+
+#[tauri::command]
+pub async fn delete_snippet_vector(
+    snippet_id: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    rag::delete_snippet_chunk(&root, &snippet_id).await
 }
 
 // ── M8: arXiv window ─────────────────────────────────────────────────────────

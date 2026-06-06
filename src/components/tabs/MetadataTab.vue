@@ -82,6 +82,8 @@ watch(() => props.slug, () => {
   sourceDraft.value = 'file'
   bibtexEditing.value = false
   bibtexDraft.value = ''
+  citeCountEditing.value = false
+  citeCountDraft.value = undefined
   fulltextEditing.value = false
   fulltextDraft.value = ''
   fulltextError.value = ''
@@ -140,6 +142,41 @@ async function saveBibtex() {
     console.error('Failed to save bibtex:', e)
   } finally {
     bibtexSaving.value = false
+  }
+}
+
+// ── Citation count inline edit ────────────────────────────────────────────────
+const citeCountEditing = ref(false)
+const citeCountDraft = ref<number | undefined>(undefined)
+const citeCountSaving = ref(false)
+
+function startCiteCountEdit() {
+  citeCountDraft.value = props.meta?.cite_count
+  citeCountEditing.value = true
+}
+
+function cancelCiteCountEdit() {
+  citeCountEditing.value = false
+  citeCountDraft.value = undefined
+}
+
+async function saveCiteCount() {
+  if (!props.slug || !props.meta) return
+  citeCountSaving.value = true
+  try {
+    const val = citeCountDraft.value
+    const updated: PaperMeta = {
+      ...props.meta,
+      cite_count: (val != null && val >= 0) ? Math.floor(val) : undefined,
+    }
+    await invoke('save_paper_meta', { slug: props.slug, meta: updated })
+    emit('saved', updated)
+    citeCountEditing.value = false
+    citeCountDraft.value = undefined
+  } catch (e) {
+    console.error('Failed to save cite_count:', e)
+  } finally {
+    citeCountSaving.value = false
   }
 }
 
@@ -378,6 +415,36 @@ async function extractAbstract() {
           <div class="label">{{ t('meta.arxivId') }}</div>
           <div class="value mono">{{ meta.arxiv_id || '—' }}</div>
         </div>
+
+        <!-- Citation count -->
+        <div class="field">
+          <div class="label cite-count-label-row">
+            <span>{{ t('meta.citeCount') }}</span>
+            <button class="copy-section-btn" @click="startCiteCountEdit">
+              {{ meta.cite_count != null ? '编辑' : '导入' }}
+            </button>
+          </div>
+          <template v-if="citeCountEditing">
+            <div class="cite-count-edit-row">
+              <input
+                v-model.number="citeCountDraft"
+                class="input cite-count-input"
+                type="number"
+                min="0"
+                placeholder="0"
+                autofocus
+              />
+              <button class="act-btn primary" :disabled="citeCountSaving" @click="saveCiteCount">
+                {{ citeCountSaving ? '保存中…' : '保存' }}
+              </button>
+              <button class="act-btn" @click="cancelCiteCountEdit">取消</button>
+            </div>
+          </template>
+          <template v-else>
+            <div v-if="meta.cite_count == null" class="fulltext-placeholder muted">暂无引用量，点击导入添加</div>
+            <div v-else class="value cite-count-val">{{ meta.cite_count.toLocaleString() }}</div>
+          </template>
+        </div>
         <div class="field tags-field">
           <div class="label">{{ t('meta.tags') }}</div>
           <div class="value tags">
@@ -613,6 +680,17 @@ async function extractAbstract() {
         <div class="field">
           <div class="label">{{ t('meta.venue') }}</div>
           <input v-model="draft.venue" class="input" type="text" />
+        </div>
+
+        <div class="field">
+          <div class="label">{{ t('meta.citeCount') }}</div>
+          <input
+            v-model.number="draft.cite_count"
+            class="input"
+            type="number"
+            min="0"
+            placeholder="0"
+          />
         </div>
 
         <div class="field">
@@ -916,6 +994,25 @@ async function extractAbstract() {
   display: flex;
   gap: 6px;
   margin-top: 6px;
+}
+
+/* Citation count section */
+.cite-count-label-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.cite-count-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cite-count-input {
+  width: 110px;
+}
+.cite-count-val {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
 }
 
 /* Abstract section */

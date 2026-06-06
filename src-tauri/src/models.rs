@@ -27,6 +27,9 @@ pub struct PaperMeta {
     /// How the paper was imported: "file" | "arxiv" | "url". None for legacy entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_source: Option<String>,
+    /// User-provided citation count (e.g. from Google Scholar).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cite_count: Option<u32>,
 }
 
 pub fn normalize_import_source(import_source: Option<&str>, arxiv_id: Option<&str>) -> String {
@@ -134,6 +137,9 @@ pub struct PaperIndexEntry {
     /// Import source: "file" | "arxiv" | "url". None for legacy entries (inferred on frontend).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_source: Option<String>,
+    /// User-provided citation count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cite_count: Option<u32>,
 }
 
 fn default_reading_status_entry() -> String {
@@ -584,6 +590,26 @@ pub struct RetrievedChunk {
     pub source_id: Option<String>,
     /// Human-readable label, e.g. "第3页批注" or "笔记: 我的想法"
     pub source_label: Option<String>,
+}
+
+// ── Snippet retrieval result ──────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetrievedSnippet {
+    pub snippet_id: String,
+    pub library_id: String,
+    pub text: String,
+    pub score: f32,
+    pub paper_id: String,
+    pub paper_title: String,
+    pub page: u32,
+    pub note: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SnippetStoreInfo {
+    pub embedded_count: usize,
 }
 
 // ── Vectorize pipeline (frontend-orchestrated) ───────────────────────────────

@@ -49,6 +49,7 @@ export const zh = {
     status: '状态',
     tags: '标签',
     source: '来源',
+    citeCount: '引用数',
     colPicker: '选择显示列',
     exportList: '导出文献列表 PDF',
     exportListDone: 'PDF 已保存',
@@ -119,6 +120,7 @@ export const zh = {
     abstractExtract: 'AI 提取',
     abstractReExtract: '重新提取',
     abstractExtracting: '提取中…',
+    citeCount: '引用量',
   },
   readingStatus: {
     unread: '未读',
@@ -766,6 +768,7 @@ export const en: typeof zh = {
     status: 'Status',
     tags: 'Tags',
     source: 'Source',
+    citeCount: 'Citations',
     colPicker: 'Choose columns',
     exportList: 'Export Literature List as PDF',
     exportListDone: 'PDF saved',
@@ -833,6 +836,7 @@ export const en: typeof zh = {
     abstractExtract: 'AI Extract',
     abstractReExtract: 'Re-extract',
     abstractExtracting: 'Extracting…',
+    citeCount: 'Citations',
   },
   readingStatus: {
     unread: 'Unread',

@@ -137,6 +137,7 @@ mod pdf_url {
             bibtex: None,
             canvas_notes: vec![],
             import_source: Some("url".to_string()),
+            cite_count: None,
         };
 
         super::finalize_paper(root, &final_dir, &final_slug, paper_meta, collection_id, app, "pdf").await?;
@@ -493,6 +494,7 @@ mod acl {
             bibtex: None,
             canvas_notes: vec![],
             import_source: Some("url".to_string()),
+            cite_count: None,
         };
 
         super::finalize_paper(
@@ -676,6 +678,7 @@ mod openreview {
             bibtex: None,
             canvas_notes: vec![],
             import_source: Some("url".to_string()),
+            cite_count: None,
         };
 
         super::finalize_paper(

@@ -58,7 +58,7 @@ function toggleSort(field: SortField) {
     sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
   } else {
     sortField.value = field
-    sortDir.value = field === 'added_at' ? 'desc' : 'asc'
+    sortDir.value = (field === 'added_at' || field === 'cite_count') ? 'desc' : 'asc'
   }
 }
 
@@ -71,32 +71,34 @@ function clearSort(field?: SortField) {
 
 function compareValue(a: PaperIndexEntry, b: PaperIndexEntry): number {
   switch (sortField.value) {
-    case 'title':    return a.title.localeCompare(b.title)
-    case 'year':     return (a.year ?? 0) - (b.year ?? 0)
-    case 'added_at': return a.added_at.localeCompare(b.added_at)
-    case 'authors':  return (a.authors[0] ?? '').localeCompare(b.authors[0] ?? '')
-    case 'venue':    return (a.venue ?? '').localeCompare(b.venue ?? '')
-    default:         return 0
+    case 'title':      return a.title.localeCompare(b.title)
+    case 'year':       return (a.year ?? 0) - (b.year ?? 0)
+    case 'added_at':   return a.added_at.localeCompare(b.added_at)
+    case 'authors':    return (a.authors[0] ?? '').localeCompare(b.authors[0] ?? '')
+    case 'venue':      return (a.venue ?? '').localeCompare(b.venue ?? '')
+    case 'cite_count': return (a.cite_count ?? -1) - (b.cite_count ?? -1)
+    default:           return 0
   }
 }
 
 // ── Column configuration ──────────────────────────────────────────────────────
-type ColId = 'title' | 'authors' | 'venue' | 'year' | 'added_at' | 'status' | 'tags' | 'source'
+type ColId = 'title' | 'authors' | 'venue' | 'year' | 'added_at' | 'status' | 'tags' | 'source' | 'cite_count'
 
 const COL_META: Record<ColId, {
   id: ColId; labelKey: string; defaultWidth: number; minWidth: number; sortField?: SortField
 }> = {
-  title:    { id: 'title',    labelKey: 'list.title',   defaultWidth: 440, minWidth: 180, sortField: 'title' },
-  authors:  { id: 'authors',  labelKey: 'list.authors', defaultWidth: 160, minWidth: 90,  sortField: 'authors' },
-  venue:    { id: 'venue',    labelKey: 'list.venue',   defaultWidth: 130, minWidth: 80,  sortField: 'venue' },
-  year:     { id: 'year',     labelKey: 'list.year',    defaultWidth: 60,  minWidth: 48,  sortField: 'year' },
-  added_at: { id: 'added_at', labelKey: 'list.addedAt', defaultWidth: 90,  minWidth: 78,  sortField: 'added_at' },
-  status:   { id: 'status',   labelKey: 'list.status',  defaultWidth: 160, minWidth: 120 },
-  tags:     { id: 'tags',     labelKey: 'list.tags',    defaultWidth: 160, minWidth: 80 },
-  source:   { id: 'source',   labelKey: 'list.source',  defaultWidth: 72,  minWidth: 60 },
+  title:      { id: 'title',      labelKey: 'list.title',     defaultWidth: 440, minWidth: 180, sortField: 'title' },
+  authors:    { id: 'authors',    labelKey: 'list.authors',   defaultWidth: 160, minWidth: 90,  sortField: 'authors' },
+  venue:      { id: 'venue',      labelKey: 'list.venue',     defaultWidth: 130, minWidth: 80,  sortField: 'venue' },
+  year:       { id: 'year',       labelKey: 'list.year',      defaultWidth: 60,  minWidth: 48,  sortField: 'year' },
+  added_at:   { id: 'added_at',   labelKey: 'list.addedAt',   defaultWidth: 90,  minWidth: 78,  sortField: 'added_at' },
+  status:     { id: 'status',     labelKey: 'list.status',    defaultWidth: 160, minWidth: 120 },
+  tags:       { id: 'tags',       labelKey: 'list.tags',      defaultWidth: 160, minWidth: 80 },
+  source:     { id: 'source',     labelKey: 'list.source',    defaultWidth: 72,  minWidth: 60 },
+  cite_count: { id: 'cite_count', labelKey: 'list.citeCount', defaultWidth: 72,  minWidth: 56,  sortField: 'cite_count' },
 }
-const ALL_COL_IDS: ColId[] = ['title', 'authors', 'venue', 'year', 'added_at', 'status', 'tags', 'source']
-const COL_STATE_KEY = 'argus:col-state-v7'
+const ALL_COL_IDS: ColId[] = ['title', 'authors', 'venue', 'year', 'added_at', 'status', 'tags', 'source', 'cite_count']
+const COL_STATE_KEY = 'argus:col-state-v8'
 
 // ── Import source helpers ─────────────────────────────────────────────────────
 type ImportSource = 'file' | 'arxiv' | 'url'
@@ -1226,6 +1228,9 @@ async function reExtract(item: PaperIndexEntry) {
                     :style="{ background: SOURCE_BG[paperSource(item)], color: SOURCE_TEXT[paperSource(item)] }"
                   >{{ SOURCE_LABEL[paperSource(item)] }}</span>
                 </div>
+                <div v-else-if="col.id === 'cite_count'" class="row-cell row-cite-count">
+                  {{ item.cite_count != null ? item.cite_count.toLocaleString() : '—' }}
+                </div>
               </template>
               <div class="hdr-trail" />
             </div>
@@ -1741,6 +1746,7 @@ async function reExtract(item: PaperIndexEntry) {
 }
 
 .row-source { justify-content: flex-start; }
+.row-cite-count { font-variant-numeric: tabular-nums; }
 .source-chip {
   display: inline-flex;
   align-items: center;

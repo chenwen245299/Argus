@@ -39,7 +39,7 @@ async function refreshCounts() {
   const t0 = Date.now()
   try {
     await invoke('sync_vectorized_flags')
-    await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts()])
+    await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts(), loadSnippetStoreCounts()])
   } finally {
     const remaining = 700 - (Date.now() - t0)
     if (remaining > 0) await new Promise(r => setTimeout(r, remaining))
@@ -123,6 +123,7 @@ interface GroupedSource {
 
 const STORAGE_KEY = 'argus.library-chats.v1'
 const LAST_MODEL_KEY = 'argus.library-chat.last-model'
+const KNOWLEDGE_SOURCE_KEY = 'argus.library-chat.knowledge-source'
 
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7)
@@ -160,6 +161,64 @@ const modelPickerMsg = computed(() =>
     ? (activeConv.value?.messages.find(m => m.id === modelPickerMsgId.value) as LibraryUiMessage | undefined)
     : undefined
 )
+
+// ── Knowledge source picker ───────────────────────────────────────────────────
+type KnowledgeSource = 'papers' | 'snippets'
+
+function loadKnowledgeSource(): KnowledgeSource {
+  const saved = localStorage.getItem(KNOWLEDGE_SOURCE_KEY)
+  return saved === 'snippets' ? 'snippets' : 'papers'
+}
+
+const knowledgeSource = ref<KnowledgeSource>(loadKnowledgeSource())
+const sourcePickerOpen = ref(false)
+
+function setKnowledgeSource(src: KnowledgeSource) {
+  knowledgeSource.value = src
+  sourcePickerOpen.value = false
+  try { localStorage.setItem(KNOWLEDGE_SOURCE_KEY, src) } catch {}
+}
+
+const knowledgeSourceLabel = computed(() =>
+  knowledgeSource.value === 'snippets' ? '素材库' : '文献库'
+)
+
+// ── Snippet store state ───────────────────────────────────────────────────────
+const snippetEmbeddedCount  = ref(0)
+const snippetTotalCount     = ref(0)
+const snippetSyncing        = ref(false)
+const snippetSyncProgress   = ref({ done: 0, total: 0, failed: 0 })
+let   snippetSyncCancel     = false
+
+async function loadSnippetStoreCounts() {
+  try {
+    const [info, allLibs] = await Promise.all([
+      invoke<{ embedded_count: number }>('get_snippet_store_info'),
+      invoke<{ id: string }[]>('list_snippet_libraries'),
+    ])
+    snippetEmbeddedCount.value = info.embedded_count
+
+    // Count total snippets across all libraries
+    let total = 0
+    for (const lib of allLibs) {
+      const snips = await invoke<unknown[]>('get_snippets', { libraryId: lib.id })
+      total += snips.length
+    }
+    snippetTotalCount.value = total
+  } catch { /* no library open */ }
+}
+
+async function syncSnippets() {
+  if (snippetSyncing.value || !ragStore.isConfigured) return
+  snippetSyncing.value = true
+  snippetSyncCancel = false
+  try {
+    const [done, failed] = await invoke<[number, number]>('embed_all_snippets')
+    snippetSyncProgress.value = { done, total: done + failed, failed }
+    await loadSnippetStoreCounts()
+  } catch { /* ignore */ }
+  finally { snippetSyncing.value = false }
+}
 
 function openModelPicker(msgId: string, e: MouseEvent) {
   if (modelPickerMsgId.value === msgId) {
@@ -579,6 +638,7 @@ async function runAssistantRequest(
       modelId: sel?.modelId ?? null,
       eventName,
       sourcesEventName,
+      knowledgeSource: knowledgeSource.value,
     })
     if (!target.content && finalText) target.content = finalText
     target.streaming = false
@@ -746,6 +806,9 @@ function closeModelMenu(e: MouseEvent) {
   if (!(e.target as HTMLElement).closest('.msg-model-picker')) {
     modelPickerMsgId.value = null
   }
+  if (!(e.target as HTMLElement).closest('.ks-picker')) {
+    sourcePickerOpen.value = false
+  }
 }
 
 watch(selectedModel, (sel) => {
@@ -770,7 +833,7 @@ onMounted(async () => {
   if (!ai.loaded) await ai.load()
   restoreLastModel()
   if (!ragStore.loaded) await ragStore.load()
-  await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts()])
+  await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts(), loadSnippetStoreCounts()])
   document.addEventListener('mousedown', closeModelMenu)
 
   messagesEl.value?.addEventListener('copy-code', onCopyCode)
@@ -812,7 +875,29 @@ onUnmounted(() => {
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
             RAG
           </button>
-          <!-- RAG configured -->
+          <template v-else-if="knowledgeSource === 'snippets'">
+            <!-- Snippet RAG controls -->
+            <span v-if="snippetSyncing" class="rag-sync-progress">{{ snippetSyncProgress.done }}/{{ snippetSyncProgress.total }}</span>
+            <button class="rag-refresh-btn" :class="{ refreshing: snippetSyncing }" title="刷新素材库嵌入状态" :disabled="snippetSyncing" @click="loadSnippetStoreCounts">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+            </button>
+            <div class="rag-counter" title="素材库：已嵌入素材 / 总素材数">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+              <span class="rag-counter-text">{{ snippetEmbeddedCount }}/{{ snippetTotalCount }}</span>
+            </div>
+            <button
+              class="rag-sync-btn"
+              :class="{ 'all-done': snippetEmbeddedCount >= snippetTotalCount && snippetTotalCount > 0 }"
+              :title="snippetEmbeddedCount < snippetTotalCount ? `嵌入 ${snippetTotalCount - snippetEmbeddedCount} 条未向量化的素材` : '所有素材已嵌入'"
+              :disabled="snippetSyncing || (snippetEmbeddedCount >= snippetTotalCount && snippetTotalCount > 0)"
+              @click="syncSnippets"
+            >
+              <svg v-if="snippetEmbeddedCount < snippetTotalCount" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+              <svg v-else width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              {{ snippetSyncing ? '嵌入中…' : snippetEmbeddedCount < snippetTotalCount ? `嵌入 ${snippetTotalCount - snippetEmbeddedCount} 条` : '已全部嵌入' }}
+            </button>
+          </template>
+          <!-- Paper RAG controls -->
           <template v-else>
             <span v-if="syncingMissing" class="rag-sync-progress">{{ syncProgress.done }}/{{ syncProgress.total }}</span>
             <button class="rag-refresh-btn" :class="{ refreshing: refreshingCounts || syncingMissing }" title="刷新嵌入状态" :disabled="refreshingCounts || syncingMissing" @click="refreshCounts">
@@ -1286,10 +1371,50 @@ onUnmounted(() => {
             />
             <div class="composer-footer">
               <div class="footer-left">
-                <span class="rag-status" :class="{ on: ragStore.isConfigured }">
-                  <span class="rag-dot" />
-                  {{ ragStore.isConfigured ? 'RAG' : t('libraryChat.ragOff') }}
-                </span>
+                <!-- Knowledge source picker -->
+                <div class="ks-picker" @click.stop>
+                  <button
+                    class="ks-trigger"
+                    :class="{
+                      on: knowledgeSource === 'papers' ? ragStore.isConfigured : true,
+                      active: sourcePickerOpen,
+                    }"
+                    @click="sourcePickerOpen = !sourcePickerOpen"
+                  >
+                    <span class="ks-dot" />
+                    {{ knowledgeSourceLabel }}
+                    <svg class="ks-chevron" :class="{ open: sourcePickerOpen }" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                      <path d="m6 9 6 6 6-6"/>
+                    </svg>
+                  </button>
+                  <div v-if="sourcePickerOpen" class="ks-menu">
+                    <button
+                      class="ks-option"
+                      :class="{ selected: knowledgeSource === 'papers' }"
+                      @click="setKnowledgeSource('papers')"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+                      </svg>
+                      <span class="ks-option-text">
+                        文献库
+                        <span v-if="!ragStore.isConfigured" class="ks-option-hint">（RAG 未配置）</span>
+                      </span>
+                      <svg v-if="knowledgeSource === 'papers'" class="ks-check" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    </button>
+                    <button
+                      class="ks-option"
+                      :class="{ selected: knowledgeSource === 'snippets' }"
+                      @click="setKnowledgeSource('snippets')"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>
+                      </svg>
+                      <span class="ks-option-text">素材库</span>
+                      <svg v-if="knowledgeSource === 'snippets'" class="ks-check" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    </button>
+                  </div>
+                </div>
               </div>
               <div class="footer-right">
                 <span class="enter-hint">{{ t('libraryChat.enterHint') }}</span>
@@ -2520,29 +2645,94 @@ onUnmounted(() => {
 .footer-left { display: flex; align-items: center; gap: 8px; }
 .footer-right { display: flex; align-items: center; gap: 8px; }
 
-.rag-status {
+/* Knowledge source picker */
+.ks-picker {
+  position: relative;
+}
+
+.ks-trigger {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   height: 24px;
   padding: 0 8px;
   border-radius: var(--radius-pill);
   background: var(--bg-secondary);
+  border: 1px solid transparent;
   font-size: 11px;
   font-weight: 600;
   color: var(--text-tertiary);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+  white-space: nowrap;
+}
+.ks-trigger:hover,
+.ks-trigger.active {
+  background: var(--bg-hover);
+  border-color: var(--border-subtle);
+  color: var(--text-secondary);
+}
+.ks-trigger.on {
+  color: var(--accent);
 }
 
-.rag-dot {
+.ks-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--text-tertiary);
   flex-shrink: 0;
 }
+.ks-trigger.on .ks-dot { background: var(--accent); }
 
-.rag-status.on { color: var(--accent); }
-.rag-status.on .rag-dot { background: var(--accent); }
+.ks-chevron {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  transition: transform 0.15s;
+}
+.ks-chevron.open { transform: rotate(180deg); }
+
+.ks-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  padding: 4px;
+  min-width: 150px;
+  z-index: 200;
+}
+
+.ks-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-primary);
+  text-align: left;
+  transition: background 0.08s;
+}
+.ks-option:hover { background: var(--bg-hover); }
+.ks-option.selected { color: var(--accent); }
+.ks-option svg { flex-shrink: 0; color: var(--text-tertiary); }
+.ks-option.selected svg:first-child { color: var(--accent); }
+
+.ks-option-text {
+  flex: 1;
+  min-width: 0;
+}
+.ks-option-hint {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-weight: 400;
+  margin-left: 4px;
+}
+.ks-check { flex-shrink: 0; color: var(--accent); }
 
 .enter-hint {
   font-size: 11px;

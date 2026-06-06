@@ -14,6 +14,7 @@ export interface PaperMeta {
   bibtex?: string
   canvas_notes?: string[]
   import_source?: string
+  cite_count?: number
 }
 
 export interface PaperStatus {
@@ -68,6 +69,7 @@ export interface PaperIndexEntry {
   reading_status: string
   meta_mtime?: number
   import_source?: string
+  cite_count?: number
 }
 
 export interface LibraryConfig {
@@ -85,7 +87,7 @@ export interface ImportJob {
   error?: string
 }
 
-export type SortField = 'title' | 'year' | 'added_at' | 'authors' | 'venue'
+export type SortField = 'title' | 'year' | 'added_at' | 'authors' | 'venue' | 'cite_count'
 export type SortDir = 'asc' | 'desc'
 
 export type NavItem = 'all' | 'inbox' | 'search' | `tag:${string}` | `collection:${string}`
@@ -246,6 +248,22 @@ export interface ChunkInput {
   source_type: string
   source_id: string | null
   source_label: string | null
+}
+
+export interface RetrievedSnippet {
+  snippet_id: string
+  library_id: string
+  text: string
+  score: number
+  paper_id: string
+  paper_title: string
+  page: number
+  note: string
+  tags: string[]
+}
+
+export interface SnippetStoreInfo {
+  embedded_count: number
 }
 
 export interface RetrievedChunk {

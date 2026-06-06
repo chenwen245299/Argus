@@ -257,5 +257,6 @@ fn default_meta() -> PaperMeta {
         bibtex: None,
         canvas_notes: vec![],
         import_source: None,
+        cite_count: None,
     }
 }

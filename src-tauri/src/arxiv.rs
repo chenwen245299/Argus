@@ -1065,6 +1065,7 @@ pub async fn add_to_library(
         bibtex: None,
         canvas_notes: vec![],
         import_source: Some("arxiv".to_string()),
+        cite_count: None,
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);
@@ -1670,6 +1671,7 @@ pub async fn import_by_url(
         bibtex: None,
         canvas_notes: vec![],
         import_source: Some("url".to_string()),
+        cite_count: None,
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);

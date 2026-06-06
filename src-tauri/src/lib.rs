@@ -183,6 +183,11 @@ pub fn run() {
             commands::focus_main_window,
             commands::save_chat_window_size,
             commands::save_paper_ai_window_size,
+            // ── Snippet RAG ──
+            commands::get_snippet_store_info,
+            commands::embed_all_snippets,
+            commands::embed_all_snippets_force,
+            commands::delete_snippet_vector,
             // ── M8: arXiv window ──
             commands::open_arxiv_window,
             commands::save_arxiv_window_size,

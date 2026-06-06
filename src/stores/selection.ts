@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { NavItem, SearchHit } from '../types'
+import { recordPaperAccess } from '../utils/recentPapers'
 
 export const useSelectionStore = defineStore('selection', () => {
   const selectedSlug = ref<string | null>(null)
@@ -14,6 +15,7 @@ export const useSelectionStore = defineStore('selection', () => {
   const searchResults = ref<SearchHit[]>([])
 
   function selectPaper(slug: string | null) {
+    recordPaperAccess(slug)
     selectedSlug.value = slug
   }
 

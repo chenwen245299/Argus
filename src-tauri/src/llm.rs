@@ -189,6 +189,7 @@ async fn embed_openrouter(
     let client = build_client()?;
     let url = format!("{}/embeddings", provider.base_url.trim_end_matches('/'));
     let mut total_tokens: u64 = 0;
+    let mut total_cost_usd: Option<f64> = None;
     let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
     // OpenRouter: send one text at a time — some models reject array input.
@@ -220,6 +221,9 @@ async fn embed_openrouter(
             .map_err(|e| format!("Invalid JSON from embeddings API: {e}"))?;
 
         total_tokens += json["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+        if let Some(v) = usage_cost_usd(&json["usage"]) {
+            total_cost_usd = Some(total_cost_usd.unwrap_or(0.0) + v);
+        }
 
         let data = json["data"].as_array().ok_or_else(|| {
             format!(
@@ -232,7 +236,14 @@ async fn embed_openrouter(
         vecs.append(&mut batch);
     }
 
-    crate::token_usage::record(source, &provider.id, model, total_tokens, 0);
+    crate::token_usage::record_with_cost(
+        source,
+        &provider.id,
+        model,
+        total_tokens,
+        0,
+        total_cost_usd,
+    );
     Ok(vecs)
 }
 
@@ -353,7 +364,8 @@ async fn stream_openrouter_with_pdf(
         "model": model,
         "messages": msgs,
         "stream": true,
-        "stream_options": {"include_usage": true}
+        "stream_options": {"include_usage": true},
+        "usage": {"include": true}
     });
 
     {
@@ -396,6 +408,8 @@ async fn stream_openrouter_with_pdf(
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
+    let mut cost_usd: Option<f64> = None;
+    let mut usage_emitted = false;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
@@ -410,12 +424,23 @@ async fn stream_openrouter_with_pdf(
 
                     if let Some(data) = line.strip_prefix("data: ") {
                         if data == "[DONE]" {
-                            crate::token_usage::record(
+                            if !usage_emitted {
+                                emit_stream_usage(
+                                    app,
+                                    event_name,
+                                    input_tokens,
+                                    output_tokens,
+                                    input_tokens.saturating_add(output_tokens),
+                                    cost_usd,
+                                );
+                            }
+                            crate::token_usage::record_with_cost(
                                 source,
                                 &provider.id,
                                 model,
                                 input_tokens,
                                 output_tokens,
+                                cost_usd,
                             );
                             let _ =
                                 app.emit(event_name, serde_json::json!({"delta":"","done":true}));
@@ -429,6 +454,21 @@ async fn stream_openrouter_with_pdf(
                                 if let Some(v) = usage["completion_tokens"].as_u64() {
                                     output_tokens = v;
                                 }
+                                if let Some(v) = usage_cost_usd(usage) {
+                                    cost_usd = Some(v);
+                                }
+                                let total_tokens = usage["total_tokens"]
+                                    .as_u64()
+                                    .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+                                emit_stream_usage(
+                                    app,
+                                    event_name,
+                                    input_tokens,
+                                    output_tokens,
+                                    total_tokens,
+                                    cost_usd,
+                                );
+                                usage_emitted = true;
                             }
                             let delta = json["choices"][0]["delta"]["content"]
                                 .as_str()
@@ -456,7 +496,24 @@ async fn stream_openrouter_with_pdf(
         }
     }
 
-    crate::token_usage::record(source, &provider.id, model, input_tokens, output_tokens);
+    crate::token_usage::record_with_cost(
+        source,
+        &provider.id,
+        model,
+        input_tokens,
+        output_tokens,
+        cost_usd,
+    );
+    if !usage_emitted {
+        emit_stream_usage(
+            app,
+            event_name,
+            input_tokens,
+            output_tokens,
+            input_tokens.saturating_add(output_tokens),
+            cost_usd,
+        );
+    }
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
 }
@@ -483,6 +540,7 @@ async fn chat_openai_compat(
     let mut body = serde_json::json!({"model": model, "messages": msgs});
 
     if is_openrouter {
+        body["usage"] = serde_json::json!({"include": true});
         let order: Vec<&str> = provider
             .models
             .iter()
@@ -513,7 +571,19 @@ async fn chat_openai_compat(
 
     let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
     let output_tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-    crate::token_usage::record(source, &provider.id, model, input_tokens, output_tokens);
+    let cost_usd = if is_openrouter {
+        usage_cost_usd(&json["usage"])
+    } else {
+        None
+    };
+    crate::token_usage::record_with_cost(
+        source,
+        &provider.id,
+        model,
+        input_tokens,
+        output_tokens,
+        cost_usd,
+    );
 
     json["choices"][0]["message"]["content"]
         .as_str()
@@ -551,6 +621,7 @@ async fn stream_openai_compat(
     });
 
     if is_openrouter {
+        body["usage"] = serde_json::json!({"include": true});
         let order: Vec<&str> = provider
             .models
             .iter()
@@ -602,6 +673,8 @@ async fn stream_openai_compat(
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
+    let mut cost_usd: Option<f64> = None;
+    let mut usage_emitted = false;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
@@ -616,12 +689,23 @@ async fn stream_openai_compat(
 
                     if let Some(data) = line.strip_prefix("data: ") {
                         if data == "[DONE]" {
-                            crate::token_usage::record(
+                            if !usage_emitted {
+                                emit_stream_usage(
+                                    app,
+                                    event_name,
+                                    input_tokens,
+                                    output_tokens,
+                                    input_tokens.saturating_add(output_tokens),
+                                    if is_openrouter { cost_usd } else { None },
+                                );
+                            }
+                            crate::token_usage::record_with_cost(
                                 source,
                                 &provider.id,
                                 model,
                                 input_tokens,
                                 output_tokens,
+                                if is_openrouter { cost_usd } else { None },
                             );
                             let _ =
                                 app.emit(event_name, serde_json::json!({"delta":"","done":true}));
@@ -636,6 +720,23 @@ async fn stream_openai_compat(
                                 if let Some(v) = usage["completion_tokens"].as_u64() {
                                     output_tokens = v;
                                 }
+                                if is_openrouter {
+                                    if let Some(v) = usage_cost_usd(usage) {
+                                        cost_usd = Some(v);
+                                    }
+                                }
+                                let total_tokens = usage["total_tokens"]
+                                    .as_u64()
+                                    .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+                                emit_stream_usage(
+                                    app,
+                                    event_name,
+                                    input_tokens,
+                                    output_tokens,
+                                    total_tokens,
+                                    if is_openrouter { cost_usd } else { None },
+                                );
+                                usage_emitted = true;
                             }
                             // Main content delta
                             if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
@@ -667,7 +768,24 @@ async fn stream_openai_compat(
         }
     }
 
-    crate::token_usage::record(source, &provider.id, model, input_tokens, output_tokens);
+    crate::token_usage::record_with_cost(
+        source,
+        &provider.id,
+        model,
+        input_tokens,
+        output_tokens,
+        if is_openrouter { cost_usd } else { None },
+    );
+    if !usage_emitted {
+        emit_stream_usage(
+            app,
+            event_name,
+            input_tokens,
+            output_tokens,
+            input_tokens.saturating_add(output_tokens),
+            if is_openrouter { cost_usd } else { None },
+        );
+    }
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
 }
@@ -826,6 +944,14 @@ async fn stream_anthropic(
                                     }
                                 }
                                 Some("message_stop") => {
+                                    emit_stream_usage(
+                                        app,
+                                        event_name,
+                                        input_tokens,
+                                        output_tokens,
+                                        input_tokens.saturating_add(output_tokens),
+                                        None,
+                                    );
                                     crate::token_usage::record(
                                         source,
                                         &provider.id,
@@ -849,8 +975,50 @@ async fn stream_anthropic(
     }
 
     crate::token_usage::record(source, &provider.id, model, input_tokens, output_tokens);
+    emit_stream_usage(
+        app,
+        event_name,
+        input_tokens,
+        output_tokens,
+        input_tokens.saturating_add(output_tokens),
+        None,
+    );
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
+}
+
+fn emit_stream_usage(
+    app: &tauri::AppHandle,
+    event_name: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cost_usd: Option<f64>,
+) {
+    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 && cost_usd.is_none() {
+        return;
+    }
+    let usage_event = format!("{event_name}-usage");
+    let _ = app.emit(
+        usage_event.as_str(),
+        serde_json::json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cost_usd": cost_usd,
+        }),
+    );
+}
+
+fn usage_cost_usd(usage: &serde_json::Value) -> Option<f64> {
+    let value = usage["cost"]
+        .as_f64()
+        .or_else(|| usage["cost"].as_str().and_then(|s| s.parse::<f64>().ok()))?;
+    if value.is_finite() && value >= 0.0 {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 // ── Model listing ─────────────────────────────────────────────────────────────
@@ -936,6 +1104,9 @@ fn parse_model_item(item: &serde_json::Value) -> Option<AiModel> {
         .as_u64()
         .or_else(|| item["context_window"].as_u64());
     let capabilities = parse_capabilities(item);
+    let input_price_usd_per_million = parse_price_usd_per_million(&item["pricing"]["prompt"]);
+    let output_price_usd_per_million =
+        parse_price_usd_per_million(&item["pricing"]["completion"]);
     Some(AiModel {
         id: id.to_string(),
         display_name,
@@ -944,8 +1115,21 @@ fn parse_model_item(item: &serde_json::Value) -> Option<AiModel> {
         enabled: true,
         input_price_per_million: None,
         output_price_per_million: None,
+        input_price_usd_per_million,
+        output_price_usd_per_million,
         provider_order: vec![],
     })
+}
+
+fn parse_price_usd_per_million(value: &serde_json::Value) -> Option<f64> {
+    let per_token = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<f64>().ok()))?;
+    if per_token.is_finite() && per_token >= 0.0 {
+        Some(per_token * 1_000_000.0)
+    } else {
+        None
+    }
 }
 
 fn parse_capabilities(item: &serde_json::Value) -> Vec<String> {
@@ -1114,6 +1298,8 @@ fn anthropic_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            input_price_usd_per_million: None,
+            output_price_usd_per_million: None,
             provider_order: vec![],
         },
         AiModel {
@@ -1124,6 +1310,8 @@ fn anthropic_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            input_price_usd_per_million: None,
+            output_price_usd_per_million: None,
             provider_order: vec![],
         },
         AiModel {
@@ -1134,6 +1322,8 @@ fn anthropic_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            input_price_usd_per_million: None,
+            output_price_usd_per_million: None,
             provider_order: vec![],
         },
     ]

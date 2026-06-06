@@ -27,6 +27,7 @@ import '@vue-flow/minimap/dist/style.css'
 import { marked } from 'marked'
 import { useCanvasStore } from '../stores/canvas'
 import { useLibraryStore } from '../stores/library'
+import { recordPaperAccess, sortPapersByRecentAccess } from '../utils/recentPapers'
 import PaperNode from '../components/canvas/PaperNode.vue'
 import AdjustableEdge from '../components/canvas/AdjustableEdge.vue'
 import SuggestPanel from '../components/canvas/SuggestPanel.vue'
@@ -71,6 +72,7 @@ async function watchWindowSize() {
 
 const nodeTypes = markRaw({ paper: PaperNode })
 const edgeTypes = markRaw({ adjustable: AdjustableEdge })
+const PAN_ON_DRAG_BUTTONS = [1, 2]
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const nodes = ref<any[]>([])
@@ -153,7 +155,7 @@ const pickerError = ref('')
 const filteredPapers = computed(() => {
   const addedIds = new Set(nodes.value.map(n => n.data.paperId))
   const q = pickerSearch.value.trim().toLowerCase()
-  const base = library.papers.filter(p => !addedIds.has(p.id))
+  const base = sortPapersByRecentAccess(library.papers).filter(p => !addedIds.has(p.id))
   if (!q) return base
   return base.filter(p =>
     p.title.toLowerCase().includes(q) ||
@@ -489,6 +491,7 @@ function openPaperPicker() {
 }
 
 function addPaperToCanvas(paper: PaperIndexEntry) {
+  recordPaperAccess(paper.slug)
   const cv = canvasStore.currentCanvas
   if (!cv) return
 
@@ -1139,6 +1142,10 @@ watch(() => library.papers, () => {
           :connection-mode="ConnectionMode.Loose"
           :default-edge-options="{ type: 'adjustable', markerEnd: MarkerType.ArrowClosed }"
           :snap-to-grid="false"
+          :pan-on-drag="PAN_ON_DRAG_BUTTONS"
+          :selection-key-code="true"
+          :elements-selectable="true"
+          :select-nodes-on-drag="true"
           fit-view-on-init
           class="canvas-flow"
           @node-mouse-enter="onNodeMouseEnter"

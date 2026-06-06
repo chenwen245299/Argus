@@ -83,6 +83,7 @@ pub fn run() {
             commands::save_notes,
             commands::list_notes,
             commands::get_canvas_note_titles,
+            commands::get_canvas_note_titles_map,
             commands::get_note,
             commands::create_note,
             commands::save_note,

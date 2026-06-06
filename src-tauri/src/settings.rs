@@ -3,6 +3,10 @@ use std::path::Path;
 use crate::models::AppSettings;
 
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
+    if !settings.usd_to_cny_rate.is_finite() || settings.usd_to_cny_rate <= 0.0 {
+        settings.usd_to_cny_rate = crate::models::default_usd_to_cny_rate();
+    }
+
     let metadata_prompt = settings.metadata_ai_prompt.trim();
     if metadata_prompt.is_empty() || metadata_prompt.contains("a concise paper abstract") {
         settings.metadata_ai_prompt = crate::models::default_metadata_ai_prompt();

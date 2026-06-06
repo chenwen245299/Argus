@@ -206,6 +206,9 @@ impl Default for CollectionsFile {
 pub struct AppSettings {
     pub appearance: String,
     pub extraction_default: String,
+    /// USD to CNY exchange rate used for displaying provider-reported AI costs.
+    #[serde(default = "default_usd_to_cny_rate")]
+    pub usd_to_cny_rate: f64,
     /// AI provider ID to use for metadata extraction (None = default)
     #[serde(default)]
     pub metadata_ai_provider_id: Option<String>,
@@ -251,6 +254,10 @@ pub struct AppSettings {
     /// User-editable prompt for chat title generation.
     #[serde(default = "default_title_ai_prompt")]
     pub title_ai_prompt: String,
+}
+
+pub fn default_usd_to_cny_rate() -> f64 {
+    7.20
 }
 
 pub fn default_metadata_ai_prompt() -> String {
@@ -390,6 +397,7 @@ impl Default for AppSettings {
         AppSettings {
             appearance: "system".to_string(),
             extraction_default: "lopdf".to_string(),
+            usd_to_cny_rate: default_usd_to_cny_rate(),
             metadata_ai_provider_id: None,
             metadata_ai_model_id: None,
             metadata_ai_prompt: default_metadata_ai_prompt(),
@@ -441,6 +449,12 @@ pub struct AiModel {
     /// CNY price per 1 million output tokens
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_price_per_million: Option<f64>,
+    /// USD price per 1 million input tokens, as returned by providers like OpenRouter
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_price_usd_per_million: Option<f64>,
+    /// USD price per 1 million output tokens, as returned by providers like OpenRouter
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_price_usd_per_million: Option<f64>,
     /// OpenRouter provider preference order (slugs like "Anthropic", "Together", etc.)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_order: Vec<String>,

@@ -253,6 +253,19 @@ pub async fn chat_with_paper_on_event(
 
 // ── Library chat ──────────────────────────────────────────────────────────────
 
+#[derive(Clone, serde::Serialize)]
+struct LibrarySentContextSection {
+    kind: String,
+    label: String,
+    content: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct LibrarySentContextPayload {
+    mode: String,
+    sections: Vec<LibrarySentContextSection>,
+}
+
 pub async fn chat_with_library(
     root: &str,
     messages: Vec<ChatMessage>,
@@ -261,6 +274,7 @@ pub async fn chat_with_library(
     event_name: &str,
     sources_event_name: &str,
     knowledge_source: Option<&str>,
+    selected_paper_slugs: Option<&[String]>,
     app: &tauri::AppHandle,
 ) -> Result<String, String> {
     use tauri::Emitter;
@@ -269,10 +283,25 @@ pub async fn chat_with_library(
         ai_manager::resolve_provider_model(root, provider_id, model_id)?;
 
     let use_snippets = knowledge_source.map_or(false, |s| s == "snippets");
+    let use_selected_papers = knowledge_source.map_or(false, |s| s == "papers");
 
     let system;
 
-    if use_snippets {
+    if use_selected_papers {
+        let slugs = selected_paper_slugs.unwrap_or(&[]);
+        let (selected_system, selected_sources, selected_contexts) =
+            build_selected_papers_system_prompt(root, slugs, &provider, &model);
+        let _ = app.emit(sources_event_name, selected_sources);
+        let context_event_name = format!("{event_name}-context");
+        let _ = app.emit(
+            context_event_name.as_str(),
+            LibrarySentContextPayload {
+                mode: "papers".to_string(),
+                sections: selected_contexts,
+            },
+        );
+        system = selected_system;
+    } else if use_snippets {
         let query = messages
             .iter()
             .rev()
@@ -677,6 +706,151 @@ fn build_library_system_prompt(chunks: Option<&[RetrievedChunk]>) -> String {
         }
     }
     prompt
+}
+
+fn selected_papers_context_budget(
+    provider: &crate::models::AiProvider,
+    model_id: &str,
+) -> usize {
+    provider
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .and_then(|m| m.context_length)
+        .map(|cl| ((cl as usize * 7 / 10) * 4).min(300_000))
+        .unwrap_or(80_000)
+        .saturating_sub(12_000)
+}
+
+fn take_chars(input: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 {
+        return (String::new(), !input.is_empty());
+    }
+    let total = input.chars().count();
+    if total <= max_chars {
+        (input.to_string(), false)
+    } else {
+        (input.chars().take(max_chars).collect(), true)
+    }
+}
+
+fn build_selected_papers_system_prompt(
+    root: &str,
+    slugs: &[String],
+    provider: &crate::models::AiProvider,
+    model_id: &str,
+) -> (String, Vec<RetrievedChunk>, Vec<LibrarySentContextSection>) {
+    let mut prompt = String::from(
+        "You are a research assistant helping the user compare and analyze a selected set of academic papers.\n\
+         Rules:\n\
+         1. Answer ONLY from the selected papers provided below — do not hallucinate.\n\
+         2. Respond in the same language the user uses (Chinese if asked in Chinese).\n\
+         3. For every key claim, cite the source paper using this format:\n\
+            **论文标题** (`slug`)\n\
+         4. If the selected papers do not contain enough evidence, say that clearly.\n\
+         5. When multiple selected papers are relevant, synthesize them and distinguish their contributions.\n\n",
+    );
+
+    if slugs.is_empty() {
+        prompt.push_str("[未选择文献。请先在「文献库」模式中添加要参与问答的论文。]\n");
+        return (prompt, Vec::new(), Vec::new());
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let selected: Vec<&str> = slugs
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter(|s| seen.insert((*s).to_string()))
+        .collect();
+
+    if selected.is_empty() {
+        prompt.push_str("[未选择文献。请先在「文献库」模式中添加要参与问答的论文。]\n");
+        return (prompt, Vec::new(), Vec::new());
+    }
+
+    let mut sources = Vec::new();
+    let mut contexts = Vec::new();
+    let mut remaining_budget = selected_papers_context_budget(provider, model_id);
+    let per_paper_budget = (remaining_budget / selected.len()).max(4_000);
+    let mut found_count = 0usize;
+
+    prompt.push_str("--- 用户选择的文献 ---\n\n");
+
+    for slug in selected {
+        if remaining_budget == 0 {
+            break;
+        }
+
+        let Ok(meta) = paper::read_meta(root, slug) else {
+            prompt.push_str(&format!("[未找到文献: `{slug}`]\n\n"));
+            continue;
+        };
+
+        let metadata = build_metadata_string(Some(&meta));
+        let fulltext = extraction::read_fulltext(root, slug);
+
+        let reserved_for_meta = metadata.chars().count() + 700;
+        let text_budget = per_paper_budget
+            .min(remaining_budget)
+            .saturating_sub(reserved_for_meta)
+            .max(1_000)
+            .min(remaining_budget);
+        let (text_excerpt, text_truncated) = take_chars(&fulltext, text_budget);
+
+        found_count += 1;
+        let mut paper_context = format!(
+            "[文献 {n}]\nSlug: `{slug}`\n{metadata}",
+            n = found_count,
+            slug = slug,
+            metadata = metadata,
+        );
+
+        if !text_excerpt.trim().is_empty() {
+            paper_context.push_str("\n全文内容:\n");
+            paper_context.push_str(&text_excerpt);
+            if text_truncated {
+                paper_context.push_str("\n[该文全文已因上下文长度限制截断]");
+            }
+            paper_context.push('\n');
+        } else {
+            paper_context.push_str("\n[该文暂无全文文本。只能基于元数据回答。]\n");
+        }
+        paper_context.push('\n');
+        prompt.push_str(&paper_context);
+        contexts.push(LibrarySentContextSection {
+            kind: "paper".to_string(),
+            label: meta.title.clone(),
+            content: paper_context,
+        });
+
+        let source_text = if !text_excerpt.trim().is_empty() {
+            text_excerpt.chars().take(800).collect()
+        } else {
+            metadata.clone()
+        };
+        sources.push(RetrievedChunk {
+            chunk_id: format!("selected-{slug}"),
+            paper_id: meta.id.clone(),
+            slug: slug.to_string(),
+            chunk_index: found_count.saturating_sub(1) as u32,
+            text: source_text,
+            score: 1.0,
+            paper_title: meta.title.clone(),
+            source_type: "text".to_string(),
+            source_id: None,
+            source_label: Some("已选文献".to_string()),
+        });
+
+        let used = metadata.chars().count() + text_excerpt.chars().count() + 700;
+        remaining_budget = remaining_budget.saturating_sub(used);
+    }
+
+    if found_count == 0 {
+        prompt.push_str("[所选文献未找到。请重新添加文献。]\n");
+    }
+
+    (prompt, sources, contexts)
 }
 
 fn build_system_prompt(

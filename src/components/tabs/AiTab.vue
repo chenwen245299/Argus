@@ -40,6 +40,10 @@ interface AssistantAnswer {
   error?: boolean
   errorText?: string
   tokenEstimate?: number
+  inputTokens?: number
+  outputTokens?: number
+  totalTokens?: number
+  costUsd?: number | null
   contextMode?: string
   usedPdf?: boolean
   source?: 'chat' | 'metadataExtraction'
@@ -60,6 +64,13 @@ interface Conversation {
 interface StreamPayload {
   delta: string
   done: boolean
+}
+
+interface StreamUsagePayload {
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
+  cost_usd?: number | null
 }
 
 interface ExtractionProgressPayload {
@@ -720,7 +731,11 @@ async function regenerate(group: ChatNode, answer: AssistantAnswer) {
     ra.reasoningContent = ''
     ra.error = false
     ra.errorText = ''
-    ra.tokenEstimate = 0
+    ra.tokenEstimate = undefined
+    ra.inputTokens = undefined
+    ra.outputTokens = undefined
+    ra.totalTokens = undefined
+    ra.costUsd = undefined
     ra.createdAt = nowIso()
   }
   persistActiveConversation()
@@ -783,7 +798,7 @@ function stopAllStreaming() {
   for (const [key, off] of unlisteners.entries()) {
     off()
     unlisteners.delete(key)
-    const answerId = key.replace(/-reasoning$/, '')
+    const answerId = key.replace(/-(reasoning|context|usage)$/, '')
     const ra = findReactiveAnswer(answerId)
     if (ra?.streaming) {
       ra.streaming = false
@@ -808,7 +823,11 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     ra.reasoningContent = ''
     ra.startedAt = performance.now()
     ra.endedAt = undefined
-    ra.tokenEstimate = 0
+    ra.tokenEstimate = undefined
+    ra.inputTokens = undefined
+    ra.outputTokens = undefined
+    ra.totalTokens = undefined
+    ra.costUsd = undefined
   }
 
   const unlisten = await listen<StreamPayload>(eventName, (event) => {
@@ -816,10 +835,15 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     const reactiveAns = findReactiveAnswer(answer.id)
     if (!reactiveAns) return
     reactiveAns.content += event.payload.delta
-    reactiveAns.tokenEstimate = estimateTokens(reactiveAns.content)
     scrollToBottom()
   })
   unlisteners.set(answer.id, unlisten)
+
+  const unlistenUsage = await listen<StreamUsagePayload>(`${eventName}-usage`, (event) => {
+    const reactiveAns = findReactiveAnswer(answer.id)
+    if (reactiveAns) applyUsage(reactiveAns, event.payload)
+  })
+  unlisteners.set(`${answer.id}-usage`, unlistenUsage)
 
   // Receive the actual context injected into the system prompt for the transparency banner
   const unlistenCtx = await listen<{ metadata: string; summary: string; fulltext: string }>(
@@ -867,7 +891,6 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) {
       if (!reactiveAns.content && finalText) reactiveAns.content = finalText
-      reactiveAns.tokenEstimate = estimateTokens(reactiveAns.content)
     }
   } catch (e) {
     const reactiveAns = findReactiveAnswer(answer.id)
@@ -891,6 +914,9 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     const offCtx = unlisteners.get(`${answer.id}-context`)
     if (offCtx) offCtx()
     unlisteners.delete(`${answer.id}-context`)
+    const offUsage = unlisteners.get(`${answer.id}-usage`)
+    if (offUsage) offUsage()
+    unlisteners.delete(`${answer.id}-usage`)
     persistActiveConversation()
     scrollToBottom()
   }
@@ -903,11 +929,29 @@ function estimateTokens(text: string) {
   return Math.max(1, Math.round(cjk * 0.8 + other / 4))
 }
 
+function applyUsage(answer: AssistantAnswer, usage: StreamUsagePayload) {
+  if (typeof usage.input_tokens === 'number') answer.inputTokens = usage.input_tokens
+  if (typeof usage.output_tokens === 'number') answer.outputTokens = usage.output_tokens
+  if (typeof usage.total_tokens === 'number') answer.totalTokens = usage.total_tokens
+  if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) answer.costUsd = usage.cost_usd
+}
+
+function hasUsage(answer: AssistantAnswer) {
+  return typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number'
+}
+
+function formatTokenCount(value: number | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return ''
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M`
+  if (value >= 10_000) return `${(value / 1_000).toFixed(1)}k`
+  return String(value)
+}
+
 function answerSpeed(answer: AssistantAnswer) {
-  if (!answer.startedAt) return ''
+  if (!answer.startedAt || typeof answer.outputTokens !== 'number') return ''
   const end = answer.endedAt ?? performance.now()
   const seconds = Math.max(0.2, (end - answer.startedAt) / 1000)
-  const speed = Math.round((answer.tokenEstimate ?? estimateTokens(answer.content)) / seconds)
+  const speed = Math.round(answer.outputTokens / seconds)
   return speed > 0 ? `~${speed} tok/s` : ''
 }
 
@@ -971,11 +1015,13 @@ function finaliseMetaAnswer(answerId: string) {
   if (ra) {
     ra.streaming = false
     ra.endedAt = performance.now()
-    ra.tokenEstimate = estimateTokens(ra.content)
   }
   const off = unlisteners.get(answerId)
   off?.()
   unlisteners.delete(answerId)
+  const offUsage = unlisteners.get(`${answerId}-usage`)
+  offUsage?.()
+  unlisteners.delete(`${answerId}-usage`)
   persistActiveConversation()
   scrollToBottom()
 }
@@ -1075,10 +1121,14 @@ onMounted(async () => {
       const ra = findReactiveAnswer(answer_id)
       if (!ra) return
       ra.content += event.payload.delta
-      ra.tokenEstimate = estimateTokens(ra.content)
       scrollToBottom()
     })
     unlisteners.set(answer_id, unlisten)
+    const unlistenUsage = await listen<StreamUsagePayload>(`paper-ai-chat-${answer_id}-usage`, (event) => {
+      const ra = findReactiveAnswer(answer_id)
+      if (ra) applyUsage(ra, event.payload)
+    })
+    unlisteners.set(`${answer_id}-usage`, unlistenUsage)
     nextTick(() => scrollToBottom(true))
   })
 
@@ -1442,9 +1492,10 @@ function toggleContextPanel(nodeId: string) {
                     </svg>
                   </button>
                 </div>
-                <div class="msg-usage">
-                  <span v-if="!answer.streaming" class="usage-tokens">↓{{ answer.tokenEstimate ?? estimateTokens(answer.content) }}</span>
-                  <span v-if="!answer.streaming && answerSpeed(answer)" class="msg-speed">{{ answerSpeed(answer) }}</span>
+                <div v-if="hasUsage(answer) || answer.error" class="msg-usage">
+                  <span v-if="typeof answer.inputTokens === 'number'" class="usage-tokens">↑{{ formatTokenCount(answer.inputTokens) }}</span>
+                  <span v-if="typeof answer.outputTokens === 'number'" class="usage-tokens">↓{{ formatTokenCount(answer.outputTokens) }}</span>
+                  <span v-if="answerSpeed(answer)" class="msg-speed">{{ answerSpeed(answer) }}</span>
                   <span v-if="answer.error" class="error-badge">出错</span>
                 </div>
               </div>

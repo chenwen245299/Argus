@@ -141,9 +141,13 @@ async function deleteNote(note: Note, e: MouseEvent) {
   if (!props.slug) return
   if (!confirm(t('notes.deleteConfirm'))) return
   try {
+    const wasCanvasNote = isPinned(note.id)
     await invoke('delete_note', { slug: props.slug, noteId: note.id })
     notes.value = notes.value.filter(n => n.id !== note.id)
     window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: props.slug } }))
+    if (wasCanvasNote) {
+      window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', { detail: { slug: props.slug } }))
+    }
     library.refresh()
     if (activeNote.value?.id === note.id) {
       activeNote.value = null
@@ -164,6 +168,9 @@ async function commitTitle() {
   try {
     await invoke('rename_note', { slug: props.slug, noteId: activeNote.value.id, title: trimmed })
     window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: props.slug } }))
+    if (isPinned(activeNote.value.id)) {
+      window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', { detail: { slug: props.slug } }))
+    }
   } catch (e) {
     console.error('Failed to rename note:', e)
   }

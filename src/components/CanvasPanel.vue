@@ -25,7 +25,9 @@ import '@vue-flow/minimap/dist/style.css'
 import { marked } from 'marked'
 import { useCanvasStore } from '../stores/canvas'
 import { useLibraryStore } from '../stores/library'
+import { useReaderStore } from '../stores/reader'
 import { useSelectionStore } from '../stores/selection'
+import { recordPaperAccess, sortPapersByRecentAccess } from '../utils/recentPapers'
 import PaperNode from './canvas/PaperNode.vue'
 import AdjustableEdge from './canvas/AdjustableEdge.vue'
 import TextNode from './canvas/TextNode.vue'
@@ -37,6 +39,7 @@ import type { PaperIndexEntry, CanvasNode as CNode, CanvasEdge as CEdge, Suggest
 const { t } = useI18n()
 const canvasStore = useCanvasStore()
 const library = useLibraryStore()
+const reader = useReaderStore()
 const selectionStore = useSelectionStore()
 
 const emit = defineEmits<{
@@ -71,7 +74,9 @@ const {
 
 // ── Bottom toolbar tool state ─────────────────────────────────────────────────
 type CanvasTool = 'pointer' | 'text' | 'shape'
+type PointerDragMode = 'select' | 'pan'
 const activeTool = ref<CanvasTool>('pointer')
+const pointerDragMode = ref<PointerDragMode>('select')
 const DEFAULT_SHAPE_WIDTH = 160
 const DEFAULT_SHAPE_HEIGHT = 100
 const MIN_SHAPE_SIZE = 12
@@ -84,10 +89,33 @@ type ShapeDraft = {
 }
 const shapeDraft = ref<ShapeDraft | null>(null)
 const flowContainerRef = ref<HTMLElement | null>(null)
+const isPointerPanMode = computed(() => activeTool.value === 'pointer' && pointerDragMode.value === 'pan')
+const pointerPanOnDrag = computed(() => {
+  if (activeTool.value !== 'pointer') return false
+  return pointerDragMode.value === 'pan' ? true : [1, 2]
+})
+const pointerSelectionKeyCode = computed(() => {
+  if (activeTool.value !== 'pointer') return null
+  return pointerDragMode.value === 'select' ? true : null
+})
+const pointerToolTitle = computed(() =>
+  pointerDragMode.value === 'select'
+    ? '框选：左键拖拽框选节点，点击切换为拖动画布'
+    : '拖动画布：左键拖动画布，点击切换为框选'
+)
 
 function selectTool(tool: CanvasTool) {
   activeTool.value = activeTool.value === tool ? 'pointer' : tool
   if (activeTool.value !== 'shape') resetShapeDraft()
+}
+
+function selectPointerTool() {
+  if (activeTool.value === 'pointer') {
+    pointerDragMode.value = pointerDragMode.value === 'select' ? 'pan' : 'select'
+  } else {
+    activeTool.value = 'pointer'
+    resetShapeDraft()
+  }
 }
 
 const shapePreviewStyle = computed(() => {
@@ -286,8 +314,9 @@ const pickerError = ref('')
 
 const filteredPapers = computed(() => {
   const q = pickerSearch.value.trim().toLowerCase()
-  if (!q) return library.papers
-  return library.papers.filter(p =>
+  const papers = sortPapersByRecentAccess(library.papers)
+  if (!q) return papers
+  return papers.filter(p =>
     p.title.toLowerCase().includes(q) ||
     p.authors.some(a => a.toLowerCase().includes(q)) ||
     String(p.year ?? '').includes(q)
@@ -653,6 +682,15 @@ function selectPaperById(paperId: string) {
   }
 }
 
+function openPaperById(paperId: string) {
+  const paper = library.papers.find(p => p.id === paperId)
+  if (!paper?.slug) return
+  selectionStore.selectPaper(paper.slug)
+  reader.openPaper(paper.slug, paper.title)
+  canvasStore.isShown = false
+  emit('select-paper', paper.slug)
+}
+
 // ── Paper node click → select in right sidebar ────────────────────────────────
 
 function onNodeClick(event: NodeMouseEvent) {
@@ -664,7 +702,10 @@ function onNodeClick(event: NodeMouseEvent) {
 function onNodeDblClick(event: NodeMouseEvent) {
   if (event.node.type === 'text' || event.node.type === 'shape') {
     openAnnotationEditor(event.node.id)
+    return
   }
+  const paperId = event.node.data?.paperId as string | undefined
+  if (paperId) openPaperById(paperId)
 }
 
 // ── Add paper to canvas ───────────────────────────────────────────────────────
@@ -676,6 +717,7 @@ function openPaperPicker() {
 }
 
 function addPaperToCanvas(paper: PaperIndexEntry) {
+  recordPaperAccess(paper.slug)
   const cv = canvasStore.currentCanvas
   if (!cv) return
   const exists = nodes.value.some(n => n.data.paperId === paper.id)
@@ -708,29 +750,41 @@ function addPaperToCanvas(paper: PaperIndexEntry) {
 
 // ── Node hover tooltip ────────────────────────────────────────────────────────
 
+function clearHoverTooltip() {
+  if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null }
+  hoverNodeId.value = null
+  hoverContent.value = ''
+  hoverLoading.value = false
+}
+
 function onNodeMouseEnter(event: NodeMouseEvent) {
+  if (ctxMenu.value.show) {
+    clearHoverTooltip()
+    return
+  }
   const nd = event.node
   const mouseEvt = event.event as MouseEvent
   hoverPos.value = { x: mouseEvt.clientX, y: mouseEvt.clientY }
   if (hoverTimer) clearTimeout(hoverTimer)
   hoverTimer = setTimeout(async () => {
+    hoverTimer = null
+    if (ctxMenu.value.show) return
     hoverNodeId.value = nd.id
     hoverLoading.value = true
     hoverContent.value = ''
     try {
       const raw = await canvasStore.getNodeDisplayContent(nd.data.paperId, 'notes')
-      hoverContent.value = raw
+      if (!ctxMenu.value.show && hoverNodeId.value === nd.id) {
+        hoverContent.value = raw
+      }
     } finally {
-      hoverLoading.value = false
+      if (hoverNodeId.value === nd.id) hoverLoading.value = false
     }
   }, 600)
 }
 
 function onNodeMouseLeave() {
-  if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null }
-  hoverNodeId.value = null
-  hoverContent.value = ''
-  hoverLoading.value = false
+  clearHoverTooltip()
 }
 
 const renderedHoverContent = computed(() => {
@@ -742,6 +796,7 @@ const renderedHoverContent = computed(() => {
 
 function onNodeContextMenu(event: NodeMouseEvent) {
   event.event.preventDefault()
+  clearHoverTooltip()
   const paperId = (event.node.data?.paperId as string) ?? null
 
   ctxMenu.value = {
@@ -757,6 +812,7 @@ function onNodeContextMenu(event: NodeMouseEvent) {
 
 function onEdgeContextMenu(event: EdgeMouseEvent) {
   event.event.preventDefault()
+  clearHoverTooltip()
   ctxMenu.value = {
     show: true,
     x: (event.event as MouseEvent).clientX,
@@ -775,7 +831,7 @@ function closeCtxMenu() {
 function ctxSelectPaper() {
   const paperId = ctxMenu.value.paperId
   closeCtxMenu()
-  if (paperId) selectPaperById(paperId)
+  if (paperId) openPaperById(paperId)
 }
 
 function ctxRemoveNode() {
@@ -1025,7 +1081,10 @@ function onKeydown(e: KeyboardEvent) {
   // Tool shortcuts (only when not typing in an input)
   const tag = (e.target as HTMLElement)?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA') return
-  if (e.key === 'v' || e.key === 'V') activeTool.value = 'pointer'
+  if (e.key === 'v' || e.key === 'V') {
+    activeTool.value = 'pointer'
+    resetShapeDraft()
+  }
   if (e.key === 't' || e.key === 'T') selectTool('text')
   if (e.key === 'r' || e.key === 'R') selectTool('shape')
 }
@@ -1195,7 +1254,10 @@ watch(() => library.papers, () => {
           :connection-mode="ConnectionMode.Loose"
           :default-edge-options="{ type: 'adjustable', markerEnd: MarkerType.ArrowClosed }"
           :snap-to-grid="false"
-          :pan-on-drag="activeTool === 'pointer'"
+          :pan-on-drag="pointerPanOnDrag"
+          :selection-key-code="pointerSelectionKeyCode"
+          :elements-selectable="activeTool === 'pointer'"
+          :select-nodes-on-drag="activeTool === 'pointer'"
           :nodes-draggable="activeTool === 'pointer'"
           fit-view-on-init
           class="canvas-flow"
@@ -1225,12 +1287,18 @@ watch(() => library.papers, () => {
         <div class="canvas-bottom-toolbar">
           <button
             class="btb-btn"
-            :class="{ active: activeTool === 'pointer' }"
-            title="选择 (V)"
-            @click="selectTool('pointer')"
+            :class="{ active: activeTool === 'pointer', 'pan-mode': isPointerPanMode }"
+            :title="pointerToolTitle"
+            @click="selectPointerTool"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg v-if="pointerDragMode === 'select'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M5 3l14 9-7 1-4 7z"/>
+            </svg>
+            <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 11V7a2 2 0 0 0-4 0v4"/>
+              <path d="M14 10V6a2 2 0 0 0-4 0v7"/>
+              <path d="M10 12V8a2 2 0 1 0-4 0v7"/>
+              <path d="M6 15c0 4 2.5 6 6.5 6H14c3 0 5-2 5-5v-5a2 2 0 0 0-4 0v1"/>
             </svg>
           </button>
           <div class="btb-sep" />
@@ -1994,6 +2062,10 @@ watch(() => library.papers, () => {
 .btb-btn.active {
   background: var(--accent-light);
   color: var(--accent);
+}
+.btb-btn.pan-mode {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent);
 }
 
 /* Cursor changes when tool is active */

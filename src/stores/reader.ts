@@ -3,6 +3,7 @@ import { ref, computed, shallowRef } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { Highlight, ReadingState } from '../types'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
+import { recordPaperAccess } from '../utils/recentPapers'
 
 export interface Tab {
   slug: string
@@ -33,6 +34,7 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   function openPaper(slug: string, title: string) {
+    recordPaperAccess(slug)
     const existing = tabs.value.find(t => t.slug === slug)
     if (!existing) {
       tabs.value.push({ slug, title })
@@ -59,6 +61,7 @@ export const useReaderStore = defineStore('reader', () => {
   function switchTab(slug: string) {
     if (activeSlug.value === slug) return
     if (!tabs.value.find(t => t.slug === slug)) return
+    recordPaperAccess(slug)
     activeSlug.value = slug
     _resetTabState()
   }

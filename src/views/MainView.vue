@@ -38,6 +38,8 @@ const canvasStore = useCanvasStore()
 
 // ── Window size persistence ────────────────────────────────────────────────────
 const WIN_SIZE_KEY = 'argus:window:size'
+const MIN_MAIN_WINDOW_W = 1400
+const MIN_MAIN_WINDOW_H = 600
 let winResizeTimer: ReturnType<typeof setTimeout> | null = null
 
 function onWinResize() {
@@ -59,8 +61,8 @@ async function restoreWindowSize() {
     const { width, height } = JSON.parse(raw) as { width: number; height: number }
     if (!width || !height) return
     await getCurrentWebviewWindow().setSize(new LogicalSize(
-      Math.max(900, width),
-      Math.max(600, height),
+      Math.max(MIN_MAIN_WINDOW_W, width),
+      Math.max(MIN_MAIN_WINDOW_H, height),
     ))
   } catch {}
 }

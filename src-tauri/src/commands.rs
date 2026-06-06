@@ -190,6 +190,38 @@ pub async fn get_canvas_note_titles(
 }
 
 #[tauri::command]
+pub async fn get_canvas_note_titles_map(
+    slugs: Vec<String>,
+    state: State<'_, LibraryRoot>,
+) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+    let root = get_root(&state)?;
+    let mut out = std::collections::HashMap::new();
+
+    for slug in slugs {
+        let Ok(meta) = paper::read_meta(&root, &slug) else {
+            continue;
+        };
+        if meta.canvas_notes.is_empty() {
+            continue;
+        }
+
+        let pinned: std::collections::HashSet<&str> =
+            meta.canvas_notes.iter().map(|s| s.as_str()).collect();
+        let titles: Vec<String> = paper::list_notes(&root, &slug)
+            .into_iter()
+            .filter(|n| pinned.contains(n.id.as_str()))
+            .map(|n| n.title)
+            .collect();
+
+        if !titles.is_empty() {
+            out.insert(slug, titles);
+        }
+    }
+
+    Ok(out)
+}
+
+#[tauri::command]
 pub async fn get_note(
     slug: String,
     note_id: String,
@@ -1378,6 +1410,7 @@ pub async fn chat_with_library(
     event_name: Option<String>,
     sources_event_name: Option<String>,
     knowledge_source: Option<String>,
+    selected_paper_slugs: Option<Vec<String>>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -1393,6 +1426,7 @@ pub async fn chat_with_library(
         &event_name,
         &sources_event_name,
         knowledge_source.as_deref(),
+        selected_paper_slugs.as_deref(),
         &app,
     )
     .await

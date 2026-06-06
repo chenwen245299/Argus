@@ -119,6 +119,7 @@ export type ThemeId = 'system' | 'light' | 'dark' | 'warm' | 'forest' | 'rose'
 export interface AppSettings {
   appearance: ThemeId
   extraction_default: string
+  usd_to_cny_rate?: number
   metadata_ai_provider_id?: string
   metadata_ai_model_id?: string
   metadata_ai_prompt?: string
@@ -156,6 +157,8 @@ export interface AiModel {
   enabled: boolean
   input_price_per_million?: number   // CNY per 1M input tokens
   output_price_per_million?: number  // CNY per 1M output tokens
+  input_price_usd_per_million?: number   // USD per 1M input tokens
+  output_price_usd_per_million?: number  // USD per 1M output tokens
   provider_order?: string[]          // OpenRouter provider preference order
 }
 

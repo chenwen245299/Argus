@@ -7,6 +7,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const settings = ref<AppSettings>({
     appearance: 'system',
     extraction_default: 'lopdf',
+    usd_to_cny_rate: 7.2,
     metadata_ai_prompt: '',
     ai_summary_prompt: '',
   })

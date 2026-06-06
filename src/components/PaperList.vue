@@ -19,6 +19,7 @@ import type { PaperVectorizeInput, ChunkInput } from '../types'
 import StatusBadges from './StatusBadges.vue'
 import CollectionCascadeMenu from './CollectionCascadeMenu.vue'
 import { titleInitialCaps } from '../utils/text'
+import { noteBadgeStyle } from '../utils/noteBadges'
 import type { Collection, Note, PaperIndexEntry, PaperMeta, SortField, SortDir } from '../types'
 
 const { t } = useI18n()
@@ -82,23 +83,25 @@ function compareValue(a: PaperIndexEntry, b: PaperIndexEntry): number {
 }
 
 // ── Column configuration ──────────────────────────────────────────────────────
-type ColId = 'title' | 'authors' | 'venue' | 'year' | 'added_at' | 'status' | 'tags' | 'source' | 'cite_count'
+type ColId = 'tags' | 'title' | 'notes' | 'authors' | 'venue' | 'year' | 'added_at' | 'status' | 'source' | 'cite_count'
 
 const COL_META: Record<ColId, {
   id: ColId; labelKey: string; defaultWidth: number; minWidth: number; sortField?: SortField
 }> = {
+  tags:       { id: 'tags',       labelKey: 'list.tags',      defaultWidth: 160, minWidth: 80 },
   title:      { id: 'title',      labelKey: 'list.title',     defaultWidth: 440, minWidth: 180, sortField: 'title' },
+  notes:      { id: 'notes',      labelKey: 'list.notes',     defaultWidth: 150, minWidth: 90 },
   authors:    { id: 'authors',    labelKey: 'list.authors',   defaultWidth: 160, minWidth: 90,  sortField: 'authors' },
   venue:      { id: 'venue',      labelKey: 'list.venue',     defaultWidth: 130, minWidth: 80,  sortField: 'venue' },
   year:       { id: 'year',       labelKey: 'list.year',      defaultWidth: 60,  minWidth: 48,  sortField: 'year' },
   added_at:   { id: 'added_at',   labelKey: 'list.addedAt',   defaultWidth: 90,  minWidth: 78,  sortField: 'added_at' },
   status:     { id: 'status',     labelKey: 'list.status',    defaultWidth: 160, minWidth: 120 },
-  tags:       { id: 'tags',       labelKey: 'list.tags',      defaultWidth: 160, minWidth: 80 },
   source:     { id: 'source',     labelKey: 'list.source',    defaultWidth: 72,  minWidth: 60 },
   cite_count: { id: 'cite_count', labelKey: 'list.citeCount', defaultWidth: 72,  minWidth: 56,  sortField: 'cite_count' },
 }
-const ALL_COL_IDS: ColId[] = ['title', 'authors', 'venue', 'year', 'added_at', 'status', 'tags', 'source', 'cite_count']
-const COL_STATE_KEY = 'argus:col-state-v8'
+const ALL_COL_IDS: ColId[] = ['tags', 'title', 'notes', 'authors', 'venue', 'year', 'added_at', 'status', 'source', 'cite_count']
+const COL_STATE_KEY = 'argus:col-state-v9'
+const LEGACY_COL_STATE_KEYS = ['argus:col-state-v8']
 
 // ── Import source helpers ─────────────────────────────────────────────────────
 type ImportSource = 'file' | 'arxiv' | 'url'
@@ -131,18 +134,34 @@ const SOURCE_TEXT: Record<ImportSource, string> = {
 function loadColState() {
   const defaults = {
     order:   [...ALL_COL_IDS] as ColId[],
-    visible: new Set<ColId>(['title', 'authors', 'venue', 'year', 'tags', 'status', 'source']),
+    visible: new Set<ColId>(['tags', 'title', 'notes', 'authors', 'venue', 'year', 'status', 'source']),
     widths:  Object.fromEntries(ALL_COL_IDS.map(id => [id, COL_META[id].defaultWidth])) as Record<ColId, number>,
   }
   try {
-    const raw = localStorage.getItem(COL_STATE_KEY)
+    let raw = localStorage.getItem(COL_STATE_KEY)
+    let fromLegacy = false
+    if (!raw) {
+      for (const key of LEGACY_COL_STATE_KEYS) {
+        raw = localStorage.getItem(key)
+        if (raw) {
+          fromLegacy = true
+          break
+        }
+      }
+    }
     if (!raw) return defaults
     const p = JSON.parse(raw)
     const saved: ColId[] = (p.order ?? []).filter((id: string) => (ALL_COL_IDS as string[]).includes(id))
+    if (!saved.includes('notes')) {
+      const titleIdx = saved.indexOf('title')
+      saved.splice(titleIdx >= 0 ? titleIdx + 1 : 0, 0, 'notes')
+    }
     for (const id of ALL_COL_IDS) if (!saved.includes(id)) saved.push(id)
+    const visible = new Set<ColId>((p.visible ?? [...defaults.visible]).filter((id: string) => (ALL_COL_IDS as string[]).includes(id)) as ColId[])
+    if (fromLegacy) visible.add('notes')
     return {
       order:   saved,
-      visible: new Set<ColId>((p.visible ?? [...defaults.visible]).filter((id: string) => (ALL_COL_IDS as string[]).includes(id)) as ColId[]),
+      visible,
       widths:  { ...defaults.widths, ...p.widths },
     }
   } catch { return defaults }
@@ -389,9 +408,15 @@ function onGlobalKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') closeCtx()
 }
 
+function onCanvasNotesUpdated(e: Event) {
+  const detail = (e as CustomEvent<{ slug?: string }>).detail
+  if (detail?.slug) refreshCanvasNoteTitle(detail.slug)
+}
+
 onMounted(() => {
   document.addEventListener('pointerdown', onGlobalPointerDown, true)
   document.addEventListener('keydown', onGlobalKeydown)
+  window.addEventListener('argus-canvas-notes-updated', onCanvasNotesUpdated)
   paperTasks.startListening()
 })
 
@@ -400,6 +425,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', stopResize)
   document.removeEventListener('pointerdown', onGlobalPointerDown, true)
   document.removeEventListener('keydown', onGlobalKeydown)
+  window.removeEventListener('argus-canvas-notes-updated', onCanvasNotesUpdated)
   cleanupColumnDrag()
   for (const slug of aiSummaryStreamUnlisteners.keys()) cleanupAiSummaryStream(slug)
 })
@@ -445,6 +471,51 @@ const sorted = computed(() => {
     return sortDir.value === 'asc' ? cmp : -cmp
   })
 })
+
+const canvasNoteTitles = ref<Record<string, string[]>>({})
+let canvasNoteLoadSeq = 0
+
+function canvasNotesFor(item: PaperIndexEntry): string[] {
+  return canvasNoteTitles.value[item.slug] ?? []
+}
+
+async function refreshCanvasNoteTitles(slugs: string[]) {
+  const unique = Array.from(new Set(slugs.filter(Boolean)))
+  if (unique.length === 0) {
+    canvasNoteTitles.value = {}
+    return
+  }
+
+  const seq = ++canvasNoteLoadSeq
+  try {
+    const map = await invoke<Record<string, string[]>>('get_canvas_note_titles_map', { slugs: unique })
+    if (seq === canvasNoteLoadSeq) canvasNoteTitles.value = map
+  } catch {
+    if (seq === canvasNoteLoadSeq) canvasNoteTitles.value = {}
+  }
+}
+
+async function refreshCanvasNoteTitle(slug: string) {
+  if (!slug) return
+  try {
+    const map = await invoke<Record<string, string[]>>('get_canvas_note_titles_map', { slugs: [slug] })
+    canvasNoteTitles.value = {
+      ...canvasNoteTitles.value,
+      [slug]: map[slug] ?? [],
+    }
+  } catch {
+    canvasNoteTitles.value = {
+      ...canvasNoteTitles.value,
+      [slug]: [],
+    }
+  }
+}
+
+watch(
+  () => sorted.value.map(p => p.slug).join('|'),
+  () => refreshCanvasNoteTitles(sorted.value.map(p => p.slug)),
+  { immediate: true },
+)
 
 function formatAuthors(authors: string[]): string {
   if (authors.length === 0) return '—'
@@ -1204,6 +1275,16 @@ async function reExtract(item: PaperIndexEntry) {
                 <div v-if="col.id === 'title'" class="row-cell row-title" :title="displayTitle(item.title)">
                   {{ displayTitle(item.title) }}
                 </div>
+                <div v-else-if="col.id === 'notes'" class="row-cell row-notes" :title="canvasNotesFor(item).join(', ')">
+                  <span
+                    v-for="(title, index) in canvasNotesFor(item)"
+                    :key="title"
+                    class="note-badge"
+                    :style="noteBadgeStyle(title, index)"
+                  >
+                    {{ title }}
+                  </span>
+                </div>
                 <div v-else-if="col.id === 'authors'" class="row-cell" :title="item.authors.join(', ')">
                   {{ formatAuthors(item.authors) }}
                 </div>
@@ -1718,6 +1799,29 @@ async function reExtract(item: PaperIndexEntry) {
   gap: 3px;
   flex-wrap: nowrap;
   overflow: hidden;
+}
+
+.row-notes {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+.note-badge {
+  display: inline-block;
+  max-width: 128px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  flex-shrink: 0;
 }
 
 .tag-chip {

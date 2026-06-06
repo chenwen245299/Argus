@@ -11,6 +11,8 @@ pub struct UsageRecord {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 // Current library root — set whenever a library is opened.
@@ -39,7 +41,20 @@ fn usage_path(root: &str) -> std::path::PathBuf {
 
 /// Append one usage record to the JSONL file for the current library.
 pub fn record(source: &str, provider: &str, model: &str, input_tokens: u64, output_tokens: u64) {
-    if input_tokens == 0 && output_tokens == 0 {
+    record_with_cost(source, provider, model, input_tokens, output_tokens, None);
+}
+
+/// Append one usage record with an optional provider-reported USD cost.
+pub fn record_with_cost(
+    source: &str,
+    provider: &str,
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: Option<f64>,
+) {
+    let cost_usd = cost_usd.filter(|v| v.is_finite() && *v >= 0.0);
+    if input_tokens == 0 && output_tokens == 0 && cost_usd.unwrap_or(0.0) == 0.0 {
         return;
     }
     let Some(root) = current_root() else { return };
@@ -51,6 +66,7 @@ pub fn record(source: &str, provider: &str, model: &str, input_tokens: u64, outp
         model: model.to_string(),
         input_tokens,
         output_tokens,
+        cost_usd,
     };
     let Ok(line) = serde_json::to_string(&rec) else {
         return;

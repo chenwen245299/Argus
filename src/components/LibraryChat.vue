@@ -10,6 +10,7 @@ import { renderMarkdown, getSegments } from '../utils/renderMarkdown'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
 import { buildChunks } from '../utils/chunker'
+import { recordPaperAccess, sortPapersByRecentAccess } from '../utils/recentPapers'
 import type { ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
 
 const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag'] }>()
@@ -88,6 +89,13 @@ interface LibraryAnswerVariant {
   createdAt: string
   model?: ModelSelection | null
   modelLabel?: string
+  contextContent?: LibrarySentContextPayload
+  inputTokens?: number
+  outputTokens?: number
+  totalTokens?: number
+  costUsd?: number | null
+  startedAt?: number
+  endedAt?: number
 }
 
 interface LibraryUiMessage {
@@ -102,6 +110,13 @@ interface LibraryUiMessage {
   modelLabel?: string
   variants?: LibraryAnswerVariant[]
   activeVariantId?: string
+  contextContent?: LibrarySentContextPayload
+  inputTokens?: number
+  outputTokens?: number
+  totalTokens?: number
+  costUsd?: number | null
+  startedAt?: number
+  endedAt?: number
 }
 
 interface LibraryConversation {
@@ -119,11 +134,30 @@ interface GroupedSource {
   chunks: RetrievedChunk[]
 }
 
+interface LibrarySentContextSection {
+  kind?: string
+  label: string
+  content: string
+}
+
+interface LibrarySentContextPayload {
+  mode?: string
+  sections?: LibrarySentContextSection[]
+}
+
+interface StreamUsagePayload {
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
+  cost_usd?: number | null
+}
+
 // ── Storage ───────────────────────────────────────────────────────────────────
 
 const STORAGE_KEY = 'argus.library-chats.v1'
 const LAST_MODEL_KEY = 'argus.library-chat.last-model'
-const KNOWLEDGE_SOURCE_KEY = 'argus.library-chat.knowledge-source'
+const KNOWLEDGE_SOURCE_KEY = 'argus.library-chat.knowledge-source.v2'
+const SELECTED_PAPERS_KEY = 'argus.library-chat.selected-papers'
 
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7)
@@ -133,8 +167,27 @@ function loadFromStorage(): LibraryConversation[] {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]') } catch { return [] }
 }
 
+function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
+  const clone: LibraryUiMessage = {
+    ...msg,
+    variants: msg.variants?.map(variant => {
+      const variantClone: LibraryAnswerVariant = { ...variant }
+      delete variantClone.contextContent
+      return variantClone
+    }),
+  }
+  delete clone.contextContent
+  return clone
+}
+
 function saveToStorage(convs: LibraryConversation[]) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(convs.slice(0, 50))) } catch {}
+  try {
+    const serializable = convs.slice(0, 50).map(conv => ({
+      ...conv,
+      messages: conv.messages.map(stripTransientContext),
+    }))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable))
+  } catch {}
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -155,6 +208,7 @@ const editingText = ref('')
 const copiedMsgIds = ref(new Set<string>())
 const modelPickerMsgId = ref<string | null>(null)
 const modelPickerPos = ref<{ top: number; left: number }>({ top: 0, left: 0 })
+const expandedContextId = ref<string | null>(null)
 
 const modelPickerMsg = computed(() =>
   modelPickerMsgId.value
@@ -163,15 +217,19 @@ const modelPickerMsg = computed(() =>
 )
 
 // ── Knowledge source picker ───────────────────────────────────────────────────
-type KnowledgeSource = 'papers' | 'snippets'
+type KnowledgeSource = 'paper-rag' | 'papers' | 'snippets'
 
 function loadKnowledgeSource(): KnowledgeSource {
   const saved = localStorage.getItem(KNOWLEDGE_SOURCE_KEY)
-  return saved === 'snippets' ? 'snippets' : 'papers'
+  if (saved === 'papers' || saved === 'paper-rag' || saved === 'snippets') return saved
+  return 'paper-rag'
 }
 
 const knowledgeSource = ref<KnowledgeSource>(loadKnowledgeSource())
 const sourcePickerOpen = ref(false)
+const paperPickerOpen = ref(false)
+const paperPickerSearch = ref('')
+const selectedPaperSlugs = ref<string[]>(loadSelectedPaperSlugs())
 
 function setKnowledgeSource(src: KnowledgeSource) {
   knowledgeSource.value = src
@@ -180,8 +238,65 @@ function setKnowledgeSource(src: KnowledgeSource) {
 }
 
 const knowledgeSourceLabel = computed(() =>
-  knowledgeSource.value === 'snippets' ? '素材库' : '文献库'
+  knowledgeSource.value === 'snippets'
+    ? '素材库'
+    : knowledgeSource.value === 'paper-rag'
+      ? '文献库RAG'
+      : '文献库'
 )
+
+function loadSelectedPaperSlugs(): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SELECTED_PAPERS_KEY) ?? '[]')
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function saveSelectedPaperSlugs() {
+  try { localStorage.setItem(SELECTED_PAPERS_KEY, JSON.stringify(selectedPaperSlugs.value.slice(0, 50))) } catch {}
+}
+
+const selectedPapers = computed(() => {
+  const bySlug = new Map(allPapers.value.map(p => [p.slug, p]))
+  return selectedPaperSlugs.value.map(slug => bySlug.get(slug)).filter((p): p is PaperIndexEntry => !!p)
+})
+
+const pickerPapers = computed(() => {
+  const q = paperPickerSearch.value.trim().toLowerCase()
+  const papers = sortPapersByRecentAccess(allPapers.value)
+  if (!q) return papers
+  return papers.filter(p =>
+    p.title.toLowerCase().includes(q) ||
+    p.authors.some(a => a.toLowerCase().includes(q)) ||
+    String(p.year ?? '').includes(q)
+  )
+})
+
+function openPaperPicker() {
+  paperPickerSearch.value = ''
+  paperPickerOpen.value = true
+}
+
+function addSelectedPaper(paper: PaperIndexEntry) {
+  recordPaperAccess(paper.slug)
+  if (!selectedPaperSlugs.value.includes(paper.slug)) {
+    selectedPaperSlugs.value = [...selectedPaperSlugs.value, paper.slug]
+    saveSelectedPaperSlugs()
+  }
+}
+
+function removeSelectedPaper(slug: string) {
+  selectedPaperSlugs.value = selectedPaperSlugs.value.filter(s => s !== slug)
+  saveSelectedPaperSlugs()
+}
+
+function clearSelectedPapers() {
+  if (selectedPaperSlugs.value.length === 0) return
+  selectedPaperSlugs.value = []
+  saveSelectedPaperSlugs()
+}
 
 // ── Snippet store state ───────────────────────────────────────────────────────
 const snippetEmbeddedCount  = ref(0)
@@ -281,6 +396,8 @@ function onDividerMouseUp() {
 
 let unlistenChat: UnlistenFn | null = null
 let unlistenSources: UnlistenFn | null = null
+let unlistenContext: UnlistenFn | null = null
+let unlistenUsage: UnlistenFn | null = null
 let pendingSources: RetrievedChunk[] = []
 let _compositionEndedAt = 0
 
@@ -290,7 +407,12 @@ const activeConv = computed(() =>
   conversations.value.find(c => c.id === activeConvId.value) ?? null
 )
 const activeMessages = computed(() => activeConv.value?.messages ?? [])
-const canSend = computed(() => input.value.trim().length > 0 && !loading.value && ai.isConfigured)
+const canSend = computed(() =>
+  input.value.trim().length > 0 &&
+  !loading.value &&
+  ai.isConfigured &&
+  (knowledgeSource.value !== 'papers' || selectedPaperSlugs.value.length > 0)
+)
 const conversationSubtitle = computed(() => {
   if (!activeConv.value) return ''
   const count = userMsgCount(activeConv.value)
@@ -467,6 +589,13 @@ function activeAnswer(msg: LibraryUiMessage): LibraryAnswerVariant {
     createdAt: msg.createdAt,
     model: msg.model,
     modelLabel: msg.modelLabel,
+    contextContent: msg.contextContent,
+    inputTokens: msg.inputTokens,
+    outputTokens: msg.outputTokens,
+    totalTokens: msg.totalTokens,
+    costUsd: msg.costUsd,
+    startedAt: msg.startedAt,
+    endedAt: msg.endedAt,
   }
 }
 
@@ -489,10 +618,48 @@ function ensureAnswerVariants(msg: LibraryUiMessage) {
       createdAt: msg.createdAt,
       model: msg.model,
       modelLabel: msg.modelLabel,
+      contextContent: msg.contextContent,
+      inputTokens: msg.inputTokens,
+      outputTokens: msg.outputTokens,
+      totalTokens: msg.totalTokens,
+      costUsd: msg.costUsd,
+      startedAt: msg.startedAt,
+      endedAt: msg.endedAt,
     }]
     msg.activeVariantId = msg.variants[0].id
   }
   return msg.variants
+}
+
+function answerContextSections(answer: LibraryAnswerVariant) {
+  return answer.contextContent?.sections?.filter(s => s.content?.trim()) ?? []
+}
+
+function hasAnswerContext(answer: LibraryAnswerVariant) {
+  return answerContextSections(answer).length > 0
+}
+
+function toggleContextPanel(answerId: string) {
+  expandedContextId.value = expandedContextId.value === answerId ? null : answerId
+}
+
+function formatTokenCount(value: number | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return ''
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M`
+  if (value >= 10_000) return `${(value / 1_000).toFixed(1)}k`
+  return String(value)
+}
+
+function hasUsage(answer: LibraryAnswerVariant) {
+  return typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number'
+}
+
+function answerSpeed(answer: LibraryAnswerVariant) {
+  if (!answer.startedAt || typeof answer.outputTokens !== 'number') return ''
+  const end = answer.endedAt ?? performance.now()
+  const seconds = Math.max(0.2, (end - answer.startedAt) / 1000)
+  const speed = Math.round(answer.outputTokens / seconds)
+  return speed > 0 ? `~${speed} tok/s` : ''
 }
 
 function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
@@ -544,7 +711,8 @@ function useSuggestion(text: string) {
 
 // ── Conversation management ───────────────────────────────────────────────────
 
-function newConversation() {
+function newConversation(options: { clearSelectedPapers?: boolean } = {}) {
+  if (options.clearSelectedPapers) clearSelectedPapers()
   const conv: LibraryConversation = {
     id: genId(),
     title: t('libraryChat.untitled'),
@@ -555,6 +723,10 @@ function newConversation() {
   conversations.value.unshift(conv)
   activeConvId.value = conv.id
   saveToStorage(conversations.value)
+}
+
+function startNewConversation() {
+  newConversation({ clearSelectedPapers: true })
 }
 
 function selectConversation(id: string) { activeConvId.value = id }
@@ -606,10 +778,19 @@ async function runAssistantRequest(
   const eventSafeId = target.id.replace(/[^A-Za-z0-9:_/-]/g, '-')
   const eventName = `library-chat-${eventSafeId}`
   const sourcesEventName = `${eventName}-sources`
+  const contextEventName = `${eventName}-context`
+  const usageEventName = `${eventName}-usage`
   target.content = ''
   target.error = false
   target.streaming = true
   target.sources = undefined
+  target.contextContent = undefined
+  target.inputTokens = undefined
+  target.outputTokens = undefined
+  target.totalTokens = undefined
+  target.costUsd = undefined
+  target.startedAt = performance.now()
+  target.endedAt = undefined
   target.model = sel
   target.modelLabel = modelLabel(sel)
   assistantMsg.streaming = true
@@ -620,6 +801,23 @@ async function runAssistantRequest(
   if (unlistenSources) { unlistenSources(); unlistenSources = null }
   unlistenSources = await listen<RetrievedChunk[]>(sourcesEventName, (e) => {
     pendingSources = e.payload ?? []
+  })
+
+  if (unlistenContext) { unlistenContext(); unlistenContext = null }
+  unlistenContext = await listen<LibrarySentContextPayload>(contextEventName, (e) => {
+    const sections = e.payload?.sections?.filter(s => s.content?.trim()) ?? []
+    target.contextContent = { mode: e.payload?.mode, sections }
+    persistActive()
+  })
+
+  if (unlistenUsage) { unlistenUsage(); unlistenUsage = null }
+  unlistenUsage = await listen<StreamUsagePayload>(usageEventName, (e) => {
+    const usage = e.payload
+    if (typeof usage.input_tokens === 'number') target.inputTokens = usage.input_tokens
+    if (typeof usage.output_tokens === 'number') target.outputTokens = usage.output_tokens
+    if (typeof usage.total_tokens === 'number') target.totalTokens = usage.total_tokens
+    if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) target.costUsd = usage.cost_usd
+    persistActive()
   })
 
   if (unlistenChat) { unlistenChat(); unlistenChat = null }
@@ -639,9 +837,11 @@ async function runAssistantRequest(
       eventName,
       sourcesEventName,
       knowledgeSource: knowledgeSource.value,
+      selectedPaperSlugs: knowledgeSource.value === 'papers' ? selectedPaperSlugs.value : [],
     })
     if (!target.content && finalText) target.content = finalText
     target.streaming = false
+    target.endedAt = performance.now()
     assistantMsg.streaming = false
     if (pendingSources.length > 0) target.sources = [...pendingSources]
     persistActive()
@@ -653,11 +853,14 @@ async function runAssistantRequest(
     target.content = String(e)
     target.error = true
     target.streaming = false
+    target.endedAt = performance.now()
     assistantMsg.streaming = false
   } finally {
     loading.value = false
     if (unlistenChat) { unlistenChat(); unlistenChat = null }
     if (unlistenSources) { unlistenSources(); unlistenSources = null }
+    if (unlistenContext) { unlistenContext(); unlistenContext = null }
+    if (unlistenUsage) { unlistenUsage(); unlistenUsage = null }
     persistActive()
     scrollToBottom()
   }
@@ -848,6 +1051,8 @@ onUnmounted(() => {
   messagesEl.value?.removeEventListener('copy-code', onCopyCode)
   if (unlistenChat) unlistenChat()
   if (unlistenSources) unlistenSources()
+  if (unlistenContext) unlistenContext()
+  if (unlistenUsage) unlistenUsage()
 })
 </script>
 
@@ -871,10 +1076,20 @@ onUnmounted(() => {
         <div class="lc-titlebar-fill" data-tauri-drag-region />
         <div class="lc-titlebar-actions">
           <!-- RAG not configured -->
-          <button v-if="!ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
+          <button v-if="knowledgeSource !== 'papers' && !ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
             RAG
           </button>
+          <template v-else-if="knowledgeSource === 'papers'">
+            <div class="paper-context-counter" :title="selectedPapers.map(p => p.title).join('\n') || '尚未添加文献'">
+              {{ selectedPapers.length }} 篇
+            </div>
+            <button class="rag-refresh-btn" title="添加文献" @click="openPaperPicker">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+            </button>
+          </template>
           <template v-else-if="knowledgeSource === 'snippets'">
             <!-- Snippet RAG controls -->
             <span v-if="snippetSyncing" class="rag-sync-progress">{{ snippetSyncProgress.done }}/{{ snippetSyncProgress.total }}</span>
@@ -898,7 +1113,7 @@ onUnmounted(() => {
             </button>
           </template>
           <!-- Paper RAG controls -->
-          <template v-else>
+          <template v-else-if="knowledgeSource === 'paper-rag'">
             <span v-if="syncingMissing" class="rag-sync-progress">{{ syncProgress.done }}/{{ syncProgress.total }}</span>
             <button class="rag-refresh-btn" :class="{ refreshing: refreshingCounts || syncingMissing }" title="刷新嵌入状态" :disabled="refreshingCounts || syncingMissing" @click="refreshCounts">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
@@ -964,7 +1179,7 @@ onUnmounted(() => {
             <span class="sidebar-title">{{ t('libraryChat.historyTitle') }}</span>
             <span class="sidebar-count">{{ conversations.length }}</span>
           </div>
-          <button class="new-chat-btn" :title="t('libraryChat.newChat')" @click="newConversation">
+          <button class="new-chat-btn" :title="t('libraryChat.newChat')" @click="startNewConversation">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
               <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
@@ -1233,6 +1448,34 @@ onUnmounted(() => {
                   </svg>
                 </div>
                 <div class="assistant-content">
+                  <div v-if="hasAnswerContext(activeAnswer(msg))" class="context-banner">
+                    <button
+                      class="ctx-pills"
+                      :title="expandedContextId === activeAnswer(msg).id ? '收起' : '查看发送给 AI 的上下文'"
+                      @click="toggleContextPanel(activeAnswer(msg).id)"
+                    >
+                      <span
+                        v-for="(section, ci) in answerContextSections(activeAnswer(msg))"
+                        :key="`${activeAnswer(msg).id}-ctx-${ci}`"
+                        class="ctx-pill ctx-paper"
+                        :title="section.label"
+                      >{{ section.label }}</span>
+                      <svg class="ctx-chevron" :class="{ open: expandedContextId === activeAnswer(msg).id }" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <path d="m6 9 6 6 6-6"/>
+                      </svg>
+                    </button>
+                    <div v-if="expandedContextId === activeAnswer(msg).id" class="ctx-preview">
+                      <div
+                        v-for="(section, ci) in answerContextSections(activeAnswer(msg))"
+                        :key="`${activeAnswer(msg).id}-ctx-preview-${ci}`"
+                        class="ctx-section"
+                      >
+                        <div class="ctx-section-label">{{ section.label }}</div>
+                        <pre class="ctx-preview-text">{{ section.content }}</pre>
+                      </div>
+                    </div>
+                  </div>
+
                   <div
                     class="assistant-bubble markdown-body"
                     :class="{ streaming: activeAnswer(msg).streaming, error: activeAnswer(msg).error }"
@@ -1252,32 +1495,39 @@ onUnmounted(() => {
                   </div>
 
                   <!-- Action buttons -->
-                  <div v-if="!activeAnswer(msg).streaming" class="message-actions assistant-actions">
-                    <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                      </svg>
-                    </button>
-                    <button title="重新生成" :disabled="loading" @click="regenerateAssistant(msg)">
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M1 4v6h6"/><path d="M23 20v-6h-6"/>
-                        <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10"/>
-                        <path d="M3.51 15a9 9 0 0 0 14.85 3.36L23 14"/>
-                      </svg>
-                    </button>
-                    <!-- @ button: pick another model and add as a variant -->
-                    <div class="msg-model-picker" @click.stop>
-                      <button
-                        class="at-btn"
-                        title="用其他模型回答"
-                        :disabled="loading"
-                        :class="{ active: modelPickerMsgId === msg.id }"
-                        @click.stop="openModelPicker(msg.id, $event)"
-                      >
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                          <circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/>
+                  <div v-if="!activeAnswer(msg).streaming || hasUsage(activeAnswer(msg))" class="assistant-action-row">
+                    <div v-if="!activeAnswer(msg).streaming" class="message-actions assistant-actions">
+                      <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
                         </svg>
                       </button>
+                      <button title="重新生成" :disabled="loading" @click="regenerateAssistant(msg)">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M1 4v6h6"/><path d="M23 20v-6h-6"/>
+                          <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10"/>
+                          <path d="M3.51 15a9 9 0 0 0 14.85 3.36L23 14"/>
+                        </svg>
+                      </button>
+                      <!-- @ button: pick another model and add as a variant -->
+                      <div class="msg-model-picker" @click.stop>
+                        <button
+                          class="at-btn"
+                          title="用其他模型回答"
+                          :disabled="loading"
+                          :class="{ active: modelPickerMsgId === msg.id }"
+                          @click.stop="openModelPicker(msg.id, $event)"
+                        >
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/>
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                    <div v-if="hasUsage(activeAnswer(msg))" class="assistant-usage">
+                      <span v-if="typeof activeAnswer(msg).inputTokens === 'number'">↑{{ formatTokenCount(activeAnswer(msg).inputTokens) }}</span>
+                      <span v-if="typeof activeAnswer(msg).outputTokens === 'number'">↓{{ formatTokenCount(activeAnswer(msg).outputTokens) }}</span>
+                      <span v-if="answerSpeed(activeAnswer(msg))" class="msg-speed">{{ answerSpeed(activeAnswer(msg)) }}</span>
                     </div>
                   </div>
 
@@ -1357,6 +1607,20 @@ onUnmounted(() => {
 
         <!-- Input area -->
         <div class="input-area">
+          <div v-if="knowledgeSource === 'papers' && selectedPapers.length > 0" class="selected-paper-strip input-context-strip">
+            <button
+              v-for="paper in selectedPapers"
+              :key="paper.slug"
+              class="selected-paper-chip"
+              :title="paper.title"
+              @click="removeSelectedPaper(paper.slug)"
+            >
+              <span>{{ paper.title }}</span>
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
           <div class="composer">
             <textarea
               ref="textareaEl"
@@ -1376,7 +1640,7 @@ onUnmounted(() => {
                   <button
                     class="ks-trigger"
                     :class="{
-                      on: knowledgeSource === 'papers' ? ragStore.isConfigured : true,
+                      on: knowledgeSource === 'paper-rag' ? ragStore.isConfigured : true,
                       active: sourcePickerOpen,
                     }"
                     @click="sourcePickerOpen = !sourcePickerOpen"
@@ -1390,16 +1654,27 @@ onUnmounted(() => {
                   <div v-if="sourcePickerOpen" class="ks-menu">
                     <button
                       class="ks-option"
-                      :class="{ selected: knowledgeSource === 'papers' }"
-                      @click="setKnowledgeSource('papers')"
+                      :class="{ selected: knowledgeSource === 'paper-rag' }"
+                      @click="setKnowledgeSource('paper-rag')"
                     >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
                       </svg>
                       <span class="ks-option-text">
-                        文献库
+                        文献库RAG
                         <span v-if="!ragStore.isConfigured" class="ks-option-hint">（RAG 未配置）</span>
                       </span>
+                      <svg v-if="knowledgeSource === 'paper-rag'" class="ks-check" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    </button>
+                    <button
+                      class="ks-option"
+                      :class="{ selected: knowledgeSource === 'papers' }"
+                      @click="setKnowledgeSource('papers')"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M12 7v6"/><path d="M9 10h6"/>
+                      </svg>
+                      <span class="ks-option-text">文献库</span>
                       <svg v-if="knowledgeSource === 'papers'" class="ks-check" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
                     </button>
                     <button
@@ -1415,6 +1690,16 @@ onUnmounted(() => {
                     </button>
                   </div>
                 </div>
+                <button
+                  v-if="knowledgeSource === 'papers'"
+                  class="add-paper-context-btn"
+                  title="添加文献"
+                  @click="openPaperPicker"
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                    <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                  </svg>
+                </button>
               </div>
               <div class="footer-right">
                 <span class="enter-hint">{{ t('libraryChat.enterHint') }}</span>
@@ -1450,6 +1735,39 @@ onUnmounted(() => {
           class="msg-model-row"
           @click="regenerateWithModel(modelPickerMsg!, model)"
         >{{ model.displayName }}</button>
+      </div>
+    </div>
+  </Teleport>
+
+  <Teleport to="body">
+    <div v-if="paperPickerOpen" class="paper-picker-overlay" @click.self="paperPickerOpen = false">
+      <div class="paper-picker-dialog">
+        <div class="paper-picker-header">
+          <span class="paper-picker-title">添加文献</span>
+          <button class="paper-picker-close" @click="paperPickerOpen = false">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+        <input v-model="paperPickerSearch" class="paper-picker-search" placeholder="搜索标题、作者、年份..." autofocus />
+        <div class="paper-picker-list">
+          <div v-if="pickerPapers.length === 0" class="paper-picker-empty">暂无匹配文献</div>
+          <button
+            v-for="paper in pickerPapers"
+            :key="paper.slug"
+            class="paper-picker-item"
+            :class="{ selected: selectedPaperSlugs.includes(paper.slug) }"
+            @click="addSelectedPaper(paper)"
+          >
+            <span class="paper-picker-item-title">{{ paper.title }}</span>
+            <span class="paper-picker-item-meta">
+              {{ paper.authors.slice(0, 2).join(', ') }}{{ paper.authors.length > 2 ? ' 等' : '' }}
+              <template v-if="paper.year"> · {{ paper.year }}</template>
+            </span>
+            <span v-if="selectedPaperSlugs.includes(paper.slug)" class="paper-picker-badge">已添加</span>
+          </button>
+        </div>
       </div>
     </div>
   </Teleport>
@@ -2303,6 +2621,122 @@ onUnmounted(() => {
   margin-top: 2px;
 }
 
+.assistant-action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 29px;
+  margin-top: 2px;
+}
+
+.assistant-usage {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.assistant-usage .msg-speed {
+  color: color-mix(in srgb, var(--accent) 74%, var(--text-tertiary));
+}
+
+/* ── Sent context banner ─────────────────────────────────────────────────── */
+.context-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  margin-bottom: 4px;
+}
+
+.ctx-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 3px 7px 3px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--bg-secondary) 70%, transparent);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.14s;
+}
+
+.ctx-pills:hover {
+  background: var(--bg-hover);
+}
+
+.ctx-pill {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 180px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctx-paper {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+.ctx-chevron {
+  color: var(--text-tertiary);
+  transition: transform 0.16s ease;
+  flex-shrink: 0;
+}
+
+.ctx-chevron.open {
+  transform: rotate(180deg);
+}
+
+.ctx-preview {
+  width: min(760px, 100%);
+  margin-top: 5px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.ctx-section + .ctx-section {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.ctx-section-label {
+  padding: 7px 12px 2px;
+  font-size: 10px;
+  font-weight: 650;
+  color: var(--text-tertiary);
+}
+
+.ctx-preview-text {
+  max-height: 260px;
+  margin: 0;
+  padding: 9px 12px 11px;
+  overflow: auto;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .user-edit-card {
   width: min(680px, 78%);
   padding: 10px;
@@ -2634,6 +3068,47 @@ onUnmounted(() => {
 .chat-input:focus { outline: none; }
 .chat-input:disabled { opacity: 0.5; }
 
+.selected-paper-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 2px 0 6px;
+}
+
+.input-context-strip {
+  padding: 0;
+  margin: 0 auto 8px;
+}
+
+.selected-paper-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 210px;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-secondary));
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border-subtle));
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+.selected-paper-chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.selected-paper-chip:hover {
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-secondary));
+}
+.selected-paper-empty {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
 .composer-footer {
   display: flex;
   align-items: center;
@@ -2644,6 +3119,23 @@ onUnmounted(() => {
 
 .footer-left { display: flex; align-items: center; gap: 8px; }
 .footer-right { display: flex; align-items: center; gap: 8px; }
+
+.add-paper-context-btn {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--accent);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+.add-paper-context-btn:hover {
+  background: var(--bg-hover);
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border-default));
+}
 
 /* Knowledge source picker */
 .ks-picker {
@@ -2756,6 +3248,121 @@ onUnmounted(() => {
 
 .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
 .send-btn:disabled { opacity: 0.38; cursor: not-allowed; }
+
+.paper-context-counter {
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-default);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.paper-picker-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.22);
+}
+.paper-picker-dialog {
+  width: min(520px, calc(100vw - 40px));
+  max-height: min(620px, calc(100vh - 80px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+  border-radius: 14px;
+  background: var(--bg-primary);
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.22);
+}
+.paper-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+}
+.paper-picker-title {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+.paper-picker-close {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  color: var(--text-tertiary);
+}
+.paper-picker-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+.paper-picker-search {
+  margin: 0 16px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.paper-picker-search:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--bg-primary);
+}
+.paper-picker-list {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 8px 12px;
+}
+.paper-picker-empty {
+  padding: 24px;
+  color: var(--text-tertiary);
+  font-size: 13px;
+  text-align: center;
+}
+.paper-picker-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 10px 78px 10px 10px;
+  border-radius: var(--radius-md);
+  text-align: left;
+  color: var(--text-primary);
+}
+.paper-picker-item:hover { background: var(--bg-hover); }
+.paper-picker-item.selected {
+  opacity: 0.62;
+  cursor: default;
+}
+.paper-picker-item-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.paper-picker-item-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.paper-picker-badge {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 650;
+}
 
 /* ── No-AI hint ──────────────────────────────────────────────────────────── */
 

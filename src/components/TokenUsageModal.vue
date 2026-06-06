@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import type { AiSettingsInfo } from '../types'
+import type { AiSettingsInfo, AppSettings } from '../types'
 
 interface UsageRecord {
   ts: string
@@ -10,6 +10,7 @@ interface UsageRecord {
   model: string
   input_tokens: number
   output_tokens: number
+  cost_usd?: number
 }
 
 type Range = 'today' | 'week' | 'month' | 'year'
@@ -18,6 +19,7 @@ const emit = defineEmits<{ close: [] }>()
 
 const records = ref<UsageRecord[]>([])
 const aiSettings = ref<AiSettingsInfo | null>(null)
+const appSettings = ref<AppSettings | null>(null)
 const loading = ref(false)
 const range = ref<Range>('week')
 
@@ -29,20 +31,28 @@ const RANGES: { key: Range; label: string }[] = [
 ]
 
 const BAR_STACK_HEIGHT = 96
+const DEFAULT_USD_TO_CNY_RATE = 7.2
 
 // ── Price lookup ───────────────────────────────────────────────────────────────
 
 const priceMap = computed(() => {
-  const map = new Map<string, { input?: number; output?: number }>()
+  const map = new Map<string, { inputCny?: number; outputCny?: number; inputUsd?: number; outputUsd?: number }>()
   for (const p of (aiSettings.value?.providers ?? [])) {
     for (const m of p.models) {
       map.set(`${p.id}::${m.id}`, {
-        input: m.input_price_per_million,
-        output: m.output_price_per_million,
+        inputCny: m.input_price_per_million,
+        outputCny: m.output_price_per_million,
+        inputUsd: m.input_price_usd_per_million,
+        outputUsd: m.output_price_usd_per_million,
       })
     }
   }
   return map
+})
+
+const usdToCnyRate = computed(() => {
+  const rate = Number(appSettings.value?.usd_to_cny_rate)
+  return Number.isFinite(rate) && rate > 0 ? rate : DEFAULT_USD_TO_CNY_RATE
 })
 
 // Map provider ID -> display name
@@ -96,20 +106,33 @@ function modelIconUrl(model: string, provider: string): string | null {
 }
 
 function recordCost(r: UsageRecord) {
+  if (r.cost_usd != null && Number.isFinite(r.cost_usd) && r.cost_usd >= 0) {
+    return r.cost_usd * usdToCnyRate.value
+  }
   const key = `${r.provider}::${r.model}`
   const prices = priceMap.value.get(key)
   if (!prices) return 0
   let c = 0
-  if (prices.input != null)  c += (r.input_tokens  / 1_000_000) * prices.input
-  if (prices.output != null) c += (r.output_tokens / 1_000_000) * prices.output
+  if (prices.inputUsd != null || prices.outputUsd != null) {
+    if (prices.inputUsd != null)  c += (r.input_tokens  / 1_000_000) * prices.inputUsd * usdToCnyRate.value
+    if (prices.outputUsd != null) c += (r.output_tokens / 1_000_000) * prices.outputUsd * usdToCnyRate.value
+    return c
+  }
+  if (prices.inputCny != null)  c += (r.input_tokens  / 1_000_000) * prices.inputCny
+  if (prices.outputCny != null) c += (r.output_tokens / 1_000_000) * prices.outputCny
   return c
 }
 
-const hasPrices = computed(() =>
-  (aiSettings.value?.providers ?? []).some(p => p.models.some(m =>
-    m.input_price_per_million != null || m.output_price_per_million != null
-  ))
-)
+function recordHasCostData(r: UsageRecord) {
+  if (r.cost_usd != null && Number.isFinite(r.cost_usd) && r.cost_usd >= 0) return true
+  const prices = priceMap.value.get(`${r.provider}::${r.model}`)
+  return !!prices && (
+    prices.inputUsd != null || prices.outputUsd != null ||
+    prices.inputCny != null || prices.outputCny != null
+  )
+}
+
+const hasCostData = computed(() => filteredRecords.value.some(recordHasCostData))
 
 const MODEL_COLORS = [
   '#7EA6F7',
@@ -151,7 +174,7 @@ const filteredRecords = computed(() => {
 const totalInput  = computed(() => filteredRecords.value.reduce((s, r) => s + r.input_tokens,  0))
 const totalOutput = computed(() => filteredRecords.value.reduce((s, r) => s + r.output_tokens, 0))
 const totalCost   = computed(() => {
-  if (!hasPrices.value) return null
+  if (!hasCostData.value) return null
   return filteredRecords.value.reduce((s, r) => s + recordCost(r), 0)
 })
 
@@ -329,12 +352,14 @@ function fmtCost(n: number) {
 async function load() {
   loading.value = true
   try {
-    const [recs, settings] = await Promise.all([
+    const [recs, settings, app] = await Promise.all([
       invoke<UsageRecord[]>('get_token_usage'),
       invoke<AiSettingsInfo>('get_ai_settings').catch(() => null),
+      invoke<AppSettings>('get_settings').catch(() => null),
     ])
     records.value = recs
     aiSettings.value = settings
+    appSettings.value = app
   } catch { records.value = [] }
   finally { loading.value = false }
 }
@@ -383,7 +408,7 @@ onMounted(load)
             <span class="card-value output-color">{{ fmtT(totalOutput) }}</span>
           </div>
           <div v-if="totalCost !== null" class="summary-card">
-            <span class="card-label">估算费用</span>
+            <span class="card-label">费用（人民币）</span>
             <span class="card-value cost-color">{{ totalCost < 0.001 ? '¥0.00' : '¥' + totalCost.toFixed(2) }}</span>
           </div>
           <div class="summary-card dim">
@@ -430,7 +455,7 @@ onMounted(load)
                 </div>
 
                 <!-- Cost below -->
-                <span v-if="hasPrices && bar.cost > 0" class="bar-cost">{{ fmtCost(bar.cost) }}</span>
+                <span v-if="hasCostData && bar.cost > 0" class="bar-cost">{{ fmtCost(bar.cost) }}</span>
 
                 <span class="bar-x">{{ bar.label }}</span>
               </div>
@@ -442,8 +467,8 @@ onMounted(load)
                 <span class="legend-dot" :style="{ background: item.color }" />{{ item.model }}
               </template>
               <span v-if="modelRanking.length > modelLegend.length" class="legend-hint">+{{ modelRanking.length - modelLegend.length }}</span>
-              <template v-if="!hasPrices">
-                <span class="legend-hint">在设置→AI 服务中配置单价后显示花费</span>
+              <template v-if="!hasCostData">
+                <span class="legend-hint">在设置→AI 服务中配置单价或使用 OpenRouter 后显示花费</span>
               </template>
             </div>
           </div>

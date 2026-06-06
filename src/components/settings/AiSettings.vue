@@ -3,10 +3,12 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { useAiStore } from '../../stores/ai'
+import { useSettingsStore } from '../../stores/settings'
 import type { AiModel, AiProviderInfo, AiProviderInput, ModelSelection } from '../../types'
 
 const { t } = useI18n()
 const ai = useAiStore()
+const settingsStore = useSettingsStore()
 
 // ── Presets ───────────────────────────────────────────────────────────────────
 
@@ -101,9 +103,12 @@ const defaultSel    = ref<ModelSelection | null>(null)
 // Save feedback
 const saveStatus    = ref<'' | 'saving' | 'saved'>('')
 const providerCtxMenu = ref<{ x: number; y: number; provider: AiProviderInfo } | null>(null)
+const usdToCnyRate = ref('7.2')
+const billingSaveStatus = ref<'' | 'saving' | 'saved'>('')
 
 onMounted(async () => {
-  await ai.load()
+  await Promise.all([ai.load(), settingsStore.load()])
+  usdToCnyRate.value = formatRate(settingsStore.settings.usd_to_cny_rate)
   defaultSel.value = ai.defaultSelection
   if (ai.settings.providers.length > 0) {
     selectProvider(ai.settings.providers[0].id)
@@ -415,6 +420,44 @@ async function saveEditModel() {
 
 function removeModel(idx: number) { editModels.value.splice(idx, 1) }
 
+// ── Billing settings ─────────────────────────────────────────────────────────
+
+function currentUsdToCnyRate() {
+  const rate = Number(settingsStore.settings.usd_to_cny_rate)
+  return Number.isFinite(rate) && rate > 0 ? rate : 7.2
+}
+
+function formatRate(rate: unknown) {
+  const n = Number(rate)
+  return Number.isFinite(n) && n > 0 ? String(n) : '7.2'
+}
+
+function parseRate(raw: string) {
+  const v = Number(raw)
+  return Number.isFinite(v) && v > 0 ? v : 7.2
+}
+
+async function saveBillingSettings() {
+  const rate = parseRate(usdToCnyRate.value)
+  usdToCnyRate.value = formatRate(rate)
+  if (settingsStore.settings.usd_to_cny_rate === rate) return
+  billingSaveStatus.value = 'saving'
+  await settingsStore.save({ usd_to_cny_rate: rate })
+  billingSaveStatus.value = 'saved'
+  setTimeout(() => { billingSaveStatus.value = '' }, 2000)
+}
+
+function priceCnyPerMillion(usd?: number, cny?: number) {
+  if (usd != null) return usd * currentUsdToCnyRate()
+  return cny
+}
+
+function fmtPricePerMillion(price?: number) {
+  if (price == null) return ''
+  if (price < 0.01) return '<¥0.01/M'
+  return `¥${price.toFixed(price < 1 ? 3 : 2)}/M`
+}
+
 // ── OpenRouter provider selection ─────────────────────────────────────────────
 
 const isOpenRouterProvider = computed(() => editKind.value === 'openrouter')
@@ -663,6 +706,28 @@ function toggleCapability(form: ModelForm, cap: string) {
 
     <!-- Right: detail panel -->
     <div class="provider-detail">
+      <div class="billing-settings">
+        <div class="billing-main">
+          <span class="billing-title">AI 计费</span>
+          <span class="billing-note">统计页统一按人民币显示</span>
+        </div>
+        <label class="billing-rate-field">
+          <span>USD/CNY</span>
+          <input
+            v-model="usdToCnyRate"
+            class="text-input sm"
+            type="number"
+            min="0.0001"
+            step="0.01"
+            @blur="saveBillingSettings"
+            @keydown.enter.prevent="saveBillingSettings"
+          />
+        </label>
+        <span v-if="billingSaveStatus" class="billing-save">
+          {{ billingSaveStatus === 'saving' ? '…' : t('settings.saved') }}
+        </span>
+      </div>
+
       <!-- Add provider form -->
       <template v-if="isAdding">
         <div class="detail-header">
@@ -1075,9 +1140,16 @@ function toggleCapability(form: ModelForm, cap: string) {
                     </div>
                     <div class="model-id-row">
                       <span class="model-id">{{ m.id }}</span>
-                      <span v-if="m.input_price_per_million != null || m.output_price_per_million != null" class="price-hint">
-                        <span v-if="m.input_price_per_million != null">入 ¥{{ m.input_price_per_million }}/M</span>
-                        <span v-if="m.output_price_per_million != null">出 ¥{{ m.output_price_per_million }}/M</span>
+                      <span
+                        v-if="m.input_price_per_million != null || m.output_price_per_million != null || m.input_price_usd_per_million != null || m.output_price_usd_per_million != null"
+                        class="price-hint"
+                      >
+                        <span v-if="priceCnyPerMillion(m.input_price_usd_per_million, m.input_price_per_million) != null">
+                          入 {{ fmtPricePerMillion(priceCnyPerMillion(m.input_price_usd_per_million, m.input_price_per_million)) }}
+                        </span>
+                        <span v-if="priceCnyPerMillion(m.output_price_usd_per_million, m.output_price_per_million) != null">
+                          出 {{ fmtPricePerMillion(priceCnyPerMillion(m.output_price_usd_per_million, m.output_price_per_million)) }}
+                        </span>
                       </span>
                       <span v-if="m.provider_order && m.provider_order.length > 0" class="provider-order-hint" :title="m.provider_order.join(' → ')">
                         Provider: {{ m.provider_order.slice(0, 2).join(' → ') }}{{ m.provider_order.length > 2 ? ' …' : '' }}
@@ -1336,6 +1408,50 @@ function toggleCapability(form: ModelForm, cap: string) {
   overflow-y: auto;
   padding: 24px 28px 28px;
   position: relative;
+}
+
+.billing-settings {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  margin-bottom: 18px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-secondary) 58%, var(--bg-primary));
+}
+.billing-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.billing-title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+.billing-note,
+.billing-rate-field span,
+.billing-save {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.billing-rate-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.billing-rate-field .text-input.sm {
+  width: 92px;
+  height: 28px;
+}
+.billing-save {
+  width: 34px;
+  text-align: right;
+  flex-shrink: 0;
 }
 
 .empty-hint {

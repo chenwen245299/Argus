@@ -299,6 +299,9 @@ export interface ArxivConfig {
   ai_provider_id: string | null
   ai_model_id: string | null
   last_fetch_date: string | null
+  ai_analysis_concurrency: number
+  fetch_biorxiv: boolean
+  fetch_arxiv: boolean
 }
 
 export interface ArxivPaper {
@@ -321,6 +324,7 @@ export interface ArxivPaper {
   fetched_at: string
   read: boolean
   rating: number
+  source?: string
 }
 
 export interface ArxivInbox {
@@ -396,6 +400,7 @@ export interface ArxivScheduleStatus {
   analyzed_count: number
   total_pending: number
 }
+
 
 export interface SuggestedEdge {
   from_paper_id: string

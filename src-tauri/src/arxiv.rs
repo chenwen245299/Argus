@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use tauri::Emitter;
@@ -22,6 +22,8 @@ const ARXIV_MIN_WINDOW_H: f64 = 500.0;
 static ANALYSIS_CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static FETCH_RUNNING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static ANALYSIS_RUNNING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+static ANALYSIS_PROGRESS_DONE: OnceLock<Arc<AtomicU32>> = OnceLock::new();
+static ANALYSIS_PROGRESS_TOTAL: OnceLock<Arc<AtomicU32>> = OnceLock::new();
 
 fn analysis_cancel() -> &'static Arc<AtomicBool> {
     ANALYSIS_CANCEL.get_or_init(|| Arc::new(AtomicBool::new(false)))
@@ -33,6 +35,14 @@ pub fn fetch_running() -> &'static Arc<AtomicBool> {
 
 pub fn analysis_running() -> &'static Arc<AtomicBool> {
     ANALYSIS_RUNNING.get_or_init(|| Arc::new(AtomicBool::new(false)))
+}
+
+fn analysis_progress_done() -> &'static Arc<AtomicU32> {
+    ANALYSIS_PROGRESS_DONE.get_or_init(|| Arc::new(AtomicU32::new(0)))
+}
+
+fn analysis_progress_total() -> &'static Arc<AtomicU32> {
+    ANALYSIS_PROGRESS_TOTAL.get_or_init(|| Arc::new(AtomicU32::new(0)))
 }
 
 pub fn cancel_analysis() {
@@ -315,6 +325,45 @@ pub fn prune_low_relevance(root: &str) -> Result<ArxivInbox, String> {
     save_inbox(root, &inbox)?;
     mark_in_library_statuses(root, &mut inbox.papers);
     Ok(inbox)
+}
+
+/// Delete all papers fetched on a specific date (YYYY-MM-DD).
+/// Removes the day file and cleans up the read-state entries.
+pub fn delete_inbox_by_date(root: &str, date: &str) -> Result<ArxivInbox, String> {
+    let papers = read_day_papers(root, date);
+    if !papers.is_empty() {
+        let mut states = load_read_states(root);
+        for p in &papers {
+            states.remove(&p.arxiv_id);
+        }
+        let _ = save_read_states(root, &states);
+    }
+    // write_day_papers with empty slice removes the file
+    write_day_papers(root, date, &[])?;
+    Ok(get_inbox(root))
+}
+
+/// Delete specific papers by arxiv_id from the inbox.
+pub fn delete_inbox_papers(root: &str, arxiv_ids: &[String]) -> Result<ArxivInbox, String> {
+    if arxiv_ids.is_empty() {
+        return Ok(get_inbox(root));
+    }
+    let id_set: std::collections::HashSet<&String> = arxiv_ids.iter().collect();
+    // Clean read states
+    let mut states = load_read_states(root);
+    for id in arxiv_ids {
+        states.remove(id);
+    }
+    let _ = save_read_states(root, &states);
+    // Remove from each day file that contains any of the ids
+    for date in list_day_dates(root) {
+        let papers = read_day_papers(root, &date);
+        if papers.iter().any(|p| id_set.contains(&p.arxiv_id)) {
+            let kept: Vec<_> = papers.into_iter().filter(|p| !id_set.contains(&p.arxiv_id)).collect();
+            write_day_papers(root, &date, &kept)?;
+        }
+    }
+    Ok(get_inbox(root))
 }
 
 /// Mark a single paper as read in the dedicated state file.
@@ -732,23 +781,20 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
         config.keywords.join(", ")
     };
 
-    // Prevent concurrent bulk analysis runs
+    let concurrency = config.ai_analysis_concurrency.clamp(1, 10) as usize;
+
     if analysis_running().load(Ordering::SeqCst) {
         return Ok(());
     }
-
     analysis_cancel().store(false, Ordering::SeqCst);
     analysis_running().store(true, Ordering::SeqCst);
+    analysis_progress_done().store(0, Ordering::SeqCst);
+    analysis_progress_total().store(0, Ordering::SeqCst);
 
     let mut inbox = get_inbox(root);
 
-    // Reset any papers stuck in "analyzing" (e.g. from a previous interrupted run)
-    // so they are picked up again as pending.
-    let had_stale = inbox
-        .papers
-        .iter()
-        .any(|p| p.analysis_status == "analyzing");
-    if had_stale {
+    // Reset papers stuck in "analyzing" from a previous interrupted run.
+    if inbox.papers.iter().any(|p| p.analysis_status == "analyzing") {
         for p in inbox.papers.iter_mut() {
             if p.analysis_status == "analyzing" {
                 p.analysis_status = "pending".to_string();
@@ -757,22 +803,27 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
         let _ = save_inbox(root, &inbox);
     }
 
-    let pending_ids: Vec<String> = inbox
+    // Collect pending papers (with full data — each task captures its own copy).
+    let pending: Vec<ArxivPaper> = inbox
         .papers
         .iter()
         .filter(|p| p.analysis_status == "pending")
-        .map(|p| p.arxiv_id.clone())
+        .cloned()
         .collect();
 
-    let total = pending_ids.len() as u32;
-    let mut done = 0u32;
+    let total = pending.len() as u32;
+    if total == 0 {
+        analysis_running().store(false, Ordering::SeqCst);
+        let _ = app.emit("arxiv-analysis",
+            serde_json::json!({"done": 0, "total": 0, "arxiv_id": "", "status": "finished", "bulk": true}));
+        return Ok(());
+    }
 
-    let _ = app.emit(
-        "arxiv-analysis",
-        serde_json::json!({
-            "done": 0, "total": total, "arxiv_id": "", "status": "started"
-        }),
-    );
+    analysis_progress_total().store(total, Ordering::SeqCst);
+
+    let _ = app.emit("arxiv-analysis", serde_json::json!({
+        "done": 0, "total": total, "arxiv_id": "", "status": "started", "bulk": true
+    }));
 
     let prompt_template = if config.ai_analysis_prompt.trim().is_empty() {
         DEFAULT_ARXIV_ANALYSIS_PROMPT.to_string()
@@ -780,128 +831,180 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
         config.ai_analysis_prompt.clone()
     };
     let filter_threshold = config.ai_filter_threshold.clamp(0.0, 10.0);
+    let filter_enabled = config.ai_filter_enabled;
 
-    for id in pending_ids {
+    // Build arxiv_id → day-file-date map once (O(n)) so result writes are O(1).
+    let id_to_date: std::collections::HashMap<String, String> = pending
+        .iter()
+        .map(|p| (p.arxiv_id.clone(), date_from_fetched_at(&p.fetched_at)))
+        .collect();
+
+    // Bulk pre-mark: O(m) — read each day file ONCE, mark all pending papers in it.
+    // Previous approach was O(n × m): scanned all files for every single paper ID.
+    {
+        let pending_set: std::collections::HashSet<&str> =
+            pending.iter().map(|p| p.arxiv_id.as_str()).collect();
+        for date in list_day_dates(root) {
+            let mut day_papers = read_day_papers(root, &date);
+            let mut changed = false;
+            for p in day_papers.iter_mut() {
+                if pending_set.contains(p.arxiv_id.as_str()) {
+                    p.analysis_status = "analyzing".to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = write_day_papers(root, &date, &day_papers);
+            }
+        }
+    }
+
+    // Shared done counter — readable by spawned tasks for real-time progress events.
+    let done_arc = analysis_progress_done().clone();
+
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let provider   = std::sync::Arc::new(provider);
+    let api_key    = std::sync::Arc::new(api_key);
+    let model      = std::sync::Arc::new(model);
+    let keywords   = std::sync::Arc::new(keywords);
+    let prompt_template = std::sync::Arc::new(prompt_template);
+
+    let mut join_set: tokio::task::JoinSet<(String, Result<AnalysisResult, String>)> =
+        tokio::task::JoinSet::new();
+
+    for paper in pending {
         if analysis_cancel().load(Ordering::SeqCst) {
             break;
         }
 
-        // Mark as "analyzing" with a targeted per-paper write.
-        // If the paper is no longer in any day file (e.g., added to library), skip it.
-        let found = update_paper_in_day_files(root, &id, |p| {
-            p.analysis_status = "analyzing".to_string();
-        });
-        if !found {
-            done += 1;
-            continue;
-        }
-        let _ = app.emit(
-            "arxiv-analysis",
-            serde_json::json!({
-                "done": done, "total": total,
-                "arxiv_id": &id, "status": "analyzing"
-            }),
-        );
+        let sem    = semaphore.clone();
+        let app_c  = app.clone();
+        let prov   = provider.clone();
+        let key    = api_key.clone();
+        let mdl    = model.clone();
+        let kws    = keywords.clone();
+        let tmpl   = prompt_template.clone();
+        let done_c = done_arc.clone();
+        let id_c   = paper.arxiv_id.clone();
 
-        // Get paper content from the in-memory snapshot (content fields don't change).
-        let paper = match inbox.papers.iter().find(|p| p.arxiv_id == id).cloned() {
-            Some(p) => p,
-            None => {
-                done += 1;
-                continue;
+        join_set.spawn(async move {
+            // Block here until a concurrency slot is free.
+            let _permit = sem.acquire_owned().await.ok();
+
+            if analysis_cancel().load(Ordering::SeqCst) {
+                return (id_c, Err("cancelled".to_string()));
             }
-        };
 
-        match call_ai_single(
-            &provider,
-            &api_key,
-            &model,
-            &keywords,
-            &prompt_template,
-            &paper,
-        )
-        .await
-        {
+            // Emit "analyzing" with the CURRENT done count and the real total
+            // so the frontend progress bar moves forward immediately.
+            let current_done = done_c.load(Ordering::SeqCst);
+            let _ = app_c.emit("arxiv-analysis", serde_json::json!({
+                "done": current_done,
+                "total": total,          // real total, not 0
+                "arxiv_id": &id_c,
+                "status": "analyzing",
+                "bulk": true
+            }));
+
+            // The actual slow part — call the AI provider.
+            let result = call_ai_single(&prov, &key, &mdl, &kws, &tmpl, &paper).await;
+            (id_c, result)
+        });
+    }
+
+    // ── Collect results as they complete ─────────────────────────────────────
+    // File writes are serialized here (join_next is awaited one at a time).
+    // Each completed task immediately frees a semaphore slot → the next queued
+    // task starts its API call straight away, keeping N requests in-flight.
+    while let Some(task_result) = join_set.join_next().await {
+        let Ok((id, result)) = task_result else { continue };
+
+        // Increment BEFORE emitting so the event carries the post-completion count.
+        let done_val = done_arc.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Fast O(1) lookup: use the pre-built id→date map instead of scanning all files.
+        let date = id_to_date.get(&id).map(|s| s.as_str()).unwrap_or("");
+
+        match result {
             Ok(result) => {
                 let score = result.relevance_score.clamp(0.0, 10.0);
-                done += 1;
 
-                if config.ai_filter_enabled && score < filter_threshold {
-                    // Remove from inbox: load fresh state to avoid overwriting concurrent changes.
-                    let mut fresh = get_inbox(root);
-                    fresh.papers.retain(|p| p.arxiv_id != id);
-                    let _ = save_inbox(root, &fresh);
-                    let _ = app.emit(
-                        "arxiv-analysis",
-                        serde_json::json!({
-                            "done": done, "total": total,
-                            "arxiv_id": &id, "status": "filtered",
-                            "removed": true,
-                            "score": score,
-                            "reason": &result.relevance_reason,
-                            "key_contributions": &result.key_contributions,
-                            "analysis_summary": &result.summary,
-                            "matched_topics": &result.matched_topics
-                        }),
-                    );
+                if filter_enabled && score < filter_threshold {
+                    // Remove from its specific day file — no full-inbox reload needed.
+                    if !date.is_empty() {
+                        let mut day_papers = read_day_papers(root, date);
+                        day_papers.retain(|p| p.arxiv_id != id);
+                        let _ = write_day_papers(root, date, &day_papers);
+                    }
+                    let _ = app.emit("arxiv-analysis", serde_json::json!({
+                        "done": done_val, "total": total,
+                        "arxiv_id": &id, "status": "filtered",
+                        "bulk": true, "removed": true,
+                        "score": score,
+                        "reason": &result.relevance_reason,
+                        "key_contributions": &result.key_contributions,
+                        "analysis_summary": &result.summary,
+                        "matched_topics": &result.matched_topics
+                    }));
                 } else {
-                    let reason = result.relevance_reason.clone();
-                    let contributions = result.key_contributions.clone();
-                    let summary = result.summary.clone();
-                    let topics = result.matched_topics.clone();
-                    update_paper_in_day_files(root, &id, |p| {
-                        p.relevance_score = Some(score);
-                        p.relevance_reason = Some(reason.clone());
-                        p.key_contributions = contributions.clone();
-                        p.analysis_summary = summary.clone();
-                        p.matched_topics = topics.clone();
-                        p.analysis_status = "done".to_string();
-                    });
-                    let _ = app.emit(
-                        "arxiv-analysis",
-                        serde_json::json!({
-                            "done": done, "total": total,
-                            "arxiv_id": &id, "status": "done",
-                            "score": score,
-                            "reason": &result.relevance_reason,
-                            "key_contributions": &result.key_contributions,
-                            "analysis_summary": &result.summary,
-                            "matched_topics": &result.matched_topics
-                        }),
-                    );
+                    // Write result to the specific day file (O(1) lookup).
+                    if !date.is_empty() {
+                        let mut day_papers = read_day_papers(root, date);
+                        if let Some(p) = day_papers.iter_mut().find(|p| p.arxiv_id == id) {
+                            p.relevance_score    = Some(score);
+                            p.relevance_reason   = Some(result.relevance_reason.clone());
+                            p.key_contributions  = result.key_contributions.clone();
+                            p.analysis_summary   = result.summary.clone();
+                            p.matched_topics     = result.matched_topics.clone();
+                            p.analysis_status    = "done".to_string();
+                        }
+                        let _ = write_day_papers(root, date, &day_papers);
+                    }
+                    let _ = app.emit("arxiv-analysis", serde_json::json!({
+                        "done": done_val, "total": total,
+                        "arxiv_id": &id, "status": "done",
+                        "bulk": true,
+                        "score": score,
+                        "reason": &result.relevance_reason,
+                        "key_contributions": &result.key_contributions,
+                        "analysis_summary": &result.summary,
+                        "matched_topics": &result.matched_topics
+                    }));
                 }
             }
             Err(e) => {
                 eprintln!("Analysis error for {}: {}", id, e);
-                done += 1;
-                update_paper_in_day_files(root, &id, |p| {
-                    p.analysis_status = "failed".to_string();
-                });
-                let _ = app.emit(
-                    "arxiv-analysis",
-                    serde_json::json!({
-                        "done": done, "total": total,
-                        "arxiv_id": &id, "status": "failed",
-                        "message": e
-                    }),
-                );
+                if !date.is_empty() {
+                    let mut day_papers = read_day_papers(root, date);
+                    if let Some(p) = day_papers.iter_mut().find(|p| p.arxiv_id == id) {
+                        p.analysis_status = "failed".to_string();
+                    }
+                    let _ = write_day_papers(root, date, &day_papers);
+                }
+                let _ = app.emit("arxiv-analysis", serde_json::json!({
+                    "done": done_val, "total": total,
+                    "arxiv_id": &id, "status": "failed",
+                    "bulk": true, "message": e
+                }));
             }
         }
 
-        // Polite delay between model calls.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if analysis_cancel().load(Ordering::SeqCst) {
+            join_set.abort_all();
+            break;
+        }
     }
 
+    let final_done = done_arc.load(Ordering::SeqCst);
     analysis_running().store(false, Ordering::SeqCst);
-    let _ = app.emit(
-        "arxiv-analysis",
-        serde_json::json!({
-            "done": done, "total": total, "arxiv_id": "", "status": "finished"
-        }),
-    );
+    let _ = app.emit("arxiv-analysis", serde_json::json!({
+        "done": final_done, "total": total,
+        "arxiv_id": "", "status": "finished", "bulk": true
+    }));
 
     Ok(())
 }
+
 
 // ── Add to library ────────────────────────────────────────────────────────────
 
@@ -1054,17 +1157,18 @@ pub async fn add_to_library(
         title: paper.title.clone(),
         authors: paper.authors.clone(),
         year,
-        doi: None,
-        arxiv_id: Some(arxiv_id.to_string()),
+        // For bioRxiv papers the arxiv_id field holds the DOI; store it in doi instead.
+        doi: if paper.source.as_deref() == Some("biorxiv") { Some(arxiv_id.to_string()) } else { None },
+        arxiv_id: if paper.source.as_deref() == Some("biorxiv") { None } else { Some(arxiv_id.to_string()) },
         venue: None,
         tags: vec![],
         added_at: chrono::Utc::now().to_rfc3339(),
-        original_filename: Some(format!("{}.pdf", arxiv_id)),
+        original_filename: Some(format!("{}.pdf", arxiv_id.replace('/', "_"))),
         reading_status: "unread".to_string(),
         paper_abstract: Some(paper.summary.clone()).filter(|s| !s.trim().is_empty()),
         bibtex: None,
         canvas_notes: vec![],
-        import_source: Some("arxiv".to_string()),
+        import_source: Some(paper.source.clone().unwrap_or_else(|| "arxiv".to_string())),
         cite_count: None,
     };
     paper::write_meta(root, &final_slug, &meta)?;
@@ -1222,6 +1326,7 @@ pub fn open_arxiv_window(app: &tauri::AppHandle) -> Result<(), String> {
 pub fn get_schedule_status(root: &str) -> ArxivScheduleStatus {
     let config = get_arxiv_config(root);
     let inbox = get_inbox(root);
+    let analyzing = analysis_running().load(Ordering::SeqCst);
 
     let total_pending = inbox
         .papers
@@ -1241,13 +1346,21 @@ pub fn get_schedule_status(root: &str) -> ArxivScheduleStatus {
         None
     };
 
+    let (analyzed_count, total_pending) = if analyzing {
+        let done = analysis_progress_done().load(Ordering::SeqCst);
+        let total = analysis_progress_total().load(Ordering::SeqCst);
+        (done, total.saturating_sub(done))
+    } else {
+        (analyzed, total_pending)
+    };
+
     ArxivScheduleStatus {
         auto_fetch_enabled: config.auto_fetch_enabled,
         last_fetch_date: config.last_fetch_date,
         next_scheduled,
         fetching: fetch_running().load(Ordering::SeqCst),
-        analyzing: analysis_running().load(Ordering::SeqCst),
-        analyzed_count: analyzed,
+        analyzing,
+        analyzed_count,
         total_pending,
     }
 }

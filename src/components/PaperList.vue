@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { useI18n } from 'vue-i18n'
 import { storeToRefs } from 'pinia'
@@ -588,7 +588,17 @@ function onRowMouseDown(e: MouseEvent, item: PaperIndexEntry) {
 }
 
 // ── Context menu ──────────────────────────────────────────────────────────────
-const ctxMenu = ref<{ x: number; y: number; item: PaperIndexEntry; showColls: boolean; tagInput: string } | null>(null)
+const CONTEXT_MENU_MARGIN = 10
+const ctxMenuEl = ref<HTMLElement | null>(null)
+type ContextMenuState = {
+  x: number
+  y: number
+  item: PaperIndexEntry
+  showColls: boolean
+  tagInput: string
+  constrained: boolean
+}
+const ctxMenu = ref<ContextMenuState | null>(null)
 const contextMenuRootCollections = computed(() => {
   const seen = new Set<string>()
 
@@ -616,9 +626,29 @@ const contextMenuRootCollections = computed(() => {
   return [...roots, ...orphanRoots]
 })
 
-function openCtx(e: MouseEvent, item: PaperIndexEntry) {
+async function positionContextMenu() {
+  await nextTick()
+  if (!ctxMenu.value || !ctxMenuEl.value) return
+
+  const rect = ctxMenuEl.value.getBoundingClientRect()
+  const viewportW = window.innerWidth
+  const viewportH = window.innerHeight
+  const constrained = rect.height > viewportH - CONTEXT_MENU_MARGIN * 2
+  const boundedHeight = constrained ? viewportH - CONTEXT_MENU_MARGIN * 2 : rect.height
+  const maxX = Math.max(CONTEXT_MENU_MARGIN, viewportW - rect.width - CONTEXT_MENU_MARGIN)
+  const maxY = Math.max(CONTEXT_MENU_MARGIN, viewportH - boundedHeight - CONTEXT_MENU_MARGIN)
+  const x = Math.min(Math.max(CONTEXT_MENU_MARGIN, ctxMenu.value.x), maxX)
+  const y = Math.min(Math.max(CONTEXT_MENU_MARGIN, ctxMenu.value.y), maxY)
+
+  if (x !== ctxMenu.value.x || y !== ctxMenu.value.y || constrained !== ctxMenu.value.constrained) {
+    ctxMenu.value = { ...ctxMenu.value, x, y, constrained }
+  }
+}
+
+async function openCtx(e: MouseEvent, item: PaperIndexEntry) {
   e.preventDefault()
-  ctxMenu.value = { x: e.clientX, y: e.clientY, item, showColls: false, tagInput: '' }
+  ctxMenu.value = { x: e.clientX, y: e.clientY, item, showColls: false, tagInput: '', constrained: false }
+  await positionContextMenu()
 }
 function closeCtx() { ctxMenu.value = null }
 
@@ -1333,7 +1363,9 @@ async function reExtract(item: PaperIndexEntry) {
     <Teleport to="body">
       <div
         v-if="ctxMenu"
+        ref="ctxMenuEl"
         class="ctx-menu"
+        :class="{ 'ctx-menu--constrained': ctxMenu.constrained }"
         :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
         @click.stop
       >
@@ -1919,6 +1951,11 @@ async function reExtract(item: PaperIndexEntry) {
   position: fixed; background: var(--bg-primary);
   border: 1px solid var(--border-default); border-radius: var(--radius-lg);
   box-shadow: var(--shadow-md); padding: 5px; min-width: 180px; z-index: 2000;
+}
+:global(.ctx-menu.ctx-menu--constrained) {
+  max-height: calc(100vh - 20px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 :global(.ctx-item) {
   display: flex; align-items: center; width: 100%;

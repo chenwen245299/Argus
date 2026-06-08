@@ -39,7 +39,7 @@ pub fn normalize_import_source(import_source: Option<&str>, arxiv_id: Option<&st
         .map(|s| s.to_ascii_lowercase())
         .as_deref()
     {
-        Some("file") | Some("arxiv") | Some("url") => import_source
+        Some("file") | Some("arxiv") | Some("biorxiv") | Some("url") => import_source
             .unwrap_or("file")
             .trim()
             .to_ascii_lowercase(),
@@ -710,6 +710,20 @@ pub struct ArxivConfig {
     pub ai_provider_id: Option<String>,
     pub ai_model_id: Option<String>,
     pub last_fetch_date: Option<String>,
+    #[serde(default = "default_ai_analysis_concurrency")]
+    pub ai_analysis_concurrency: u32,
+    #[serde(default)]
+    pub fetch_biorxiv: bool,
+    #[serde(default = "default_fetch_arxiv")]
+    pub fetch_arxiv: bool,
+}
+
+fn default_fetch_arxiv() -> bool {
+    true
+}
+
+fn default_ai_analysis_concurrency() -> u32 {
+    5
 }
 
 fn default_interval_days() -> u32 {
@@ -751,6 +765,9 @@ impl Default for ArxivConfig {
             ai_provider_id: None,
             ai_model_id: None,
             last_fetch_date: None,
+            ai_analysis_concurrency: 5,
+            fetch_biorxiv: false,
+            fetch_arxiv: true,
         }
     }
 }
@@ -783,6 +800,9 @@ pub struct ArxivPaper {
     pub read: bool,
     #[serde(default)]
     pub rating: u8,
+    /// "biorxiv" for bioRxiv papers; None / missing = arXiv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 fn default_analysis_status() -> String {

@@ -9,9 +9,9 @@ use crate::models::{
 };
 use crate::LibraryRoot;
 use crate::{
-    ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas, canvas_enhance, collections, copilot,
-    extraction, library, llm, metadata, paper, rag, search, security_bookmark, settings, snippets,
-    url_import,
+    ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas,
+    canvas_enhance, collections, copilot, extraction, library, llm, metadata, paper, rag, search,
+    security_bookmark, settings, snippets, url_import,
 };
 // ── Library management ────────────────────────────────────────────────────────
 
@@ -1812,6 +1812,38 @@ pub async fn refresh_arxiv_inbox(
     Ok(inbox)
 }
 
+// ── M8: arXiv batch delete ────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn delete_arxiv_inbox_by_date(
+    date: String,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<ArxivInbox, String> {
+    let root = get_root(&state)?;
+    let inbox = arxiv::delete_inbox_by_date(&root, &date)?;
+    let _ = app.emit(
+        "arxiv-new-recommendations",
+        serde_json::json!({ "count": inbox.papers.iter().filter(|p| !p.in_library).count() }),
+    );
+    Ok(inbox)
+}
+
+#[tauri::command]
+pub async fn delete_arxiv_papers(
+    arxiv_ids: Vec<String>,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<ArxivInbox, String> {
+    let root = get_root(&state)?;
+    let inbox = arxiv::delete_inbox_papers(&root, &arxiv_ids)?;
+    let _ = app.emit(
+        "arxiv-new-recommendations",
+        serde_json::json!({ "count": inbox.papers.iter().filter(|p| !p.in_library).count() }),
+    );
+    Ok(inbox)
+}
+
 // ── M8: arXiv read status & rating ───────────────────────────────────────────
 
 #[tauri::command]
@@ -1874,6 +1906,7 @@ pub async fn start_arxiv_analysis(
                 "arxiv-analysis",
                 serde_json::json!({
                     "done": 0, "total": 0, "arxiv_id": "", "status": "error",
+                    "bulk": true,
                     "message": e
                 }),
             );

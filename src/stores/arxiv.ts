@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { ArxivConfig, ArxivPaper, ArxivScheduleStatus } from '../types'
 import { fetchArxivCategories } from '../utils/arxivFetch'
+import { fetchBiorxivAsArxivPapers } from '../utils/biorxivFetch'
 
 export type SortMode = 'score' | 'date' | 'status' | 'rating'
 export type SortOrder = 'desc' | 'asc'
@@ -40,6 +41,9 @@ const DEFAULT_CONFIG: ArxivConfig = {
   ai_provider_id: null,
   ai_model_id: null,
   last_fetch_date: null,
+  ai_analysis_concurrency: 5,
+  fetch_biorxiv: false,
+  fetch_arxiv: true,
 }
 
 export const useArxivStore = defineStore('arxiv', () => {
@@ -65,6 +69,7 @@ export const useArxivStore = defineStore('arxiv', () => {
   let unlistenFetch: UnlistenFn | null = null
   let unlistenAnalysis: UnlistenFn | null = null
   let unlistenRecommend: UnlistenFn | null = null
+  let statusPollTimer: ReturnType<typeof setInterval> | null = null
 
   const sortedPapers = computed(() => {
     let list = [...papers.value]
@@ -112,9 +117,22 @@ export const useArxivStore = defineStore('arxiv', () => {
     } catch { papers.value = [] }
   }
 
+  function applyScheduleStatus(status: ArxivScheduleStatus) {
+    scheduleStatus.value = status
+    if (status.analyzing) {
+      analyzing.value = true
+      analyzeProgress.value = {
+        done: status.analyzed_count,
+        total: status.analyzed_count + status.total_pending,
+      }
+    } else if (analyzing.value) {
+      analyzing.value = false
+    }
+  }
+
   async function loadScheduleStatus() {
     try {
-      scheduleStatus.value = await invoke<ArxivScheduleStatus>('get_arxiv_schedule_status')
+      applyScheduleStatus(await invoke<ArxivScheduleStatus>('get_arxiv_schedule_status'))
     } catch { scheduleStatus.value = null }
   }
 
@@ -144,10 +162,17 @@ export const useArxivStore = defineStore('arxiv', () => {
     fetchMessage.value = ''
     try {
       await loadConfig()
-      if (config.value.categories.length === 0) throw new Error('未配置分类，请在设置 → arXiv 中添加')
+      if (!config.value.fetch_arxiv && !config.value.fetch_biorxiv)
+        throw new Error('请至少开启一种爬取来源（arXiv 或 bioRxiv）')
       const today = new Date().toISOString().slice(0, 10)
       const from = new Date(Date.now() - config.value.days_back * 86400000).toISOString().slice(0, 10)
-      const fetched = await fetchArxivCategories(config.value, from, today)
+      const arxivPapers = config.value.fetch_arxiv && config.value.categories.length > 0
+        ? await fetchArxivCategories(config.value, from, today)
+        : []
+      const biorxivPapers = config.value.fetch_biorxiv
+        ? await fetchBiorxivAsArxivPapers(from, today)
+        : []
+      const fetched = [...arxivPapers, ...biorxivPapers]
       const result = await invoke<ArxivPaper[]>('store_arxiv_papers', { papers: fetched, updateLastFetch: true })
       const knownRead = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
       papers.value = result.map(p => ({ ...p, read: p.read || knownRead.has(p.arxiv_id) }))
@@ -165,7 +190,8 @@ export const useArxivStore = defineStore('arxiv', () => {
     fetchMessage.value = ''
     try {
       await loadConfig()
-      if (!config.value.auto_fetch_enabled || config.value.categories.length === 0) return
+      if (!config.value.auto_fetch_enabled) return
+      if (!config.value.fetch_arxiv && !config.value.fetch_biorxiv) return
       const today = new Date().toISOString().slice(0, 10)
       let dateFrom: string
       if (!config.value.last_fetch_date) {
@@ -175,7 +201,13 @@ export const useArxivStore = defineStore('arxiv', () => {
         if (next > today) return
         dateFrom = next
       }
-      const fetched = await fetchArxivCategories(config.value, dateFrom, today)
+      const arxivPapers = config.value.fetch_arxiv && config.value.categories.length > 0
+        ? await fetchArxivCategories(config.value, dateFrom, today)
+        : []
+      const biorxivPapers = config.value.fetch_biorxiv
+        ? await fetchBiorxivAsArxivPapers(dateFrom, today)
+        : []
+      const fetched = [...arxivPapers, ...biorxivPapers]
       const result = await invoke<ArxivPaper[]>('store_arxiv_papers', { papers: fetched, updateLastFetch: true })
       const knownRead2 = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
       papers.value = result.map(p => ({ ...p, read: p.read || knownRead2.has(p.arxiv_id) }))
@@ -247,6 +279,7 @@ export const useArxivStore = defineStore('arxiv', () => {
     if (unlistenFetch) { unlistenFetch(); unlistenFetch = null }
     if (unlistenAnalysis) { unlistenAnalysis(); unlistenAnalysis = null }
     if (unlistenRecommend) { unlistenRecommend(); unlistenRecommend = null }
+    if (statusPollTimer) { clearInterval(statusPollTimer); statusPollTimer = null }
 
     unlistenFetch = await listen<{
       status: string; done: number; total: number; message?: string
@@ -267,20 +300,28 @@ export const useArxivStore = defineStore('arxiv', () => {
 
     unlistenAnalysis = await listen<{
       done: number; total: number; arxiv_id: string; status: string;
+      bulk?: boolean;
       score?: number; reason?: string; message?: string; removed?: boolean;
       key_contributions?: string[]; analysis_summary?: string | null; matched_topics?: string[]
     }>('arxiv-analysis', (e) => {
       const {
-        done, total, arxiv_id, status, score, reason, removed,
+        done, total, arxiv_id, status, bulk, score, reason, removed,
         key_contributions, analysis_summary, matched_topics,
       } = e.payload
-      analyzeProgress.value = { done, total }
+      const isBulk = total > 1 || bulk === true
 
-      if (status === 'finished' || status === 'error') {
-        analyzing.value = false
-        loadInbox()
-      } else {
-        analyzing.value = true
+      if (isBulk) {
+        if (total > 0 || status === 'started' || status === 'finished') {
+          analyzeProgress.value = { done, total }
+        }
+
+        if (status === 'finished' || status === 'error') {
+          analyzing.value = false
+          loadInbox()
+          loadScheduleStatus()
+        } else {
+          analyzing.value = true
+        }
       }
 
       // Update individual paper status inline
@@ -307,12 +348,16 @@ export const useArxivStore = defineStore('arxiv', () => {
     unlistenRecommend = await listen<{ count: number }>('arxiv-new-recommendations', (e) => {
       newCount.value = e.payload.count
     })
+
+    await loadScheduleStatus()
+    statusPollTimer = setInterval(loadScheduleStatus, 2000)
   }
 
   function unsubscribeEvents() {
     if (unlistenFetch) { unlistenFetch(); unlistenFetch = null }
     if (unlistenAnalysis) { unlistenAnalysis(); unlistenAnalysis = null }
     if (unlistenRecommend) { unlistenRecommend(); unlistenRecommend = null }
+    if (statusPollTimer) { clearInterval(statusPollTimer); statusPollTimer = null }
   }
 
   return {

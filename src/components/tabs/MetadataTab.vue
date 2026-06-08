@@ -19,17 +19,18 @@ const { t } = useI18n()
 const library = useLibraryStore()
 
 // ── Source options ────────────────────────────────────────────────────────────
-type ImportSource = 'file' | 'arxiv' | 'url'
+type ImportSource = 'file' | 'arxiv' | 'biorxiv' | 'url'
 
-const SOURCE_LABEL: Record<ImportSource, string> = { arxiv: 'ArXiv', file: '文件', url: '链接' }
+const SOURCE_LABEL: Record<ImportSource, string> = { arxiv: 'ArXiv', biorxiv: 'bioRxiv', file: '文件', url: '链接' }
 const SOURCE_OPTIONS = [
-  { value: 'file' as const,  label: '文件' },
-  { value: 'arxiv' as const, label: 'ArXiv' },
-  { value: 'url' as const,   label: '链接' },
+  { value: 'file' as const,    label: '文件' },
+  { value: 'arxiv' as const,   label: 'ArXiv' },
+  { value: 'biorxiv' as const, label: 'bioRxiv' },
+  { value: 'url' as const,     label: '链接' },
 ]
 
 function importSource(value?: string | null, arxivId?: string | null): ImportSource {
-  if (value === 'arxiv' || value === 'url' || value === 'file') return value
+  if (value === 'arxiv' || value === 'url' || value === 'file' || value === 'biorxiv') return value
   if (arxivId?.trim()) return 'arxiv'
   return 'file'
 }
@@ -1090,9 +1091,10 @@ async function extractAbstract() {
   padding: 2px 10px; border-radius: var(--radius-pill);
   font-size: var(--font-size-xs); font-weight: 500;
 }
-.src-arxiv { background: var(--source-arxiv-bg); color: var(--source-arxiv-text); }
-.src-file  { background: var(--source-file-bg);  color: var(--source-file-text);  }
-.src-url   { background: var(--source-url-bg);   color: var(--source-url-text);   }
+.src-arxiv   { background: var(--source-arxiv-bg); color: var(--source-arxiv-text); }
+.src-biorxiv { background: #d1fae5; color: #065f46; }
+.src-file    { background: var(--source-file-bg);  color: var(--source-file-text);  }
+.src-url     { background: var(--source-url-bg);   color: var(--source-url-text);   }
 
 .source-btns { display: flex; gap: 5px; }
 .source-btn {

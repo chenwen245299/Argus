@@ -66,6 +66,7 @@ pub fn run() {
             // Start background scheduler
             arxiv_scheduler::start_scheduler(app.handle().clone());
 
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -201,6 +202,9 @@ pub fn run() {
             commands::store_arxiv_papers,
             commands::get_arxiv_inbox,
             commands::refresh_arxiv_inbox,
+            // ── M8: arXiv batch delete ──
+            commands::delete_arxiv_inbox_by_date,
+            commands::delete_arxiv_papers,
             // ── M8: read status & rating ──
             commands::mark_arxiv_paper_read,
             commands::rate_arxiv_paper,

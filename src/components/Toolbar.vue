@@ -486,16 +486,16 @@ onMounted(async () => {
     // Only update bulk-analysis indicator for bulk events (total > 1 or explicit bulk flag)
     // Single-paper events (total === 1) should not reset bulk analysis state
     const isBulk = total > 1 || e.payload.bulk === true
-    if (status === 'started' || status === 'analyzing') {
-      if (isBulk) arxivAnalyzing.value = true
-    } else if (status === 'finished' || status === 'error') {
-      if (isBulk) {
-        arxivAnalyzing.value = false
-        arxivProgress.value = { done, total }
-      }
-    }
-    if (isBulk && (status === 'started' || status === 'analyzing')) {
+    if (!isBulk) return
+
+    if (total > 0 || status === 'started' || status === 'finished') {
       arxivProgress.value = { done, total }
+    }
+
+    if (status === 'finished' || status === 'error') {
+      arxivAnalyzing.value = false
+    } else {
+      arxivAnalyzing.value = true
     }
   })
   unlistenArxivFetch = await listen<{ status: string }>('arxiv-fetch', (e) => {
@@ -1400,6 +1400,7 @@ onUnmounted(() => {
   display: flex; align-items: center; justify-content: center;
   line-height: 1;
 }
+
 
 .right-toolbar-reserve {
   display: flex;

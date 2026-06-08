@@ -36,7 +36,12 @@ fn is_sufficient(text: &str, page_count: usize) -> bool {
 /// Try to extract text via the system `pdftotext` (poppler-utils).
 /// Returns None if the binary is not installed or extraction fails.
 fn try_pdftotext(pdf_path: &Path) -> Option<String> {
-    let output = std::process::Command::new(crate::ocr::find_bin("pdftotext"))
+    let bin = crate::ocr::find_bin("pdftotext");
+    // Bail out early if the binary doesn't exist so we don't pay the process-spawn cost.
+    if !std::path::Path::new(&bin).exists() {
+        return None;
+    }
+    let output = std::process::Command::new(bin)
         .arg("-enc")
         .arg("UTF-8")
         .arg(pdf_path.as_os_str())
@@ -49,10 +54,15 @@ fn try_pdftotext(pdf_path: &Path) -> Option<String> {
     }
 
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
+    if text.trim().is_empty() { None } else { Some(text) }
+}
+
+/// Pure-Rust fallback using the `pdf-extract` crate.
+/// Used when `pdftotext` (poppler) is not installed.
+fn try_pdf_extract_rs(pdf_path: &Path) -> Option<String> {
+    match pdf_extract::extract_text(pdf_path) {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        _ => None,
     }
 }
 
@@ -103,8 +113,10 @@ pub fn extract_and_write(root: &str, slug: &str, _settings: &AppSettings) -> Ext
         return ExtractionResult::Text;
     }
 
-    // Stage 2: pdftotext fallback (handles encodings lopdf can't decode)
-    if let Some(text) = try_pdftotext(&pdf_path) {
+    // Stage 2: pdftotext (poppler) → pdf-extract-rs fallback
+    // If poppler is not installed, pdf-extract-rs is used transparently.
+    let stage2 = try_pdftotext(&pdf_path).or_else(|| try_pdf_extract_rs(&pdf_path));
+    if let Some(text) = stage2 {
         if is_sufficient(&text, page_count.max(1)) {
             if let Err(e) = write_fulltext_and_status(root, slug, &text) {
                 return ExtractionResult::Failed(e);

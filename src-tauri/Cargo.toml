@@ -34,6 +34,7 @@ aes-gcm = "0.10"
 rand = "0.8"
 regex = "1"
 lopdf = "0.34"
+pdf-extract = "0.7"
 rusqlite = { version = "0.31", features = ["bundled"] }
 base64 = "0.22"
 

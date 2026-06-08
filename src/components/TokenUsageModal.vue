@@ -677,7 +677,7 @@ onMounted(load)
 }
 
 /* Bars */
-.chart-wrap { display: flex; flex-direction: column; gap: 8px; flex: 1; overflow: hidden; }
+.chart-wrap { display: flex; flex-direction: column; gap: 8px; flex: 1; overflow: visible; }
 .bars-area {
   flex: 1;
   display: flex;
@@ -693,7 +693,7 @@ onMounted(load)
 .bars-area::-webkit-scrollbar-thumb { background: var(--usage-border-strong); border-radius: 2px; }
 .bar-col {
   display: flex; flex-direction: column; align-items: center;
-  flex: 1; min-width: 22px; max-width: 54px;
+  flex: 1; min-width: 38px; max-width: 54px;
   height: 100%;
   justify-content: flex-end;
   gap: 5px;

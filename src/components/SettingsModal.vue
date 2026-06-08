@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { updateStore } from '../stores/update'
 import GeneralSettings from './settings/GeneralSettings.vue'
 import AiSettings from './settings/AiSettings.vue'
 import ExtractionSettings from './settings/ExtractionSettings.vue'
@@ -86,6 +87,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               >
                 {{ t(sec.label) }}
                 <span v-if="sec.placeholder" class="coming-badge">{{ t('settings.comingSoon') }}</span>
+                <span v-else-if="sec.id === 'about' && updateStore.hasUpdate && activeSection !== 'about'" class="update-nav-dot" />
               </button>
             </nav>
 
@@ -250,6 +252,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
   padding: 1px 6px;
   border-radius: var(--radius-pill);
   white-space: nowrap;
+}
+.update-nav-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #ef4444;
+  flex-shrink: 0;
+  margin-left: auto;
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.25);
 }
 
 /* Right content */

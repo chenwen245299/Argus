@@ -35,6 +35,10 @@ const emit = defineEmits<{
 const selection = useSelectionStore()
 const cStore = useCollectionsStore()
 
+let _subCollCompositionEndedAt = 0
+function onSubCollCompositionEnd() { _subCollCompositionEndedAt = Date.now() }
+function isSubCollIMEActive() { return Date.now() - _subCollCompositionEndedAt < 100 }
+
 const children = computed(() => cStore.childrenOf(props.collection.id))
 const isExpanded = computed(() => props.expanded.has(props.collection.id))
 const isActive = computed(() => selection.activeCollectionId === props.collection.id)
@@ -119,7 +123,8 @@ function onCollectionMouseDown(e: MouseEvent) {
         class="coll-name-input"
         placeholder="Collection name"
         @input="$emit('update:newCollName', ($event.target as HTMLInputElement).value)"
-        @keydown.enter="$emit('submitNew')"
+        @compositionend="onSubCollCompositionEnd"
+        @keydown.enter="() => { if (!isSubCollIMEActive()) $emit('submitNew') }"
         @keydown.escape="$emit('update:showNewInput', false)"
         @blur="$emit('submitNew')"
       />

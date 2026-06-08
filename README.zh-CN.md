@@ -43,6 +43,14 @@ Argus 是一个面向学术论文的桌面应用。它把 PDF 阅读、元数据
 | arXiv 与 RAG | 跟踪 arXiv 推荐，导入有价值的论文，建立语义搜索，并带来源地提问整个文献库。 |
 | 论文关系图谱 | 把论文放到画布上，连接相关工作，并导出论文关系图。 |
 
+## 安装（macOS）
+
+从 [Releases](../../releases) 页下载 `.dmg` 安装后，需要在终端运行以下命令清除系统隔离标记，否则 macOS 会阻止应用打开：
+
+```bash
+xattr -cr /Applications/Argus.app
+```
+
 ## 编译部署
 
 ```bash

@@ -46,15 +46,21 @@ const selectedProvider = computed(() =>
 
 const availableModels = computed(() => selectedProvider.value?.models ?? [])
 
-const keywordsText = computed({
-  get: () => form.value.keywords.join('\n'),
-  set: (val: string) => { form.value.keywords = val.split('\n').filter(Boolean) }
-})
+const keywordsDraft = ref('')
+
+function syncKeywordsDraftFromForm() {
+  keywordsDraft.value = form.value.keywords.join('\n')
+}
+
+function flushKeywordsDraft() {
+  form.value.keywords = keywordsDraft.value.split('\n').filter(Boolean)
+}
 
 onMounted(async () => {
   await aiStore.load()
   if (!store.loaded) await store.load()
   form.value = normalizeConfig(store.config)
+  syncKeywordsDraftFromForm()
   await nextTick()
   formReady = true
 })
@@ -181,10 +187,11 @@ const PRESETS = ['cs.AI', 'cs.CL', 'cs.LG', 'cs.CV', 'cs.NE', 'cs.RO', 'stat.ML'
     <div class="field-group">
       <label class="field-label">{{ t('arxivSettings.keywords') }}</label>
       <textarea
-        v-model="keywordsText"
+        v-model="keywordsDraft"
         class="field-textarea"
         rows="3"
         :placeholder="t('arxivSettings.keywordsPh')"
+        @blur="flushKeywordsDraft"
       />
       <p class="field-hint">{{ t('arxivSettings.keywordsHint') }}</p>
     </div>

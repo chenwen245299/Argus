@@ -43,6 +43,14 @@ Argus is a desktop app for managing academic papers and working with them throug
 | arXiv and RAG | Track arXiv recommendations, import useful papers, build semantic search, and ask questions across the library with sources. |
 | Research canvas | Arrange papers as nodes, connect related work, and export paper relationship maps. |
 
+## Installation (macOS)
+
+Download the `.dmg` from the [Releases](../../releases) page, install the app, then run the following command to clear the quarantine flag — otherwise macOS will block it from opening:
+
+```bash
+xattr -cr /Applications/Argus.app
+```
+
 ## Development
 
 ```bash

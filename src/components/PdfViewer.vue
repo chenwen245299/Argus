@@ -785,7 +785,7 @@ function scrollToPageIndex(pageIndex: number, offsetYAtScale1 = 0) {
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
-interface SearchMatch { pageIndex: number; rects: Rect[] }
+interface SearchMatch { pageIndex: number; rects: Rect[]; matchOnPage: number }
 
 const searchOpen          = ref(false)
 const searchQuery         = ref('')
@@ -822,13 +822,12 @@ function buildSearchRegex(): RegExp | null {
   } catch { return null }
 }
 
-function findPageMatchRects(pageIndex: number, regex: RegExp): Rect[] {
+function findAllPageMatchRects(pageIndex: number, regex: RegExp): Rect[][] {
   const el = pageRefs.value[pageIndex]
   if (!el) return []
   const textLayer = el.querySelector('.textLayer')
   if (!textLayer) return []
 
-  // Collect leaf spans (pdfjs renders each text item as a direct-child span)
   const spans = Array.from(textLayer.querySelectorAll('span')).filter(
     s => !s.querySelector('span')
   ) as HTMLSpanElement[]
@@ -843,11 +842,12 @@ function findPageMatchRects(pageIndex: number, regex: RegExp): Rect[] {
     fullText += t
   }
 
-  const rects: Rect[] = []
+  const allMatches: Rect[][] = []
   regex.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = regex.exec(fullText)) !== null) {
     const ms = m.index, me = ms + m[0].length
+    const matchRects: Rect[] = []
     for (const { span, start, end } of map) {
       if (end <= ms || start >= me) continue
       const textNode = Array.from(span.childNodes).find(n => n.nodeType === Node.TEXT_NODE)
@@ -861,7 +861,7 @@ function findPageMatchRects(pageIndex: number, regex: RegExp): Rect[] {
         range.setEnd(textNode, re)
         for (const cr of range.getClientRects()) {
           if (cr.width > 0 && cr.height > 0) {
-            rects.push({
+            matchRects.push({
               x: (cr.left - pageRect.left) / scale.value,
               y: (cr.top  - pageRect.top)  / scale.value,
               width:  cr.width  / scale.value,
@@ -871,9 +871,10 @@ function findPageMatchRects(pageIndex: number, regex: RegExp): Rect[] {
         }
       } catch { /* ignore */ }
     }
+    if (matchRects.length > 0) allMatches.push(matchRects)
     if (m[0].length === 0) regex.lastIndex++
   }
-  return rects
+  return allMatches
 }
 
 function refreshSearchOverlays() {
@@ -926,12 +927,18 @@ async function runSearch() {
   for (let i = 0; i < pageCount.value; i++) {
     regex.lastIndex = 0
     if (renderedPages.value.has(i)) {
-      const rects = findPageMatchRects(i, regex)
-      if (rects.length > 0) matches.push({ pageIndex: i, rects })
+      const pageMatches = findAllPageMatchRects(i, regex)
+      pageMatches.forEach((rects, j) => matches.push({ pageIndex: i, rects, matchOnPage: j }))
     } else {
       const text = await fetchPageText(i)
       regex.lastIndex = 0
-      if (regex.test(text)) matches.push({ pageIndex: i, rects: [] })
+      let m: RegExpExecArray | null
+      let j = 0
+      while ((m = regex.exec(text)) !== null) {
+        matches.push({ pageIndex: i, rects: [], matchOnPage: j })
+        j++
+        if (m[0].length === 0) regex.lastIndex++
+      }
     }
   }
   searchMatches.value = matches
@@ -950,7 +957,12 @@ async function navigateToSearchMatch(idx: number) {
   if (match.rects.length === 0) {
     await ensurePageRendered(match.pageIndex)
     const regex = buildSearchRegex()
-    if (regex) match.rects = findPageMatchRects(match.pageIndex, regex)
+    if (regex) {
+      const pageMatches = findAllPageMatchRects(match.pageIndex, regex)
+      searchMatches.value
+        .filter(m => m.pageIndex === match.pageIndex)
+        .forEach(m => { if (pageMatches[m.matchOnPage]) m.rects = pageMatches[m.matchOnPage] })
+    }
   }
   scrollToPageIndex(match.pageIndex, match.rects[0]?.y ?? 0)
   refreshSearchOverlays()
@@ -975,12 +987,17 @@ watch(renderedPages, async () => {
   const regex = buildSearchRegex()
   if (!regex) return
   let changed = false
-  for (const match of searchMatches.value) {
-    if (renderedPages.value.has(match.pageIndex) && match.rects.length === 0) {
-      regex.lastIndex = 0
-      match.rects = findPageMatchRects(match.pageIndex, regex)
-      changed = true
-    }
+  const pagesNeedingRects = new Set(
+    searchMatches.value
+      .filter(m => renderedPages.value.has(m.pageIndex) && m.rects.length === 0)
+      .map(m => m.pageIndex)
+  )
+  for (const pageIndex of pagesNeedingRects) {
+    regex.lastIndex = 0
+    const pageMatches = findAllPageMatchRects(pageIndex, regex)
+    searchMatches.value
+      .filter(m => m.pageIndex === pageIndex)
+      .forEach(m => { if (pageMatches[m.matchOnPage]) { m.rects = pageMatches[m.matchOnPage]; changed = true } })
   }
   if (changed) refreshSearchOverlays()
 })

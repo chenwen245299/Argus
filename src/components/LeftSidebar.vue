@@ -217,6 +217,9 @@ async function handleSnippetRefresh() {
 const showNewInput = ref(false)
 const newCollName = ref('')
 const newCollParent = ref<string | undefined>(undefined)
+let _newCollCompositionEndedAt = 0
+function onNewCollCompositionEnd() { _newCollCompositionEndedAt = Date.now() }
+function isNewCollIMEActive() { return Date.now() - _newCollCompositionEndedAt < 100 }
 
 function startNew(parentId?: string) {
   newCollParent.value = parentId
@@ -809,7 +812,8 @@ onUnmounted(() => {
                 v-model="newCollName"
                 class="coll-name-input"
                 :placeholder="t('collections.namePlaceholder')"
-                @keydown.enter="submitNew"
+                @compositionend="onNewCollCompositionEnd"
+                @keydown.enter="() => { if (!isNewCollIMEActive()) submitNew() }"
                 @keydown.escape="showNewInput = false"
                 @blur="submitNew"
               />

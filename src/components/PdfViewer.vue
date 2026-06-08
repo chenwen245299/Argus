@@ -11,16 +11,11 @@ import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import type { Highlight, Rect } from '../types'
+// The legacy build includes its own Promise.withResolvers polyfill, so the worker
+// runs correctly on Ventura (WebKit < 17.4) without a custom wrapper.
+import PDFWorkerLegacyUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 
-// ── Worker (polyfill-wrapped, offline-safe) ───────────────────────────────────
-// The worker runs in an isolated thread — the Promise.withResolvers polyfill in
-// main.ts doesn't reach it. This wrapper applies the polyfill before PDF.js runs,
-// fixing infinite loading on Ventura / WebKit < 17.4.
-const _pdfjsWorker = new Worker(
-  new URL('../workers/pdfjs-worker.ts', import.meta.url),
-  { type: 'module' },
-)
-pdfjsLib.GlobalWorkerOptions.workerPort = _pdfjsWorker
+pdfjsLib.GlobalWorkerOptions.workerSrc = PDFWorkerLegacyUrl
 
 // ── Store & i18n ──────────────────────────────────────────────────────────────
 const reader = useReaderStore()

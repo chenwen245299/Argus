@@ -25,11 +25,6 @@ export default defineConfig({
       'llamaindex',
     ],
   },
-  worker: {
-    // ES module format required for dynamic imports inside worker files
-    // (our pdfjs-worker.ts wrapper uses `await import(...)` to apply polyfills first).
-    format: 'es',
-  },
   build: {
     rollupOptions: {
       output: {

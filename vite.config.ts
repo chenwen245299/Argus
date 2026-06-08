@@ -25,12 +25,15 @@ export default defineConfig({
       'llamaindex',
     ],
   },
+  worker: {
+    // ES module format required for dynamic imports inside worker files
+    // (our pdfjs-worker.ts wrapper uses `await import(...)` to apply polyfills first).
+    format: 'es',
+  },
   build: {
     rollupOptions: {
       output: {
         manualChunks: {
-          // Keep PDF.js worker in its own chunk so Tauri can load it as a local URL.
-          'pdf-worker': ['pdfjs-dist/build/pdf.worker.min.mjs'],
           // llamaindex + its tokenizer are large — isolate them for lazy loading.
           'llamaindex-vendor': ['llamaindex'],
         },

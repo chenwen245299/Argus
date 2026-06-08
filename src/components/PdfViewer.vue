@@ -12,9 +12,15 @@ import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import type { Highlight, Rect } from '../types'
 
-// ── Worker (local bundle, offline-safe) ──────────────────────────────────────
-import PDFWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
-pdfjsLib.GlobalWorkerOptions.workerSrc = PDFWorkerUrl
+// ── Worker (polyfill-wrapped, offline-safe) ───────────────────────────────────
+// The worker runs in an isolated thread — the Promise.withResolvers polyfill in
+// main.ts doesn't reach it. This wrapper applies the polyfill before PDF.js runs,
+// fixing infinite loading on Ventura / WebKit < 17.4.
+const _pdfjsWorker = new Worker(
+  new URL('../workers/pdfjs-worker.ts', import.meta.url),
+  { type: 'module' },
+)
+pdfjsLib.GlobalWorkerOptions.workerPort = _pdfjsWorker
 
 // ── Store & i18n ──────────────────────────────────────────────────────────────
 const reader = useReaderStore()

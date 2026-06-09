@@ -1767,34 +1767,8 @@ pub async fn store_arxiv_papers(
 pub async fn get_arxiv_inbox(state: State<'_, LibraryRoot>) -> Result<ArxivInbox, String> {
     let root = get_root(&state)?;
 
-    // Auto-prune papers below relevance threshold every time the inbox is opened.
-    let cfg = arxiv::get_arxiv_config(&root);
-    if cfg.ai_filter_enabled {
-        let _ = arxiv::prune_low_relevance(&root);
-    }
-
     let mut inbox = arxiv::get_inbox(&root);
-    // Refresh in_library flags on every read
-    for p in inbox.papers.iter_mut() {
-        p.in_library = {
-            let papers_dir = std::path::Path::new(&root).join("papers");
-            let mut found = false;
-            if let Ok(entries) = std::fs::read_dir(&papers_dir) {
-                for entry in entries.flatten() {
-                    let meta_path = entry.path().join("meta.json");
-                    if let Ok(text) = std::fs::read_to_string(&meta_path) {
-                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if meta.get("arxiv_id").and_then(|v| v.as_str()) == Some(&p.arxiv_id) {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            found
-        };
-    }
+    arxiv::mark_in_library_statuses(&root, &mut inbox.papers);
     Ok(inbox)
 }
 

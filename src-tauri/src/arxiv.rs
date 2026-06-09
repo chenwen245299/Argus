@@ -246,7 +246,7 @@ pub fn get_inbox(root: &str) -> ArxivInbox {
     }
 }
 
-/// Collect arxiv_ids of all papers already in the library (checks meta.json arxiv_id field).
+/// Collect source ids of all papers already in the library.
 fn collect_library_arxiv_ids(root: &str) -> std::collections::HashSet<String> {
     let papers_dir = std::path::Path::new(root).join("papers");
     let mut ids = std::collections::HashSet::new();
@@ -255,9 +255,11 @@ fn collect_library_arxiv_ids(root: &str) -> std::collections::HashSet<String> {
             let meta_path = entry.path().join("meta.json");
             if let Ok(text) = std::fs::read_to_string(&meta_path) {
                 if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(id) = meta.get("arxiv_id").and_then(|v| v.as_str()) {
-                        if !id.is_empty() {
-                            ids.insert(id.to_string());
+                    for key in ["arxiv_id", "doi"] {
+                        if let Some(id) = meta.get(key).and_then(|v| v.as_str()) {
+                            if !id.is_empty() {
+                                ids.insert(id.to_string());
+                            }
                         }
                     }
                 }
@@ -405,7 +407,73 @@ fn normalize_lastname(name: &str) -> String {
         .collect()
 }
 
-fn check_in_library(root: &str, title: &str, authors: &[String]) -> bool {
+struct LibraryLookup {
+    ids: std::collections::HashSet<String>,
+    titles: std::collections::HashSet<String>,
+    title_authors: std::collections::HashSet<(String, String)>,
+    title_without_author: std::collections::HashSet<String>,
+}
+
+fn build_library_lookup(root: &str) -> LibraryLookup {
+    let mut lookup = LibraryLookup {
+        ids: std::collections::HashSet::new(),
+        titles: std::collections::HashSet::new(),
+        title_authors: std::collections::HashSet::new(),
+        title_without_author: std::collections::HashSet::new(),
+    };
+
+    let Ok(entries) = crate::paper::list_paper_dirs(root) else {
+        return lookup;
+    };
+
+    for (_, path) in entries {
+        let meta_path = path.join("meta.json");
+        if !meta_path.exists() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+
+        for key in ["arxiv_id", "doi"] {
+            if let Some(id) = meta.get(key).and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    lookup.ids.insert(id.to_string());
+                }
+            }
+        }
+
+        let title = normalize_title(meta.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+        if title.is_empty() {
+            continue;
+        }
+        lookup.titles.insert(title.clone());
+
+        let lastname = meta
+            .get("authors")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .map(normalize_lastname)
+            .unwrap_or_default();
+        if lastname.is_empty() {
+            lookup.title_without_author.insert(title);
+        } else {
+            lookup.title_authors.insert((title, lastname));
+        }
+    }
+
+    lookup
+}
+
+fn lookup_contains_paper(lookup: &LibraryLookup, arxiv_id: &str, title: &str, authors: &[String]) -> bool {
+    if lookup.ids.contains(arxiv_id) {
+        return true;
+    }
+
     let target_title = normalize_title(title);
     if target_title.is_empty() {
         return false;
@@ -415,56 +483,31 @@ fn check_in_library(root: &str, title: &str, authors: &[String]) -> bool {
         .map(|a| normalize_lastname(a))
         .unwrap_or_default();
 
-    let entries = match crate::paper::list_paper_dirs(root) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-    for (_, path) in entries {
-        let meta_path = path.join("meta.json");
-        if !meta_path.exists() {
-            continue;
-        }
-        let text = match std::fs::read_to_string(&meta_path) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let meta: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let lib_title = meta.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        if normalize_title(lib_title) != target_title {
-            continue;
-        }
-        // Title matches — check first author's last name if available on both sides
-        if !target_lastname.is_empty() {
-            let lib_lastname = meta
-                .get("authors")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str())
-                .map(normalize_lastname)
-                .unwrap_or_default();
-            if !lib_lastname.is_empty() && lib_lastname != target_lastname {
-                continue;
-            }
-        }
-        return true;
+    if target_lastname.is_empty() {
+        return lookup.titles.contains(&target_title);
     }
-    false
+
+    lookup
+        .title_authors
+        .contains(&(target_title.clone(), target_lastname))
+        || lookup.title_without_author.contains(&target_title)
 }
 
-fn mark_in_library_statuses(root: &str, papers: &mut Vec<ArxivPaper>) {
+fn check_in_library(root: &str, title: &str, authors: &[String]) -> bool {
+    let lookup = build_library_lookup(root);
+    lookup_contains_paper(&lookup, "", title, authors)
+}
+
+pub fn mark_in_library_statuses(root: &str, papers: &mut Vec<ArxivPaper>) {
+    let lookup = build_library_lookup(root);
     for p in papers.iter_mut() {
-        p.in_library = check_in_library(root, &p.title, &p.authors);
+        p.in_library = lookup_contains_paper(&lookup, &p.arxiv_id, &p.title, &p.authors);
     }
 }
 
 
-/// Merge new papers into today's day file (dedup against all existing day files).
+/// Merge new papers into per-day files (dedup against all existing day files).
 pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<ArxivInbox, String> {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-
     // Collect all existing papers grouped by their day file.
     let all_dates = list_day_dates(root);
     let mut day_buckets: std::collections::HashMap<String, Vec<ArxivPaper>> = all_dates
@@ -486,37 +529,46 @@ pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<Arxiv
 
     let mut changed_dates: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for new_p in new_papers {
-        if let Some(existing_date) = id_to_date.get(&new_p.arxiv_id) {
+    for mut new_p in new_papers {
+        let target_date = date_from_fetched_at(&new_p.fetched_at);
+        let paper_id = new_p.arxiv_id.clone();
+
+        if let Some(existing_date) = id_to_date.get(&paper_id).cloned() {
             // Duplicate: overwrite with latest fetch data, but keep analysis results
             // if they exist (read/rating are handled by the state file).
-            let bucket = day_buckets.entry(existing_date.clone()).or_default();
-            if let Some(old_p) = bucket.iter_mut().find(|p| p.arxiv_id == new_p.arxiv_id) {
-                // Preserve analysis results from prior run
-                let keep_score = old_p.relevance_score;
-                let keep_reason = old_p.relevance_reason.clone();
-                let keep_contributions = old_p.key_contributions.clone();
-                let keep_summary = old_p.analysis_summary.clone();
-                let keep_topics = old_p.matched_topics.clone();
-                let keep_status = old_p.analysis_status.clone();
-                *old_p = new_p;
-                old_p.relevance_score = keep_score;
-                old_p.relevance_reason = keep_reason;
-                old_p.key_contributions = keep_contributions;
-                old_p.analysis_summary = keep_summary;
-                old_p.matched_topics = keep_topics;
-                // Only keep done/failed status; reset analyzing/pending to pending
-                old_p.analysis_status = if keep_status == "done" || keep_status == "failed" {
-                    keep_status
-                } else {
-                    "pending".to_string()
-                };
+            let mut found_existing = false;
+            {
+                let bucket = day_buckets.entry(existing_date.clone()).or_default();
+                if let Some(pos) = bucket.iter().position(|p| p.arxiv_id == paper_id) {
+                    let old_p = bucket.remove(pos);
+                    found_existing = true;
+
+                    // Preserve analysis results from prior run
+                    new_p.relevance_score = old_p.relevance_score;
+                    new_p.relevance_reason = old_p.relevance_reason;
+                    new_p.key_contributions = old_p.key_contributions;
+                    new_p.analysis_summary = old_p.analysis_summary;
+                    new_p.matched_topics = old_p.matched_topics;
+                    // Only keep done/failed status; reset analyzing/pending to pending
+                    new_p.analysis_status = if old_p.analysis_status == "done" || old_p.analysis_status == "failed" {
+                        old_p.analysis_status
+                    } else {
+                        "pending".to_string()
+                    };
+                }
             }
-            changed_dates.insert(existing_date.clone());
+
+            if found_existing {
+                day_buckets.entry(target_date.clone()).or_default().push(new_p);
+                changed_dates.insert(existing_date);
+                changed_dates.insert(target_date);
+            }
         } else if !library_ids.contains(&new_p.arxiv_id) {
-            // Truly new paper not already in the library — add to today's bucket.
-            day_buckets.entry(today.clone()).or_default().push(new_p);
-            changed_dates.insert(today.clone());
+            // Truly new paper not already in the library — add to the paper's
+            // bucket. arXiv fetches use fetch time; bioRxiv backfills use the
+            // paper date so multi-day ranges stay grouped by actual day.
+            day_buckets.entry(target_date.clone()).or_default().push(new_p);
+            changed_dates.insert(target_date);
         }
         // If the paper is in library_ids, skip it silently (user already imported it).
     }

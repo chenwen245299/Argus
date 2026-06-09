@@ -38,6 +38,7 @@ function toInt(v: string | number | undefined): number {
 function mapToPaper(raw: BiorxivApiPaper, fetchedAt: string): ArxivPaper {
   const doi = raw.doi.trim()
   const version = parseInt(raw.version, 10) || 1
+  const paperDate = raw.date?.trim() || fetchedAt
   return {
     arxiv_id: doi,
     title: raw.title.replace(/\s+/g, ' ').trim(),
@@ -45,8 +46,8 @@ function mapToPaper(raw: BiorxivApiPaper, fetchedAt: string): ArxivPaper {
     authors: raw.authors.split(/\s*;\s*/).map(a => a.trim()).filter(Boolean),
     summary: raw.abstract.trim(),
     categories: [raw.category.trim()],
-    published: raw.date,
-    updated: raw.date,
+    published: paperDate,
+    updated: paperDate,
     pdf_url: `https://www.biorxiv.org/content/${doi}v${version}.full.pdf`,
     abs_url: `https://www.biorxiv.org/content/${doi}`,
     relevance_score: null,
@@ -56,7 +57,9 @@ function mapToPaper(raw: BiorxivApiPaper, fetchedAt: string): ArxivPaper {
     matched_topics: [],
     analysis_status: 'pending',
     in_library: false,
-    fetched_at: fetchedAt,
+    // For bioRxiv, use the paper date as the inbox bucket date so a
+    // multi-day backfill appears under each actual day instead of today.
+    fetched_at: paperDate,
     read: false,
     rating: 0,
     source: 'biorxiv',

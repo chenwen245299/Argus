@@ -29,6 +29,7 @@ const showSortMenu = ref(false)
 const sortBtnRef = ref<HTMLElement | null>(null)
 const sortPopoverStyle = ref({ top: '0px', left: '0px' })
 let windowResizeTimer: ReturnType<typeof setTimeout> | null = null
+let addMsgTimer: ReturnType<typeof setTimeout> | null = null
 
 const ARXIV_WIN_SIZE_KEY = 'argus:arxiv:window:size'
 
@@ -160,11 +161,15 @@ const cascadePanels = computed<CascadePanel[]>(() => {
 
 onMounted(async () => {
   await watchWindowSize()
-  await restoreWindowSize()
-  await aiStore.load()
+  const restoreSizePromise = restoreWindowSize().catch(() => {})
+  const aiLoadPromise = aiStore.load().catch(console.error)
+  const collectionsLoadPromise = collectionsStore.load().catch(console.error)
+
   await store.load()
   await store.subscribeEvents()
-  await collectionsStore.load()
+  await restoreSizePromise
+  void aiLoadPromise
+  void collectionsLoadPromise
   window.addEventListener('keydown', onKeydown)
   emitTo('main', 'arxiv-window-opened').catch(() => {})
 })
@@ -172,6 +177,7 @@ onMounted(async () => {
 onUnmounted(() => {
   ;(store as any).unsubscribeEvents()
   if (windowResizeTimer) clearTimeout(windowResizeTimer)
+  if (addMsgTimer) clearTimeout(addMsgTimer)
   window.removeEventListener('resize', saveWindowSizeToStorage)
   window.removeEventListener('keydown', onKeydown)
   emitTo('main', 'arxiv-window-closed').catch(() => {})
@@ -201,13 +207,17 @@ function selectPaper(id: string) {
 }
 
 // Keep the detail panel on a real paper after refreshes/imports remove rows.
-watch(() => store.sortedPapers.map(p => p.arxiv_id).join('|'), () => {
-  if (store.sortedPapers.length > 0 && (!selectedId.value || !store.papers.some(p => p.arxiv_id === selectedId.value))) {
-    selectedId.value = store.sortedPapers[0]?.arxiv_id ?? null
-  } else if (store.sortedPapers.length === 0) {
+watch(() => store.papers, () => {
+  const papers = store.sortedPapers
+  const selectedExists = selectedId.value
+    ? store.papers.some(p => p.arxiv_id === selectedId.value)
+    : false
+  if (papers.length > 0 && (!selectedId.value || !selectedExists)) {
+    selectedId.value = papers[0]?.arxiv_id ?? null
+  } else if (papers.length === 0) {
     selectedId.value = null
   }
-})
+}, { deep: false })
 
 function toggleSortMenu() {
   if (!showSortMenu.value && sortBtnRef.value) {
@@ -237,7 +247,7 @@ async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
   if (paper.in_library || addingId.value) return
   showColPicker.value = false
   addingId.value = paper.arxiv_id
-  addMsg.value = ''
+  setAddMessage('')
 
   // Remember which paper to select next before the store removes the current one.
   const list = filteredPapers.value
@@ -254,11 +264,10 @@ async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
     const colName = collectionId
       ? (collectionsStore.file.collections.find(c => c.id === collectionId)?.name ?? '')
       : ''
-    addMsg.value = colName ? `已添加到「${colName}」` : '已添加到文库'
-    setTimeout(() => addMsg.value = '', 3000)
+    setAddMessage(colName ? `已添加到「${colName}」` : '已添加到文库', 3000)
     emitTo('main', 'library-paper-added').catch(() => {})
   } catch (e) {
-    addMsg.value = String(e)
+    setAddMessage(String(e))
   } finally {
     addingId.value = null
   }
@@ -267,6 +276,25 @@ async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
 async function doFetch() {
   store.fetchMessage = ''
   await store.fetchManual()
+}
+
+function setAddMessage(message: string, timeoutMs = 0) {
+  if (addMsgTimer) {
+    clearTimeout(addMsgTimer)
+    addMsgTimer = null
+  }
+  addMsg.value = message
+  if (timeoutMs > 0 && message) {
+    addMsgTimer = setTimeout(() => {
+      if (addMsg.value === message) addMsg.value = ''
+      addMsgTimer = null
+    }, timeoutMs)
+  }
+}
+
+function dismissStatusBar() {
+  setAddMessage('')
+  if (!store.fetching) store.fetchMessage = ''
 }
 
 const TAG_PALETTES = [
@@ -280,11 +308,17 @@ const TAG_PALETTES = [
   { bg: '#e0e7ff', color: '#4338ca' }, // indigo
 ]
 
+const tagStyleCache = new Map<string, Record<string, string>>()
+
 function tagStyle(topic: string): Record<string, string> {
+  const cached = tagStyleCache.get(topic)
+  if (cached) return cached
   let h = 0
   for (let i = 0; i < topic.length; i++) h = (h * 31 + topic.charCodeAt(i)) >>> 0
   const p = TAG_PALETTES[h % TAG_PALETTES.length]
-  return { background: p.bg, color: p.color, borderColor: p.bg }
+  const style = { background: p.bg, color: p.color, borderColor: p.bg }
+  tagStyleCache.set(topic, style)
+  return style
 }
 
 function scoreColor(score: number | null): string {
@@ -317,6 +351,10 @@ function formatFullDate(dateStr: string): string {
   return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`
 }
 
+function paperDisplayDate(paper: ArxivPaper): string {
+  return (paper.published || paper.fetched_at).slice(0, 10)
+}
+
 const filteredPapers = computed(() => {
   if (!categoryFilter.value) return store.sortedPapers
   const f = categoryFilter.value.toLowerCase()
@@ -327,41 +365,10 @@ const filteredPapers = computed(() => {
   )
 })
 
-// Group by fetched_at date so the grouping maps 1:1 to storage day files.
-const groupedPapers = computed(() => {
-  const map = new Map<string, ArxivPaper[]>()
-  for (const p of filteredPapers.value) {
-    const date = (p.fetched_at ?? p.published).slice(0, 10)
-    if (!map.has(date)) map.set(date, [])
-    map.get(date)!.push(p)
-  }
-  return [...map.entries()]
-    .sort(([a], [b]) => b.localeCompare(a))
-    .map(([date, papers]) => ({ date, papers }))
-})
-
 // ── Batch delete ──────────────────────────────────────────────────────────────
 
 const deletingDate = ref<string | null>(null)    // date currently showing confirm prompt
 const deleteInProgress = ref<string | null>(null) // date currently being deleted
-
-async function deleteByDate(date: string) {
-  deleteInProgress.value = date
-  deletingDate.value = null
-  try {
-    await invoke('delete_arxiv_inbox_by_date', { date })
-    await store.loadInbox()
-    selectedPaperIds.clear()
-    activeSelectionDates.delete(date)
-    if (selectedId.value && !store.papers.find(p => p.arxiv_id === selectedId.value)) {
-      selectedId.value = null
-    }
-  } catch (e) {
-    console.error('delete_arxiv_inbox_by_date failed:', e)
-  } finally {
-    deleteInProgress.value = null
-  }
-}
 
 // ── Multi-select ──────────────────────────────────────────────────────────────
 // reactive(Set) gives fine-grained reactivity on .add() / .delete() / .has() / .size
@@ -371,6 +378,66 @@ const lastCheckedId = ref<string | null>(null)
 const hasSelection = computed(() => selectedPaperIds.size > 0)
 const deletingSelectedConfirm = ref(false)
 const deletingSelectedInProgress = ref(false)
+
+type GroupCheckState = 'none' | 'some' | 'all'
+
+interface ArxivPaperGroup {
+  date: string
+  papers: ArxivPaper[]
+  selectedCount: number
+  checkState: GroupCheckState
+  selectionActive: boolean
+}
+
+// Group by paper date, not fetch date. Refresh/backfill can write many papers
+// into the same storage bucket, but the UI should reflect when the papers are from.
+// Selection state is computed once per group; the template can then render
+// thousands of rows without repeatedly scanning each date bucket.
+const groupedPapers = computed<ArxivPaperGroup[]>(() => {
+  const map = new Map<string, ArxivPaper[]>()
+  for (const p of filteredPapers.value) {
+    const date = paperDisplayDate(p)
+    if (!map.has(date)) map.set(date, [])
+    map.get(date)!.push(p)
+  }
+  return [...map.entries()]
+    .sort(([a], [b]) => b.localeCompare(a))
+    .map(([date, papers]) => {
+      let selectedCount = 0
+      for (const paper of papers) {
+        if (selectedPaperIds.has(paper.arxiv_id)) selectedCount++
+      }
+      const checkState: GroupCheckState =
+        selectedCount === 0 ? 'none' : selectedCount === papers.length ? 'all' : 'some'
+
+      return {
+        date,
+        papers,
+        selectedCount,
+        checkState,
+        selectionActive: activeSelectionDates.has(date) || selectedCount > 0 || deletingDate.value === date,
+      }
+    })
+})
+
+async function deleteGroup(group: ArxivPaperGroup) {
+  deleteInProgress.value = group.date
+  deletingDate.value = null
+  const ids = group.papers.map(p => p.arxiv_id)
+  try {
+    await invoke('delete_arxiv_papers', { arxivIds: ids })
+    await store.loadInbox()
+    ids.forEach(id => selectedPaperIds.delete(id))
+    activeSelectionDates.delete(group.date)
+    if (selectedId.value && !store.papers.find(p => p.arxiv_id === selectedId.value)) {
+      selectedId.value = null
+    }
+  } catch (e) {
+    console.error('delete_arxiv_papers by paper date failed:', e)
+  } finally {
+    deleteInProgress.value = null
+  }
+}
 
 function toggleCheck(arxivId: string, e?: MouseEvent) {
   if (e?.shiftKey && lastCheckedId.value) {
@@ -390,22 +457,9 @@ function toggleCheck(arxivId: string, e?: MouseEvent) {
   lastCheckedId.value = arxivId
 }
 
-function groupCheckState(group: { date: string; papers: ArxivPaper[] }): 'none' | 'some' | 'all' {
-  const n = group.papers.filter(p => selectedPaperIds.has(p.arxiv_id)).length
-  return n === 0 ? 'none' : n === group.papers.length ? 'all' : 'some'
-}
-
-function groupSelectedCount(group: { date: string; papers: ArxivPaper[] }): number {
-  return group.papers.filter(p => selectedPaperIds.has(p.arxiv_id)).length
-}
-
-function groupSelectionActive(group: { date: string; papers: ArxivPaper[] }): boolean {
-  return activeSelectionDates.has(group.date) || groupSelectedCount(group) > 0 || deletingDate.value === group.date
-}
-
-function toggleDateSelection(group: { date: string; papers: ArxivPaper[] }) {
+function toggleDateSelection(group: ArxivPaperGroup) {
   deletingDate.value = null
-  if (activeSelectionDates.has(group.date) && groupSelectedCount(group) === 0) {
+  if (activeSelectionDates.has(group.date) && group.selectedCount === 0) {
     activeSelectionDates.delete(group.date)
   } else {
     activeSelectionDates.add(group.date)
@@ -413,9 +467,9 @@ function toggleDateSelection(group: { date: string; papers: ArxivPaper[] }) {
   }
 }
 
-function toggleGroupCheck(group: { date: string; papers: ArxivPaper[] }) {
+function toggleGroupCheck(group: ArxivPaperGroup) {
   activeSelectionDates.add(group.date)
-  const allChecked = groupCheckState(group) === 'all'
+  const allChecked = group.checkState === 'all'
   group.papers.forEach(p => allChecked ? selectedPaperIds.delete(p.arxiv_id) : selectedPaperIds.add(p.arxiv_id))
 }
 
@@ -432,9 +486,11 @@ function clearSelection() {
 }
 
 async function deleteSelected() {
-  if (!hasSelection.value) return
+  if (!hasSelection.value) {
+    deletingSelectedConfirm.value = false
+    return
+  }
   deletingSelectedInProgress.value = true
-  deletingSelectedConfirm.value = false
   const ids = [...selectedPaperIds]
   try {
     await invoke('delete_arxiv_papers', { arxivIds: ids })
@@ -442,6 +498,7 @@ async function deleteSelected() {
     ids.forEach(id => selectedPaperIds.delete(id))
     lastCheckedId.value = null
     if (selectedId.value && ids.includes(selectedId.value)) selectedId.value = null
+    deletingSelectedConfirm.value = false
   } catch (e) {
     console.error('delete_arxiv_papers failed:', e)
   } finally {
@@ -472,7 +529,7 @@ function toggleCalendar() {
 const fetchedDateSet = computed(() => {
   const s = new Set<string>()
   for (const p of store.papers) {
-    s.add(p.published.slice(0, 10))
+    s.add(paperDisplayDate(p))
   }
   return s
 })
@@ -481,7 +538,7 @@ const fetchedDateSet = computed(() => {
 const papersPerDate = computed(() => {
   const m = new Map<string, number>()
   for (const p of store.papers) {
-    const d = p.published.slice(0, 10)
+    const d = paperDisplayDate(p)
     m.set(d, (m.get(d) ?? 0) + 1)
   }
   return m
@@ -511,7 +568,7 @@ const calendarGrid = computed<(CalDay | null)[]>(() => {
       hasPapers: fetchedDateSet.value.has(dateStr),
       count: papersPerDate.value.get(dateStr) ?? 0,
       isToday: dateStr === todayStr,
-      isSelected: selectedPaper.value?.published.slice(0, 10) === dateStr,
+      isSelected: selectedPaper.value ? paperDisplayDate(selectedPaper.value) === dateStr : false,
     })
   }
   return cells
@@ -534,7 +591,7 @@ function calNextMonth() {
 
 function jumpToDate(dateStr: string) {
   // Select first paper of that date in the main list
-  const paper = store.papers.find(p => p.published.slice(0, 10) === dateStr)
+  const paper = store.papers.find(p => paperDisplayDate(p) === dateStr)
   if (paper) { selectedId.value = paper.arxiv_id; showCalendar.value = false }
 }
 </script>
@@ -599,12 +656,26 @@ function jumpToDate(dateStr: string) {
     <!-- Status bar (progress / errors) -->
     <Transition name="status-slide">
       <div v-if="store.fetching || store.fetchMessage || addMsg" class="status-bar">
-        <div v-if="store.fetching" class="status-row">
-          <span class="spinner" />
-          <span>{{ store.fetchMessage || '正在抓取论文...' }}</span>
+        <div class="status-content">
+          <div v-if="store.fetching" class="status-row">
+            <span class="spinner" />
+            <span>{{ store.fetchMessage || '正在抓取论文...' }}</span>
+          </div>
+          <span v-if="store.fetchMessage && !store.fetching" class="status-error">{{ store.fetchMessage }}</span>
+          <span v-if="addMsg" class="status-ok">{{ addMsg }}</span>
         </div>
-        <span v-if="store.fetchMessage && !store.fetching" class="status-error">{{ store.fetchMessage }}</span>
-        <span v-if="addMsg" class="status-ok">{{ addMsg }}</span>
+        <button
+          v-if="!store.fetching"
+          class="status-close-btn"
+          title="关闭提示"
+          aria-label="关闭提示"
+          @click="dismissStatusBar"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+            <path d="M18 6L6 18"/>
+            <path d="M6 6l12 12"/>
+          </svg>
+        </button>
       </div>
     </Transition>
 
@@ -786,7 +857,7 @@ function jumpToDate(dateStr: string) {
               class="date-header"
               :class="{
                 collapsed: collapsedDates.has(group.date),
-                'selection-active': groupSelectionActive(group),
+                'selection-active': group.selectionActive,
                 'delete-confirming': deletingDate === group.date
               }"
               @click="collapsedDates.has(group.date) ? collapsedDates.delete(group.date) : collapsedDates.add(group.date)"
@@ -800,8 +871,8 @@ function jumpToDate(dateStr: string) {
               <span class="date-header-actions" @click.stop>
                 <button
                   class="date-action-btn date-select-btn"
-                  :class="{ active: groupSelectionActive(group) }"
-                  :title="groupSelectionActive(group) ? '收起本日选择' : '选择本日论文'"
+                  :class="{ active: group.selectionActive }"
+                  :title="group.selectionActive ? '收起本日选择' : '选择本日论文'"
                   @click="toggleDateSelection(group)"
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
@@ -812,37 +883,29 @@ function jumpToDate(dateStr: string) {
               </span>
             </div>
             <Transition name="date-tools">
-              <div v-if="groupSelectionActive(group)" class="date-selection-toolbar" @click.stop>
+              <div v-if="group.selectionActive" class="date-selection-toolbar" @click.stop>
                 <button class="date-select-all-btn" @click="toggleGroupCheck(group)">
                   <span
                     class="group-checkbox"
                     :class="{
-                      checked: groupCheckState(group) === 'all',
-                      indeterminate: groupCheckState(group) === 'some'
+                      checked: group.checkState === 'all',
+                      indeterminate: group.checkState === 'some'
                     }"
                   >
-                    <svg v-if="groupCheckState(group) === 'all'" width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                    <svg v-if="group.checkState === 'all'" width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
                       <polyline points="2 6 5 9 10 3"/>
                     </svg>
-                    <span v-else-if="groupCheckState(group) === 'some'" class="indeterminate-bar"/>
+                    <span v-else-if="group.checkState === 'some'" class="indeterminate-bar"/>
                   </span>
                   <span>本日全选</span>
                 </button>
-                <span class="date-selected-count">已选 {{ groupSelectedCount(group) }}</span>
+                <span class="date-selected-count">已选 {{ group.selectedCount }}</span>
                 <span class="date-toolbar-spacer" />
-                <template v-if="deletingDate === group.date">
-                  <span class="delete-confirm-text">删除本日 {{ group.papers.length }} 篇？</span>
-                  <button class="date-del-cancel" @click="deletingDate = null">取消</button>
-                  <button class="date-del-confirm" @click="deleteByDate(group.date)">确认删除</button>
-                </template>
-                <template v-else-if="deleteInProgress === group.date">
-                  <span class="del-spinner" />
-                </template>
                 <button
-                  v-else
-                  class="date-delete-action"
-                  :title="`删除 ${formatDateLabel(group.date)} 全部抓取的论文`"
-                  @click="deletingDate = group.date"
+                  class="date-delete-selected-action"
+                  :disabled="!hasSelection || deletingSelectedInProgress"
+                  :title="hasSelection ? '删除已选论文' : '请先选择论文'"
+                  @click="deletingSelectedConfirm = true"
                 >
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <polyline points="3 6 5 6 21 6"/>
@@ -850,7 +913,7 @@ function jumpToDate(dateStr: string) {
                     <path d="M10 11v6M14 11v6"/>
                     <path d="M9 6V4h6v2"/>
                   </svg>
-                  删除本日
+                  删除所选
                 </button>
               </div>
             </Transition>
@@ -862,7 +925,7 @@ function jumpToDate(dateStr: string) {
                   class="paper-item"
                   :class="{
                     selected: selectedId === paper.arxiv_id,
-                    selectable: groupSelectionActive(group),
+                    selectable: group.selectionActive,
                     'multi-checked': selectedPaperIds.has(paper.arxiv_id),
                     unread: !paper.read
                   }"
@@ -891,7 +954,7 @@ function jumpToDate(dateStr: string) {
                     </div>
                   </div>
                   <button
-                    v-if="groupSelectionActive(group)"
+                    v-if="group.selectionActive"
                     class="item-checkbox"
                     :class="{ checked: selectedPaperIds.has(paper.arxiv_id) }"
                     title="选择论文"
@@ -906,32 +969,6 @@ function jumpToDate(dateStr: string) {
             </div>
           </template>
         </div>
-
-        <!-- Selection action bar (slides in when any papers are checked) -->
-        <Transition name="sel-bar">
-          <div v-if="hasSelection" class="selection-bar">
-            <span class="sel-count">已选 {{ selectedPaperIds.size }} 篇</span>
-            <button class="sel-btn" @click="selectAllVisible">全选可见</button>
-            <button class="sel-btn" @click="clearSelection">清除</button>
-            <template v-if="deletingSelectedConfirm">
-              <span class="sel-confirm-text">确认删除？</span>
-              <button class="sel-del-confirm" :disabled="deletingSelectedInProgress" @click="deleteSelected">
-                <span v-if="deletingSelectedInProgress" class="del-spinner" />
-                <template v-else>删除</template>
-              </button>
-              <button class="sel-btn" @click="deletingSelectedConfirm = false">取消</button>
-            </template>
-            <button v-else class="sel-del-btn" @click="deletingSelectedConfirm = true">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="3 6 5 6 21 6"/>
-                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-                <path d="M10 11v6M14 11v6"/>
-                <path d="M9 6V4h6v2"/>
-              </svg>
-              删除
-            </button>
-          </div>
-        </Transition>
       </div>
 
       <!-- Right: paper detail panel -->
@@ -1144,6 +1181,25 @@ function jumpToDate(dateStr: string) {
         </Transition>
       </div>
     </Teleport>
+
+    <!-- Delete selected confirm -->
+    <Teleport to="body">
+      <div v-if="deletingSelectedConfirm" class="modal-overlay" @click.self="!deletingSelectedInProgress && (deletingSelectedConfirm = false)">
+        <Transition name="modal-pop" appear>
+          <div v-if="deletingSelectedConfirm" class="confirm-modal-box">
+            <div class="confirm-modal-title">删除所选论文？</div>
+            <p class="confirm-modal-text">将从 arXiv 推荐列表中删除已选的 {{ selectedPaperIds.size }} 篇论文。</p>
+            <div class="confirm-modal-actions">
+              <button class="confirm-cancel-btn" :disabled="deletingSelectedInProgress" @click="deletingSelectedConfirm = false">取消</button>
+              <button class="confirm-danger-btn" :disabled="deletingSelectedInProgress" @click="deleteSelected">
+                <span v-if="deletingSelectedInProgress" class="del-spinner" />
+                <template v-else>确认删除</template>
+              </button>
+            </div>
+          </div>
+        </Transition>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -1271,6 +1327,14 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0; overflow: hidden;
 }
+.status-content {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
 .status-row { display: flex; align-items: center; gap: 6px; color: var(--text-secondary); }
 .progress-track {
   width: 80px; height: 3px;
@@ -1284,8 +1348,30 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   transition: background 0.1s;
 }
 .cancel-btn:hover { background: var(--bg-hover); }
+.status-error,
+.status-ok {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .status-error { color: #ef4444; }
 .status-ok { color: var(--accent); }
+.status-close-btn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  border-radius: var(--radius-md);
+  transition: background 0.12s, color 0.12s;
+}
+.status-close-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
 
 .status-slide-enter-active { transition: all 0.2s ease; }
 .status-slide-leave-active { transition: all 0.15s ease; }
@@ -1501,13 +1587,14 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   color: var(--accent);
 }
 .date-selection-toolbar {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
-  min-height: 34px;
-  margin: 0 8px 6px 28px;
-  padding: 6px 8px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 7px;
+  display: flex; align-items: center; gap: 8px;
+  min-height: 38px;
+  margin: 0 0 6px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-secondary);
+  overflow: hidden;
 }
 .date-select-all-btn {
   display: inline-flex; align-items: center; gap: 7px;
@@ -1515,13 +1602,20 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   border: 0; background: transparent; color: var(--text-secondary);
   font-size: 11.5px; font-weight: 600; cursor: pointer;
   border-radius: 5px;
+  white-space: nowrap;
 }
 .date-select-all-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .date-selected-count {
+  flex-shrink: 0;
   font-size: 11px; font-weight: 600; color: var(--text-tertiary);
+  white-space: nowrap;
 }
 .date-toolbar-spacer { flex: 1; min-width: 6px; }
 .delete-confirm-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 11px; font-weight: 500; color: #dc2626;
 }
 .date-del-confirm {
@@ -1537,15 +1631,26 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   white-space: nowrap;
 }
 .date-del-cancel:hover { background: var(--bg-hover); }
-.date-delete-action {
+.date-delete-selected-action {
   display: inline-flex; align-items: center; gap: 4px;
-  padding: 4px 8px; border-radius: 5px;
+  padding: 5px 10px; border-radius: 6px;
   background: #fff1f2; color: #dc2626;
   border: 1px solid #fecdd3; cursor: pointer;
   font-size: 11px; font-weight: 600;
   white-space: nowrap;
 }
-.date-delete-action:hover { background: #ffe4e6; }
+.date-delete-selected-action:hover:not(:disabled) { background: #ffe4e6; }
+.date-delete-selected-action {
+  border-color: color-mix(in srgb, #dc2626 42%, #fecdd3);
+  font-weight: 700;
+}
+.date-delete-selected-action:disabled {
+  cursor: not-allowed;
+  color: var(--text-tertiary);
+  background: var(--bg-tertiary);
+  border-color: var(--border-subtle);
+  opacity: 0.68;
+}
 .del-spinner {
   display: inline-block; width: 12px; height: 12px;
   border: 2px solid var(--border-subtle); border-top-color: #dc2626;
@@ -1663,43 +1768,6 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   display: block; width: 7px; height: 1.5px;
   background: var(--text-secondary); border-radius: 1px;
 }
-
-/* ── Selection action bar ─────────────────────────────────────────────── */
-.selection-bar {
-  flex-shrink: 0;
-  display: flex; align-items: center; gap: 6px;
-  padding: 7px 12px;
-  border-top: 1px solid var(--border-subtle);
-  background: var(--bg-secondary);
-  font-size: 12px;
-}
-.sel-count { font-weight: 600; color: var(--text-primary); margin-right: 4px; }
-.sel-btn {
-  padding: 3px 9px; border-radius: 5px; font-size: 11.5px;
-  background: var(--bg-tertiary); color: var(--text-secondary);
-  border: 1px solid var(--border-subtle); cursor: pointer;
-}
-.sel-btn:hover { background: var(--bg-hover); }
-.sel-del-btn {
-  display: flex; align-items: center; gap: 4px;
-  padding: 3px 9px; border-radius: 5px; font-size: 11.5px;
-  background: #fee2e2; color: #dc2626;
-  border: 1px solid #fecaca; cursor: pointer; margin-left: auto;
-}
-.sel-del-btn:hover { background: #fecaca; }
-.sel-confirm-text { font-size: 11.5px; font-weight: 500; color: #dc2626; margin-left: auto; }
-.sel-del-confirm {
-  display: flex; align-items: center; gap: 4px;
-  padding: 3px 10px; border-radius: 5px; font-size: 11.5px; font-weight: 600;
-  background: #dc2626; color: #fff; border: none; cursor: pointer;
-}
-.sel-del-confirm:hover { background: #b91c1c; }
-.sel-del-confirm:disabled { opacity: 0.6; cursor: default; }
-
-/* Slide-in animation */
-.sel-bar-enter-active { transition: max-height 0.2s ease, opacity 0.15s ease; max-height: 48px; }
-.sel-bar-leave-active { transition: max-height 0.18s ease, opacity 0.12s ease; }
-.sel-bar-enter-from, .sel-bar-leave-to { max-height: 0; opacity: 0; overflow: hidden; }
 
 /* ── Original item-score (outside check-zone, fallback) ─────────────── */
 .item-score {
@@ -1976,6 +2044,65 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   width: min(560px, 92vw);
   max-height: min(680px, 88vh);
   display: flex; flex-direction: column; overflow: hidden;
+}
+.confirm-modal-box {
+  width: min(360px, calc(100vw - 40px));
+  padding: 18px;
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-primary);
+  box-shadow: var(--shadow-lg);
+}
+.confirm-modal-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.confirm-modal-text {
+  margin: 8px 0 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.confirm-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.confirm-cancel-btn,
+.confirm-danger-btn {
+  height: 32px;
+  padding: 0 13px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.confirm-cancel-btn {
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+.confirm-cancel-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.confirm-danger-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 84px;
+  border: 1px solid #dc2626;
+  background: #dc2626;
+  color: #fff;
+}
+.confirm-danger-btn:hover:not(:disabled) {
+  background: #b91c1c;
+  border-color: #b91c1c;
+}
+.confirm-cancel-btn:disabled,
+.confirm-danger-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 .modal-pop-enter-active { animation: modal-in 0.18s cubic-bezier(0.34, 1.56, 0.64, 1); }
 .modal-pop-leave-active { animation: modal-in 0.14s ease reverse; }

@@ -123,6 +123,7 @@ interface LibraryConversation {
   id: string
   title: string
   messages: LibraryUiMessage[]
+  selectedPaperSlugs: string[]
   createdAt: string
   updatedAt: string
 }
@@ -157,14 +158,38 @@ interface StreamUsagePayload {
 const STORAGE_KEY = 'argus.library-chats.v1'
 const LAST_MODEL_KEY = 'argus.library-chat.last-model'
 const KNOWLEDGE_SOURCE_KEY = 'argus.library-chat.knowledge-source.v2'
-const SELECTED_PAPERS_KEY = 'argus.library-chat.selected-papers'
 
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7)
 }
 
+function normalizeSelectedPaperSlugs(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.filter((v): v is string => typeof v === 'string'))].slice(0, 50)
+}
+
 function loadFromStorage(): LibraryConversation[] {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]') } catch { return [] }
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((conv): conv is Partial<LibraryConversation> =>
+        !!conv &&
+        typeof conv === 'object' &&
+        typeof conv.id === 'string' &&
+        Array.isArray(conv.messages)
+      )
+      .map(conv => ({
+        id: conv.id!,
+        title: conv.title || t('libraryChat.untitled'),
+        messages: conv.messages!,
+        selectedPaperSlugs: normalizeSelectedPaperSlugs(conv.selectedPaperSlugs),
+        createdAt: conv.createdAt || new Date().toISOString(),
+        updatedAt: conv.updatedAt || conv.createdAt || new Date().toISOString(),
+      }))
+  } catch {
+    return []
+  }
 }
 
 function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
@@ -184,6 +209,7 @@ function saveToStorage(convs: LibraryConversation[]) {
   try {
     const serializable = convs.slice(0, 50).map(conv => ({
       ...conv,
+      selectedPaperSlugs: normalizeSelectedPaperSlugs(conv.selectedPaperSlugs),
       messages: conv.messages.map(stripTransientContext),
     }))
     localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable))
@@ -229,7 +255,10 @@ const knowledgeSource = ref<KnowledgeSource>(loadKnowledgeSource())
 const sourcePickerOpen = ref(false)
 const paperPickerOpen = ref(false)
 const paperPickerSearch = ref('')
-const selectedPaperSlugs = ref<string[]>(loadSelectedPaperSlugs())
+const selectedPaperSlugs = computed(() => {
+  const conv = conversations.value.find(c => c.id === activeConvId.value)
+  return conv?.selectedPaperSlugs ?? []
+})
 
 function setKnowledgeSource(src: KnowledgeSource) {
   knowledgeSource.value = src
@@ -245,17 +274,11 @@ const knowledgeSourceLabel = computed(() =>
       : '文献库'
 )
 
-function loadSelectedPaperSlugs(): string[] {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(SELECTED_PAPERS_KEY) ?? '[]')
-    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : []
-  } catch {
-    return []
-  }
-}
-
-function saveSelectedPaperSlugs() {
-  try { localStorage.setItem(SELECTED_PAPERS_KEY, JSON.stringify(selectedPaperSlugs.value.slice(0, 50))) } catch {}
+function setActiveSelectedPaperSlugs(slugs: string[]) {
+  const conv = conversations.value.find(c => c.id === activeConvId.value)
+  if (!conv) return
+  conv.selectedPaperSlugs = normalizeSelectedPaperSlugs(slugs)
+  saveToStorage(conversations.value)
 }
 
 const selectedPapers = computed(() => {
@@ -282,20 +305,16 @@ function openPaperPicker() {
 function addSelectedPaper(paper: PaperIndexEntry) {
   recordPaperAccess(paper.slug)
   if (!selectedPaperSlugs.value.includes(paper.slug)) {
-    selectedPaperSlugs.value = [...selectedPaperSlugs.value, paper.slug]
-    saveSelectedPaperSlugs()
+    setActiveSelectedPaperSlugs([...selectedPaperSlugs.value, paper.slug])
   }
 }
 
 function removeSelectedPaper(slug: string) {
-  selectedPaperSlugs.value = selectedPaperSlugs.value.filter(s => s !== slug)
-  saveSelectedPaperSlugs()
+  setActiveSelectedPaperSlugs(selectedPaperSlugs.value.filter(s => s !== slug))
 }
 
 function clearSelectedPapers() {
-  if (selectedPaperSlugs.value.length === 0) return
-  selectedPaperSlugs.value = []
-  saveSelectedPaperSlugs()
+  setActiveSelectedPaperSlugs([])
 }
 
 // ── Snippet store state ───────────────────────────────────────────────────────
@@ -576,6 +595,24 @@ function modelLabel(sel: ModelSelection | null | undefined) {
   return model?.displayName ?? sel?.modelId ?? '默认模型'
 }
 
+function answerModelOption(answer: LibraryAnswerVariant) {
+  return ai.findModel(answer.model ?? null)
+}
+
+function answerModelLogo(answer: LibraryAnswerVariant) {
+  return modelLogo(answerModelOption(answer))
+}
+
+function answerModelName(answer: LibraryAnswerVariant) {
+  const model = answerModelOption(answer)
+  if (!model) return answer.modelLabel ?? answer.model?.modelId ?? '默认模型'
+  return model.providerName ? `${model.providerName} · ${model.displayName}` : model.displayName
+}
+
+function modelFallbackInitial(answer: LibraryAnswerVariant) {
+  return (answer.modelLabel ?? answer.model?.modelId ?? 'AI').trim().charAt(0).toUpperCase() || 'AI'
+}
+
 function activeAnswer(msg: LibraryUiMessage): LibraryAnswerVariant {
   const variants = msg.variants ?? []
   const active = variants.find(v => v.id === msg.activeVariantId) ?? variants[variants.length - 1]
@@ -711,12 +748,25 @@ function useSuggestion(text: string) {
 
 // ── Conversation management ───────────────────────────────────────────────────
 
-function newConversation(options: { clearSelectedPapers?: boolean } = {}) {
-  if (options.clearSelectedPapers) clearSelectedPapers()
+function resetNewConversationContext() {
+  input.value = ''
+  paperPickerOpen.value = false
+  paperPickerSearch.value = ''
+  sourcePickerOpen.value = false
+  modelPickerMsgId.value = null
+  expandedSources.value = []
+  expandedContextId.value = null
+  editingMsgId.value = null
+  editingText.value = ''
+  nextTick(autoResize)
+}
+
+function newConversation() {
   const conv: LibraryConversation = {
     id: genId(),
     title: t('libraryChat.untitled'),
     messages: [],
+    selectedPaperSlugs: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }
@@ -726,7 +776,8 @@ function newConversation(options: { clearSelectedPapers?: boolean } = {}) {
 }
 
 function startNewConversation() {
-  newConversation({ clearSelectedPapers: true })
+  resetNewConversationContext()
+  newConversation()
 }
 
 function selectConversation(id: string) { activeConvId.value = id }
@@ -830,6 +881,9 @@ async function runAssistantRequest(
   })
 
   try {
+    const requestPaperSlugs = knowledgeSource.value === 'papers'
+      ? normalizeSelectedPaperSlugs(conv.selectedPaperSlugs)
+      : []
     const finalText = await invoke<string>('chat_with_library', {
       messages: history,
       providerId: sel?.providerId ?? null,
@@ -837,7 +891,7 @@ async function runAssistantRequest(
       eventName,
       sourcesEventName,
       knowledgeSource: knowledgeSource.value,
-      selectedPaperSlugs: knowledgeSource.value === 'papers' ? selectedPaperSlugs.value : [],
+      selectedPaperSlugs: requestPaperSlugs,
     })
     if (!target.content && finalText) target.content = finalText
     target.streaming = false
@@ -1003,13 +1057,14 @@ function onMsgContainerClick(e: MouseEvent) {
 }
 
 function closeModelMenu(e: MouseEvent) {
-  if (modelMenuRoot.value && !modelMenuRoot.value.contains(e.target as Node)) {
+  const target = e.target as HTMLElement
+  if (!target.closest('.lc-model-picker')) {
     modelMenuOpen.value = false
   }
-  if (!(e.target as HTMLElement).closest('.msg-model-picker')) {
+  if (!target.closest('.msg-model-picker') && !target.closest('.msg-model-menu-teleport')) {
     modelPickerMsgId.value = null
   }
-  if (!(e.target as HTMLElement).closest('.ks-picker')) {
+  if (!target.closest('.ks-picker')) {
     sourcePickerOpen.value = false
   }
 }
@@ -1143,7 +1198,14 @@ onUnmounted(() => {
             <div v-if="modelMenuOpen" class="lc-model-menu">
               <div v-for="group in ai.groupedModels" :key="group.id" class="lc-model-group">
                 <div class="lc-model-group-name">{{ group.name }}</div>
-                <button v-for="model in group.models" :key="selectionKey(model)" class="lc-model-row" :class="{ active: selectionKey(model) === selectionKey(effectiveModel()) }" @click="selectModel(model)">
+                <button
+                  v-for="model in group.models"
+                  :key="selectionKey(model)"
+                  class="lc-model-row"
+                  :class="{ active: selectionKey(model) === selectionKey(effectiveModel()) }"
+                  @mousedown.prevent.stop="selectModel(model)"
+                  @click.stop="selectModel(model)"
+                >
                   <span class="lc-model-row-icon"><img v-if="modelLogo(model)" :src="modelLogo(model)" alt="" /><span v-else>{{ model.displayName.charAt(0).toUpperCase() }}</span></span>
                   <span class="lc-model-row-text"><span class="lc-model-row-name">{{ model.displayName }}</span><span class="lc-model-row-meta">{{ modelCapabilityText(model) || model.modelId }}</span></span>
                 </button>
@@ -1344,7 +1406,8 @@ onUnmounted(() => {
                     :key="selectionKey(model)"
                     class="lc-model-row"
                     :class="{ active: selectionKey(model) === selectionKey(effectiveModel()) }"
-                    @click="selectModel(model)"
+                    @mousedown.prevent.stop="selectModel(model)"
+                    @click.stop="selectModel(model)"
                   >
                     <span class="lc-model-row-icon">
                       <img v-if="modelLogo(model)" :src="modelLogo(model)" alt="" />
@@ -1442,10 +1505,9 @@ onUnmounted(() => {
             <!-- Assistant -->
             <div v-else class="msg-row assistant">
               <div class="assistant-wrap">
-                <div class="assistant-avatar">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1v1a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-1H1a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"/>
-                  </svg>
+                <div class="assistant-avatar" :title="answerModelName(activeAnswer(msg))">
+                  <img v-if="answerModelLogo(activeAnswer(msg))" :src="answerModelLogo(activeAnswer(msg))" alt="" />
+                  <span v-else>{{ modelFallbackInitial(activeAnswer(msg)) }}</span>
                 </div>
                 <div class="assistant-content">
                   <div v-if="hasAnswerContext(activeAnswer(msg))" class="context-banner">
@@ -1524,7 +1586,14 @@ onUnmounted(() => {
                         </button>
                       </div>
                     </div>
-                    <div v-if="hasUsage(activeAnswer(msg))" class="assistant-usage">
+                    <div class="assistant-usage">
+                      <span class="assistant-model-meta" :title="answerModelName(activeAnswer(msg))">
+                        <span class="assistant-model-meta-icon">
+                          <img v-if="answerModelLogo(activeAnswer(msg))" :src="answerModelLogo(activeAnswer(msg))" alt="" />
+                          <span v-else>{{ modelFallbackInitial(activeAnswer(msg)) }}</span>
+                        </span>
+                        <span class="assistant-model-meta-name">{{ answerModelName(activeAnswer(msg)) }}</span>
+                      </span>
                       <span v-if="typeof activeAnswer(msg).inputTokens === 'number'">↑{{ formatTokenCount(activeAnswer(msg).inputTokens) }}</span>
                       <span v-if="typeof activeAnswer(msg).outputTokens === 'number'">↓{{ formatTokenCount(activeAnswer(msg).outputTokens) }}</span>
                       <span v-if="answerSpeed(activeAnswer(msg))" class="msg-speed">{{ answerSpeed(activeAnswer(msg)) }}</span>
@@ -2542,6 +2611,19 @@ onUnmounted(() => {
   flex-shrink: 0;
   margin-top: 2px;
   border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.assistant-avatar img {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
+}
+
+.assistant-avatar span {
+  line-height: 1;
 }
 
 .assistant-content {
@@ -2634,11 +2716,50 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 6px;
+  gap: 7px;
   min-width: 0;
   color: var(--text-tertiary);
   font-size: 10.5px;
   line-height: 1;
+  white-space: nowrap;
+}
+
+.assistant-model-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: min(320px, 42vw);
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.assistant-model-meta-icon {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  overflow: hidden;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.assistant-model-meta-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.assistant-model-meta-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

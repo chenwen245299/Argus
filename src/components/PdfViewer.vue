@@ -240,6 +240,37 @@ function addHighlightToSnippetLibrary(hlId: string) {
   })
 }
 
+async function writeTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  textarea.style.top = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  document.execCommand('copy')
+  document.body.removeChild(textarea)
+}
+
+async function copyHighlightText(hlId: string) {
+  const hl = reader.highlights.find(h => h.id === hlId)
+  const text = hl?.text?.trim()
+  hlColorPopup.value = null
+  if (!text) return
+
+  try {
+    await writeTextToClipboard(text)
+  } catch (e) {
+    console.error('Copy highlight text failed:', e)
+  }
+}
+
 // ── fulltext extraction (pdfjs text → OCR fallback) ──────────────────────────
 const ocrProgress = ref<{ page: number; total: number } | null>(null)
 
@@ -1395,6 +1426,7 @@ function triggerInitialRender() {
         />
       </div>
       <div class="hl-popup-divider" />
+      <button class="hl-action-btn" @click="copyHighlightText(hlColorPopup!.hlId)">{{ t('pdf.copy') }}</button>
       <button class="hl-action-btn" @click="addHighlightToSnippetLibrary(hlColorPopup!.hlId)">{{ t('pdf.snippet') }}</button>
       <button class="hl-action-btn" @click="translateHighlight(hlColorPopup!.hlId)">{{ t('pdf.translate') }}</button>
       <button class="hl-action-btn danger" @click="deleteHighlight(hlColorPopup!.hlId)">{{ t('pdf.delete') }}</button>

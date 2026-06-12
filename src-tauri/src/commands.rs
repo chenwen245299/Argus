@@ -1319,6 +1319,16 @@ pub async fn sync_vectorized_flags(
     rag::sync_vectorized_flags(&root).await
 }
 
+/// Delete every vector stored under one embedding model. Returns rows removed.
+#[tauri::command]
+pub async fn delete_model_embeddings(
+    model: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<usize, String> {
+    let root = get_root(&state)?;
+    rag::delete_model_embeddings(&root, &model).await
+}
+
 // ── M7: Vectorization ─────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1577,6 +1587,111 @@ pub async fn open_library_chat_window(app: tauri::AppHandle) -> Result<(), Strin
     copilot::open_library_chat_window(&app)
 }
 
+// ── Embedding map window ──────────────────────────────────────────────────────
+
+const EMBED_MAP_WINDOW_SIZE_KEY: &str = "embedding_map_window_size";
+const EMBED_MAP_DEFAULT_W: f64 = 1080.0;
+const EMBED_MAP_DEFAULT_H: f64 = 720.0;
+const EMBED_MAP_MIN_W: f64 = 680.0;
+const EMBED_MAP_MIN_H: f64 = 480.0;
+
+fn load_embedding_map_window_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
+    use tauri_plugin_store::StoreExt;
+    let store = app.store("settings.json").ok()?;
+    let v = store.get(EMBED_MAP_WINDOW_SIZE_KEY)?;
+    let w = v.get("w")?.as_f64()?;
+    let h = v.get("h")?.as_f64()?;
+    if w >= EMBED_MAP_MIN_W && h >= EMBED_MAP_MIN_H && w <= 4000.0 && h <= 3000.0 {
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
+fn save_embedding_map_window_size(app: &tauri::AppHandle, width: f64, height: f64) {
+    use tauri_plugin_store::StoreExt;
+    if width < EMBED_MAP_MIN_W || height < EMBED_MAP_MIN_H {
+        return;
+    }
+    if let Ok(store) = app.store("settings.json") {
+        store.set(
+            EMBED_MAP_WINDOW_SIZE_KEY,
+            serde_json::json!({ "w": width, "h": height }),
+        );
+        let _ = store.save();
+    }
+}
+
+#[tauri::command]
+pub async fn open_embedding_map_window(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+    if let Some(win) = app.get_webview_window("embedding-map") {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+
+    let (width, height) = load_embedding_map_window_size(&app)
+        .unwrap_or((EMBED_MAP_DEFAULT_W, EMBED_MAP_DEFAULT_H));
+
+    let builder = WebviewWindowBuilder::new(
+        &app,
+        "embedding-map",
+        WebviewUrl::App(std::path::PathBuf::from("/")),
+    )
+    .title("Argus — 向量图谱")
+    .inner_size(width, height)
+    .min_inner_size(EMBED_MAP_MIN_W, EMBED_MAP_MIN_H);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition { x: 14.0, y: 22.0 });
+
+    let win = builder
+        .build()
+        .map_err(|e| format!("Open embedding map window: {e}"))?;
+
+    let win_ref = win.clone();
+    let app_handle = app.clone();
+    win.on_window_event(move |event| {
+        let save = |w: &tauri::WebviewWindow| {
+            if let (Ok(phys), Ok(sf)) = (w.inner_size(), w.scale_factor()) {
+                if phys.width > 0 && phys.height > 0 {
+                    save_embedding_map_window_size(
+                        &app_handle,
+                        phys.width as f64 / sf,
+                        phys.height as f64 / sf,
+                    );
+                }
+            }
+        };
+        match event {
+            WindowEvent::Resized(_) | WindowEvent::CloseRequested { .. } => save(&win_ref),
+            _ => {}
+        }
+    });
+
+    let win_c = win.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = win_c.unmaximize();
+        let _ = win_c.set_size(tauri::LogicalSize::new(width, height));
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_embedding_map(
+    model: Option<String>,
+    state: State<'_, LibraryRoot>,
+) -> Result<crate::models::EmbeddingMapData, String> {
+    let root = get_root(&state)?;
+    rag::get_embedding_map(&root, model).await
+}
+
 #[tauri::command]
 pub async fn focus_main_window(app: tauri::AppHandle) -> Result<(), String> {
     let main = app
@@ -1656,15 +1771,17 @@ pub async fn get_snippet_store_info(
 #[tauri::command]
 pub async fn embed_all_snippets(
     state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
 ) -> Result<(usize, usize), String> {
     let root = get_root(&state)?;
     let snippets = rag::get_unembedded_snippets(&root)?;
-    rag::embed_and_store_snippets(&root, snippets).await
+    rag::embed_and_store_snippets(&root, snippets, &app).await
 }
 
 #[tauri::command]
 pub async fn embed_all_snippets_force(
     state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
 ) -> Result<(usize, usize), String> {
     let root = get_root(&state)?;
     // Collect all snippets regardless of embedding status
@@ -1673,7 +1790,7 @@ pub async fn embed_all_snippets_force(
     for lib in &libs {
         all.extend(snippets::get_snippets(&root, &lib.id).unwrap_or_default());
     }
-    rag::embed_and_store_snippets(&root, all).await
+    rag::embed_and_store_snippets(&root, all, &app).await
 }
 
 #[tauri::command]
@@ -2353,8 +2470,26 @@ pub fn delete_snippet(
 }
 
 // ── File export ───────────────────────────────────────────────────────────────
+/// Write bytes to a user-chosen export path.
+///
+/// This is a generic write primitive exposed to the webview, so it is restricted
+/// to known export file types as defence-in-depth: even if some content-injection
+/// bug let attacker-controlled script reach this command, it cannot be used to
+/// drop an executable, shell profile, or config file at an arbitrary path.
 #[tauri::command]
 pub fn write_bytes_to_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    const ALLOWED_EXT: &[&str] = &[
+        "pdf", "png", "jpg", "jpeg", "webp", "svg", "gif", "json", "csv", "md",
+        "txt", "bib", "bibtex", "html",
+    ];
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext {
+        Some(e) if ALLOWED_EXT.contains(&e.as_str()) => {}
+        _ => return Err("Refused: unsupported export file type".to_string()),
+    }
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())
 }
 

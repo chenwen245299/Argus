@@ -163,28 +163,66 @@ fn db_path(root: &str) -> std::path::PathBuf {
     Path::new(root).join(".argus").join(DB_FILE)
 }
 
-fn open_db(root: &str) -> Result<Connection, String> {
-    let path = db_path(root);
-    let conn = Connection::open(&path).map_err(|e| format!("Open vectors DB: {e}"))?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         CREATE TABLE IF NOT EXISTS chunks (
-             chunk_id     TEXT PRIMARY KEY,
-             paper_id     TEXT NOT NULL,
-             slug         TEXT NOT NULL,
-             chunk_index  INTEGER NOT NULL,
-             text         TEXT NOT NULL,
-             vector       BLOB NOT NULL,
-             source_type  TEXT NOT NULL DEFAULT 'text',
-             source_id    TEXT,
-             source_label TEXT,
-             paper_title  TEXT NOT NULL DEFAULT ''
+// Multi-model chunks schema. Vectors are partitioned by `embedding_model` so
+// switching embedding models keeps the previous model's vectors intact — the
+// primary key is (chunk_id, embedding_model), letting the same logical chunk
+// coexist under several models.
+const CHUNKS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS chunks (
+             chunk_id        TEXT NOT NULL,
+             embedding_model TEXT NOT NULL DEFAULT '',
+             paper_id        TEXT NOT NULL,
+             slug            TEXT NOT NULL,
+             chunk_index     INTEGER NOT NULL,
+             text            TEXT NOT NULL,
+             vector          BLOB NOT NULL,
+             source_type     TEXT NOT NULL DEFAULT 'text',
+             source_id       TEXT,
+             source_label    TEXT,
+             paper_title     TEXT NOT NULL DEFAULT '',
+             PRIMARY KEY (chunk_id, embedding_model)
          );
-         CREATE INDEX IF NOT EXISTS idx_chunks_paper ON chunks(paper_id);",
-    )
-    .map_err(|e| format!("Init vectors DB: {e}"))?;
+         CREATE INDEX IF NOT EXISTS idx_chunks_paper ON chunks(paper_id);
+         CREATE INDEX IF NOT EXISTS idx_chunks_model ON chunks(embedding_model);";
 
-    // Migrate older databases that predate the new columns (errors = already present, ignore)
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return false;
+    };
+    stmt.query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.filter_map(|r| r.ok()).any(|c| c == column))
+        .unwrap_or(false)
+}
+
+/// Bring the `chunks` table to the multi-model schema. A fresh DB gets the new
+/// schema directly; a legacy single-model table (no `embedding_model` column)
+/// is migrated in one atomic transaction, tagging every existing row with the
+/// model recorded in vectors_meta.json (the model that originally produced it).
+fn migrate_chunks_table(conn: &Connection, root: &str) -> Result<(), String> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if !exists {
+        return conn
+            .execute_batch(CHUNKS_SCHEMA)
+            .map_err(|e| format!("Init vectors DB: {e}"));
+    }
+
+    if table_has_column(conn, "chunks", "embedding_model") {
+        // Already multi-model — just make sure the indexes exist.
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_paper ON chunks(paper_id);
+             CREATE INDEX IF NOT EXISTS idx_chunks_model ON chunks(embedding_model);",
+        );
+        return Ok(());
+    }
+
+    // Legacy single-model table. Ensure it has the text columns this app added
+    // over time so the copy below succeeds, then fold it into the new schema.
     for (col, def) in &[
         ("source_type", "TEXT NOT NULL DEFAULT 'text'"),
         ("source_id", "TEXT"),
@@ -194,7 +232,71 @@ fn open_db(root: &str) -> Result<Connection, String> {
         let _ = conn.execute_batch(&format!("ALTER TABLE chunks ADD COLUMN {col} {def};"));
     }
 
+    let legacy_model = get_vectors_meta(root)
+        .map(|m| m.embedding_model)
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "legacy".to_string());
+    let m = legacy_model.replace('\'', "''");
+
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE chunks RENAME TO chunks_legacy;
+         {CHUNKS_SCHEMA}
+         INSERT INTO chunks
+             (chunk_id, embedding_model, paper_id, slug, chunk_index, text, vector,
+              source_type, source_id, source_label, paper_title)
+         SELECT chunk_id, '{m}', paper_id, slug, chunk_index, text, vector,
+                source_type, source_id, source_label, paper_title
+         FROM chunks_legacy;
+         DROP TABLE chunks_legacy;
+         COMMIT;"
+    ))
+    .map_err(|e| format!("Migrate chunks to multi-model store: {e}"))
+}
+
+fn open_db(root: &str) -> Result<Connection, String> {
+    let path = db_path(root);
+    let conn = Connection::open(&path).map_err(|e| format!("Open vectors DB: {e}"))?;
+    // Concurrent vectorization opens one connection per paper; WAL allows a
+    // single writer at a time, so writers must wait instead of failing with
+    // SQLITE_BUSY ("database is locked").
+    conn.busy_timeout(std::time::Duration::from_secs(30))
+        .map_err(|e| format!("Set busy timeout: {e}"))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")
+        .map_err(|e| format!("Init vectors DB: {e}"))?;
+    migrate_chunks_table(&conn, root)?;
     Ok(conn)
+}
+
+/// The embedding model currently selected in RAG settings, if configured.
+fn current_embedding_model(root: &str) -> Option<String> {
+    get_rag_settings(root)
+        .embedding_model
+        .filter(|m| !m.is_empty())
+}
+
+/// Per-model chunk statistics, ordered by chunk count (largest first).
+fn list_model_stats(conn: &Connection) -> Result<Vec<crate::models::EmbeddingModelStat>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT embedding_model, COUNT(*), COUNT(DISTINCT paper_id), MAX(length(vector)) \
+             FROM chunks GROUP BY embedding_model ORDER BY COUNT(*) DESC",
+        )
+        .map_err(|e| format!("Prepare model stats: {e}"))?;
+    let stats = stmt
+        .query_map([], |r| {
+            let byte_len: i64 = r.get(3).unwrap_or(0);
+            Ok(crate::models::EmbeddingModelStat {
+                embedding_model: r.get(0)?,
+                total_chunks: r.get::<_, i64>(1)? as usize,
+                unique_papers: r.get::<_, i64>(2)? as usize,
+                dimension: (byte_len / 4) as usize,
+            })
+        })
+        .map_err(|e| format!("Query model stats: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(stats)
 }
 
 fn vec_to_blob(v: &[f32]) -> Vec<u8> {
@@ -371,17 +473,6 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
 
     let (provider, api_key, emb_model) = resolve_embedding_provider(root, &settings)?;
 
-    // Dimension consistency guard
-    if let Some(vmeta) = get_vectors_meta(root) {
-        if vmeta.provider_id != provider.id || vmeta.embedding_model != emb_model {
-            return Err(format!(
-                "Vector store uses provider '{}' model '{}', but config uses '{}' model '{}'. \
-                 Rebuild the vector store to switch embedding models.",
-                vmeta.provider_id, vmeta.embedding_model, provider.id, emb_model
-            ));
-        }
-    }
-
     let texts: Vec<String> = pending.iter().map(|c| c.text.clone()).collect();
     let total = texts.len();
     let _ = app.emit(
@@ -401,6 +492,7 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
     let slug_str = slug.to_string();
     let paper_title_c = paper_title.clone();
     let paper_id_c = paper_id.clone();
+    let emb_model_c = emb_model.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let mut conn = open_db(&root_str)?;
@@ -408,9 +500,11 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
             .transaction()
             .map_err(|e| format!("Begin transaction: {e}"))?;
 
+        // Only clear this paper's vectors for the model being (re)built —
+        // other models' embeddings of the same paper stay untouched.
         tx.execute(
-            "DELETE FROM chunks WHERE paper_id = ?1",
-            params![paper_id_c],
+            "DELETE FROM chunks WHERE paper_id = ?1 AND embedding_model = ?2",
+            params![paper_id_c, emb_model_c],
         )
         .map_err(|e| format!("Delete old chunks: {e}"))?;
 
@@ -418,9 +512,9 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
             let mut stmt = tx
                 .prepare(
                     "INSERT OR REPLACE INTO chunks \
-                     (chunk_id, paper_id, slug, chunk_index, text, vector, \
+                     (chunk_id, embedding_model, paper_id, slug, chunk_index, text, vector, \
                       source_type, source_id, source_label, paper_title) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )
                 .map_err(|e| format!("Prepare insert: {e}"))?;
 
@@ -443,6 +537,7 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
                 let blob = vec_to_blob(emb);
                 stmt.execute(params![
                     chunk_id,
+                    emb_model_c,
                     paper_id_c,
                     slug_str,
                     i as i64,
@@ -569,16 +664,6 @@ pub async fn embed_and_store_chunks(
 
     let (provider, api_key, emb_model) = resolve_embedding_provider(root, &settings)?;
 
-    if let Some(vmeta) = get_vectors_meta(root) {
-        if vmeta.provider_id != provider.id || vmeta.embedding_model != emb_model {
-            return Err(format!(
-                "Vector store uses provider '{}' model '{}', but config uses '{}' model '{}'. \
-                 Rebuild the vector store to switch embedding models.",
-                vmeta.provider_id, vmeta.embedding_model, provider.id, emb_model
-            ));
-        }
-    }
-
     let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
     let total = texts.len();
 
@@ -600,6 +685,7 @@ pub async fn embed_and_store_chunks(
     let slug_str = slug.to_string();
     let paper_id_str = paper_id.to_string();
     let paper_title_str = paper_title.to_string();
+    let emb_model_c = emb_model.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let mut conn = open_db(&root_str)?;
@@ -607,9 +693,11 @@ pub async fn embed_and_store_chunks(
             .transaction()
             .map_err(|e| format!("Begin transaction: {e}"))?;
 
+        // Only clear this paper's vectors for the model being (re)built —
+        // other models' embeddings of the same paper stay untouched.
         tx.execute(
-            "DELETE FROM chunks WHERE paper_id = ?1",
-            params![paper_id_str],
+            "DELETE FROM chunks WHERE paper_id = ?1 AND embedding_model = ?2",
+            params![paper_id_str, emb_model_c],
         )
         .map_err(|e| format!("Delete old chunks: {e}"))?;
 
@@ -617,9 +705,9 @@ pub async fn embed_and_store_chunks(
             let mut stmt = tx
                 .prepare(
                     "INSERT OR REPLACE INTO chunks \
-                     (chunk_id, paper_id, slug, chunk_index, text, vector, \
+                     (chunk_id, embedding_model, paper_id, slug, chunk_index, text, vector, \
                       source_type, source_id, source_label, paper_title) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )
                 .map_err(|e| format!("Prepare insert: {e}"))?;
 
@@ -642,6 +730,7 @@ pub async fn embed_and_store_chunks(
                 let blob = vec_to_blob(emb);
                 stmt.execute(params![
                     chunk_id,
+                    emb_model_c,
                     paper_id_str,
                     slug_str,
                     i as i64,
@@ -683,27 +772,32 @@ pub async fn embed_and_store_chunks(
 /// Papers marked as vectorized but missing from the DB are reset to false,
 /// and vice versa. Returns (fixed_count, total_count).
 pub async fn sync_vectorized_flags(root: &str) -> Result<(usize, usize), String> {
-    let embedded_ids: std::collections::HashSet<String> = if db_path(root).exists() {
-        let root_str = root.to_string();
-        tokio::task::spawn_blocking(
-            move || -> Result<std::collections::HashSet<String>, String> {
-                let conn = open_db(&root_str)?;
-                let mut stmt = conn
-                    .prepare("SELECT DISTINCT paper_id FROM chunks")
-                    .map_err(|e| e.to_string())?;
-                let ids = stmt
-                    .query_map([], |r| r.get::<_, String>(0))
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                Ok(ids)
-            },
-        )
-        .await
-        .map_err(|e| format!("Spawn blocking: {e}"))??
-    } else {
-        std::collections::HashSet::new()
-    };
+    // The `vectorized` flag tracks whether a paper is embedded under the
+    // *currently selected* model — so switching models flips it accordingly.
+    let current_model = current_embedding_model(root);
+    let embedded_ids: std::collections::HashSet<String> =
+        if db_path(root).exists() && current_model.is_some() {
+            let root_str = root.to_string();
+            let model = current_model.unwrap();
+            tokio::task::spawn_blocking(
+                move || -> Result<std::collections::HashSet<String>, String> {
+                    let conn = open_db(&root_str)?;
+                    let mut stmt = conn
+                        .prepare("SELECT DISTINCT paper_id FROM chunks WHERE embedding_model = ?1")
+                        .map_err(|e| e.to_string())?;
+                    let ids = stmt
+                        .query_map(params![model], |r| r.get::<_, String>(0))
+                        .map_err(|e| e.to_string())?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(ids)
+                },
+            )
+            .await
+            .map_err(|e| format!("Spawn blocking: {e}"))??
+        } else {
+            std::collections::HashSet::new()
+        };
 
     let entries = crate::library::scan_library(root).unwrap_or_default();
     let total = entries.len();
@@ -731,12 +825,43 @@ pub async fn delete_paper_chunks(root: &str, paper_id: &str) -> Result<(), Strin
             return Ok(());
         }
         let conn = open_db(&root)?;
+        // No model filter: deleting a paper drops its vectors under *every*
+        // embedding model.
         conn.execute("DELETE FROM chunks WHERE paper_id = ?1", params![paper_id])
             .map_err(|e| format!("Delete chunks: {e}"))?;
         Ok(())
     })
     .await
     .map_err(|e| format!("Spawn blocking: {e}"))?
+}
+
+/// Drop every chunk stored under one embedding model, freeing its partition
+/// without touching the other models' vectors. Returns the rows removed.
+pub async fn delete_model_embeddings(root: &str, model: &str) -> Result<usize, String> {
+    let root_c = root.to_string();
+    let model_c = model.to_string();
+    let removed = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        if !db_path(&root_c).exists() {
+            return Ok(0);
+        }
+        let conn = open_db(&root_c)?;
+        let n = conn
+            .execute(
+                "DELETE FROM chunks WHERE embedding_model = ?1",
+                params![model_c],
+            )
+            .map_err(|e| format!("Delete model embeddings: {e}"))?;
+        Ok(n)
+    })
+    .await
+    .map_err(|e| format!("Spawn blocking: {e}"))??;
+
+    // If we cleared the model that's currently selected, the per-paper
+    // `vectorized` flags now overstate reality — reconcile them.
+    if current_embedding_model(root).as_deref() == Some(model) {
+        let _ = sync_vectorized_flags(root).await;
+    }
+    Ok(removed)
 }
 
 // ── Batch vectorize (rebuild) ─────────────────────────────────────────────────
@@ -748,13 +873,11 @@ pub async fn rebuild_vector_store(root: &str, app: &tauri::AppHandle) -> Result<
     let slugs: Vec<String> = entries.iter().map(|e| e.slug.clone()).collect();
     let total = slugs.len();
 
-    // Drop existing store for clean rebuild
-    let path = db_path(root);
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
+    // Clean rebuild for the *current* model only — clear just its partition so
+    // other models' vectors survive. (Dropping the whole DB would wipe them.)
+    if let Some(model) = current_embedding_model(root) {
+        let _ = delete_model_embeddings(root, &model).await;
     }
-    let meta_path = Path::new(root).join(".argus").join(VECTORS_META_FILE);
-    let _ = std::fs::remove_file(&meta_path);
 
     for slug in &slugs {
         let _ = update_vectorized(root, slug, false);
@@ -765,20 +888,40 @@ pub async fn rebuild_vector_store(root: &str, app: &tauri::AppHandle) -> Result<
         serde_json::json!({"total": total, "done": 0, "failed": 0, "status": "running"}),
     );
 
+    // Embedding API latency dominates each paper, so run a few papers
+    // concurrently. SQLite writes serialize on the WAL writer lock (with the
+    // busy_timeout set in open_db), so concurrent finishes are safe.
+    const VECTORIZE_CONCURRENCY: usize = 3;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(VECTORIZE_CONCURRENCY));
+    let mut join_set: tokio::task::JoinSet<(String, Result<(), String>)> =
+        tokio::task::JoinSet::new();
+
+    for slug in slugs {
+        let sem = semaphore.clone();
+        let root_c = root.to_string();
+        let app_c = app.clone();
+        join_set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            if batch_cancel().load(Ordering::SeqCst) {
+                return (slug, Err("cancelled".to_string()));
+            }
+            let result = vectorize_paper(&root_c, &slug, &app_c).await;
+            (slug, result)
+        });
+    }
+
     let mut done = 0usize;
     let mut failed = 0usize;
+    let mut cancelled = false;
 
-    for slug in &slugs {
-        if batch_cancel().load(Ordering::SeqCst) {
-            let _ = app.emit(
-                "vectorize-batch",
-                serde_json::json!({"total": total, "done": done, "failed": failed, "status": "cancelled"}),
-            );
-            return Ok(done);
-        }
-
-        match vectorize_paper(root, slug, app).await {
+    while let Some(task_result) = join_set.join_next().await {
+        let Ok((slug, result)) = task_result else { continue };
+        match result {
             Ok(()) => done += 1,
+            Err(e) if e == "cancelled" => {
+                cancelled = true;
+                continue;
+            }
             Err(e) => {
                 eprintln!("vectorize {} failed: {}", slug, e);
                 failed += 1;
@@ -791,9 +934,10 @@ pub async fn rebuild_vector_store(root: &str, app: &tauri::AppHandle) -> Result<
         );
     }
 
+    let status = if cancelled { "cancelled" } else { "done" };
     let _ = app.emit(
         "vectorize-batch",
-        serde_json::json!({"total": total, "done": done, "failed": failed, "status": "done"}),
+        serde_json::json!({"total": total, "done": done, "failed": failed, "status": status}),
     );
     Ok(done)
 }
@@ -801,34 +945,346 @@ pub async fn rebuild_vector_store(root: &str, app: &tauri::AppHandle) -> Result<
 // ── Vector store info ─────────────────────────────────────────────────────────
 
 pub async fn get_vector_store_info(root: &str) -> Result<VectorStoreInfo, String> {
-    let meta = get_vectors_meta(root);
+    let settings = get_rag_settings(root);
+    let current_model = current_embedding_model(root);
     let root = root.to_string();
     tokio::task::spawn_blocking(move || -> Result<VectorStoreInfo, String> {
-        let empty = VectorStoreInfo {
-            total_chunks: 0,
-            unique_papers: 0,
-            dimension: meta.as_ref().map(|m| m.dimension),
-            provider_id: meta.as_ref().map(|m| m.provider_id.clone()),
-            embedding_model: meta.as_ref().map(|m| m.embedding_model.clone()),
+        // Top-level fields describe the *currently selected* model's partition;
+        // `models` lists every model that has vectors stored.
+        let base = |models: Vec<crate::models::EmbeddingModelStat>| {
+            let cur = current_model
+                .as_ref()
+                .and_then(|m| models.iter().find(|s| &s.embedding_model == m));
+            VectorStoreInfo {
+                total_chunks: cur.map(|s| s.total_chunks).unwrap_or(0),
+                unique_papers: cur.map(|s| s.unique_papers).unwrap_or(0),
+                dimension: cur.map(|s| s.dimension),
+                provider_id: settings.provider_id.clone(),
+                embedding_model: current_model.clone(),
+                models,
+            }
         };
         if !db_path(&root).exists() {
-            return Ok(empty);
+            return Ok(base(Vec::new()));
         }
         let conn = open_db(&root)?;
-        let total: usize = conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-            .unwrap_or(0);
-        let unique: usize = conn
-            .query_row("SELECT COUNT(DISTINCT paper_id) FROM chunks", [], |r| {
-                r.get(0)
+        let models = list_model_stats(&conn)?;
+        Ok(base(models))
+    })
+    .await
+    .map_err(|e| format!("Spawn blocking: {e}"))?
+}
+
+// ── Embedding map (vector space visualization) ───────────────────────────────
+
+fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+/// Remove from `w` its projection onto unit vector `p`.
+fn orthogonalize(w: &mut [f32], p: &[f32]) {
+    let dot: f32 = w.iter().zip(p.iter()).map(|(a, b)| a * b).sum();
+    for (wi, pi) in w.iter_mut().zip(p.iter()) {
+        *wi -= dot * pi;
+    }
+}
+
+/// Deterministic pseudo-random unit vector so the layout is stable across runs.
+fn pseudo_rand_unit(d: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut v: Vec<f32> = (0..d)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s as f64 / u64::MAX as f64) as f32 - 0.5
+        })
+        .collect();
+    l2_normalize(&mut v);
+    v
+}
+
+/// Top principal component of `data` (rows already centered) via power
+/// iteration, deflated against `prev` if given.
+fn power_iteration_pc(data: &[Vec<f32>], prev: Option<&[f32]>, seed: u64) -> Vec<f32> {
+    let d = data.first().map(|v| v.len()).unwrap_or(0);
+    let mut w = pseudo_rand_unit(d, seed);
+    if let Some(p) = prev {
+        orthogonalize(&mut w, p);
+        l2_normalize(&mut w);
+    }
+    for _ in 0..25 {
+        let mut nw = vec![0f32; d];
+        for x in data {
+            let dot: f32 = x.iter().zip(w.iter()).map(|(a, b)| a * b).sum();
+            for (ni, xi) in nw.iter_mut().zip(x.iter()) {
+                *ni += xi * dot;
+            }
+        }
+        if let Some(p) = prev {
+            orthogonalize(&mut nw, p);
+        }
+        l2_normalize(&mut nw);
+        let converged: f32 = nw.iter().zip(w.iter()).map(|(a, b)| a * b).sum();
+        w = nw;
+        if (1.0 - converged.abs()) < 1e-6 {
+            break;
+        }
+    }
+    w
+}
+
+pub async fn get_embedding_map(
+    root: &str,
+    requested_model: Option<String>,
+) -> Result<crate::models::EmbeddingMapData, String> {
+    use crate::models::{EmbeddingMapChunk, EmbeddingMapData, EmbeddingMapEdge, EmbeddingMapPaper};
+
+    let current_model = current_embedding_model(root);
+    // Reading status per paper id, used to tint nodes in the map.
+    let reading_status: std::collections::HashMap<String, String> =
+        crate::library::scan_library(root)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.id, e.reading_status))
+            .collect();
+    let root = root.to_string();
+    tokio::task::spawn_blocking(move || -> Result<EmbeddingMapData, String> {
+        let empty = |available: Vec<crate::models::EmbeddingModelStat>| EmbeddingMapData {
+            papers: Vec::new(),
+            chunks: Vec::new(),
+            edges: Vec::new(),
+            dimension: 0,
+            embedding_model: None,
+            available_models: available,
+        };
+        if !db_path(&root).exists() {
+            return Ok(empty(Vec::new()));
+        }
+        let conn = open_db(&root)?;
+        let available = list_model_stats(&conn)?;
+        if available.is_empty() {
+            return Ok(empty(Vec::new()));
+        }
+
+        // Pick the model to render: an explicit request wins, then the model
+        // currently selected in settings, then whichever has the most chunks.
+        let has = |m: &str| available.iter().any(|s| s.embedding_model == m);
+        let target = requested_model
+            .filter(|m| has(m))
+            .or_else(|| current_model.clone().filter(|m| has(m)))
+            .or_else(|| available.first().map(|s| s.embedding_model.clone()));
+        let Some(target) = target else {
+            return Ok(empty(available));
+        };
+
+        struct Row {
+            paper_id: String,
+            slug: String,
+            vector: Vec<f32>,
+            source_type: String,
+            source_label: Option<String>,
+            paper_title: String,
+            preview: String,
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT paper_id, slug, text, vector, source_type, source_label, paper_title \
+                 FROM chunks WHERE embedding_model = ?1 ORDER BY paper_id, chunk_index",
+            )
+            .map_err(|e| format!("Prepare map query: {e}"))?;
+        let mut rows: Vec<Row> = stmt
+            .query_map(params![target], |r| {
+                let text: String = r.get(2)?;
+                let blob: Vec<u8> = r.get(3)?;
+                let mut preview: String = text.chars().take(90).collect();
+                preview = preview.replace(['\n', '\r'], " ");
+                if text.chars().count() > 90 {
+                    preview.push('…');
+                }
+                Ok(Row {
+                    paper_id: r.get(0)?,
+                    slug: r.get(1)?,
+                    vector: blob_to_vec(&blob),
+                    source_type: r.get(4)?,
+                    source_label: r.get(5)?,
+                    paper_title: r.get(6)?,
+                    preview,
+                })
             })
-            .unwrap_or(0);
-        Ok(VectorStoreInfo {
-            total_chunks: total,
-            unique_papers: unique,
-            dimension: meta.as_ref().map(|m| m.dimension),
-            provider_id: meta.as_ref().map(|m| m.provider_id.clone()),
-            embedding_model: meta.as_ref().map(|m| m.embedding_model.clone()),
+            .map_err(|e| format!("Query chunks: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Keep only vectors matching the dominant dimension (guards against
+        // leftovers from a previous embedding model).
+        let dim = rows.first().map(|r| r.vector.len()).unwrap_or(0);
+        rows.retain(|r| r.vector.len() == dim && dim > 0);
+        if rows.is_empty() {
+            return Ok(empty(available));
+        }
+
+        // Normalize chunk vectors so cosine geometry is consistent.
+        for r in rows.iter_mut() {
+            l2_normalize(&mut r.vector);
+        }
+
+        // Group rows into papers (rows are sorted by paper_id).
+        let mut papers: Vec<EmbeddingMapPaper> = Vec::new();
+        let mut centroids: Vec<Vec<f32>> = Vec::new();
+        let mut paper_of_row: Vec<usize> = Vec::with_capacity(rows.len());
+        for r in rows.iter() {
+            let is_new = papers
+                .last()
+                .map(|p: &EmbeddingMapPaper| p.paper_id != r.paper_id)
+                .unwrap_or(true);
+            if is_new {
+                papers.push(EmbeddingMapPaper {
+                    paper_id: r.paper_id.clone(),
+                    slug: r.slug.clone(),
+                    title: if r.paper_title.is_empty() {
+                        r.slug.clone()
+                    } else {
+                        r.paper_title.clone()
+                    },
+                    chunk_count: 0,
+                    x: 0.0,
+                    y: 0.0,
+                    reading_status: reading_status
+                        .get(&r.paper_id)
+                        .cloned()
+                        .unwrap_or_else(|| "unread".to_string()),
+                });
+                centroids.push(vec![0f32; dim]);
+            }
+            let idx = papers.len() - 1;
+            // Prefer a non-empty title from any chunk of the paper
+            if papers[idx].title == papers[idx].slug && !r.paper_title.is_empty() {
+                papers[idx].title = r.paper_title.clone();
+            }
+            papers[idx].chunk_count += 1;
+            for (c, v) in centroids[idx].iter_mut().zip(r.vector.iter()) {
+                *c += v;
+            }
+            paper_of_row.push(idx);
+        }
+        for c in centroids.iter_mut() {
+            l2_normalize(c);
+        }
+
+        // PCA basis from centered chunk vectors.
+        let mut mean = vec![0f32; dim];
+        for r in rows.iter() {
+            for (m, v) in mean.iter_mut().zip(r.vector.iter()) {
+                *m += v;
+            }
+        }
+        let n = rows.len() as f32;
+        for m in mean.iter_mut() {
+            *m /= n;
+        }
+        let centered: Vec<Vec<f32>> = rows
+            .iter()
+            .map(|r| r.vector.iter().zip(mean.iter()).map(|(v, m)| v - m).collect())
+            .collect();
+        let pc1 = power_iteration_pc(&centered, None, 1);
+        let pc2 = power_iteration_pc(&centered, Some(&pc1), 2);
+
+        let project = |v: &[f32]| -> (f32, f32) {
+            let cx: f32 = v
+                .iter()
+                .zip(mean.iter())
+                .zip(pc1.iter())
+                .map(|((vi, mi), wi)| (vi - mi) * wi)
+                .sum();
+            let cy: f32 = v
+                .iter()
+                .zip(mean.iter())
+                .zip(pc2.iter())
+                .map(|((vi, mi), wi)| (vi - mi) * wi)
+                .sum();
+            (cx, cy)
+        };
+
+        let chunk_xy: Vec<(f32, f32)> = centered
+            .iter()
+            .map(|c| {
+                let x: f32 = c.iter().zip(pc1.iter()).map(|(a, b)| a * b).sum();
+                let y: f32 = c.iter().zip(pc2.iter()).map(|(a, b)| a * b).sum();
+                (x, y)
+            })
+            .collect();
+        for (p, c) in papers.iter_mut().zip(centroids.iter()) {
+            let (x, y) = project(c);
+            p.x = x;
+            p.y = y;
+        }
+
+        // Z-score both axes (based on chunk spread) so the map is roughly
+        // isotropic regardless of how dominant PC1 is.
+        let axis_std = |get: &dyn Fn(&(f32, f32)) -> f32| -> f32 {
+            let mu: f32 = chunk_xy.iter().map(|p| get(p)).sum::<f32>() / n;
+            let var: f32 = chunk_xy.iter().map(|p| (get(p) - mu).powi(2)).sum::<f32>() / n;
+            var.sqrt().max(1e-6)
+        };
+        let sx = axis_std(&|p: &(f32, f32)| p.0);
+        let sy = axis_std(&|p: &(f32, f32)| p.1);
+        for p in papers.iter_mut() {
+            p.x /= sx;
+            p.y /= sy;
+        }
+
+        let chunks: Vec<EmbeddingMapChunk> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| EmbeddingMapChunk {
+                paper: paper_of_row[i],
+                x: chunk_xy[i].0 / sx,
+                y: chunk_xy[i].1 / sy,
+                source_type: r.source_type.clone(),
+                source_label: r.source_label.clone(),
+                preview: r.preview.clone(),
+            })
+            .collect();
+
+        // Similarity edges: top neighbors per paper centroid.
+        const EDGE_TOP_K: usize = 4;
+        const EDGE_MIN_SIM: f32 = 0.25;
+        let mut edge_set: std::collections::HashMap<(usize, usize), f32> =
+            std::collections::HashMap::new();
+        for i in 0..centroids.len() {
+            let mut sims: Vec<(usize, f32)> = (0..centroids.len())
+                .filter(|&j| j != i)
+                .map(|j| (j, cosine_similarity(&centroids[i], &centroids[j])))
+                .collect();
+            sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for &(j, sim) in sims.iter().take(EDGE_TOP_K) {
+                if sim < EDGE_MIN_SIM {
+                    break;
+                }
+                let key = (i.min(j), i.max(j));
+                edge_set.entry(key).or_insert(sim);
+            }
+        }
+        let mut edges: Vec<EmbeddingMapEdge> = edge_set
+            .into_iter()
+            .map(|((a, b), sim)| EmbeddingMapEdge { a, b, sim })
+            .collect();
+        edges.sort_by(|x, y| y.sim.partial_cmp(&x.sim).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(EmbeddingMapData {
+            papers,
+            chunks,
+            edges,
+            dimension: dim,
+            embedding_model: Some(target),
+            available_models: available,
         })
     })
     .await
@@ -903,6 +1359,9 @@ async fn search_chunks_internal(
     top_k: usize,
     paper_id_filter: Option<String>,
 ) -> Result<Vec<RetrievedChunk>, String> {
+    // The query vector was embedded with the current model, so restrict the
+    // search to that model's partition — other models have different dimensions.
+    let current_model = current_embedding_model(root);
     let root = root.to_string();
     tokio::task::spawn_blocking(move || -> Result<Vec<RetrievedChunk>, String> {
         if !db_path(&root).exists() {
@@ -923,17 +1382,26 @@ async fn search_chunks_internal(
             paper_title: String,
         }
 
-        // Always load all chunks then filter in Rust — avoids stmt lifetime issues
-        // and is fine for personal library sizes (few thousand chunks at most).
-        let mut stmt = conn
-            .prepare(
+        // Load this model's chunks then filter in Rust — avoids stmt lifetime
+        // issues and is fine for personal library sizes (a few thousand chunks).
+        // If no model is configured, fall back to scanning every partition.
+        let (sql, model_param): (&str, Vec<String>) = match &current_model {
+            Some(m) => (
+                "SELECT chunk_id, paper_id, slug, chunk_index, text, vector, \
+                 source_type, source_id, source_label, paper_title \
+                 FROM chunks WHERE embedding_model = ?1",
+                vec![m.clone()],
+            ),
+            None => (
                 "SELECT chunk_id, paper_id, slug, chunk_index, text, vector, \
                  source_type, source_id, source_label, paper_title FROM chunks",
-            )
-            .map_err(|e| e.to_string())?;
+                Vec::new(),
+            ),
+        };
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
 
         let all_rows: Vec<Row> = stmt
-            .query_map([], |r| {
+            .query_map(rusqlite::params_from_iter(model_param.iter()), |r| {
                 let blob: Vec<u8> = r.get(5)?;
                 Ok(Row {
                     chunk_id: r.get(0)?,
@@ -1026,51 +1494,126 @@ fn build_snippet_embed_text(s: &crate::models::Snippet) -> String {
 pub async fn embed_and_store_snippets(
     root: &str,
     snippets: Vec<crate::models::Snippet>,
+    app: &tauri::AppHandle,
 ) -> Result<(usize, usize), String> {
+    if snippets.is_empty() {
+        return Ok((0, 0));
+    }
+
     let settings = get_rag_settings(root);
     let (provider, api_key, emb_model) = resolve_embedding_provider(root, &settings)?;
 
     let root = root.to_string();
+    let total = snippets.len();
     let mut done = 0usize;
     let mut failed = 0usize;
 
-    for snippet in &snippets {
-        let text = build_snippet_embed_text(snippet);
-        let vecs = match llm::embeddings(&provider, &api_key, &emb_model, &[text], "embedding").await {
-            Ok(v) => v,
-            Err(_) => { failed += 1; continue; }
+    // Drop snippets with nothing to embed up front: an empty input string
+    // would make the embeddings API reject the whole batch it lands in.
+    let snippets: Vec<crate::models::Snippet> = {
+        let (valid, empty): (Vec<_>, Vec<_>) = snippets
+            .into_iter()
+            .partition(|s| !build_snippet_embed_text(s).trim().is_empty());
+        failed += empty.len();
+        valid
+    };
+
+    // Batch the texts: one embeddings request per batch instead of one per
+    // snippet, with one DB transaction per batch. On a batch error, count the
+    // whole batch as failed and keep going.
+    const BATCH_SIZE: usize = 32;
+
+    let _ = app.emit(
+        "snippet-embed-progress",
+        serde_json::json!({"done": 0, "failed": 0, "total": total}),
+    );
+
+    for batch in snippets.chunks(BATCH_SIZE) {
+        let texts: Vec<String> = batch.iter().map(build_snippet_embed_text).collect();
+        let vecs = match llm::embeddings(&provider, &api_key, &emb_model, &texts, "embedding").await
+        {
+            Ok(v) if v.len() == batch.len() => v,
+            Ok(_) | Err(_) => {
+                failed += batch.len();
+                let _ = app.emit(
+                    "snippet-embed-progress",
+                    serde_json::json!({"done": done, "failed": failed, "total": total}),
+                );
+                continue;
+            }
         };
-        let Some(vec) = vecs.into_iter().next() else { failed += 1; continue; };
-        let blob = vec_to_blob(&vec);
-        let tags_json = serde_json::to_string(&snippet.tags).unwrap_or_else(|_| "[]".to_string());
 
-        let snippet_id  = snippet.id.clone();
-        let library_id  = snippet.library_id.clone();
-        let text        = snippet.text.clone();
-        let paper_id    = snippet.paper_id.clone();
-        let paper_title = snippet.paper_title.clone();
-        let page        = snippet.page;
-        let note        = snippet.note.clone();
-        let root2       = root.clone();
+        struct SnippetRow {
+            snippet_id: String,
+            library_id: String,
+            text: String,
+            blob: Vec<u8>,
+            paper_id: String,
+            paper_title: String,
+            page: u32,
+            note: String,
+            tags_json: String,
+        }
 
+        let rows: Vec<SnippetRow> = batch
+            .iter()
+            .zip(vecs.iter())
+            .map(|(snippet, vec)| SnippetRow {
+                snippet_id: snippet.id.clone(),
+                library_id: snippet.library_id.clone(),
+                text: snippet.text.clone(),
+                blob: vec_to_blob(vec),
+                paper_id: snippet.paper_id.clone(),
+                paper_title: snippet.paper_title.clone(),
+                page: snippet.page,
+                note: snippet.note.clone(),
+                tags_json: serde_json::to_string(&snippet.tags)
+                    .unwrap_or_else(|_| "[]".to_string()),
+            })
+            .collect();
+
+        let batch_len = rows.len();
+        let root2 = root.clone();
         let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let conn = open_db_with_snippet_table(&root2)?;
-            conn.execute(
-                "INSERT OR REPLACE INTO snippet_chunks
-                 (snippet_id, library_id, text, vector, paper_id, paper_title, page, note, tags)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                params![snippet_id, library_id, text, blob, paper_id, paper_title, page, note, tags_json],
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(())
+            let mut conn = open_db_with_snippet_table(&root2)?;
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT OR REPLACE INTO snippet_chunks
+                         (snippet_id, library_id, text, vector, paper_id, paper_title, page, note, tags)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    )
+                    .map_err(|e| e.to_string())?;
+                for r in &rows {
+                    stmt.execute(params![
+                        r.snippet_id,
+                        r.library_id,
+                        r.text,
+                        r.blob,
+                        r.paper_id,
+                        r.paper_title,
+                        r.page,
+                        r.note,
+                        r.tags_json,
+                    ])
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            tx.commit().map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| e.to_string())?;
 
         match res {
-            Ok(_)  => done += 1,
-            Err(_) => failed += 1,
+            Ok(()) => done += batch_len,
+            Err(_) => failed += batch_len,
         }
+
+        let _ = app.emit(
+            "snippet-embed-progress",
+            serde_json::json!({"done": done, "failed": failed, "total": total}),
+        );
     }
 
     Ok((done, failed))

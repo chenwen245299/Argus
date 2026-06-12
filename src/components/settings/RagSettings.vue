@@ -173,27 +173,35 @@ async function rebuild(mode: 'full' | 'missing') {
     const chunkSize: number = form.value.chunk_size ?? 512
     const chunkOverlap: number = form.value.chunk_overlap ?? 50
 
-    for (const paper of papers) {
-      if (cancelRequested) break
-      rebuildCurrentPaper.value = paper.title
+    // Small worker pool: the embedding API call dominates each paper's wall
+    // time, so a few in-flight papers give a near-linear speedup.
+    const CONCURRENCY = 3
+    const queue = [...papers]
+    const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+      while (!cancelRequested) {
+        const paper = queue.shift()
+        if (!paper) break
+        rebuildCurrentPaper.value = paper.title
 
-      try {
-        const input = await invoke<PaperVectorizeInput>('get_paper_vectorize_input', { slug: paper.slug })
-        const chunks: ChunkInput[] = buildChunks(input, chunkSize, chunkOverlap)
-        if (chunks.length === 0) { failed++; rebuildProgress.value = { done, total, failed }; continue }
-        await invoke('embed_and_store_chunks', {
-          slug: paper.slug,
-          paperId: input.paper_id,
-          paperTitle: input.paper_title,
-          chunks,
-        })
-        done++
-      } catch {
-        failed++
+        try {
+          const input = await invoke<PaperVectorizeInput>('get_paper_vectorize_input', { slug: paper.slug })
+          const chunks: ChunkInput[] = await buildChunks(input, chunkSize, chunkOverlap)
+          if (chunks.length === 0) { failed++; rebuildProgress.value = { done, total, failed }; continue }
+          await invoke('embed_and_store_chunks', {
+            slug: paper.slug,
+            paperId: input.paper_id,
+            paperTitle: input.paper_title,
+            chunks,
+          })
+          done++
+        } catch {
+          failed++
+        }
+
+        rebuildProgress.value = { done, total, failed }
       }
-
-      rebuildProgress.value = { done, total, failed }
-    }
+    })
+    await Promise.all(workers)
 
     if (cancelRequested) {
       rebuildMsg.value = `已暂停，已完成 ${done}/${total}。点击「同步缺失」可从断点继续。`
@@ -211,6 +219,22 @@ async function rebuild(mode: 'full' | 'missing') {
 
 function cancelRebuild() {
   cancelRequested = true
+}
+
+// Per-model deletion: drops one model's whole partition, leaving others intact.
+const deletingModel = ref('')
+async function deleteModelEmbeddings(model: string) {
+  if (deletingModel.value) return
+  if (!window.confirm(t('ragSettings.confirmDeleteModel', { model }))) return
+  deletingModel.value = model
+  try {
+    await invoke('delete_model_embeddings', { model })
+    await ragStore.loadStoreInfo()
+  } catch (e) {
+    rebuildMsg.value = String(e)
+  } finally {
+    deletingModel.value = ''
+  }
 }
 </script>
 
@@ -294,6 +318,29 @@ function cancelRebuild() {
         <span class="info-label">{{ t('ragSettings.storeModel') }}</span>
         <span class="info-val">{{ ragStore.storeInfo.embedding_model ?? '—' }}</span>
       </div>
+
+      <!-- Stored models: each embedding model keeps its own vectors -->
+      <div class="model-list" v-if="ragStore.storeInfo.models && ragStore.storeInfo.models.length">
+        <div class="model-list-title">{{ t('ragSettings.storedModels') }}</div>
+        <div
+          v-for="m in ragStore.storeInfo.models"
+          :key="m.embedding_model"
+          class="model-row"
+          :class="{ 'is-current': m.embedding_model === ragStore.storeInfo.embedding_model }"
+        >
+          <div class="model-meta">
+            <span class="model-name" :title="m.embedding_model">{{ m.embedding_model }}</span>
+            <span class="model-sub">{{ t('ragSettings.modelStat', { dim: m.dimension, papers: m.unique_papers, chunks: m.total_chunks }) }}</span>
+          </div>
+          <button
+            class="btn-ghost sm"
+            :disabled="deletingModel === m.embedding_model"
+            @click="deleteModelEmbeddings(m.embedding_model)"
+          >
+            {{ deletingModel === m.embedding_model ? t('ragSettings.deleting') : t('ragSettings.cleanModel') }}
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- Rebuild -->
@@ -358,6 +405,14 @@ function cancelRebuild() {
 .info-grid { display: grid; grid-template-columns: auto 1fr; gap: 5px 16px; }
 .info-label { font-size: var(--font-size-xs); color: var(--text-secondary); }
 .info-val { font-size: var(--font-size-xs); font-weight: 500; }
+.model-list { margin-top: 12px; border-top: 1px solid var(--border-subtle); padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.model-list-title { font-size: var(--font-size-xs); font-weight: 600; color: var(--text-secondary); }
+.model-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--bg-primary); }
+.model-row.is-current { outline: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); }
+.model-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.model-name { font-size: var(--font-size-xs); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-sub { font-size: 11px; color: var(--text-tertiary); }
+.btn-ghost.sm { flex-shrink: 0; }
 .rebuild-section { border-top: 1px solid var(--border-subtle); padding-top: 14px; display: flex; flex-direction: column; gap: 8px; }
 .rebuild-controls { display: flex; gap: 8px; flex-wrap: wrap; }
 .progress-wrap { display: flex; flex-direction: column; gap: 6px; }

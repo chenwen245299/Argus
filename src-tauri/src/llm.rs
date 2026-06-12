@@ -148,6 +148,7 @@ async fn embed_openai_compat(
 
     let resp = client
         .post(&url)
+        .timeout(REQUEST_TIMEOUT)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .json(&body)
@@ -167,7 +168,7 @@ async fn embed_openai_compat(
     let data = json["data"].as_array().ok_or_else(|| {
         format!(
             "No 'data' array in embeddings response: {}",
-            &text[..text.len().min(200)]
+            char_prefix(&text, 200)
         )
     })?;
 
@@ -177,8 +178,10 @@ async fn embed_openai_compat(
     Ok(vecs)
 }
 
-/// OpenRouter-specific embedding: one request per text, explicit float format,
-/// with base64 fallback parsing and required attribution header.
+/// OpenRouter-specific embedding: one request per text (some models reject
+/// array input), explicit float format, with base64 fallback parsing and
+/// required attribution header. Requests run a few at a time; `buffered`
+/// keeps results in input order so embeddings stay aligned with their chunks.
 async fn embed_openrouter(
     provider: &AiProvider,
     api_key: &str,
@@ -186,53 +189,76 @@ async fn embed_openrouter(
     texts: &[String],
     source: &str,
 ) -> Result<Vec<Vec<f32>>, String> {
+    use futures::TryStreamExt;
+
+    const EMBED_CONCURRENCY: usize = 4;
+
     let client = build_client()?;
     let url = format!("{}/embeddings", provider.base_url.trim_end_matches('/'));
+
+    // Each request future owns its data ('static) — borrowing across
+    // `buffered` trips rustc's higher-ranked lifetime inference when this
+    // future is later awaited inside a spawned task.
+    let requests = texts.to_vec().into_iter().map(|text| {
+        let client = client.clone();
+        let url = url.clone();
+        let api_key = api_key.to_string();
+        let model = model.to_string();
+        async move {
+            let body = serde_json::json!({
+                "model": model,
+                "input": text,
+                "encoding_format": "float",
+            });
+
+            let resp = client
+                .post(&url)
+                .timeout(REQUEST_TIMEOUT)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .header("HTTP-Referer", "https://github.com/argus-app/argus")
+                .header("X-Title", "Argus")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Network error: {e}"))?;
+
+            let status = resp.status().as_u16();
+            let resp_text = resp.text().await.unwrap_or_default();
+            if status >= 400 {
+                return Err(friendly_error(status, &resp_text));
+            }
+
+            let json: serde_json::Value = serde_json::from_str(&resp_text)
+                .map_err(|e| format!("Invalid JSON from embeddings API: {e}"))?;
+
+            let tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+            let cost = usage_cost_usd(&json["usage"]);
+
+            let data = json["data"].as_array().ok_or_else(|| {
+                format!(
+                    "No 'data' array in embeddings response: {}",
+                    char_prefix(&resp_text, 200)
+                )
+            })?;
+
+            Ok::<_, String>((parse_embedding_data(data)?, tokens, cost))
+        }
+    });
+
+    let results: Vec<(Vec<Vec<f32>>, u64, Option<f64>)> = futures::stream::iter(requests)
+        .buffered(EMBED_CONCURRENCY)
+        .try_collect()
+        .await?;
+
     let mut total_tokens: u64 = 0;
     let mut total_cost_usd: Option<f64> = None;
     let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-
-    // OpenRouter: send one text at a time — some models reject array input.
-    for text in texts {
-        let body = serde_json::json!({
-            "model": model,
-            "input": text,
-            "encoding_format": "float",
-        });
-
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://github.com/argus-app/argus")
-            .header("X-Title", "Argus")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Network error: {e}"))?;
-
-        let status = resp.status().as_u16();
-        let resp_text = resp.text().await.unwrap_or_default();
-        if status >= 400 {
-            return Err(friendly_error(status, &resp_text));
-        }
-
-        let json: serde_json::Value = serde_json::from_str(&resp_text)
-            .map_err(|e| format!("Invalid JSON from embeddings API: {e}"))?;
-
-        total_tokens += json["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
-        if let Some(v) = usage_cost_usd(&json["usage"]) {
+    for (mut batch, tokens, cost) in results {
+        total_tokens += tokens;
+        if let Some(v) = cost {
             total_cost_usd = Some(total_cost_usd.unwrap_or(0.0) + v);
         }
-
-        let data = json["data"].as_array().ok_or_else(|| {
-            format!(
-                "No 'data' array in embeddings response: {}",
-                &resp_text[..resp_text.len().min(200)]
-            )
-        })?;
-
-        let mut batch = parse_embedding_data(data)?;
         vecs.append(&mut batch);
     }
 
@@ -554,6 +580,7 @@ async fn chat_openai_compat(
 
     let resp = client
         .post(&url)
+        .timeout(REQUEST_TIMEOUT)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .json(&body)
@@ -809,6 +836,7 @@ async fn chat_anthropic(
 
     let resp = client
         .post(&url)
+        .timeout(REQUEST_TIMEOUT)
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("Content-Type", "application/json")
@@ -1030,6 +1058,7 @@ async fn fetch_openai_models(provider: &AiProvider, api_key: &str) -> Result<Vec
 
     let resp = client
         .get(&url)
+        .timeout(REQUEST_TIMEOUT)
         .header("Authorization", format!("Bearer {api_key}"))
         .send()
         .await
@@ -1047,7 +1076,7 @@ async fn fetch_openai_models(provider: &AiProvider, api_key: &str) -> Result<Vec
     let data = json["data"].as_array().ok_or_else(|| {
         format!(
             "No 'data' array in /models response. Got: {}",
-            &text[..text.len().min(200)]
+            char_prefix(&text, 200)
         )
     })?;
 
@@ -1062,6 +1091,7 @@ async fn fetch_openai_models(provider: &AiProvider, api_key: &str) -> Result<Vec
         let embed_url = format!("{base}/embeddings/models");
         if let Ok(embed_resp) = client
             .get(&embed_url)
+            .timeout(REQUEST_TIMEOUT)
             .header("Authorization", format!("Bearer {api_key}"))
             .send()
             .await
@@ -1331,12 +1361,29 @@ fn anthropic_known_models() -> Vec<AiModel> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Total-request timeout for non-streaming calls. Streaming calls only get the
+/// connect timeout: their body legitimately takes as long as the generation
+/// (reasoning models regularly exceed 2 minutes).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Process-wide shared client: reuses the connection pool (TCP + TLS sessions)
+/// across requests instead of paying a fresh handshake per AI call, which
+/// matters most for request bursts like batch analysis and embeddings.
 fn build_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        // Per-read idle timeout: kills silently stalled connections without
+        // capping total stream duration (long generations stay alive as long
+        // as tokens keep arriving).
+        .read_timeout(Duration::from_secs(120))
         .user_agent("Argus/0.1")
         .build()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(CLIENT.get_or_init(|| client).clone())
 }
 
 fn split_system(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
@@ -1354,8 +1401,15 @@ fn split_system(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
     (system, conv)
 }
 
+/// First `n` characters of `s` — char-safe, never panics on UTF-8 boundaries.
+/// (Plain `&s[..n]` byte-slicing panics when the cut lands mid-character, which
+/// is common for non-ASCII error bodies / titles.)
+fn char_prefix(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
 fn friendly_error(status: u16, body: &str) -> String {
-    let preview = &body[..body.len().min(300)];
+    let preview = char_prefix(body, 300);
     match status {
         401 => "Authentication failed (401). Check your API key in Settings → AI Services.".to_string(),
         403 => "Access denied (403). Your key may lack permission for this model.".to_string(),

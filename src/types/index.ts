@@ -214,12 +214,21 @@ export interface VectorsMeta {
   dimension: number
 }
 
+export interface EmbeddingModelStat {
+  embedding_model: string
+  dimension: number
+  total_chunks: number
+  unique_papers: number
+}
+
 export interface VectorStoreInfo {
   total_chunks: number
   unique_papers: number
   dimension: number | null
   provider_id: string | null
   embedding_model: string | null
+  /** Every embedding model that currently has vectors stored. */
+  models: EmbeddingModelStat[]
 }
 
 // ── Vectorize pipeline ────────────────────────────────────────────────────────
@@ -347,13 +356,24 @@ export interface CanvasNode {
   y: number
   color?: string
   hover_source?: string
-  node_type?: 'paper' | 'text' | 'shape'
+  node_type?: 'paper' | 'text' | 'shape' | 'line'
   content?: string
   font_size?: number
   font_bold?: boolean
   font_italic?: boolean
   width?: number
   height?: number
+  shape_kind?: 'rect' | 'ellipse' | 'diamond'
+  fill_color?: string
+  stroke_width?: number
+  rotation?: number
+  opacity?: number
+  corner_radius?: number
+  font_family?: string
+  text_align?: 'left' | 'center' | 'right'
+  line_kind?: 'line' | 'arrow'
+  line_points?: { x: number; y: number }[]
+  z_index?: number
 }
 
 export interface CanvasEdge {
@@ -414,4 +434,41 @@ export interface NodePosition {
   node_id: string
   x: number
   y: number
+}
+
+// ── Embedding map (vector space visualization) ───────────────────────────────
+
+export interface EmbeddingMapPaper {
+  paper_id: string
+  slug: string
+  title: string
+  chunk_count: number
+  x: number
+  y: number
+  reading_status: string
+}
+
+export interface EmbeddingMapChunk {
+  /** Index into EmbeddingMapData.papers */
+  paper: number
+  x: number
+  y: number
+  source_type: string
+  source_label: string | null
+  preview: string
+}
+
+export interface EmbeddingMapEdge {
+  a: number
+  b: number
+  sim: number
+}
+
+export interface EmbeddingMapData {
+  papers: EmbeddingMapPaper[]
+  chunks: EmbeddingMapChunk[]
+  edges: EmbeddingMapEdge[]
+  dimension: number
+  embedding_model: string | null
+  available_models: EmbeddingModelStat[]
 }

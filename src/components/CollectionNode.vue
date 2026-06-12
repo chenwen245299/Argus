@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
+import { useRagStore } from '../stores/rag'
 import type { Collection } from '../types'
 
 const props = defineProps<{
@@ -32,8 +34,10 @@ const emit = defineEmits<{
   'update:showNewInput': [val: boolean]
 }>()
 
+const { t } = useI18n()
 const selection = useSelectionStore()
 const cStore = useCollectionsStore()
+const ragStore = useRagStore()
 
 let _subCollCompositionEndedAt = 0
 function onSubCollCompositionEnd() { _subCollCompositionEndedAt = Date.now() }
@@ -47,6 +51,9 @@ const isCollectionDragOver = computed(() => props.collectionDragOverId === props
 const isCollectionDragging = computed(() => props.collectionDraggingId === props.collection.id)
 const paperCount = computed(() => cStore.collectionPaperCount(props.collection.id))
 const displayEmoji = computed(() => props.collection.emoji?.trim() || '📚')
+
+// Embed progress for this collection (started from the context menu in LeftSidebar)
+const embedJob = computed(() => ragStore.collectionEmbedJobs[props.collection.id] ?? null)
 
 function selectCollection() {
   selection.selectNav(`collection:${props.collection.id}` as any)
@@ -108,7 +115,12 @@ function onCollectionMouseDown(e: MouseEvent) {
       </button>
       <span v-else class="expand-placeholder" />
 
-      <span class="badge">{{ paperCount }}</span>
+      <span v-if="embedJob" class="badge embed-badge" :class="{ done: embedJob.status === 'done' }">
+        <template v-if="embedJob.status === 'running'">{{ embedJob.total > 0 ? `${embedJob.done + embedJob.failed}/${embedJob.total}` : '…' }}</template>
+        <template v-else-if="embedJob.failed > 0">{{ t('collections.embedFailedCount', { n: embedJob.failed }) }}</template>
+        <template v-else>✓</template>
+      </span>
+      <span v-else class="badge">{{ paperCount }}</span>
     </div>
 
     <!-- New sub-collection input -->
@@ -262,6 +274,18 @@ function onCollectionMouseDown(e: MouseEvent) {
 .nav-item.active .badge {
   background: color-mix(in srgb, var(--accent) 16%, transparent);
   color: var(--accent);
+}
+
+.embed-badge {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  width: auto;
+  min-width: 34px;
+  font-variant-numeric: tabular-nums;
+}
+.embed-badge.done {
+  background: color-mix(in srgb, #34a853 16%, transparent);
+  color: #34a853;
 }
 
 .new-coll-row { padding: 3px 10px 3px 14px; }

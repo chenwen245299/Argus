@@ -47,3 +47,10 @@ tauri-plugin-process = "2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+# Smaller, faster release binary: thin LTO + single codegen unit let LLVM
+# optimize across crates; strip removes debug symbols (faster cold start).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

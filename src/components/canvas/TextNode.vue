@@ -9,6 +9,10 @@ export interface TextNodeData {
   fontSize?: number
   bold?: boolean
   italic?: boolean
+  fontFamily?: string
+  textAlign?: 'left' | 'center' | 'right'
+  rotation?: number
+  opacity?: number
 }
 
 const props = defineProps<NodeProps<TextNodeData>>()
@@ -18,11 +22,19 @@ const textStyle = computed(() => ({
   fontSize: (props.data.fontSize ?? 14) + 'px',
   fontWeight: props.data.bold ? '700' : '400',
   fontStyle: props.data.italic ? 'italic' : 'normal',
+  fontFamily: props.data.fontFamily || 'inherit',
+  textAlign: props.data.textAlign ?? 'left',
 }))
+
+const nodeStyle = computed(() => {
+  const style: Record<string, string> = { opacity: String(props.data.opacity ?? 1) }
+  if (props.data.rotation) style.transform = `rotate(${props.data.rotation}deg)`
+  return style
+})
 </script>
 
 <template>
-  <div class="text-node">
+  <div class="text-node" :style="nodeStyle">
     <div class="text-content" :style="textStyle">{{ data.content || '双击编辑文字' }}</div>
 
     <Handle id="src-top"    :position="Position.Top"    type="source" class="node-handle" />

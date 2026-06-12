@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { Window as TauriWindow } from '@tauri-apps/api/window'
@@ -13,18 +13,22 @@ import { useCollectionsStore } from '../stores/collections'
 import { useAiStore } from '../stores/ai'
 import { useSelectionStore } from '../stores/selection'
 import { useCanvasStore } from '../stores/canvas'
+import { useRagStore } from '../stores/rag'
 import { switchToTranslationsTab, askAiText } from '../stores/translationHistory'
 import { pendingSnippet, initSnippetStore } from '../stores/snippetLibrary'
 import Toolbar from '../components/Toolbar.vue'
 import LeftSidebar from '../components/LeftSidebar.vue'
 import PaperList from '../components/PaperList.vue'
-import PdfViewer from '../components/PdfViewer.vue'
-import CanvasPanel from '../components/CanvasPanel.vue'
 import TabBar from '../components/TabBar.vue'
 import RightSidebar from '../components/RightSidebar.vue'
-import SettingsModal from '../components/SettingsModal.vue'
 import AddSnippetModal from '../components/AddSnippetModal.vue'
-import SnippetLibraryView from '../components/SnippetLibraryView.vue'
+
+// Conditionally-rendered heavyweights (pdfjs / vue-flow / settings panels) are
+// code-split so the main window paints before any of them download.
+const PdfViewer = defineAsyncComponent(() => import('../components/PdfViewer.vue'))
+const CanvasPanel = defineAsyncComponent(() => import('../components/CanvasPanel.vue'))
+const SettingsModal = defineAsyncComponent(() => import('../components/SettingsModal.vue'))
+const SnippetLibraryView = defineAsyncComponent(() => import('../components/SnippetLibraryView.vue'))
 
 const { t } = useI18n()
 const libraryStore = useLibraryStore()
@@ -35,6 +39,7 @@ const collectionsStore = useCollectionsStore()
 const aiStore = useAiStore()
 const selectionStore = useSelectionStore()
 const canvasStore = useCanvasStore()
+const ragStore = useRagStore()
 
 // ── Window size persistence ────────────────────────────────────────────────────
 const WIN_SIZE_KEY = 'argus:window:size'
@@ -74,6 +79,8 @@ const MAIN_RIGHT_WIDTH_KEY = 'argus:layout:right-width'
 const MAIN_RIGHT_VISIBLE_KEY = 'argus:layout:right-visible'
 const MAIN_RIGHT_TAB_KEY = 'argus:layout:right-tab'
 const PAPER_TABS = ['notes', 'highlights', 'ai', 'metadata']
+// Tabs available while the canvas/graph is shown (翻译/批注 hidden, 绘图 added).
+const CANVAS_TABS = ['draw', 'notes', 'ai', 'metadata']
 const MIN_LEFT_WIDTH = 240
 const MAX_LEFT_WIDTH = 360
 const DEFAULT_LEFT_WIDTH = 220
@@ -131,11 +138,15 @@ function onOpenCanvas() {
   showCanvas.value = true
   canvasStore.isShown = true
   showSnippetLibrary.value = false
+  // Land on the drawing panel (and leave the PDF-only tabs behind).
+  if (!CANVAS_TABS.includes(sidebarTab.value)) sidebarTab.value = 'draw'
 }
 
 function closeCanvas() {
   showCanvas.value = false
   canvasStore.isShown = false
+  // 'draw' only exists in canvas mode — fall back to a paper tab.
+  if (!PAPER_TABS.includes(sidebarTab.value)) sidebarTab.value = 'metadata'
 }
 
 function onOpenSnippetLibrary(libraryId: string) {
@@ -160,11 +171,24 @@ function onSnippetOpenPaper(slug: string, page: number, title: string) {
 function onCanvasSelectPaper(slug: string) {
   selectionStore.selectPaper(slug)
   rightSidebarVisible.value = true
-  // Ensure the sidebar is on a tab that shows paper-level content
+  // In canvas mode, clicking any element jumps to the drawing properties tab.
+  if (showCanvas.value) {
+    sidebarTab.value = 'draw'
+    return
+  }
   if (!PAPER_TABS.includes(sidebarTab.value)) {
     sidebarTab.value = 'metadata'
   }
 }
+
+// Selecting any element on the canvas (node / text / shape / line) jumps the
+// sidebar to the drawing properties tab so its properties are visible.
+watch(() => canvasStore.selectedNodeIds.length, (n) => {
+  if (showCanvas.value && n > 0) {
+    sidebarTab.value = 'draw'
+    rightSidebarVisible.value = true
+  }
+})
 
 function onSwitchSidebarTab(event: Event) {
   const { tab } = (event as CustomEvent<{ tab: string }>).detail ?? {}
@@ -260,11 +284,9 @@ onMounted(async () => {
     scheduleMainWindowFocus()
   })
 
-  // Load settings and collections on startup.
+  // Load settings and collections on startup (independent — load in parallel).
   if (libraryStore.currentPath) {
-    await settingsStore.load()
-    await collectionsStore.load()
-    await aiStore.load()
+    await Promise.all([settingsStore.load(), collectionsStore.load(), aiStore.load(), ragStore.load()])
     readerStore.loadTabs(libraryStore.currentPath)
     initSnippetStore()
   }
@@ -356,18 +378,19 @@ function onMouseUp() {
 }
 
 async function onLibraryOpened() {
-  await settingsStore.load()
-  await collectionsStore.load()
-  await aiStore.load()
+  await Promise.all([settingsStore.load(), collectionsStore.load(), aiStore.load(), ragStore.load()])
   readerStore.loadTabs(libraryStore.currentPath!)
   initSnippetStore()
 }
 
-// Load all stores when library path becomes available (handles auto-restore on startup).
+// Reload per-library stores whenever the library path changes — both the
+// startup auto-restore (null → path) and an in-app library switch (A → B).
+// Without the switch case, the sidebar kept the previous library's
+// collections/settings/AI/RAG state.
 watch(
   () => libraryStore.currentPath,
   async (newPath, oldPath) => {
-    if (newPath && !oldPath) {
+    if (newPath && newPath !== oldPath) {
       await onLibraryOpened()
     }
   }
@@ -487,6 +510,7 @@ watch(
       :right-sidebar-open="rightSidebarVisible"
       :right-sidebar-width="rightWidth"
       :sidebar-tab="sidebarTab"
+      :canvas-mode="showCanvas"
       @toggle-right-sidebar="rightSidebarVisible = !rightSidebarVisible"
       @update:sidebar-tab="sidebarTab = $event"
     />

@@ -141,7 +141,7 @@ fn list_day_dates(root: &str) -> Vec<String> {
             let name = e.file_name().to_string_lossy().to_string();
             // Accept only YYYY-MM-DD.json (15 chars)
             if name.ends_with(".json") && name.len() == 15 {
-                Some(name[..10].to_string())
+                Some(name.chars().take(10).collect::<String>())
             } else {
                 None
             }
@@ -1062,7 +1062,7 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
 
 /// Build a canonical slug from author/year/title.
 fn make_slug(authors: &[String], published: &str, title: &str) -> String {
-    let year = &published[..published.len().min(4)];
+    let year: String = published.chars().take(4).collect();
     let last_name = authors
         .first()
         .map(|a| a.split_whitespace().last().unwrap_or("unknown"))

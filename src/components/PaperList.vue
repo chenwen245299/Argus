@@ -6,7 +6,6 @@ import { storeToRefs } from 'pinia'
 import { RecycleScroller } from 'vue-virtual-scroller'
 import { invoke } from '@tauri-apps/api/core'
 import { save as dialogSave } from '@tauri-apps/plugin-dialog'
-import { jsPDF } from 'jspdf'
 import { useLibraryStore } from '../stores/library'
 import { useSelectionStore } from '../stores/selection'
 import { useReaderStore } from '../stores/reader'
@@ -807,6 +806,8 @@ async function exportToPdf() {
 
   exportBusy.value = true
   try {
+    // jspdf is export-only — load it on demand instead of at startup.
+    const { jsPDF } = await import('jspdf')
     const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
     const pageW = doc.internal.pageSize.getWidth()
     const pageH = doc.internal.pageSize.getHeight()
@@ -988,7 +989,7 @@ async function vectorizePaper(item: PaperIndexEntry) {
     await ragStore.load()
     const s = ragStore.settings
     const input = await invoke<PaperVectorizeInput>('get_paper_vectorize_input', { slug: item.slug })
-    const chunks: ChunkInput[] = buildChunks(input, s.chunk_size ?? 512, s.chunk_overlap ?? 50)
+    const chunks: ChunkInput[] = await buildChunks(input, s.chunk_size ?? 512, s.chunk_overlap ?? 50)
     if (chunks.length === 0) return
     await invoke('embed_and_store_chunks', {
       slug: item.slug,

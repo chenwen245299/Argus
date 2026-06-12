@@ -4,12 +4,18 @@ use serde::{Deserialize, Serialize};
 pub struct PaperMeta {
     pub id: String,
     pub title: String,
+    // `serde(default)` so a meta.json that predates these fields (or was
+    // hand-edited / partially synced) still loads instead of failing wholesale,
+    // which would make the paper unreadable in the UI.
+    #[serde(default)]
     pub authors: Vec<String>,
     pub year: Option<u32>,
     pub doi: Option<String>,
     pub arxiv_id: Option<String>,
     pub venue: Option<String>,
+    #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
     pub added_at: String,
     pub original_filename: Option<String>,
     /// User-controlled reading status: "unread" | "reading" | "read"
@@ -581,13 +587,26 @@ pub struct VectorsMeta {
     pub dimension: usize,
 }
 
+/// Per-embedding-model statistics for the multi-model vector store.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EmbeddingModelStat {
+    pub embedding_model: String,
+    pub dimension: usize,
+    pub total_chunks: usize,
+    pub unique_papers: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VectorStoreInfo {
+    /// Chunk count for the *currently selected* embedding model.
     pub total_chunks: usize,
+    /// Vectorized-paper count for the currently selected model.
     pub unique_papers: usize,
     pub dimension: Option<usize>,
     pub provider_id: Option<String>,
     pub embedding_model: Option<String>,
+    /// Every embedding model that currently has vectors stored.
+    pub models: Vec<EmbeddingModelStat>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -604,6 +623,54 @@ pub struct RetrievedChunk {
     pub source_id: Option<String>,
     /// Human-readable label, e.g. "第3页批注" or "笔记: 我的想法"
     pub source_label: Option<String>,
+}
+
+// ── Embedding map (vector space visualization) ────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EmbeddingMapPaper {
+    pub paper_id: String,
+    pub slug: String,
+    pub title: String,
+    pub chunk_count: usize,
+    /// 2D PCA projection of the paper centroid (z-scored per axis)
+    pub x: f32,
+    pub y: f32,
+    /// "unread" | "reading" | "read"
+    pub reading_status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EmbeddingMapChunk {
+    /// Index into `EmbeddingMapData::papers`
+    pub paper: usize,
+    pub x: f32,
+    pub y: f32,
+    /// "text" | "metadata" | "highlight" | "note"
+    pub source_type: String,
+    pub source_label: Option<String>,
+    pub preview: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EmbeddingMapEdge {
+    /// Indices into `EmbeddingMapData::papers`
+    pub a: usize,
+    pub b: usize,
+    /// Cosine similarity of the two paper centroids
+    pub sim: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EmbeddingMapData {
+    pub papers: Vec<EmbeddingMapPaper>,
+    pub chunks: Vec<EmbeddingMapChunk>,
+    pub edges: Vec<EmbeddingMapEdge>,
+    pub dimension: usize,
+    /// The model whose vectors this map is showing.
+    pub embedding_model: Option<String>,
+    /// Every embedding model that has vectors stored, for the model picker.
+    pub available_models: Vec<EmbeddingModelStat>,
 }
 
 // ── Snippet retrieval result ──────────────────────────────────────────────────
@@ -878,6 +945,39 @@ pub struct CanvasNode {
     /// Height for shape nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<f64>,
+    /// Shape kind for shape nodes: "rect" (default) | "ellipse" | "diamond".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_kind: Option<String>,
+    /// Fill color for shape nodes (separate from `color`, which is the stroke).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_color: Option<String>,
+    /// Stroke/border width in px for shape nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_width: Option<f64>,
+    /// Rotation in degrees (text/shape nodes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<f64>,
+    /// Opacity 0..1 (text/shape nodes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+    /// Corner radius in px for shape nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corner_radius: Option<f64>,
+    /// Font family for text nodes (CSS font-family value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_family: Option<String>,
+    /// Text alignment for text nodes: "left" | "center" | "right".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_align: Option<String>,
+    /// Line node kind: "line" | "arrow".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_kind: Option<String>,
+    /// Line node endpoints as offsets within the node's bounding box.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub line_points: Vec<CanvasEdgePoint>,
+    /// Stacking order (z-index) for layering (置顶/置底).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_index: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

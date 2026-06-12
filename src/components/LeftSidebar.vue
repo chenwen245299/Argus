@@ -7,6 +7,7 @@ import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
 import { useCanvasStore } from '../stores/canvas'
 import { useReaderStore } from '../stores/reader'
+import { useRagStore } from '../stores/rag'
 import CollectionNode from './CollectionNode.vue'
 import type { CanvasIndexEntry, Collection, NavItem } from '../types'
 import { updateStore } from '../stores/update'
@@ -18,6 +19,7 @@ const selection = useSelectionStore()
 const collectionsStore = useCollectionsStore()
 const canvasStore = useCanvasStore()
 const readerStore = useReaderStore()
+const ragStore = useRagStore()
 
 const showSettings = defineModel<boolean>('showSettings', { default: false })
 const props = defineProps<{ snippetLibraryVisible?: boolean }>()
@@ -556,6 +558,13 @@ async function openCanvasesInFinder() {
   } catch (e) {
     console.error('Open canvases in finder failed:', e)
   }
+}
+
+// Embed all not-yet-vectorized papers in the collection tree (progress shows
+// in the collection row's badge, driven by ragStore.collectionEmbedJobs).
+function embedCollectionTree(col: Collection) {
+  const papers = collectionsStore.listAllPapersInTree(col.id)
+  ragStore.embedCollection(col.id, papers)
 }
 
 // ── Context menu (All Papers / library root) ──────────────────────────────────
@@ -1103,6 +1112,16 @@ onUnmounted(() => {
         <button class="ctx-item" @click="openCollectionInFinder(ctxMenu!.col); closeCtx()">
           {{ t('collections.openInFinder') }}
         </button>
+        <template v-if="ragStore.isConfigured">
+          <div class="ctx-sep" />
+          <button
+            class="ctx-item"
+            :disabled="!!ragStore.collectionEmbedJobs[ctxMenu!.col.id]"
+            @click="embedCollectionTree(ctxMenu!.col); closeCtx()"
+          >
+            {{ ragStore.collectionEmbedJobs[ctxMenu!.col.id] ? t('collections.buildEmbeddingsRunning') : t('collections.buildEmbeddings') }}
+          </button>
+        </template>
         <div class="ctx-sep" />
         <button class="ctx-item danger" @click="deleteCollection(ctxMenu!.col); closeCtx()">
           {{ t('collections.delete') }}

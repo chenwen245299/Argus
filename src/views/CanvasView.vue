@@ -24,7 +24,7 @@ import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
 import '@vue-flow/controls/dist/style.css'
 import '@vue-flow/minimap/dist/style.css'
-import { marked } from 'marked'
+import { renderMarkdown } from '../utils/renderMarkdown'
 import { useCanvasStore } from '../stores/canvas'
 import { useLibraryStore } from '../stores/library'
 import { recordPaperAccess, sortPapersByRecentAccess } from '../utils/recentPapers'
@@ -568,7 +568,7 @@ function onNodeMouseLeave() {
 
 const renderedHoverContent = computed(() => {
   if (!hoverContent.value) return ''
-  return marked(hoverContent.value) as string
+  return renderMarkdown(hoverContent.value)
 })
 
 // ── Context menu ──────────────────────────────────────────────────────────────
@@ -1565,7 +1565,7 @@ watch(() => library.papers, () => {
 }
 
 .canvas-toolbar {
-  height: 44px;
+  height: 40px;
   flex-shrink: 0;
   display: flex;
   align-items: center;

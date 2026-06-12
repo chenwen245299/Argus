@@ -1,17 +1,23 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, ref, nextTick, watch } from 'vue'
-import Vditor from 'vditor'
-import 'vditor/dist/index.css'
+import type VditorType from 'vditor'
 
 const props = defineProps<{ initialContent: string }>()
 const emit = defineEmits<{ change: [markdown: string] }>()
 
 const containerEl = ref<HTMLDivElement | null>(null)
-let vd: Vditor | null = null
+let vd: VditorType | null = null
+let destroyed = false
 
 onMounted(async () => {
+  // Vditor (JS + CSS) is heavyweight — load it when an editor actually mounts
+  // instead of in every window's startup bundle.
+  const [{ default: Vditor }] = await Promise.all([
+    import('vditor'),
+    import('vditor/dist/index.css'),
+  ])
   await nextTick()
-  if (!containerEl.value) return
+  if (!containerEl.value || destroyed) return
 
   const content = props.initialContent
 
@@ -45,6 +51,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  destroyed = true
   vd?.destroy()
   vd = null
   clearHighlights()

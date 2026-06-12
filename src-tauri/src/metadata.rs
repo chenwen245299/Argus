@@ -215,7 +215,7 @@ fn parse_arxiv_xml(xml: &str) -> Option<MetaUpdate> {
 
     // Year from <published>YYYY-…
     let year = extract_between(entry, "<published>", "</published>")
-        .and_then(|s| s[..4.min(s.len())].parse::<u32>().ok());
+        .and_then(|s| s.chars().take(4).collect::<String>().parse::<u32>().ok());
 
     // Optional DOI
     let doi = extract_between(entry, "<arxiv:doi>", "</arxiv:doi>")
@@ -395,11 +395,15 @@ pub async fn fetch_semantic_scholar_by_title(title: &str) -> Option<MetaUpdate> 
     let papers = json["data"].as_array()?;
     // Pick the first result whose title roughly matches (case-insensitive substring)
     let title_lower = title.to_lowercase();
+    // Char-safe prefix: byte-slicing `[..40]` panics when the cut lands mid-character,
+    // which is essentially guaranteed for CJK titles (3 bytes/char).
+    let title_prefix: String = title_lower.chars().take(40).collect();
     for paper in papers {
         let candidate = paper["title"].as_str().unwrap_or("").to_lowercase();
+        let candidate_prefix: String = candidate.chars().take(40).collect();
         // Accept if either title contains the other (handles truncated/subtitle variants)
-        if candidate.contains(&title_lower[..title_lower.len().min(40)])
-            || title_lower.contains(&candidate[..candidate.len().min(40)])
+        if candidate.contains(title_prefix.as_str())
+            || title_lower.contains(candidate_prefix.as_str())
         {
             return parse_s2_json(paper);
         }

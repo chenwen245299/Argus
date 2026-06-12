@@ -3,6 +3,32 @@ import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { Canvas, CanvasIndexEntry, CanvasSettings } from '../types'
 
+/** Editable snapshot of the currently selected canvas node, shared between the
+ *  canvas (CanvasPanel) and the right-sidebar properties panel (DrawTab). */
+export interface DrawNodeSnapshot {
+  nodeId: string
+  type: 'paper' | 'text' | 'shape' | 'line'
+  lineKind?: 'line' | 'arrow'
+  x: number
+  y: number
+  width?: number
+  height?: number
+  rotation?: number
+  opacity?: number
+  cornerRadius?: number
+  /** Stroke/border (shape) or text color (text) or accent (paper). */
+  color?: string
+  fillColor?: string
+  strokeWidth?: number
+  shapeKind?: 'rect' | 'ellipse' | 'diamond'
+  content?: string
+  fontFamily?: string
+  fontSize?: number
+  bold?: boolean
+  italic?: boolean
+  textAlign?: 'left' | 'center' | 'right'
+}
+
 export const useCanvasStore = defineStore('canvas', () => {
   const canvasList = ref<CanvasIndexEntry[]>([])
   const currentCanvas = ref<Canvas | null>(null)
@@ -11,6 +37,40 @@ export const useCanvasStore = defineStore('canvas', () => {
   const loading = ref(false)
   const settingsSaving = ref(false)
   const settingsSaved = ref(false)
+
+  // ── Drawing selection (canvas ↔ properties panel) ──────────────────────────
+  const selectedNode = ref<DrawNodeSnapshot | null>(null)
+  // All currently selected node ids (multi-select batch operations).
+  const selectedNodeIds = ref<string[]>([])
+  // CanvasPanel watches this and applies the patch to the live Vue Flow node.
+  const pendingPatch = ref<{ nodeId: string; patch: Partial<DrawNodeSnapshot>; seq: number } | null>(null)
+  // Generic action channel for batch ops (align/distribute/z-order/duplicate/…).
+  const pendingAction = ref<{ type: string; payload?: unknown; seq: number } | null>(null)
+  let patchSeq = 0
+  let actionSeq = 0
+
+  /** Called by CanvasPanel to publish the selected node's current properties. */
+  function setSelectedNode(snap: DrawNodeSnapshot | null) {
+    selectedNode.value = snap
+  }
+
+  function setSelectedNodeIds(ids: string[]) {
+    selectedNodeIds.value = ids
+  }
+
+  /** Called by DrawTab to push a property change down to the canvas. */
+  function patchNode(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
+    pendingPatch.value = { nodeId, patch, seq: ++patchSeq }
+    // Optimistically reflect into the snapshot so inputs stay in sync.
+    if (selectedNode.value && selectedNode.value.nodeId === nodeId) {
+      selectedNode.value = { ...selectedNode.value, ...patch }
+    }
+  }
+
+  /** Called by DrawTab to request a canvas-level action on the selection. */
+  function requestAction(type: string, payload?: unknown) {
+    pendingAction.value = { type, payload, seq: ++actionSeq }
+  }
 
   // Debounce timer for auto-save
   let saveTimer: ReturnType<typeof setTimeout> | null = null
@@ -123,6 +183,14 @@ export const useCanvasStore = defineStore('canvas', () => {
     loading,
     settingsSaving,
     settingsSaved,
+    selectedNode,
+    selectedNodeIds,
+    pendingPatch,
+    pendingAction,
+    setSelectedNode,
+    setSelectedNodeIds,
+    patchNode,
+    requestAction,
     loadList,
     createCanvas,
     openCanvas,

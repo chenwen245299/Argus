@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, defineAsyncComponent } from 'vue'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
@@ -7,12 +7,17 @@ import { useLibraryStore } from './stores/library'
 import { useArxivStore } from './stores/arxiv'
 import { useSettingsStore } from './stores/settings'
 import { checkForUpdates } from './stores/update'
-import MainView from './views/MainView.vue'
-import ArxivView from './views/ArxivView.vue'
-import CanvasView from './views/CanvasView.vue'
-import LibraryChatView from './views/LibraryChatView.vue'
-import PaperAiView from './views/PaperAiView.vue'
-import NoteWindowView from './views/NoteWindowView.vue'
+
+// Async views: each window label renders exactly one view, so code-split them.
+// This keeps every window from loading all other windows' code (pdfjs, vue-flow,
+// vditor, llamaindex …) at startup.
+const MainView = defineAsyncComponent(() => import('./views/MainView.vue'))
+const ArxivView = defineAsyncComponent(() => import('./views/ArxivView.vue'))
+const CanvasView = defineAsyncComponent(() => import('./views/CanvasView.vue'))
+const LibraryChatView = defineAsyncComponent(() => import('./views/LibraryChatView.vue'))
+const EmbeddingMapView = defineAsyncComponent(() => import('./views/EmbeddingMapView.vue'))
+const PaperAiView = defineAsyncComponent(() => import('./views/PaperAiView.vue'))
+const NoteWindowView = defineAsyncComponent(() => import('./views/NoteWindowView.vue'))
 
 const libraryStore = useLibraryStore()
 const arxivStore = useArxivStore()
@@ -32,10 +37,11 @@ onMounted(async () => {
   try {
     windowLabel.value = getCurrentWebviewWindow().label
   } catch { /* running in browser/non-tauri */ }
-  try {
-    const currentLibrary = await invoke<string | null>('get_current_library')
-    if (currentLibrary) await settingsStore.load()
-  } catch { /* no library available yet */ }
+  // Settings and library init are independent — run them concurrently instead
+  // of serially awaiting three IPC round-trips before first paint.
+  invoke<string | null>('get_current_library')
+    .then((currentLibrary) => { if (currentLibrary) return settingsStore.load() })
+    .catch(() => { /* no library available yet */ })
   // All windows except arXiv need the library store initialized
   if (windowLabel.value !== 'arxiv') {
     libraryStore.initialize()
@@ -53,6 +59,7 @@ onMounted(async () => {
     <ArxivView v-if="windowLabel === 'arxiv'" />
     <CanvasView v-else-if="windowLabel === 'canvas'" />
     <LibraryChatView v-else-if="windowLabel === 'library-chat'" />
+    <EmbeddingMapView v-else-if="windowLabel === 'embedding-map'" />
     <PaperAiView v-else-if="windowLabel === 'paper-ai'" />
     <NoteWindowView v-else-if="windowLabel.startsWith('note-window')" />
     <MainView v-else />

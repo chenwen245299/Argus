@@ -21,6 +21,22 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Convert a raw user query into a safe FTS5 MATCH expression.
+///
+/// Each whitespace-separated term is wrapped as an FTS5 string literal (double
+/// quotes, with embedded quotes doubled). Without this, characters that FTS5
+/// treats specially — `:`, `*`, `-`, `(`, `^`, a bare `AND`/`OR`/`NOT`, or an
+/// unbalanced quote — raise a syntax error, which the frontend silently swallows
+/// (the search just appears to do nothing). Terms are space-joined, preserving
+/// the previous implicit-AND multi-word behaviour.
+fn escape_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn db_path(root: &str) -> std::path::PathBuf {
     Path::new(root).join(".argus").join("search.db")
 }
@@ -224,6 +240,13 @@ pub fn search_fulltext(root: &str, query: &str) -> Result<Vec<SearchHit>, String
         return Ok(vec![]);
     }
 
+    // Escape into a valid FTS5 expression so special characters in the query
+    // (e.g. "C++", "foo:bar", an unbalanced quote) don't raise a syntax error.
+    let match_query = escape_fts_query(query);
+    if match_query.is_empty() {
+        return Ok(vec![]);
+    }
+
     let conn = get_or_recreate_db(root)?;
 
     // Use control-character markers so we can HTML-escape the full snippet text
@@ -247,7 +270,7 @@ pub fn search_fulltext(root: &str, query: &str) -> Result<Vec<SearchHit>, String
         .map_err(|e| format!("Prepare search: {e}"))?;
 
     let rows = stmt
-        .query_map(params![query], |row| {
+        .query_map(params![match_query], |row| {
             let paper_id: String = row.get(0)?;
             let slug: String = row.get(1)?;
             let title: String = row.get(2)?;

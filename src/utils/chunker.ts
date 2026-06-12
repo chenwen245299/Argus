@@ -1,10 +1,13 @@
-import { SentenceSplitter } from 'llamaindex'
+import type { SentenceSplitter } from 'llamaindex'
 import type { PaperVectorizeInput, ChunkInput } from '../types'
 
 let _splitter: SentenceSplitter | null = null
 
-function getSplitter(chunkSize: number, chunkOverlap: number): SentenceSplitter {
+// llamaindex is multi-MB; load it on first vectorization instead of at startup
+// (the static import defeated the manualChunks isolation in vite.config.ts).
+async function getSplitter(chunkSize: number, chunkOverlap: number): Promise<SentenceSplitter> {
   if (!_splitter || (_splitter as any).chunkSize !== chunkSize || (_splitter as any).chunkOverlap !== chunkOverlap) {
+    const { SentenceSplitter } = await import('llamaindex')
     _splitter = new SentenceSplitter({ chunkSize, chunkOverlap })
   }
   return _splitter
@@ -20,12 +23,12 @@ function getSplitter(chunkSize: number, chunkOverlap: number): SentenceSplitter 
  *  - highlights → one chunk per highlight (naturally short)
  *  - notes      → SentenceSplitter per note file
  */
-export function buildChunks(
+export async function buildChunks(
   input: PaperVectorizeInput,
   chunkSize: number,
   chunkOverlap: number,
-): ChunkInput[] {
-  const splitter = getSplitter(chunkSize, chunkOverlap)
+): Promise<ChunkInput[]> {
+  const splitter = await getSplitter(chunkSize, chunkOverlap)
   const chunks: ChunkInput[] = []
 
   // 1. Metadata – single chunk, no splitting

@@ -22,8 +22,8 @@ import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
 import '@vue-flow/controls/dist/style.css'
 import '@vue-flow/minimap/dist/style.css'
-import { marked } from 'marked'
-import { useCanvasStore } from '../stores/canvas'
+import { renderMarkdown } from '../utils/renderMarkdown'
+import { useCanvasStore, type DrawNodeSnapshot } from '../stores/canvas'
 import { useLibraryStore } from '../stores/library'
 import { useReaderStore } from '../stores/reader'
 import { useSelectionStore } from '../stores/selection'
@@ -32,6 +32,7 @@ import PaperNode from './canvas/PaperNode.vue'
 import AdjustableEdge from './canvas/AdjustableEdge.vue'
 import TextNode from './canvas/TextNode.vue'
 import ShapeNode from './canvas/ShapeNode.vue'
+import LineNode from './canvas/LineNode.vue'
 import SuggestPanel from './canvas/SuggestPanel.vue'
 import ExportDialog from './canvas/ExportDialog.vue'
 import type { PaperIndexEntry, CanvasNode as CNode, CanvasEdge as CEdge, SuggestedEdge, NodePosition } from '../types'
@@ -49,7 +50,7 @@ const emit = defineEmits<{
 
 // ── Vue Flow setup ────────────────────────────────────────────────────────────
 
-const nodeTypes = markRaw({ paper: PaperNode, text: TextNode, shape: ShapeNode })
+const nodeTypes = markRaw({ paper: PaperNode, text: TextNode, shape: ShapeNode, line: LineNode })
 const edgeTypes = markRaw({ adjustable: AdjustableEdge })
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -66,20 +67,34 @@ const {
   removeNodes,
   removeEdges,
   onNodeDragStop,
+  onNodeDrag,
+  onNodeDragStart,
   getViewport,
   setViewport,
   fitView,
   screenToFlowCoordinate,
+  updateNode,
+  updateNodeData,
+  findNode,
+  getNodes,
+  getSelectedNodes,
+  addSelectedNodes,
+  removeSelectedNodes,
 } = useVueFlow()
 
 // ── Bottom toolbar tool state ─────────────────────────────────────────────────
-type CanvasTool = 'pointer' | 'text' | 'shape'
+type CanvasTool = 'pointer' | 'text' | 'shape' | 'line'
 type PointerDragMode = 'select' | 'pan'
+type ShapeKind = 'rect' | 'ellipse' | 'diamond'
+type LineKind = 'line' | 'arrow'
 const activeTool = ref<CanvasTool>('pointer')
 const pointerDragMode = ref<PointerDragMode>('select')
+const pendingShapeKind = ref<ShapeKind>('rect')
+const pendingLineKind = ref<LineKind>('arrow')
 const DEFAULT_SHAPE_WIDTH = 160
 const DEFAULT_SHAPE_HEIGHT = 100
 const MIN_SHAPE_SIZE = 12
+const isDraftTool = computed(() => activeTool.value === 'shape' || activeTool.value === 'line')
 
 type ShapeDraft = {
   startClientX: number
@@ -106,7 +121,27 @@ const pointerToolTitle = computed(() =>
 
 function selectTool(tool: CanvasTool) {
   activeTool.value = activeTool.value === tool ? 'pointer' : tool
-  if (activeTool.value !== 'shape') resetShapeDraft()
+  if (!isDraftTool.value) resetShapeDraft()
+}
+
+function selectShape(kind: ShapeKind) {
+  if (activeTool.value === 'shape' && pendingShapeKind.value === kind) {
+    activeTool.value = 'pointer'
+    resetShapeDraft()
+    return
+  }
+  pendingShapeKind.value = kind
+  activeTool.value = 'shape'
+}
+
+function selectLine(kind: LineKind) {
+  if (activeTool.value === 'line' && pendingLineKind.value === kind) {
+    activeTool.value = 'pointer'
+    resetShapeDraft()
+    return
+  }
+  pendingLineKind.value = kind
+  activeTool.value = 'line'
 }
 
 function selectPointerTool() {
@@ -158,6 +193,11 @@ function commitAnnotationEdit() {
 
 // ── Pane interactions → place text / draw shape node ─────────────────────────
 function onPaneClick(event: MouseEvent) {
+  // Clicking empty canvas deselects (so the properties panel clears).
+  if (activeTool.value === 'pointer') {
+    canvasStore.setSelectedNode(null)
+    return
+  }
   if (activeTool.value !== 'text') return
   const flowPos = screenToFlowCoordinate({ x: event.clientX, y: event.clientY })
   const nodeId = `node-${Date.now()}`
@@ -211,6 +251,42 @@ function addShapeFromDraft(draft: ShapeDraft) {
       nodeId,
       width,
       height,
+      shapeKind: pendingShapeKind.value,
+    },
+  }
+  addNodes([newNode])
+  triggerSave()
+}
+
+// Create a standalone line / arrow from a drag, storing its two endpoints as
+// offsets inside the node's bounding box.
+function addLineFromDraft(draft: ShapeDraft) {
+  const start = screenToFlowCoordinate({ x: draft.startClientX, y: draft.startClientY })
+  const end = screenToFlowCoordinate({ x: draft.currentClientX, y: draft.currentClientY })
+  // Ignore an accidental click with no drag.
+  if (Math.hypot(end.x - start.x, end.y - start.y) < MIN_SHAPE_SIZE) return
+
+  const minX = Math.min(start.x, end.x)
+  const minY = Math.min(start.y, end.y)
+  const width = Math.max(1, Math.abs(end.x - start.x))
+  const height = Math.max(1, Math.abs(end.y - start.y))
+
+  const nodeId = `node-${Date.now()}`
+  const newNode: VfNode = {
+    id: nodeId,
+    type: 'line',
+    position: { x: minX, y: minY },
+    data: {
+      nodeId,
+      lineKind: pendingLineKind.value,
+      color: '#1a1a1a',
+      strokeWidth: 2,
+      width,
+      height,
+      x1: start.x - minX,
+      y1: start.y - minY,
+      x2: end.x - minX,
+      y2: end.y - minY,
     },
   }
   addNodes([newNode])
@@ -245,13 +321,15 @@ function onShapeDraftPointerUp(event: PointerEvent) {
     currentClientX: event.clientX,
     currentClientY: event.clientY,
   }
+  const wasLine = activeTool.value === 'line'
   resetShapeDraft()
-  addShapeFromDraft(draft)
+  if (wasLine) addLineFromDraft(draft)
+  else addShapeFromDraft(draft)
   activeTool.value = 'pointer'
 }
 
 function onFlowPointerDown(event: PointerEvent) {
-  if (activeTool.value !== 'shape' || event.button !== 0 || !canStartShapeDraft(event)) return
+  if (!isDraftTool.value || event.button !== 0 || !canStartShapeDraft(event)) return
   event.preventDefault()
   event.stopPropagation()
   shapeDraft.value = {
@@ -451,12 +529,17 @@ function buildVfNodes(cnodes: CNode[]): VfNode[] {
         id: cn.node_id,
         type: 'text',
         position: { x: cn.x, y: cn.y },
+        zIndex: cn.z_index,
         data: {
           content: cn.content ?? '',
           color: cn.color,
           fontSize: cn.font_size,
           bold: cn.font_bold,
           italic: cn.font_italic,
+          fontFamily: cn.font_family,
+          textAlign: cn.text_align,
+          rotation: cn.rotation,
+          opacity: cn.opacity,
           nodeId: cn.node_id,
         },
       } satisfies VfNode
@@ -466,12 +549,39 @@ function buildVfNodes(cnodes: CNode[]): VfNode[] {
         id: cn.node_id,
         type: 'shape',
         position: { x: cn.x, y: cn.y },
+        zIndex: cn.z_index,
         data: {
           content: cn.content ?? '',
           color: cn.color,
+          fillColor: cn.fill_color,
           nodeId: cn.node_id,
           width: cn.width,
           height: cn.height,
+          shapeKind: cn.shape_kind,
+          strokeWidth: cn.stroke_width,
+          cornerRadius: cn.corner_radius,
+          rotation: cn.rotation,
+          opacity: cn.opacity,
+        },
+      } satisfies VfNode
+    }
+    if (nt === 'line') {
+      return {
+        id: cn.node_id,
+        type: 'line',
+        position: { x: cn.x, y: cn.y },
+        zIndex: cn.z_index,
+        data: {
+          nodeId: cn.node_id,
+          lineKind: cn.line_kind ?? 'arrow',
+          color: cn.color,
+          strokeWidth: cn.stroke_width,
+          width: cn.width,
+          height: cn.height,
+          x1: cn.line_points?.[0]?.x ?? 0,
+          y1: cn.line_points?.[0]?.y ?? 0,
+          x2: cn.line_points?.[1]?.x ?? (cn.width ?? 0),
+          y2: cn.line_points?.[1]?.y ?? (cn.height ?? 0),
         },
       } satisfies VfNode
     }
@@ -480,6 +590,7 @@ function buildVfNodes(cnodes: CNode[]): VfNode[] {
       id: cn.node_id,
       type: 'paper',
       position: { x: cn.x, y: cn.y },
+        zIndex: cn.z_index,
       data: {
         title: paper?.title ?? '???',
         authors: paper?.authors ?? [],
@@ -532,12 +643,33 @@ function extractCanvasNodes(): CNode[] {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const d = n.data as any
     const nt = n.type as string
+    if (nt === 'line') {
+      return {
+        node_id: n.id,
+        paper_id: '',
+        x: n.position.x,
+        y: n.position.y,
+        z_index: Number.isFinite(n.zIndex) ? (n.zIndex as number) : undefined,
+        color: d.color as string | undefined,
+        hover_source: undefined,
+        node_type: 'line',
+        width: Number.isFinite(d.width) ? d.width : undefined,
+        height: Number.isFinite(d.height) ? d.height : undefined,
+        stroke_width: Number.isFinite(d.strokeWidth) ? d.strokeWidth : undefined,
+        line_kind: d.lineKind as 'line' | 'arrow' | undefined,
+        line_points: [
+          { x: (d.x1 as number) ?? 0, y: (d.y1 as number) ?? 0 },
+          { x: (d.x2 as number) ?? 0, y: (d.y2 as number) ?? 0 },
+        ],
+      }
+    }
     if (nt === 'text' || nt === 'shape') {
       return {
         node_id: n.id,
         paper_id: '',
         x: n.position.x,
         y: n.position.y,
+        z_index: Number.isFinite(n.zIndex) ? (n.zIndex as number) : undefined,
         color: d.color as string | undefined,
         hover_source: undefined,
         node_type: nt,
@@ -545,8 +677,16 @@ function extractCanvasNodes(): CNode[] {
         font_size: nt === 'text' ? (d.fontSize as number | undefined) : undefined,
         font_bold: nt === 'text' ? (d.bold as boolean | undefined) : undefined,
         font_italic: nt === 'text' ? (d.italic as boolean | undefined) : undefined,
+        font_family: nt === 'text' ? (d.fontFamily as string | undefined) : undefined,
+        text_align: nt === 'text' ? (d.textAlign as 'left' | 'center' | 'right' | undefined) : undefined,
         width: nt === 'shape' && Number.isFinite(d.width) ? d.width : undefined,
         height: nt === 'shape' && Number.isFinite(d.height) ? d.height : undefined,
+        shape_kind: nt === 'shape' ? (d.shapeKind as 'rect' | 'ellipse' | 'diamond' | undefined) : undefined,
+        fill_color: nt === 'shape' ? (d.fillColor as string | undefined) : undefined,
+        stroke_width: nt === 'shape' && Number.isFinite(d.strokeWidth) ? d.strokeWidth : undefined,
+        corner_radius: nt === 'shape' && Number.isFinite(d.cornerRadius) ? d.cornerRadius : undefined,
+        rotation: Number.isFinite(d.rotation) ? d.rotation : undefined,
+        opacity: Number.isFinite(d.opacity) ? d.opacity : undefined,
       }
     }
     return {
@@ -614,6 +754,7 @@ async function renderCanvas() {
 watch(
   () => canvasStore.currentCanvas?.id,
   async (id) => {
+    canvasStore.setSelectedNode(null)
     if (id) await renderCanvas()
     else { nodes.value = []; edges.value = [] }
   },
@@ -670,7 +811,73 @@ onConnect((params: Connection) => {
   triggerSave()
 })
 
-onNodeDragStop(() => { triggerSave() })
+// ── Smart alignment guides / snapping ─────────────────────────────────────────
+// Guide lines are stored in container pixels (flow coord * zoom + viewport offset).
+const snapGuides = ref<{ vertical: boolean; pos: number }[]>([])
+const SNAP_PX = 6 // screen-space snap threshold
+let isDraggingNode = false
+
+onNodeDragStart(() => {
+  isDraggingNode = true
+  snapGuides.value = []
+  clearHoverTooltip() // never show the hover preview card while dragging
+})
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+onNodeDrag(({ node }: { node: any }) => {
+  // Only snap a single dragged node (multi-drag would desync the group).
+  if (canvasStore.selectedNodeIds.length > 1) { snapGuides.value = []; return }
+  const g = findNode(node.id)
+  if (!g) return
+  const w = g.dimensions?.width ?? 0
+  const h = g.dimensions?.height ?? 0
+  const x = node.position.x
+  const y = node.position.y
+  const vp = getViewport()
+  const th = SNAP_PX / Math.max(vp.zoom, 1e-4) // threshold in flow units
+
+  const others = getNodes.value.filter(n => n.id !== node.id)
+  const dragXs = [x, x + w / 2, x + w]
+  const dragYs = [y, y + h / 2, y + h]
+
+  let bestDX = 0, bestAbsX = th, lineX: number | null = null
+  let bestDY = 0, bestAbsY = th, lineY: number | null = null
+  for (const o of others) {
+    const ow = o.dimensions?.width ?? 0
+    const oh = o.dimensions?.height ?? 0
+    for (const t of [o.position.x, o.position.x + ow / 2, o.position.x + ow]) {
+      for (const d of dragXs) {
+        const diff = t - d
+        if (Math.abs(diff) < bestAbsX) { bestAbsX = Math.abs(diff); bestDX = diff; lineX = t }
+      }
+    }
+    for (const t of [o.position.y, o.position.y + oh / 2, o.position.y + oh]) {
+      for (const d of dragYs) {
+        const diff = t - d
+        if (Math.abs(diff) < bestAbsY) { bestAbsY = Math.abs(diff); bestDY = diff; lineY = t }
+      }
+    }
+  }
+
+  if (lineX !== null || lineY !== null) {
+    updateNode(node.id, {
+      position: { x: lineX !== null ? x + bestDX : x, y: lineY !== null ? y + bestDY : y },
+    })
+  }
+  const guides: { vertical: boolean; pos: number }[] = []
+  if (lineX !== null) guides.push({ vertical: true, pos: lineX * vp.zoom + vp.x })
+  if (lineY !== null) guides.push({ vertical: false, pos: lineY * vp.zoom + vp.y })
+  snapGuides.value = guides
+})
+
+onNodeDragStop(() => {
+  isDraggingNode = false
+  snapGuides.value = []
+  triggerSave()
+  // Reflect the new position in the properties panel.
+  const sel = canvasStore.selectedNode
+  if (sel) publishSelection(sel.nodeId)
+})
 
 // ── Resolve paper → emit + select in store ────────────────────────────────────
 
@@ -694,9 +901,258 @@ function openPaperById(paperId: string) {
 // ── Paper node click → select in right sidebar ────────────────────────────────
 
 function onNodeClick(event: NodeMouseEvent) {
-  if (event.node.type === 'text' || event.node.type === 'shape') return
+  // Selection itself is published via onSelectionChange; here we only do the
+  // paper-node side effect (select the paper in the library).
+  if (event.node.type !== 'paper') return
   const paperId = event.node.data?.paperId as string | undefined
   if (paperId) selectPaperById(paperId)
+}
+
+// Keep the properties panel & multi-select state in sync with Vue Flow.
+watch(getSelectedNodes, (sel) => {
+  const ids = sel.map(n => n.id)
+  canvasStore.setSelectedNodeIds(ids)
+  canvasStore.setSelectedNode(ids.length === 1 ? snapshotFromVf(sel[0]) : null)
+})
+
+// ── Selection ↔ properties panel (DrawTab) sync ───────────────────────────────
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function snapshotFromVf(n: any): DrawNodeSnapshot {
+  const d = n.data ?? {}
+  const type = (n.type ?? 'paper') as 'paper' | 'text' | 'shape' | 'line'
+  return {
+    nodeId: n.id,
+    type,
+    lineKind: d.lineKind,
+    x: Math.round(n.position.x),
+    y: Math.round(n.position.y),
+    width: Number.isFinite(d.width) ? Math.round(d.width) : undefined,
+    height: Number.isFinite(d.height) ? Math.round(d.height) : undefined,
+    rotation: d.rotation,
+    opacity: d.opacity,
+    cornerRadius: d.cornerRadius,
+    color: d.color,
+    fillColor: d.fillColor,
+    strokeWidth: d.strokeWidth,
+    shapeKind: d.shapeKind,
+    content: d.content,
+    fontFamily: d.fontFamily,
+    fontSize: d.fontSize,
+    bold: d.bold,
+    italic: d.italic,
+    textAlign: d.textAlign,
+  }
+}
+
+function publishSelection(nodeId: string) {
+  const n = findNode(nodeId)
+  canvasStore.setSelectedNode(n ? snapshotFromVf(n) : null)
+}
+
+// Apply a property change coming from the DrawTab panel onto the live node.
+function applyNodePatch(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const dataPatch: Record<string, any> = {}
+  let posX: number | undefined
+  let posY: number | undefined
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue
+    if (k === 'x') posX = v as number
+    else if (k === 'y') posY = v as number
+    else if (k === 'nodeId' || k === 'type') continue
+    else dataPatch[k] = v
+  }
+  if (Object.keys(dataPatch).length) updateNodeData(nodeId, dataPatch)
+  if (posX !== undefined || posY !== undefined) {
+    const n = findNode(nodeId)
+    if (n) {
+      updateNode(nodeId, {
+        position: { x: posX ?? n.position.x, y: posY ?? n.position.y },
+      })
+    }
+  }
+  triggerSave()
+}
+
+watch(
+  () => canvasStore.pendingPatch,
+  (p) => {
+    if (!p) return
+    applyNodePatch(p.nodeId, p.patch)
+  }
+)
+
+// ── Batch operations (multi-select) ───────────────────────────────────────────
+
+interface NodeBox { id: string; x: number; y: number; w: number; h: number }
+
+function selectedBoxes(): NodeBox[] {
+  return canvasStore.selectedNodeIds
+    .map(id => findNode(id))
+    .filter((n): n is NonNullable<typeof n> => !!n)
+    .map(n => ({
+      id: n.id,
+      x: n.position.x,
+      y: n.position.y,
+      w: n.dimensions?.width ?? 0,
+      h: n.dimensions?.height ?? 0,
+    }))
+}
+
+function refreshSelectionSnapshot() {
+  const ids = canvasStore.selectedNodeIds
+  if (ids.length === 1) {
+    const n = findNode(ids[0])
+    if (n) canvasStore.setSelectedNode(snapshotFromVf(n))
+  }
+}
+
+type AlignDir = 'left' | 'hcenter' | 'right' | 'top' | 'vcenter' | 'bottom'
+function alignNodes(dir: AlignDir) {
+  const boxes = selectedBoxes()
+  if (boxes.length < 2) return
+  const minX = Math.min(...boxes.map(b => b.x))
+  const maxX = Math.max(...boxes.map(b => b.x + b.w))
+  const minY = Math.min(...boxes.map(b => b.y))
+  const maxY = Math.max(...boxes.map(b => b.y + b.h))
+  const cx = (minX + maxX) / 2
+  const cy = (minY + maxY) / 2
+  for (const b of boxes) {
+    let x = b.x, y = b.y
+    if (dir === 'left') x = minX
+    else if (dir === 'right') x = maxX - b.w
+    else if (dir === 'hcenter') x = cx - b.w / 2
+    else if (dir === 'top') y = minY
+    else if (dir === 'bottom') y = maxY - b.h
+    else if (dir === 'vcenter') y = cy - b.h / 2
+    updateNode(b.id, { position: { x, y } })
+  }
+  triggerSave()
+  refreshSelectionSnapshot()
+}
+
+function distributeNodes(axis: 'h' | 'v') {
+  const boxes = selectedBoxes()
+  if (boxes.length < 3) return
+  if (axis === 'h') {
+    boxes.sort((a, b) => a.x - b.x)
+    const left = boxes[0].x
+    const step = (boxes[boxes.length - 1].x - left) / (boxes.length - 1)
+    boxes.forEach((b, i) => updateNode(b.id, { position: { x: left + step * i, y: b.y } }))
+  } else {
+    boxes.sort((a, b) => a.y - b.y)
+    const top = boxes[0].y
+    const step = (boxes[boxes.length - 1].y - top) / (boxes.length - 1)
+    boxes.forEach((b, i) => updateNode(b.id, { position: { x: b.x, y: top + step * i } }))
+  }
+  triggerSave()
+  refreshSelectionSnapshot()
+}
+
+function setZOrder(mode: 'front' | 'back') {
+  const ids = canvasStore.selectedNodeIds
+  if (!ids.length) return
+  const zs = getNodes.value.map(n => n.zIndex ?? 0)
+  const target = mode === 'front' ? Math.max(0, ...zs) + 1 : Math.min(0, ...zs) - 1
+  ids.forEach(id => updateNode(id, { zIndex: target }))
+  triggerSave()
+}
+
+function batchPatch(patch: Partial<DrawNodeSnapshot>) {
+  const ids = canvasStore.selectedNodeIds
+  if (!ids.length) return
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const dataPatch: Record<string, any> = {}
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined || k === 'x' || k === 'y' || k === 'nodeId' || k === 'type') continue
+    dataPatch[k] = v
+  }
+  if (!Object.keys(dataPatch).length) return
+  ids.forEach(id => updateNodeData(id, dataPatch))
+  triggerSave()
+  refreshSelectionSnapshot()
+}
+
+function newNodeId(i = 0): string {
+  return `node-${Date.now()}-${Math.floor(Math.random() * 1e6)}-${i}`
+}
+
+function selectOnly(ids: string[]) {
+  if (getSelectedNodes.value.length) removeSelectedNodes(getSelectedNodes.value)
+  const targets = ids.map(id => findNode(id)).filter((n): n is NonNullable<typeof n> => !!n)
+  if (targets.length) addSelectedNodes(targets)
+}
+
+function cloneCnodes(ids: string[], offset: number): CNode[] {
+  const idSet = new Set(ids)
+  return extractCanvasNodes()
+    .filter(c => idSet.has(c.node_id))
+    .map((c, i) => ({ ...c, node_id: newNodeId(i), x: c.x + offset, y: c.y + offset }))
+}
+
+function duplicateSelection() {
+  const clones = cloneCnodes(canvasStore.selectedNodeIds, 24)
+  if (!clones.length) return
+  addNodes(buildVfNodes(clones))
+  triggerSave()
+  nextTick(() => selectOnly(clones.map(c => c.node_id)))
+}
+
+// Clipboard for copy/paste (canvas-local).
+let clipboardCnodes: CNode[] = []
+function copySelection() {
+  const ids = new Set(canvasStore.selectedNodeIds)
+  clipboardCnodes = extractCanvasNodes().filter(c => ids.has(c.node_id))
+}
+function pasteClipboard() {
+  if (!clipboardCnodes.length) return
+  const clones = clipboardCnodes.map((c, i) => ({ ...c, node_id: newNodeId(i), x: c.x + 24, y: c.y + 24 }))
+  addNodes(buildVfNodes(clones))
+  triggerSave()
+  nextTick(() => selectOnly(clones.map(c => c.node_id)))
+}
+
+function deleteSelection() {
+  const ids = canvasStore.selectedNodeIds
+  if (!ids.length) return
+  removeNodes(ids)
+  triggerSave()
+  canvasStore.setSelectedNode(null)
+  canvasStore.setSelectedNodeIds([])
+}
+
+watch(
+  () => canvasStore.pendingAction,
+  (a) => {
+    if (!a) return
+    switch (a.type) {
+      case 'align': alignNodes(a.payload as AlignDir); break
+      case 'distribute': distributeNodes(a.payload as 'h' | 'v'); break
+      case 'zorder': setZOrder(a.payload as 'front' | 'back'); break
+      case 'batchPatch': batchPatch(a.payload as Partial<DrawNodeSnapshot>); break
+      case 'duplicate': duplicateSelection(); break
+      case 'copy': copySelection(); break
+      case 'paste': pasteClipboard(); break
+      case 'delete': deleteSelection(); break
+    }
+  }
+)
+
+// ── Keyboard shortcuts (canvas only) ──────────────────────────────────────────
+function onCanvasKeydown(e: KeyboardEvent) {
+  if (!canvasStore.isShown) return
+  const el = e.target as HTMLElement | null
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return
+  const meta = e.metaKey || e.ctrlKey
+  if (meta && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); duplicateSelection() }
+  else if (meta && (e.key === 'c' || e.key === 'C')) { copySelection() }
+  else if (meta && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); pasteClipboard() }
+  else if (meta && e.key === ']') { e.preventDefault(); setZOrder('front') }
+  else if (meta && e.key === '[') { e.preventDefault(); setZOrder('back') }
+  else if ((e.key === 'Delete' || e.key === 'Backspace') && canvasStore.selectedNodeIds.length) {
+    e.preventDefault(); deleteSelection()
+  }
 }
 
 function onNodeDblClick(event: NodeMouseEvent) {
@@ -758,7 +1214,7 @@ function clearHoverTooltip() {
 }
 
 function onNodeMouseEnter(event: NodeMouseEvent) {
-  if (ctxMenu.value.show) {
+  if (ctxMenu.value.show || isDraggingNode) {
     clearHoverTooltip()
     return
   }
@@ -768,7 +1224,7 @@ function onNodeMouseEnter(event: NodeMouseEvent) {
   if (hoverTimer) clearTimeout(hoverTimer)
   hoverTimer = setTimeout(async () => {
     hoverTimer = null
-    if (ctxMenu.value.show) return
+    if (ctxMenu.value.show || isDraggingNode) return
     hoverNodeId.value = nd.id
     hoverLoading.value = true
     hoverContent.value = ''
@@ -789,7 +1245,7 @@ function onNodeMouseLeave() {
 
 const renderedHoverContent = computed(() => {
   if (!hoverContent.value) return ''
-  return marked(hoverContent.value) as string
+  return renderMarkdown(hoverContent.value)
 })
 
 // ── Context menu ──────────────────────────────────────────────────────────────
@@ -1120,6 +1576,7 @@ onMounted(async () => {
   }
   await canvasStore.loadSettings()
   document.addEventListener('keydown', onKeydown)
+  document.addEventListener('keydown', onCanvasKeydown)
   document.addEventListener('pointerdown', onDocClick)
   window.addEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
   window.addEventListener('argus-canvas-notes-updated', onCanvasNotesUpdated)
@@ -1128,6 +1585,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   document.removeEventListener('keydown', onKeydown)
+  document.removeEventListener('keydown', onCanvasKeydown)
   document.removeEventListener('pointerdown', onDocClick)
   window.removeEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
   window.removeEventListener('argus-canvas-notes-updated', onCanvasNotesUpdated)
@@ -1261,7 +1719,7 @@ watch(() => library.papers, () => {
           :nodes-draggable="activeTool === 'pointer'"
           fit-view-on-init
           class="canvas-flow"
-          :class="{ 'tool-text': activeTool === 'text', 'tool-shape': activeTool === 'shape' }"
+          :class="{ 'tool-text': activeTool === 'text', 'tool-shape': activeTool === 'shape' || activeTool === 'line' }"
           @node-click="onNodeClick"
           @node-double-click="onNodeDblClick"
           @node-mouse-enter="onNodeMouseEnter"
@@ -1282,6 +1740,17 @@ watch(() => library.papers, () => {
           class="shape-draft-preview"
           :style="shapePreviewStyle"
         />
+
+        <!-- Smart alignment guides -->
+        <div class="snap-guides">
+          <div
+            v-for="(gd, i) in snapGuides"
+            :key="i"
+            class="snap-guide"
+            :class="gd.vertical ? 'snap-v' : 'snap-h'"
+            :style="gd.vertical ? { left: `${gd.pos}px` } : { top: `${gd.pos}px` }"
+          />
+        </div>
 
         <!-- Bottom center toolbar -->
         <div class="canvas-bottom-toolbar">
@@ -1315,12 +1784,53 @@ watch(() => library.papers, () => {
           </button>
           <button
             class="btb-btn"
-            :class="{ active: activeTool === 'shape' }"
+            :class="{ active: activeTool === 'shape' && pendingShapeKind === 'rect' }"
             title="矩形 (R)"
-            @click="selectTool('shape')"
+            @click="selectShape('rect')"
           >
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="3" y="5" width="18" height="14" rx="2"/>
+            </svg>
+          </button>
+          <button
+            class="btb-btn"
+            :class="{ active: activeTool === 'shape' && pendingShapeKind === 'ellipse' }"
+            title="椭圆"
+            @click="selectShape('ellipse')"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <ellipse cx="12" cy="12" rx="9" ry="7"/>
+            </svg>
+          </button>
+          <button
+            class="btb-btn"
+            :class="{ active: activeTool === 'shape' && pendingShapeKind === 'diamond' }"
+            title="菱形"
+            @click="selectShape('diamond')"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+              <path d="M12 3l9 9-9 9-9-9z"/>
+            </svg>
+          </button>
+          <div class="btb-sep" />
+          <button
+            class="btb-btn"
+            :class="{ active: activeTool === 'line' && pendingLineKind === 'line' }"
+            title="直线"
+            @click="selectLine('line')"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <line x1="5" y1="19" x2="19" y2="5"/>
+            </svg>
+          </button>
+          <button
+            class="btb-btn"
+            :class="{ active: activeTool === 'line' && pendingLineKind === 'arrow' }"
+            title="箭头"
+            @click="selectLine('arrow')"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="5" y1="19" x2="19" y2="5"/><path d="M11 5h8v8"/>
             </svg>
           </button>
         </div>
@@ -1654,7 +2164,7 @@ watch(() => library.papers, () => {
 }
 
 .canvas-toolbar {
-  height: 44px;
+  height: 40px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -1746,6 +2256,21 @@ watch(() => library.papers, () => {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
 }
+
+/* Smart alignment guides */
+.snap-guides {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 7;
+  overflow: hidden;
+}
+.snap-guide {
+  position: absolute;
+  background: #f0398b;
+}
+.snap-guide.snap-v { top: 0; bottom: 0; width: 1px; }
+.snap-guide.snap-h { left: 0; right: 0; height: 1px; }
 
 .layout-wrap { position: relative; }
 

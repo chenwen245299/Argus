@@ -58,21 +58,29 @@ async function syncMissing() {
 
   const s = ragStore.settings
   let done = 0, failed = 0
-  for (const paper of papers) {
-    if (syncCancelRequested) break
-    try {
-      const input = await invoke<PaperVectorizeInput>('get_paper_vectorize_input', { slug: paper.slug })
-      const chunks: ChunkInput[] = buildChunks(input, s.chunk_size ?? 512, s.chunk_overlap ?? 50)
-      if (chunks.length === 0) { failed++; syncProgress.value = { done, total: papers.length, failed }; continue }
-      await invoke('embed_and_store_chunks', {
-        slug: paper.slug, paperId: input.paper_id, paperTitle: input.paper_title, chunks,
-      })
-      paper.status.vectorized = true
-      done++
-    } catch { failed++ }
-    syncProgress.value = { done, total: papers.length, failed }
-    emitTo('main', 'rag-embed-progress', { syncing: true, done, total: papers.length }).catch(() => {})
-  }
+  // Small worker pool — embedding API latency dominates, so a few papers
+  // in flight at once give a near-linear speedup.
+  const CONCURRENCY = 3
+  const queue = [...papers]
+  const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+    while (!syncCancelRequested) {
+      const paper = queue.shift()
+      if (!paper) break
+      try {
+        const input = await invoke<PaperVectorizeInput>('get_paper_vectorize_input', { slug: paper.slug })
+        const chunks: ChunkInput[] = await buildChunks(input, s.chunk_size ?? 512, s.chunk_overlap ?? 50)
+        if (chunks.length === 0) { failed++; syncProgress.value = { done, total: papers.length, failed }; continue }
+        await invoke('embed_and_store_chunks', {
+          slug: paper.slug, paperId: input.paper_id, paperTitle: input.paper_title, chunks,
+        })
+        paper.status.vectorized = true
+        done++
+      } catch { failed++ }
+      syncProgress.value = { done, total: papers.length, failed }
+      emitTo('main', 'rag-embed-progress', { syncing: true, done, total: papers.length }).catch(() => {})
+    }
+  })
+  await Promise.all(workers)
   syncingMissing.value = false
   emitTo('main', 'rag-embed-progress', { syncing: false, done, total: papers.length }).catch(() => {})
   await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts()])
@@ -346,12 +354,27 @@ async function syncSnippets() {
   if (snippetSyncing.value || !ragStore.isConfigured) return
   snippetSyncing.value = true
   snippetSyncCancel = false
+  snippetSyncProgress.value = { done: 0, total: snippetTotalCount.value - snippetEmbeddedCount.value, failed: 0 }
+  // Live progress from the backend while batches are embedded
+  const unlistenProgress = await listen<{ done: number; failed: number; total: number }>(
+    'snippet-embed-progress',
+    (ev) => {
+      snippetSyncProgress.value = {
+        done: ev.payload.done,
+        total: ev.payload.total,
+        failed: ev.payload.failed,
+      }
+    },
+  )
   try {
     const [done, failed] = await invoke<[number, number]>('embed_all_snippets')
     snippetSyncProgress.value = { done, total: done + failed, failed }
     await loadSnippetStoreCounts()
   } catch { /* ignore */ }
-  finally { snippetSyncing.value = false }
+  finally {
+    unlistenProgress()
+    snippetSyncing.value = false
+  }
 }
 
 function openModelPicker(msgId: string, e: MouseEvent) {

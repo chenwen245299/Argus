@@ -10,6 +10,7 @@ import NotesTab from './tabs/NotesTab.vue'
 import HighlightsTab from './tabs/HighlightsTab.vue'
 import AnalysisTab from './tabs/AnalysisTab.vue'
 import TranslationHistoryTab from './tabs/TranslationHistoryTab.vue'
+import DrawTab from './tabs/DrawTab.vue'
 import type { PaperMeta } from '../types'
 
 const props = defineProps<{ activeTab: string }>()
@@ -82,8 +83,11 @@ async function onSlugChanged(newSlug: string) {
 
 <template>
   <div class="right-sidebar">
+    <!-- Drawing properties: canvas-scoped, independent of paper selection -->
+    <DrawTab v-if="props.activeTab === 'draw'" />
+
     <!-- Translation history: always available regardless of paper selection -->
-    <TranslationHistoryTab v-if="paperTab === 'translations'" />
+    <TranslationHistoryTab v-else-if="paperTab === 'translations'" />
 
     <template v-else-if="!activePaperSlug">
       <!-- No paper selected -->

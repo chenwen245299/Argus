@@ -9,18 +9,40 @@ export interface ShapeNodeData {
   fillColor?: string
   width?: number
   height?: number
+  shapeKind?: 'rect' | 'ellipse' | 'diamond'
+  strokeWidth?: number
+  cornerRadius?: number
+  rotation?: number
+  opacity?: number
 }
 
 const props = defineProps<NodeProps<ShapeNodeData>>()
 
 const borderColor = computed(() => props.data.color ?? 'var(--border-default)')
 const fillColor = computed(() => props.data.fillColor ?? 'transparent')
-const shapeStyle = computed(() => ({
-  width: `${props.data.width ?? 160}px`,
-  height: `${props.data.height ?? 100}px`,
-  borderColor: borderColor.value,
-  background: fillColor.value,
-}))
+const shapeKind = computed(() => props.data.shapeKind ?? 'rect')
+
+const shapeStyle = computed(() => {
+  const kind = shapeKind.value
+  const borderRadius =
+    kind === 'ellipse' ? '50%' : `${props.data.cornerRadius ?? 6}px`
+  const style: Record<string, string> = {
+    width: `${props.data.width ?? 160}px`,
+    height: `${props.data.height ?? 100}px`,
+    borderColor: borderColor.value,
+    borderWidth: `${props.data.strokeWidth ?? 2}px`,
+    background: fillColor.value,
+    borderRadius,
+    opacity: String(props.data.opacity ?? 1),
+  }
+  if (props.data.rotation) style.transform = `rotate(${props.data.rotation}deg)`
+  // A diamond is clipped; borders don't render through clip-path, so drop the radius.
+  if (kind === 'diamond') {
+    style.clipPath = 'polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)'
+    style.borderRadius = '0'
+  }
+  return style
+})
 </script>
 
 <template>

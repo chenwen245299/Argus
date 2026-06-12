@@ -167,6 +167,7 @@ pub fn run() {
             commands::save_rag_settings,
             commands::get_vector_store_info,
             commands::sync_vectorized_flags,
+            commands::delete_model_embeddings,
             // ── M7: Vectorization ──
             commands::vectorize_paper,
             commands::rebuild_vector_store,
@@ -185,6 +186,9 @@ pub fn run() {
             commands::focus_main_window,
             commands::save_chat_window_size,
             commands::save_paper_ai_window_size,
+            // ── Embedding map ──
+            commands::open_embedding_map_window,
+            commands::get_embedding_map,
             // ── Snippet RAG ──
             commands::get_snippet_store_info,
             commands::embed_all_snippets,

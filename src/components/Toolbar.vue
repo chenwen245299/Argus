@@ -9,6 +9,7 @@ import { useImportStore } from '../stores/import'
 import { useSelectionStore } from '../stores/selection'
 import { usePaperTasksStore, type AiSummaryJob } from '../stores/paperTasks'
 import { useCollectionsStore } from '../stores/collections'
+import { useRagStore } from '../stores/rag'
 import { titleInitialCaps } from '../utils/text'
 import type { SearchHit, Note } from '../types'
 import TokenUsageModal from './TokenUsageModal.vue'
@@ -19,6 +20,32 @@ const importStore = useImportStore()
 const selection = useSelectionStore()
 const paperTasks = usePaperTasksStore()
 const collectionsStore = useCollectionsStore()
+const ragStore = useRagStore()
+
+// Aggregate embed-vector progress across all running collection jobs so the
+// toolbar shows a single status chip while embeddings are being built.
+const embedJobAgg = computed(() => {
+  const jobs = Object.values(ragStore.collectionEmbedJobs)
+  if (!jobs.length) return null
+  let done = 0, total = 0, failed = 0, running = false
+  for (const j of jobs) {
+    done += j.done
+    total += j.total
+    failed += j.failed
+    if (j.status === 'running') running = true
+  }
+  return { done, total, failed, running }
+})
+
+const embedJobText = computed(() => {
+  const a = embedJobAgg.value
+  if (!a) return ''
+  const processed = a.done + a.failed
+  if (a.running) return t('toolbar.embedBuilding', { done: processed, total: a.total })
+  if (a.total === 0) return t('toolbar.embedUpToDate')
+  if (a.failed > 0) return t('toolbar.embedDoneFailed', { done: a.done, total: a.total, failed: a.failed })
+  return t('toolbar.embedDone', { done: a.done, total: a.total })
+})
 const { aiSummaryJobs, aiMetaSlug, aiMetaStage, abstractSlug } = storeToRefs(paperTasks)
 
 const props = defineProps<{
@@ -26,6 +53,7 @@ const props = defineProps<{
   rightSidebarOpen?: boolean
   rightSidebarWidth?: number
   sidebarTab?: string
+  canvasMode?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -35,7 +63,28 @@ const emit = defineEmits<{
 
 type SidebarTabDef = { id: string; paths: string[]; label: string }
 
-const sidebarTabs = computed((): SidebarTabDef[] => [
+const drawTabDef = computed((): SidebarTabDef => ({
+  id: 'draw',
+  label: t('toolbarTabs.draw'),
+  // pen / edit icon
+  paths: ['M12 19l7-7 3 3-7 7-3-3z', 'M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z', 'M2 2l7.586 7.586', 'M11 11a2 2 0 1 0 4 0 2 2 0 0 0-4 0z'],
+}))
+
+const sidebarTabs = computed((): SidebarTabDef[] => {
+  // In canvas/graph mode, hide PDF-only tabs (translations/highlights) and
+  // surface the drawing properties tab to the left of notes.
+  if (props.canvasMode) {
+    return baseSidebarTabs.value.filter(t => t.id === 'notes' || t.id === 'ai' || t.id === 'metadata')
+      .reduce<SidebarTabDef[]>((acc, t) => {
+        if (t.id === 'notes') acc.push(drawTabDef.value)
+        acc.push(t)
+        return acc
+      }, [])
+  }
+  return baseSidebarTabs.value
+})
+
+const baseSidebarTabs = computed((): SidebarTabDef[] => [
   {
     id: 'translations',
     label: t('toolbarTabs.translations'),
@@ -103,6 +152,62 @@ const rightReserveStyle = computed(() => ({
     : '40px',
 }))
 
+// ── Import dropdown menu ─────────────────────────────────────────────────────
+const showImportMenu = ref(false)
+
+function toggleImportMenu() {
+  if (showImportMenu.value) {
+    showImportMenu.value = false
+    return
+  }
+  showUrlPopover.value = false
+  showAiMenu.value = false
+  showImportMenu.value = true
+}
+
+// ── AI hub dropdown menu (arXiv + library chat) ─────────────────────────────
+const showAiMenu = ref(false)
+
+function toggleAiMenu() {
+  if (showAiMenu.value) {
+    showAiMenu.value = false
+    return
+  }
+  showImportMenu.value = false
+  showUrlPopover.value = false
+  showAiMenu.value = true
+}
+
+function chooseArxiv() {
+  showAiMenu.value = false
+  openArxiv()
+}
+
+function chooseLibraryChat() {
+  showAiMenu.value = false
+  openLibraryChat()
+}
+
+function chooseEmbeddingMap() {
+  showAiMenu.value = false
+  invoke('open_embedding_map_window').catch((e) => console.error('Open embedding map window:', e))
+}
+
+function chooseUsage() {
+  showAiMenu.value = false
+  showUsage.value = true
+}
+
+function chooseFileImport() {
+  showImportMenu.value = false
+  pickAndImport()
+}
+
+function chooseUrlImport() {
+  showImportMenu.value = false
+  openUrlPopover()
+}
+
 // ── URL import popover ───────────────────────────────────────────────────────
 const showUrlPopover = ref(false)
 const urlInput = ref('')
@@ -123,9 +228,16 @@ function closeUrlPopover() {
 }
 
 function onDocClick(e: MouseEvent) {
-  if (showUrlPopover.value) {
-    const wrap = document.querySelector('.url-import-wrap')
-    if (wrap && !wrap.contains(e.target as Node)) closeUrlPopover()
+  if (showUrlPopover.value || showImportMenu.value) {
+    const wrap = document.querySelector('.import-wrap')
+    if (wrap && !wrap.contains(e.target as Node)) {
+      closeUrlPopover()
+      showImportMenu.value = false
+    }
+  }
+  if (showAiMenu.value) {
+    const wrap = document.querySelector('.ai-hub-wrap')
+    if (wrap && !wrap.contains(e.target as Node)) showAiMenu.value = false
   }
   if (showBatchDetail.value) {
     const strip = document.querySelector('.batch-progress-strip')
@@ -398,49 +510,48 @@ const arxivWindowOpen = ref(false)
 const arxivAnalyzing = ref(false)
 const arxivFetching = ref(false)
 const arxivProgress = ref({ done: 0, total: 0 })
-const arxivLabelMode = ref<'name' | 'progress'>('name')
 let unlistenArxiv: UnlistenFn | null = null
 let unlistenArxivAnalysis: UnlistenFn | null = null
 let unlistenArxivFetch: UnlistenFn | null = null
 let unlistenArxivWinOpen: UnlistenFn | null = null
 let unlistenArxivWinClose: UnlistenFn | null = null
-let labelToggleTimer: ReturnType<typeof setInterval> | null = null
 let statusPollTimer: ReturnType<typeof setInterval> | null = null
 
 // RAG embed progress state
 const ragEmbedSyncing = ref(false)
 const ragEmbedProgress = ref({ done: 0, total: 0 })
-const ragLabelMode = ref<'name' | 'progress'>('name')
-let ragLabelToggleTimer: ReturnType<typeof setInterval> | null = null
 let unlistenRagEmbed: UnlistenFn | null = null
-
-watch(ragEmbedSyncing, (syncing) => {
-  if (syncing) {
-    if (!ragLabelToggleTimer) {
-      ragLabelMode.value = 'name'
-      ragLabelToggleTimer = setInterval(() => {
-        ragLabelMode.value = ragLabelMode.value === 'name' ? 'progress' : 'name'
-      }, 2200)
-    }
-  } else {
-    if (ragLabelToggleTimer) { clearInterval(ragLabelToggleTimer); ragLabelToggleTimer = null }
-    ragLabelMode.value = 'name'
-  }
-})
 
 const arxivBusy = computed(() => arxivAnalyzing.value || arxivFetching.value)
 
-watch(arxivBusy, (busy) => {
+// AI hub button: flips between its name and the active task's progress
+const aiBusy = computed(() => arxivBusy.value || ragEmbedSyncing.value)
+const aiLabelMode = ref<'name' | 'progress'>('name')
+let aiLabelToggleTimer: ReturnType<typeof setInterval> | null = null
+
+const aiProgressText = computed(() => {
+  if (arxivAnalyzing.value && arxivProgress.value.total > 0) {
+    return t('toolbar.arxivProgress', { done: arxivProgress.value.done, total: arxivProgress.value.total })
+  }
+  if (ragEmbedSyncing.value && ragEmbedProgress.value.total > 0) {
+    return t('toolbar.ragProgress', { done: ragEmbedProgress.value.done, total: ragEmbedProgress.value.total })
+  }
+  return ''
+})
+
+const aiShowName = computed(() => aiLabelMode.value === 'name' || !aiProgressText.value)
+
+watch(aiBusy, (busy) => {
   if (busy) {
-    if (!labelToggleTimer) {
-      arxivLabelMode.value = 'name'
-      labelToggleTimer = setInterval(() => {
-        arxivLabelMode.value = arxivLabelMode.value === 'name' ? 'progress' : 'name'
+    if (!aiLabelToggleTimer) {
+      aiLabelMode.value = 'name'
+      aiLabelToggleTimer = setInterval(() => {
+        aiLabelMode.value = aiLabelMode.value === 'name' ? 'progress' : 'name'
       }, 2200)
     }
   } else {
-    if (labelToggleTimer) { clearInterval(labelToggleTimer); labelToggleTimer = null }
-    arxivLabelMode.value = 'name'
+    if (aiLabelToggleTimer) { clearInterval(aiLabelToggleTimer); aiLabelToggleTimer = null }
+    aiLabelMode.value = 'name'
   }
 })
 
@@ -526,8 +637,7 @@ onUnmounted(() => {
   if (unlistenRagEmbed) unlistenRagEmbed()
   if (unlistenArxivWinOpen) unlistenArxivWinOpen()
   if (unlistenArxivWinClose) unlistenArxivWinClose()
-  if (labelToggleTimer) { clearInterval(labelToggleTimer); labelToggleTimer = null }
-  if (ragLabelToggleTimer) { clearInterval(ragLabelToggleTimer); ragLabelToggleTimer = null }
+  if (aiLabelToggleTimer) { clearInterval(aiLabelToggleTimer); aiLabelToggleTimer = null }
   if (statusPollTimer) { clearInterval(statusPollTimer); statusPollTimer = null }
   if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
   document.removeEventListener('pointerdown', onDocClick, true)
@@ -553,6 +663,10 @@ onUnmounted(() => {
         </svg>
       </button>
     </div>
+
+    <!-- Center: shrinkable section — clips horizontally so the right reserve
+         (and its border) stays aligned with the sidebar below on narrow windows -->
+    <div class="toolbar-center">
 
     <!-- Center: search -->
     <div v-if="library.currentPath" class="search-box">
@@ -633,6 +747,17 @@ onUnmounted(() => {
       <span v-if="hiddenPaperTaskCount" class="paper-task-more">+{{ hiddenPaperTaskCount }}</span>
     </div>
 
+    <!-- Embed-vector build progress (started from a collection's context menu) -->
+    <div v-if="embedJobAgg" class="embed-progress-strip">
+      <span class="paper-task-chip" :class="{ 'is-active': embedJobAgg.running }">
+        <span v-if="embedJobAgg.running" class="paper-task-spinner" />
+        <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+        <span class="paper-task-label">{{ embedJobText }}</span>
+      </span>
+    </div>
+
     <!-- Import status -->
     <div v-if="importStatusLabel" class="import-status">
       <span class="spinner" />
@@ -655,39 +780,49 @@ onUnmounted(() => {
       </svg>
     </div>
 
-    <!-- Import PDF -->
-    <button
-      v-if="library.currentPath"
-      class="btn-outline"
-      :disabled="activeJobs > 0 || !canImport"
-      :title="importTitle"
-      @click="pickAndImport"
-    >
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-        <polyline points="14 2 14 8 20 8"/>
-        <line x1="12" y1="18" x2="12" y2="12"/>
-        <polyline points="9 15 12 18 15 15"/>
-      </svg>
-      {{ t('import.fileImportBtn') }}
-    </button>
-
-    <!-- URL import -->
-    <div v-if="library.currentPath" class="url-import-wrap">
+    <!-- Import (file / URL) -->
+    <div v-if="library.currentPath" class="import-wrap">
       <button
         class="btn-outline"
         :disabled="activeJobs > 0 || !canImport"
-        :title="t('import.urlImportTitle')"
-        @click="openUrlPopover"
+        :title="importTitle"
+        @click="toggleImportMenu"
       >
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="12" y1="18" x2="12" y2="12"/>
+          <polyline points="9 15 12 18 15 15"/>
         </svg>
-        {{ t('import.urlImportBtn') }}
+        {{ t('import.btn') }}
+        <svg class="import-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
       </button>
 
-      <!-- Popover -->
+      <!-- Dropdown: choose import method -->
+      <Transition name="popover">
+        <div v-if="showImportMenu" class="import-menu">
+          <button class="import-menu-item" :title="t('import.btnTitle')" @click="chooseFileImport">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="12" y1="18" x2="12" y2="12"/>
+              <polyline points="9 15 12 18 15 15"/>
+            </svg>
+            {{ t('import.fileImportBtn') }}
+          </button>
+          <button class="import-menu-item" :title="t('import.urlImportTitle')" @click="chooseUrlImport">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+            </svg>
+            {{ t('import.urlImportBtn') }}
+          </button>
+        </div>
+      </Transition>
+
+      <!-- URL import popover -->
       <Transition name="popover">
         <div v-if="showUrlPopover" class="url-import-popover" @keydown.escape="closeUrlPopover">
           <div class="popover-header">
@@ -722,61 +857,82 @@ onUnmounted(() => {
     <!-- Divider -->
     <div class="tb-sep" />
 
-    <!-- arXiv -->
-    <button
-      v-if="library.currentPath"
-      class="tb-btn arxiv-btn rainbow-chip"
-      :class="{ 'arxiv-busy': arxivBusy }"
-      @click="openArxiv"
-      :title="t('toolbar.arxivTitle')"
-    >
-      <span v-if="arxivBusy" class="arxiv-pulse-dot" />
-      <Transition name="arxiv-flip" mode="out-in">
-        <span
-          v-if="arxivLabelMode === 'name' || arxivProgress.total === 0"
-          key="name"
-          class="arxiv-label-inner"
-        >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-            <path d="M2 17l10 5 10-5"/>
-            <path d="M2 12l10 5 10-5"/>
-          </svg>
-          <span class="rainbow-chip-label">ArXiv</span>
+    <!-- AI hub: arXiv recommendations + library chat -->
+    <div v-if="library.currentPath" class="ai-hub-wrap">
+      <button
+        class="tb-btn ai-hub-btn rainbow-chip"
+        :class="{ 'ai-busy': aiBusy }"
+        :title="t('toolbar.aiHubTitle')"
+        @click="toggleAiMenu"
+      >
+        <span v-if="aiBusy" class="arxiv-pulse-dot" />
+        <!-- Both states stay rendered (stacked) so the button width never
+             changes while flipping between name and progress -->
+        <span class="ai-flip-stack">
+          <span class="arxiv-label-inner ai-flip-item" :class="{ 'is-on': aiShowName }">
+            <!-- GitHub Copilot (octicon) -->
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M7.998 15.035c-4.562 0-7.873-2.914-7.998-3.749V9.338c.085-.628.677-1.686 1.588-2.065.013-.07.024-.143.036-.218.029-.183.06-.384.126-.612-.201-.508-.254-1.084-.254-1.656 0-.87.128-1.769.693-2.484.579-.733 1.494-1.124 2.724-1.261 1.206-.134 2.262.034 2.944.765.05.053.096.108.139.165.044-.057.094-.112.143-.165.682-.731 1.738-.899 2.944-.765 1.23.137 2.145.528 2.724 1.261.566.715.693 1.614.693 2.484 0 .572-.053 1.148-.254 1.656.066.228.098.429.126.612.012.076.024.148.037.218.924.385 1.522 1.471 1.591 2.095v1.872c0 .766-3.351 3.795-8.002 3.795Zm0-1.485c2.28 0 4.584-1.11 5.002-1.433V7.862l-.023-.116c-.49.21-1.075.291-1.727.291-1.146 0-2.059-.327-2.71-.991A3.222 3.222 0 0 1 8 6.303a3.24 3.24 0 0 1-.544.743c-.65.664-1.563.991-2.71.991-.652 0-1.236-.081-1.727-.291l-.023.116v4.255c.419.323 2.722 1.433 5.002 1.433ZM6.762 2.83c-.193-.206-.637-.413-1.682-.297-1.019.113-1.479.404-1.713.7-.247.312-.369.789-.369 1.554 0 .793.129 1.171.308 1.371.162.181.519.379 1.442.379.853 0 1.339-.235 1.638-.54.315-.322.527-.827.617-1.553.117-.935-.037-1.395-.241-1.614Zm4.155-.297c-1.044-.116-1.488.091-1.681.297-.204.219-.359.679-.242 1.614.091.726.303 1.231.618 1.553.299.305.784.54 1.638.54.922 0 1.28-.198 1.442-.379.179-.2.308-.578.308-1.371 0-.765-.123-1.242-.37-1.554-.233-.296-.693-.587-1.713-.7Z"/>
+              <path d="M6.25 9.037a.75.75 0 0 1 .75.75v1.501a.75.75 0 0 1-1.5 0V9.787a.75.75 0 0 1 .75-.75Zm4.25.75v1.501a.75.75 0 0 1-1.5 0V9.787a.75.75 0 0 1 1.5 0Z"/>
+            </svg>
+            <span class="rainbow-chip-label">{{ t('toolbar.aiHub') }}</span>
+          </span>
+          <span class="arxiv-label-inner arxiv-progress-text ai-flip-item" :class="{ 'is-on': !aiShowName }">
+            {{ aiProgressText }}
+          </span>
         </span>
-        <span v-else key="progress" class="arxiv-label-inner arxiv-progress-text">
-          {{ arxivProgress.done }}/{{ arxivProgress.total }}
-        </span>
-      </Transition>
-      <span v-if="!arxivWindowOpen && arxivNewCount > 0" class="arxiv-badge">{{ arxivNewCount }}</span>
-    </button>
+        <svg class="import-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
+        <span v-if="!arxivWindowOpen && arxivNewCount > 0" class="arxiv-badge">{{ arxivNewCount }}</span>
+      </button>
 
-    <button
-      v-if="library.currentPath"
-      class="tb-btn library-chat-btn rainbow-chip"
-      :class="{ 'rag-busy': ragEmbedSyncing }"
-      :title="t('toolbar.libraryChatTitle')"
-      @click="openLibraryChat"
-    >
-      <span v-if="ragEmbedSyncing" class="arxiv-pulse-dot" />
-      <Transition name="arxiv-flip" mode="out-in">
-        <span
-          v-if="ragLabelMode === 'name' || ragEmbedProgress.total === 0"
-          key="name"
-          class="arxiv-label-inner"
-        >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
-            <path d="M8 9h8"/>
-            <path d="M8 13h5"/>
-          </svg>
-          <span class="rainbow-chip-label">{{ t('toolbar.libraryChat') }}</span>
-        </span>
-        <span v-else key="progress" class="arxiv-label-inner arxiv-progress-text">
-          {{ ragEmbedProgress.done }}/{{ ragEmbedProgress.total }}
-        </span>
+      <!-- Dropdown: arXiv / library chat -->
+      <Transition name="popover">
+        <div v-if="showAiMenu" class="import-menu ai-hub-menu">
+          <button class="import-menu-item" :title="t('toolbar.arxivTitle')" @click="chooseArxiv">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+              <path d="M2 17l10 5 10-5"/>
+              <path d="M2 12l10 5 10-5"/>
+            </svg>
+            {{ t('toolbar.arxivMenuItem') }}
+            <span v-if="!arxivWindowOpen && arxivNewCount > 0" class="menu-badge">{{ arxivNewCount }}</span>
+            <span v-else-if="arxivAnalyzing && arxivProgress.total > 0" class="menu-meta">{{ arxivProgress.done }}/{{ arxivProgress.total }}</span>
+          </button>
+          <button class="import-menu-item" :title="t('toolbar.libraryChatTitle')" @click="chooseLibraryChat">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
+              <path d="M8 9h8"/>
+              <path d="M8 13h5"/>
+            </svg>
+            {{ t('toolbar.libraryChat') }}
+            <span v-if="ragEmbedSyncing && ragEmbedProgress.total > 0" class="menu-meta">{{ ragEmbedProgress.done }}/{{ ragEmbedProgress.total }}</span>
+          </button>
+          <button class="import-menu-item" :title="t('toolbar.embeddingMapTitle')" @click="chooseEmbeddingMap">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <circle cx="5.5" cy="6" r="2.6"/>
+              <circle cx="18" cy="5" r="2.2"/>
+              <circle cx="12" cy="13.5" r="2.8"/>
+              <circle cx="6" cy="19" r="2"/>
+              <circle cx="19" cy="18" r="2.4"/>
+              <path d="M7.8 7.5 10 11.4M14.6 12.2 16.4 6.9M10 15.6 7.3 17.5M14.5 15 17 16.6"/>
+            </svg>
+            {{ t('toolbar.embeddingMap') }}
+          </button>
+          <div class="menu-divider" />
+          <button class="import-menu-item" :title="t('toolbar.aiUsageTitle')" @click="chooseUsage">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <ellipse cx="12" cy="6" rx="7" ry="3"/>
+              <path d="M5 6v5c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/>
+              <path d="M5 11v5c0 1.7 3.1 3 7 3 1.3 0 2.5-.1 3.5-.4"/>
+              <path d="M18.5 14.5l.5 1.2 1.2.5-1.2.5-.5 1.2-.5-1.2-1.2-.5 1.2-.5.5-1.2z"/>
+            </svg>
+            {{ t('toolbar.aiUsage') }}
+          </button>
+        </div>
       </Transition>
-    </button>
+    </div>
 
     <div v-if="library.currentPath" class="tb-sep global-feature-sep" />
 
@@ -804,24 +960,7 @@ onUnmounted(() => {
       <span class="batch-btn-label">{{ batchStopping ? t('toolbar.batchStopping') : batchRunning ? t('toolbar.batchStop') : t('toolbar.batchAnalysis') }}</span>
     </button>
 
-    <div v-if="library.currentPath" class="tb-sep" />
-
-    <!-- Token usage button -->
-    <button
-      v-if="library.currentPath"
-      class="tb-btn usage-btn"
-      :title="t('toolbar.aiUsageTitle')"
-      :aria-label="t('toolbar.aiUsageTitle')"
-      @click="showUsage = true"
-    >
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <ellipse cx="12" cy="6" rx="7" ry="3"/>
-        <path d="M5 6v5c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/>
-        <path d="M5 11v5c0 1.7 3.1 3 7 3 1.3 0 2.5-.1 3.5-.4"/>
-        <path d="M18.5 14.5l.5 1.2 1.2.5-1.2.5-.5 1.2-.5-1.2-1.2-.5 1.2-.5.5-1.2z"/>
-      </svg>
-      <span class="usage-label">{{ t('toolbar.aiUsage') }}</span>
-    </button>
+    </div><!-- /toolbar-center -->
 
     <!-- Token usage modal -->
     <Teleport to="body">
@@ -979,6 +1118,22 @@ onUnmounted(() => {
 
 .spacer { flex: 1; min-width: 12px; }
 
+/* Shrinkable middle section: clips its own overflow (horizontally only) so the
+   fixed-width right reserve never gets pushed past the window edge — keeps the
+   reserve border aligned with the right sidebar below on narrow windows.
+   justify-content: flex-end keeps the action buttons visible and lets the
+   search box clip first. */
+.toolbar-center {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  overflow-x: clip;
+  overflow-y: visible;
+}
+
 .paper-task-strip {
   display: flex;
   align-items: center;
@@ -987,6 +1142,12 @@ onUnmounted(() => {
   min-width: 0;
   max-width: min(520px, 36vw);
   flex: 0 1 auto;
+}
+
+.embed-progress-strip {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
 }
 
 .paper-task-chip {
@@ -1126,26 +1287,65 @@ onUnmounted(() => {
   margin: 0 4px;
   flex-shrink: 0;
 }
-.toolbar > .tb-sep {
+.toolbar-center > .tb-sep {
   height: 24px;
   background: color-mix(in srgb, var(--text-tertiary) 34%, transparent);
 }
 
-/* arXiv button */
-.arxiv-btn {
-  width: 82px;
-  padding: 0 12px;
-  gap: 5px;
+/* AI hub button (merged arXiv + library chat) */
+.ai-hub-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.ai-hub-btn {
+  width: auto;
+  padding: 0 10px;
+  gap: 4px;
   position: relative;
   color: var(--text-secondary);
   overflow: hidden;
 }
 
-.arxiv-btn.arxiv-busy {
+.ai-hub-btn.ai-busy {
   animation: arxiv-breathe 1.8s ease-in-out infinite;
 }
-.library-chat-btn.rag-busy {
-  animation: arxiv-breathe 1.8s ease-in-out infinite;
+
+.ai-hub-menu {
+  min-width: 188px;
+}
+
+.menu-badge {
+  margin-left: auto;
+  min-width: 16px;
+  height: 15px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 8px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.menu-meta {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.menu-divider {
+  height: 1px;
+  background: var(--border-subtle);
+  margin: 3px 6px;
+  flex-shrink: 0;
 }
 @keyframes arxiv-breathe {
   0%, 100% { box-shadow: 0 0 0 0 rgba(255, 77, 125, 0); }
@@ -1153,6 +1353,9 @@ onUnmounted(() => {
 }
 
 .arxiv-pulse-dot {
+  /* corner indicator: out of flex flow so it never affects button width */
+  position: absolute;
+  top: 4px; left: 6px;
   width: 6px; height: 6px;
   border-radius: 50%;
   background: #ff4d7d;
@@ -1176,16 +1379,21 @@ onUnmounted(() => {
   color: transparent;
 }
 
-.arxiv-flip-enter-active,
-.arxiv-flip-leave-active { transition: opacity 0.22s ease, transform 0.22s ease; }
-.arxiv-flip-enter-from   { opacity: 0; transform: translateY(6px); }
-.arxiv-flip-leave-to     { opacity: 0; transform: translateY(-6px); }
-.library-chat-btn {
-  width: 104px;
-  padding: 0 12px;
-  gap: 5px;
-  color: var(--text-secondary);
-  overflow: hidden;
+/* Name/progress flip: both layers stay in the grid so the wider one defines
+   a stable button width — flipping never resizes the button */
+.ai-flip-stack {
+  display: inline-grid;
+  align-items: center;
+  justify-items: center;
+}
+.ai-flip-item {
+  grid-area: 1 / 1;
+  transition: opacity 0.22s ease, transform 0.22s ease;
+}
+.ai-flip-item:not(.is-on) {
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
 }
 .batch-progress-strip {
   position: relative;
@@ -1328,30 +1536,6 @@ onUnmounted(() => {
   font-size: var(--font-size-sm);
 }
 
-.usage-btn {
-  width: auto;
-  min-width: 0;
-  height: auto;
-  min-height: 0;
-  box-sizing: border-box;
-  padding: 4px 12px;
-  gap: 5px;
-  line-height: normal;
-  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border-default));
-  border-radius: var(--radius-pill);
-  background: var(--bg-secondary);
-  color: color-mix(in srgb, var(--accent) 76%, #64748b);
-  flex-shrink: 0;
-}
-.usage-btn:hover {
-  color: color-mix(in srgb, var(--accent) 82%, #475569);
-  border-color: color-mix(in srgb, var(--accent) 46%, var(--border-default));
-  background: color-mix(in srgb, var(--accent) 9%, var(--bg-secondary));
-}
-.usage-label {
-  font-weight: 600;
-  white-space: nowrap;
-}
 .usage-fade-enter-active, .usage-fade-leave-active { transition: opacity 0.18s ease; }
 .usage-fade-enter-from, .usage-fade-leave-to { opacity: 0; }
 .rainbow-chip {
@@ -1473,11 +1657,50 @@ onUnmounted(() => {
 .btn-outline:hover { background: var(--accent-light); }
 .btn-outline:disabled { opacity: 0.35; cursor: not-allowed; }
 
-/* URL import popover */
-.url-import-wrap {
+/* Import button wrapper (dropdown + URL popover anchor) */
+.import-wrap {
   position: relative;
   flex-shrink: 0;
 }
+
+.import-caret {
+  margin-left: -1px;
+  opacity: 0.65;
+  flex-shrink: 0;
+}
+
+/* Import method dropdown */
+.import-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 148px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: 4px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.import-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  text-align: left;
+  white-space: nowrap;
+  transition: background 0.12s;
+}
+.import-menu-item:hover { background: var(--bg-hover); }
+.import-menu-item svg { color: var(--accent); flex-shrink: 0; }
 
 .url-import-popover {
   position: absolute;

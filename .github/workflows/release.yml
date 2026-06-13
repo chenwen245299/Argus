@@ -80,6 +80,15 @@ jobs:
       matrix:
         platform: [macos-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
+    env:
+      # Harden cargo's crates.io downloads against flaky CI networks. The
+      # "Recv failure: Connection was reset" / "curl [56]" errors on the
+      # Windows runner come from HTTP/2 multiplexing dropping mid-download;
+      # forcing HTTP/1 plus generous retries makes the fetch resilient.
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_HTTP_CHECK_REVOKE: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -90,6 +99,14 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          # Keep the cache even when a later build step fails, so a transient
+          # network error doesn't force a full re-download on the next run.
+          cache-on-failure: true
 
       - name: Sync version and enable bundle
         shell: bash

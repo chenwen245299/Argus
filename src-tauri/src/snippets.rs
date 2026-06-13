@@ -1,8 +1,18 @@
 use chrono::Utc;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use uuid::Uuid;
 
 use crate::models::{Snippet, SnippetLibrary};
+
+/// Serializes read-modify-write cycles on the snippet libraries index and the
+/// per-library snippet files. Tauri commands run concurrently, so without this
+/// two callers could each read then write, losing one update.
+static SNIPPETS_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_snippets() -> std::sync::MutexGuard<'static, ()> {
+    SNIPPETS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -43,7 +53,8 @@ fn read_libraries(root: &str) -> Vec<SnippetLibrary> {
 fn write_libraries(root: &str, libs: &[SnippetLibrary]) -> Result<(), String> {
     let content =
         serde_json::to_string_pretty(libs).map_err(|e| format!("Serialize libraries: {e}"))?;
-    std::fs::write(libraries_path(root), content).map_err(|e| format!("Write libraries: {e}"))
+    crate::fsutil::atomic_write_str(&libraries_path(root), &content)
+        .map_err(|e| format!("Write libraries: {e}"))
 }
 
 pub fn list_snippet_libraries(root: &str) -> Result<Vec<SnippetLibrary>, String> {
@@ -56,6 +67,7 @@ pub fn create_snippet_library(
     name: String,
     emoji: Option<String>,
 ) -> Result<SnippetLibrary, String> {
+    let _g = lock_snippets();
     ensure_snippets_dir(root)?;
     let lib = SnippetLibrary {
         id: Uuid::new_v4().to_string(),
@@ -69,12 +81,14 @@ pub fn create_snippet_library(
     // Create empty snippets file
     let snippets_path = library_snippets_path(root, &lib.id)?;
     if !snippets_path.exists() {
-        std::fs::write(&snippets_path, "[]").map_err(|e| format!("Init snippets file: {e}"))?;
+        crate::fsutil::atomic_write_str(&snippets_path, "[]")
+            .map_err(|e| format!("Init snippets file: {e}"))?;
     }
     Ok(lib)
 }
 
 pub fn rename_snippet_library(root: &str, id: &str, name: String) -> Result<(), String> {
+    let _g = lock_snippets();
     ensure_snippets_dir(root)?;
     validate_library_id(id)?;
     let mut libs = read_libraries(root);
@@ -89,6 +103,7 @@ pub fn update_snippet_library_emoji(
     id: &str,
     emoji: Option<String>,
 ) -> Result<(), String> {
+    let _g = lock_snippets();
     ensure_snippets_dir(root)?;
     validate_library_id(id)?;
     let mut libs = read_libraries(root);
@@ -99,6 +114,7 @@ pub fn update_snippet_library_emoji(
 }
 
 pub fn delete_snippet_library(root: &str, id: &str) -> Result<(), String> {
+    let _g = lock_snippets();
     ensure_snippets_dir(root)?;
     validate_library_id(id)?;
     let mut libs = read_libraries(root);
@@ -130,7 +146,7 @@ fn write_snippets(root: &str, library_id: &str, snippets: &[Snippet]) -> Result<
     validate_library_id(library_id)?;
     let content =
         serde_json::to_string_pretty(snippets).map_err(|e| format!("Serialize snippets: {e}"))?;
-    std::fs::write(library_snippets_path(root, library_id)?, content)
+    crate::fsutil::atomic_write_str(&library_snippets_path(root, library_id)?, &content)
         .map_err(|e| format!("Write snippets: {e}"))
 }
 
@@ -154,6 +170,7 @@ pub struct AddSnippetInput {
 }
 
 pub fn add_snippet(root: &str, input: AddSnippetInput) -> Result<Snippet, String> {
+    let _g = lock_snippets();
     ensure_snippets_dir(root)?;
     validate_library_id(&input.library_id)?;
     let snippet = Snippet {
@@ -181,6 +198,7 @@ pub fn update_snippet(
     tags: Option<Vec<String>>,
     note: Option<String>,
 ) -> Result<(), String> {
+    let _g = lock_snippets();
     ensure_snippets_dir(root)?;
     validate_library_id(library_id)?;
     let mut snippets = read_snippets(root, library_id);
@@ -196,6 +214,7 @@ pub fn update_snippet(
 }
 
 pub fn delete_snippet(root: &str, library_id: &str, id: &str) -> Result<(), String> {
+    let _g = lock_snippets();
     ensure_snippets_dir(root)?;
     validate_library_id(library_id)?;
     let mut snippets = read_snippets(root, library_id);
@@ -211,6 +230,7 @@ pub fn migrate_from_localstorage(
     libraries: Vec<SnippetLibrary>,
     snippets_by_library: Vec<(String, Vec<Snippet>)>,
 ) -> Result<(), String> {
+    let _g = lock_snippets();
     ensure_snippets_dir(root)?;
     // Only migrate if the libraries file doesn't exist yet
     if libraries_path(root).exists() {

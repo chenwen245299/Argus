@@ -33,6 +33,44 @@ fn index_path(root: &str) -> PathBuf {
     canvases_dir(root).join("index.json")
 }
 
+/// Write `content` to `path` atomically (temp file + rename) so a crash or power
+/// loss mid-write can never leave a truncated, unparseable JSON file behind.
+fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+    crate::fsutil::atomic_write_str(path, content)
+}
+
+/// Rebuild the index by scanning every `*.json` canvas file in the directory.
+/// Used to recover when `index.json` is missing or corrupt instead of silently
+/// presenting an empty list (which a subsequent save would then persist, wiping
+/// the user's other canvases from the listing).
+fn rebuild_index_from_disk(root: &str) -> Vec<CanvasIndexEntry> {
+    let dir = canvases_dir(root);
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // Skip the index file itself.
+            if path.file_name().and_then(|n| n.to_str()) == Some("index.json") {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(canvas) = serde_json::from_str::<Canvas>(&content) {
+                    entries.push(CanvasIndexEntry {
+                        id: canvas.id,
+                        name: canvas.name,
+                        node_count: canvas.nodes.len() as u32,
+                        updated_at: canvas.updated_at,
+                    });
+                }
+            }
+        }
+    }
+    entries
+}
+
 fn ensure_canvases_dir(root: &str) -> Result<(), String> {
     let dir = canvases_dir(root);
     let legacy = legacy_canvases_dir(root);
@@ -67,18 +105,32 @@ fn ensure_canvases_dir(root: &str) -> Result<(), String> {
 fn read_index(root: &str) -> Vec<CanvasIndexEntry> {
     let path = index_path(root);
     if !path.exists() {
-        return vec![];
+        // No index yet: recover any canvases already on disk (e.g. after a
+        // migration or a deleted index) rather than reporting none.
+        return rebuild_index_from_disk(root);
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+    match std::fs::read_to_string(&path) {
+        Ok(c) => match serde_json::from_str(&c) {
+            Ok(entries) => entries,
+            // Corrupt index (e.g. truncated by an interrupted write): rebuild
+            // from the canvas files so a later save can't overwrite a good
+            // listing with an empty one.
+            Err(e) => {
+                eprintln!("canvas index.json corrupt ({e}); rebuilding from disk");
+                rebuild_index_from_disk(root)
+            }
+        },
+        Err(e) => {
+            eprintln!("canvas index.json unreadable ({e}); rebuilding from disk");
+            rebuild_index_from_disk(root)
+        }
+    }
 }
 
 fn write_index(root: &str, entries: &[CanvasIndexEntry]) -> Result<(), String> {
     let content = serde_json::to_string_pretty(entries)
         .map_err(|e| format!("Serialize canvas index: {e}"))?;
-    std::fs::write(index_path(root), content).map_err(|e| format!("Write canvas index: {e}"))
+    atomic_write(&index_path(root), &content).map_err(|e| format!("Write canvas index: {e}"))
 }
 
 fn upsert_index(root: &str, canvas: &Canvas) {
@@ -119,7 +171,7 @@ pub fn create_canvas(root: &str, name: String) -> Result<Canvas, String> {
     };
     let content =
         serde_json::to_string_pretty(&canvas).map_err(|e| format!("Serialize canvas: {e}"))?;
-    std::fs::write(canvas_path(root, &canvas.id)?, content)
+    atomic_write(&canvas_path(root, &canvas.id)?, &content)
         .map_err(|e| format!("Write canvas: {e}"))?;
     upsert_index(root, &canvas);
     Ok(canvas)
@@ -140,7 +192,7 @@ pub fn save_canvas(root: &str, mut canvas: Canvas) -> Result<(), String> {
     canvas.updated_at = Utc::now().to_rfc3339();
     let content =
         serde_json::to_string_pretty(&canvas).map_err(|e| format!("Serialize canvas: {e}"))?;
-    std::fs::write(canvas_path(root, &canvas.id)?, &content)
+    atomic_write(&canvas_path(root, &canvas.id)?, &content)
         .map_err(|e| format!("Write canvas: {e}"))?;
     upsert_index(root, &canvas);
     Ok(())
@@ -156,7 +208,7 @@ pub fn rename_canvas(root: &str, id: &str, new_name: String) -> Result<(), Strin
     canvas.updated_at = Utc::now().to_rfc3339();
     let content =
         serde_json::to_string_pretty(&canvas).map_err(|e| format!("Serialize canvas: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Write canvas: {e}"))?;
+    atomic_write(&path, &content).map_err(|e| format!("Write canvas: {e}"))?;
     upsert_index(root, &canvas);
     Ok(())
 }
@@ -335,7 +387,7 @@ pub fn write_canvas_settings(root: &str, settings: &CanvasSettings) -> Result<()
         serde_json::to_value(settings).map_err(|e| format!("Serialize CanvasSettings: {e}"))?;
     let content =
         serde_json::to_string_pretty(&config).map_err(|e| format!("Serialize config.json: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Write config.json: {e}"))
+    atomic_write(&path, &content).map_err(|e| format!("Write config.json: {e}"))
 }
 
 // ── Window ────────────────────────────────────────────────────────────────────

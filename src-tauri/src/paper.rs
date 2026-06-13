@@ -2,15 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::models::{Highlight, Note, PaperMeta, PaperStatus, ReadingState};
 
-/// Write `content` to `path` atomically: write to a temp file first, then
-/// rename into place. This prevents partial-write data loss if the process
-/// crashes mid-write.
+/// Write `content` to `path` atomically (temp file + rename), preventing
+/// partial-write data loss if the process crashes mid-write.
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, content)
-        .map_err(|e| format!("Failed to write tmp file {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("Failed to rename tmp to {}: {e}", path.display()))
+    crate::fsutil::atomic_write_str(path, content)
 }
 
 pub fn papers_dir(root: &str) -> PathBuf {
@@ -129,7 +124,7 @@ pub fn read_notes(root: &str, slug: &str) -> String {
 pub fn write_notes(root: &str, slug: &str, content: &str) -> Result<(), String> {
     validate_slug(slug)?;
     let path = paper_dir(root, slug).join("notes.md");
-    std::fs::write(&path, content).map_err(|e| format!("Failed to write notes.md: {e}"))
+    atomic_write(&path, content).map_err(|e| format!("Failed to write notes.md: {e}"))
 }
 
 // ── Multi-Notes ───────────────────────────────────────────────────────────────
@@ -251,7 +246,7 @@ pub fn upsert_note_by_title(
 
     if let Some(note) = notes.iter_mut().find(|n| n.title == title) {
         note.updated_at = now;
-        std::fs::write(dir.join(format!("{}.md", note.id)), content)
+        atomic_write(&dir.join(format!("{}.md", note.id)), content)
             .map_err(|e| format!("Failed to write note: {e}"))?;
         let updated = note.clone();
         write_notes_index(root, slug, &notes)?;
@@ -265,7 +260,7 @@ pub fn upsert_note_by_title(
         created_at: now.clone(),
         updated_at: now,
     };
-    std::fs::write(dir.join(format!("{id}.md")), content)
+    atomic_write(&dir.join(format!("{id}.md")), content)
         .map_err(|e| format!("Failed to create note file: {e}"))?;
     notes.push(note.clone());
     write_notes_index(root, slug, &notes)?;
@@ -277,7 +272,7 @@ pub fn save_note(root: &str, slug: &str, note_id: &str, content: &str) -> Result
     validate_note_id(note_id)?;
     let dir = notes_dir(root, slug);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create notes dir: {e}"))?;
-    std::fs::write(note_file_path(root, slug, note_id)?, content)
+    atomic_write(&note_file_path(root, slug, note_id)?, content)
         .map_err(|e| format!("Failed to write note: {e}"))?;
     let mut notes = read_notes_index(root, slug);
     let now = chrono::Utc::now().to_rfc3339();

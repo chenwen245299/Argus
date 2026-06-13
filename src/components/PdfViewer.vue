@@ -31,6 +31,21 @@ const pageCount = ref(0)
 const pageSizes = ref<{ width: number; height: number }[]>([]) // at scale=1
 const renderedPages = ref<Set<number>>(new Set())
 const renderingPages = new Set<number>() // guard against concurrent renders
+// Bumped on every scale change so in-flight renders from the old scale can
+// detect they're stale and discard their work instead of leaving a page
+// rendered at the wrong size (the zoom "ghost page" glitch).
+let renderGeneration = 0
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const pageRenderTasks = new Map<number, any>() // pdfjs RenderTask per page
+const inflightRenders = new Map<number, Promise<void>>()
+
+/** Track a render so the scale watcher can await/cancel in-flight work. */
+function requestRenderPage(idx: number): Promise<void> {
+  const p = renderPage(idx)
+  inflightRenders.set(idx, p)
+  p.finally(() => { if (inflightRenders.get(idx) === p) inflightRenders.delete(idx) })
+  return p
+}
 
 const scale = ref(1.25)
 const displayPage = ref(1) // shown in toolbar (1-based)
@@ -430,7 +445,7 @@ function setupObserver() {
       entries.forEach(entry => {
         const idx = Number((entry.target as HTMLElement).dataset.pageIndex)
         if (entry.isIntersecting) {
-          renderPage(idx)
+          requestRenderPage(idx)
         } else if (!entry.isIntersecting && renderedPages.value.has(idx)) {
           // Only evict pages that are far away (rootMargin keeps nearby pages alive)
           unrenderPage(idx)
@@ -464,13 +479,17 @@ async function renderPage(idx: number) {
   const el = pageRefs.value[idx]
   if (!el) { renderingPages.delete(idx); return }
 
+  const myGen = renderGeneration
+  const scenScale = scale.value
   try {
     const page: PDFPageProxy = await pdfDoc.value.getPage(idx + 1)
+    // Scale changed while we were fetching the page — abandon.
+    if (myGen !== renderGeneration) { page.cleanup(); return }
     const dpr = window.devicePixelRatio || 1
     // Logical viewport for CSS layout / text layer / highlights
-    const logicalVp = page.getViewport({ scale: scale.value })
+    const logicalVp = page.getViewport({ scale: scenScale })
     // Physical viewport for crisp canvas rendering on HiDPI screens
-    const physicalVp = page.getViewport({ scale: scale.value * dpr })
+    const physicalVp = page.getViewport({ scale: scenScale * dpr })
 
     // Canvas — pdfjs v5 takes the canvas element directly and owns the context
     const canvas = document.createElement('canvas')
@@ -481,13 +500,20 @@ async function renderPage(idx: number) {
     canvas.style.height = `${Math.round(logicalVp.height)}px`
     el.appendChild(canvas)
 
-    await page.render({ canvas, viewport: physicalVp }).promise
+    const task = page.render({ canvas, viewport: physicalVp })
+    pageRenderTasks.set(idx, task)
+    await task.promise
+    pageRenderTasks.delete(idx)
+
+    // Scale changed during render — the watcher cleared `el`; bail without
+    // marking the page rendered so it re-renders cleanly at the new scale.
+    if (myGen !== renderGeneration) { page.cleanup(); return }
 
     // Text layer at logical scale so CSS positions match layout
     const textLayerDiv = document.createElement('div')
     textLayerDiv.className = 'textLayer'
     // pdfjs v5 uses --total-scale-factor to size the container via setLayerDimensions
-    textLayerDiv.style.setProperty('--total-scale-factor', String(scale.value))
+    textLayerDiv.style.setProperty('--total-scale-factor', String(scenScale))
     el.appendChild(textLayerDiv)
 
     try {
@@ -500,6 +526,7 @@ async function renderPage(idx: number) {
     } catch (e) {
       console.warn('TextLayer render failed:', e)
     }
+    if (myGen !== renderGeneration) { page.cleanup(); return }
 
     // Highlight overlay at logical scale
     const hlDiv = document.createElement('div')
@@ -513,8 +540,12 @@ async function renderPage(idx: number) {
     renderedPages.value = new Set(renderedPages.value).add(idx)
     page.cleanup()
   } catch (e) {
-    console.error(`renderPage(${idx}) failed:`, e)
+    // RenderingCancelledException is expected when a zoom cancels in-flight work.
+    if ((e as { name?: string })?.name !== 'RenderingCancelledException') {
+      console.error(`renderPage(${idx}) failed:`, e)
+    }
   } finally {
+    pageRenderTasks.delete(idx)
     renderingPages.delete(idx)
   }
 }
@@ -532,16 +563,29 @@ function unrenderPage(idx: number) {
 // ── Re-render on scale change ─────────────────────────────────────────────────
 watch(scale, async () => {
   saveZoom()
-  // Evict all rendered pages; observer will re-render the visible ones
-  const toEvict = [...renderedPages.value]
-  toEvict.forEach(unrenderPage)
+  // Mark every in-flight render stale and cancel the running pdfjs tasks so
+  // none of them lands a canvas sized for the previous scale.
+  renderGeneration++
+  pageRenderTasks.forEach((task) => { try { task.cancel() } catch { /* already done */ } })
+  pageRenderTasks.clear()
+  // Wait for the cancelled/stale renders to unwind so their page locks free up
+  // before we re-render — otherwise a re-render could be blocked or doubled.
+  await Promise.allSettled([...inflightRenders.values()])
+
+  // Drop ALL rendered/partial content (not just `renderedPages`, which misses
+  // pages that were mid-render) and reset state.
+  pageRefs.value.forEach((el) => { if (el) while (el.firstChild) el.removeChild(el.firstChild) })
+  renderingPages.clear()
+  renderedPages.value = new Set()
+
   await nextTick()
   updateScrollThumbs()
-  // Force observer to fire by briefly disconnecting & reconnecting
+  // Re-render the currently visible pages at the new scale.
   if (observer && containerRef.value) {
     observer.disconnect()
     pageRefs.value.forEach((el) => { if (el) observer!.observe(el) })
   }
+  triggerInitialRender()
 })
 
 // ── Highlight rendering ───────────────────────────────────────────────────────
@@ -670,7 +714,7 @@ watch(() => reader.scrollToHighlightId, async (id) => {
 
 async function ensurePageRendered(pageIndex: number) {
   if (renderedPages.value.has(pageIndex)) return
-  await renderPage(pageIndex)
+  await requestRenderPage(pageIndex)
   await nextTick()
 }
 
@@ -706,9 +750,59 @@ function showScrollThumbs() {
   const hasScrollableAxis = scrollThumbs.value.vertical.visible || scrollThumbs.value.horizontal.visible
   scrollThumbsActive.value = hasScrollableAxis
   if (scrollThumbHideTimer) clearTimeout(scrollThumbHideTimer)
+  // Don't auto-hide while the user is dragging a thumb.
+  if (thumbDrag) return
   scrollThumbHideTimer = setTimeout(() => {
     scrollThumbsActive.value = false
   }, SCROLL_THUMB_HIDE_DELAY)
+}
+
+// ── Draggable scroll thumbs ───────────────────────────────────────────────────
+let thumbDrag: { axis: 'v' | 'h'; startPos: number; startScroll: number; ratio: number } | null = null
+
+function onThumbPointerDown(axis: 'v' | 'h', e: PointerEvent) {
+  const el = containerRef.value
+  if (!el || e.button !== 0) return
+  e.preventDefault()
+  e.stopPropagation()
+  try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch { /* ignore */ }
+
+  // Map a 1px move of the thumb to the corresponding scroll delta.
+  let ratio = 0
+  if (axis === 'v') {
+    const track = el.clientHeight - SCROLL_THUMB_INSET * 2
+    const denom = track - scrollThumbs.value.vertical.size
+    ratio = denom > 0 ? (el.scrollHeight - el.clientHeight) / denom : 0
+    thumbDrag = { axis, startPos: e.clientY, startScroll: el.scrollTop, ratio }
+  } else {
+    const track = el.clientWidth - SCROLL_THUMB_INSET * 2
+    const denom = track - scrollThumbs.value.horizontal.size
+    ratio = denom > 0 ? (el.scrollWidth - el.clientWidth) / denom : 0
+    thumbDrag = { axis, startPos: e.clientX, startScroll: el.scrollLeft, ratio }
+  }
+  scrollThumbsActive.value = true
+  if (scrollThumbHideTimer) { clearTimeout(scrollThumbHideTimer); scrollThumbHideTimer = null }
+  window.addEventListener('pointermove', onThumbPointerMove)
+  window.addEventListener('pointerup', onThumbPointerUp)
+}
+
+function onThumbPointerMove(e: PointerEvent) {
+  const el = containerRef.value
+  if (!thumbDrag || !el) return
+  if (thumbDrag.axis === 'v') {
+    el.scrollTop = thumbDrag.startScroll + (e.clientY - thumbDrag.startPos) * thumbDrag.ratio
+  } else {
+    el.scrollLeft = thumbDrag.startScroll + (e.clientX - thumbDrag.startPos) * thumbDrag.ratio
+  }
+  updateScrollThumbs()
+  scrollThumbsActive.value = true
+}
+
+function onThumbPointerUp() {
+  thumbDrag = null
+  window.removeEventListener('pointermove', onThumbPointerMove)
+  window.removeEventListener('pointerup', onThumbPointerUp)
+  showScrollThumbs()
 }
 
 function updateDisplayPage() {
@@ -1208,7 +1302,7 @@ function triggerInitialRender() {
   for (let i = 0; i < pageSizes.value.length; i++) {
     const pageH = pageSizes.value[i].height * scale.value + gap
     if (cumY + pageH > scrollTop - margin && cumY < scrollTop + containerH + margin) {
-      renderPage(i)
+      requestRenderPage(i)
     }
     if (cumY > scrollTop + containerH + margin) break
     cumY += pageH
@@ -1284,6 +1378,7 @@ function triggerInitialRender() {
         @scroll.passive="onScroll"
         @click="hlNotePopup = null; hlColorPopup = null"
         @wheel="onWheel"
+        @pointermove.passive="showScrollThumbs"
       >
         <div class="pdf-pages">
           <div
@@ -1308,6 +1403,7 @@ function triggerInitialRender() {
           height: `${scrollThumbs.vertical.size}px`,
           transform: `translateY(${scrollThumbs.vertical.offset}px)`,
         }"
+        @pointerdown="onThumbPointerDown('v', $event)"
       />
       <div
         v-if="scrollThumbs.horizontal.visible"
@@ -1317,6 +1413,7 @@ function triggerInitialRender() {
           width: `${scrollThumbs.horizontal.size}px`,
           transform: `translateX(${scrollThumbs.horizontal.offset}px)`,
         }"
+        @pointerdown="onThumbPointerDown('h', $event)"
       />
     </div>
 
@@ -1658,23 +1755,37 @@ function triggerInitialRender() {
   opacity: 0;
   border-radius: 999px;
   background: color-mix(in srgb, var(--text-tertiary) 58%, transparent);
-  transition: opacity 180ms ease;
+  transition: opacity 180ms ease, background 120ms ease;
 }
 
 .pdf-scroll-thumb.visible {
   opacity: 1;
+  pointer-events: auto;
+}
+
+.pdf-scroll-thumb:hover {
+  background: color-mix(in srgb, var(--text-tertiary) 78%, transparent);
+}
+.pdf-scroll-thumb:active {
+  background: color-mix(in srgb, var(--text-secondary) 90%, transparent);
 }
 
 .pdf-scroll-thumb-y {
   top: 0;
-  right: 4px;
-  width: 5px;
+  right: 3px;
+  width: 8px;
+  cursor: grab;
 }
 
 .pdf-scroll-thumb-x {
   left: 0;
-  bottom: 4px;
-  height: 5px;
+  bottom: 3px;
+  height: 8px;
+  cursor: grab;
+}
+
+.pdf-scroll-thumb:active {
+  cursor: grabbing;
 }
 
 .pdf-pages {

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -77,7 +77,7 @@ pub fn save_arxiv_config(root: &str, config: &ArxivConfig) -> Result<(), String>
         serde_json::to_value(config).map_err(|e| e.to_string())?,
     );
     let content = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
-    std::fs::write(&path, content).map_err(|e| e.to_string())
+    crate::fsutil::atomic_write_str(&path, &content).map_err(|e| e.to_string())
 }
 
 // ── Inbox (per-day files: inbox/YYYY-MM-DD.json) ─────────────────────────────
@@ -123,7 +123,7 @@ fn write_day_papers(root: &str, date: &str, papers: &[ArxivPaper]) -> Result<(),
     }
     let content =
         serde_json::to_string_pretty(papers).map_err(|e| format!("Serialize day papers: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Write day file: {e}"))
+    crate::fsutil::atomic_write_str(&path, &content).map_err(|e| format!("Write day file: {e}"))
 }
 
 /// List existing fetch-date strings (YYYY-MM-DD), newest first.
@@ -206,7 +206,7 @@ fn save_read_states(
     let dir = inbox_dir(root);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let content = serde_json::to_string_pretty(states).map_err(|e| e.to_string())?;
-    std::fs::write(read_state_path(root), content).map_err(|e| e.to_string())
+    crate::fsutil::atomic_write_str(&read_state_path(root), &content).map_err(|e| e.to_string())
 }
 
 pub fn get_inbox(root: &str) -> ArxivInbox {
@@ -1154,14 +1154,9 @@ pub async fn add_to_library(
         paper.pdf_url.clone()
     };
 
-    let pdf_bytes = client
-        .get(&pdf_url)
-        .send()
-        .await
-        .map_err(|e| format!("Download PDF: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("Read PDF bytes: {e}"))?;
+    // Verify the response is a real PDF (checks HTTP status + `%PDF` magic) so a
+    // 404 / rate-limit / HTML error page never gets written as a broken paper.
+    let pdf_bytes = download_pdf(&client, &pdf_url, &[]).await?;
 
     let _ = app.emit(
         "arxiv-import",
@@ -1172,15 +1167,11 @@ pub async fn add_to_library(
 
     // Create paper directory
     let slug = make_slug(&paper.authors, &paper.published, &paper.title);
-    let paper_dir = Path::new(root).join("papers").join(&slug);
+    let papers_root = Path::new(root).join("papers");
 
-    // If slug collision, add a unique suffix
-    let final_dir = if paper_dir.exists() {
-        let s = format!("{}-2", slug);
-        Path::new(root).join("papers").join(&s)
-    } else {
-        paper_dir
-    };
+    // If slug collision, find the next free suffix instead of blindly using
+    // `-2` (which would overwrite an existing `-2` paper and lose its data).
+    let final_dir = unique_paper_dir(&papers_root, &slug);
     let final_slug = final_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -1684,6 +1675,25 @@ async fn download_pdf(
     } else {
         last_err
     })
+}
+
+/// Resolve a collision-free paper directory under `papers_root` for `slug`.
+/// Returns `papers_root/slug` if free, otherwise `slug-2`, `slug-3`, … picking
+/// the first path that does not yet exist so an existing paper is never
+/// overwritten.
+pub(crate) fn unique_paper_dir(papers_root: &Path, slug: &str) -> PathBuf {
+    let base = papers_root.join(slug);
+    if !base.exists() {
+        return base;
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = papers_root.join(format!("{slug}-{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Find the slug of a paper already in the library by its arXiv ID.

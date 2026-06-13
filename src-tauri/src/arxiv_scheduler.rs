@@ -17,7 +17,9 @@ pub fn set_enabled(enabled: bool) {
 
 fn get_root(app: &tauri::AppHandle) -> Option<String> {
     let state: tauri::State<LibraryRoot> = app.state();
-    let guard = state.0.lock().unwrap();
+    // Tolerate a poisoned lock so a panic elsewhere can't take down the
+    // long-lived scheduler loop.
+    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
     guard.clone()
 }
 

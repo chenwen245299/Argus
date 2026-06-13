@@ -144,7 +144,8 @@ pub fn extract_and_write(root: &str, slug: &str, _settings: &AppSettings) -> Ext
 fn write_fulltext_and_status(root: &str, slug: &str, text: &str) -> Result<(), String> {
     let dir = crate::paper::paper_dir(root, slug);
     let fulltext_path = dir.join("fulltext.txt");
-    std::fs::write(&fulltext_path, text).map_err(|e| format!("Write fulltext.txt: {e}"))?;
+    crate::fsutil::atomic_write_str(&fulltext_path, text)
+        .map_err(|e| format!("Write fulltext.txt: {e}"))?;
 
     let mut status = crate::paper::read_status_for(root, slug);
     status.text_extracted = true;

@@ -227,7 +227,7 @@ pub fn ensure_current(root: &str) -> Result<(), String> {
     }
 
     rebuild_index(root)?;
-    std::fs::write(&path, SEARCH_INDEX_VERSION)
+    crate::fsutil::atomic_write_str(&path, SEARCH_INDEX_VERSION)
         .map_err(|e| format!("Write search index version: {e}"))?;
     Ok(())
 }

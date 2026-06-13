@@ -70,5 +70,5 @@ pub fn write_settings(root: &str, settings: &AppSettings) -> Result<(), String> 
 
     let content =
         serde_json::to_string_pretty(&config).map_err(|e| format!("Serialize config.json: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Write config.json: {e}"))
+    crate::fsutil::atomic_write_str(&path, &content).map_err(|e| format!("Write config.json: {e}"))
 }

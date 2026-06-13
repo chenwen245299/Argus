@@ -31,6 +31,9 @@ interface AssistantAnswer {
   modelId: string
   modelName: string
   content: string
+  // Throttled copy of `content` used for live markdown rendering while
+  // streaming (re-rendering the full markdown on every token freezes the UI).
+  displayContent?: string
   reasoningContent?: string
   withReasoning?: boolean
   createdAt: string
@@ -803,9 +806,46 @@ function stopAllStreaming() {
     if (ra?.streaming) {
       ra.streaming = false
       ra.endedAt = performance.now()
+      flushStreamRender(ra)
     }
   }
   persistActiveConversation()
+}
+
+// ── Throttled streaming render ────────────────────────────────────────────────
+// Re-rendering the full markdown (markdown-it + KaTeX + highlight.js) on every
+// streamed token is O(n²) and freezes the UI on long answers. We instead refresh
+// a `displayContent` copy at most once per STREAM_RENDER_MS.
+const STREAM_RENDER_MS = 90
+const streamRenderTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const streamRenderLast = new Map<string, number>()
+
+function scheduleStreamRender(ans: AssistantAnswer) {
+  const now = Date.now()
+  const last = streamRenderLast.get(ans.id) ?? 0
+  const elapsed = now - last
+  if (elapsed >= STREAM_RENDER_MS) {
+    streamRenderLast.set(ans.id, now)
+    ans.displayContent = ans.content
+    scrollToBottom()
+    return
+  }
+  if (streamRenderTimers.has(ans.id)) return
+  const timer = setTimeout(() => {
+    streamRenderTimers.delete(ans.id)
+    streamRenderLast.set(ans.id, Date.now())
+    const live = findReactiveAnswer(ans.id)
+    if (live) { live.displayContent = live.content; scrollToBottom() }
+  }, STREAM_RENDER_MS - elapsed)
+  streamRenderTimers.set(ans.id, timer)
+}
+
+// Final flush so the last tokens are shown even if a throttle window was pending.
+function flushStreamRender(ans: AssistantAnswer) {
+  const timer = streamRenderTimers.get(ans.id)
+  if (timer) { clearTimeout(timer); streamRenderTimers.delete(ans.id) }
+  streamRenderLast.delete(ans.id)
+  ans.displayContent = ans.content
 }
 
 async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history: ChatMessage[]) {
@@ -835,7 +875,9 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     const reactiveAns = findReactiveAnswer(answer.id)
     if (!reactiveAns) return
     reactiveAns.content += event.payload.delta
-    scrollToBottom()
+    // Throttle the heavy markdown render (markdown-it + KaTeX + highlight.js)
+    // instead of re-rendering the whole message on every token.
+    scheduleStreamRender(reactiveAns)
   })
   unlisteners.set(answer.id, unlisten)
 
@@ -904,6 +946,7 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     if (reactiveAns) {
       reactiveAns.streaming = false
       reactiveAns.endedAt = performance.now()
+      flushStreamRender(reactiveAns)
     }
     const off = unlisteners.get(answer.id)
     if (off) off()
@@ -1015,6 +1058,7 @@ function finaliseMetaAnswer(answerId: string) {
   if (ra) {
     ra.streaming = false
     ra.endedAt = performance.now()
+    flushStreamRender(ra)
   }
   const off = unlisteners.get(answerId)
   off?.()
@@ -1121,7 +1165,7 @@ onMounted(async () => {
       const ra = findReactiveAnswer(answer_id)
       if (!ra) return
       ra.content += event.payload.delta
-      scrollToBottom()
+      scheduleStreamRender(ra)
     })
     unlisteners.set(answer_id, unlisten)
     const unlistenUsage = await listen<StreamUsagePayload>(`paper-ai-chat-${answer_id}-usage`, (event) => {
@@ -1462,7 +1506,7 @@ function toggleContextPanel(nodeId: string) {
                   :class="{ pending: answer.streaming && !answer.content && !answer.reasoningContent }"
                 >
                   <template v-if="answer.streaming">
-                    <div v-if="answer.content" v-html="renderMarkdown(answer.content)" />
+                    <div v-if="answer.content" v-html="renderMarkdown(answer.displayContent ?? answer.content)" />
                     <div v-else-if="!answer.reasoningContent" class="thinking-placeholder">{{ answer.withReasoning ? '正在思考…' : '生成中…' }}</div>
                   </template>
                   <template v-else>
@@ -1782,7 +1826,7 @@ function toggleContextPanel(nodeId: string) {
 .center-hint p { max-width: 230px; font-size: var(--font-size-sm); line-height: 1.5; }
 
 .ai-header {
-  height: 48px;
+  height: 40px;
   flex-shrink: 0;
   display: flex;
   align-items: center;

@@ -1,9 +1,21 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::{
     models::{normalize_import_source, Assignment, Collection, CollectionsFile, PaperIndexEntry},
     paper,
 };
+
+/// Serializes read-modify-write cycles on collections.json. Tauri commands run
+/// concurrently, so without this two callers could each read the old file and
+/// write back, losing one of the updates.
+static COLLECTIONS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the collections write lock, tolerating poisoning so one panicking
+/// caller can't permanently wedge all collection operations.
+fn lock_collections() -> std::sync::MutexGuard<'static, ()> {
+    COLLECTIONS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn collections_path(root: &str) -> PathBuf {
     Path::new(root).join(".argus").join("collections.json")
@@ -26,7 +38,8 @@ fn write_collections(root: &str, file: &CollectionsFile) -> Result<(), String> {
     let path = collections_path(root);
     let content =
         serde_json::to_string_pretty(file).map_err(|e| format!("Serialize collections: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Write collections.json: {e}"))
+    crate::fsutil::atomic_write_str(&path, &content)
+        .map_err(|e| format!("Write collections.json: {e}"))
 }
 
 fn random_collection_emoji() -> String {
@@ -55,6 +68,7 @@ fn ensure_collection_emojis(file: &mut CollectionsFile) -> bool {
 }
 
 pub fn get_collections(root: &str) -> Result<CollectionsFile, String> {
+    let _g = lock_collections();
     let mut file = read_collections(root);
     if ensure_collection_emojis(&mut file) {
         write_collections(root, &file)?;
@@ -189,6 +203,7 @@ pub fn create_collection(
     name: String,
     parent_id: Option<String>,
 ) -> Result<Collection, String> {
+    let _g = lock_collections();
     let mut file = read_collections(root);
     let col = Collection {
         id: uuid::Uuid::new_v4().to_string(),
@@ -208,6 +223,7 @@ pub fn create_collection(
 }
 
 pub fn rename_collection(root: &str, id: &str, new_name: String) -> Result<(), String> {
+    let _g = lock_collections();
     let mut file = read_collections(root);
 
     // Capture the old folder path BEFORE updating the name.
@@ -236,6 +252,7 @@ pub fn rename_collection(root: &str, id: &str, new_name: String) -> Result<(), S
 }
 
 pub fn move_collection(root: &str, id: &str, new_parent_id: Option<String>) -> Result<(), String> {
+    let _g = lock_collections();
     let mut file = read_collections(root);
 
     if !file.collections.iter().any(|c| c.id == id) {
@@ -314,6 +331,7 @@ pub fn move_collection(root: &str, id: &str, new_parent_id: Option<String>) -> R
 }
 
 pub fn set_collection_emoji(root: &str, id: &str, emoji: Option<String>) -> Result<(), String> {
+    let _g = lock_collections();
     let mut file = read_collections(root);
     let col = file
         .collections
@@ -331,6 +349,7 @@ pub fn set_collection_emoji(root: &str, id: &str, emoji: Option<String>) -> Resu
 
 /// Delete a collection and cascade-remove all descendants and their assignments.
 pub fn delete_collection(root: &str, id: &str) -> Result<(), String> {
+    let _g = lock_collections();
     let mut file = read_collections(root);
     if !file.collections.iter().any(|c| c.id == id) {
         return Err(format!("Collection {id} not found"));
@@ -473,6 +492,7 @@ pub fn add_paper_to_collection(
     paper_id: &str,
     collection_id: &str,
 ) -> Result<(), String> {
+    let _g = lock_collections();
     let mut file = read_collections(root);
 
     if !file.collections.iter().any(|c| c.id == collection_id) {
@@ -499,6 +519,7 @@ pub fn move_paper_to_collection(
     paper_id: &str,
     collection_id: &str,
 ) -> Result<(), String> {
+    let _g = lock_collections();
     let mut file = read_collections(root);
 
     if !file.collections.iter().any(|c| c.id == collection_id) {
@@ -523,6 +544,7 @@ pub fn remove_paper_from_collection(
     paper_id: &str,
     collection_id: &str,
 ) -> Result<(), String> {
+    let _g = lock_collections();
     let mut file = read_collections(root);
     let before = file.assignments.len();
     file.assignments

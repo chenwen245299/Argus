@@ -39,12 +39,16 @@ pub async fn open_library(
 ) -> Result<LibraryConfig, String> {
     let config = library::open_library(&root)?;
 
-    // Clean up stale temp directories left by interrupted imports.
+    // Clean up stale temp directories left by *interrupted* imports — but only
+    // ones that never finished writing their meta.json. A completed import that
+    // simply didn't get renamed (e.g. the app closed, or metadata fetch failed
+    // before `rename_paper_folder` ran) still holds the user's PDF and notes, so
+    // it must be preserved rather than deleted.
     let papers_dir = std::path::Path::new(&root).join("papers");
     if let Ok(entries) = std::fs::read_dir(&papers_dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("importing_") {
+                if name.starts_with("importing_") && !entry.path().join("meta.json").exists() {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
@@ -340,7 +344,7 @@ pub async fn save_pdfjs_fulltext(
     if !dir.exists() {
         return Err(format!("Paper not found: {slug}"));
     }
-    std::fs::write(dir.join("fulltext.txt"), &text)
+    crate::fsutil::atomic_write_str(&dir.join("fulltext.txt"), &text)
         .map_err(|e| format!("Write fulltext: {e}"))?;
     let _ = search::index_paper(&root, &slug);
     let mut status = paper::read_status_for(&root, &slug);
@@ -361,7 +365,7 @@ pub async fn save_fulltext(
         return Err(format!("Paper not found: {slug}"));
     }
 
-    std::fs::write(dir.join("fulltext.txt"), &text)
+    crate::fsutil::atomic_write_str(&dir.join("fulltext.txt"), &text)
         .map_err(|e| format!("Write fulltext: {e}"))?;
     let _ = search::index_paper(&root, &slug);
 
@@ -2489,6 +2493,14 @@ pub fn write_bytes_to_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
     match ext {
         Some(e) if ALLOWED_EXT.contains(&e.as_str()) => {}
         _ => return Err("Refused: unsupported export file type".to_string()),
+    }
+    // Refuse to follow a symlink at the destination: otherwise a pre-planted
+    // link could redirect the write to overwrite a file outside the intended
+    // export location.
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            return Err("Refused: export target is a symlink".to_string());
+        }
     }
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())
 }

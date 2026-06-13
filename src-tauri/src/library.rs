@@ -60,7 +60,7 @@ pub fn open_library(root: &str) -> Result<LibraryConfig, String> {
     };
     let content = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
-    std::fs::write(&config_path, content)
+    crate::fsutil::atomic_write_str(&config_path, &content)
         .map_err(|e| format!("Failed to write config.json: {e}"))?;
 
     Ok(config)
@@ -177,7 +177,7 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
         papers: entries.clone(),
     };
     if let Ok(content) = serde_json::to_string_pretty(&index_file) {
-        if let Err(e) = std::fs::write(&index_path, content) {
+        if let Err(e) = crate::fsutil::atomic_write_str(&index_path, &content) {
             eprintln!("[scan] failed to write index.json: {e}");
         }
     }

@@ -49,7 +49,7 @@ fn get_or_create_master_key(root: &str) -> Result<[u8; 32], String> {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key);
-        std::fs::write(&path, to_hex(&key)).map_err(|e| e.to_string())?;
+        crate::fsutil::atomic_write_str(&path, &to_hex(&key)).map_err(|e| e.to_string())?;
         Ok(key)
     }
 }
@@ -71,7 +71,7 @@ fn write_keys_map(root: &str, map: &HashMap<String, String>) -> Result<(), Strin
     let dir = Path::new(root).join(".argus");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let content = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
-    std::fs::write(keys_map_path(root), content).map_err(|e| e.to_string())
+    crate::fsutil::atomic_write_str(&keys_map_path(root), &content).map_err(|e| e.to_string())
 }
 
 // ── Key CRUD ──────────────────────────────────────────────────────────────────
@@ -142,7 +142,8 @@ pub fn write_ai_settings(root: &str, settings: &AiSettings) -> Result<(), String
     let path = dir.join("ai_providers.json");
     let content = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Serialize AI settings: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Write ai_providers.json: {e}"))
+    crate::fsutil::atomic_write_str(&path, &content)
+        .map_err(|e| format!("Write ai_providers.json: {e}"))
 }
 
 // ── Info conversion (strips keys) ────────────────────────────────────────────

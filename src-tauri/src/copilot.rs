@@ -22,7 +22,7 @@ pub fn write_chat_history(root: &str, slug: &str, messages: &[ChatMessage]) -> R
     let path = paper::paper_dir(root, slug).join("chat.json");
     let content = serde_json::to_string_pretty(messages)
         .map_err(|e| format!("Serialize chat history: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Write chat.json: {e}"))
+    crate::fsutil::atomic_write_str(&path, &content).map_err(|e| format!("Write chat.json: {e}"))
 }
 
 pub fn clear_chat_history(root: &str, slug: &str) -> Result<(), String> {
@@ -64,7 +64,8 @@ pub fn write_paper_ai_conversations(
     }
     let content = serde_json::to_string_pretty(conversations)
         .map_err(|e| format!("Serialize paper AI conversations: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Write ai_conversations.json: {e}"))
+    crate::fsutil::atomic_write_str(&path, &content)
+        .map_err(|e| format!("Write ai_conversations.json: {e}"))
 }
 
 fn library_chat_history_path(root: &str) -> PathBuf {
@@ -89,7 +90,8 @@ pub fn write_library_chat_history(root: &str, messages: &[ChatMessage]) -> Resul
     }
     let content = serde_json::to_string_pretty(messages)
         .map_err(|e| format!("Serialize library chat history: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Write library_chat.json: {e}"))
+    crate::fsutil::atomic_write_str(&path, &content)
+        .map_err(|e| format!("Write library_chat.json: {e}"))
 }
 
 pub fn clear_library_chat_history(root: &str) -> Result<(), String> {

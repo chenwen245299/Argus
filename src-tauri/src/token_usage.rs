@@ -23,11 +23,16 @@ fn root_mutex() -> &'static Mutex<String> {
 }
 
 pub fn set_root(root: &str) {
-    *root_mutex().lock().unwrap() = root.to_string();
+    // Tolerate a poisoned lock: a panic elsewhere must not break usage
+    // accounting, which runs after every LLM/embedding call.
+    *root_mutex().lock().unwrap_or_else(|e| e.into_inner()) = root.to_string();
 }
 
 fn current_root() -> Option<String> {
-    let s = root_mutex().lock().unwrap().clone();
+    let s = root_mutex()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if s.is_empty() {
         None
     } else {

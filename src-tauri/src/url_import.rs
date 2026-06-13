@@ -101,10 +101,7 @@ mod pdf_url {
         let title = title_from_url(url);
         let slug_base = super::build_slug(&[], None, &title);
         let papers_dir = Path::new(root).join("papers");
-        let final_dir = {
-            let c = papers_dir.join(&slug_base);
-            if c.exists() { papers_dir.join(format!("{slug_base}-2")) } else { c }
-        };
+        let final_dir = crate::arxiv::unique_paper_dir(&papers_dir, &slug_base);
         let final_slug = final_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -460,14 +457,7 @@ mod acl {
 
         let slug_base = super::build_slug(&meta.authors, meta.year, &meta.title);
         let papers_dir = Path::new(root).join("papers");
-        let final_dir = {
-            let c = papers_dir.join(&slug_base);
-            if c.exists() {
-                papers_dir.join(format!("{slug_base}-2"))
-            } else {
-                c
-            }
-        };
+        let final_dir = crate::arxiv::unique_paper_dir(&papers_dir, &slug_base);
         let final_slug = final_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -648,10 +638,7 @@ mod openreview {
 
         let slug_base = super::build_slug(&meta.authors, meta.year, &meta.title);
         let papers_dir = Path::new(root).join("papers");
-        let final_dir = {
-            let c = papers_dir.join(&slug_base);
-            if c.exists() { papers_dir.join(format!("{slug_base}-2")) } else { c }
-        };
+        let final_dir = crate::arxiv::unique_paper_dir(&papers_dir, &slug_base);
         let final_slug = final_dir
             .file_name()
             .and_then(|n| n.to_str())

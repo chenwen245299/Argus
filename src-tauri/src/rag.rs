@@ -53,7 +53,7 @@ pub fn save_rag_settings(root: &str, settings: &RagSettings) -> Result<(), Strin
         serde_json::to_value(settings).map_err(|e| e.to_string())?,
     );
     let content = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
-    std::fs::write(&path, content).map_err(|e| e.to_string())
+    crate::fsutil::atomic_write_str(&path, &content).map_err(|e| e.to_string())
 }
 
 // ── VectorsMeta ───────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ pub fn get_vectors_meta(root: &str) -> Option<VectorsMeta> {
 fn save_vectors_meta(root: &str, meta: &VectorsMeta) -> Result<(), String> {
     let path = Path::new(root).join(".argus").join(VECTORS_META_FILE);
     let content = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
-    std::fs::write(&path, content).map_err(|e| e.to_string())
+    crate::fsutil::atomic_write_str(&path, &content).map_err(|e| e.to_string())
 }
 
 // ── Text chunking ─────────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ fn save_vectors_meta(root: &str, meta: &VectorsMeta) -> Result<(), String> {
 /// Paragraph-aware chunking: splits on blank lines, groups paragraphs up to
 /// `target_size` chars, keeps last paragraph as overlap into the next chunk.
 /// Falls back to character sliding-window for paragraphs longer than target.
-fn chunk_text(text: &str, target_size: usize, _overlap: usize) -> Vec<String> {
+fn chunk_text(text: &str, target_size: usize, overlap: usize) -> Vec<String> {
     // Collect non-empty paragraphs (split on one or more blank lines).
     let paragraphs: Vec<String> = text
         .split("\n\n")
@@ -90,25 +90,44 @@ fn chunk_text(text: &str, target_size: usize, _overlap: usize) -> Vec<String> {
         return Vec::new();
     }
 
+    // Keep overlap below target so a chunk always makes forward progress.
+    let overlap = overlap.min(target_size.saturating_sub(1));
+
     let mut chunks: Vec<String> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     let mut current_len: usize = 0;
 
+    // After emitting a chunk, carry the trailing paragraphs that fit within
+    // `overlap` chars into the next chunk so context spans the boundary. The
+    // very last paragraph is always kept (even if it alone exceeds `overlap`)
+    // unless overlap is 0.
     let flush = |current: &mut Vec<String>, current_len: &mut usize, chunks: &mut Vec<String>| {
-        if !current.is_empty() {
-            chunks.push(current.join("\n\n"));
+        if current.is_empty() {
+            return;
         }
-        // Keep last paragraph as overlap
-        let overlap_para = current.pop().map(|p| {
+        chunks.push(current.join("\n\n"));
+        if overlap == 0 {
+            current.clear();
+            *current_len = 0;
+            return;
+        }
+        let mut kept: Vec<String> = Vec::new();
+        let mut kept_len: usize = 0;
+        while let Some(p) = current.pop() {
             let l = p.chars().count();
-            (p, l)
-        });
-        current.clear();
-        *current_len = 0;
-        if let Some((p, l)) = overlap_para {
-            current.push(p);
-            *current_len = l;
+            if kept_len + l > overlap && !kept.is_empty() {
+                current.push(p); // doesn't fit — leave it in the flushed chunk
+                break;
+            }
+            kept_len += l;
+            kept.push(p);
+            if kept_len >= overlap {
+                break;
+            }
         }
+        kept.reverse();
+        *current = kept;
+        *current_len = kept_len;
     };
 
     for para in paragraphs {
@@ -116,14 +135,16 @@ fn chunk_text(text: &str, target_size: usize, _overlap: usize) -> Vec<String> {
 
         // Long paragraph: character-slide it directly
         if plen > target_size {
-            // Flush whatever we have
+            // Emit whatever we've accumulated as its own chunk first.
             if !current.is_empty() {
                 chunks.push(current.join("\n\n"));
                 current.clear();
                 current_len = 0;
             }
             let chars: Vec<char> = para.chars().collect();
-            let step = target_size.saturating_sub(target_size / 5).max(1);
+            // Step forward by target minus overlap so successive windows share
+            // `overlap` chars; the user-configured overlap now drives this.
+            let step = target_size.saturating_sub(overlap).max(1);
             let mut s = 0;
             while s < chars.len() {
                 let e = (s + target_size).min(chars.len());
@@ -481,9 +502,19 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
     );
     let embeddings = llm::embeddings(&provider, &api_key, &emb_model, &texts, "embedding").await?;
 
+    // The chunk↔embedding pairing below relies on positional `zip`, which would
+    // silently drop the tail (or misalign text with vectors) if the provider
+    // returned a different count. Refuse rather than corrupt the index.
+    if embeddings.len() != pending.len() {
+        return Err(format!(
+            "Embedding count mismatch: sent {} chunks, got {} vectors. Aborting to avoid text/vector misalignment.",
+            pending.len(),
+            embeddings.len()
+        ));
+    }
     let dim = embeddings.first().map(|v| v.len()).unwrap_or(0);
-    if dim == 0 {
-        return Err("Embeddings returned zero-dimension vectors.".to_string());
+    if dim == 0 || embeddings.iter().any(|v| v.len() != dim) {
+        return Err("Embeddings have zero or inconsistent dimensions.".to_string());
     }
 
     let _ = app.emit(&event, serde_json::json!({"status": "storing"}));
@@ -674,9 +705,16 @@ pub async fn embed_and_store_chunks(
     );
 
     let embeddings = llm::embeddings(&provider, &api_key, &emb_model, &texts, "embedding").await?;
+    if embeddings.len() != chunks.len() {
+        return Err(format!(
+            "Embedding count mismatch: sent {} chunks, got {} vectors. Aborting to avoid text/vector misalignment.",
+            chunks.len(),
+            embeddings.len()
+        ));
+    }
     let dim = embeddings.first().map(|v| v.len()).unwrap_or(0);
-    if dim == 0 {
-        return Err("Embeddings returned zero-dimension vectors.".to_string());
+    if dim == 0 || embeddings.iter().any(|v| v.len() != dim) {
+        return Err("Embeddings have zero or inconsistent dimensions.".to_string());
     }
 
     let _ = app.emit(&event, serde_json::json!({"status": "storing"}));
@@ -829,6 +867,13 @@ pub async fn delete_paper_chunks(root: &str, paper_id: &str) -> Result<(), Strin
         // embedding model.
         conn.execute("DELETE FROM chunks WHERE paper_id = ?1", params![paper_id])
             .map_err(|e| format!("Delete chunks: {e}"))?;
+        // Also drop snippet vectors tied to this paper so they don't linger as
+        // orphans pointing at a deleted paper. (`snippet_chunks` may not exist
+        // yet on older libraries, so ignore a missing-table error.)
+        let _ = conn.execute(
+            "DELETE FROM snippet_chunks WHERE paper_id = ?1",
+            params![paper_id],
+        );
         Ok(())
     })
     .await

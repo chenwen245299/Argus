@@ -8,6 +8,7 @@ mod collections;
 mod commands;
 mod copilot;
 mod extraction;
+mod fsutil;
 mod library;
 mod llm;
 mod metadata;

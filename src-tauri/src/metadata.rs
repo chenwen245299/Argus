@@ -18,6 +18,7 @@ pub struct MetaUpdate {
     pub arxiv_id: Option<String>,
     pub venue: Option<String>,
     pub paper_abstract: Option<String>,
+    pub cite_count: Option<u32>,
 }
 
 // ── PDF text extraction ───────────────────────────────────────────────────────
@@ -243,6 +244,7 @@ fn parse_arxiv_xml(xml: &str) -> Option<MetaUpdate> {
         arxiv_id: None,
         venue,
         paper_abstract,
+        cite_count: None,
     })
 }
 
@@ -312,6 +314,7 @@ fn parse_crossref_json(json: &Value) -> Option<MetaUpdate> {
         arxiv_id: None,
         venue,
         paper_abstract,
+        cite_count: None,
     })
 }
 
@@ -329,7 +332,7 @@ pub async fn fetch_semantic_scholar(
         return None;
     };
     let url = format!(
-        "https://api.semanticscholar.org/graph/v1/paper/{}?fields=title,authors,year,venue,abstract,externalIds",
+        "https://api.semanticscholar.org/graph/v1/paper/{}?fields=title,authors,year,venue,abstract,externalIds,citationCount",
         paper_id
     );
     let client = build_client();
@@ -363,6 +366,7 @@ fn parse_s2_json(json: &Value) -> Option<MetaUpdate> {
         .as_str()
         .map(|s| normalize_space(s))
         .filter(|s| !s.is_empty());
+    let cite_count = json["citationCount"].as_u64().map(|n| n as u32);
 
     Some(MetaUpdate {
         title: Some(title),
@@ -372,6 +376,7 @@ fn parse_s2_json(json: &Value) -> Option<MetaUpdate> {
         arxiv_id,
         venue,
         paper_abstract,
+        cite_count,
     })
 }
 
@@ -383,7 +388,7 @@ pub async fn fetch_semantic_scholar_by_title(title: &str) -> Option<MetaUpdate> 
         .get("https://api.semanticscholar.org/graph/v1/paper/search")
         .query(&[
             ("query", title),
-            ("fields", "title,authors,year,venue,abstract,externalIds"),
+            ("fields", "title,authors,year,venue,abstract,externalIds,citationCount"),
             ("limit", "3"),
         ])
         .send()
@@ -475,6 +480,7 @@ pub async fn fetch_crossref_by_title(title: &str) -> Option<MetaUpdate> {
         arxiv_id: None,
         venue,
         paper_abstract: None,
+        cite_count: None,
     })
 }
 
@@ -531,6 +537,7 @@ fn parse_ai_content(raw: &str) -> Option<MetaUpdate> {
         arxiv_id,
         venue,
         paper_abstract: None,
+        cite_count: None,
     })
 }
 
@@ -647,6 +654,10 @@ pub async fn fetch_and_apply(
         if u.paper_abstract.is_some() {
             meta.paper_abstract = u.paper_abstract;
         }
+        // Only auto-fill citation count when the user has not provided one manually.
+        if meta.cite_count.is_none() && u.cite_count.is_some() {
+            meta.cite_count = u.cite_count;
+        }
 
         crate::paper::write_meta(root, slug, &meta)?;
 
@@ -671,6 +682,28 @@ pub async fn fetch_and_apply(
     }
 
     Ok(meta)
+}
+
+/// Fetch only the citation count for a paper from Semantic Scholar.
+/// Tries arXiv ID / DOI first, then falls back to title search.
+/// Returns the fetched count (which caller can choose to write into meta).
+pub async fn fetch_citation_count(root: &str, slug: &str) -> Result<Option<u32>, String> {
+    let meta = crate::paper::read_meta(root, slug)?;
+
+    // Prefer stable identifiers from meta.
+    if let Some(update) = fetch_semantic_scholar(meta.arxiv_id.as_deref(), meta.doi.as_deref()).await
+    {
+        return Ok(update.cite_count);
+    }
+
+    // Fallback to title search if title is long enough to be specific.
+    if meta.title.split_whitespace().count() >= 3 {
+        if let Some(update) = fetch_semantic_scholar_by_title(&meta.title).await {
+            return Ok(update.cite_count);
+        }
+    }
+
+    Ok(None)
 }
 
 /// Extract metadata using AI only (manual trigger from context menu).

@@ -149,6 +149,27 @@ pub async fn save_paper_meta(
     Ok(())
 }
 
+/// Remove a tag from all papers in the library (global tag deletion).
+#[tauri::command]
+pub async fn delete_tag(
+    tag: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    let dirs = paper::list_paper_dirs(&root)?;
+    for (slug, _) in dirs {
+        if let Ok(mut meta) = paper::read_meta(&root, &slug) {
+            let before = meta.tags.len();
+            meta.tags.retain(|t| t != &tag);
+            if meta.tags.len() != before {
+                let _ = paper::write_meta(&root, &slug, &meta);
+                refresh_search_index(&root, &slug);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_notes(slug: String, state: State<'_, LibraryRoot>) -> Result<String, String> {
     let root = get_root(&state)?;
@@ -648,6 +669,23 @@ pub async fn fetch_metadata(
     let root = get_root(&state)?;
     let meta = metadata::fetch_and_apply(&root, &slug, &app).await?;
     refresh_search_index(&root, &slug);
+    Ok(meta)
+}
+
+/// Fetch only the citation count from Semantic Scholar and update meta.
+#[tauri::command]
+pub async fn fetch_citation_count(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<PaperMeta, String> {
+    let root = get_root(&state)?;
+    let count = metadata::fetch_citation_count(&root, &slug).await?;
+    let mut meta = crate::paper::read_meta(&root, &slug)?;
+    if let Some(n) = count {
+        meta.cite_count = Some(n);
+        crate::paper::write_meta(&root, &slug, &meta)?;
+        refresh_search_index(&root, &slug);
+    }
     Ok(meta)
 }
 

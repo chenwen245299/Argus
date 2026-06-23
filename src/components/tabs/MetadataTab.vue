@@ -85,6 +85,7 @@ watch(() => props.slug, () => {
   bibtexDraft.value = ''
   citeCountEditing.value = false
   citeCountDraft.value = undefined
+  citeCountFetching.value = false
   fulltextEditing.value = false
   fulltextDraft.value = ''
   fulltextError.value = ''
@@ -150,6 +151,20 @@ async function saveBibtex() {
 const citeCountEditing = ref(false)
 const citeCountDraft = ref<number | undefined>(undefined)
 const citeCountSaving = ref(false)
+const citeCountFetching = ref(false)
+
+async function fetchCiteCount() {
+  if (!props.slug) return
+  citeCountFetching.value = true
+  try {
+    const updated = await invoke<PaperMeta>('fetch_citation_count', { slug: props.slug })
+    emit('saved', updated)
+  } catch (e) {
+    console.error('Failed to fetch citation count:', e)
+  } finally {
+    citeCountFetching.value = false
+  }
+}
 
 function startCiteCountEdit() {
   citeCountDraft.value = props.meta?.cite_count
@@ -421,9 +436,18 @@ async function extractAbstract() {
         <div class="field">
           <div class="label cite-count-label-row">
             <span>{{ t('meta.citeCount') }}</span>
-            <button class="copy-section-btn" @click="startCiteCountEdit">
-              {{ meta.cite_count != null ? '编辑' : '导入' }}
-            </button>
+            <div class="cite-count-actions">
+              <button
+                class="copy-section-btn"
+                :disabled="citeCountFetching"
+                @click="fetchCiteCount"
+              >
+                {{ citeCountFetching ? t('meta.citeCountFetching') : t('meta.citeCountFetch') }}
+              </button>
+              <button class="copy-section-btn" @click="startCiteCountEdit">
+                {{ meta.cite_count != null ? t('meta.citeCountEdit') : t('meta.citeCountImport') }}
+              </button>
+            </div>
           </div>
           <template v-if="citeCountEditing">
             <div class="cite-count-edit-row">
@@ -442,7 +466,7 @@ async function extractAbstract() {
             </div>
           </template>
           <template v-else>
-            <div v-if="meta.cite_count == null" class="fulltext-placeholder muted">暂无引用量，点击导入添加</div>
+            <div v-if="meta.cite_count == null" class="fulltext-placeholder muted">{{ t('meta.citeCountNone') }}</div>
             <div v-else class="value cite-count-val">{{ meta.cite_count.toLocaleString() }}</div>
           </template>
         </div>
@@ -1002,6 +1026,11 @@ async function extractAbstract() {
   display: flex; align-items: center; justify-content: space-between;
   gap: 8px;
   margin-bottom: 6px;
+}
+.cite-count-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .cite-count-edit-row {
   display: flex;

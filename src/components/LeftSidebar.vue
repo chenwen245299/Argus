@@ -121,6 +121,36 @@ function toggleTag(tag: string) {
   selection.toggleTagFilter(tag)
 }
 
+const CATEGORY_ICONS: Record<string, string> = {
+  '理论': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>',
+  '方法': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
+  '数据集': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>',
+}
+
+const CATEGORY_STYLES: Record<string, { color: string; background: string }> = {
+  '理论': { color: '#7c3aed', background: '#f3e8ff' },
+  '方法': { color: '#2563eb', background: '#dbeafe' },
+  '数据集': { color: '#059669', background: '#d1fae5' },
+}
+
+function categoryStyleFor(tag: string): { color: string; background: string } | undefined {
+  return CATEGORY_STYLES[tag]
+}
+
+async function deleteTag(tag: string) {
+  const confirmMsg = t('sidebar.deleteTagConfirm').replace('{name}', tag)
+  if (!window.confirm(confirmMsg)) return
+  try {
+    await invoke('delete_tag', { tag })
+    if (selection.tagFilter === tag) {
+      selection.selectNav('all')
+    }
+    await library.refresh()
+  } catch (e) {
+    console.error('Failed to delete tag:', e)
+  }
+}
+
 function toggleExpand(id: string) {
   if (expanded.value.has(id)) expanded.value.delete(id)
   else expanded.value.add(id)
@@ -1051,16 +1081,30 @@ onUnmounted(() => {
       <div class="tags-resize-handle" @mousedown.stop.prevent="startResizeTags" />
       <div class="section-title tags-title">{{ t('sidebar.tags') }}</div>
       <div class="tag-cloud">
-        <button
+        <div
           v-for="tag in library.allTags"
           :key="tag"
           class="tag-chip"
           :class="{ active: selection.tagFilter === tag }"
-          :title="tag"
+          :style="selection.tagFilter === tag ? {} : categoryStyleFor(tag)"
           @click="toggleTag(tag)"
         >
-          {{ tag }}
-        </button>
+          <span
+            v-if="CATEGORY_ICONS[tag]"
+            class="tag-chip-icon"
+            v-html="CATEGORY_ICONS[tag]"
+          />
+          <span class="tag-chip-text">{{ tag }}</span>
+          <button
+            class="tag-chip-delete"
+            :title="t('common.delete')"
+            @click.stop="deleteTag(tag)"
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+              <path d="M18 6L6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
       </div>
     </div>
 
@@ -1552,9 +1596,10 @@ onUnmounted(() => {
 .tag-chip {
   display: inline-flex;
   align-items: center;
+  gap: 2px;
   max-width: 100%;
   min-width: 0;
-  padding: 2px 5px;
+  padding: 2px 3px 2px 7px;
   border-radius: var(--radius-pill);
   background: transparent;
   color: var(--text-secondary);
@@ -1562,9 +1607,23 @@ onUnmounted(() => {
   font-size: 12px;
   line-height: 1.25;
   white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+
+.tag-chip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 11px;
+  height: 11px;
+  flex-shrink: 0;
+  margin-right: 2px;
+}
+
+.tag-chip-text {
   overflow: hidden;
   text-overflow: ellipsis;
-  transition: background 0.1s, color 0.1s, border-color 0.1s;
 }
 
 .tag-chip:hover {
@@ -1576,6 +1635,34 @@ onUnmounted(() => {
   background: var(--accent-light);
   color: var(--accent);
   font-weight: 500;
+}
+
+.tag-chip-delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.1s, color 0.1s;
+}
+
+.tag-chip:hover .tag-chip-delete,
+.tag-chip-delete:focus-visible {
+  opacity: 1;
+}
+
+.tag-chip-delete:hover {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  color: var(--danger);
 }
 
 .sidebar-footer {

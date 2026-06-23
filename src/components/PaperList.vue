@@ -667,6 +667,7 @@ const suggestedContextTags = computed(() => {
   const query = ctxMenu.value.tagInput.trim().toLowerCase()
   return library.allTags
     .filter(tag => !owned.has(tag))
+    .filter(tag => !CATEGORY_TAGS.has(tag))
     .filter(tag => !query || tag.toLowerCase().includes(query))
     .slice(0, 10)
 })
@@ -767,6 +768,17 @@ const PAPER_CATEGORIES = [
     bg: '#d1fae5',
   },
 ]
+
+function categoryIconFor(tag: string): string | undefined {
+  return PAPER_CATEGORIES.find(c => c.tag === tag)?.icon
+}
+
+function categoryStyleFor(tag: string): { color: string; background: string } | undefined {
+  const cat = PAPER_CATEGORIES.find(c => c.tag === tag)
+  return cat ? { color: cat.color, background: cat.bg } : undefined
+}
+
+const CATEGORY_TAGS = new Set(PAPER_CATEGORIES.map(c => c.tag))
 
 async function toggleCategoryTag(item: PaperIndexEntry, tag: string) {
   const tags = [...(item.tags ?? [])]
@@ -1373,7 +1385,13 @@ async function reExtract(item: PaperIndexEntry) {
                       v-for="tag in item.tags.slice(0, 3)"
                       :key="tag"
                       class="tag-chip"
+                      :style="categoryStyleFor(tag)"
                     >
+                      <span
+                        v-if="categoryIconFor(tag)"
+                        class="tag-icon"
+                        v-html="categoryIconFor(tag)"
+                      />
                       <span class="tag-text" @click="clickTag($event, tag)">{{ tag }}</span>
                       <button
                         class="tag-remove"
@@ -1457,8 +1475,14 @@ async function reExtract(item: PaperIndexEntry) {
               :key="tag"
               class="ctx-tag-chip"
               :title="t('metaEdit.removeTag')"
+              :style="categoryStyleFor(tag)"
               @click="removeTagFromContext(tag)"
             >
+              <span
+                v-if="categoryIconFor(tag)"
+                class="ctx-tag-icon"
+                v-html="categoryIconFor(tag)"
+              />
               <span>{{ tag }}</span>
               <span class="ctx-tag-remove">×</span>
             </button>
@@ -1490,7 +1514,12 @@ async function reExtract(item: PaperIndexEntry) {
                 class="ctx-tag-suggestion"
                 @click="addSuggestedTag(tag)"
               >
-                {{ tag }}
+                <span
+                  v-if="categoryIconFor(tag)"
+                  class="ctx-tag-icon"
+                  v-html="categoryIconFor(tag)"
+                />
+                <span>{{ tag }}</span>
               </button>
             </div>
           </div>
@@ -1942,6 +1971,15 @@ async function reExtract(item: PaperIndexEntry) {
   background: var(--accent);
   color: #fff;
 }
+.tag-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  margin-right: 2px;
+}
 .tag-text {
   cursor: pointer;
 }
@@ -2166,6 +2204,14 @@ async function reExtract(item: PaperIndexEntry) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+:global(.ctx-tag-icon) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+}
 :global(.ctx-tag-chip:hover) {
   background: color-mix(in srgb, #e53e3e 12%, var(--accent-light));
   color: #e53e3e;
@@ -2229,6 +2275,9 @@ async function reExtract(item: PaperIndexEntry) {
   max-width: 190px;
 }
 :global(.ctx-tag-suggestion) {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   max-width: 100%;
   padding: 2px 6px;
   border-radius: var(--radius-pill);

@@ -48,6 +48,7 @@ export const zh = {
     tags: '标签',
     selectPaper: '选择一篇论文',
     canvas: '论文关系图谱',
+    deleteTagConfirm: '确定删除标签「{name}」？所有论文上的该标签都会被移除。',
   },
   // Paper list
   list: {
@@ -175,6 +176,11 @@ export const zh = {
     abstractReExtract: '重新提取',
     abstractExtracting: '提取中…',
     citeCount: '引用量',
+    citeCountFetch: '自动获取',
+    citeCountFetching: '获取中…',
+    citeCountEdit: '编辑',
+    citeCountImport: '导入',
+    citeCountNone: '暂无引用量',
   },
   readingStatus: {
     unread: '未读',
@@ -861,6 +867,7 @@ export const en: typeof zh = {
     tags: 'Tags',
     selectPaper: 'Select a paper',
     canvas: 'Paper Graph',
+    deleteTagConfirm: 'Delete tag "{name}"? It will be removed from all papers.',
   },
   list: {
     date: 'Date',
@@ -983,6 +990,11 @@ export const en: typeof zh = {
     abstractReExtract: 'Re-extract',
     abstractExtracting: 'Extracting…',
     citeCount: 'Citations',
+    citeCountFetch: 'Fetch',
+    citeCountFetching: 'Fetching…',
+    citeCountEdit: 'Edit',
+    citeCountImport: 'Import',
+    citeCountNone: 'No citations yet',
   },
   readingStatus: {
     unread: 'Unread',

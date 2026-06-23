@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
+    "build:fast": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "postinstall": "node scripts/setup-vditor.js"

@@ -81,6 +81,7 @@ pub fn run() {
             // ── M0-M3: Single paper ──
             commands::get_paper_meta,
             commands::save_paper_meta,
+            commands::delete_tag,
             commands::get_notes,
             commands::save_notes,
             commands::list_notes,
@@ -111,6 +112,7 @@ pub fn run() {
             commands::pick_pdf_files,
             commands::import_pdf,
             commands::fetch_metadata,
+            commands::fetch_citation_count,
             commands::extract_metadata_ai,
             commands::extract_first_page_text,
             commands::rename_paper_folder,

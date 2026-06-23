@@ -92,11 +92,11 @@ pub async fn generate_summary(
         &[
             ChatMessage {
                 role: "system".to_string(),
-                content: system,
+                content: system.into(),
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: user,
+                content: user.into(),
             },
         ],
         &event_name,

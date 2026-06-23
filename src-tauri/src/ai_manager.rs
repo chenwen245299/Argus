@@ -130,10 +130,25 @@ pub fn read_ai_settings(root: &str) -> AiSettings {
     if !path.exists() {
         return AiSettings::default();
     }
-    std::fs::read_to_string(&path)
+    let mut settings: AiSettings = std::fs::read_to_string(&path)
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    // Migration: older Kimi Code providers may have an empty model list because
+    // the /coding endpoint has no public /models list. Backfill the built-in
+    // model so the provider shows up in the model selector immediately.
+    let mut changed = false;
+    for p in &mut settings.providers {
+        if p.models.is_empty() && is_kimi_code(&p.kind, &p.base_url) {
+            p.models = crate::llm::kimi_known_models();
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = write_ai_settings(root, &settings);
+    }
+    settings
 }
 
 pub fn write_ai_settings(root: &str, settings: &AiSettings) -> Result<(), String> {
@@ -170,6 +185,10 @@ pub fn to_info(root: &str, settings: &AiSettings) -> AiSettingsInfo {
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 
+fn is_kimi_code(kind: &str, base_url: &str) -> bool {
+    kind == "kimi" || base_url.to_lowercase().contains("api.kimi.com")
+}
+
 pub fn add_provider(
     root: &str,
     input: AiProviderInput,
@@ -177,13 +196,17 @@ pub fn add_provider(
 ) -> Result<AiProvider, String> {
     let mut settings = read_ai_settings(root);
     let id = uuid::Uuid::new_v4().to_string();
+    let mut models = input.models;
+    if models.is_empty() && is_kimi_code(&input.kind, &input.base_url) {
+        models = crate::llm::kimi_known_models();
+    }
     let provider = AiProvider {
         id: id.clone(),
         name: input.name,
         kind: input.kind,
         base_url: input.base_url,
         enabled: input.enabled,
-        models: input.models,
+        models,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     if !api_key.is_empty() {
@@ -210,10 +233,14 @@ pub fn update_provider(
         .find(|p| p.id == id)
         .ok_or_else(|| format!("Provider not found: {id}"))?;
     p.name = input.name;
-    p.kind = input.kind;
-    p.base_url = input.base_url;
+    p.kind = input.kind.clone();
+    p.base_url = input.base_url.clone();
     p.enabled = input.enabled;
-    p.models = input.models;
+    p.models = if input.models.is_empty() && is_kimi_code(&input.kind, &input.base_url) {
+        crate::llm::kimi_known_models()
+    } else {
+        input.models
+    };
     if let Some(key) = api_key {
         if !key.is_empty() {
             save_api_key(root, id, key)?;

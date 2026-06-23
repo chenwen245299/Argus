@@ -435,7 +435,7 @@ Only include high-confidence relationships. Return [] if unsure. No markdown, no
 
     let messages = vec![ChatMessage {
         role: "user".to_string(),
-        content: prompt,
+        content: prompt.into(),
     }];
 
     let response = llm::chat_completion(&provider, &api_key, &model, &messages, "canvas").await?;

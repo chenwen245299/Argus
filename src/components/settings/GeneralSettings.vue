@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useLibraryStore } from '../../stores/library'
 import { useSettingsStore } from '../../stores/settings'
@@ -9,6 +9,34 @@ import type { ThemeId } from '../../types'
 const { t, locale } = useI18n()
 const library = useLibraryStore()
 const settingsStore = useSettingsStore()
+
+const usdToCnyRate = ref('7.2')
+const billingSaveStatus = ref<'' | 'saving' | 'saved'>('')
+
+onMounted(async () => {
+  await settingsStore.load()
+  usdToCnyRate.value = formatRate(settingsStore.settings.usd_to_cny_rate)
+})
+
+function formatRate(rate: unknown) {
+  const n = Number(rate)
+  return Number.isFinite(n) && n > 0 ? String(n) : '7.2'
+}
+
+function parseRate(raw: string) {
+  const v = Number(raw)
+  return Number.isFinite(v) && v > 0 ? v : 7.2
+}
+
+async function saveBillingSettings() {
+  const rate = parseRate(usdToCnyRate.value)
+  usdToCnyRate.value = formatRate(rate)
+  if (settingsStore.settings.usd_to_cny_rate === rate) return
+  billingSaveStatus.value = 'saving'
+  await settingsStore.save({ usd_to_cny_rate: rate })
+  billingSaveStatus.value = 'saved'
+  setTimeout(() => { billingSaveStatus.value = '' }, 2000)
+}
 
 interface ThemeOption {
   id: ThemeId
@@ -96,6 +124,28 @@ function shortPath(p: string): string {
         >
           {{ option.label }}
         </button>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <div class="setting-label">{{ t('settings.aiBilling') }}</div>
+      <div class="setting-row billing-row">
+        <span class="billing-desc">{{ t('settings.aiBillingDesc') }}</span>
+        <label class="billing-rate-field">
+          <span>USD/CNY</span>
+          <input
+            v-model="usdToCnyRate"
+            class="text-input sm"
+            type="number"
+            min="0.0001"
+            step="0.01"
+            @blur="saveBillingSettings"
+            @keydown.enter.prevent="saveBillingSettings"
+          />
+        </label>
+        <span v-if="billingSaveStatus" class="billing-save">
+          {{ billingSaveStatus === 'saving' ? '…' : t('settings.saved') }}
+        </span>
       </div>
     </div>
 
@@ -284,5 +334,66 @@ h2 { font-size: 18px; font-weight: 600; margin-bottom: 24px; color: var(--text-p
 .check-icon {
   color: var(--accent);
   flex-shrink: 0;
+}
+
+.billing-row {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.billing-desc {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  flex: 1;
+  min-width: 0;
+}
+
+.billing-rate-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.billing-rate-field span {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+}
+
+.billing-rate-field .text-input.sm {
+  width: 92px;
+  height: 28px;
+  padding: 4px 8px;
+}
+
+.billing-save {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  width: 34px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.text-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.text-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-light);
+}
+
+.text-input.sm {
+  width: 92px;
+  height: 28px;
+  padding: 4px 8px;
 }
 </style>

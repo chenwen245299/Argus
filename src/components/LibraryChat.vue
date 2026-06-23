@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useAiStore, type ModelOption } from '../stores/ai'
 import { useRagStore } from '../stores/rag'
+import { useSettingsStore } from '../stores/settings'
 import MermaidBlock from './MermaidBlock.vue'
 import { renderMarkdown, getSegments } from '../utils/renderMarkdown'
 import { svgStringToPngBlob } from '../utils/svgToPng'
@@ -17,6 +18,7 @@ const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag'] }>()
 const { t } = useI18n()
 const ai = useAiStore()
 const ragStore = useRagStore()
+const settingsStore = useSettingsStore()
 
 // ── RAG vectorization status ───────────────────────────────────────────────────
 const allPapers = ref<PaperIndexEntry[]>([])
@@ -703,11 +705,23 @@ function toggleContextPanel(answerId: string) {
   expandedContextId.value = expandedContextId.value === answerId ? null : answerId
 }
 
+const usdToCnyRate = computed(() => {
+  const r = Number(settingsStore.settings.usd_to_cny_rate)
+  return Number.isFinite(r) && r > 0 ? r : 7.2
+})
+
 function formatTokenCount(value: number | undefined) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return ''
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M`
   if (value >= 10_000) return `${(value / 1_000).toFixed(1)}k`
   return String(value)
+}
+
+function formatCostCny(costUsd: number | null | undefined) {
+  if (typeof costUsd !== 'number' || !Number.isFinite(costUsd) || costUsd < 0) return ''
+  const cny = costUsd * usdToCnyRate.value
+  if (cny < 0.01) return '<0.01'
+  return cny.toFixed(cny < 1 ? 3 : 2)
 }
 
 function hasUsage(answer: LibraryAnswerVariant) {
@@ -723,14 +737,17 @@ function answerSpeed(answer: LibraryAnswerVariant) {
 }
 
 function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
-  return messages
-    .map(m => {
-      if (m.role === 'user') return { role: 'user', content: m.content }
+  const history: ChatMessage[] = []
+  for (const m of messages) {
+    if (m.role === 'user') {
+      history.push({ role: 'user', content: m.content })
+    } else {
       const ans = activeAnswer(m)
-      if (ans.streaming || ans.error || !ans.content.trim()) return null
-      return { role: 'assistant', content: ans.content }
-    })
-    .filter((m): m is ChatMessage => !!m)
+      if (ans.streaming || ans.error || !ans.content.trim()) continue
+      history.push({ role: 'assistant', content: ans.content })
+    }
+  }
+  return history
 }
 
 function buildHistoryBeforeMessage(conv: LibraryConversation, messageId: string) {
@@ -1106,6 +1123,7 @@ function onCopyCode(e: Event) {
 }
 
 onMounted(async () => {
+  await settingsStore.load()
   const saved = loadFromStorage()
   conversations.value = saved
   if (saved.length > 0) activeConvId.value = saved[0].id
@@ -1617,9 +1635,10 @@ onUnmounted(() => {
                         </span>
                         <span class="assistant-model-meta-name">{{ answerModelName(activeAnswer(msg)) }}</span>
                       </span>
-                      <span v-if="typeof activeAnswer(msg).inputTokens === 'number'">↑{{ formatTokenCount(activeAnswer(msg).inputTokens) }}</span>
-                      <span v-if="typeof activeAnswer(msg).outputTokens === 'number'">↓{{ formatTokenCount(activeAnswer(msg).outputTokens) }}</span>
+                      <span v-if="typeof activeAnswer(msg).inputTokens === 'number'" title="上下文输入 tokens">↑{{ formatTokenCount(activeAnswer(msg).inputTokens) }}</span>
+                      <span v-if="typeof activeAnswer(msg).outputTokens === 'number'" title="本次输出 tokens">↓{{ formatTokenCount(activeAnswer(msg).outputTokens) }}</span>
                       <span v-if="answerSpeed(activeAnswer(msg))" class="msg-speed">{{ answerSpeed(activeAnswer(msg)) }}</span>
+                      <span v-if="activeAnswer(msg).costUsd != null && formatCostCny(activeAnswer(msg).costUsd)" class="usage-cost" :title="`约 ¥${formatCostCny(activeAnswer(msg).costUsd)} / $${activeAnswer(msg).costUsd!.toFixed(6)}`">¥{{ formatCostCny(activeAnswer(msg).costUsd) }}</span>
                     </div>
                   </div>
 
@@ -2788,6 +2807,12 @@ onUnmounted(() => {
 
 .assistant-usage .msg-speed {
   color: color-mix(in srgb, var(--accent) 74%, var(--text-tertiary));
+}
+
+.assistant-usage .usage-cost {
+  color: var(--text-secondary);
+  font-weight: 500;
+  margin-left: 2px;
 }
 
 /* ── Sent context banner ─────────────────────────────────────────────────── */

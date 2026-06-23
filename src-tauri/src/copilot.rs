@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use tauri::Emitter;
 
-use crate::models::{ChatMessage, PaperMeta, RetrievedChunk};
+use crate::models::{ChatContent, ChatMessage, PaperMeta, RetrievedChunk};
 use crate::{ai_manager, ai_summary, extraction, llm, paper, rag};
 
 // ── Chat history persistence ──────────────────────────────────────────────────
@@ -161,13 +161,13 @@ pub async fn chat_with_paper_on_event(
         "none" => {
             all_messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: "You are a research assistant. Answer the user's questions clearly and concisely.".to_string(),
+                content: "You are a research assistant. Answer the user's questions clearly and concisely.".into(),
             });
         }
         "metadata" => {
             sent_metadata = build_metadata_string(meta.as_ref());
             let system = build_system_prompt(meta.as_ref(), "", false, false, None);
-            all_messages.push(ChatMessage { role: "system".to_string(), content: system });
+            all_messages.push(ChatMessage { role: "system".to_string(), content: system.into() });
         }
         "summary" => {
             let summary = ai_summary::read_summary(root, slug);
@@ -175,7 +175,7 @@ pub async fn chat_with_paper_on_event(
             sent_summary = summary.clone();
             // meta=None: user did not select 元数据
             let system = build_system_prompt(None, "", false, false, summary_ctx);
-            all_messages.push(ChatMessage { role: "system".to_string(), content: system });
+            all_messages.push(ChatMessage { role: "system".to_string(), content: system.into() });
         }
         "summary+fulltext" => {
             let summary = ai_summary::read_summary(root, slug);
@@ -189,7 +189,7 @@ pub async fn chat_with_paper_on_event(
             };
             // meta=None: user did not select 元数据
             let system = build_system_prompt(None, &context, truncated, false, summary_ctx);
-            all_messages.push(ChatMessage { role: "system".to_string(), content: system });
+            all_messages.push(ChatMessage { role: "system".to_string(), content: system.into() });
         }
         _ => {
             // "fulltext"
@@ -201,7 +201,7 @@ pub async fn chat_with_paper_on_event(
             };
             // meta=None: user did not select 元数据
             let system = build_system_prompt(None, &context, truncated, false, None);
-            all_messages.push(ChatMessage { role: "system".to_string(), content: system });
+            all_messages.push(ChatMessage { role: "system".to_string(), content: system.into() });
         }
     }
 
@@ -217,8 +217,9 @@ pub async fn chat_with_paper_on_event(
 
     all_messages.extend_from_slice(&messages);
 
-    // OpenRouter with PDF toggle: send the PDF file directly.
-    let use_pdf = use_pdf && provider.kind == "openrouter";
+    // OpenRouter / Kimi with PDF toggle: send the PDF file directly.
+    let is_kimi = provider.kind == "kimi" || provider.base_url.to_lowercase().contains("moonshot.cn");
+    let use_pdf = use_pdf && (provider.kind == "openrouter" || is_kimi);
 
     if use_pdf {
         let pdf_path = crate::metadata::find_pdf_in_dir(root, slug);
@@ -304,16 +305,19 @@ pub async fn chat_with_library(
         );
         system = selected_system;
     } else if use_snippets {
-        let query = messages
+        let query_text = messages
             .iter()
             .rev()
             .find(|m| m.role == "user")
-            .map(|m| m.content.clone())
+            .and_then(|m| match &m.content {
+                ChatContent::Text(s) => Some(s.clone()),
+                _ => None,
+            })
             .unwrap_or_default();
 
         let settings = rag::get_rag_settings(root);
-        let retrieved = if settings.is_configured() && !query.is_empty() {
-            match rag::embed_query(root, &query, &settings).await {
+        let retrieved = if settings.is_configured() && !query_text.is_empty() {
+            match rag::embed_query(root, &query_text, &settings).await {
                 Ok(vec) => rag::search_snippet_chunks_with_vec(root, vec, 12).await.unwrap_or_default(),
                 Err(_) => vec![],
             }
@@ -326,12 +330,15 @@ pub async fn chat_with_library(
     } else {
         let settings = rag::get_rag_settings(root);
         let rag_chunks = if settings.is_configured() {
-            let query = messages
+            let query_text = messages
                 .iter()
                 .rev()
                 .find(|m| m.role == "user")
-                .map(|m| m.content.clone());
-            if let Some(q) = query {
+                .and_then(|m| match &m.content {
+                    ChatContent::Text(s) => Some(s.clone()),
+                    _ => None,
+                });
+            if let Some(q) = query_text {
                 if let Ok(vec) = rag::embed_query(root, &q, &settings).await {
                     rag::search_library_chunks_with_vec(root, vec, settings.top_k * 2)
                         .await
@@ -355,7 +362,7 @@ pub async fn chat_with_library(
 
     let mut all_messages = vec![ChatMessage {
         role: "system".to_string(),
-        content: system,
+        content: system.into(),
     }];
     all_messages.extend_from_slice(&messages);
 

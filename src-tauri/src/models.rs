@@ -520,7 +520,48 @@ pub struct AiProviderInput {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: ChatContent,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum ChatContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlData },
+    #[serde(rename = "file")]
+    File { file: FileData },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ImageUrlData {
+    pub url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FileData {
+    pub filename: String,
+    pub file_data: String,
+}
+
+impl From<String> for ChatContent {
+    fn from(s: String) -> Self {
+        ChatContent::Text(s)
+    }
+}
+
+impl From<&str> for ChatContent {
+    fn from(s: &str) -> Self {
+        ChatContent::Text(s.to_string())
+    }
 }
 
 // ── M7: RAG / Vectorization ──────────────────────────────────────────────────

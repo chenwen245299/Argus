@@ -3,7 +3,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use tauri::Emitter;
 
-use crate::models::{AiModel, AiProvider, ChatMessage};
+use crate::models::{AiModel, AiProvider, ChatContent, ChatMessage};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -67,9 +67,9 @@ pub async fn chat_completion_stream(
     }
 }
 
-/// Like `chat_completion_stream` but for OpenRouter with an attached PDF.
-/// Encodes the PDF as base64 and injects it as a `file` content block into
-/// the first user message so the model can read the paper directly.
+/// Like `chat_completion_stream` but for providers that accept an inline PDF
+/// (OpenRouter and Kimi). Encodes the PDF as base64 and injects it as a `file`
+/// content block into the first user message so the model can read the paper directly.
 pub async fn chat_completion_stream_with_pdf(
     provider: &AiProvider,
     api_key: &str,
@@ -82,7 +82,7 @@ pub async fn chat_completion_stream_with_pdf(
     source: &str,
     pdf_path: &std::path::Path,
 ) -> Result<String, String> {
-    stream_openrouter_with_pdf(
+    stream_with_pdf_injected(
         provider,
         api_key,
         model,
@@ -101,10 +101,103 @@ pub async fn chat_completion_stream_with_pdf(
 /// OpenAI-compatible: GET {base_url}/models
 /// Anthropic: returns a hardcoded well-known list (no public /models endpoint).
 pub async fn list_models(provider: &AiProvider, api_key: &str) -> Result<Vec<AiModel>, String> {
+    if provider.kind == "kimi" || provider.base_url.to_lowercase().contains("api.kimi.com") {
+        // Kimi Code / Moonshot does not expose a public /models endpoint for
+        // ordinary API keys (it typically returns 401). Return a hard-coded
+        // well-known list instead.
+        return Ok(kimi_known_models());
+    }
     match provider.kind.as_str() {
         "anthropic" => Ok(anthropic_known_models()),
         _ => fetch_openai_models(provider, api_key).await,
     }
+}
+
+/// Test provider connectivity by sending a tiny non-streaming chat completion.
+/// Unlike /models, this works for providers such as Kimi Code that do not
+/// expose a public model-list endpoint.
+pub async fn test_connection(provider: &AiProvider, api_key: &str) -> Result<String, String> {
+    let client = build_client()?;
+    let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+    let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
+    let is_kimi = provider.kind == "kimi"
+        || provider.base_url.to_lowercase().contains("moonshot.cn")
+        || provider.base_url.to_lowercase().contains("api.kimi.com");
+
+    // Pick a model id to probe. For Kimi Code / Moonshot use a known id.
+    let model = if is_kimi {
+        provider
+            .models
+            .iter()
+            .find(|m| m.id == "kimi-for-coding" || m.id.starts_with("kimi-k2"))
+            .map(|m| m.id.as_str())
+            .unwrap_or("kimi-for-coding")
+    } else {
+        provider
+            .models
+            .first()
+            .map(|m| m.id.as_str())
+            .unwrap_or("gpt-4o-mini")
+    };
+
+    let is_kimi_k2 = is_kimi && model.starts_with("kimi-k2");
+    let is_kimi_for_coding = is_kimi && model == "kimi-for-coding";
+
+    // Kimi Code's /coding endpoint is sensitive to extra parameters; keep the
+    // probe minimal. Other providers get a tiny max_tokens cap.
+    let mut body = if is_kimi_for_coding {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Hi"}]
+        })
+    } else {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 1
+        })
+    };
+
+    // The Moonshot /models endpoint is gone for Kimi Code; avoid Moonshot-only
+    // extensions such as usage.include on the /coding endpoint.
+    if is_openrouter || (is_kimi && !is_kimi_for_coding) {
+        body["usage"] = serde_json::json!({"include": true});
+    }
+
+    if is_kimi_k2 {
+        body["thinking"] = serde_json::json!({"type": "enabled"});
+        body["temperature"] = serde_json::json!(1.0);
+        body["top_p"] = serde_json::json!(0.95);
+        body["n"] = serde_json::json!(1);
+        body["presence_penalty"] = serde_json::json!(0.0);
+        body["frequency_penalty"] = serde_json::json!(0.0);
+    }
+
+    let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
+    let mut req = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json");
+    if is_kimi_coding_endpoint {
+        // Kimi Code's /coding endpoint gates access by User-Agent whitelist.
+        // Pretend to be a whitelisted coding agent so ordinary API keys work.
+        req = req.header("User-Agent", "KimiCLI/1.5");
+    }
+    let resp = req.json(&body).send().await.map_err(|e| format!("Network error: {e}"))?;
+
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if status >= 400 {
+        return Err(format!(
+            "{} [kind={}, base_url={}, model={}]",
+            friendly_error(status, &text),
+            provider.kind,
+            provider.base_url,
+            model
+        ));
+    }
+
+    Ok(format!("Connected. Provider responded with status {status} (model={model})."))
 }
 
 /// Embed texts using the provider's /embeddings endpoint (OpenAI-compatible).
@@ -312,11 +405,11 @@ fn parse_embedding_data(data: &[serde_json::Value]) -> Result<Vec<Vec<f32>>, Str
     Ok(vecs)
 }
 
-// ── OpenRouter with PDF ───────────────────────────────────────────────────────
+// ── OpenAI-compatible providers with inline PDF ───────────────────────────────
 
-/// Build the `messages` array for OpenRouter with the PDF injected as a
-/// `file` content block into the first user message.
-fn build_openrouter_messages_with_pdf(
+/// Build the `messages` array with the PDF injected as a `file` content block
+/// into the first user message. Works for OpenRouter and Kimi.
+fn build_messages_with_pdf(
     messages: &[ChatMessage],
     pdf_path: &std::path::Path,
 ) -> Vec<serde_json::Value> {
@@ -345,13 +438,20 @@ fn build_openrouter_messages_with_pdf(
         .map(|(i, m)| {
             if Some(i) == first_user_idx {
                 if let Some(ref fb) = file_block {
-                    return serde_json::json!({
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": &m.content},
-                            fb
-                        ]
-                    });
+                    let content = match &m.content {
+                        ChatContent::Text(s) => {
+                            serde_json::json!([{"type": "text", "text": s.as_str()}, fb])
+                        }
+                        ChatContent::Parts(parts) => {
+                            let mut arr = serde_json::to_value(parts)
+                                .ok()
+                                .and_then(|v| v.as_array().cloned())
+                                .unwrap_or_default();
+                            arr.push(fb.clone());
+                            serde_json::Value::Array(arr)
+                        }
+                    };
+                    return serde_json::json!({"role": "user", "content": content});
                 }
             }
             serde_json::json!({"role": m.role, "content": &m.content})
@@ -359,7 +459,7 @@ fn build_openrouter_messages_with_pdf(
         .collect()
 }
 
-async fn stream_openrouter_with_pdf(
+async fn stream_with_pdf_injected(
     provider: &AiProvider,
     api_key: &str,
     model: &str,
@@ -378,23 +478,33 @@ async fn stream_openrouter_with_pdf(
     );
 
     let msgs = if pdf_path.exists() {
-        build_openrouter_messages_with_pdf(messages, pdf_path)
+        build_messages_with_pdf(messages, pdf_path)
     } else {
         messages
             .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
             .collect()
     };
+
+    let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
+    let is_kimi = provider.kind == "kimi"
+        || provider.base_url.to_lowercase().contains("moonshot.cn")
+        || provider.base_url.to_lowercase().contains("api.kimi.com");
+    let is_kimi_k2 = is_kimi && model.starts_with("kimi-k2");
+    let is_kimi_for_coding = is_kimi && model == "kimi-for-coding";
 
     let mut body = serde_json::json!({
         "model": model,
         "messages": msgs,
         "stream": true,
-        "stream_options": {"include_usage": true},
-        "usage": {"include": true}
+        "stream_options": {"include_usage": true}
     });
 
-    {
+    if is_openrouter || (is_kimi && !is_kimi_for_coding) {
+        body["usage"] = serde_json::json!({"include": true});
+    }
+
+    if is_openrouter {
         let order: Vec<&str> = provider
             .models
             .iter()
@@ -406,21 +516,38 @@ async fn stream_openrouter_with_pdf(
         }
     }
 
-    if use_reasoning {
-        body["reasoning"] = serde_json::json!({
-            "effort": reasoning_effort.unwrap_or("high"),
-            "exclude": false
-        });
+    if use_reasoning || is_kimi_k2 {
+        if is_openrouter {
+            body["reasoning"] = serde_json::json!({
+                "effort": reasoning_effort.unwrap_or("high"),
+                "exclude": false
+            });
+        } else if is_kimi_k2 {
+            // Kimi K2.* series requires thinking enabled and fixed sampling params.
+            body["thinking"] = serde_json::json!({"type": "enabled"});
+            body["temperature"] = serde_json::json!(1.0);
+            body["top_p"] = serde_json::json!(0.95);
+            body["n"] = serde_json::json!(1);
+            body["presence_penalty"] = serde_json::json!(0.0);
+            body["frequency_penalty"] = serde_json::json!(0.0);
+        } else if is_kimi_for_coding {
+            // Kimi Code subscription model supports thinking but does not require it.
+            body["thinking"] = serde_json::json!({"type": "enabled"});
+        }
     }
 
-    let resp = client
+    let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
+    let mut req = client
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .header("Content-Type", "application/json");
+    if is_kimi_coding_endpoint {
+        req = req.header("User-Agent", "KimiCLI/1.5");
+        // reqwest's bytes_stream() does not decompress gzip. Kimi Code may return
+        // a gzipped SSE stream, so ask for identity encoding to keep it plain text.
+        req = req.header("Accept-Encoding", "identity");
+    }
+    let resp = req.json(&body).send().await.map_err(|e| format!("Network error: {e}"))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -448,7 +575,8 @@ async fn stream_openrouter_with_pdf(
                     let line = buf[..pos].trim_end_matches('\r').to_string();
                     buf.drain(..pos + 1);
 
-                    if let Some(data) = line.strip_prefix("data: ") {
+                    if let Some(data) = line.strip_prefix("data:") {
+                        let data = data.trim_start();
                         if data == "[DONE]" {
                             if !usage_emitted {
                                 emit_stream_usage(
@@ -496,23 +624,32 @@ async fn stream_openrouter_with_pdf(
                                 );
                                 usage_emitted = true;
                             }
-                            let delta = json["choices"][0]["delta"]["content"]
+                            let content_delta = json["choices"][0]["delta"]["content"]
                                 .as_str()
                                 .unwrap_or("");
-                            let reasoning_delta = json["choices"][0]["delta"]["reasoning"]
+                            let reasoning_delta = json["choices"][0]["delta"]["reasoning_content"]
                                 .as_str()
+                                .or_else(|| json["choices"][0]["delta"]["reasoning"].as_str())
+                                .or_else(|| json["choices"][0]["delta"]["thinking"].as_str())
                                 .unwrap_or("");
-                            if !reasoning_delta.is_empty() {
+
+                            if !content_delta.is_empty() {
+                                accumulated.push_str(content_delta);
+                                let _ = app.emit(
+                                    event_name,
+                                    serde_json::json!({"delta": content_delta, "done": false}),
+                                );
+                            } else if is_kimi_for_coding && !reasoning_delta.is_empty() {
+                                // kimi-for-coding emits its response as reasoning_content by default.
+                                accumulated.push_str(reasoning_delta);
+                                let _ = app.emit(
+                                    event_name,
+                                    serde_json::json!({"delta": reasoning_delta, "done": false}),
+                                );
+                            } else if !reasoning_delta.is_empty() {
                                 let _ = app.emit(
                                     &reasoning_event,
                                     serde_json::json!({"delta": reasoning_delta, "done": false}),
-                                );
-                            }
-                            if !delta.is_empty() {
-                                accumulated.push_str(delta);
-                                let _ = app.emit(
-                                    event_name,
-                                    serde_json::json!({"delta": delta, "done": false}),
                                 );
                             }
                         }
@@ -559,14 +696,23 @@ async fn chat_openai_compat(
         provider.base_url.trim_end_matches('/')
     );
     let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
+    let is_kimi = provider.kind == "kimi"
+        || provider.base_url.to_lowercase().contains("moonshot.cn")
+        || provider.base_url.to_lowercase().contains("api.kimi.com");
+    let is_kimi_k2 = is_kimi && model.starts_with("kimi-k2");
     let msgs: Vec<serde_json::Value> = messages
         .iter()
-        .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+        .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
         .collect();
+    let is_kimi_for_coding = is_kimi && model == "kimi-for-coding";
+
     let mut body = serde_json::json!({"model": model, "messages": msgs});
 
-    if is_openrouter {
+    if is_openrouter || (is_kimi && !is_kimi_for_coding) {
         body["usage"] = serde_json::json!({"include": true});
+    }
+
+    if is_openrouter {
         let order: Vec<&str> = provider
             .models
             .iter()
@@ -578,15 +724,25 @@ async fn chat_openai_compat(
         }
     }
 
-    let resp = client
+    if is_kimi_k2 {
+        body["thinking"] = serde_json::json!({"type": "enabled"});
+        body["temperature"] = serde_json::json!(1.0);
+        body["top_p"] = serde_json::json!(0.95);
+        body["n"] = serde_json::json!(1);
+        body["presence_penalty"] = serde_json::json!(0.0);
+        body["frequency_penalty"] = serde_json::json!(0.0);
+    }
+
+    let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
+    let mut req = client
         .post(&url)
         .timeout(REQUEST_TIMEOUT)
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .header("Content-Type", "application/json");
+    if is_kimi_coding_endpoint {
+        req = req.header("User-Agent", "KimiCLI/1.5");
+    }
+    let resp = req.json(&body).send().await.map_err(|e| format!("Network error: {e}"))?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -598,7 +754,7 @@ async fn chat_openai_compat(
 
     let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
     let output_tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-    let cost_usd = if is_openrouter {
+    let cost_usd = if is_openrouter || is_kimi {
         usage_cost_usd(&json["usage"])
     } else {
         None
@@ -636,18 +792,23 @@ async fn stream_openai_compat(
     );
     let msgs: Vec<serde_json::Value> = messages
         .iter()
-        .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+        .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
         .collect();
 
     let is_deepseek = provider.base_url.to_lowercase().contains("deepseek");
     let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
+    let is_kimi = provider.kind == "kimi"
+        || provider.base_url.to_lowercase().contains("moonshot.cn")
+        || provider.base_url.to_lowercase().contains("api.kimi.com");
+    let is_kimi_k2 = is_kimi && model.starts_with("kimi-k2");
+    let is_kimi_for_coding = is_kimi && model == "kimi-for-coding";
 
     let mut body = serde_json::json!({
         "model": model, "messages": msgs, "stream": true,
         "stream_options": {"include_usage": true}
     });
 
-    if is_openrouter {
+    if is_openrouter || (is_kimi && !is_kimi_for_coding) {
         body["usage"] = serde_json::json!({"include": true});
         let order: Vec<&str> = provider
             .models
@@ -660,7 +821,7 @@ async fn stream_openai_compat(
         }
     }
 
-    if use_reasoning {
+    if use_reasoning || is_kimi_k2 {
         if is_deepseek {
             body["thinking"] = serde_json::json!({"type": "enabled"});
             // DeepSeek: low/medium -> "high", high -> "max"
@@ -674,19 +835,31 @@ async fn stream_openai_compat(
                 "effort": reasoning_effort.unwrap_or("high"),
                 "exclude": false
             });
+        } else if is_kimi_k2 {
+            // Kimi K2.7 Code/K2.6/K2.5 require thinking enabled and fixed sampling params.
+            body["thinking"] = serde_json::json!({"type": "enabled"});
+            body["temperature"] = serde_json::json!(1.0);
+            body["top_p"] = serde_json::json!(0.95);
+            body["n"] = serde_json::json!(1);
+            body["presence_penalty"] = serde_json::json!(0.0);
+            body["frequency_penalty"] = serde_json::json!(0.0);
+        } else if is_kimi_for_coding && use_reasoning {
+            // Kimi Code subscription model supports thinking but does not require it.
+            body["thinking"] = serde_json::json!({"type": "enabled"});
         } else {
             body["reasoning_effort"] = serde_json::json!(reasoning_effort.unwrap_or("high"));
         }
     }
 
-    let resp = client
+    let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
+    let mut req = client
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .header("Content-Type", "application/json");
+    if is_kimi_coding_endpoint {
+        req = req.header("User-Agent", "KimiCLI/1.5");
+    }
+    let resp = req.json(&body).send().await.map_err(|e| format!("Network error: {e}"))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -714,7 +887,8 @@ async fn stream_openai_compat(
                     let line = buf[..pos].trim_end_matches('\r').to_string();
                     buf.drain(..pos + 1);
 
-                    if let Some(data) = line.strip_prefix("data: ") {
+                    if let Some(data) = line.strip_prefix("data:") {
+                        let data = data.trim_start();
                         if data == "[DONE]" {
                             if !usage_emitted {
                                 emit_stream_usage(
@@ -723,7 +897,7 @@ async fn stream_openai_compat(
                                     input_tokens,
                                     output_tokens,
                                     input_tokens.saturating_add(output_tokens),
-                                    if is_openrouter { cost_usd } else { None },
+                                    if is_openrouter || is_kimi { cost_usd } else { None },
                                 );
                             }
                             crate::token_usage::record_with_cost(
@@ -732,7 +906,7 @@ async fn stream_openai_compat(
                                 model,
                                 input_tokens,
                                 output_tokens,
-                                if is_openrouter { cost_usd } else { None },
+                                if is_openrouter || is_kimi { cost_usd } else { None },
                             );
                             let _ =
                                 app.emit(event_name, serde_json::json!({"delta":"","done":true}));
@@ -747,7 +921,7 @@ async fn stream_openai_compat(
                                 if let Some(v) = usage["completion_tokens"].as_u64() {
                                     output_tokens = v;
                                 }
-                                if is_openrouter {
+                                if is_openrouter || is_kimi {
                                     if let Some(v) = usage_cost_usd(usage) {
                                         cost_usd = Some(v);
                                     }
@@ -761,13 +935,28 @@ async fn stream_openai_compat(
                                     input_tokens,
                                     output_tokens,
                                     total_tokens,
-                                    if is_openrouter { cost_usd } else { None },
+                                    if is_openrouter || is_kimi { cost_usd } else { None },
                                 );
                                 usage_emitted = true;
                             }
                             // Main content delta
-                            if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
-                                if !delta.is_empty() {
+                            let content_delta = json["choices"][0]["delta"]["content"].as_str();
+                            let reasoning_delta = json["choices"][0]["delta"]["reasoning_content"]
+                                .as_str()
+                                .or_else(|| json["choices"][0]["delta"]["reasoning"].as_str())
+                                .or_else(|| json["choices"][0]["delta"]["thinking"].as_str());
+
+                            if let Some(delta) = content_delta.filter(|s| !s.is_empty()) {
+                                accumulated.push_str(delta);
+                                let _ = app.emit(
+                                    event_name,
+                                    serde_json::json!({"delta": delta, "done": false}),
+                                );
+                            } else if is_kimi_for_coding {
+                                // kimi-for-coding emits its response as reasoning_content by
+                                // default. Treat it as the main answer so users see output even
+                                // without the reasoning toggle.
+                                if let Some(delta) = reasoning_delta.filter(|s| !s.is_empty()) {
                                     accumulated.push_str(delta);
                                     let _ = app.emit(
                                         event_name,
@@ -775,13 +964,11 @@ async fn stream_openai_compat(
                                     );
                                 }
                             }
-                            // Reasoning/thinking content (DeepSeek: reasoning_content, OpenRouter: reasoning, Ollama: thinking)
-                            let reasoning = json["choices"][0]["delta"]["reasoning_content"]
-                                .as_str()
-                                .or_else(|| json["choices"][0]["delta"]["reasoning"].as_str())
-                                .or_else(|| json["choices"][0]["delta"]["thinking"].as_str());
-                            if let Some(r) = reasoning {
-                                if !r.is_empty() {
+
+                            // Reasoning/thinking content for other providers (DeepSeek, OpenRouter, Ollama).
+                            // For kimi-for-coding we already folded reasoning_content into the main answer above.
+                            if !is_kimi_for_coding {
+                                if let Some(r) = reasoning_delta.filter(|s| !s.is_empty()) {
                                     let _ = app.emit(
                                         &reasoning_event,
                                         serde_json::json!({"delta": r, "done": false}),
@@ -801,7 +988,7 @@ async fn stream_openai_compat(
         model,
         input_tokens,
         output_tokens,
-        if is_openrouter { cost_usd } else { None },
+        if is_openrouter || is_kimi { cost_usd } else { None },
     );
     if !usage_emitted {
         emit_stream_usage(
@@ -810,7 +997,7 @@ async fn stream_openai_compat(
             input_tokens,
             output_tokens,
             input_tokens.saturating_add(output_tokens),
-            if is_openrouter { cost_usd } else { None },
+            if is_openrouter || is_kimi { cost_usd } else { None },
         );
     }
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
@@ -933,7 +1120,8 @@ async fn stream_anthropic(
                     let line = buf[..pos].trim_end_matches('\r').to_string();
                     buf.drain(..pos + 1);
 
-                    if let Some(data) = line.strip_prefix("data: ") {
+                    if let Some(data) = line.strip_prefix("data:") {
+                        let data = data.trim_start();
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                             match json["type"].as_str() {
                                 Some("message_start") => {
@@ -1060,6 +1248,7 @@ async fn fetch_openai_models(provider: &AiProvider, api_key: &str) -> Result<Vec
         .get(&url)
         .timeout(REQUEST_TIMEOUT)
         .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
@@ -1240,6 +1429,7 @@ fn parse_capabilities(item: &serde_json::Value) -> Vec<String> {
         || search_text.contains("pixtral")
         || search_text.contains("gemini")
         || search_text.contains("gpt-4o")
+        || search_text.contains("kimi-k2")
     {
         add_capability(&mut caps, "vision");
     }
@@ -1318,6 +1508,23 @@ fn looks_like_reasoning_model(text: &str) -> bool {
         || text.contains("qwq")
 }
 
+pub fn kimi_known_models() -> Vec<AiModel> {
+    vec![
+        AiModel {
+            id: "kimi-for-coding".to_string(),
+            display_name: "Kimi for Coding".to_string(),
+            capabilities: vec!["vision".to_string(), "reasoning".to_string(), "tool_calling".to_string()],
+            context_length: Some(256_000),
+            enabled: true,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            input_price_usd_per_million: None,
+            output_price_usd_per_million: None,
+            provider_order: vec![],
+        },
+    ]
+}
+
 fn anthropic_known_models() -> Vec<AiModel> {
     vec![
         AiModel {
@@ -1375,28 +1582,38 @@ fn build_client() -> Result<reqwest::Client, String> {
         return Ok(client.clone());
     }
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(30))
         // Per-read idle timeout: kills silently stalled connections without
         // capping total stream duration (long generations stay alive as long
         // as tokens keep arriving).
-        .read_timeout(Duration::from_secs(120))
+        .read_timeout(Duration::from_secs(180))
         .user_agent("Argus/0.1")
+        // Some providers (notably Kimi Code's /coding endpoint) send SSE streams
+        // that behave more reliably over HTTP/1.1.
+        .http1_only()
         .build()
         .map_err(|e| e.to_string())?;
     Ok(CLIENT.get_or_init(|| client).clone())
+}
+
+fn chat_content_text(content: &ChatContent) -> &str {
+    match content {
+        ChatContent::Text(s) => s.as_str(),
+        ChatContent::Parts(_) => "",
+    }
 }
 
 fn split_system(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
     let system: String = messages
         .iter()
         .filter(|m| m.role == "system")
-        .map(|m| m.content.as_str())
+        .map(|m| chat_content_text(&m.content))
         .collect::<Vec<_>>()
         .join("\n");
     let conv: Vec<serde_json::Value> = messages
         .iter()
         .filter(|m| m.role != "system")
-        .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+        .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
         .collect();
     (system, conv)
 }
@@ -1412,7 +1629,7 @@ fn friendly_error(status: u16, body: &str) -> String {
     let preview = char_prefix(body, 300);
     match status {
         401 => "Authentication failed (401). Check your API key in Settings → AI Services.".to_string(),
-        403 => "Access denied (403). Your key may lack permission for this model.".to_string(),
+        403 => format!("Access denied (403). Your key may lack permission for this model. Response: {preview}"),
         404 => format!("Endpoint or model not found (404). Verify your API address and model ID. Response: {preview}"),
         429 => "Rate limited (429). Please wait a moment and try again.".to_string(),
         _ => format!("API error {status}: {preview}"),

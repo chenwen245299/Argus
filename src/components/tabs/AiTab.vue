@@ -4,11 +4,12 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useAiStore, type ModelOption } from '../../stores/ai'
+import { useSettingsStore } from '../../stores/settings'
 import MermaidBlock from '../MermaidBlock.vue'
 import { renderMarkdown, getSegments } from '../../utils/renderMarkdown'
 import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
-import type { ChatMessage, PaperMeta, PaperStatus } from '../../types'
+import type { ChatContentPart, ChatMessage, PaperMeta, PaperStatus } from '../../types'
 import { askAiText } from '../../stores/translationHistory'
 
 const props = withDefaults(defineProps<{ slug: string | null; standalone?: boolean }>(), {
@@ -18,9 +19,17 @@ const emit = defineEmits<{ 'open-settings': [] }>()
 
 const { t } = useI18n()
 const ai = useAiStore()
+const settingsStore = useSettingsStore()
+
+interface Attachment {
+  id: string
+  type: 'image' | 'pdf'
+  name: string
+  dataUrl: string
+}
 
 type ChatNode =
-  | { id: string; role: 'user'; content: string; createdAt: string }
+  | { id: string; role: 'user'; content: string; attachments?: Attachment[]; createdAt: string }
   | { id: string; role: 'assistantGroup'; promptId: string; answers: AssistantAnswer[]; createdAt: string }
 type AssistantGroupNode = Extract<ChatNode, { role: 'assistantGroup' }>
 
@@ -93,11 +102,15 @@ const allSelectableModels = computed<ModelOption[]>(() =>
 const conversations = ref<Conversation[]>([])
 const activeConversation = ref<Conversation | null>(null)
 const input = ref('')
+const attachments = ref<Attachment[]>([])
+const fileInputRef = ref<HTMLInputElement | null>(null)
 const messagesEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const selectedModelKeys = ref<string[]>([])
 const showModelMenu = ref(false)
 const showHistory = ref(false)
+const previewImage = ref<string | null>(null)
+const previewPdf = ref<string | null>(null)
 const modelMenuRoot = ref<HTMLElement | null>(null)
 const unlisteners = new Map<string, UnlistenFn>()
 const fulltextReady = ref(false)
@@ -143,9 +156,11 @@ const summaryAvailable = ref(false)
 
 // PDF mode is only supported by OpenRouter providers
 const pdfSupported = computed(() =>
-  selectedModels.value.some(m =>
-    ai.settings.providers.find(p => p.id === m.providerId)?.kind === 'openrouter'
-  )
+  selectedModels.value.some(m => {
+    const p = ai.settings.providers.find(p => p.id === m.providerId)
+    if (!p) return false
+    return p.kind === 'openrouter' || p.kind === 'kimi' || p.base_url.toLowerCase().includes('moonshot.cn')
+  })
 )
 
 const hasSummary = computed(() =>
@@ -258,6 +273,14 @@ function findReactiveAnswer(answerId: string): AssistantAnswer | null {
   return null
 }
 
+function chatContentText(content: string | ChatContentPart[]): string {
+  if (typeof content === 'string') return content
+  return content
+    .filter((p): p is Extract<ChatContentPart, { type: 'text' }> => p.type === 'text')
+    .map(p => p.text)
+    .join('\n')
+}
+
 function isMetadataExtractionConversation(conv: Conversation | null) {
   if (!conv) return false
   if (conv.source === 'metadataExtraction' || conv.title === 'AI 元数据提取') return true
@@ -343,9 +366,13 @@ async function importLegacyHistory(slug: string) {
   try {
     const history = await invoke<ChatMessage[]>('get_chat_history', { slug })
     const nodes: ChatNode[] = []
-    for (const msg of history.filter(m => m.role !== 'system' && m.content?.trim())) {
+    for (const msg of history.filter(m => {
+      if (m.role === 'system') return false
+      return chatContentText(m.content).trim().length > 0
+    })) {
+      const text = chatContentText(msg.content)
       if (msg.role === 'user') {
-        nodes.push({ id: newId('user'), role: 'user', content: msg.content, createdAt: nowIso() })
+        nodes.push({ id: newId('user'), role: 'user', content: text, createdAt: nowIso() })
       } else if (msg.role === 'assistant') {
         const fallback = ai.chatModels[0]
         nodes.push({
@@ -359,9 +386,9 @@ async function importLegacyHistory(slug: string) {
             providerName: fallback?.providerName ?? 'AI',
             modelId: fallback?.modelId ?? '',
             modelName: fallback?.displayName ?? 'AI',
-            content: msg.content,
+            content: text,
             createdAt: nowIso(),
-            tokenEstimate: estimateTokens(msg.content),
+            tokenEstimate: estimateTokens(text),
           }],
         })
       }
@@ -552,8 +579,8 @@ async function saveLegacyActiveHistory(conv: Conversation) {
 }
 
 function firstUserTitle(nodes: ChatNode[]) {
-  const first = nodes.find(n => n.role === 'user')
-  if (!first || first.role !== 'user') return ''
+  const first = nodes.find((n): n is Extract<ChatNode, { role: 'user' }> => n.role === 'user')
+  if (!first) return ''
   const title = first.content.replace(/\s+/g, ' ').trim()
   return title.length > 32 ? `${title.slice(0, 32)}…` : title
 }
@@ -665,6 +692,74 @@ function formatContext(n: number) {
   return String(n)
 }
 
+function openFilePicker() {
+  fileInputRef.value?.click()
+}
+
+function addAttachmentFromFile(file: File) {
+  if (!file.type.startsWith('image/') && file.type !== 'application/pdf') return false
+  const reader = new FileReader()
+  reader.onload = () => {
+    const dataUrl = reader.result as string
+    const type: Attachment['type'] = file.type.startsWith('image/') ? 'image' : 'pdf'
+    const name = file.name || (type === 'image' ? 'pasted-image.png' : 'pasted-file.pdf')
+    attachments.value.push({ id: crypto.randomUUID(), type, name, dataUrl })
+  }
+  reader.readAsDataURL(file)
+  return true
+}
+
+function onFileSelected(e: Event) {
+  const target = e.target as HTMLInputElement
+  const files = target.files
+  if (!files) return
+  for (const file of Array.from(files)) {
+    addAttachmentFromFile(file)
+  }
+  target.value = ''
+}
+
+function onPaste(e: ClipboardEvent) {
+  const items = e.clipboardData?.items
+  if (!items) return
+  let consumed = false
+  for (const item of Array.from(items)) {
+    const file = item.getAsFile()
+    if (!file) continue
+    if (addAttachmentFromFile(file)) consumed = true
+  }
+  if (consumed) e.preventDefault()
+}
+
+function removeAttachment(id: string) {
+  attachments.value = attachments.value.filter(a => a.id !== id)
+}
+
+function previewAttachment(att: Attachment) {
+  if (att.type === 'image') {
+    previewImage.value = att.dataUrl
+  } else {
+    previewPdf.value = att.dataUrl
+  }
+}
+
+function closePreview() {
+  previewImage.value = null
+  previewPdf.value = null
+}
+
+function buildUserContentParts(text: string, atts?: Attachment[]): ChatContentPart[] {
+  const parts: ChatContentPart[] = [{ type: 'text', text }]
+  for (const att of atts ?? []) {
+    if (att.type === 'image') {
+      parts.push({ type: 'image_url', image_url: { url: att.dataUrl } })
+    } else {
+      parts.push({ type: 'file', file: { filename: att.name, file_data: att.dataUrl } })
+    }
+  }
+  return parts
+}
+
 function buildHistoryUntil(conv: Conversation, stopGroupId?: string): ChatMessage[] {
   const messages: ChatMessage[] = []
   for (const node of conv.nodes) {
@@ -672,8 +767,12 @@ function buildHistoryUntil(conv: Conversation, stopGroupId?: string): ChatMessag
       if (node.id === stopGroupId) break
       const answer = node.answers.find(a => !a.error && a.content.trim()) ?? node.answers.find(a => a.content.trim())
       if (answer) messages.push({ role: 'assistant', content: answer.content })
-    } else {
-      messages.push({ role: 'user', content: node.content })
+    } else if (node.role === 'user') {
+      if (node.attachments?.length) {
+        messages.push({ role: 'user', content: buildUserContentParts(node.content, node.attachments) })
+      } else {
+        messages.push({ role: 'user', content: node.content })
+      }
     }
   }
   return messages
@@ -690,7 +789,13 @@ async function sendMessage() {
   activeConversation.value = conv
   const contextPlan = contextPlanForConversation(conv)
 
-  const userNode: ChatNode = { id: newId('user'), role: 'user', content: text, createdAt: nowIso() }
+  const userNode: ChatNode = {
+    id: newId('user'),
+    role: 'user',
+    content: text,
+    attachments: attachments.value.length > 0 ? [...attachments.value] : undefined,
+    createdAt: nowIso(),
+  }
   const group: ChatNode = {
     id: newId('group'),
     role: 'assistantGroup',
@@ -702,6 +807,7 @@ async function sendMessage() {
   conv.nodes.push(userNode, group)
   conv.title = firstUserTitle(conv.nodes) || conv.title
   input.value = ''
+  attachments.value = []
   persistActiveConversation()
   await nextTick()
   resizeTextarea()
@@ -983,11 +1089,23 @@ function hasUsage(answer: AssistantAnswer) {
   return typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number'
 }
 
+const usdToCnyRate = computed(() => {
+  const r = Number(settingsStore.settings.usd_to_cny_rate)
+  return Number.isFinite(r) && r > 0 ? r : 7.2
+})
+
 function formatTokenCount(value: number | undefined) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return ''
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M`
   if (value >= 10_000) return `${(value / 1_000).toFixed(1)}k`
   return String(value)
+}
+
+function formatCostCny(costUsd: number | null | undefined) {
+  if (typeof costUsd !== 'number' || !Number.isFinite(costUsd) || costUsd < 0) return ''
+  const cny = costUsd * usdToCnyRate.value
+  if (cny < 0.01) return '<0.01'
+  return cny.toFixed(cny < 1 ? 3 : 2)
 }
 
 function answerSpeed(answer: AssistantAnswer) {
@@ -1108,6 +1226,7 @@ watch(activeConversationIsMetadataExtraction, (isMetadataExtraction) => {
 })
 
 onMounted(async () => {
+  await settingsStore.load()
   if (!ai.loaded) await ai.load()
   ensureDefaultModels()
   document.addEventListener('mousedown', closeFloating)
@@ -1303,6 +1422,11 @@ function toggleContextPanel(nodeId: string) {
           </div>
 
           <div class="header-actions">
+            <button class="icon-btn" title="新建对话" @click="startNewConversation(true)">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 5v14"/><path d="M5 12h14"/>
+              </svg>
+            </button>
             <button v-if="!props.standalone" class="icon-btn" title="在独立窗口打开" @click="openPopupWindow">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
@@ -1435,6 +1559,23 @@ function toggleContextPanel(nodeId: string) {
                     <div v-else class="ctx-loading">{{ getFirstAnswer(node.id)?.streaming ? '等待后端响应…' : '暂无上下文记录（旧对话不支持）' }}</div>
                   </div>
                 </div>
+                <div v-if="node.attachments && node.attachments.length" class="user-attachments">
+                  <button
+                    v-for="att in node.attachments"
+                    :key="att.id"
+                    class="user-attachment"
+                    :class="{ pdf: att.type === 'pdf' }"
+                    :title="att.name"
+                    @click="previewAttachment(att)"
+                  >
+                    <img v-if="att.type === 'image'" :src="att.dataUrl" class="user-attachment-thumb" alt="" />
+                    <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                      <polyline points="14 2 14 8 20 8"/>
+                    </svg>
+                    <span class="user-attachment-name">{{ att.name }}</span>
+                  </button>
+                </div>
                 <div class="user-bubble">{{ node.content }}</div>
                 <div class="msg-footer user-footer">
                   <div class="msg-actions">
@@ -1537,9 +1678,10 @@ function toggleContextPanel(nodeId: string) {
                   </button>
                 </div>
                 <div v-if="hasUsage(answer) || answer.error" class="msg-usage">
-                  <span v-if="typeof answer.inputTokens === 'number'" class="usage-tokens">↑{{ formatTokenCount(answer.inputTokens) }}</span>
-                  <span v-if="typeof answer.outputTokens === 'number'" class="usage-tokens">↓{{ formatTokenCount(answer.outputTokens) }}</span>
+                  <span v-if="typeof answer.inputTokens === 'number'" class="usage-tokens" title="上下文输入 tokens">↑{{ formatTokenCount(answer.inputTokens) }}</span>
+                  <span v-if="typeof answer.outputTokens === 'number'" class="usage-tokens" title="本次输出 tokens">↓{{ formatTokenCount(answer.outputTokens) }}</span>
                   <span v-if="answerSpeed(answer)" class="msg-speed">{{ answerSpeed(answer) }}</span>
+                  <span v-if="answer.costUsd != null && formatCostCny(answer.costUsd)" class="usage-cost" :title="`约 ¥${formatCostCny(answer.costUsd)} / $${answer.costUsd.toFixed(6)}`">¥{{ formatCostCny(answer.costUsd) }}</span>
                   <span v-if="answer.error" class="error-badge">出错</span>
                 </div>
               </div>
@@ -1600,12 +1742,33 @@ function toggleContextPanel(nodeId: string) {
             class="context-btn context-btn-pdf"
             :class="{ active: usePdf }"
             :disabled="!pdfSupported"
-            :title="pdfSupported ? 'PDF（直接将 PDF 文件发给模型，仅 OpenRouter 支持）' : '当前模型不支持直接上传 PDF'"
+            :title="pdfSupported ? 'PDF（直接将 PDF 文件发给模型，OpenRouter / Kimi 支持）' : '当前模型不支持直接上传 PDF'"
             @click="usePdf = pdfSupported ? !usePdf : usePdf"
           >PDF</button>
           <span v-if="!fulltextReady && !fulltextChecking" class="context-hint">请先获取全文</span>
         </div>
         <div class="composer-box">
+          <div v-if="attachments.length" class="attachment-row">
+            <div
+              v-for="att in attachments"
+              :key="att.id"
+              class="attachment-chip"
+              :class="{ pdf: att.type === 'pdf' }"
+              :title="att.name"
+            >
+              <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
+              <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              <span class="attachment-name">{{ att.name }}</span>
+              <button class="attachment-remove" title="移除" @click="removeAttachment(att.id)">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+              </button>
+            </div>
+          </div>
           <textarea
             ref="textareaEl"
             v-model="input"
@@ -1616,12 +1779,26 @@ function toggleContextPanel(nodeId: string) {
             @keydown="handleKeydown"
             @compositionstart="onCompositionStart"
             @compositionend="onCompositionEnd"
+            @paste="onPaste"
+          />
+          <input
+            ref="fileInputRef"
+            type="file"
+            accept="image/*,.pdf"
+            multiple
+            style="display: none"
+            @change="onFileSelected"
           />
           <div class="composer-toolbar">
             <button class="toolbar-btn" title="新建对话" @click="startNewConversation(true)">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                 <path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"/>
+              </svg>
+            </button>
+            <button class="toolbar-btn" title="上传图片或 PDF" @click="openFilePicker">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
               </svg>
             </button>
 
@@ -1740,6 +1917,26 @@ function toggleContextPanel(nodeId: string) {
         </div>
       </section>
     </template>
+
+    <!-- Attachment preview lightbox -->
+    <Teleport to="body">
+      <div v-if="previewImage" class="attachment-lightbox" @click.self="closePreview">
+        <img :src="previewImage" class="lightbox-image" alt="" />
+        <button class="lightbox-close" @click="closePreview">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div v-if="previewPdf" class="attachment-lightbox pdf-lightbox" @click.self="closePreview">
+        <iframe :src="previewPdf" class="lightbox-pdf" frameborder="0"></iframe>
+        <button class="lightbox-close" @click="closePreview">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -2434,6 +2631,11 @@ function toggleContextPanel(nodeId: string) {
 }
 .usage-tokens { color: var(--text-tertiary); }
 .msg-speed { color: color-mix(in srgb, var(--accent) 74%, var(--text-tertiary)); }
+.usage-cost {
+  color: var(--text-secondary);
+  font-weight: 500;
+  margin-left: 2px;
+}
 .error-badge { color: #ef4444; }
 
 .composer {
@@ -2557,6 +2759,59 @@ function toggleContextPanel(nodeId: string) {
   line-height: 1.45;
 }
 .composer-input:disabled { opacity: .65; }
+.attachment-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px 0;
+}
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 180px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.attachment-chip.pdf {
+  background: #fff0f0;
+  border-color: #f0c0c0;
+  color: #8b1e1e;
+}
+.attachment-thumb {
+  width: 18px;
+  height: 18px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  margin-left: 2px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.attachment-remove:hover {
+  background: rgba(0, 0, 0, 0.08);
+  color: var(--text-primary);
+}
 .composer-toolbar {
   display: flex;
   align-items: center;
@@ -2937,5 +3192,96 @@ function toggleContextPanel(nodeId: string) {
   font-family: inherit;
   max-height: 260px;
   overflow-y: auto;
+}
+
+.user-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+  max-width: 88%;
+  justify-content: flex-end;
+}
+.user-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 160px;
+  padding: 4px 7px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s;
+}
+.user-attachment:hover {
+  background: var(--accent-light);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.user-attachment.pdf {
+  background: #fff0f0;
+  border-color: #f0c0c0;
+  color: #8b1e1e;
+}
+.user-attachment.pdf:hover {
+  background: #ffe0e0;
+  border-color: #e0a0a0;
+}
+.user-attachment-thumb {
+  width: 18px;
+  height: 18px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.user-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.78);
+  backdrop-filter: blur(2px);
+}
+.lightbox-image {
+  max-width: 92vw;
+  max-height: 92vh;
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+}
+.lightbox-pdf {
+  width: 92vw;
+  height: 92vh;
+  border-radius: 10px;
+  background: #fff;
+}
+.lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.lightbox-close:hover {
+  background: rgba(255, 255, 255, 0.22);
 }
 </style>

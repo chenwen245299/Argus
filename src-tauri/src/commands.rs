@@ -408,7 +408,7 @@ pub async fn translate_text(
     let prompt = s.translate_ai_prompt.replace("{text}", &text);
     let messages = vec![crate::models::ChatMessage {
         role: "user".to_string(),
-        content: prompt,
+        content: prompt.into(),
     }];
 
     tauri::async_runtime::spawn(async move {
@@ -438,7 +438,7 @@ pub async fn translate_text_stream(
     let prompt = s.translate_ai_prompt.replace("{text}", &text);
     let messages = vec![crate::models::ChatMessage {
         role: "user".to_string(),
-        content: prompt,
+        content: prompt.into(),
     }];
     let event_name = format!("translate-stream-{}", event_id);
 
@@ -474,7 +474,7 @@ pub async fn generate_conversation_title(
         .replace("{ai_msg}", &ai_msg);
     let messages = vec![crate::models::ChatMessage {
         role: "user".to_string(),
-        content: prompt,
+        content: prompt.into(),
     }];
 
     let result = crate::llm::chat_completion(&provider, &api_key, &model, &messages, "title").await?;
@@ -1016,10 +1016,7 @@ pub async fn test_ai_provider(id: String, state: State<'_, LibraryRoot>) -> Resu
         .ok_or_else(|| format!("Provider not found: {id}"))?;
     let key =
         ai_manager::get_api_key(&root, &id).ok_or("No API key configured for this provider")?;
-    match llm::list_models(provider, &key).await {
-        Ok(models) => Ok(format!("Connected. Found {} model(s).", models.len())),
-        Err(e) => Err(e),
-    }
+    llm::test_connection(provider, &key).await
 }
 
 // ── M5: Model management ──────────────────────────────────────────────────────
@@ -1136,11 +1133,11 @@ pub async fn extract_abstract_ai(
     let messages = vec![
         crate::models::ChatMessage {
             role: "system".to_string(),
-            content: "你是一名信息抽取助手。只能从给定原文中抽取 Abstract/摘要段落，禁止生成、改写、翻译或概括。".to_string(),
+            content: "你是一名信息抽取助手。只能从给定原文中抽取 Abstract/摘要段落，禁止生成、改写、翻译或概括。".into(),
         },
         crate::models::ChatMessage {
             role: "user".to_string(),
-            content: prompt,
+            content: prompt.into(),
         },
     ];
 

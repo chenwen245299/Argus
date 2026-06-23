@@ -756,7 +756,7 @@ pub async fn fetch_metadata_with_ai(
     let event_name = format!("paper-ai-chat-{}", answer_id);
     let messages = vec![crate::models::ChatMessage {
         role: "user".to_string(),
-        content: prompt.clone(),
+        content: prompt.clone().into(),
     }];
 
     let raw = match crate::llm::chat_completion_stream(

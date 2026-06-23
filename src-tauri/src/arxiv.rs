@@ -677,11 +677,11 @@ async fn call_ai_single(
             role: "system".to_string(),
             content:
                 "你是一名严谨的研究助理。请只输出用户要求的有效 JSON，不要添加 Markdown 或解释。"
-                    .to_string(),
+                    .into(),
         },
         ChatMessage {
             role: "user".to_string(),
-            content: build_analysis_prompt(prompt_template, topics, paper),
+            content: build_analysis_prompt(prompt_template, topics, paper).into(),
         },
     ];
 

@@ -532,6 +532,16 @@ function clickTag(e: MouseEvent, tag: string) {
   selection.toggleTagFilter(tag)
 }
 
+async function confirmRemoveTag(item: PaperIndexEntry, tag: string) {
+  if (!confirm(`确定要删除标签 "${tag}" 吗？`)) return
+  const tags = (item.tags ?? []).filter(t => t !== tag)
+  try {
+    await savePaperTags(item, tags)
+  } catch (e) {
+    showError(String(e))
+  }
+}
+
 // ── Paper row drag (pointer-based, no HTML5 drag API → no macOS green "+") ────
 const dragGhostItem = ref<PaperIndexEntry | null>(null)
 const dragGhostPos  = ref({ x: 0, y: 0 })
@@ -723,6 +733,7 @@ async function addSuggestedTag(tag: string) {
 
 async function removeTagFromContext(tag: string) {
   if (!ctxMenu.value) return
+  if (!confirm(`确定要删除标签 "${tag}" 吗？`)) return
   const tags = (ctxMenu.value.item.tags ?? []).filter(t => t !== tag)
   try {
     await savePaperTags(ctxMenu.value.item, tags)
@@ -734,6 +745,39 @@ async function removeTagFromContext(tag: string) {
 const STATUS_LABELS: Record<string, string> = { unread: '未读', reading: '阅读中', read: '已读' }
 const STATUS_COLORS: Record<string, string> = {
   unread: 'var(--text-tertiary)', reading: '#f59e0b', read: '#22c55e',
+}
+
+const PAPER_CATEGORIES = [
+  {
+    tag: '理论',
+    icon: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>',
+    color: '#7c3aed',
+    bg: '#f3e8ff',
+  },
+  {
+    tag: '方法',
+    icon: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
+    color: '#2563eb',
+    bg: '#dbeafe',
+  },
+  {
+    tag: '数据集',
+    icon: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>',
+    color: '#059669',
+    bg: '#d1fae5',
+  },
+]
+
+async function toggleCategoryTag(item: PaperIndexEntry, tag: string) {
+  const tags = [...(item.tags ?? [])]
+  const idx = tags.indexOf(tag)
+  if (idx >= 0) tags.splice(idx, 1)
+  else tags.push(tag)
+  try {
+    await savePaperTags(item, tags)
+  } catch (e) {
+    showError(String(e))
+  }
 }
 
 async function setReadingStatus(item: PaperIndexEntry, status: string) {
@@ -1329,8 +1373,14 @@ async function reExtract(item: PaperIndexEntry) {
                       v-for="tag in item.tags.slice(0, 3)"
                       :key="tag"
                       class="tag-chip"
-                      @click="clickTag($event, tag)"
-                    >{{ tag }}</span>
+                    >
+                      <span class="tag-text" @click="clickTag($event, tag)">{{ tag }}</span>
+                      <button
+                        class="tag-remove"
+                        title="删除标签"
+                        @click.stop="confirmRemoveTag(item, tag)"
+                      >×</button>
+                    </span>
                     <span v-if="item.tags.length > 3" class="tag-more">+{{ item.tags.length - 3 }}</span>
                   </template>
                 </div>
@@ -1456,6 +1506,23 @@ async function reExtract(item: PaperIndexEntry) {
           >
             <span class="ctx-status-dot" :style="{ background: STATUS_COLORS[s] }" />
             {{ STATUS_LABELS[s] }}
+          </button>
+        </div>
+        <div class="ctx-sep" />
+        <div class="ctx-category-row">
+          <button
+            v-for="cat in PAPER_CATEGORIES"
+            :key="cat.tag"
+            class="ctx-category-btn"
+            :class="{ 'ctx-category-btn-active': ctxMenu!.item.tags?.includes(cat.tag) }"
+            :style="{
+              color: ctxMenu!.item.tags?.includes(cat.tag) ? cat.color : 'var(--text-secondary)',
+              background: ctxMenu!.item.tags?.includes(cat.tag) ? cat.bg : 'var(--bg-secondary)',
+            }"
+            @click="toggleCategoryTag(ctxMenu!.item, cat.tag)"
+          >
+            <span class="ctx-category-icon" v-html="cat.icon" />
+            {{ cat.tag }}
           </button>
         </div>
         <div class="ctx-sep" />
@@ -1860,19 +1927,46 @@ async function reExtract(item: PaperIndexEntry) {
 .tag-chip {
   display: inline-flex;
   align-items: center;
-  padding: 1px 6px;
+  gap: 1px;
+  padding: 1px 4px 1px 6px;
   background: var(--accent-light);
   color: var(--accent);
   font-size: 10px;
   font-weight: 500;
   border-radius: var(--radius-pill);
   white-space: nowrap;
-  cursor: pointer;
   flex-shrink: 0;
   transition: background 0.1s, color 0.1s;
 }
 .tag-chip:hover {
   background: var(--accent);
+  color: #fff;
+}
+.tag-text {
+  cursor: pointer;
+}
+.tag-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: currentColor;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s;
+}
+.tag-chip:hover .tag-remove {
+  opacity: 1;
+}
+.tag-remove:hover {
+  background: rgba(255, 255, 255, 0.25);
   color: #fff;
 }
 
@@ -2009,6 +2103,36 @@ async function reExtract(item: PaperIndexEntry) {
   color: var(--accent);
   background: var(--accent-light);
   font-weight: 600;
+}
+:global(.ctx-category-row) {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding: 2px 0;
+}
+:global(.ctx-category-btn) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 5px 7px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  border: none;
+  cursor: pointer;
+  transition: transform 0.08s, filter 0.08s;
+}
+:global(.ctx-category-btn:hover) {
+  filter: brightness(0.97);
+}
+:global(.ctx-category-btn-active) {
+  font-weight: 600;
+}
+:global(.ctx-category-icon) {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
 }
 :global(.ctx-tags-section) {
   padding: 5px 6px 6px;

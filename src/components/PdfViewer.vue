@@ -7,6 +7,7 @@ import { startTranslation, appendTranslationChunk, finishTranslation, failTransl
 import { openAddSnippetModal } from '../stores/snippetLibrary'
 import * as pdfjsLib from 'pdfjs-dist'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
+import { EventBus, SimpleLinkService } from 'pdfjs-dist/web/pdf_viewer.mjs'
 import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
@@ -123,6 +124,14 @@ let progressDebounce: ReturnType<typeof setTimeout> | null = null
 
 // IntersectionObserver for lazy rendering
 let observer: IntersectionObserver | null = null
+
+// PDF.js link/annotation handling
+const eventBus = new EventBus()
+const linkService = new SimpleLinkService({ eventBus, externalLinkTarget: 2 })
+
+eventBus.on('pagechanging', ({ pageNumber }: { pageNumber: number }) => {
+  scrollToPageIndex(pageNumber - 1, 0)
+})
 
 // ── Computed ──────────────────────────────────────────────────────────────────
 const sortedHighlights = computed(() => {
@@ -253,6 +262,78 @@ function addHighlightToSnippetLibrary(hlId: string) {
     page: hl.page,
     color: hl.color,
   })
+}
+
+function onAnnotationLayerClick(e: MouseEvent) {
+  const target = e.target as HTMLElement
+  const link = target.closest('a')
+  if (!link) return
+  if (link.hasAttribute('data-internal-link')) return
+  const href = link.getAttribute('href')
+  if (!href) return
+  e.preventDefault()
+  e.stopPropagation()
+  openExternalLink(href)
+}
+
+async function openExternalLink(url: string) {
+  try {
+    await invoke('open_url', { url })
+  } catch (e) {
+    console.error('Failed to open URL:', e)
+  }
+}
+
+function linkifyTextLayer(textLayer: HTMLDivElement, overlay: HTMLDivElement) {
+  const spans = Array.from(textLayer.querySelectorAll('span')).filter(
+    s => !s.querySelector('span')
+  ) as HTMLSpanElement[]
+  const overlayRect = overlay.getBoundingClientRect()
+  const urlRegex = /https?:\/\/[^\s<>"{}|\\^`[\]]+/gi
+  for (const span of spans) {
+    const text = span.textContent ?? ''
+    let match: RegExpExecArray | null
+    while ((match = urlRegex.exec(text)) !== null) {
+      const rawUrl = match[0]
+      // Strip trailing punctuation that is part of sentence grammar, not the URL.
+      const url = rawUrl.replace(/[.,;:!?)\]}"'`]+$/, '')
+      if (!url) continue
+      const start = match.index
+      const end = start + url.length
+      const textNode = span.firstChild
+      if (!textNode || textNode.nodeType !== Node.TEXT_NODE) continue
+      const range = document.createRange()
+      range.setStart(textNode, start)
+      range.setEnd(textNode, end)
+      for (const rect of range.getClientRects()) {
+        createTextLinkOverlay(overlay, rect, overlayRect, url)
+      }
+    }
+  }
+}
+
+function createTextLinkOverlay(
+  overlay: HTMLDivElement,
+  rect: DOMRect,
+  overlayRect: DOMRect,
+  url: string,
+) {
+  const a = document.createElement('a')
+  a.href = url
+  a.className = 'text-link'
+  a.target = '_blank'
+  a.rel = 'noopener noreferrer nofollow'
+  a.style.position = 'absolute'
+  a.style.left = `${rect.left - overlayRect.left}px`
+  a.style.top = `${rect.top - overlayRect.top}px`
+  a.style.width = `${rect.width}px`
+  a.style.height = `${rect.height}px`
+  a.addEventListener('click', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    openExternalLink(url)
+  })
+  overlay.appendChild(a)
 }
 
 async function writeTextToClipboard(text: string) {
@@ -393,6 +474,7 @@ async function loadPdf() {
     const doc = await loadingTask.promise
     pdfDoc.value = doc
     reader.setPdfDoc(doc)
+    linkService.setDocument(doc)
     pageCount.value = doc.numPages
 
     // Pre-fetch all page sizes at scale=1 (fast — no rendering)
@@ -536,6 +618,46 @@ async function renderPage(idx: number) {
     el.appendChild(hlDiv)
 
     renderHighlightsOnPage(hlDiv, idx)
+
+    // Annotation layer (links, forms) — rendered on top so links are clickable
+    const annotationLayerDiv = document.createElement('div')
+    annotationLayerDiv.className = 'annotationLayer'
+    el.appendChild(annotationLayerDiv)
+
+    try {
+      const annotations = await page.getAnnotations()
+      if (annotations.length > 0) {
+        const annotationLayer = new pdfjsLib.AnnotationLayer({
+          div: annotationLayerDiv,
+          page,
+          viewport: logicalVp,
+          linkService,
+        } as any)
+        await annotationLayer.render({
+          viewport: logicalVp,
+          annotations,
+          page,
+          linkService,
+          renderForms: false,
+        } as any)
+      }
+    } catch (e) {
+      console.warn('AnnotationLayer render failed:', e)
+    }
+
+    annotationLayerDiv.addEventListener('click', onAnnotationLayerClick)
+
+    // Linkify plain-text URLs in the text layer (many PDFs render URLs as text)
+    const linkifyDiv = document.createElement('div')
+    linkifyDiv.className = 'linkify-overlay'
+    linkifyDiv.style.width = `${Math.round(logicalVp.width)}px`
+    linkifyDiv.style.height = `${Math.round(logicalVp.height)}px`
+    el.appendChild(linkifyDiv)
+    try {
+      linkifyTextLayer(textLayerDiv, linkifyDiv)
+    } catch (e) {
+      console.warn('Linkify text layer failed:', e)
+    }
 
     renderedPages.value = new Set(renderedPages.value).add(idx)
     page.cleanup()
@@ -1834,6 +1956,48 @@ function triggerInitialRender() {
   left: 0;
   pointer-events: none;
   overflow: hidden;
+}
+
+/* ── PDF.js annotation layer (links) ── */
+:deep(.annotationLayer) {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+:deep(.annotationLayer section) {
+  position: absolute;
+  pointer-events: auto;
+}
+
+:deep(.annotationLayer .linkAnnotation > a) {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ── Plain-text URL linkification overlay ── */
+:deep(.linkify-overlay) {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+:deep(.linkify-overlay .text-link) {
+  position: absolute;
+  pointer-events: auto;
+  cursor: pointer;
+  background: transparent;
+  border-bottom: 1px solid transparent;
+}
+
+:deep(.linkify-overlay .text-link:hover) {
+  border-bottom-color: var(--accent);
 }
 
 :deep(.hl-rect) {

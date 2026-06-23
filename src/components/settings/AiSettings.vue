@@ -16,6 +16,7 @@ const PRESETS = [
   { label: 'OpenAI',       base_url: 'https://api.openai.com/v1',         kind: 'openai_compatible' },
   { label: 'OpenRouter',   base_url: 'https://openrouter.ai/api/v1',      kind: 'openrouter' },
   { label: 'DeepSeek',     base_url: 'https://api.deepseek.com/v1',       kind: 'openai_compatible' },
+  { label: 'Kimi Code',    base_url: 'https://api.kimi.com/coding/v1',    kind: 'kimi' },
   { label: 'Ollama (local)',base_url:'http://localhost:11434/v1',          kind: 'openai_compatible' },
   { label: 'Anthropic',    base_url: 'https://api.anthropic.com/v1',      kind: 'anthropic' },
 ]
@@ -103,12 +104,9 @@ const defaultSel    = ref<ModelSelection | null>(null)
 // Save feedback
 const saveStatus    = ref<'' | 'saving' | 'saved'>('')
 const providerCtxMenu = ref<{ x: number; y: number; provider: AiProviderInfo } | null>(null)
-const usdToCnyRate = ref('7.2')
-const billingSaveStatus = ref<'' | 'saving' | 'saved'>('')
 
 onMounted(async () => {
   await Promise.all([ai.load(), settingsStore.load()])
-  usdToCnyRate.value = formatRate(settingsStore.settings.usd_to_cny_rate)
   defaultSel.value = ai.defaultSelection
   if (ai.settings.providers.length > 0) {
     selectProvider(ai.settings.providers[0].id)
@@ -322,6 +320,9 @@ async function fetchModels() {
   } catch (e) {
     fetchErr.value = String(e)
     fetchStatus.value = ''
+    fetchedModels.value = []
+    fetchSelected.value = new Set()
+    showFetchDialog.value = true
   }
 }
 
@@ -427,26 +428,6 @@ function currentUsdToCnyRate() {
   return Number.isFinite(rate) && rate > 0 ? rate : 7.2
 }
 
-function formatRate(rate: unknown) {
-  const n = Number(rate)
-  return Number.isFinite(n) && n > 0 ? String(n) : '7.2'
-}
-
-function parseRate(raw: string) {
-  const v = Number(raw)
-  return Number.isFinite(v) && v > 0 ? v : 7.2
-}
-
-async function saveBillingSettings() {
-  const rate = parseRate(usdToCnyRate.value)
-  usdToCnyRate.value = formatRate(rate)
-  if (settingsStore.settings.usd_to_cny_rate === rate) return
-  billingSaveStatus.value = 'saving'
-  await settingsStore.save({ usd_to_cny_rate: rate })
-  billingSaveStatus.value = 'saved'
-  setTimeout(() => { billingSaveStatus.value = '' }, 2000)
-}
-
 function priceCnyPerMillion(usd?: number, cny?: number) {
   if (usd != null) return usd * currentUsdToCnyRate()
   return cny
@@ -517,6 +498,7 @@ const LOGO_MAP: [string[], string][] = [
   [['openai', 'api.openai.com'], 'openai.svg'],
   [['anthropic', 'claude', 'api.anthropic.com'], 'claude.svg'],
   [['openrouter', 'openrouter.ai'], 'openrouter.svg'],
+  [['kimi', 'moonshot'], 'kimi.svg'],
   [['ollama', '11434'], 'ollama-color.svg'],
   [['gemini', 'generativelanguage.googleapis.com'], 'gemini.svg'],
   [['gemma'], 'gemma.svg'],
@@ -608,7 +590,7 @@ function normalizedFetchCapabilities(model: AiModel) {
   if (/\b(embed|embedding|embeddings)\b/.test(text) || /text-embedding|bge-|gte-|e5-|voyage-/.test(text)) {
     caps.add('embedding')
   }
-  if (/vision|multimodal|image|qwen-vl|llava|pixtral|janus|gpt-4o|gemini/.test(text)) {
+  if (/vision|multimodal|image|qwen-vl|llava|pixtral|janus|gpt-4o|gemini|kimi-k2/.test(text)) {
     caps.add('vision')
   }
   if (/tool|function/.test(text)) {
@@ -706,28 +688,6 @@ function toggleCapability(form: ModelForm, cap: string) {
 
     <!-- Right: detail panel -->
     <div class="provider-detail">
-      <div class="billing-settings">
-        <div class="billing-main">
-          <span class="billing-title">AI 计费</span>
-          <span class="billing-note">统计页统一按人民币显示</span>
-        </div>
-        <label class="billing-rate-field">
-          <span>USD/CNY</span>
-          <input
-            v-model="usdToCnyRate"
-            class="text-input sm"
-            type="number"
-            min="0.0001"
-            step="0.01"
-            @blur="saveBillingSettings"
-            @keydown.enter.prevent="saveBillingSettings"
-          />
-        </label>
-        <span v-if="billingSaveStatus" class="billing-save">
-          {{ billingSaveStatus === 'saving' ? '…' : t('settings.saved') }}
-        </span>
-      </div>
-
       <!-- Add provider form -->
       <template v-if="isAdding">
         <div class="detail-header">
@@ -755,7 +715,8 @@ function toggleCapability(form: ModelForm, cap: string) {
           <div class="field-label">{{ t('aiService.serviceType') }}</div>
           <select v-model="addForm.kind" class="select-input">
             <option value="openai_compatible">{{ t('aiService.openaiCompat') }}</option>
-            <option value="openrouter">OpenRouter（支持 PDF）</option>
+            <option value="openrouter">{{ t('aiService.openrouter') }}</option>
+            <option value="kimi">{{ t('aiService.kimi') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
           </select>
         </div>
@@ -846,7 +807,8 @@ function toggleCapability(form: ModelForm, cap: string) {
           <div class="field-label">{{ t('aiService.serviceType') }}</div>
           <select v-model="editKind" class="select-input" @change="saveProvider">
             <option value="openai_compatible">{{ t('aiService.openaiCompat') }}</option>
-            <option value="openrouter">OpenRouter（支持 PDF）</option>
+            <option value="openrouter">{{ t('aiService.openrouter') }}</option>
+            <option value="kimi">{{ t('aiService.kimi') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
           </select>
         </div>
@@ -1408,50 +1370,6 @@ function toggleCapability(form: ModelForm, cap: string) {
   overflow-y: auto;
   padding: 24px 28px 28px;
   position: relative;
-}
-
-.billing-settings {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  margin-bottom: 18px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--bg-secondary) 58%, var(--bg-primary));
-}
-.billing-main {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  flex: 1;
-}
-.billing-title {
-  font-size: 13px;
-  font-weight: 650;
-  color: var(--text-primary);
-}
-.billing-note,
-.billing-rate-field span,
-.billing-save {
-  font-size: 11px;
-  color: var(--text-tertiary);
-}
-.billing-rate-field {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-}
-.billing-rate-field .text-input.sm {
-  width: 92px;
-  height: 28px;
-}
-.billing-save {
-  width: 34px;
-  text-align: right;
-  flex-shrink: 0;
 }
 
 .empty-hint {

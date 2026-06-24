@@ -154,12 +154,14 @@ const contextMode = ref<PaperContextMode>('none')
 const usePdf = ref(false)
 const summaryAvailable = ref(false)
 
-// PDF mode is only supported by OpenRouter providers
+// PDF mode uses OpenAI-compatible inline file content parts, which only
+// OpenRouter reliably supports. Kimi / Moonshot endpoints reject the "file"
+// part type, so we keep the toggle disabled for those providers.
 const pdfSupported = computed(() =>
   selectedModels.value.some(m => {
     const p = ai.settings.providers.find(p => p.id === m.providerId)
     if (!p) return false
-    return p.kind === 'openrouter' || p.kind === 'kimi' || p.base_url.toLowerCase().includes('moonshot.cn')
+    return p.kind === 'openrouter' || p.base_url.toLowerCase().includes('openrouter')
   })
 )
 
@@ -1742,7 +1744,7 @@ function toggleContextPanel(nodeId: string) {
             class="context-btn context-btn-pdf"
             :class="{ active: usePdf }"
             :disabled="!pdfSupported"
-            :title="pdfSupported ? 'PDF（直接将 PDF 文件发给模型，OpenRouter / Kimi 支持）' : '当前模型不支持直接上传 PDF'"
+            :title="pdfSupported ? 'PDF（直接将 PDF 文件发给模型，仅 OpenRouter 支持）' : '当前模型不支持直接上传 PDF'"
             @click="usePdf = pdfSupported ? !usePdf : usePdf"
           >PDF</button>
           <span v-if="!fulltextReady && !fulltextChecking" class="context-hint">请先获取全文</span>

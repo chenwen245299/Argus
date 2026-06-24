@@ -12,7 +12,7 @@ import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
 import { buildChunks } from '../utils/chunker'
 import { recordPaperAccess, sortPapersByRecentAccess } from '../utils/recentPapers'
-import type { ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
+import type { ChatContentPart, ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
 
 const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag'] }>()
 const { t } = useI18n()
@@ -112,6 +112,7 @@ interface LibraryUiMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
+  attachments?: Attachment[]
   sources?: RetrievedChunk[]
   streaming?: boolean
   error?: boolean
@@ -154,6 +155,13 @@ interface LibrarySentContextSection {
 interface LibrarySentContextPayload {
   mode?: string
   sections?: LibrarySentContextSection[]
+}
+
+interface Attachment {
+  id: string
+  type: 'image' | 'pdf'
+  name: string
+  dataUrl: string
 }
 
 interface StreamUsagePayload {
@@ -231,6 +239,10 @@ function saveToStorage(convs: LibraryConversation[]) {
 const conversations = ref<LibraryConversation[]>([])
 const activeConvId = ref<string | null>(null)
 const input = ref('')
+const attachments = ref<Attachment[]>([])
+const fileInputRef = ref<HTMLInputElement | null>(null)
+const previewImage = ref<string | null>(null)
+const previewPdf = ref<string | null>(null)
 const loading = ref(false)
 const messagesEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
@@ -452,7 +464,7 @@ const activeConv = computed(() =>
 )
 const activeMessages = computed(() => activeConv.value?.messages ?? [])
 const canSend = computed(() =>
-  input.value.trim().length > 0 &&
+  (input.value.trim().length > 0 || attachments.value.length > 0) &&
   !loading.value &&
   ai.isConfigured &&
   (knowledgeSource.value !== 'papers' || selectedPaperSlugs.value.length > 0)
@@ -578,6 +590,38 @@ function persistSelectedModel(sel: ModelSelection | null) {
 
 function modelLogo(model?: ModelOption | null) {
   if (!model) return ''
+  const provider = ai.settings.providers.find(p => p.id === model.providerId)
+  // "openai_compatible" is a generic adapter kind used for DeepSeek/Kimi/etc.
+  // It should not be treated as the OpenAI brand.
+  const kind = provider?.kind === 'openai_compatible' ? '' : provider?.kind
+  const haystack = [
+    kind,
+    model.providerId,
+    model.providerName,
+    model.modelId,
+    model.displayName,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+
+  // Check model-specific brands first so generic adapter kinds don't win.
+  if (haystack.includes('deepseek')) return modelIconMap.deepseek
+  if (haystack.includes('kimi') || haystack.includes('moonshot')) return modelIconMap.kimi
+  if (haystack.includes('claude') || haystack.includes('anthropic')) return modelIconMap.claude
+  if (haystack.includes('gemini') || haystack.includes('google')) return modelIconMap.gemini
+  if (haystack.includes('qwen') || haystack.includes('通义') || haystack.includes('alibaba')) {
+    return modelIconMap.qwen ?? modelIconMap.alibaba
+  }
+  if (haystack.includes('grok') || haystack.includes('xai')) return modelIconMap.grok ?? modelIconMap.xai
+  if (haystack.includes('zhipu') || haystack.includes('智谱') || haystack.includes('glm')) return modelIconMap.zhipu
+  if (haystack.includes('baidu') || haystack.includes('ernie')) return modelIconMap.baidu
+  if (haystack.includes('doubao') || haystack.includes('bytedance')) return modelIconMap.bytedance
+  if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
+  if (haystack.includes('ollama')) return modelIconMap['ollama-color']
+  if (haystack.includes('openai') || haystack.includes('gpt')) return modelIconMap.openai
+
+  // Fall back to filename-based matching for less common providers.
   const keys = [
     model.providerId,
     model.providerName,
@@ -587,9 +631,6 @@ function modelLogo(model?: ModelOption | null) {
   for (const raw of keys) {
     const key = raw.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
     if (modelIconMap[key]) return modelIconMap[key]
-    if (key === 'anthropic') return modelIconMap.claude
-    if (key === 'x-ai') return modelIconMap.xai || modelIconMap.grok
-    if (key === 'google') return modelIconMap.gemini
   }
   return ''
 }
@@ -701,6 +742,10 @@ function hasAnswerContext(answer: LibraryAnswerVariant) {
   return answerContextSections(answer).length > 0
 }
 
+function answerUsedPdf(answer: LibraryAnswerVariant) {
+  return answer.sources?.some(s => s.source_type === 'pdf')
+}
+
 function toggleContextPanel(answerId: string) {
   expandedContextId.value = expandedContextId.value === answerId ? null : answerId
 }
@@ -740,7 +785,14 @@ function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
   const history: ChatMessage[] = []
   for (const m of messages) {
     if (m.role === 'user') {
-      history.push({ role: 'user', content: m.content })
+      // Keep attachments inside the user message so they travel with the
+      // conversation history. Each PDF only needs to be uploaded once; later
+      // turns can reference it via the prior messages.
+      if (m.attachments?.length) {
+        history.push({ role: 'user', content: buildUserContentParts(m.content, m.attachments) })
+      } else {
+        history.push({ role: 'user', content: m.content })
+      }
     } else {
       const ans = activeAnswer(m)
       if (ans.streaming || ans.error || !ans.content.trim()) continue
@@ -859,6 +911,74 @@ function autoResize() {
 
 watch(input, () => nextTick(autoResize))
 
+function openFilePicker() {
+  fileInputRef.value?.click()
+}
+
+function addAttachmentFromFile(file: File) {
+  if (!file.type.startsWith('image/') && file.type !== 'application/pdf') return false
+  const reader = new FileReader()
+  reader.onload = () => {
+    const dataUrl = reader.result as string
+    const type: Attachment['type'] = file.type.startsWith('image/') ? 'image' : 'pdf'
+    const name = file.name || (type === 'image' ? 'pasted-image.png' : 'pasted-file.pdf')
+    attachments.value.push({ id: crypto.randomUUID(), type, name, dataUrl })
+  }
+  reader.readAsDataURL(file)
+  return true
+}
+
+function onFileSelected(e: Event) {
+  const target = e.target as HTMLInputElement
+  const files = target.files
+  if (!files) return
+  for (const file of Array.from(files)) {
+    addAttachmentFromFile(file)
+  }
+  target.value = ''
+}
+
+function onPaste(e: ClipboardEvent) {
+  const items = e.clipboardData?.items
+  if (!items) return
+  let consumed = false
+  for (const item of Array.from(items)) {
+    const file = item.getAsFile()
+    if (!file) continue
+    if (addAttachmentFromFile(file)) consumed = true
+  }
+  if (consumed) e.preventDefault()
+}
+
+function removeAttachment(id: string) {
+  attachments.value = attachments.value.filter(a => a.id !== id)
+}
+
+function previewAttachment(att: Attachment) {
+  if (att.type === 'image') {
+    previewImage.value = att.dataUrl
+  } else {
+    previewPdf.value = att.dataUrl
+  }
+}
+
+function closePreview() {
+  previewImage.value = null
+  previewPdf.value = null
+}
+
+function buildUserContentParts(text: string, atts?: Attachment[]): ChatContentPart[] {
+  const parts: ChatContentPart[] = [{ type: 'text', text }]
+  for (const att of atts ?? []) {
+    if (att.type === 'image') {
+      parts.push({ type: 'image_url', image_url: { url: att.dataUrl } })
+    } else {
+      parts.push({ type: 'file', file: { filename: att.name, file_data: att.dataUrl } })
+    }
+  }
+  return parts
+}
+
 async function runAssistantRequest(
   conv: LibraryConversation,
   assistantMsg: LibraryUiMessage,
@@ -932,6 +1052,7 @@ async function runAssistantRequest(
       sourcesEventName,
       knowledgeSource: knowledgeSource.value,
       selectedPaperSlugs: requestPaperSlugs,
+      attachments: null,
     })
     if (!target.content && finalText) target.content = finalText
     target.streaming = false
@@ -974,12 +1095,14 @@ function createAssistantMessage(sel: ModelSelection | null): LibraryUiMessage {
 
 async function sendMessage() {
   const text = input.value.trim()
-  if (!text || loading.value) return
+  if ((!text && !attachments.value.length) || loading.value) return
 
   if (!activeConvId.value) newConversation()
   const conv = activeConv.value!
   const sel = effectiveModel()
+  const currentAttachments = attachments.value.length > 0 ? [...attachments.value] : undefined
   input.value = ''
+  attachments.value = []
   nextTick(autoResize)
 
   if (conv.messages.filter(m => m.role === 'user').length === 0) {
@@ -987,7 +1110,7 @@ async function sendMessage() {
   }
 
   conv.messages.push({
-    id: genId(), role: 'user', content: text, createdAt: new Date().toISOString(),
+    id: genId(), role: 'user', content: text, attachments: currentAttachments, createdAt: new Date().toISOString(),
   })
   conv.messages.push(createAssistantMessage(sel))
   // Use the reactive reference from the array so Vue tracks mutations during streaming
@@ -1526,6 +1649,23 @@ onUnmounted(() => {
               </div>
               <template v-else>
                 <div class="user-message-stack">
+                  <div v-if="msg.attachments && msg.attachments.length" class="user-attachments">
+                    <button
+                      v-for="att in msg.attachments"
+                      :key="att.id"
+                      class="user-attachment"
+                      :class="{ pdf: att.type === 'pdf' }"
+                      :title="att.name"
+                      @click="previewAttachment(att)"
+                    >
+                      <img v-if="att.type === 'image'" :src="att.dataUrl" class="user-attachment-thumb" alt="" />
+                      <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                      </svg>
+                      <span class="user-attachment-name">{{ att.name }}</span>
+                    </button>
+                  </div>
                   <div class="user-bubble">{{ msg.content }}</div>
                   <div class="message-actions user-actions">
                     <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
@@ -1634,6 +1774,11 @@ onUnmounted(() => {
                           <span v-else>{{ modelFallbackInitial(activeAnswer(msg)) }}</span>
                         </span>
                         <span class="assistant-model-meta-name">{{ answerModelName(activeAnswer(msg)) }}</span>
+                        <span
+                          v-if="answerUsedPdf(activeAnswer(msg))"
+                          class="pdf-badge"
+                          title="已将选中文献的 PDF 直接发送给模型"
+                        >PDF</span>
                       </span>
                       <span v-if="typeof activeAnswer(msg).inputTokens === 'number'" title="上下文输入 tokens">↑{{ formatTokenCount(activeAnswer(msg).inputTokens) }}</span>
                       <span v-if="typeof activeAnswer(msg).outputTokens === 'number'" title="本次输出 tokens">↓{{ formatTokenCount(activeAnswer(msg).outputTokens) }}</span>
@@ -1733,6 +1878,27 @@ onUnmounted(() => {
             </button>
           </div>
           <div class="composer">
+            <div v-if="attachments.length" class="attachment-row">
+              <div
+                v-for="att in attachments"
+                :key="att.id"
+                class="attachment-chip"
+                :class="{ pdf: att.type === 'pdf' }"
+                :title="att.name"
+              >
+                <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
+                <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                </svg>
+                <span class="attachment-name">{{ att.name }}</span>
+                <button class="attachment-remove" title="移除" @click="removeAttachment(att.id)">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
             <textarea
               ref="textareaEl"
               v-model="input"
@@ -1743,9 +1909,28 @@ onUnmounted(() => {
               @keydown="handleKeydown"
               @compositionstart="onCompositionStart"
               @compositionend="onCompositionEnd"
+              @paste="onPaste"
+            />
+            <input
+              ref="fileInputRef"
+              type="file"
+              accept="image/*,.pdf"
+              multiple
+              style="display: none"
+              @change="onFileSelected"
             />
             <div class="composer-footer">
               <div class="footer-left">
+                <button
+                  class="attach-btn"
+                  title="添加图片或 PDF 附件"
+                  :disabled="loading"
+                  @click="openFilePicker"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                  </svg>
+                </button>
                 <!-- Knowledge source picker -->
                 <div class="ks-picker" @click.stop>
                   <button
@@ -1880,6 +2065,26 @@ onUnmounted(() => {
           </button>
         </div>
       </div>
+    </div>
+  </Teleport>
+
+  <!-- Attachment preview lightbox -->
+  <Teleport to="body">
+    <div v-if="previewImage" class="attachment-lightbox" @click.self="closePreview">
+      <img :src="previewImage" class="lightbox-image" alt="" />
+      <button class="lightbox-close" @click="closePreview">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+    <div v-if="previewPdf" class="attachment-lightbox pdf-lightbox" @click.self="closePreview">
+      <iframe :src="previewPdf" class="lightbox-pdf" frameborder="0"></iframe>
+      <button class="lightbox-close" @click="closePreview">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
     </div>
   </Teleport>
 </template>
@@ -2814,6 +3019,20 @@ onUnmounted(() => {
   font-weight: 500;
   margin-left: 2px;
 }
+.pdf-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 15px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: #fff0f0;
+  border: 1px solid #f0c0c0;
+  color: #8b1e1e;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
 
 /* ── Sent context banner ─────────────────────────────────────────────────── */
 .context-banner {
@@ -3288,6 +3507,157 @@ onUnmounted(() => {
 
 .footer-left { display: flex; align-items: center; gap: 8px; }
 .footer-right { display: flex; align-items: center; gap: 8px; }
+
+.attach-btn {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.attach-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border-default));
+  color: var(--accent);
+}
+.attach-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.attachment-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 0 8px;
+}
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 180px;
+  padding: 4px 6px;
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.attachment-chip.pdf {
+  background: #fff0f0;
+  border-color: #f0c0c0;
+  color: #8b1e1e;
+}
+.attachment-thumb {
+  width: 18px;
+  height: 18px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.attachment-remove:hover {
+  background: rgba(0, 0, 0, 0.08);
+  color: var(--text-primary);
+}
+
+.user-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+  max-width: 88%;
+  justify-content: flex-end;
+}
+.user-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 160px;
+  padding: 4px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+.user-attachment.pdf {
+  background: #fff0f0;
+  border-color: #f0c0c0;
+  color: #8b1e1e;
+}
+.user-attachment-thumb {
+  width: 16px;
+  height: 16px;
+  object-fit: cover;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.user-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(2px);
+}
+.lightbox-image {
+  max-width: 92vw;
+  max-height: 92vh;
+  border-radius: var(--radius-md);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+}
+.lightbox-pdf {
+  width: 92vw;
+  height: 92vh;
+  border-radius: var(--radius-md);
+  background: #fff;
+}
+.lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  cursor: pointer;
+}
+.lightbox-close:hover { background: rgba(0, 0, 0, 0.65); }
 
 .add-paper-context-btn {
   width: 26px;

@@ -3,11 +3,19 @@ use std::time::Duration;
 use futures::StreamExt;
 use tauri::Emitter;
 
-use crate::models::{AiModel, AiProvider, ChatContent, ChatMessage};
+use crate::models::{AiModel, AiProvider, ChatContent, ChatContentPart, ChatMessage};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Non-streaming chat completion. Returns the full response text.
+fn is_kimi_coding_endpoint(provider: &AiProvider) -> bool {
+    provider.base_url.to_lowercase().contains("api.kimi.com")
+}
+
+fn is_anthropic_protocol(provider: &AiProvider) -> bool {
+    provider.kind == "anthropic" || is_kimi_coding_endpoint(provider)
+}
+
 pub async fn chat_completion(
     provider: &AiProvider,
     api_key: &str,
@@ -15,9 +23,10 @@ pub async fn chat_completion(
     messages: &[ChatMessage],
     source: &str,
 ) -> Result<String, String> {
-    match provider.kind.as_str() {
-        "anthropic" => chat_anthropic(provider, api_key, model, messages, source).await,
-        _ => chat_openai_compat(provider, api_key, model, messages, source).await,
+    if is_anthropic_protocol(provider) {
+        chat_anthropic(provider, api_key, model, messages, source).await
+    } else {
+        chat_openai_compat(provider, api_key, model, messages, source).await
     }
 }
 
@@ -36,40 +45,36 @@ pub async fn chat_completion_stream(
     reasoning_effort: Option<&str>,
     source: &str,
 ) -> Result<String, String> {
-    match provider.kind.as_str() {
-        "anthropic" => {
-            stream_anthropic(
-                provider,
-                api_key,
-                model,
-                messages,
-                event_name,
-                app,
-                use_reasoning,
-                source,
-            )
-            .await
-        }
-        _ => {
-            stream_openai_compat(
-                provider,
-                api_key,
-                model,
-                messages,
-                event_name,
-                app,
-                use_reasoning,
-                reasoning_effort,
-                source,
-            )
-            .await
-        }
+    if is_anthropic_protocol(provider) {
+        stream_anthropic(
+            provider,
+            api_key,
+            model,
+            messages,
+            event_name,
+            app,
+            use_reasoning,
+            source,
+        )
+        .await
+    } else {
+        stream_openai_compat(
+            provider,
+            api_key,
+            model,
+            messages,
+            event_name,
+            app,
+            use_reasoning,
+            reasoning_effort,
+            source,
+        )
+        .await
     }
 }
 
-/// Like `chat_completion_stream` but for providers that accept an inline PDF
-/// (OpenRouter and Kimi). Encodes the PDF as base64 and injects it as a `file`
-/// content block into the first user message so the model can read the paper directly.
+/// Like `chat_completion_stream` but for providers that accept an inline PDF.
+/// Currently only OpenRouter supports OpenAI-compatible `file` content parts.
 pub async fn chat_completion_stream_with_pdf(
     provider: &AiProvider,
     api_key: &str,
@@ -858,6 +863,8 @@ async fn stream_openai_compat(
         .header("Content-Type", "application/json");
     if is_kimi_coding_endpoint {
         req = req.header("User-Agent", "KimiCLI/1.5");
+        // Kimi Code may return a gzipped SSE stream; ask for identity to keep it plain text.
+        req = req.header("Accept-Encoding", "identity");
     }
     let resp = req.json(&body).send().await.map_err(|e| format!("Network error: {e}"))?;
 
@@ -1016,17 +1023,30 @@ async fn chat_anthropic(
     let client = build_client()?;
     let url = format!("{}/messages", provider.base_url.trim_end_matches('/'));
     let (system, conv) = split_system(messages);
-    let mut body = serde_json::json!({"model": model, "max_tokens": 4096, "messages": conv});
+    let is_kimi_coding = is_kimi_coding_endpoint(provider);
+    // Kimi Code allows larger output windows; Anthropic defaults stay conservative.
+    let max_tokens: i64 = if is_kimi_coding { 8192 } else { 4096 };
+    let mut body = serde_json::json!({"model": model, "max_tokens": max_tokens, "messages": conv});
     if !system.is_empty() {
         body["system"] = serde_json::json!(system);
     }
 
-    let resp = client
+    let mut req = client
         .post(&url)
         .timeout(REQUEST_TIMEOUT)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    if is_kimi_coding {
+        // Kimi Code's /coding/v1 endpoint authenticates with a standard Bearer
+        // token and gates access by User-Agent whitelist.
+        req = req
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "KimiCLI/1.5");
+    } else {
+        req = req
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01");
+    }
+    let resp = req
         .json(&body)
         .send()
         .await
@@ -1063,10 +1083,13 @@ async fn stream_anthropic(
     let client = build_client()?;
     let url = format!("{}/messages", provider.base_url.trim_end_matches('/'));
     let (system, conv) = split_system(messages);
+    let is_kimi_coding = is_kimi_coding_endpoint(provider);
 
     let thinking_budget: i64 = 10_000;
-    let max_tokens = if use_reasoning {
+    let max_tokens = if use_reasoning && !is_kimi_coding {
         std::cmp::max(16_384, thinking_budget + 4_096)
+    } else if is_kimi_coding {
+        8192
     } else {
         4_096
     };
@@ -1079,18 +1102,28 @@ async fn stream_anthropic(
     if !system.is_empty() {
         body["system"] = serde_json::json!(system);
     }
-    if use_reasoning {
+    if use_reasoning && !is_kimi_coding {
         body["thinking"] = serde_json::json!({
             "type": "enabled",
             "budget_tokens": thinking_budget
         });
     }
 
-    let resp = client
+    let mut req = client
         .post(&url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    if is_kimi_coding {
+        // Kimi Code may gzip SSE streams; ask for identity to keep parsing simple.
+        req = req
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "KimiCLI/1.5")
+            .header("Accept-Encoding", "identity");
+    } else {
+        req = req
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01");
+    }
+    let resp = req
         .json(&body)
         .send()
         .await
@@ -1603,6 +1636,51 @@ fn chat_content_text(content: &ChatContent) -> &str {
     }
 }
 
+/// Convert our internal `ChatContent` into an Anthropic Messages API content
+/// array. Text parts become `{type:"text"}`, images become `{type:"image"}`,
+/// and PDF file parts become `{type:"document"}` with a base64 source.
+fn to_anthropic_content(content: &ChatContent) -> Vec<serde_json::Value> {
+    match content {
+        ChatContent::Text(s) => {
+            vec![serde_json::json!({"type": "text", "text": s})]
+        }
+        ChatContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                ChatContentPart::Text { text } => {
+                    Some(serde_json::json!({"type": "text", "text": text}))
+                }
+                ChatContentPart::ImageUrl { image_url } => {
+                    let (media_type, data) = parse_data_uri(&image_url.url)?;
+                    if !media_type.starts_with("image/") {
+                        return None;
+                    }
+                    Some(serde_json::json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": data
+                        }
+                    }))
+                }
+                // Kimi Code's /coding endpoint accepts Anthropic image blocks but
+                // does not support PDF document blocks, so drop file attachments.
+                ChatContentPart::File { .. } => None,
+            })
+            .collect(),
+    }
+}
+
+/// Parse a `data:<mime>;base64,<payload>` URI. Returns the media type and the
+/// raw base64 payload. Non-data URIs are rejected.
+fn parse_data_uri(uri: &str) -> Option<(String, String)> {
+    let rest = uri.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(",")?;
+    let media_type = meta.split(';').next().unwrap_or("application/octet-stream");
+    Some((media_type.to_string(), payload.to_string()))
+}
+
 fn split_system(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
     let system: String = messages
         .iter()
@@ -1613,7 +1691,12 @@ fn split_system(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
     let conv: Vec<serde_json::Value> = messages
         .iter()
         .filter(|m| m.role != "system")
-        .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content": to_anthropic_content(&m.content)
+            })
+        })
         .collect();
     (system, conv)
 }

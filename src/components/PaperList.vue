@@ -666,10 +666,10 @@ const suggestedContextTags = computed(() => {
   const owned = new Set(ctxMenu.value.item.tags ?? [])
   const query = ctxMenu.value.tagInput.trim().toLowerCase()
   return library.allTags
+    .filter(tag => tag.trim())
     .filter(tag => !owned.has(tag))
     .filter(tag => !CATEGORY_TAGS.has(tag))
     .filter(tag => !query || tag.toLowerCase().includes(query))
-    .slice(0, 10)
 })
 
 async function addToCollection(collectionId: string) {
@@ -2273,6 +2273,9 @@ async function reExtract(item: PaperIndexEntry) {
   flex-wrap: wrap;
   gap: 4px;
   max-width: 190px;
+  max-height: 150px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 :global(.ctx-tag-suggestion) {
   display: inline-flex;

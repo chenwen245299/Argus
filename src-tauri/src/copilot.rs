@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use tauri::Emitter;
 
-use crate::models::{ChatContent, ChatMessage, PaperMeta, RetrievedChunk};
+use crate::models::{ChatContent, ChatContentPart, ChatMessage, FileData, PaperMeta, RetrievedChunk};
 use crate::{ai_manager, ai_summary, extraction, llm, paper, rag};
 
 // ── Chat history persistence ──────────────────────────────────────────────────
@@ -217,9 +217,9 @@ pub async fn chat_with_paper_on_event(
 
     all_messages.extend_from_slice(&messages);
 
-    // OpenRouter / Kimi with PDF toggle: send the PDF file directly.
-    let is_kimi = provider.kind == "kimi" || provider.base_url.to_lowercase().contains("moonshot.cn");
-    let use_pdf = use_pdf && (provider.kind == "openrouter" || is_kimi);
+    // Only OpenRouter supports inline PDF `file` content parts. Other providers
+    // fall back to the text context already injected into the system prompt.
+    let use_pdf = use_pdf && provider_supports_inline_pdf(&provider);
 
     if use_pdf {
         let pdf_path = crate::metadata::find_pdf_in_dir(root, slug);
@@ -269,6 +269,12 @@ struct LibrarySentContextPayload {
     sections: Vec<LibrarySentContextSection>,
 }
 
+fn provider_supports_inline_pdf(provider: &crate::models::AiProvider) -> bool {
+    // Only OpenRouter reliably supports OpenAI-compatible inline `file`
+    // content parts for PDFs.
+    provider.kind == "openrouter" || provider.base_url.to_lowercase().contains("openrouter")
+}
+
 pub async fn chat_with_library(
     root: &str,
     messages: Vec<ChatMessage>,
@@ -278,6 +284,7 @@ pub async fn chat_with_library(
     sources_event_name: &str,
     knowledge_source: Option<&str>,
     selected_paper_slugs: Option<&[String]>,
+    attachments: Option<&[ChatContentPart]>,
     app: &tauri::AppHandle,
 ) -> Result<String, String> {
     use tauri::Emitter;
@@ -290,10 +297,28 @@ pub async fn chat_with_library(
 
     let system;
 
+    let mut pdf_attachments: Vec<ChatContentPart> = Vec::new();
+
     if use_selected_papers {
         let slugs = selected_paper_slugs.unwrap_or(&[]);
-        let (selected_system, selected_sources, selected_contexts) =
-            build_selected_papers_system_prompt(root, slugs, &provider, &model);
+        let use_inline_pdf = provider_supports_inline_pdf(&provider);
+        pdf_attachments = slugs
+            .iter()
+            .filter_map(|slug| {
+                let slug = slug.trim();
+                if slug.is_empty() {
+                    return None;
+                }
+                let pdf_path = crate::metadata::find_pdf_in_dir(root, slug);
+                encode_pdf_attachment(&pdf_path)
+            })
+            .collect();
+        let use_pdf = use_inline_pdf && !pdf_attachments.is_empty();
+        let (selected_system, selected_sources, selected_contexts) = if use_pdf {
+            build_selected_papers_pdf_system_prompt(root, slugs)
+        } else {
+            build_selected_papers_system_prompt(root, slugs, &provider, &model)
+        };
         let _ = app.emit(sources_event_name, selected_sources);
         let context_event_name = format!("{event_name}-context");
         let _ = app.emit(
@@ -358,6 +383,25 @@ pub async fn chat_with_library(
             rag_chunks.as_deref().unwrap_or(&[]).to_vec(),
         );
         system = build_library_system_prompt(rag_chunks.as_deref());
+    }
+
+    let mut messages = messages;
+    let mut extra_parts: Vec<ChatContentPart> = Vec::new();
+    extra_parts.extend(pdf_attachments);
+    if let Some(attachments) = attachments {
+        extra_parts.extend(attachments.iter().cloned());
+    }
+    if !extra_parts.is_empty() {
+        if let Some(idx) = messages.iter().rposition(|m| m.role == "user") {
+            let mut parts: Vec<ChatContentPart> = match &messages[idx].content {
+                ChatContent::Text(t) => {
+                    vec![ChatContentPart::Text { text: t.clone() }]
+                }
+                ChatContent::Parts(p) => p.clone(),
+            };
+            parts.extend(extra_parts);
+            messages[idx].content = ChatContent::Parts(parts);
+        }
     }
 
     let mut all_messages = vec![ChatMessage {
@@ -860,6 +904,104 @@ fn build_selected_papers_system_prompt(
     }
 
     (prompt, sources, contexts)
+}
+
+/// Build a minimal system prompt for providers that accept inline PDFs.
+/// The actual paper content comes from the PDF file blocks injected into the
+/// user message, so the prompt only needs to tell the model what to do.
+fn build_selected_papers_pdf_system_prompt(
+    root: &str,
+    slugs: &[String],
+) -> (String, Vec<RetrievedChunk>, Vec<LibrarySentContextSection>) {
+    let mut prompt = String::from(
+        "You are a research assistant helping the user compare and analyze a selected set of academic papers.\n\
+         The full PDFs of the selected papers are attached to the user message.\n\
+         Rules:\n\
+         1. Answer ONLY from the attached PDFs — do not hallucinate.\n\
+         2. Respond in the same language the user uses (Chinese if asked in Chinese).\n\
+         3. For every key claim, cite the source paper using this format:\n\
+            **论文标题** (`slug`)\n\
+         4. If the selected papers do not contain enough evidence, say that clearly.\n\
+         5. When multiple selected papers are relevant, synthesize them and distinguish their contributions.\n\n",
+    );
+
+    if slugs.is_empty() {
+        prompt.push_str("[未选择文献。请先在「文献库」模式中添加要参与问答的论文。]\n");
+        return (prompt, Vec::new(), Vec::new());
+    }
+
+    let mut sources = Vec::new();
+    let mut contexts = Vec::new();
+    let mut found_count = 0usize;
+
+    prompt.push_str("--- 用户选择的文献（PDF 已作为附件发送） ---\n\n");
+
+    for slug in slugs {
+        let slug = slug.trim();
+        if slug.is_empty() {
+            continue;
+        }
+
+        let Ok(meta) = paper::read_meta(root, slug) else {
+            prompt.push_str(&format!("[未找到文献: `{slug}`]\n\n"));
+            continue;
+        };
+
+        found_count += 1;
+        let paper_line = format!("[文献 {n}] {title} (`{slug}`)\n", n = found_count, title = meta.title);
+        prompt.push_str(&paper_line);
+
+        let pdf_path = crate::metadata::find_pdf_in_dir(root, slug);
+        let context_line = if pdf_path.exists() {
+            format!("{paper_line}PDF 文件已直接发送给模型。\n")
+        } else {
+            format!("{paper_line}[未找到 PDF 文件]\n")
+        };
+        contexts.push(LibrarySentContextSection {
+            kind: "paper".to_string(),
+            label: meta.title.clone(),
+            content: context_line,
+        });
+
+        sources.push(RetrievedChunk {
+            chunk_id: format!("selected-{slug}"),
+            paper_id: meta.id.clone(),
+            slug: slug.to_string(),
+            chunk_index: found_count.saturating_sub(1) as u32,
+            text: meta.title.clone(),
+            score: 1.0,
+            paper_title: meta.title.clone(),
+            source_type: "pdf".to_string(),
+            source_id: None,
+            source_label: Some("已选文献 PDF".to_string()),
+        });
+    }
+
+    if found_count == 0 {
+        prompt.push_str("[所选文献未找到。请重新添加文献。]\n");
+    }
+
+    (prompt, sources, contexts)
+}
+
+fn encode_pdf_attachment(pdf_path: &std::path::Path) -> Option<ChatContentPart> {
+    use base64::Engine;
+    if !pdf_path.exists() {
+        return None;
+    }
+    let bytes = std::fs::read(pdf_path).ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let filename = pdf_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("paper.pdf")
+        .to_string();
+    Some(ChatContentPart::File {
+        file: FileData {
+            filename,
+            file_data: format!("data:application/pdf;base64,{b64}"),
+        },
+    })
 }
 
 fn build_system_prompt(

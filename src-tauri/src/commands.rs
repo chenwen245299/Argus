@@ -1460,6 +1460,7 @@ pub async fn chat_with_library(
     sources_event_name: Option<String>,
     knowledge_source: Option<String>,
     selected_paper_slugs: Option<Vec<String>>,
+    attachments: Option<Vec<crate::models::ChatContentPart>>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -1476,6 +1477,7 @@ pub async fn chat_with_library(
         &sources_event_name,
         knowledge_source.as_deref(),
         selected_paper_slugs.as_deref(),
+        attachments.as_deref(),
         &app,
     )
     .await

@@ -1747,6 +1747,27 @@ pub async fn delete_snippet_chunk(root: &str, snippet_id: &str) -> Result<(), St
     .map_err(|e| e.to_string())?
 }
 
+pub async fn update_snippet_library_id(
+    root: &str,
+    snippet_id: &str,
+    library_id: &str,
+) -> Result<(), String> {
+    let root = root.to_string();
+    let snippet_id = snippet_id.to_string();
+    let library_id = library_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = open_db_with_snippet_table(&root)?;
+        conn.execute(
+            "UPDATE snippet_chunks SET library_id = ?1 WHERE snippet_id = ?2",
+            params![library_id, snippet_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 pub fn get_unembedded_snippets(root: &str) -> Result<Vec<crate::models::Snippet>, String> {
     let libs = crate::snippets::list_snippet_libraries(root)?;
     let mut all: Vec<crate::models::Snippet> = vec![];

@@ -11,7 +11,7 @@ import { usePaperTasksStore, type AiSummaryJob } from '../stores/paperTasks'
 import { useCollectionsStore } from '../stores/collections'
 import { useRagStore } from '../stores/rag'
 import { titleInitialCaps } from '../utils/text'
-import type { SearchHit, Note } from '../types'
+import type { SearchHit, Note, PaperStatus } from '../types'
 import TokenUsageModal from './TokenUsageModal.vue'
 
 const { t } = useI18n()
@@ -149,7 +149,7 @@ const leftReserveStyle = computed(() => ({
 const rightReserveStyle = computed(() => ({
   width: props.rightSidebarOpen
     ? `${Math.max(40, (props.rightSidebarWidth ?? 300) + 1)}px`
-    : '40px',
+    : '50px',
 }))
 
 // ── Import dropdown menu ─────────────────────────────────────────────────────
@@ -309,6 +309,18 @@ watch(batchRunning, (running) => {
   if (!running) showBatchDetail.value = false
 })
 
+async function refreshSinglePaperStatus(slug: string) {
+  try {
+    const status = await invoke<PaperStatus>('get_paper_status', { slug })
+    const idx = library.papers.findIndex(p => p.slug === slug)
+    if (idx >= 0) {
+      library.papers[idx] = { ...library.papers[idx], status }
+    }
+  } catch (e) {
+    console.error('[batch] failed to refresh paper status:', e)
+  }
+}
+
 async function analyzeOnePaper(slug: string): Promise<void> {
   if (batchCancelled) return
   paperTasks.setAiSummaryJob(slug, { kind: 'summary', stage: 'queued', generatedChars: 0, message: undefined })
@@ -331,6 +343,7 @@ async function analyzeOnePaper(slug: string): Promise<void> {
   try {
     await invoke<Note>('generate_summary', { slug, providerId: null, modelId: null })
     paperTasks.setAiSummaryJob(slug, { stage: 'done' })
+    await refreshSinglePaperStatus(slug)
     window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug } }))
   } catch (e: unknown) {
     paperTasks.setAiSummaryJob(slug, { stage: 'error', message: String(e) })
@@ -991,7 +1004,7 @@ onUnmounted(() => {
       <!-- Right sidebar toggle -->
       <button
         class="tb-btn sidebar-toggle-btn"
-        :class="{ active: props.rightSidebarOpen }"
+        :class="{ active: props.rightSidebarOpen, 'sidebar-collapsed': !props.rightSidebarOpen }"
         :title="props.rightSidebarOpen ? t('pdf.hideSidebar') : t('pdf.showSidebar')"
         @click="emit('toggle-right-sidebar')"
       >
@@ -1309,6 +1322,8 @@ onUnmounted(() => {
 
 .ai-hub-btn.ai-busy {
   animation: arxiv-breathe 1.8s ease-in-out infinite;
+  /* reserve space on the left for the pulse dot so it never overlaps text */
+  padding-left: 18px;
 }
 
 .ai-hub-menu {
@@ -1413,14 +1428,15 @@ onUnmounted(() => {
 .batch-detail-popover {
   position: absolute;
   top: calc(100% + 8px);
-  left: 0;
+  right: 0;
+  left: auto;
   z-index: 300;
   background: var(--bg-primary);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
   min-width: 320px;
-  max-width: 440px;
+  max-width: min(440px, calc(100vw - 16px));
   max-height: 360px;
   display: flex;
   flex-direction: column;
@@ -1591,11 +1607,21 @@ onUnmounted(() => {
   align-items: center;
   justify-content: flex-end;
   flex-shrink: 0;
+  position: relative;
   height: 100%;
-  border-left: 1px solid var(--border-default);
   padding-left: 8px;
   padding-right: 10px;
   box-sizing: border-box;
+}
+.right-toolbar-reserve::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+  height: 18px;
+  background: var(--border-subtle);
 }
 
 .sidebar-tab-btn.active {
@@ -1627,11 +1653,14 @@ onUnmounted(() => {
 }
 
 .tb-btn.sidebar-toggle-btn {
-  width: 36px;
+  width: 32px;
   height: 32px;
   margin-left: 4px;
   border-radius: var(--radius-md);
   background: transparent;
+}
+.tb-btn.sidebar-toggle-btn.sidebar-collapsed {
+  margin-left: 0;
 }
 .tb-btn.sidebar-toggle-btn:hover {
   color: var(--accent);

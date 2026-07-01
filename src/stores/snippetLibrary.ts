@@ -154,6 +154,14 @@ export async function updateSnippet(id: string, changes: Partial<Pick<Snippet, '
   snippets.value = snippets.value.map(s => s.id === id ? { ...s, ...changes } : s)
 }
 
+export async function moveSnippet(id: string, targetLibraryId: string): Promise<Snippet | undefined> {
+  const s = snippets.value.find(s => s.id === id)
+  if (!s || s.libraryId === targetLibraryId) return
+  const moved = await invoke<Snippet>('move_snippet', { id, targetLibraryId })
+  snippets.value = snippets.value.map(s => s.id === id ? moved : s)
+  return moved
+}
+
 export function snippetsForLibrary(libraryId: string): Snippet[] {
   return snippets.value.filter(s => s.libraryId === libraryId)
 }

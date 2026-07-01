@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, watch, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import type { PaperMeta } from '../../types'
@@ -120,10 +120,12 @@ async function saveSource() {
 const bibtexEditing = ref(false)
 const bibtexDraft = ref('')
 const bibtexSaving = ref(false)
+const bibtexTextareaRef = ref<HTMLTextAreaElement | null>(null)
 
 function startBibtexEdit() {
   bibtexDraft.value = props.meta?.bibtex ?? ''
   bibtexEditing.value = true
+  nextTick(() => bibtexTextareaRef.value?.focus())
 }
 
 function cancelBibtexEdit() {
@@ -152,6 +154,7 @@ const citeCountEditing = ref(false)
 const citeCountDraft = ref<number | undefined>(undefined)
 const citeCountSaving = ref(false)
 const citeCountFetching = ref(false)
+const citeCountInputRef = ref<HTMLInputElement | null>(null)
 
 async function fetchCiteCount() {
   if (!props.slug) return
@@ -169,6 +172,7 @@ async function fetchCiteCount() {
 function startCiteCountEdit() {
   citeCountDraft.value = props.meta?.cite_count
   citeCountEditing.value = true
+  nextTick(() => citeCountInputRef.value?.focus())
 }
 
 function cancelCiteCountEdit() {
@@ -289,6 +293,7 @@ const fulltextEditing = ref(false)
 const fulltextDraft = ref('')
 const fulltextSaving = ref(false)
 const fulltextError = ref('')
+const fulltextTextareaRef = ref<HTMLTextAreaElement | null>(null)
 
 async function loadFulltext(slug: string | null) {
   if (!slug) { fulltext.value = ''; return }
@@ -306,6 +311,7 @@ function startFulltextEdit() {
   fulltextDraft.value = fulltext.value
   fulltextError.value = ''
   fulltextEditing.value = true
+  nextTick(() => fulltextTextareaRef.value?.focus())
 }
 
 function cancelFulltextEdit() {
@@ -452,12 +458,12 @@ async function extractAbstract() {
           <template v-if="citeCountEditing">
             <div class="cite-count-edit-row">
               <input
+                ref="citeCountInputRef"
                 v-model.number="citeCountDraft"
                 class="input cite-count-input"
                 type="number"
                 min="0"
                 placeholder="0"
-                autofocus
               />
               <button class="act-btn primary" :disabled="citeCountSaving" @click="saveCiteCount">
                 {{ citeCountSaving ? '保存中…' : '保存' }}
@@ -525,10 +531,10 @@ async function extractAbstract() {
           <!-- Inline editor -->
           <template v-if="bibtexEditing">
             <textarea
+              ref="bibtexTextareaRef"
               v-model="bibtexDraft"
               class="bibtex-textarea"
               placeholder="@article{key,&#10;  author = {Author Name},&#10;  title  = {Title},&#10;  year   = {2024},&#10;  ...&#10;}"
-              autofocus
             />
             <div class="bibtex-edit-actions">
               <button class="act-btn primary" :disabled="bibtexSaving" @click="saveBibtex">
@@ -608,10 +614,10 @@ async function extractAbstract() {
           </div>
           <template v-if="fulltextEditing">
             <textarea
+              ref="fulltextTextareaRef"
               v-model="fulltextDraft"
               class="fulltext-box fulltext-editor"
               :placeholder="t('meta.fulltextPlaceholder')"
-              autofocus
             />
             <div v-if="fulltextError" class="fulltext-error">{{ fulltextError }}</div>
             <div class="fulltext-edit-actions">

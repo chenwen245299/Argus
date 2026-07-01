@@ -6,6 +6,7 @@
 /// Currently supported:
 ///   - ACL Anthology   (aclanthology.org)
 ///   - OpenReview      (openreview.net)
+///   - AAAI / OJS      (ojs.aaai.org)
 ///   - arXiv           (arxiv.org, or bare IDs — default fallback)
 pub async fn import_by_url(
     root: &str,
@@ -24,6 +25,8 @@ pub async fn import_by_url(
         acl::import(root, url, collection_id, app).await
     } else if u.contains("openreview.net") {
         openreview::import(root, url, collection_id, app).await
+    } else if u.contains("aaai.org") {
+        aaai::import(root, url, collection_id, app).await
     } else {
         // Default: arXiv (handles arxiv.org URLs and bare IDs)
         crate::arxiv::import_by_url(root, url, collection_id, app).await
@@ -498,6 +501,251 @@ mod acl {
         )
         .await?;
         Ok(final_slug)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AAAI (Open Journal Systems)
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod aaai {
+    use super::*;
+
+    /// Extract the numeric article ID from an AAAI / OJS article URL.
+    /// URL shape: https://ojs.aaai.org/index.php/AAAI/article/view/32097
+    pub fn parse_id(input: &str) -> Option<String> {
+        let s = input.trim().trim_end_matches('/');
+        if let Some(pos) = s.find("/article/view/") {
+            let after = &s[pos + "/article/view/".len()..];
+            let id = after
+                .split(|c: char| c == '/' || c == '?' || c == '#')
+                .next()?
+                .trim();
+            if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+                return Some(id.to_string());
+            }
+        }
+        None
+    }
+
+    struct Meta {
+        title: String,
+        authors: Vec<String>,
+        year: Option<u32>,
+        venue: Option<String>,
+        abstract_text: Option<String>,
+        doi: Option<String>,
+        pdf_url: String,
+    }
+
+    fn html_unescape(s: &str) -> String {
+        s.replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#x27;", "'")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+    }
+
+    /// Extract the `content="..."` value from the first `<meta name="...">` tag
+    /// whose attributes contain `name="..."`. Works regardless of attribute order.
+    fn meta_content(html: &str, name: &str) -> Option<String> {
+        let name_pat = format!(r#"name="{name}""#);
+        let mut rest = html;
+        while let Some(pos) = rest.find(&name_pat) {
+            let tag_start = rest[..pos].rfind("<meta").unwrap_or(0);
+            let tag_end = rest[tag_start..]
+                .find('>')
+                .map(|p| tag_start + p)
+                .unwrap_or(rest.len());
+            let tag = &rest[tag_start..=tag_end];
+            if let Some(content_pos) = tag.find(r#"content=""#) {
+                let after = &tag[content_pos + 9..];
+                if let Some(end) = after.find('"') {
+                    let val = &after[..end];
+                    if !val.is_empty() {
+                        return Some(html_unescape(val));
+                    }
+                }
+            }
+            rest = &rest[pos + name_pat.len()..];
+        }
+        None
+    }
+
+    /// Extract all `content="..."` values from matching `<meta name="...">` tags.
+    fn meta_content_all(html: &str, name: &str) -> Vec<String> {
+        let name_pat = format!(r#"name="{name}""#);
+        let mut out = vec![];
+        let mut rest = html;
+        while let Some(pos) = rest.find(&name_pat) {
+            let tag_start = rest[..pos].rfind("<meta").unwrap_or(0);
+            let tag_end = rest[tag_start..]
+                .find('>')
+                .map(|p| tag_start + p)
+                .unwrap_or(rest.len());
+            let tag = &rest[tag_start..=tag_end];
+            if let Some(content_pos) = tag.find(r#"content=""#) {
+                let after = &tag[content_pos + 9..];
+                if let Some(end) = after.find('"') {
+                    let val = &after[..end];
+                    if !val.is_empty() {
+                        out.push(html_unescape(val));
+                    }
+                }
+            }
+            rest = &rest[pos + name_pat.len()..];
+        }
+        out
+    }
+
+    async fn fetch_meta(client: &reqwest::Client, id: &str) -> Result<Meta, String> {
+        let article_url = format!("https://ojs.aaai.org/index.php/AAAI/article/view/{id}");
+        let html = client
+            .get(&article_url)
+            .send()
+            .await
+            .map_err(|e| format!("Fetch AAAI page: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("Read page: {e}"))?;
+
+        let title = meta_content(&html, "citation_title")
+            .ok_or_else(|| format!("AAAI: could not find title for '{id}'"))?;
+        let authors = meta_content_all(&html, "citation_author");
+        let pdf_url = meta_content(&html, "citation_pdf_url")
+            .unwrap_or_else(|| format!("https://ojs.aaai.org/index.php/AAAI/article/download/{id}"));
+        let venue = meta_content(&html, "citation_journal_title")
+            .or_else(|| meta_content(&html, "citation_conference_title"));
+        let doi = meta_content(&html, "citation_doi");
+        // OJS exposes the abstract in DC.Description.
+        let abstract_text = meta_content(&html, "DC.Description")
+            .or_else(|| meta_content(&html, "citation_abstract"))
+            .filter(|s| !s.is_empty());
+        // citation_date is "YYYY/MM/DD".
+        let year = meta_content(&html, "citation_date")
+            .and_then(|d| d.split('/').next().and_then(|y| y.parse::<u32>().ok()));
+
+        Ok(Meta {
+            title,
+            authors,
+            year,
+            venue,
+            abstract_text,
+            doi,
+            pdf_url,
+        })
+    }
+
+    pub async fn import(
+        root: &str,
+        url: &str,
+        collection_id: &str,
+        app: &tauri::AppHandle,
+    ) -> Result<String, String> {
+        let id = parse_id(url)
+            .ok_or_else(|| format!("Could not find an AAAI article ID in: {url}"))?;
+
+        let emit = |s: &str| {
+            let _ = app.emit(
+                "paper-url-import",
+                serde_json::json!({ "id": &id, "source": "aaai", "status": s }),
+            );
+        };
+        emit("fetching");
+
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; Argus/1.0)")
+            .timeout(std::time::Duration::from_secs(40))
+            .build()
+            .map_err(|e| format!("HTTP client: {e}"))?;
+
+        let meta = fetch_meta(&client, &id).await?;
+
+        emit("downloading");
+        let resp = client
+            .get(&meta.pdf_url)
+            .send()
+            .await
+            .map_err(|e| format!("Download PDF: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("PDF unavailable: HTTP {}", resp.status()));
+        }
+        let pdf_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Read PDF: {e}"))?;
+
+        if !pdf_bytes.starts_with(b"%PDF") {
+            return Err(format!("AAAI returned an invalid PDF for '{id}'"));
+        }
+
+        emit("importing");
+
+        let slug_base = super::build_slug(&meta.authors, meta.year, &meta.title);
+        let papers_dir = Path::new(root).join("papers");
+        let final_dir = crate::arxiv::unique_paper_dir(&papers_dir, &slug_base);
+        let final_slug = final_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&slug_base)
+            .to_string();
+
+        std::fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir: {e}"))?;
+        std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
+            .map_err(|e| format!("write PDF: {e}"))?;
+
+        let paper_meta = PaperMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: meta.title,
+            authors: meta.authors,
+            year: meta.year,
+            doi: meta.doi,
+            arxiv_id: None,
+            venue: meta.venue,
+            tags: vec![],
+            added_at: chrono::Utc::now().to_rfc3339(),
+            original_filename: Some(format!("{id}.pdf")),
+            reading_status: "unread".to_string(),
+            paper_abstract: meta.abstract_text,
+            bibtex: None,
+            canvas_notes: vec![],
+            import_source: Some("url".to_string()),
+            cite_count: None,
+        };
+
+        super::finalize_paper(
+            root, &final_dir, &final_slug, paper_meta, collection_id, app, "aaai",
+        )
+        .await?;
+        Ok(final_slug)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_id;
+
+        #[test]
+        fn parse_article_url() {
+            assert_eq!(
+                parse_id("https://ojs.aaai.org/index.php/AAAI/article/view/32097"),
+                Some("32097".to_string())
+            );
+        }
+
+        #[test]
+        fn parse_url_with_trailing_slash() {
+            assert_eq!(
+                parse_id("https://ojs.aaai.org/index.php/AAAI/article/view/32097/"),
+                Some("32097".to_string())
+            );
+        }
+
+        #[test]
+        fn rejects_non_article_url() {
+            assert!(parse_id("https://ojs.aaai.org/index.php/AAAI/issue/view/123").is_none());
+        }
     }
 }
 

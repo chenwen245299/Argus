@@ -1,3 +1,4 @@
+<!-- From: /Users/qichengwen/My_APP_UI/Argus/AGENTS.md -->
 # Argus — Agent Guide
 
 This file is written for AI coding agents. It assumes you know nothing about the project. Read this before making non-trivial changes.
@@ -6,9 +7,9 @@ This file is written for AI coding agents. It assumes you know nothing about the
 
 ## Project overview
 
-**Argus** is a local-first desktop research workspace for academic papers. It bundles PDF reading, note-taking, metadata extraction, arXiv tracking, paper relationship maps, library-wide RAG search, and AI-assisted reading into one application.
+**Argus** is a local-first desktop research workspace for academic papers. It bundles PDF reading, note-taking, metadata extraction, arXiv tracking, paper relationship maps, library-wide RAG search, embedding-space visualization, and AI-assisted reading into one application.
 
-- **Frontend:** Vue 3 + TypeScript + Vite + Pinia + vue-router + vue-i18n.
+- **Frontend:** Vue 3 + TypeScript + Vite + Pinia + vue-i18n.
 - **Desktop shell:** Tauri v2 (Rust backend, WebKit-based WebView frontend).
 - **Target platforms:** macOS (primary) and Windows. Linux is not currently released.
 - **Data model:** Everything is stored locally in a user-chosen library folder. The app uses a hybrid of plain JSON/text files, SQLite FTS5 for full-text search, and SQLite vector tables for RAG.
@@ -25,10 +26,9 @@ Argus/
 ├── src/                    # Vue/TypeScript frontend
 │   ├── App.vue             # Root view selector (uses Tauri window label)
 │   ├── main.ts             # Frontend entry point
-│   ├── assets/             # Icons, provider logos, CSS design tokens
+│   ├── assets/             # Icons, provider/model logos, CSS design tokens
 │   ├── components/         # Vue SFCs (feature folders: tabs/, canvas/, settings/)
 │   ├── i18n/               # vue-i18n messages (zh + en)
-│   ├── router/             # vue-router config (single route)
 │   ├── stores/             # Pinia stores + a few reactive helper modules
 │   ├── types/              # Shared TypeScript types
 │   ├── utils/              # Frontend utilities
@@ -60,7 +60,6 @@ Argus/
 | Framework | Vue 3 (Composition API, `<script setup lang="ts">`) |
 | Build tool | Vite 6 |
 | State | Pinia 2 |
-| Routing | vue-router 4 (formal; real "routing" is by Tauri window label) |
 | i18n | vue-i18n 9 (locales: `zh` default, `en`) |
 | PDF | pdfjs-dist v5 (legacy worker for older macOS) |
 | Markdown / math | marked, katex, mermaid, highlight.js, dompurify |
@@ -117,6 +116,9 @@ Vite dev server runs on `http://localhost:1420` (HMR on `1421` when `TAURI_DEV_H
 # Type-check and bundle the frontend to dist/
 npm run build
 
+# Fast frontend build without type checking
+npm run build:fast
+
 # Build the Tauri desktop app installer for the current platform
 npm run tauri build
 ```
@@ -144,9 +146,10 @@ The app uses multiple Tauri windows rather than browser-style routing. `src/App.
 | `canvas` | `CanvasView` | Paper relationship canvas (Vue Flow) |
 | `library-chat` | `LibraryChatView` | Library-wide RAG chat |
 | `paper-ai` | `PaperAiView` | Per-paper AI chat |
+| `embedding-map` | `EmbeddingMapView` | 2-D visualization of the vector embedding space |
 | `note-window-*` | `NoteWindowView` | Standalone note editor |
 
-`src/router/index.ts` defines only a single `/` route for the main window.
+All top-level views are loaded with `defineAsyncComponent` so each window only loads the code it needs.
 
 ### Frontend state management (Pinia stores)
 
@@ -184,7 +187,7 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `rag.rs` | Vector store, embedding storage, cosine similarity search |
 | `ai_manager.rs` | AI provider CRUD and AES-256-GCM API key encryption |
 | `llm.rs` | OpenAI-compatible / Anthropic chat, embeddings, OpenRouter, token usage |
-| `ai_summary.rs` | Generate AI paper summaries |
+| `ai_summary.rs` | Generate AI paper summaries and abstract extraction |
 | `copilot.rs` | Per-paper and library-wide chat, chat history persistence |
 | `arxiv.rs` / `arxiv_scheduler.rs` | arXiv/bioRxiv fetching, inbox storage, scheduled catch-up |
 | `canvas.rs` / `canvas_enhance.rs` | Canvas CRUD, edge suggestions, auto-layout, export |
@@ -194,6 +197,7 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `settings.rs` | `config.json` settings I/O |
 | `path_guard.rs` | Path-segment validation against traversal attacks |
 | `security_bookmark.rs` | macOS security-scoped bookmark persistence |
+| `fsutil.rs` | Shared filesystem helpers |
 
 ### Data persistence
 
@@ -241,10 +245,10 @@ Key design points:
 ## Frontend ↔ backend communication
 
 - **Commands:** Frontend calls Rust with `invoke` from `@tauri-apps/api/core`. Commands are registered in `src-tauri/src/lib.rs` via `tauri::generate_handler!`.
-- **Events:** Rust pushes progress/cancellation events with `app.emit()`; frontend listens with `listen` from `@tauri-apps/api/event`. Examples: `ai-summary-progress`, `arxiv-fetch-due`.
+- **Events:** Rust pushes progress/cancellation events with `app.emit()`; frontend listens with `listen` from `@tauri-apps/api/event`. Examples: `ai-summary-progress`, `arxiv-fetch-due`, `arxiv-analysis`, `extraction_progress`, `extraction_done`, `library-updated`.
 - **Cross-window events:** Some decoupled UI updates use browser `CustomEvent` on `window` (e.g., `argus-paper-meta-updated`, `argus-switch-sidebar-tab`).
 
-The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` for the authoritative list, grouped into library management, single-paper I/O, collections, metadata/import, AI providers, chat/copilot, RAG, arXiv, canvas, and window/system operations.
+The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` for the authoritative list, grouped into library management, single-paper I/O, collections, metadata/import, AI providers, chat/copilot, RAG, arXiv, canvas, embedding map, snippets, and window/system operations.
 
 ---
 
@@ -263,7 +267,7 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   - `src/components/tabs/`
   - `src/components/canvas/`
   - `src/components/settings/`
-  - `src/views/`, `src/stores/`, `src/utils/`, `src/types/`
+  - `src/views/`, `src/stores/`, `src/types/`, `src/utils/`
 
 ### Styling
 
@@ -376,7 +380,9 @@ xattr -cr /Applications/Argus.app
 | Change canvas | `src/views/CanvasView.vue`, `src/components/canvas/`, `src-tauri/src/canvas*.rs` |
 | Change import pipeline | `src/stores/import.ts`, `src-tauri/src/metadata.rs`, `src-tauri/src/url_import.rs` |
 | Change themes | `src/assets/main.css`, `src/stores/settings.ts` |
+| Change arXiv inbox | `src/views/ArxivView.vue`, `src/stores/arxiv.ts`, `src-tauri/src/arxiv*.rs` |
+| Change embedding map | `src/views/EmbeddingMapView.vue`, `src-tauri/src/rag.rs` |
 
 ---
 
-*Last updated: 2026-06-23. Keep this file in sync with major architectural changes.*
+*Last updated: 2026-06-24. Keep this file in sync with major architectural changes.*

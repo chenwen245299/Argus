@@ -265,6 +265,7 @@ pub fn run() {
             commands::add_snippet,
             commands::update_snippet,
             commands::delete_snippet,
+            commands::move_snippet,
             commands::migrate_snippets_from_localstorage,
             // ── File export ──
             commands::write_bytes_to_file,

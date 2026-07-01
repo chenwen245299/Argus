@@ -628,7 +628,16 @@ function onPaperDragOver(e: Event) {
   dragOverId.value = (e as CustomEvent<{ collectionId: string | null }>).detail.collectionId
 }
 
-onMounted(() => document.addEventListener('argus-paper-drag-over', onPaperDragOver))
+const snippetDragOverLibraryId = ref<string | null>(null)
+
+function onSnippetDragOver(e: Event) {
+  snippetDragOverLibraryId.value = (e as CustomEvent<{ libraryId: string | null }>).detail.libraryId
+}
+
+onMounted(() => {
+  document.addEventListener('argus-paper-drag-over', onPaperDragOver)
+  document.addEventListener('argus-snippet-drag-over', onSnippetDragOver)
+})
 
 function isCollectionDescendant(collectionId: string, ancestorId: string) {
   let cur = collectionsStore.collectionById(collectionId)
@@ -768,6 +777,7 @@ onUnmounted(() => {
   collectionDragCleanup = null
   clearCollectionDragState()
   document.removeEventListener('argus-paper-drag-over', onPaperDragOver)
+  document.removeEventListener('argus-snippet-drag-over', onSnippetDragOver)
   window.removeEventListener('mousemove', onResizeTagsMove)
   window.removeEventListener('mouseup', stopResizeTags)
   window.removeEventListener('mousemove', onResizeCanvasMove)
@@ -1041,7 +1051,11 @@ onUnmounted(() => {
             v-for="lib in snippetLibraries"
             :key="lib.id"
             class="nav-item"
-            :class="{ active: props.snippetLibraryVisible && activeSnippetLibraryId === lib.id }"
+            :class="{
+              active: props.snippetLibraryVisible && activeSnippetLibraryId === lib.id,
+              'drag-over': snippetDragOverLibraryId === lib.id,
+            }"
+            :data-snippet-library-id="lib.id"
             role="button"
             tabindex="0"
             @click="openSnippetLibrary(lib.id)"
@@ -1427,6 +1441,12 @@ onUnmounted(() => {
   background: var(--accent);
   color: #fff;
   font-weight: 500;
+}
+.nav-item.drag-over {
+  outline: 1.5px solid color-mix(in srgb, var(--accent) 72%, transparent);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-primary));
+  color: var(--accent);
 }
 
 .nav-item .badge {

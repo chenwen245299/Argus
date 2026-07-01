@@ -2510,6 +2510,18 @@ pub fn delete_snippet(
     snippets::delete_snippet(&root, &library_id, &id)
 }
 
+#[tauri::command]
+pub async fn move_snippet(
+    state: State<'_, LibraryRoot>,
+    id: String,
+    target_library_id: String,
+) -> Result<crate::models::Snippet, String> {
+    let root = get_root(&state)?;
+    let snippet = snippets::move_snippet(&root, &id, &target_library_id)?;
+    let _ = crate::rag::update_snippet_library_id(&root, &id, &target_library_id).await;
+    Ok(snippet)
+}
+
 // ── File export ───────────────────────────────────────────────────────────────
 /// Write bytes to a user-chosen export path.
 ///

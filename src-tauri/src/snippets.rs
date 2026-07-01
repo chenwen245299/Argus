@@ -222,6 +222,35 @@ pub fn delete_snippet(root: &str, library_id: &str, id: &str) -> Result<(), Stri
     write_snippets(root, library_id, &snippets)
 }
 
+pub fn move_snippet(root: &str, id: &str, target_library_id: &str) -> Result<Snippet, String> {
+    let _g = lock_snippets();
+    ensure_snippets_dir(root)?;
+    validate_library_id(target_library_id)?;
+
+    // Find snippet in any library file and remove it from the source.
+    let libs = read_libraries(root);
+    let mut moved_snippet: Option<Snippet> = None;
+    for lib in &libs {
+        let mut snippets = read_snippets(root, &lib.id);
+        if let Some(pos) = snippets.iter().position(|s| s.id == id) {
+            let mut snippet = snippets.remove(pos);
+            write_snippets(root, &snippet.library_id, &snippets)?;
+            snippet.library_id = target_library_id.to_string();
+            moved_snippet = Some(snippet);
+            break;
+        }
+    }
+
+    let snippet = moved_snippet.ok_or_else(|| format!("Snippet '{id}' not found"))?;
+
+    // Append to target library file.
+    let mut target_snippets = read_snippets(root, target_library_id);
+    target_snippets.push(snippet.clone());
+    write_snippets(root, target_library_id, &target_snippets)?;
+
+    Ok(snippet)
+}
+
 // ── Migration from localStorage ───────────────────────────────────────────────
 // Called once when the frontend sends its localStorage data on first launch.
 

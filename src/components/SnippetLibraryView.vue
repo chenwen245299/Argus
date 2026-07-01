@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, nextTick, Teleport } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   libraries,
   snippets,
   deleteSnippet,
   updateSnippet,
+  moveSnippet,
   type Snippet,
 } from '../stores/snippetLibrary'
 
@@ -42,6 +43,64 @@ async function handleDelete(s: Snippet) {
 
 function truncate(text: string, max = 120) {
   return text.length > max ? text.slice(0, max) + '…' : text
+}
+
+// ── Drag to move snippet between libraries (pointer-based, no HTML5 DnD) ────────
+const dragSnippet = ref<Snippet | null>(null)
+const dragPos = ref({ x: 0, y: 0 })
+const draggingSnippetId = ref<string | null>(null)
+
+function isInteractiveDragTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false
+  return el.closest('button, input, textarea, .tag-editor, .editable-cell') !== null
+}
+
+function onSnippetMouseDown(e: MouseEvent, s: Snippet) {
+  if (e.button !== 0) return
+  if (isInteractiveDragTarget(e.target)) return
+  const startX = e.clientX
+  const startY = e.clientY
+  let dragging = false
+
+  function findLibraryId(x: number, y: number): string | null {
+    for (const el of document.elementsFromPoint(x, y)) {
+      const id = (el as HTMLElement).dataset?.snippetLibraryId
+      if (id) return id
+    }
+    return null
+  }
+
+  function onMove(ev: MouseEvent) {
+    if (!dragging && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 6) return
+    if (!dragging) {
+      dragging = true
+      dragSnippet.value = s
+      draggingSnippetId.value = s.id
+      document.body.style.cursor = 'grabbing'
+    }
+    dragPos.value = { x: ev.clientX + 14, y: ev.clientY + 10 }
+    const libraryId = findLibraryId(ev.clientX, ev.clientY)
+    document.dispatchEvent(new CustomEvent('argus-snippet-drag-over', { detail: { libraryId } }))
+  }
+
+  async function onUp(ev: MouseEvent) {
+    window.removeEventListener('mousemove', onMove)
+    window.removeEventListener('mouseup', onUp)
+    document.body.style.cursor = ''
+    const wasDragging = dragging
+    if (wasDragging) {
+      dragSnippet.value = null
+      draggingSnippetId.value = null
+      document.dispatchEvent(new CustomEvent('argus-snippet-drag-over', { detail: { libraryId: null } }))
+      const targetLibraryId = findLibraryId(ev.clientX, ev.clientY)
+      if (targetLibraryId && targetLibraryId !== s.libraryId) {
+        await moveSnippet(s.id, targetLibraryId)
+      }
+    }
+  }
+
+  window.addEventListener('mousemove', onMove)
+  window.addEventListener('mouseup', onUp)
 }
 
 // ── Inline note editing ───────────────────────────────────────────────────────
@@ -163,7 +222,12 @@ async function commitTags(s: Snippet) {
         </thead>
         <tbody>
           <template v-for="s in items" :key="s.id">
-            <tr class="snippet-row" @dblclick="openPaper(s)">
+            <tr
+              class="snippet-row"
+              :class="{ 'is-dragging': draggingSnippetId === s.id }"
+              @mousedown="onSnippetMouseDown($event, s)"
+              @dblclick="openPaper(s)"
+            >
 
               <!-- Tags cell -->
               <td class="col-tags" @click.stop>
@@ -243,6 +307,15 @@ async function commitTags(s: Snippet) {
         </tbody>
       </table>
     </div>
+
+    <!-- Drag ghost -->
+    <Teleport to="body">
+      <div
+        v-if="dragSnippet"
+        class="snippet-drag-ghost"
+        :style="{ left: dragPos.x + 'px', top: dragPos.y + 'px' }"
+      >{{ truncate(dragSnippet.text, 80) }}</div>
+    </Teleport>
   </div>
 </template>
 
@@ -518,4 +591,32 @@ async function commitTags(s: Snippet) {
 }
 .snippet-row:hover .del-btn { opacity: 1; }
 .del-btn:hover { color: #e53935; background: var(--bg-hover); }
+
+.snippet-row.is-dragging {
+  opacity: 0.35;
+}
+
+:global(.snippet-drag-ghost) {
+  position: fixed;
+  pointer-events: none;
+  z-index: 9999;
+  background: var(--bg-primary);
+  border: 1.5px solid var(--accent);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22), 0 2px 6px rgba(0, 0, 0, 0.1);
+  animation: snippet-ghost-pop 0.14s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+@keyframes snippet-ghost-pop {
+  from { opacity: 0; transform: scale(0.92); }
+  to { opacity: 1; transform: scale(1); }
+}
 </style>

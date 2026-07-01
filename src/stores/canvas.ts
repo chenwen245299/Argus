@@ -74,6 +74,8 @@ export const useCanvasStore = defineStore('canvas', () => {
 
   // Debounce timer for auto-save
   let saveTimer: ReturnType<typeof setTimeout> | null = null
+  // Timer that resets the "saved" flash indicator.
+  let settingsSavedTimer: ReturnType<typeof setTimeout> | null = null
 
   async function loadList() {
     try {
@@ -169,7 +171,13 @@ export const useCanvasStore = defineStore('canvas', () => {
     try {
       await invoke('save_canvas_settings', { settings: settings.value })
       settingsSaved.value = true
-      setTimeout(() => (settingsSaved.value = false), 2000)
+      // Clear any pending reset so rapid re-saves don't cause the indicator to
+      // flicker off early.
+      if (settingsSavedTimer) clearTimeout(settingsSavedTimer)
+      settingsSavedTimer = setTimeout(() => {
+        settingsSaved.value = false
+        settingsSavedTimer = null
+      }, 2000)
     } finally {
       settingsSaving.value = false
     }

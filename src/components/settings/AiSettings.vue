@@ -173,6 +173,14 @@ function selectProvider(id: string) {
   fetchErr.value = ''
   showAddModel.value = false
   editModelIdx.value = null
+  // Reset any open fetch dialog / fetched-model state so models from a
+  // previously selected provider can't leak into the newly selected one.
+  showFetchDialog.value = false
+  fetchedModels.value = []
+  fetchSelected.value = new Set()
+  orEndpoints.value = []
+  orEndpointStatus.value = ''
+  orEndpointErr.value = ''
 }
 
 watch(() => ai.settings.providers, (providers) => {
@@ -202,7 +210,7 @@ async function submitAdd() {
     name: addForm.value.name,
     base_url: addForm.value.base_url,
     kind: addForm.value.kind,
-    enabled: true,
+    enabled: addForm.value.enabled,
     models: [],
   }
   try {
@@ -419,7 +427,12 @@ async function saveEditModel() {
   await saveProvider()
 }
 
-function removeModel(idx: number) { editModels.value.splice(idx, 1) }
+function removeModel(idx: number) {
+  editModels.value.splice(idx, 1)
+  // Keep inline-edit target aligned after the array shifts.
+  if (editModelIdx.value === idx) editModelIdx.value = null
+  else if (editModelIdx.value !== null && editModelIdx.value > idx) editModelIdx.value -= 1
+}
 
 // ── Billing settings ─────────────────────────────────────────────────────────
 
@@ -467,11 +480,11 @@ async function fetchOrEndpoints(modelId: string) {
       orEndpointStatus.value = 'ok'
     } else {
       orEndpointStatus.value = 'fail'
-      orEndpointErr.value = '未找到 provider 数据，请手动输入'
+      orEndpointErr.value = t('aiService.orNoProviderData')
     }
   } catch (e) {
     orEndpointStatus.value = 'fail'
-    orEndpointErr.value = `获取失败，请手动输入（${e}）`
+    orEndpointErr.value = t('aiService.orFetchFailed', { err: String(e) })
   }
 }
 
@@ -623,7 +636,7 @@ function fetchModelCapabilityBadges(model: AiModel) {
 }
 
 function fetchGroupLabel(cap: FetchGroupId) {
-  return cap === 'other' ? '其他' : capabilityLabelById(cap)
+  return cap === 'other' ? t('aiService.capOther') : capabilityLabelById(cap)
 }
 
 function toggleCapability(form: ModelForm, cap: string) {
@@ -833,7 +846,7 @@ function toggleCapability(form: ModelForm, cap: string) {
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/>
                   </svg>
-                  <input v-model="fetchSearch" placeholder="搜索模型名称或 ID..." />
+                  <input v-model="fetchSearch" :placeholder="t('aiService.searchModelPlaceholder')" />
                 </div>
                 <div class="fetch-cap-tabs">
                   <button
@@ -841,7 +854,7 @@ function toggleCapability(form: ModelForm, cap: string) {
                     :class="{ active: fetchCapability === 'all' }"
                     @click="fetchCapability = 'all'"
                   >
-                    全部
+                    {{ t('aiService.filterAll') }}
                   </button>
                   <button
                     v-for="cap in FETCH_GROUP_ORDER"
@@ -858,7 +871,7 @@ function toggleCapability(form: ModelForm, cap: string) {
                 <button class="btn-ghost xs" @click="selectAllFetched">{{ t('aiService.selectAll') }}</button>
                 <button class="btn-ghost xs" @click="deselectAllFetched">{{ t('aiService.deselectAll') }}</button>
                 <span class="fetch-selected-count">
-                  已选 {{ fetchSelected.size }}，显示 {{ fetchFilteredModels.length }}/{{ fetchedModels.length }}
+                  {{ t('aiService.fetchSelectedCount', { selected: fetchSelected.size, shown: fetchFilteredModels.length, total: fetchedModels.length }) }}
                 </span>
               </div>
               <div class="fetch-dialog-list">
@@ -895,11 +908,11 @@ function toggleCapability(form: ModelForm, cap: string) {
                     </label>
                   </div>
                 </template>
-                <div v-else class="fetch-empty">没有匹配的模型</div>
+                <div v-else class="fetch-empty">{{ t('aiService.fetchNoMatch') }}</div>
               </div>
               <div class="fetch-dialog-footer">
                 <span v-if="fetchAvailableVisibleCount > 0" class="fetch-footer-hint">
-                  当前筛选可添加 {{ fetchAvailableVisibleCount }} 个
+                  {{ t('aiService.fetchAvailableCount', { n: fetchAvailableVisibleCount }) }}
                 </span>
                 <button class="btn-ghost sm" @click="showFetchDialog = false">{{ t('aiService.cancel') }}</button>
                 <button class="btn-primary sm" @click="confirmFetchedSelection" :disabled="fetchSelected.size === 0">
@@ -944,14 +957,14 @@ function toggleCapability(form: ModelForm, cap: string) {
             </div>
             <div class="model-form-price-row">
               <label class="model-form-field" :class="{ 'full-width': newModel.capabilities.includes('embedding') }">
-                <span>{{ newModel.capabilities.includes('embedding') ? '向量化价格' : '输入价格' }} <small>（元/百万tokens）</small></span>
-                <input v-model="newModel.input_price" class="text-input sm" placeholder="如 2.0" type="number" min="0" step="0.01" />
+                <span>{{ newModel.capabilities.includes('embedding') ? t('aiService.priceEmbedding') : t('aiService.priceInput') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                <input v-model="newModel.input_price" class="text-input sm" :placeholder="t('aiService.pricePh2')" type="number" min="0" step="0.01" />
               </label>
               <label v-if="!newModel.capabilities.includes('embedding')" class="model-form-field">
-                <span>输出价格 <small>（元/百万tokens）</small></span>
-                <input v-model="newModel.output_price" class="text-input sm" placeholder="如 8.0" type="number" min="0" step="0.01" />
+                <span>{{ t('aiService.priceOutput') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                <input v-model="newModel.output_price" class="text-input sm" :placeholder="t('aiService.pricePh8')" type="number" min="0" step="0.01" />
               </label>
-              <p v-else class="embedding-price-note">Embedding 模型仅计算输入 token，无输出费用</p>
+              <p v-else class="embedding-price-note">{{ t('aiService.embeddingPriceNote') }}</p>
             </div>
             <div class="capability-editor">
               <span class="capability-label">{{ t('aiService.capabilities') }}</span>
@@ -1015,14 +1028,14 @@ function toggleCapability(form: ModelForm, cap: string) {
                     </div>
                     <div class="model-form-price-row">
                       <label class="model-form-field" :class="{ 'full-width': editModelForm.capabilities.includes('embedding') }">
-                        <span>{{ editModelForm.capabilities.includes('embedding') ? '向量化价格' : '输入价格' }} <small>（元/百万tokens）</small></span>
-                        <input v-model="editModelForm.input_price" class="text-input sm" placeholder="如 2.0" type="number" min="0" step="0.01" />
+                        <span>{{ editModelForm.capabilities.includes('embedding') ? t('aiService.priceEmbedding') : t('aiService.priceInput') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                        <input v-model="editModelForm.input_price" class="text-input sm" :placeholder="t('aiService.pricePh2')" type="number" min="0" step="0.01" />
                       </label>
                       <label v-if="!editModelForm.capabilities.includes('embedding')" class="model-form-field">
-                        <span>输出价格 <small>（元/百万tokens）</small></span>
-                        <input v-model="editModelForm.output_price" class="text-input sm" placeholder="如 8.0" type="number" min="0" step="0.01" />
+                        <span>{{ t('aiService.priceOutput') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                        <input v-model="editModelForm.output_price" class="text-input sm" :placeholder="t('aiService.pricePh8')" type="number" min="0" step="0.01" />
                       </label>
-                      <p v-else class="embedding-price-note">Embedding 模型仅计算输入 token，无输出费用</p>
+                      <p v-else class="embedding-price-note">{{ t('aiService.embeddingPriceNote') }}</p>
                     </div>
                     <div class="capability-editor">
                       <span class="capability-label">{{ t('aiService.capabilities') }}</span>
@@ -1042,16 +1055,16 @@ function toggleCapability(form: ModelForm, cap: string) {
                     <!-- OpenRouter provider selection -->
                     <div v-if="isOpenRouterProvider" class="or-provider-section">
                       <div class="or-provider-header">
-                        <span class="capability-label">Provider 偏好</span>
+                        <span class="capability-label">{{ t('aiService.providerPref') }}</span>
                         <button
                           class="btn-ghost xs"
                           :disabled="orEndpointStatus === 'fetching'"
                           @click="fetchOrEndpoints(editModelForm.id)"
-                        >{{ orEndpointStatus === 'fetching' ? '获取中…' : '从 OpenRouter 获取' }}</button>
+                        >{{ orEndpointStatus === 'fetching' ? t('aiService.fetching') : t('aiService.fetchFromOpenRouter') }}</button>
                       </div>
                       <!-- Fetched endpoint list -->
                       <template v-if="orEndpointStatus === 'ok' && orEndpoints.length > 0">
-                        <div class="or-provider-hint">勾选并排序：排在前面的优先使用（不勾则 OpenRouter 自动选择）</div>
+                        <div class="or-provider-hint">{{ t('aiService.orProviderHint') }}</div>
                         <div class="or-endpoint-list">
                           <label
                             v-for="ep in orEndpoints"
@@ -1078,7 +1091,7 @@ function toggleCapability(form: ModelForm, cap: string) {
                         <div class="or-provider-manual">
                           <input
                             class="text-input sm"
-                            placeholder="Anthropic, Together, … （逗号分隔，按优先级排列）"
+                            :placeholder="t('aiService.orProviderPlaceholder')"
                             :value="editModelForm.provider_order.join(', ')"
                             @change="(e) => editModelForm.provider_order = (e.target as HTMLInputElement).value.split(',').map(s => s.trim()).filter(Boolean)"
                           />
@@ -1107,10 +1120,10 @@ function toggleCapability(form: ModelForm, cap: string) {
                         class="price-hint"
                       >
                         <span v-if="priceCnyPerMillion(m.input_price_usd_per_million, m.input_price_per_million) != null">
-                          入 {{ fmtPricePerMillion(priceCnyPerMillion(m.input_price_usd_per_million, m.input_price_per_million)) }}
+                          {{ t('aiService.priceInPrefix') }} {{ fmtPricePerMillion(priceCnyPerMillion(m.input_price_usd_per_million, m.input_price_per_million)) }}
                         </span>
                         <span v-if="priceCnyPerMillion(m.output_price_usd_per_million, m.output_price_per_million) != null">
-                          出 {{ fmtPricePerMillion(priceCnyPerMillion(m.output_price_usd_per_million, m.output_price_per_million)) }}
+                          {{ t('aiService.priceOutPrefix') }} {{ fmtPricePerMillion(priceCnyPerMillion(m.output_price_usd_per_million, m.output_price_per_million)) }}
                         </span>
                       </span>
                       <span v-if="m.provider_order && m.provider_order.length > 0" class="provider-order-hint" :title="m.provider_order.join(' → ')">

@@ -37,7 +37,7 @@ function openPaper(s: Snippet) {
 }
 
 async function handleDelete(s: Snippet) {
-  if (!window.confirm(`删除这条素材？`)) return
+  if (!window.confirm(t('snippets.deleteConfirm'))) return
   await deleteSnippet(s.id)
 }
 
@@ -242,16 +242,16 @@ async function commitTags(s: Snippet) {
                       :id="`tag-input-${s.id}`"
                       v-model="editTagInput"
                       class="tag-inline-input"
-                      placeholder="添加标签…"
+                      :placeholder="t('snippetLibrary.tagPlaceholder')"
                       @keydown="onTagInputKeydown($event, s)"
                       @blur="commitTags(s)"
                     />
                   </div>
                 </div>
                 <!-- View mode -->
-                <div v-else class="tag-list editable-cell" title="点击编辑标签" @click="startEditTags(s)">
+                <div v-else class="tag-list editable-cell" :title="t('snippetLibrary.editTags')" @click="startEditTags(s)">
                   <span v-for="tag in s.tags" :key="tag" class="tag-chip">{{ tag }}</span>
-                  <span v-if="s.tags.length === 0" class="no-tag placeholder">+ 添加</span>
+                  <span v-if="s.tags.length === 0" class="no-tag placeholder">{{ t('snippetLibrary.addTag') }}</span>
                 </div>
               </td>
 
@@ -286,9 +286,9 @@ async function commitTags(s: Snippet) {
                   v-else
                   class="note-preview editable-cell"
                   :class="{ placeholder: !s.note }"
-                  title="点击编辑备注"
+                  :title="t('snippetLibrary.editNote')"
                   @click="startEditNote(s)"
-                >{{ s.note || '+ 添加备注' }}</span>
+                >{{ s.note || t('snippetLibrary.addNote') }}</span>
               </td>
 
               <!-- Delete -->

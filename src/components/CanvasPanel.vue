@@ -27,6 +27,7 @@ import { useCanvasStore, type DrawNodeSnapshot } from '../stores/canvas'
 import { useLibraryStore } from '../stores/library'
 import { useReaderStore } from '../stores/reader'
 import { useSelectionStore } from '../stores/selection'
+import { useCanvasHistory, type CanvasSnapshot } from '../composables/useCanvasHistory'
 import { recordPaperAccess, sortPapersByRecentAccess } from '../utils/recentPapers'
 import PaperNode from './canvas/PaperNode.vue'
 import AdjustableEdge from './canvas/AdjustableEdge.vue'
@@ -189,6 +190,7 @@ function commitAnnotationEdit() {
   )
   editingAnnotationId.value = null
   triggerSave()
+  recordHistory()
 }
 
 // ── Pane interactions → place text / draw shape node ─────────────────────────
@@ -209,6 +211,7 @@ function onPaneClick(event: MouseEvent) {
   }
   addNodes([newNode])
   triggerSave()
+  recordHistory()
   openAnnotationEditor(nodeId)
   activeTool.value = 'pointer'
 }
@@ -256,6 +259,7 @@ function addShapeFromDraft(draft: ShapeDraft) {
   }
   addNodes([newNode])
   triggerSave()
+  recordHistory()
 }
 
 // Create a standalone line / arrow from a drag, storing its two endpoints as
@@ -291,6 +295,7 @@ function addLineFromDraft(draft: ShapeDraft) {
   }
   addNodes([newNode])
   triggerSave()
+  recordHistory()
 }
 
 function cleanupShapeDraftListeners() {
@@ -748,6 +753,8 @@ async function renderCanvas() {
   } else {
     fitView({ padding: 0.2 })
   }
+  // Seed the history baseline for this canvas. Loading is NOT an undoable step.
+  history.reset()
 }
 
 // Watch for canvas switches (LeftSidebar calls canvasStore.openCanvas)
@@ -776,6 +783,25 @@ function triggerSave() {
   canvasStore.scheduleSave()
 }
 
+// ── Undo / redo history (snapshot based) ──────────────────────────────────────
+const history = useCanvasHistory({
+  capture: (): CanvasSnapshot => ({
+    nodes: extractCanvasNodes(),
+    edges: extractCanvasEdges(),
+  }),
+  restore: (snap) => {
+    nodes.value = buildVfNodes(snap.nodes)
+    edges.value = buildVfEdges(snap.edges)
+  },
+  persist: triggerSave,
+})
+
+// Record a structural change into history. Called from every real mutation
+// (add/remove/drag-stop/color/size/paste/text edit/etc). No-op while restoring.
+function recordHistory() {
+  history.commit()
+}
+
 // ── Vue Flow event handlers ───────────────────────────────────────────────────
 
 onConnectStart(({ nodeId, handleId }) => {
@@ -795,7 +821,7 @@ onConnect((params: Connection) => {
   )
   if (exists) return
   const newEdge: VfEdge = {
-    id: `e-${Date.now()}`,
+    id: newEdgeId(),
     source: directed.source,
     target: directed.target,
     sourceHandle: directed.sourceHandle,
@@ -809,6 +835,7 @@ onConnect((params: Connection) => {
   }
   addEdges([newEdge])
   triggerSave()
+  recordHistory()
 })
 
 // ── Smart alignment guides / snapping ─────────────────────────────────────────
@@ -874,6 +901,7 @@ onNodeDragStop(() => {
   isDraggingNode = false
   snapGuides.value = []
   triggerSave()
+  recordHistory()
   // Reflect the new position in the properties panel.
   const sel = canvasStore.selectedNode
   if (sel) publishSelection(sel.nodeId)
@@ -956,16 +984,51 @@ function applyNodePatch(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
   const dataPatch: Record<string, any> = {}
   let posX: number | undefined
   let posY: number | undefined
+  let newW: number | undefined
+  let newH: number | undefined
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined) continue
     if (k === 'x') posX = v as number
     else if (k === 'y') posY = v as number
     else if (k === 'nodeId' || k === 'type') continue
-    else dataPatch[k] = v
+    else {
+      if (k === 'width') newW = v as number
+      else if (k === 'height') newH = v as number
+      dataPatch[k] = v
+    }
   }
+
+  const n = findNode(nodeId)
+
+  // When resizing a line, scale its two endpoints so the drawn segment keeps
+  // filling the (new) bounding box instead of staying anchored to old offsets.
+  if (n?.type === 'line' && (newW !== undefined || newH !== undefined)) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const d = n.data as any
+    const oldW = Number.isFinite(d.width) && d.width > 0 ? (d.width as number) : 1
+    const oldH = Number.isFinite(d.height) && d.height > 0 ? (d.height as number) : 1
+    const sx = newW !== undefined ? newW / oldW : 1
+    const sy = newH !== undefined ? newH / oldH : 1
+    dataPatch.x1 = (Number.isFinite(d.x1) ? d.x1 : 0) * sx
+    dataPatch.y1 = (Number.isFinite(d.y1) ? d.y1 : 0) * sy
+    dataPatch.x2 = (Number.isFinite(d.x2) ? d.x2 : oldW) * sx
+    dataPatch.y2 = (Number.isFinite(d.y2) ? d.y2 : oldH) * sy
+  }
+
   if (Object.keys(dataPatch).length) updateNodeData(nodeId, dataPatch)
+
+  // Keep Vue Flow's node dimensions in sync so alignment / box-select / snap
+  // guides operate on the new size (the visual size is driven by data.width/
+  // height, but dimensions are otherwise only re-measured lazily).
+  if (newW !== undefined || newH !== undefined) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const style: Record<string, any> = { ...((n?.style as any) ?? {}) }
+    if (newW !== undefined) style.width = `${newW}px`
+    if (newH !== undefined) style.height = `${newH}px`
+    updateNode(nodeId, { style })
+  }
+
   if (posX !== undefined || posY !== undefined) {
-    const n = findNode(nodeId)
     if (n) {
       updateNode(nodeId, {
         position: { x: posX ?? n.position.x, y: posY ?? n.position.y },
@@ -973,6 +1036,7 @@ function applyNodePatch(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
     }
   }
   triggerSave()
+  recordHistory()
 }
 
 watch(
@@ -1029,6 +1093,7 @@ function alignNodes(dir: AlignDir) {
     updateNode(b.id, { position: { x, y } })
   }
   triggerSave()
+  recordHistory()
   refreshSelectionSnapshot()
 }
 
@@ -1047,6 +1112,7 @@ function distributeNodes(axis: 'h' | 'v') {
     boxes.forEach((b, i) => updateNode(b.id, { position: { x: b.x, y: top + step * i } }))
   }
   triggerSave()
+  recordHistory()
   refreshSelectionSnapshot()
 }
 
@@ -1054,9 +1120,14 @@ function setZOrder(mode: 'front' | 'back') {
   const ids = canvasStore.selectedNodeIds
   if (!ids.length) return
   const zs = getNodes.value.map(n => n.zIndex ?? 0)
-  const target = mode === 'front' ? Math.max(0, ...zs) + 1 : Math.min(0, ...zs) - 1
+  // Push above the current top (or below the current bottom). Guard the empty
+  // case so we don't call Math.max/min with no args (which yields ±Infinity).
+  const target = zs.length
+    ? (mode === 'front' ? Math.max(...zs) + 1 : Math.min(...zs) - 1)
+    : (mode === 'front' ? 1 : -1)
   ids.forEach(id => updateNode(id, { zIndex: target }))
   triggerSave()
+  recordHistory()
 }
 
 function batchPatch(patch: Partial<DrawNodeSnapshot>) {
@@ -1071,11 +1142,16 @@ function batchPatch(patch: Partial<DrawNodeSnapshot>) {
   if (!Object.keys(dataPatch).length) return
   ids.forEach(id => updateNodeData(id, dataPatch))
   triggerSave()
+  recordHistory()
   refreshSelectionSnapshot()
 }
 
 function newNodeId(i = 0): string {
   return `node-${Date.now()}-${Math.floor(Math.random() * 1e6)}-${i}`
+}
+
+function newEdgeId(i = 0): string {
+  return `e-${Date.now()}-${Math.floor(Math.random() * 1e6)}-${i}`
 }
 
 function selectOnly(ids: string[]) {
@@ -1096,6 +1172,7 @@ function duplicateSelection() {
   if (!clones.length) return
   addNodes(buildVfNodes(clones))
   triggerSave()
+  recordHistory()
   nextTick(() => selectOnly(clones.map(c => c.node_id)))
 }
 
@@ -1110,6 +1187,7 @@ function pasteClipboard() {
   const clones = clipboardCnodes.map((c, i) => ({ ...c, node_id: newNodeId(i), x: c.x + 24, y: c.y + 24 }))
   addNodes(buildVfNodes(clones))
   triggerSave()
+  recordHistory()
   nextTick(() => selectOnly(clones.map(c => c.node_id)))
 }
 
@@ -1118,6 +1196,7 @@ function deleteSelection() {
   if (!ids.length) return
   removeNodes(ids)
   triggerSave()
+  recordHistory()
   canvasStore.setSelectedNode(null)
   canvasStore.setSelectedNodeIds([])
 }
@@ -1145,7 +1224,10 @@ function onCanvasKeydown(e: KeyboardEvent) {
   const el = e.target as HTMLElement | null
   if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return
   const meta = e.metaKey || e.ctrlKey
-  if (meta && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); duplicateSelection() }
+  const lower = e.key.toLowerCase()
+  if (meta && lower === 'z' && !e.shiftKey) { e.preventDefault(); history.undo() }
+  else if (meta && ((lower === 'z' && e.shiftKey) || lower === 'y')) { e.preventDefault(); history.redo() }
+  else if (meta && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); duplicateSelection() }
   else if (meta && (e.key === 'c' || e.key === 'C')) { copySelection() }
   else if (meta && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); pasteClipboard() }
   else if (meta && e.key === ']') { e.preventDefault(); setZOrder('front') }
@@ -1202,6 +1284,7 @@ function addPaperToCanvas(paper: PaperIndexEntry) {
   showPaperPicker.value = false
   refreshPaperNoteTitles(paper.slug, paper.id).catch(() => {})
   triggerSave()
+  recordHistory()
 }
 
 // ── Node hover tooltip ────────────────────────────────────────────────────────
@@ -1297,6 +1380,7 @@ function ctxRemoveNode() {
   removeEdges((edges.value as VfEdge[]).filter(e => e.source === nodeId || e.target === nodeId).map(e => e.id))
   closeCtxMenu()
   triggerSave()
+  recordHistory()
 }
 
 function ctxRemoveEdge() {
@@ -1305,6 +1389,7 @@ function ctxRemoveEdge() {
   removeEdges([edgeId])
   closeCtxMenu()
   triggerSave()
+  recordHistory()
 }
 
 function ctxEditEdgeLabel() {
@@ -1325,6 +1410,7 @@ function commitEdgeLabel() {
   )
   editingEdgeId.value = null
   triggerSave()
+  recordHistory()
 }
 
 // ── Node / edge style controls ───────────────────────────────────────────────
@@ -1361,6 +1447,7 @@ function ctxSetNodeColor(color: string | undefined) {
       : n
   ))
   triggerSave()
+  recordHistory()
 }
 
 // ── Text node style controls ──────────────────────────────────────────────────
@@ -1387,6 +1474,7 @@ function ctxSetTextFontSize(size: number) {
     n.id === nodeId ? { ...n, data: { ...n.data, fontSize: size } } : n
   )
   triggerSave()
+  recordHistory()
 }
 
 function ctxToggleTextBold() {
@@ -1396,6 +1484,7 @@ function ctxToggleTextBold() {
     n.id === nodeId ? { ...n, data: { ...n.data, bold: !n.data.bold } } : n
   )
   triggerSave()
+  recordHistory()
 }
 
 function ctxToggleTextItalic() {
@@ -1405,6 +1494,7 @@ function ctxToggleTextItalic() {
     n.id === nodeId ? { ...n, data: { ...n.data, italic: !n.data.italic } } : n
   )
   triggerSave()
+  recordHistory()
 }
 
 const ctxCurrentEdgeData = computed(() => {
@@ -1439,6 +1529,7 @@ function ctxSetEdgeColor(color: string | undefined) {
     }
   })
   triggerSave()
+  recordHistory()
 }
 
 function ctxSetEdgeStrokeWidth(width: number) {
@@ -1456,15 +1547,21 @@ function ctxSetEdgeStrokeWidth(width: number) {
       : e
   ))
   triggerSave()
+  recordHistory()
 }
 
 // ── M10: Accept suggestion as real edge ───────────────────────────────────────
-function acceptSuggestion(s: SuggestedEdge) {
+function acceptSuggestion(s: SuggestedEdge, index = 0) {
   const fromNode = (nodes.value as any[]).find(n => n.data?.paperId === s.from_paper_id)
   const toNode = (nodes.value as any[]).find(n => n.data?.paperId === s.to_paper_id)
   if (!fromNode || !toNode) return
+  // Skip if an edge with the same source/target already exists.
+  const exists = edges.value.some(
+    e => e.source === fromNode.id && e.target === toNode.id
+  )
+  if (exists) return
   const newEdge = {
-    id: `edge-${Date.now()}`,
+    id: newEdgeId(index),
     source: fromNode.id,
     target: toNode.id,
     type: 'adjustable',
@@ -1476,10 +1573,11 @@ function acceptSuggestion(s: SuggestedEdge) {
   }
   addEdges([newEdge])
   triggerSave()
+  recordHistory()
 }
 
 function acceptAllSuggestions(suggestions: SuggestedEdge[]) {
-  suggestions.forEach(s => acceptSuggestion(s))
+  suggestions.forEach((s, i) => acceptSuggestion(s, i))
 }
 
 // ── M10: Auto layout ──────────────────────────────────────────────────────────
@@ -1505,6 +1603,7 @@ async function applyLayout(layout: 'timeline' | 'topological', direction: 'horiz
     await nextTick()
     fitView({ padding: 0.12 })
     triggerSave()
+    recordHistory()
   } catch (e) {
     console.error('Layout failed:', e)
   } finally {
@@ -1537,6 +1636,9 @@ function onKeydown(e: KeyboardEvent) {
   // Tool shortcuts (only when not typing in an input)
   const tag = (e.target as HTMLElement)?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA') return
+  // Bare tool shortcuts must not fire when a modifier is held, otherwise 'v'
+  // clobbers Cmd/Ctrl+V (paste) handled in onCanvasKeydown.
+  if (e.metaKey || e.ctrlKey) return
   if (e.key === 'v' || e.key === 'V') {
     activeTool.value = 'pointer'
     resetShapeDraft()
@@ -1554,6 +1656,12 @@ function onDocClick(e: MouseEvent) {
 
 function onEdgeControlChanged() {
   triggerSave()
+  recordHistory()
+}
+
+// Before an image export, fit all nodes into the viewport so nothing is cropped.
+function onExportFit() {
+  fitView({ padding: 0.12 })
 }
 
 function onCanvasNotesUpdated(event: Event) {
@@ -1581,6 +1689,7 @@ onMounted(async () => {
   window.addEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
   window.addEventListener('argus-canvas-notes-updated', onCanvasNotesUpdated)
   window.addEventListener('argus-notes-updated', onNotesUpdated)
+  window.addEventListener('argus-canvas-export-fit', onExportFit)
 })
 
 onUnmounted(() => {
@@ -1590,6 +1699,7 @@ onUnmounted(() => {
   window.removeEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
   window.removeEventListener('argus-canvas-notes-updated', onCanvasNotesUpdated)
   window.removeEventListener('argus-notes-updated', onNotesUpdated)
+  window.removeEventListener('argus-canvas-export-fit', onExportFit)
   resetShapeDraft()
   if (hoverTimer) clearTimeout(hoverTimer)
 })

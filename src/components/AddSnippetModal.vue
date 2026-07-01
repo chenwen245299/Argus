@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   libraries,
@@ -16,12 +16,12 @@ const emit = defineEmits<{ close: [] }>()
 const { t } = useI18n()
 
 const SNIPPET_COLORS = [
-  { label: '黄色', value: '#FFEB3B' },
-  { label: '绿色', value: '#A5D6A7' },
-  { label: '蓝色', value: '#90CAF9' },
-  { label: '粉色', value: '#F48FB1' },
-  { label: '橙色', value: '#FFCC80' },
-  { label: '紫色', value: '#CE93D8' },
+  { labelKey: 'addSnippet.colorYellow', value: '#FFEB3B' },
+  { labelKey: 'addSnippet.colorGreen', value: '#A5D6A7' },
+  { labelKey: 'addSnippet.colorBlue', value: '#90CAF9' },
+  { labelKey: 'addSnippet.colorPink', value: '#F48FB1' },
+  { labelKey: 'addSnippet.colorOrange', value: '#FFCC80' },
+  { labelKey: 'addSnippet.colorPurple', value: '#CE93D8' },
 ]
 
 const selectedLibraryId = ref(libraries.value[0]?.id ?? '')
@@ -135,11 +135,18 @@ async function confirm() {
 function cancel() {
   emit('close')
 }
+
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') cancel()
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
 <template>
   <Teleport to="body">
-    <div class="modal-overlay" @mousedown.self="cancel">
+    <div class="modal-overlay" @click.self="cancel">
       <div class="modal-card">
         <div class="modal-header">
           <span class="modal-title">{{ t('snippets.addToLibrary') }}</span>
@@ -153,7 +160,7 @@ function cancel() {
         <!-- Original text preview with color highlight -->
         <div class="field-label">{{ t('snippets.sourceText') }}</div>
         <div class="text-preview" :style="{ background: selectedColor + '55', borderLeft: `3px solid ${selectedColor}` }">{{ pending.text }}</div>
-        <div class="text-meta">{{ pending.paperTitle }}  ·  第 {{ pending.page }} 页</div>
+        <div class="text-meta">{{ pending.paperTitle }}  ·  {{ t('addSnippet.page', { page: pending.page }) }}</div>
 
         <!-- Color picker -->
         <div class="color-row">
@@ -163,7 +170,7 @@ function cancel() {
             class="color-dot"
             :class="{ 'color-dot--active': selectedColor === c.value }"
             :style="{ background: c.value }"
-            :title="c.label"
+            :title="t(c.labelKey)"
             @click="selectedColor = c.value"
           />
         </div>

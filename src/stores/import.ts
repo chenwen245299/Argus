@@ -67,13 +67,24 @@ export const useImportStore = defineStore('import', () => {
     }
 
     _addJob(tempSlug, filename)
-    // Immediately refresh so the paper appears in the list
+    // Immediately refresh so the paper appears in the list. With the trailing
+    // refresh guard in the library store this awaits a scan that includes the
+    // just-imported paper.
     await library.refresh()
 
-    const tempPaper = library.papers.find(p => p.slug === tempSlug)
-    if (tempPaper) {
-      await collections.movePaper(tempPaper.id, collectionId)
-      await library.refresh()
+    // Locate the freshly-imported paper's id. It should be present after the
+    // refresh above; fall back to invoke in case the scan raced the copy.
+    let tempPaperId = library.papers.find(p => p.slug === tempSlug)?.id ?? null
+    if (!tempPaperId) {
+      try {
+        const entry = await invoke<PaperMeta>('get_paper_meta', { slug: tempSlug })
+        tempPaperId = entry?.id ?? null
+      } catch {
+        // Fallback unavailable — skip the move; the paper still imported fine.
+      }
+    }
+    if (tempPaperId) {
+      await collections.movePaper(tempPaperId, collectionId)
     }
 
     // 2. Fetch metadata (async, non-blocking)

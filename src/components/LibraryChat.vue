@@ -93,6 +93,9 @@ async function syncMissing() {
 interface LibraryAnswerVariant {
   id: string
   content: string
+  // Throttled copy of `content` used for live markdown rendering while streaming
+  // (re-rendering the full markdown on every token freezes the UI on long answers).
+  displayContent?: string
   sources?: RetrievedChunk[]
   streaming?: boolean
   error?: boolean
@@ -112,6 +115,7 @@ interface LibraryUiMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
+  displayContent?: string
   attachments?: Attachment[]
   sources?: RetrievedChunk[]
   streaming?: boolean
@@ -216,10 +220,12 @@ function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
     variants: msg.variants?.map(variant => {
       const variantClone: LibraryAnswerVariant = { ...variant }
       delete variantClone.contextContent
+      delete variantClone.displayContent
       return variantClone
     }),
   }
   delete clone.contextContent
+  delete clone.displayContent
   return clone
 }
 
@@ -450,12 +456,61 @@ function onDividerMouseUp() {
   try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(sidebarWidth.value))) } catch {}
 }
 
-let unlistenChat: UnlistenFn | null = null
-let unlistenSources: UnlistenFn | null = null
-let unlistenContext: UnlistenFn | null = null
-let unlistenUsage: UnlistenFn | null = null
-let pendingSources: RetrievedChunk[] = []
-let _compositionEndedAt = 0
+// Per-request event unlisteners, keyed by the streaming target's id, so
+// concurrent / rapid requests never overwrite each other's listeners (the old
+// module-level singletons leaked and cross-contaminated messages).
+const activeUnlisteners = new Map<string, UnlistenFn[]>()
+// Targets the user explicitly stopped — used to block a late `finalText`
+// from refilling content after the front-end has already halted streaming.
+const stoppedTargetIds = new Set<string>()
+// Maps a streaming target id -> the backend request_id we sent, so stopStreaming
+// can tell the backend to truly cancel the in-flight HTTP request (stop billing).
+const activeRequestIds = new Map<string, string>()
+
+// ── Throttled streaming render ────────────────────────────────────────────────
+// Re-rendering full markdown (markdown-it + KaTeX + highlight.js) on every
+// streamed token is O(n²) and freezes the UI on long answers. We refresh a
+// `displayContent` copy at most once per STREAM_RENDER_MS instead.
+const STREAM_RENDER_MS = 90
+const streamRenderTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const streamRenderLast = new Map<string, number>()
+
+type StreamTarget = LibraryUiMessage | LibraryAnswerVariant
+
+function scheduleStreamRender(target: StreamTarget) {
+  const now = Date.now()
+  const last = streamRenderLast.get(target.id) ?? 0
+  const elapsed = now - last
+  if (elapsed >= STREAM_RENDER_MS) {
+    streamRenderLast.set(target.id, now)
+    target.displayContent = target.content
+    scrollToBottom()
+    return
+  }
+  if (streamRenderTimers.has(target.id)) return
+  const timer = setTimeout(() => {
+    streamRenderTimers.delete(target.id)
+    streamRenderLast.set(target.id, Date.now())
+    target.displayContent = target.content
+    scrollToBottom()
+  }, STREAM_RENDER_MS - elapsed)
+  streamRenderTimers.set(target.id, timer)
+}
+
+// Final flush so the last tokens render even if a throttle window was pending.
+function flushStreamRender(target: StreamTarget) {
+  const timer = streamRenderTimers.get(target.id)
+  if (timer) { clearTimeout(timer); streamRenderTimers.delete(target.id) }
+  streamRenderLast.delete(target.id)
+  target.displayContent = target.content
+}
+
+// Clear every pending throttle timer (session switch / unmount).
+function clearAllStreamRenderTimers() {
+  for (const timer of streamRenderTimers.values()) clearTimeout(timer)
+  streamRenderTimers.clear()
+  streamRenderLast.clear()
+}
 
 // ── Computed ──────────────────────────────────────────────────────────────────
 
@@ -991,7 +1046,11 @@ async function runAssistantRequest(
   const sourcesEventName = `${eventName}-sources`
   const contextEventName = `${eventName}-context`
   const usageEventName = `${eventName}-usage`
+  // Sources are collected per-request in a closure local (was a shared
+  // module-level array that concurrent requests overwrote).
+  let pendingSources: RetrievedChunk[] = []
   target.content = ''
+  target.displayContent = ''
   target.error = false
   target.streaming = true
   target.sources = undefined
@@ -1006,39 +1065,47 @@ async function runAssistantRequest(
   target.modelLabel = modelLabel(sel)
   assistantMsg.streaming = true
   loading.value = true
-  pendingSources = []
+  // Backend cancellation id: generated per request, sent to `chat_with_library`,
+  // and used by stopStreaming to invoke `cancel_ai_request`.
+  const requestId = crypto.randomUUID()
+  activeRequestIds.set(target.id, requestId)
+  stoppedTargetIds.delete(target.id)
   scrollToBottom()
 
-  if (unlistenSources) { unlistenSources(); unlistenSources = null }
-  unlistenSources = await listen<RetrievedChunk[]>(sourcesEventName, (e) => {
-    pendingSources = e.payload ?? []
-  })
+  // All listeners for this request are tracked under target.id so a later
+  // request (or unmount / stop) can tear down exactly this request's listeners.
+  detachListeners(target.id)
+  const offs: UnlistenFn[] = []
+  activeUnlisteners.set(target.id, offs)
 
-  if (unlistenContext) { unlistenContext(); unlistenContext = null }
-  unlistenContext = await listen<LibrarySentContextPayload>(contextEventName, (e) => {
+  offs.push(await listen<RetrievedChunk[]>(sourcesEventName, (e) => {
+    pendingSources = e.payload ?? []
+  }))
+
+  offs.push(await listen<LibrarySentContextPayload>(contextEventName, (e) => {
     const sections = e.payload?.sections?.filter(s => s.content?.trim()) ?? []
     target.contextContent = { mode: e.payload?.mode, sections }
     persistActive()
-  })
+  }))
 
-  if (unlistenUsage) { unlistenUsage(); unlistenUsage = null }
-  unlistenUsage = await listen<StreamUsagePayload>(usageEventName, (e) => {
+  offs.push(await listen<StreamUsagePayload>(usageEventName, (e) => {
     const usage = e.payload
     if (typeof usage.input_tokens === 'number') target.inputTokens = usage.input_tokens
     if (typeof usage.output_tokens === 'number') target.outputTokens = usage.output_tokens
     if (typeof usage.total_tokens === 'number') target.totalTokens = usage.total_tokens
     if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) target.costUsd = usage.cost_usd
     persistActive()
-  })
+  }))
 
-  if (unlistenChat) { unlistenChat(); unlistenChat = null }
-  unlistenChat = await listen<{ delta?: string; done?: boolean }>(eventName, (e) => {
+  offs.push(await listen<{ delta?: string; done?: boolean }>(eventName, (e) => {
     if (e.payload.done) return
+    if (stoppedTargetIds.has(target.id)) return
     const delta = e.payload.delta ?? ''
     if (!delta) return
     target.content += delta
-    scrollToBottom()
-  })
+    // Throttle the heavy markdown render instead of re-rendering every token.
+    scheduleStreamRender(target)
+  }))
 
   try {
     const requestPaperSlugs = knowledgeSource.value === 'papers'
@@ -1053,31 +1120,47 @@ async function runAssistantRequest(
       knowledgeSource: knowledgeSource.value,
       selectedPaperSlugs: requestPaperSlugs,
       attachments: null,
+      requestId,
     })
-    if (!target.content && finalText) target.content = finalText
+    // If the user pressed stop, don't refill content the backend produced anyway.
+    if (!stoppedTargetIds.has(target.id)) {
+      if (!target.content && finalText) target.content = finalText
+      if (pendingSources.length > 0) target.sources = [...pendingSources]
+    }
     target.streaming = false
     target.endedAt = performance.now()
     assistantMsg.streaming = false
-    if (pendingSources.length > 0) target.sources = [...pendingSources]
+    flushStreamRender(target)
     persistActive()
     // Auto-generate title after the first exchange (fire-and-forget)
     if (conv.messages.filter((m: LibraryUiMessage) => m.role === 'user').length === 1) {
       generateAiTitle(conv)
     }
   } catch (e) {
-    target.content = String(e)
-    target.error = true
+    if (!stoppedTargetIds.has(target.id)) {
+      target.content = String(e)
+      target.error = true
+    }
     target.streaming = false
     target.endedAt = performance.now()
     assistantMsg.streaming = false
+    flushStreamRender(target)
   } finally {
     loading.value = false
-    if (unlistenChat) { unlistenChat(); unlistenChat = null }
-    if (unlistenSources) { unlistenSources(); unlistenSources = null }
-    if (unlistenContext) { unlistenContext(); unlistenContext = null }
-    if (unlistenUsage) { unlistenUsage(); unlistenUsage = null }
+    stoppedTargetIds.delete(target.id)
+    activeRequestIds.delete(target.id)
+    detachListeners(target.id)
     persistActive()
     scrollToBottom()
+  }
+}
+
+// Off + drop all event listeners registered for a streaming target.
+function detachListeners(targetId: string) {
+  const offs = activeUnlisteners.get(targetId)
+  if (offs) {
+    for (const off of offs) off()
+    activeUnlisteners.delete(targetId)
   }
 }
 
@@ -1091,6 +1174,37 @@ function createAssistantMessage(sel: ModelSelection | null): LibraryUiMessage {
     model: sel,
     modelLabel: modelLabel(sel),
   }
+}
+
+// Stop all in-flight streaming: tell the backend to cancel the HTTP request
+// (via `cancel_ai_request`), detach front-end listeners, mark the streaming
+// targets stopped (so the pending `finalText` won't refill their content), and
+// reset UI state.
+function stopStreaming() {
+  // Tell the backend to truly cancel each in-flight request (closes the HTTP
+  // stream so the provider stops generating / billing).
+  for (const requestId of [...activeRequestIds.values()]) {
+    invoke('cancel_ai_request', { requestId }).catch(() => {})
+  }
+  for (const id of [...activeUnlisteners.keys()]) {
+    stoppedTargetIds.add(id)
+    detachListeners(id)
+  }
+  const conv = activeConv.value
+  if (conv) {
+    for (const msg of conv.messages) {
+      const targets: StreamTarget[] = [msg, ...(msg.variants ?? [])]
+      for (const target of targets) {
+        if (target.streaming) {
+          target.streaming = false
+          target.endedAt = performance.now()
+          flushStreamRender(target)
+        }
+      }
+    }
+  }
+  loading.value = false
+  persistActive()
 }
 
 async function sendMessage() {
@@ -1199,12 +1313,12 @@ async function copyMessage(msg: LibraryUiMessage) {
   }, 1400)
 }
 
-function onCompositionStart() { _compositionEndedAt = 0 }
-function onCompositionEnd()   { _compositionEndedAt = Date.now() }
-function isIMEActive()        { return Date.now() - _compositionEndedAt < 100 }
+// `isComposing` / keyCode 229 reliably detect an active IME composition,
+// avoiding the race-prone Date.now() heuristic that could send half-typed text.
+function isIMEActive(e: KeyboardEvent) { return e.isComposing || e.keyCode === 229 }
 
 function handleKeydown(e: KeyboardEvent) {
-  if (e.key === 'Enter' && !e.shiftKey && !isIMEActive()) { e.preventDefault(); sendMessage() }
+  if (e.key === 'Enter' && !e.shiftKey && !isIMEActive(e)) { e.preventDefault(); sendMessage() }
 }
 
 function onMsgContainerClick(e: MouseEvent) {
@@ -1245,6 +1359,18 @@ function onCopyCode(e: Event) {
   navigator.clipboard.writeText((e.target as HTMLElement).textContent ?? '').catch(() => {})
 }
 
+// Switching conversations abandons any in-flight stream for the previous one:
+// detach its listeners and clear pending throttle timers so scheduled renders
+// don't fire against a conversation that's no longer visible.
+watch(activeConvId, () => {
+  for (const id of [...activeUnlisteners.keys()]) {
+    stoppedTargetIds.add(id)
+    detachListeners(id)
+  }
+  clearAllStreamRenderTimers()
+  loading.value = false
+})
+
 onMounted(async () => {
   await settingsStore.load()
   const saved = loadFromStorage()
@@ -1268,10 +1394,8 @@ onUnmounted(() => {
   window.removeEventListener('mousemove', onDividerMouseMove)
   window.removeEventListener('mouseup', onDividerMouseUp)
   messagesEl.value?.removeEventListener('copy-code', onCopyCode)
-  if (unlistenChat) unlistenChat()
-  if (unlistenSources) unlistenSources()
-  if (unlistenContext) unlistenContext()
-  if (unlistenUsage) unlistenUsage()
+  for (const id of [...activeUnlisteners.keys()]) detachListeners(id)
+  clearAllStreamRenderTimers()
 })
 </script>
 
@@ -1638,9 +1762,7 @@ onUnmounted(() => {
                   class="user-edit-input"
                   rows="3"
                   @keydown.escape.prevent="cancelEdit"
-                  @compositionstart="onCompositionStart"
-                  @compositionend="onCompositionEnd"
-                  @keydown.enter.exact.prevent="!isIMEActive() && submitUserEdit(msg)"
+                  @keydown.enter.exact.prevent="!isIMEActive($event) && submitUserEdit(msg)"
                 />
                 <div class="user-edit-actions">
                   <button class="edit-cancel" @click="cancelEdit">取消</button>
@@ -1723,9 +1845,10 @@ onUnmounted(() => {
                     class="assistant-bubble markdown-body"
                     :class="{ streaming: activeAnswer(msg).streaming, error: activeAnswer(msg).error }"
                   >
-                    <!-- Streaming -->
+                    <!-- Streaming: render the throttled displayContent copy, not the
+                         raw content, so long answers don't re-render on every token. -->
                     <template v-if="activeAnswer(msg).streaming">
-                      <div v-html="renderMarkdown(activeAnswer(msg).content || '<em style=\'opacity:.5\'>' + t('copilot.thinking') + '</em>')" />
+                      <div v-html="renderMarkdown((activeAnswer(msg).displayContent ?? activeAnswer(msg).content) || '<em style=\'opacity:.5\'>' + t('copilot.thinking') + '</em>')" />
                       <span class="cursor-blink"/>
                     </template>
                     <!-- Done: Mermaid-aware segment rendering -->
@@ -1907,8 +2030,6 @@ onUnmounted(() => {
               rows="1"
               :disabled="loading"
               @keydown="handleKeydown"
-              @compositionstart="onCompositionStart"
-              @compositionend="onCompositionEnd"
               @paste="onPaste"
             />
             <input
@@ -1999,7 +2120,13 @@ onUnmounted(() => {
               </div>
               <div class="footer-right">
                 <span class="enter-hint">{{ t('libraryChat.enterHint') }}</span>
-                <button class="send-btn" :disabled="!canSend" @click="sendMessage">
+                <button v-if="loading" class="send-btn stop-btn" title="停止生成" @click="stopStreaming">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                    <rect width="14" height="14" x="5" y="5" rx="2"/>
+                  </svg>
+                  停止
+                </button>
+                <button v-else class="send-btn" :disabled="!canSend" @click="sendMessage">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                     <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
                   </svg>
@@ -3787,6 +3914,12 @@ onUnmounted(() => {
 
 .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
 .send-btn:disabled { opacity: 0.38; cursor: not-allowed; }
+
+.stop-btn {
+  background: color-mix(in srgb, var(--text-primary) 10%, transparent);
+  color: var(--text-primary);
+}
+.stop-btn:hover { background: color-mix(in srgb, var(--text-primary) 16%, transparent); }
 
 .paper-context-counter {
   height: 24px;

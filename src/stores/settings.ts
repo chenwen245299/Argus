@@ -24,11 +24,15 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   async function save(patch: Partial<AppSettings>) {
+    const previous = settings.value
     settings.value = { ...settings.value, ...patch }
     try {
       await invoke('save_settings', { settingsData: settings.value })
       applyAppearance(settings.value.appearance)
     } catch (e) {
+      // Roll back the optimistic update so UI reflects the persisted state.
+      settings.value = previous
+      applyAppearance(settings.value.appearance)
       console.error('Failed to save settings:', e)
     }
   }

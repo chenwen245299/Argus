@@ -219,60 +219,80 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
 /// is migrated in one atomic transaction, tagging every existing row with the
 /// model recorded in vectors_meta.json (the model that originally produced it).
 fn migrate_chunks_table(conn: &Connection, root: &str) -> Result<(), String> {
-    let exists: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'",
-            [],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
+    // Acquire the write lock up front. Everything below — including the
+    // "is it already migrated?" check — runs inside this transaction, so with
+    // several connections opening concurrently only one performs the migration;
+    // the others block on BEGIN IMMEDIATE and then observe the finished schema.
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|e| format!("Begin migration transaction: {e}"))?;
 
-    if !exists {
-        return conn
-            .execute_batch(CHUNKS_SCHEMA)
-            .map_err(|e| format!("Init vectors DB: {e}"));
+    // Run the migration body in a closure so any error can trigger a ROLLBACK.
+    let result = (|| -> Result<(), String> {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !exists {
+            return conn
+                .execute_batch(CHUNKS_SCHEMA)
+                .map_err(|e| format!("Init vectors DB: {e}"));
+        }
+
+        if table_has_column(conn, "chunks", "embedding_model") {
+            // Already multi-model (possibly migrated by a peer connection that
+            // held the lock before us) — just make sure the indexes exist.
+            let _ = conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_paper ON chunks(paper_id);
+                 CREATE INDEX IF NOT EXISTS idx_chunks_model ON chunks(embedding_model);",
+            );
+            return Ok(());
+        }
+
+        // Legacy single-model table. Ensure it has the text columns this app
+        // added over time so the copy below succeeds, then fold it into the new
+        // schema.
+        for (col, def) in &[
+            ("source_type", "TEXT NOT NULL DEFAULT 'text'"),
+            ("source_id", "TEXT"),
+            ("source_label", "TEXT"),
+            ("paper_title", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            let _ = conn.execute_batch(&format!("ALTER TABLE chunks ADD COLUMN {col} {def};"));
+        }
+
+        let legacy_model = get_vectors_meta(root)
+            .map(|m| m.embedding_model)
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "legacy".to_string());
+        let m = legacy_model.replace('\'', "''");
+
+        conn.execute_batch(&format!(
+            "ALTER TABLE chunks RENAME TO chunks_legacy;
+             {CHUNKS_SCHEMA}
+             INSERT INTO chunks
+                 (chunk_id, embedding_model, paper_id, slug, chunk_index, text, vector,
+                  source_type, source_id, source_label, paper_title)
+             SELECT chunk_id, '{m}', paper_id, slug, chunk_index, text, vector,
+                    source_type, source_id, source_label, paper_title
+             FROM chunks_legacy;
+             DROP TABLE chunks_legacy;"
+        ))
+        .map_err(|e| format!("Migrate chunks to multi-model store: {e}"))
+    })();
+
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT;")
+            .map_err(|e| format!("Commit migration transaction: {e}")),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
     }
-
-    if table_has_column(conn, "chunks", "embedding_model") {
-        // Already multi-model — just make sure the indexes exist.
-        let _ = conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_chunks_paper ON chunks(paper_id);
-             CREATE INDEX IF NOT EXISTS idx_chunks_model ON chunks(embedding_model);",
-        );
-        return Ok(());
-    }
-
-    // Legacy single-model table. Ensure it has the text columns this app added
-    // over time so the copy below succeeds, then fold it into the new schema.
-    for (col, def) in &[
-        ("source_type", "TEXT NOT NULL DEFAULT 'text'"),
-        ("source_id", "TEXT"),
-        ("source_label", "TEXT"),
-        ("paper_title", "TEXT NOT NULL DEFAULT ''"),
-    ] {
-        let _ = conn.execute_batch(&format!("ALTER TABLE chunks ADD COLUMN {col} {def};"));
-    }
-
-    let legacy_model = get_vectors_meta(root)
-        .map(|m| m.embedding_model)
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| "legacy".to_string());
-    let m = legacy_model.replace('\'', "''");
-
-    conn.execute_batch(&format!(
-        "BEGIN IMMEDIATE;
-         ALTER TABLE chunks RENAME TO chunks_legacy;
-         {CHUNKS_SCHEMA}
-         INSERT INTO chunks
-             (chunk_id, embedding_model, paper_id, slug, chunk_index, text, vector,
-              source_type, source_id, source_label, paper_title)
-         SELECT chunk_id, '{m}', paper_id, slug, chunk_index, text, vector,
-                source_type, source_id, source_label, paper_title
-         FROM chunks_legacy;
-         DROP TABLE chunks_legacy;
-         COMMIT;"
-    ))
-    .map_err(|e| format!("Migrate chunks to multi-model store: {e}"))
 }
 
 fn open_db(root: &str) -> Result<Connection, String> {

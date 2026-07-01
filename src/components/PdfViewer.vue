@@ -473,7 +473,7 @@ async function loadPdf() {
     const loadingTask = pdfjsLib.getDocument({ data: uint8, isOffscreenCanvasSupported: false })
     const doc = await loadingTask.promise
     pdfDoc.value = doc
-    reader.setPdfDoc(doc)
+    reader.setPdfDoc(doc, slug)
     linkService.setDocument(doc)
     pageCount.value = doc.numPages
 
@@ -563,10 +563,14 @@ async function renderPage(idx: number) {
 
   const myGen = renderGeneration
   const scenScale = scale.value
+  // Track every node this render appends so we can tear down a half-built page
+  // if a newer generation supersedes us at any await point (avoids ghost layers).
+  const appended: HTMLElement[] = []
+  const cleanupAppended = () => { appended.forEach(n => n.remove()) }
   try {
     const page: PDFPageProxy = await pdfDoc.value.getPage(idx + 1)
     // Scale changed while we were fetching the page — abandon.
-    if (myGen !== renderGeneration) { page.cleanup(); return }
+    if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
     const dpr = window.devicePixelRatio || 1
     // Logical viewport for CSS layout / text layer / highlights
     const logicalVp = page.getViewport({ scale: scenScale })
@@ -581,6 +585,7 @@ async function renderPage(idx: number) {
     canvas.style.width = `${Math.round(logicalVp.width)}px`
     canvas.style.height = `${Math.round(logicalVp.height)}px`
     el.appendChild(canvas)
+    appended.push(canvas)
 
     const task = page.render({ canvas, viewport: physicalVp })
     pageRenderTasks.set(idx, task)
@@ -589,7 +594,7 @@ async function renderPage(idx: number) {
 
     // Scale changed during render — the watcher cleared `el`; bail without
     // marking the page rendered so it re-renders cleanly at the new scale.
-    if (myGen !== renderGeneration) { page.cleanup(); return }
+    if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
 
     // Text layer at logical scale so CSS positions match layout
     const textLayerDiv = document.createElement('div')
@@ -597,6 +602,7 @@ async function renderPage(idx: number) {
     // pdfjs v5 uses --total-scale-factor to size the container via setLayerDimensions
     textLayerDiv.style.setProperty('--total-scale-factor', String(scenScale))
     el.appendChild(textLayerDiv)
+    appended.push(textLayerDiv)
 
     try {
       const textLayer = new pdfjsLib.TextLayer({
@@ -608,7 +614,7 @@ async function renderPage(idx: number) {
     } catch (e) {
       console.warn('TextLayer render failed:', e)
     }
-    if (myGen !== renderGeneration) { page.cleanup(); return }
+    if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
 
     // Highlight overlay at logical scale
     const hlDiv = document.createElement('div')
@@ -616,6 +622,7 @@ async function renderPage(idx: number) {
     hlDiv.style.width = `${Math.round(logicalVp.width)}px`
     hlDiv.style.height = `${Math.round(logicalVp.height)}px`
     el.appendChild(hlDiv)
+    appended.push(hlDiv)
 
     renderHighlightsOnPage(hlDiv, idx)
 
@@ -623,6 +630,7 @@ async function renderPage(idx: number) {
     const annotationLayerDiv = document.createElement('div')
     annotationLayerDiv.className = 'annotationLayer'
     el.appendChild(annotationLayerDiv)
+    appended.push(annotationLayerDiv)
 
     try {
       const annotations = await page.getAnnotations()
@@ -801,7 +809,7 @@ watch(() => reader.highlights, () => {
     const overlay = el.querySelector('.highlight-overlay') as HTMLDivElement | null
     if (overlay) renderHighlightsOnPage(overlay, idx)
   })
-}, { deep: true })
+})
 
 // Re-render highlight overlays when scale changes (handled by full page re-render above)
 
@@ -1340,8 +1348,17 @@ function onWindowMouseUp(e: MouseEvent) {
   // Pre-compute rects NOW while selection is active.
   // If we read them later in createHighlight(), mousedown on a color dot will have already cleared the selection.
   const pageRect = pageEl.getBoundingClientRect()
+  // A selection can span multiple pages; getClientRects() returns rects on every
+  // page it touches. Keep only rects whose center lands inside the starting page,
+  // otherwise off-page rects get mapped into this page's coords and misalign.
   const rects: Rect[] = domRects
     .filter(r => r.width > 0 && r.height > 0)
+    .filter(r => {
+      const cy = r.top + r.height / 2
+      const cx = r.left + r.width / 2
+      return cy >= pageRect.top && cy <= pageRect.bottom &&
+             cx >= pageRect.left && cx <= pageRect.right
+    })
     .map(r => ({
       x: (r.left - pageRect.left) / scale.value,
       y: (r.top - pageRect.top) / scale.value,

@@ -90,10 +90,7 @@ mod pdf_url {
             return Err(format!("HTTP {} from {url}", resp.status()));
         }
 
-        let pdf_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Read PDF bytes: {e}"))?;
+        let pdf_bytes = super::read_bytes_capped(resp).await?;
 
         if !pdf_bytes.starts_with(b"%PDF") {
             return Err(format!("URL did not return a valid PDF: {url}"));
@@ -140,7 +137,12 @@ mod pdf_url {
             cite_count: None,
         };
 
-        super::finalize_paper(root, &final_dir, &final_slug, paper_meta, collection_id, app, "pdf").await?;
+        if let Err(e) =
+            super::finalize_paper(root, &final_dir, &final_slug, paper_meta, collection_id, app, "pdf").await
+        {
+            let _ = std::fs::remove_dir_all(&final_dir);
+            return Err(e);
+        }
         Ok(final_slug)
     }
 }
@@ -153,6 +155,26 @@ use crate::models::{PaperMeta, PaperStatus};
 use crate::{collections, extraction, paper, search, settings};
 use std::path::Path;
 use tauri::Emitter;
+
+/// Maximum PDF download size (200 MB). Guards against pathological / malicious
+/// links that would otherwise buffer unbounded bytes into memory.
+const MAX_PDF_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Read the response body into bytes, first rejecting it if the advertised
+/// `Content-Length` exceeds `MAX_PDF_BYTES`.
+async fn read_bytes_capped(resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_PDF_BYTES {
+            return Err(format!(
+                "PDF too large: {len} bytes exceeds limit of {MAX_PDF_BYTES} bytes"
+            ));
+        }
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("Read PDF bytes: {e}"))
+}
 
 fn sanitize(s: &str) -> String {
     s.chars()
@@ -451,10 +473,7 @@ mod acl {
         if !pdf_resp.status().is_success() {
             return Err(format!("PDF unavailable: HTTP {}", pdf_resp.status()));
         }
-        let pdf_bytes = pdf_resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Read PDF: {e}"))?;
+        let pdf_bytes = super::read_bytes_capped(pdf_resp).await?;
 
         emit("importing");
 
@@ -490,7 +509,7 @@ mod acl {
             cite_count: None,
         };
 
-        super::finalize_paper(
+        if let Err(e) = super::finalize_paper(
             root,
             &final_dir,
             &final_slug,
@@ -499,7 +518,11 @@ mod acl {
             app,
             "acl",
         )
-        .await?;
+        .await
+        {
+            let _ = std::fs::remove_dir_all(&final_dir);
+            return Err(e);
+        }
         Ok(final_slug)
     }
 }
@@ -559,7 +582,7 @@ mod aaai {
                 .find('>')
                 .map(|p| tag_start + p)
                 .unwrap_or(rest.len());
-            let tag = &rest[tag_start..=tag_end];
+            let tag = &rest[tag_start..tag_end];
             if let Some(content_pos) = tag.find(r#"content=""#) {
                 let after = &tag[content_pos + 9..];
                 if let Some(end) = after.find('"') {
@@ -585,7 +608,7 @@ mod aaai {
                 .find('>')
                 .map(|p| tag_start + p)
                 .unwrap_or(rest.len());
-            let tag = &rest[tag_start..=tag_end];
+            let tag = &rest[tag_start..tag_end];
             if let Some(content_pos) = tag.find(r#"content=""#) {
                 let after = &tag[content_pos + 9..];
                 if let Some(end) = after.find('"') {
@@ -672,10 +695,7 @@ mod aaai {
         if !resp.status().is_success() {
             return Err(format!("PDF unavailable: HTTP {}", resp.status()));
         }
-        let pdf_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Read PDF: {e}"))?;
+        let pdf_bytes = super::read_bytes_capped(resp).await?;
 
         if !pdf_bytes.starts_with(b"%PDF") {
             return Err(format!("AAAI returned an invalid PDF for '{id}'"));
@@ -715,10 +735,14 @@ mod aaai {
             cite_count: None,
         };
 
-        super::finalize_paper(
+        if let Err(e) = super::finalize_paper(
             root, &final_dir, &final_slug, paper_meta, collection_id, app, "aaai",
         )
-        .await?;
+        .await
+        {
+            let _ = std::fs::remove_dir_all(&final_dir);
+            return Err(e);
+        }
         Ok(final_slug)
     }
 
@@ -877,10 +901,7 @@ mod openreview {
         if !resp.status().is_success() {
             return Err(format!("PDF unavailable: HTTP {}", resp.status()));
         }
-        let pdf_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Read PDF: {e}"))?;
+        let pdf_bytes = super::read_bytes_capped(resp).await?;
 
         emit("importing");
 
@@ -916,10 +937,14 @@ mod openreview {
             cite_count: None,
         };
 
-        super::finalize_paper(
+        if let Err(e) = super::finalize_paper(
             root, &final_dir, &final_slug, paper_meta, collection_id, app, "openreview",
         )
-        .await?;
+        .await
+        {
+            let _ = std::fs::remove_dir_all(&final_dir);
+            return Err(e);
+        }
         Ok(final_slug)
     }
 }

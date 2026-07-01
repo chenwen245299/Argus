@@ -127,7 +127,11 @@ export const useReaderStore = defineStore('reader', () => {
     } catch {}
   }
 
-  function setPdfDoc(doc: PDFDocumentProxy) {
+  function setPdfDoc(doc: PDFDocumentProxy, slug?: string) {
+    // Guard against a slow async PDF load for a now-inactive tab clobbering the
+    // freshly-switched tab's document. Only apply when the load's slug (if
+    // provided) still matches the active tab.
+    if (slug !== undefined && slug !== activeSlug.value) return
     pdfDoc.value = doc
   }
 

@@ -59,12 +59,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
                   <line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/>
                 </svg>
               </button>
-              <button class="tl-btn tl-yellow" :title="t('settings.close')">
+              <button class="tl-btn tl-yellow">
                 <svg v-if="tlHover" width="6" height="6" viewBox="0 0 10 2" fill="none" stroke="#5c3d00" stroke-width="1.8" stroke-linecap="round">
                   <line x1="1" y1="1" x2="9" y2="1"/>
                 </svg>
               </button>
-              <button class="tl-btn tl-green" :title="t('settings.close')">
+              <button class="tl-btn tl-green">
                 <svg v-if="tlHover" width="7" height="7" viewBox="0 0 10 10" fill="none" stroke="#003300" stroke-width="1.5" stroke-linecap="round">
                   <path d="M2 5 L4.5 7.5 L8.5 2.5"/>
                 </svg>

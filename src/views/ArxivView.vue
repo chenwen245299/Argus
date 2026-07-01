@@ -68,6 +68,13 @@ const analyzeError = ref('')
 
 async function analyzeSingle(paper: ArxivPaper) {
   if (analyzingId.value) return
+  // Optimistically flip the paper to the non-terminal 'analyzing' state before
+  // wiring up the watch. Re-analyzing an already-'done'/'failed' paper would
+  // otherwise let the watch read the stale terminal status and clear analyzingId
+  // immediately, flashing the loading state off. Now analyzingId is only cleared
+  // once the store event transitions it back to a terminal state.
+  const target = store.papers.find(p => p.arxiv_id === paper.arxiv_id)
+  if (target) target.analysis_status = 'analyzing'
   analyzingId.value = paper.arxiv_id
   analyzeError.value = ''
   try {
@@ -423,7 +430,12 @@ const groupedPapers = computed<ArxivPaperGroup[]>(() => {
 async function deleteGroup(group: ArxivPaperGroup) {
   deleteInProgress.value = group.date
   deletingDate.value = null
-  const ids = group.papers.map(p => p.arxiv_id)
+  // Recompute the ids for this date from the latest filteredPapers rather than
+  // trusting the (possibly stale) group.papers snapshot captured by the
+  // grouped-papers computed, so we delete exactly what's currently in the group.
+  const ids = filteredPapers.value
+    .filter(p => paperDisplayDate(p) === group.date)
+    .map(p => p.arxiv_id)
   try {
     await invoke('delete_arxiv_papers', { arxivIds: ids })
     await store.loadInbox()
@@ -440,11 +452,13 @@ async function deleteGroup(group: ArxivPaperGroup) {
 }
 
 function toggleCheck(arxivId: string, e?: MouseEvent) {
-  if (e?.shiftKey && lastCheckedId.value) {
-    // Range-select across the currently visible (filtered) flat list
-    const flat = filteredPapers.value.map(p => p.arxiv_id)
-    const a = flat.indexOf(lastCheckedId.value)
-    const b = flat.indexOf(arxivId)
+  const flat = filteredPapers.value.map(p => p.arxiv_id)
+  const a = e?.shiftKey && lastCheckedId.value ? flat.indexOf(lastCheckedId.value) : -1
+  const b = flat.indexOf(arxivId)
+  if (a !== -1 && b !== -1) {
+    // Range-select across the currently visible (filtered) flat list. If the
+    // previous anchor was filtered out (a === -1), fall through to single toggle
+    // so we don't push undefined ids from a -1 start index.
     const [lo, hi] = a <= b ? [a, b] : [b, a]
     for (let i = lo; i <= hi; i++) selectedPaperIds.add(flat[i])
   } else {

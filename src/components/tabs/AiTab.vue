@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useAiStore, type ModelOption } from '../../stores/ai'
 import { useSettingsStore } from '../../stores/settings'
 import MermaidBlock from '../MermaidBlock.vue'
@@ -113,6 +114,9 @@ const previewImage = ref<string | null>(null)
 const previewPdf = ref<string | null>(null)
 const modelMenuRoot = ref<HTMLElement | null>(null)
 const unlisteners = new Map<string, UnlistenFn>()
+// Maps answer.id -> backend request_id, so stopAllStreaming can tell the backend
+// to truly cancel the in-flight HTTP request (stop the provider generating/billing).
+const activeRequestIds = new Map<string, string>()
 const fulltextReady = ref(false)
 const fulltextChecking = ref(false)
 const abstractAvailable = ref(false)
@@ -120,7 +124,7 @@ const activeAnswerTabs = ref<Record<string, string>>({})
 let unlistenExtractionProgress: UnlistenFn | null = null
 let unlistenMetaStart: UnlistenFn | null = null
 let unlistenMetaDone: UnlistenFn | null = null
-let _compositionEndedAt = 0
+let unlistenMetaError: UnlistenFn | null = null
 
 // Copy state for message actions
 const copiedIds = ref(new Set<string>())
@@ -906,6 +910,12 @@ function onEditKeydown(e: KeyboardEvent, node: UserNode) {
 }
 
 function stopAllStreaming() {
+  // Tell the backend to truly cancel each in-flight request (closes the HTTP
+  // stream so the provider stops generating / billing).
+  for (const requestId of [...activeRequestIds.values()]) {
+    invoke('cancel_ai_request', { requestId }).catch(() => {})
+  }
+  activeRequestIds.clear()
   for (const [key, off] of unlisteners.entries()) {
     off()
     unlisteners.delete(key)
@@ -956,10 +966,22 @@ function flushStreamRender(ans: AssistantAnswer) {
   ans.displayContent = ans.content
 }
 
+// Clear every pending throttle timer (used on session switch / unmount so
+// scheduled renders don't fire against a stale/torn-down conversation).
+function clearAllStreamRenderTimers() {
+  for (const timer of streamRenderTimers.values()) clearTimeout(timer)
+  streamRenderTimers.clear()
+  streamRenderLast.clear()
+}
+
 async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history: ChatMessage[]) {
   if (!props.slug) return
   const eventName = `paper-ai-chat-${answer.id}`
   const reasoningEventName = `${eventName}-reasoning`
+  // Backend cancellation id: sent to `chat_with_paper_event`, used by
+  // stopAllStreaming to invoke `cancel_ai_request`.
+  const requestId = crypto.randomUUID()
+  activeRequestIds.set(answer.id, requestId)
 
   // Initialize through reactive proxy chain so Vue tracks all mutations
   const ra = findReactiveAnswer(answer.id)
@@ -1037,6 +1059,7 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
       reasoningEffort: useReasoning.value ? effortToSend : null,
       contextMode: answer.contextMode ?? 'none',
       usePdf: !!answer.usedPdf,
+      requestId,
     })
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) {
@@ -1068,6 +1091,7 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     const offUsage = unlisteners.get(`${answer.id}-usage`)
     if (offUsage) offUsage()
     unlisteners.delete(`${answer.id}-usage`)
+    activeRequestIds.delete(answer.id)
     persistActiveConversation()
     scrollToBottom()
   }
@@ -1144,12 +1168,10 @@ function resizeTextarea() {
   })
 }
 
-function onCompositionStart() { _compositionEndedAt = 0 }
-function onCompositionEnd()   { _compositionEndedAt = Date.now() }
-function isIMEActive()        { return Date.now() - _compositionEndedAt < 100 }
-
 function handleKeydown(e: KeyboardEvent) {
-  if (e.key === 'Enter' && !e.shiftKey && !isIMEActive()) {
+  // `isComposing` / keyCode 229 reliably detect an active IME composition,
+  // avoiding the race-prone Date.now() heuristic that could send half-typed text.
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
     e.preventDefault()
     sendMessage()
   }
@@ -1202,6 +1224,7 @@ function closeFloating(e: MouseEvent) {
 watch(() => props.slug, async (slug) => {
   for (const off of unlisteners.values()) off()
   unlisteners.clear()
+  clearAllStreamRenderTimers()
   showHistory.value = false
   showModelMenu.value = false
   activeConversation.value = null
@@ -1240,6 +1263,14 @@ onMounted(async () => {
       applyFulltextReady(true)
     }
   })
+
+  // `ai-meta-start` / `ai-meta-done` / `ai-meta-error` are broadcast globally
+  // (Rust `app.emit`), so both the main window and the standalone popup receive
+  // them. Only the main window should materialise the metadata-extraction
+  // conversation — otherwise opening the same paper in the popup double-pushes
+  // the group. Metadata extraction is always initiated from the main window.
+  const isMainWindow = getCurrentWindow().label === 'main'
+  if (isMainWindow) {
   unlistenMetaStart = await listen<{
     slug: string; group_id: string; answer_id: string; prompt: string
     provider_id: string; provider_name: string; model_id: string
@@ -1305,7 +1336,7 @@ onMounted(async () => {
     }
   )
   // Also handle error event from Rust (streaming failed)
-  listen<{ slug: string; answer_id: string; error: string }>('ai-meta-error', (ev) => {
+  unlistenMetaError = await listen<{ slug: string; answer_id: string; error: string }>('ai-meta-error', (ev) => {
     if (ev.payload.slug !== props.slug) return
     const ra = findReactiveAnswer(ev.payload.answer_id)
     if (ra) {
@@ -1315,6 +1346,7 @@ onMounted(async () => {
     }
     finaliseMetaAnswer(ev.payload.answer_id)
   })
+  }
   messagesEl.value?.addEventListener('copy-code', (e: Event) => {
     navigator.clipboard.writeText((e.target as HTMLElement).textContent ?? '').catch(() => {})
   })
@@ -1328,8 +1360,10 @@ onUnmounted(() => {
   unlistenExtractionProgress?.()
   unlistenMetaStart?.()
   unlistenMetaDone?.()
+  unlistenMetaError?.()
   for (const off of unlisteners.values()) off()
   unlisteners.clear()
+  clearAllStreamRenderTimers()
 })
 
 // ── Context banner ────────────────────────────────────────────────────────────
@@ -1779,8 +1813,6 @@ function toggleContextPanel(nodeId: string) {
             :disabled="hasStreaming"
             placeholder="问这篇论文里的任何问题…"
             @keydown="handleKeydown"
-            @compositionstart="onCompositionStart"
-            @compositionend="onCompositionEnd"
             @paste="onPaste"
           />
           <input

@@ -432,13 +432,20 @@ onBeforeUnmount(() => {
 // ── Collection papers ─────────────────────────────────────────────────────────
 const collectionPapers = ref<PaperIndexEntry[]>([])
 
+let collectionLoadSeq = 0
+
 async function refreshCollectionPapers(id: string | null) {
+  const seq = ++collectionLoadSeq
   if (!id) { collectionPapers.value = []; return }
-  if (collectionsStore.isTopLevel(id)) {
-    collectionPapers.value = collectionsStore.listAllPapersInTree(id)
-  } else {
-    collectionPapers.value = await collectionsStore.listPapersInCollection(id)
-  }
+  // Show the whole subtree for every collection so the list count matches the
+  // recursive badge shown in the sidebar (paperCountsByCollection). Both use the
+  // same childMap + existingPaperIds filtering, so the two stay in sync.
+  const papers = collectionsStore.listAllPapersInTree(id)
+  // Guard against a stale response overwriting a newer selection (parity with
+  // the canvasNoteLoadSeq pattern below); harmless while sync, safe if this
+  // ever becomes async again.
+  if (seq !== collectionLoadSeq) return
+  collectionPapers.value = papers
 }
 
 watch(() => selection.activeCollectionId, (id) => refreshCollectionPapers(id ?? null), { immediate: true })
@@ -681,7 +688,7 @@ async function addToCollection(collectionId: string) {
 async function removeFromCurrentCollection() {
   if (!ctxMenu.value || !selection.activeCollectionId) return
   await collectionsStore.removePaper(ctxMenu.value.item.id, selection.activeCollectionId)
-  collectionPapers.value = await collectionsStore.listPapersInCollection(selection.activeCollectionId)
+  await refreshCollectionPapers(selection.activeCollectionId)
   closeCtx()
 }
 
@@ -811,7 +818,6 @@ async function deletePaper(item: PaperIndexEntry) {
     collectionPapers.value = collectionPapers.value.filter(p => p.slug !== item.slug)
     if (selection.selectedSlug === item.slug) selection.selectPaper('')
     if (reader.openSlug === item.slug) reader.closePaper()
-    library.refresh()
   } catch (e: unknown) { showError(String(e)) }
 }
 

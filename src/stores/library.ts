@@ -13,6 +13,11 @@ export const useLibraryStore = defineStore('library', () => {
   const isRefreshing = ref(false)
   const error = ref<string | null>(null)
 
+  // The in-flight refresh promise (so concurrent callers can await the same run),
+  // plus a flag requesting a trailing re-run for requests that arrived mid-refresh.
+  let refreshPromise: Promise<void> | null = null
+  let refreshPending = false
+
   const allTags = computed(() => {
     const set = new Set<string>()
     papers.value.forEach(p => p.tags?.forEach(t => set.add(t)))
@@ -94,8 +99,7 @@ export const useLibraryStore = defineStore('library', () => {
     papers.value = papers.value.filter(p => p.slug !== slug)
   }
 
-  async function refresh() {
-    if (!currentPath.value || isRefreshing.value) return
+  async function _doRefresh(): Promise<void> {
     isRefreshing.value = true
     try {
       const fresh = await invoke<PaperIndexEntry[]>('scan_library')
@@ -109,6 +113,33 @@ export const useLibraryStore = defineStore('library', () => {
       isRefreshing.value = false
       isLoading.value = false
     }
+  }
+
+  async function refresh(): Promise<void> {
+    if (!currentPath.value) return
+    // A refresh is already running: mark a trailing re-run (so any state that
+    // changed during the current scan gets picked up) and share its promise so
+    // every caller awaits a scan that started at or after their call.
+    if (refreshPromise) {
+      refreshPending = true
+      return refreshPromise
+    }
+
+    refreshPromise = (async () => {
+      try {
+        await _doRefresh()
+        // Drain any requests that arrived while we were scanning, running at
+        // most one trailing pass (which itself absorbs further requests).
+        while (refreshPending) {
+          refreshPending = false
+          await _doRefresh()
+        }
+      } finally {
+        refreshPromise = null
+      }
+    })()
+
+    return refreshPromise
   }
 
   return {

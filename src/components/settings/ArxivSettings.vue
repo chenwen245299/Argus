@@ -37,6 +37,10 @@ function normalizeConfig(config: ArxivConfig): ArxivConfig {
       : 5,
     fetch_biorxiv: config.fetch_biorxiv ?? false,
     fetch_arxiv: config.fetch_arxiv ?? true,
+    days_back: Number.isFinite(config.days_back)
+      ? Math.min(30, Math.max(1, Math.round(config.days_back)))
+      : 5,
+    fetch_time: config.fetch_time?.trim() ? config.fetch_time : '09:00',
   }
 }
 
@@ -75,6 +79,12 @@ watch(form, () => {
   if (autoSaveTimer) clearTimeout(autoSaveTimer)
   autoSaveTimer = setTimeout(() => save(), 600)
 }, { deep: true })
+
+// Switching provider invalidates the previously selected model.
+watch(() => form.value.ai_provider_id, () => {
+  if (!formReady) return
+  form.value.ai_model_id = null
+})
 
 function addCategory() {
   const cat = newCategory.value.trim()
@@ -164,9 +174,9 @@ const PRESETS = ['cs.AI', 'cs.CL', 'cs.LG', 'cs.CV', 'cs.NE', 'cs.RO', 'stat.ML'
         <div>
           <label class="field-label source-label">
             <span class="source-pill arxiv-pill-color">arXiv</span>
-            爬取 arXiv
+            {{ t('arxivSettings.fetchArxiv') }}
           </label>
-          <p class="field-hint">从 arXiv 按分类抓取论文预印本</p>
+          <p class="field-hint">{{ t('arxivSettings.fetchArxivHint') }}</p>
         </div>
         <label class="toggle">
           <input type="checkbox" v-model="form.fetch_arxiv" />
@@ -178,9 +188,9 @@ const PRESETS = ['cs.AI', 'cs.CL', 'cs.LG', 'cs.CV', 'cs.NE', 'cs.RO', 'stat.ML'
         <div>
           <label class="field-label source-label">
             <span class="source-pill biorxiv-pill-color">bioRxiv</span>
-            爬取 bioRxiv
+            {{ t('arxivSettings.fetchBiorxiv') }}
           </label>
-          <p class="field-hint">按日期全量抓取生命科学预印本，与 arXiv 合并显示</p>
+          <p class="field-hint">{{ t('arxivSettings.fetchBiorxivHint') }}</p>
         </div>
         <label class="toggle">
           <input type="checkbox" v-model="form.fetch_biorxiv" />
@@ -336,7 +346,7 @@ const PRESETS = ['cs.AI', 'cs.CL', 'cs.LG', 'cs.CV', 'cs.NE', 'cs.RO', 'stat.ML'
 
       <!-- Concurrency -->
       <div class="field-group">
-        <label class="field-label">同时请求数</label>
+        <label class="field-label">{{ t('arxivSettings.concurrency') }}</label>
         <div class="concurrency-row">
           <input
             type="range"
@@ -346,7 +356,7 @@ const PRESETS = ['cs.AI', 'cs.CL', 'cs.LG', 'cs.CV', 'cs.NE', 'cs.RO', 'stat.ML'
           />
           <span class="concurrency-value">{{ form.ai_analysis_concurrency }}</span>
         </div>
-        <p class="field-hint">同时向 AI 发送的并发请求数量（默认 5），数值越大分析速度越快，但可能触发 API 限流</p>
+        <p class="field-hint">{{ t('arxivSettings.concurrencyHint') }}</p>
       </div>
     </template>
 

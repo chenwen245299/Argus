@@ -161,8 +161,10 @@ function closeFind() {
   matchIndex.value = 0
   findQuery.value = ''
   findVisible.value = false
-  // Re-set content so Vditor replaces all Text nodes, invalidating any stale Highlight ranges
-  if (vd) vd.setValue(vd.getValue())
+  // Re-set content so Vditor replaces all Text nodes, invalidating any stale Highlight ranges.
+  // Pass `clearStack=true` so this internal reset does NOT emit `input` — otherwise merely
+  // opening/closing the find bar would mark the note dirty and trigger an autosave.
+  if (vd) vd.setValue(vd.getValue(), true)
 }
 
 // Use @input on the input element instead of a watcher to avoid async flush races

@@ -104,6 +104,7 @@ pub async fn generate_summary(
         false,
         None,
         "summary",
+        None,
     )
     .await?;
 

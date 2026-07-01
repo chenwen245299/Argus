@@ -220,8 +220,12 @@ watch(() => props.slug, async (newSlug) => {
 async function handleNotesUpdated(event: Event) {
   const slug = (event as CustomEvent<{ slug: string }>).detail?.slug
   if (!slug || slug !== props.slug) return
+  // If the user is currently editing the AI总结 note, don't re-open it — that would
+  // blow away their in-progress edits with the freshly regenerated version. Only
+  // auto-open the refreshed summary when they're on the list (or editing something else).
+  const editingSummary = view.value === 'editor' && activeNote.value?.title === 'AI总结'
   await loadList(slug)
-  if (activeNote.value?.title === 'AI总结') {
+  if (!editingSummary) {
     const refreshed = notes.value.find(n => n.title === 'AI总结')
     if (refreshed) await openNote(refreshed)
   }

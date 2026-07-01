@@ -84,6 +84,10 @@ export const useArxivStore = defineStore('arxiv', () => {
       list.sort((a, b) => a.published.localeCompare(b.published))
     } else if (sortMode.value === 'rating') {
       list.sort((a, b) => (a.rating ?? 0) - (b.rating ?? 0))
+    } else if (sortMode.value === 'status') {
+      // Order by analysis lifecycle: done → analyzing → pending → failed.
+      const rank: Record<string, number> = { done: 3, analyzing: 2, pending: 1, failed: 0 }
+      list.sort((a, b) => (rank[a.analysis_status] ?? -1) - (rank[b.analysis_status] ?? -1))
     }
     if (sortOrder.value === 'desc') {
       list.reverse()
@@ -291,7 +295,7 @@ export const useArxivStore = defineStore('arxiv', () => {
       } else if (status === 'done') {
         fetching.value = false
         fetchMessage.value = ''
-        loadInbox()
+        loadInbox().catch(() => {})
       }
       scheduleStatus.value = scheduleStatus.value
         ? { ...scheduleStatus.value, fetching: status === 'fetching' }
@@ -317,8 +321,8 @@ export const useArxivStore = defineStore('arxiv', () => {
 
         if (status === 'finished' || status === 'error') {
           analyzing.value = false
-          loadInbox()
-          loadScheduleStatus()
+          loadInbox().catch(() => {})
+          loadScheduleStatus().catch(() => {})
         } else {
           analyzing.value = true
         }

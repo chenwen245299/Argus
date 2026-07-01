@@ -1,9 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { invoke } from '@tauri-apps/api/core'
 import { updateStore, initUpdateStore, checkForUpdates, startUpdate } from '../../stores/update'
+
+const { t } = useI18n()
+
+// Bundled via the asset pipeline so it resolves correctly after packaging.
+const appIconUrl = new URL('../../assets/app-icon-128.png', import.meta.url).href
 
 const librarySize = ref<string | null>(null)
 
@@ -48,7 +54,7 @@ const renderedNotes = computed(() => {
         <div class="rn-header">
           <div class="rn-title-wrap">
             <span class="rn-badge">v{{ updateStore.newVersion }}</span>
-            <h2 class="rn-title">更新内容</h2>
+            <h2 class="rn-title">{{ t('about.releaseNotesTitle') }}</h2>
           </div>
           <button class="rn-close" @click="updateStore.showReleaseNotes = false">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -58,8 +64,8 @@ const renderedNotes = computed(() => {
         </div>
         <div class="rn-body markdown-body" v-html="renderedNotes" />
         <div class="rn-footer">
-          <button class="rn-dismiss" @click="updateStore.showReleaseNotes = false">稍后</button>
-          <button class="rn-install" @click="startUpdate(); updateStore.showReleaseNotes = false">立即更新</button>
+          <button class="rn-dismiss" @click="updateStore.showReleaseNotes = false">{{ t('about.later') }}</button>
+          <button class="rn-install" @click="startUpdate(); updateStore.showReleaseNotes = false">{{ t('about.updateNow') }}</button>
         </div>
       </div>
     </div>
@@ -69,32 +75,32 @@ const renderedNotes = computed(() => {
     <!-- App hero -->
     <div class="app-hero">
       <div class="app-logo">
-        <img src="/src-tauri/icons/128x128.png" alt="Argus" class="app-logo-img" />
+        <img :src="appIconUrl" alt="Argus" class="app-logo-img" />
       </div>
       <div class="app-info">
         <h1 class="app-name">Argus</h1>
-        <span class="app-version">版本 {{ updateStore.version || '—' }}</span>
+        <span class="app-version">{{ t('about.version', { v: updateStore.version || '—' }) }}</span>
       </div>
     </div>
 
-    <p class="app-desc">面向 AI 时代的本地优先文献管理工具。</p>
+    <p class="app-desc">{{ t('about.appDesc') }}</p>
 
     <!-- Info card -->
     <div class="section-card">
       <div class="info-row">
-        <span class="row-label">框架</span>
+        <span class="row-label">{{ t('about.framework') }}</span>
         <span class="row-val">Tauri 2 + Vue 3</span>
       </div>
       <div class="info-row">
-        <span class="row-label">存储</span>
-        <span class="row-val">本地文件系统 + SQLite</span>
+        <span class="row-label">{{ t('about.storage') }}</span>
+        <span class="row-val">{{ t('about.storageVal') }}</span>
       </div>
       <div class="info-row">
-        <span class="row-label">占用空间</span>
-        <span class="row-val">{{ librarySize ?? '计算中…' }}</span>
+        <span class="row-label">{{ t('about.diskUsage') }}</span>
+        <span class="row-val">{{ librarySize ?? t('about.calculating') }}</span>
       </div>
       <div class="info-row">
-        <span class="row-label">许可</span>
+        <span class="row-label">{{ t('about.license') }}</span>
         <span class="row-val">GPL-3.0</span>
       </div>
     </div>
@@ -102,16 +108,16 @@ const renderedNotes = computed(() => {
     <!-- Update card -->
     <div class="section-card update-card">
       <div class="update-header">
-        <span class="update-title">检查更新</span>
-        <span v-if="updateStore.state === 'available'" class="update-badge">有新版本</span>
+        <span class="update-title">{{ t('about.checkUpdate') }}</span>
+        <span v-if="updateStore.state === 'available'" class="update-badge">{{ t('about.newVersionBadge') }}</span>
       </div>
 
       <div class="version-row">
-        <span class="row-label">当前版本</span>
+        <span class="row-label">{{ t('about.currentVersion') }}</span>
         <span class="row-val">{{ updateStore.version || '—' }}</span>
       </div>
       <div v-if="updateStore.state === 'available'" class="version-row">
-        <span class="row-label">新版本</span>
+        <span class="row-label">{{ t('about.newVersion') }}</span>
         <span class="row-val new-version">{{ updateStore.newVersion }}</span>
       </div>
 
@@ -130,36 +136,36 @@ const renderedNotes = computed(() => {
       <div class="update-actions">
         <div v-if="updateStore.showLatestFeedback" class="latest-tip">
           <span class="latest-dot" />
-          已是最新版本
+          {{ t('about.upToDate') }}
         </div>
 
         <button v-else-if="updateStore.state === 'checking'" class="btn-check" disabled>
           <span class="spinner" />
-          检查中…
+          {{ t('about.checking') }}
         </button>
 
         <button v-else-if="updateStore.state === 'downloading'" class="btn-check" disabled>
           <span class="spinner" />
-          下载中…
+          {{ t('about.downloading') }}
         </button>
 
         <template v-else-if="updateStore.state === 'available'">
           <button v-if="updateStore.releaseNotes" class="btn-notes" @click="updateStore.showReleaseNotes = true">
-            查看更新内容
+            {{ t('about.viewReleaseNotes') }}
           </button>
           <button class="btn-update" @click="startUpdate">
-            立即更新到 {{ updateStore.newVersion }}
+            {{ t('about.updateTo', { v: updateStore.newVersion }) }}
           </button>
         </template>
 
         <button v-else class="btn-check" @click="checkForUpdates(true)">
-          检查更新
+          {{ t('about.checkUpdate') }}
         </button>
       </div>
 
       <div class="star-sep" />
       <div class="star-row">
-        <p class="star-text">如果觉得好用，欢迎给我们的项目点个 Star ⭐</p>
+        <p class="star-text">{{ t('about.starText') }}</p>
         <button class="github-link" @click="openGitHub">
           <svg class="github-icon" viewBox="0 0 24 24" fill="currentColor" width="15" height="15">
             <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/>

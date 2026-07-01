@@ -35,7 +35,12 @@ export function svgStringToPngBlob(svgString: string): Promise<Blob> {
       const canvas = document.createElement('canvas')
       canvas.width = width
       canvas.height = height
-      const ctx = canvas.getContext('2d')!
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        URL.revokeObjectURL(url)
+        reject(new Error('Failed to get 2D canvas context'))
+        return
+      }
       ctx.drawImage(img, 0, 0)
       URL.revokeObjectURL(url)
       canvas.toBlob(

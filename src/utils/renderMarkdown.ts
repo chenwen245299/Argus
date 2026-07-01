@@ -136,27 +136,29 @@ export function renderMarkdown(content: string): string {
     if (typeof html !== 'string') return content
 
     html = html.replace(/<!--DISPLAY_MATH_(\d+)-->/g, (_, i) => {
+      const tex = displayMaths[+i] ?? ''
       try {
-        return katex.renderToString(displayMaths[+i], { displayMode: true, throwOnError: false, strict: false })
+        return katex.renderToString(tex, { displayMode: true, throwOnError: false, strict: false })
       } catch {
-        return escapeHtml(`$$${displayMaths[+i]}$$`)
+        return escapeHtml(`$$${tex}$$`)
       }
     })
 
     html = html.replace(/<!--INLINE_MATH_(\d+)-->/g, (_, i) => {
+      const tex = inlineMaths[+i] ?? ''
       try {
-        return katex.renderToString(inlineMaths[+i], { displayMode: false, throwOnError: false, strict: false })
+        return katex.renderToString(tex, { displayMode: false, throwOnError: false, strict: false })
       } catch {
-        return escapeHtml(`$${inlineMaths[+i]}$`)
+        return escapeHtml(`$${tex}$`)
       }
     })
 
     html = html.replace(/<!--CODE_BLOCK_(\d+)-->/g, (_, i) => {
-      return marked.parse(codeBlocks[+i]) as string
+      return marked.parse(codeBlocks[+i] ?? '') as string
     })
 
     html = html.replace(/<!--INLINE_CODE_(\d+)-->/g, (_, i) => {
-      const raw = inlineCodes[+i].slice(1, -1)
+      const raw = (inlineCodes[+i] ?? '``').slice(1, -1)
       return `<code class="md-inline-code">${escapeHtml(raw)}</code>`
     })
 

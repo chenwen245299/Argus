@@ -32,6 +32,30 @@ async function doExport() {
   statusMsg.value = t('canvas.exporting')
   isError.value = false
 
+  // Overlay elements (controls / minimap / alignment guides) that must not be
+  // baked into the exported image. Hidden just for the capture, then restored.
+  const OVERLAY_SELECTORS = [
+    '.vue-flow__controls',
+    '.vue-flow__minimap',
+    '.canvas-minimap',
+    '.snap-guides',
+    '.shape-draft-preview',
+  ]
+  const hidden: { el: HTMLElement; prev: string }[] = []
+  function hideOverlays() {
+    if (!props.flowEl) return
+    for (const sel of OVERLAY_SELECTORS) {
+      props.flowEl.querySelectorAll<HTMLElement>(sel).forEach(el => {
+        hidden.push({ el, prev: el.style.visibility })
+        el.style.visibility = 'hidden'
+      })
+    }
+  }
+  function restoreOverlays() {
+    for (const { el, prev } of hidden) el.style.visibility = prev
+    hidden.length = 0
+  }
+
   try {
     // Get save path from user
     const ext = format.value
@@ -46,20 +70,31 @@ async function doExport() {
       return
     }
 
+    // Ask the canvas to fit all content into view so nothing is cropped, then
+    // hide the control overlays before capturing.
+    window.dispatchEvent(new CustomEvent('argus-canvas-export-fit'))
+    await new Promise(resolve => setTimeout(resolve, 260))
+
     // Render canvas to image
     const bgColor = bg.value === 'white' ? '#ffffff' : undefined
     const pixelRatio = scale.value
 
+    hideOverlays()
+
     let imageData: string
-    if (format.value === 'png') {
-      imageData = await toPng(props.flowEl, {
-        backgroundColor: bgColor,
-        pixelRatio,
-      })
-    } else {
-      imageData = await toSvg(props.flowEl, {
-        backgroundColor: bgColor,
-      })
+    try {
+      if (format.value === 'png') {
+        imageData = await toPng(props.flowEl, {
+          backgroundColor: bgColor,
+          pixelRatio,
+        })
+      } else {
+        imageData = await toSvg(props.flowEl, {
+          backgroundColor: bgColor,
+        })
+      }
+    } finally {
+      restoreOverlays()
     }
 
     // Write file via Rust
@@ -73,6 +108,7 @@ async function doExport() {
     isError.value = false
     setTimeout(() => emit('close'), 1200)
   } catch (e) {
+    restoreOverlays()
     statusMsg.value = `${t('canvas.exportFail')}: ${String(e)}`
     isError.value = true
   } finally {

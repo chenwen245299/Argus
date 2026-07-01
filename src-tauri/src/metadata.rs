@@ -172,11 +172,19 @@ pub fn find_doi(text: &str) -> Option<String> {
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
 fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    // Cache a single client: reqwest clients pool connections, so rebuilding one
+    // per request is wasteful. Never panic on builder failure — fall back to a
+    // default client so metadata lookups degrade gracefully instead of aborting.
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return client.clone();
+    }
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .user_agent("Argus/0.1 (local-first literature manager)")
         .build()
-        .expect("Failed to build HTTP client")
+        .unwrap_or_else(|_| reqwest::Client::new());
+    CLIENT.get_or_init(|| client).clone()
 }
 
 // ── arXiv API ─────────────────────────────────────────────────────────────────
@@ -802,6 +810,7 @@ pub async fn fetch_metadata_with_ai(
         false,
         None,
         "metadata",
+        None,
     )
     .await
     {

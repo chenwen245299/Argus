@@ -130,6 +130,9 @@ const hasUnavailableEmbeddingModel = computed(() =>
 
 async function save() {
   if (saving.value) return
+  // Cancel any pending debounced auto-save so a manual click doesn't fire a
+  // duplicate IPC write right after.
+  if (autoSaveTimer) { clearTimeout(autoSaveTimer); autoSaveTimer = null }
   saving.value = true
   saveMsg.value = ''
   try {
@@ -166,12 +169,12 @@ async function rebuild(mode: 'full' | 'missing') {
     rebuildProgress.value = { done, total, failed }
 
     if (total === 0) {
-      rebuildMsg.value = mode === 'missing' ? '所有论文已同步，无需处理' : '暂无论文'
+      rebuildMsg.value = mode === 'missing' ? t('ragSettings.allSynced') : t('ragSettings.noPapers')
       return
     }
 
-    const chunkSize: number = form.value.chunk_size ?? 512
-    const chunkOverlap: number = form.value.chunk_overlap ?? 50
+    const chunkSize: number = form.value.chunk_size || 800
+    const chunkOverlap: number = form.value.chunk_overlap || 100
 
     // Small worker pool: the embedding API call dominates each paper's wall
     // time, so a few in-flight papers give a near-linear speedup.
@@ -204,9 +207,11 @@ async function rebuild(mode: 'full' | 'missing') {
     await Promise.all(workers)
 
     if (cancelRequested) {
-      rebuildMsg.value = `已暂停，已完成 ${done}/${total}。点击「同步缺失」可从断点继续。`
+      rebuildMsg.value = t('ragSettings.rebuildPaused', { done, total })
     } else {
-      rebuildMsg.value = `完成 ${done}/${total} 篇${failed > 0 ? `，${failed} 篇失败` : ''}`
+      rebuildMsg.value = failed > 0
+        ? t('ragSettings.rebuildDoneWithFailed', { done, total, failed })
+        : t('ragSettings.rebuildDoneCount', { done, total })
     }
     await ragStore.loadStoreInfo()
   } catch (e) {
@@ -261,7 +266,7 @@ async function deleteModelEmbeddings(model: string) {
         :disabled="!form.enabled || embeddingModels.length === 0"
       >
         <option value="">
-          {{ embeddingModels.length ? '选择已启用的嵌入模型' : '暂无可用的嵌入模型' }}
+          {{ embeddingModels.length ? t('ragSettings.selectEmbeddingModel') : t('ragSettings.noEmbeddingModels') }}
         </option>
         <optgroup v-for="group in groupedEmbeddingModels" :key="group.id" :label="group.name">
           <option
@@ -274,9 +279,9 @@ async function deleteModelEmbeddings(model: string) {
         </optgroup>
       </select>
       <p v-if="hasUnavailableEmbeddingModel" class="field-warning">
-        当前嵌入模型未启用或不支持 embedding，请从已启用模型中重新选择。
+        {{ t('ragSettings.embeddingModelInvalid') }}
       </p>
-      <p v-else class="field-hint">从 AI 供应商中已启用的 embedding 模型里选择。</p>
+      <p v-else class="field-hint">{{ t('ragSettings.embeddingModelSource') }}</p>
     </div>
 
     <!-- Chunk size -->
@@ -345,14 +350,14 @@ async function deleteModelEmbeddings(model: string) {
 
     <!-- Rebuild -->
     <div class="rebuild-section">
-      <h3 class="store-title">向量库管理</h3>
-      <p class="field-hint">「同步缺失」只处理尚未向量化的论文，支持断点续建和增量添加；「完整重建」重新处理所有论文。</p>
+      <h3 class="store-title">{{ t('ragSettings.storeManage') }}</h3>
+      <p class="field-hint">{{ t('ragSettings.storeManageHint') }}</p>
       <div class="rebuild-controls">
         <button class="btn-primary sm" @click="rebuild('missing')" :disabled="rebuilding || !form.enabled">
-          同步缺失
+          {{ t('ragSettings.syncMissing') }}
         </button>
         <button class="btn-danger sm" @click="rebuild('full')" :disabled="rebuilding || !form.enabled">
-          完整重建
+          {{ t('ragSettings.fullRebuild') }}
         </button>
         <button v-if="rebuilding" class="btn-ghost sm" @click="cancelRebuild">
           {{ t('ragSettings.cancelBtn') }}
@@ -367,7 +372,7 @@ async function deleteModelEmbeddings(model: string) {
         </div>
         <div class="progress-meta">
           <span class="progress-count">{{ rebuildProgress.done }}/{{ rebuildProgress.total }}
-            <template v-if="rebuildProgress.failed > 0">（{{ rebuildProgress.failed }} 失败）</template>
+            <template v-if="rebuildProgress.failed > 0">{{ t('ragSettings.failedCount', { n: rebuildProgress.failed }) }}</template>
           </span>
           <span v-if="rebuildCurrentPaper" class="progress-paper" :title="rebuildCurrentPaper">
             {{ rebuildCurrentPaper }}

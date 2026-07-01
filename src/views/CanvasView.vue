@@ -27,9 +27,13 @@ import '@vue-flow/minimap/dist/style.css'
 import { renderMarkdown } from '../utils/renderMarkdown'
 import { useCanvasStore } from '../stores/canvas'
 import { useLibraryStore } from '../stores/library'
+import { useCanvasHistory, type CanvasSnapshot } from '../composables/useCanvasHistory'
 import { recordPaperAccess, sortPapersByRecentAccess } from '../utils/recentPapers'
 import PaperNode from '../components/canvas/PaperNode.vue'
 import AdjustableEdge from '../components/canvas/AdjustableEdge.vue'
+import TextNode from '../components/canvas/TextNode.vue'
+import ShapeNode from '../components/canvas/ShapeNode.vue'
+import LineNode from '../components/canvas/LineNode.vue'
 import SuggestPanel from '../components/canvas/SuggestPanel.vue'
 import ExportDialog from '../components/canvas/ExportDialog.vue'
 import type { PaperIndexEntry, CanvasNode as CNode, CanvasEdge as CEdge, Canvas, SuggestedEdge, NodePosition } from '../types'
@@ -70,7 +74,7 @@ async function watchWindowSize() {
 
 // ── Vue Flow setup ────────────────────────────────────────────────────────────
 
-const nodeTypes = markRaw({ paper: PaperNode })
+const nodeTypes = markRaw({ paper: PaperNode, text: TextNode, shape: ShapeNode, line: LineNode })
 const edgeTypes = markRaw({ adjustable: AdjustableEdge })
 const PAN_ON_DRAG_BUTTONS = [1, 2]
 
@@ -95,6 +99,15 @@ const {
   setViewport,
   fitView,
 } = useVueFlow()
+
+// Unique id generators — random + index guards against collisions when several
+// ids are minted within the same tick (e.g. accept-all suggestions).
+function newNodeId(i = 0): string {
+  return `node-${Date.now()}-${Math.floor(Math.random() * 1e6)}-${i}`
+}
+function newEdgeId(i = 0): string {
+  return `e-${Date.now()}-${Math.floor(Math.random() * 1e6)}-${i}`
+}
 
 type ConnectStartInfo = { nodeId?: string; handleId: string | null }
 const connectStart = ref<ConnectStartInfo | null>(null)
@@ -233,11 +246,74 @@ async function loadNoteTitles(cnodes: CNode[]) {
 
 function buildVfNodes(cnodes: CNode[]): VfNode[] {
   return cnodes.map(cn => {
+    const nt = cn.node_type ?? 'paper'
+    if (nt === 'text') {
+      return {
+        id: cn.node_id,
+        type: 'text',
+        position: { x: cn.x, y: cn.y },
+        zIndex: cn.z_index,
+        data: {
+          content: cn.content ?? '',
+          color: cn.color,
+          fontSize: cn.font_size,
+          bold: cn.font_bold,
+          italic: cn.font_italic,
+          fontFamily: cn.font_family,
+          textAlign: cn.text_align,
+          rotation: cn.rotation,
+          opacity: cn.opacity,
+          nodeId: cn.node_id,
+        },
+      } satisfies VfNode
+    }
+    if (nt === 'shape') {
+      return {
+        id: cn.node_id,
+        type: 'shape',
+        position: { x: cn.x, y: cn.y },
+        zIndex: cn.z_index,
+        data: {
+          content: cn.content ?? '',
+          color: cn.color,
+          fillColor: cn.fill_color,
+          nodeId: cn.node_id,
+          width: cn.width,
+          height: cn.height,
+          shapeKind: cn.shape_kind,
+          strokeWidth: cn.stroke_width,
+          cornerRadius: cn.corner_radius,
+          rotation: cn.rotation,
+          opacity: cn.opacity,
+        },
+      } satisfies VfNode
+    }
+    if (nt === 'line') {
+      return {
+        id: cn.node_id,
+        type: 'line',
+        position: { x: cn.x, y: cn.y },
+        zIndex: cn.z_index,
+        data: {
+          nodeId: cn.node_id,
+          lineKind: cn.line_kind ?? 'arrow',
+          color: cn.color,
+          strokeWidth: cn.stroke_width,
+          width: cn.width,
+          height: cn.height,
+          x1: cn.line_points?.[0]?.x ?? 0,
+          y1: cn.line_points?.[0]?.y ?? 0,
+          x2: cn.line_points?.[1]?.x ?? (cn.width ?? 0),
+          y2: cn.line_points?.[1]?.y ?? (cn.height ?? 0),
+        },
+      } satisfies VfNode
+    }
     const paper = paperById(cn.paper_id)
     return {
       id: cn.node_id,
       type: 'paper',
       position: { x: cn.x, y: cn.y },
+      zIndex: cn.z_index,
       data: {
         title: paper?.title ?? '???',
         authors: paper?.authors ?? [],
@@ -286,20 +362,74 @@ function buildVfEdges(cedges: CEdge[]): VfEdge[] {
 }
 
 function extractCanvasNodes(): CNode[] {
-  return (nodes.value as VfNode[]).map((n): CNode => ({
-    node_id: n.id,
-    paper_id: (n.data as Record<string, unknown>).paperId as string,
-    x: n.position.x,
-    y: n.position.y,
-    color: (n.data as Record<string, unknown>).color as string | undefined,
-    hover_source: (n.data as Record<string, unknown>).hoverSource as string | undefined,
-  }))
+  return (nodes.value as VfNode[]).map((n): CNode => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const d = n.data as any
+    const nt = n.type as string
+    if (nt === 'line') {
+      return {
+        node_id: n.id,
+        paper_id: '',
+        x: n.position.x,
+        y: n.position.y,
+        z_index: Number.isFinite(n.zIndex) ? (n.zIndex as number) : undefined,
+        color: d.color as string | undefined,
+        hover_source: undefined,
+        node_type: 'line',
+        width: Number.isFinite(d.width) ? d.width : undefined,
+        height: Number.isFinite(d.height) ? d.height : undefined,
+        stroke_width: Number.isFinite(d.strokeWidth) ? d.strokeWidth : undefined,
+        line_kind: d.lineKind as 'line' | 'arrow' | undefined,
+        line_points: [
+          { x: (d.x1 as number) ?? 0, y: (d.y1 as number) ?? 0 },
+          { x: (d.x2 as number) ?? 0, y: (d.y2 as number) ?? 0 },
+        ],
+      }
+    }
+    if (nt === 'text' || nt === 'shape') {
+      return {
+        node_id: n.id,
+        paper_id: '',
+        x: n.position.x,
+        y: n.position.y,
+        z_index: Number.isFinite(n.zIndex) ? (n.zIndex as number) : undefined,
+        color: d.color as string | undefined,
+        hover_source: undefined,
+        node_type: nt,
+        content: d.content as string | undefined,
+        font_size: nt === 'text' ? (d.fontSize as number | undefined) : undefined,
+        font_bold: nt === 'text' ? (d.bold as boolean | undefined) : undefined,
+        font_italic: nt === 'text' ? (d.italic as boolean | undefined) : undefined,
+        font_family: nt === 'text' ? (d.fontFamily as string | undefined) : undefined,
+        text_align: nt === 'text' ? (d.textAlign as 'left' | 'center' | 'right' | undefined) : undefined,
+        width: nt === 'shape' && Number.isFinite(d.width) ? d.width : undefined,
+        height: nt === 'shape' && Number.isFinite(d.height) ? d.height : undefined,
+        shape_kind: nt === 'shape' ? (d.shapeKind as 'rect' | 'ellipse' | 'diamond' | undefined) : undefined,
+        fill_color: nt === 'shape' ? (d.fillColor as string | undefined) : undefined,
+        stroke_width: nt === 'shape' && Number.isFinite(d.strokeWidth) ? d.strokeWidth : undefined,
+        corner_radius: nt === 'shape' && Number.isFinite(d.cornerRadius) ? d.cornerRadius : undefined,
+        rotation: Number.isFinite(d.rotation) ? d.rotation : undefined,
+        opacity: Number.isFinite(d.opacity) ? d.opacity : undefined,
+      }
+    }
+    return {
+      node_id: n.id,
+      paper_id: d.paperId as string,
+      x: n.position.x,
+      y: n.position.y,
+      color: d.color as string | undefined,
+      hover_source: d.hoverSource as string | undefined,
+    }
+  })
 }
 
 function extractCanvasEdges(): CEdge[] {
   return (edges.value as VfEdge[]).map((e): CEdge => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const d = e.data as any
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const style = e.style as any
+    const strokeWidth = Number(d?.edgeStrokeWidth ?? style?.strokeWidth ?? 1.8)
     const controlPoints = Array.isArray(d?.controlPoints)
       ? d.controlPoints.filter((point: unknown) => {
           if (!point || typeof point !== 'object') return false
@@ -315,8 +445,8 @@ function extractCanvasEdges(): CEdge[] {
       source_handle: e.sourceHandle ?? undefined,
       target_handle: e.targetHandle ?? undefined,
       label: typeof e.label === 'string' ? e.label || undefined : undefined,
-      color: d?.edgeColor || undefined,
-      stroke_width: d?.edgeStrokeWidth !== 1.8 ? d?.edgeStrokeWidth : undefined,
+      color: d?.edgeColor ?? style?.stroke ?? undefined,
+      stroke_width: Math.abs(strokeWidth - 1.8) > 0.01 ? strokeWidth : undefined,
       control_points: controlPoints.length ? controlPoints : undefined,
     }
   })
@@ -345,6 +475,8 @@ async function loadCanvas(id: string) {
   } else {
     fitView({ padding: 0.2 })
   }
+  // Seed the history baseline for this canvas. Loading is NOT an undoable step.
+  history.reset()
 }
 
 // ── Persist canvas (debounced) ────────────────────────────────────────────────
@@ -364,6 +496,25 @@ function triggerSave() {
     },
   }
   canvasStore.scheduleSave()
+}
+
+// ── Undo / redo history (snapshot based) ──────────────────────────────────────
+const history = useCanvasHistory({
+  capture: (): CanvasSnapshot => ({
+    nodes: extractCanvasNodes(),
+    edges: extractCanvasEdges(),
+  }),
+  restore: (snap) => {
+    nodes.value = buildVfNodes(snap.nodes)
+    edges.value = buildVfEdges(snap.edges)
+  },
+  persist: triggerSave,
+})
+
+// Record a structural change into history. Called from every real mutation
+// (add/remove/drag-stop/color/size/paste/accept/etc). No-op while restoring.
+function recordHistory() {
+  history.commit()
 }
 
 // ── Vue Flow event handlers ───────────────────────────────────────────────────
@@ -387,7 +538,7 @@ onConnect((params: Connection) => {
   if (exists) return
 
   const newEdge: VfEdge = {
-    id: `e-${Date.now()}`,
+    id: newEdgeId(),
     source: directed.source,
     target: directed.target,
     sourceHandle: directed.sourceHandle,
@@ -401,6 +552,7 @@ onConnect((params: Connection) => {
   }
   addEdges([newEdge])
   triggerSave()
+  recordHistory()
 })
 
 const isDraggingNode = ref(false)
@@ -416,6 +568,7 @@ onNodeDrag(() => {
 onNodeDragStop(() => {
   isDraggingNode.value = false
   triggerSave()
+  recordHistory()
 })
 
 onNodesChange(() => {
@@ -502,7 +655,7 @@ function addPaperToCanvas(paper: PaperIndexEntry) {
     return
   }
 
-  const nodeId = `node-${Date.now()}`
+  const nodeId = newNodeId()
   const vp = getViewport()
   const el = flowContainerRef.value
   const w = el ? el.clientWidth : 800
@@ -528,6 +681,7 @@ function addPaperToCanvas(paper: PaperIndexEntry) {
   addNodes([newNode])
   showPaperPicker.value = false
   triggerSave()
+  recordHistory()
 }
 
 // ── Node hover tooltip ────────────────────────────────────────────────────────
@@ -615,6 +769,7 @@ function ctxRemoveNode() {
   removeEdges((edges.value as VfEdge[]).filter(e => e.source === nodeId || e.target === nodeId).map(e => e.id))
   closeCtxMenu()
   triggerSave()
+  recordHistory()
 }
 
 function ctxRemoveEdge() {
@@ -623,6 +778,7 @@ function ctxRemoveEdge() {
   removeEdges([edgeId])
   closeCtxMenu()
   triggerSave()
+  recordHistory()
 }
 
 function ctxEditEdgeLabel() {
@@ -643,6 +799,7 @@ function commitEdgeLabel() {
   )
   editingEdgeId.value = null
   triggerSave()
+  recordHistory()
 }
 
 // ── Node / Edge shared color palette ─────────────────────────────────────────
@@ -690,6 +847,7 @@ function ctxSetEdgeColor(color: string | undefined) {
     }
   })
   triggerSave()
+  recordHistory()
 }
 
 function ctxSetEdgeStrokeWidth(w: number) {
@@ -706,6 +864,7 @@ function ctxSetEdgeStrokeWidth(w: number) {
     }
   })
   triggerSave()
+  recordHistory()
 }
 
 // ── Node color ────────────────────────────────────────────────────────────────
@@ -725,16 +884,23 @@ function ctxSetNodeColor(color: string | undefined) {
     return { ...n, data: { ...n.data, color } }
   })
   triggerSave()
+  recordHistory()
 }
 
 // ── M10: Accept suggestion as real edge ───────────────────────────────────────
-function acceptSuggestion(s: SuggestedEdge) {
+function acceptSuggestion(s: SuggestedEdge, index = 0) {
   const fromNode = (nodes.value as any[]).find(n => n.data?.paperId === s.from_paper_id)
   const toNode = (nodes.value as any[]).find(n => n.data?.paperId === s.to_paper_id)
   if (!fromNode || !toNode) return
 
+  // Skip if an edge with the same source/target already exists.
+  const exists = edges.value.some(
+    e => e.source === fromNode.id && e.target === toNode.id
+  )
+  if (exists) return
+
   const newEdge = {
-    id: `edge-${Date.now()}`,
+    id: newEdgeId(index),
     source: fromNode.id,
     target: toNode.id,
     type: 'adjustable',
@@ -747,10 +913,11 @@ function acceptSuggestion(s: SuggestedEdge) {
   }
   addEdges([newEdge])
   triggerSave()
+  recordHistory()
 }
 
 function acceptAllSuggestions(suggestions: SuggestedEdge[]) {
-  suggestions.forEach(s => acceptSuggestion(s))
+  suggestions.forEach((s, i) => acceptSuggestion(s, i))
 }
 
 // ── M10: Auto layout (enhanced) ──────────────────────────────────────────────
@@ -782,6 +949,7 @@ async function applyLayout(layout: 'timeline' | 'topological', direction: 'horiz
     await nextTick()
     fitView({ padding: 0.12 })
     triggerSave()
+    recordHistory()
   } catch (e) {
     console.error('Layout failed:', e)
   } finally {
@@ -871,6 +1039,7 @@ function autoLayout() {
   }))
 
   triggerSave()
+  recordHistory()
   nextTick(() => fitView({ padding: 0.1 }))
 }
 
@@ -885,6 +1054,21 @@ function onKeydown(e: KeyboardEvent) {
   if ((e.key === 'Delete' || e.key === 'Backspace') && ctxMenu.value.nodeId) {
     ctxRemoveNode()
   }
+
+  // Undo / redo. Skip when the user is typing in an input / editable region so
+  // the browser's native text undo keeps working there.
+  const el = e.target as HTMLElement | null
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return
+  const meta = e.metaKey || e.ctrlKey
+  if (!meta) return
+  const key = e.key.toLowerCase()
+  if (key === 'z' && !e.shiftKey) {
+    e.preventDefault()
+    history.undo()
+  } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+    e.preventDefault()
+    history.redo()
+  }
 }
 
 // ── Document click: close context menu ───────────────────────────────────────
@@ -898,6 +1082,12 @@ function onDocClick(e: MouseEvent) {
 
 function onEdgeControlChanged() {
   triggerSave()
+  recordHistory()
+}
+
+// Before an image export, fit all nodes into the viewport so nothing is cropped.
+function onExportFit() {
+  fitView({ padding: 0.12 })
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -930,6 +1120,7 @@ onMounted(async () => {
   document.addEventListener('keydown', onKeydown)
   document.addEventListener('pointerdown', onDocClick)
   window.addEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
+  window.addEventListener('argus-canvas-export-fit', onExportFit)
 })
 
 onUnmounted(() => {
@@ -939,6 +1130,7 @@ onUnmounted(() => {
   document.removeEventListener('keydown', onKeydown)
   document.removeEventListener('pointerdown', onDocClick)
   window.removeEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
+  window.removeEventListener('argus-canvas-export-fit', onExportFit)
   if (hoverTimer) clearTimeout(hoverTimer)
   if (windowResizeTimer) clearTimeout(windowResizeTimer)
   saveWindowSize()
@@ -947,6 +1139,9 @@ onUnmounted(() => {
 // Watch for library papers changes to update node validity
 watch(() => library.papers, () => {
   nodes.value = nodes.value.map(n => {
+    // Only paper nodes carry library-backed metadata; leave annotation nodes
+    // (text / shape / line) untouched so their data isn't clobbered.
+    if (n.type !== 'paper') return n
     const paper = paperById(n.data.paperId)
     return {
       ...n,

@@ -28,6 +28,10 @@ const isMac = navigator.userAgent.toLowerCase().includes('macintosh')
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let unlisten: UnlistenFn | null = null
+let unlistenClose: UnlistenFn | null = null
+// Latest markdown seen on input; flushed on close so a debounce that hasn't
+// fired yet doesn't drop the user's last edits when the window is destroyed.
+const latestContent = ref<string | null>(null)
 
 function noteWindowStorageKey() {
   return `argus:note-window:${windowLabel}`
@@ -72,10 +76,21 @@ async function flushSave(markdown: string) {
 
 function onContentChange(markdown: string) {
   clearTimeout(debounceTimer!)
+  latestContent.value = markdown
   const s = slug.value
   const nid = noteId.value
   if (!s || !nid) return
   debounceTimer = setTimeout(() => flushSave(markdown), 1500)
+}
+
+// Best-effort synchronous-ish save of the newest content (used before unload/close).
+async function flushPendingSave() {
+  if (latestContent.value === null) return
+  clearTimeout(debounceTimer!)
+  debounceTimer = null
+  const md = latestContent.value
+  latestContent.value = null
+  await flushSave(md)
 }
 
 onMounted(async () => {
@@ -91,11 +106,23 @@ onMounted(async () => {
       if (data.slug && data.noteId) await loadNote(data)
     }
   } catch {}
+
+  // Flush pending edits before the window actually closes (debounce may be mid-flight).
+  try {
+    unlistenClose = await getCurrentWebviewWindow().onCloseRequested(async () => {
+      await flushPendingSave()
+    })
+  } catch {}
 })
 
-onBeforeUnmount(() => {
+// Fallback for hard reloads / navigations that skip Tauri's close hook.
+window.addEventListener('beforeunload', () => { void flushPendingSave() })
+
+onBeforeUnmount(async () => {
   unlisten?.()
+  unlistenClose?.()
   clearTimeout(debounceTimer!)
+  await flushPendingSave()
 })
 </script>
 

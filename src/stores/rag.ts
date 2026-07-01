@@ -82,7 +82,9 @@ export const useRagStore = defineStore('rag', () => {
    * job is already embedding. Progress is exposed via `collectionEmbedJobs`.
    */
   async function embedCollection(collectionId: string, papers: PaperIndexEntry[]) {
-    if (collectionEmbedJobs.value[collectionId]) return
+    // Only block a truly in-progress job. A finished job lingers ~2s for UI
+    // feedback; re-embedding during that window must be allowed.
+    if (collectionEmbedJobs.value[collectionId]?.status === 'running') return
     // Claim the slot before any await so a rapid double-click can't start twice.
     setCollectionJob(collectionId, { done: 0, total: 0, failed: 0, status: 'running' })
 
@@ -157,7 +159,9 @@ export const useRagStore = defineStore('rag', () => {
       for (const p of queue) inFlightSlugs.delete(p.slug)
       // …and never leave a job stuck in 'running' (it would disable the menu
       // item and pin the progress badge forever).
-      if (collectionEmbedJobs.value[collectionId]?.status === 'running') {
+      const finalStatus: string | undefined =
+        collectionEmbedJobs.value[collectionId]?.status
+      if (finalStatus === 'running') {
         removeCollectionJob(collectionId)
       }
     }

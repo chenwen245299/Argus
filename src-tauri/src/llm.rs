@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -44,6 +46,7 @@ pub async fn chat_completion_stream(
     use_reasoning: bool,
     reasoning_effort: Option<&str>,
     source: &str,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
     if is_anthropic_protocol(provider) {
         stream_anthropic(
@@ -55,6 +58,7 @@ pub async fn chat_completion_stream(
             app,
             use_reasoning,
             source,
+            cancel,
         )
         .await
     } else {
@@ -68,6 +72,7 @@ pub async fn chat_completion_stream(
             use_reasoning,
             reasoning_effort,
             source,
+            cancel,
         )
         .await
     }
@@ -86,6 +91,7 @@ pub async fn chat_completion_stream_with_pdf(
     reasoning_effort: Option<&str>,
     source: &str,
     pdf_path: &std::path::Path,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
     stream_with_pdf_injected(
         provider,
@@ -98,6 +104,7 @@ pub async fn chat_completion_stream_with_pdf(
         reasoning_effort,
         source,
         pdf_path,
+        cancel,
     )
     .await
 }
@@ -475,6 +482,7 @@ async fn stream_with_pdf_injected(
     reasoning_effort: Option<&str>,
     source: &str,
     pdf_path: &std::path::Path,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
     let client = build_client()?;
     let url = format!(
@@ -562,6 +570,7 @@ async fn stream_with_pdf_injected(
 
     let reasoning_event = format!("{event_name}-reasoning");
     let mut stream = resp.bytes_stream();
+    let mut byte_buf: Vec<u8> = Vec::new();
     let mut buf = String::new();
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
@@ -570,8 +579,27 @@ async fn stream_with_pdf_injected(
     let mut usage_emitted = false;
 
     while let Some(chunk) = stream.next().await {
+        // Backend cancellation: if the user pressed stop, break out of the loop.
+        // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
+        // provider stops generating (and billing). Return the partial text.
+        if let Some(flag) = &cancel {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+        }
         let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        byte_buf.extend_from_slice(&bytes);
+        // Decode only up to the last complete UTF-8 boundary; keep the trailing
+        // incomplete bytes (a multi-byte char split across chunks) for next round.
+        let valid_up_to = match std::str::from_utf8(&byte_buf) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_up_to > 0 {
+            // Safe: bytes[..valid_up_to] is guaranteed valid UTF-8.
+            buf.push_str(unsafe { std::str::from_utf8_unchecked(&byte_buf[..valid_up_to]) });
+            byte_buf.drain(..valid_up_to);
+        }
 
         loop {
             match buf.find('\n') {
@@ -789,6 +817,7 @@ async fn stream_openai_compat(
     use_reasoning: bool,
     reasoning_effort: Option<&str>,
     source: &str,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
     let client = build_client()?;
     let url = format!(
@@ -876,6 +905,7 @@ async fn stream_openai_compat(
 
     let reasoning_event = format!("{event_name}-reasoning");
     let mut stream = resp.bytes_stream();
+    let mut byte_buf: Vec<u8> = Vec::new();
     let mut buf = String::new();
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
@@ -884,8 +914,26 @@ async fn stream_openai_compat(
     let mut usage_emitted = false;
 
     while let Some(chunk) = stream.next().await {
+        // Backend cancellation: if the user pressed stop, break out of the loop.
+        // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
+        // provider stops generating (and billing). Return the partial text.
+        if let Some(flag) = &cancel {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+        }
         let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        byte_buf.extend_from_slice(&bytes);
+        // Decode only up to the last complete UTF-8 boundary; keep the trailing
+        // incomplete bytes (a multi-byte char split across chunks) for next round.
+        let valid_up_to = match std::str::from_utf8(&byte_buf) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_up_to > 0 {
+            buf.push_str(unsafe { std::str::from_utf8_unchecked(&byte_buf[..valid_up_to]) });
+            byte_buf.drain(..valid_up_to);
+        }
 
         loop {
             match buf.find('\n') {
@@ -1079,6 +1127,7 @@ async fn stream_anthropic(
     app: &tauri::AppHandle,
     use_reasoning: bool,
     source: &str,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
     let client = build_client()?;
     let url = format!("{}/messages", provider.base_url.trim_end_matches('/'));
@@ -1137,14 +1186,33 @@ async fn stream_anthropic(
 
     let reasoning_event = format!("{event_name}-reasoning");
     let mut stream = resp.bytes_stream();
+    let mut byte_buf: Vec<u8> = Vec::new();
     let mut buf = String::new();
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
+        // Backend cancellation: if the user pressed stop, break out of the loop.
+        // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
+        // provider stops generating (and billing). Return the partial text.
+        if let Some(flag) = &cancel {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+        }
         let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        byte_buf.extend_from_slice(&bytes);
+        // Decode only up to the last complete UTF-8 boundary; keep the trailing
+        // incomplete bytes (a multi-byte char split across chunks) for next round.
+        let valid_up_to = match std::str::from_utf8(&byte_buf) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_up_to > 0 {
+            buf.push_str(unsafe { std::str::from_utf8_unchecked(&byte_buf[..valid_up_to]) });
+            byte_buf.drain(..valid_up_to);
+        }
 
         loop {
             match buf.find('\n') {

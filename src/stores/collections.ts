@@ -88,17 +88,24 @@ export const useCollectionsStore = defineStore('collections', () => {
   }
 
   function listAllPapersInTree(collectionId: string): PaperIndexEntry[] {
-    const ids = new Set<string>([collectionId])
+    // Collect every collection id in this subtree (including the root itself).
+    const collectionIds = new Set<string>([collectionId])
     const queue = [collectionId]
     while (queue.length > 0) {
       const id = queue.pop()!
       for (const child of childrenOf(id)) {
-        if (!ids.has(child.id)) { ids.add(child.id); queue.push(child.id) }
+        if (!collectionIds.has(child.id)) { collectionIds.add(child.id); queue.push(child.id) }
       }
     }
+    // Gather paper ids assigned anywhere in the subtree, filtering out ghost
+    // papers (assignments whose paper no longer exists in the library) so the
+    // list matches the badge count produced by paperCountsByCollection.
+    const existingPaperIds = new Set(library.papers.map(p => p.id))
     const paperIds = new Set<string>()
     for (const a of file.value.assignments) {
-      if (ids.has(a.collection_id)) paperIds.add(a.paper_id)
+      if (collectionIds.has(a.collection_id) && existingPaperIds.has(a.paper_id)) {
+        paperIds.add(a.paper_id)
+      }
     }
     return library.papers.filter(p => paperIds.has(p.id))
   }

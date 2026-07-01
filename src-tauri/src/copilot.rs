@@ -129,6 +129,7 @@ pub async fn chat_with_paper(
         None,
         "fulltext",
         false,
+        None,
     )
     .await
 }
@@ -145,6 +146,7 @@ pub async fn chat_with_paper_on_event(
     reasoning_effort: Option<&str>,
     context_mode: &str,
     use_pdf: bool,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String, String> {
     let (provider, api_key, model) =
         ai_manager::resolve_provider_model(root, provider_id, model_id)?;
@@ -236,6 +238,7 @@ pub async fn chat_with_paper_on_event(
             reasoning_effort,
             "copilot",
             &pdf_path,
+            cancel,
         )
         .await;
     }
@@ -250,6 +253,7 @@ pub async fn chat_with_paper_on_event(
         use_reasoning,
         reasoning_effort,
         "copilot",
+        cancel,
     )
     .await
 }
@@ -286,6 +290,7 @@ pub async fn chat_with_library(
     selected_paper_slugs: Option<&[String]>,
     attachments: Option<&[ChatContentPart]>,
     app: &tauri::AppHandle,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String, String> {
     use tauri::Emitter;
 
@@ -420,6 +425,7 @@ pub async fn chat_with_library(
         false,
         None,
         "library_chat",
+        cancel,
     )
     .await
 }

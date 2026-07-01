@@ -599,7 +599,10 @@ function hitChunk(sx: number, sy: number): number | null {
   const d = data.value
   if (!d || !showChunks.value) return null
   let best: number | null = null
-  let bestDist = 7
+  // Match the on-screen dot radius (see render) so hit-testing scales with zoom
+  // instead of using a fixed 7px that felt unresponsive when zoomed in/out.
+  const dotR = Math.max(1.4, Math.min(2.6, 1.2 * scale))
+  let bestDist = Math.max(6, dotR + 3)
   for (let i = 0; i < d.chunks.length; i++) {
     const ch = d.chunks[i]
     const p = ch.paper
@@ -955,7 +958,7 @@ onUnmounted(() => {
       <div
         v-if="hoverInfo"
         class="em-tooltip"
-        :style="{ left: `${Math.min(hoverInfo.x + 14, cssW - 280)}px`, top: `${hoverInfo.y + 14}px` }"
+        :style="{ left: `${Math.max(8, Math.min(hoverInfo.x + 14, cssW - 280))}px`, top: `${hoverInfo.y + 14 + 80 > cssH ? Math.max(8, hoverInfo.y - 80) : hoverInfo.y + 14}px` }"
       >
         <div class="em-tooltip-title">{{ hoverInfo.title }}</div>
         <div class="em-tooltip-sub">{{ hoverInfo.sub }}</div>

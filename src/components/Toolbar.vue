@@ -420,6 +420,7 @@ interface PaperTaskStatusItem {
   label: string
   detail?: string
   active?: boolean
+  stage: string
 }
 
 function paperTaskTitle(slug: string) {
@@ -486,29 +487,35 @@ function aiSummaryDetail(slug: string, job: AiSummaryJob): string {
 const paperTaskItems = computed<PaperTaskStatusItem[]>(() => {
   const items = Object.entries(aiSummaryJobs.value).map(([slug, job]) => {
     const action = job.kind === 'extract' ? t('extraction.reExtract') : t('paper.summarizeAi')
+    const stage = aiSummaryStageLabel(job)
     return {
       id: `${job.kind}:${slug}`,
-      label: `${action} · ${aiSummaryStageLabel(job)}`,
+      label: `${action} · ${stage}`,
       detail: aiSummaryDetail(slug, job),
       active: paperTasks.isAiSummaryActive(slug),
+      stage,
     }
   })
 
   if (aiMetaSlug.value) {
+    const stage = aiMetaStageLabel()
     items.push({
       id: `meta:${aiMetaSlug.value}`,
-      label: `${t('paper.extractMetaAi')} · ${aiMetaStageLabel()}`,
+      label: `${t('paper.extractMetaAi')} · ${stage}`,
       detail: paperTaskTitle(aiMetaSlug.value),
       active: true,
+      stage,
     })
   }
 
   if (abstractSlug.value) {
+    const stage = t('paper.extractAbstractAiIng')
     items.push({
       id: `abstract:${abstractSlug.value}`,
-      label: `${t('paper.extractAbstractAi')} · ${t('paper.extractAbstractAiIng')}`,
+      label: `${t('paper.extractAbstractAi')} · ${stage}`,
       detail: paperTaskTitle(abstractSlug.value),
       active: true,
+      stage,
     })
   }
 
@@ -735,7 +742,7 @@ onUnmounted(() => {
                 <polyline points="20 6 9 17 4 12"/>
               </svg>
               <span class="batch-item-name">{{ item.detail?.split('\n')[0] ?? item.id }}</span>
-              <span class="batch-item-stage">{{ aiSummaryStageLabel(aiSummaryJobs[item.id.replace(/^[^:]+:/, '')]) }}</span>
+              <span class="batch-item-stage">{{ item.stage }}</span>
             </div>
             <div v-if="!paperTaskItems.length" class="batch-detail-empty">正在准备…</div>
           </div>

@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import type { AiSettingsInfo, AppSettings } from '../types'
+
+const { t } = useI18n()
 
 interface UsageRecord {
   ts: string
@@ -23,11 +26,11 @@ const appSettings = ref<AppSettings | null>(null)
 const loading = ref(false)
 const range = ref<Range>('week')
 
-const RANGES: { key: Range; label: string }[] = [
-  { key: 'today', label: '今天' },
-  { key: 'week',  label: '本周' },
-  { key: 'month', label: '本月' },
-  { key: 'year',  label: '本年' },
+const RANGES: { key: Range }[] = [
+  { key: 'today' },
+  { key: 'week' },
+  { key: 'month' },
+  { key: 'year' },
 ]
 
 const BAR_STACK_HEIGHT = 96
@@ -374,7 +377,7 @@ onMounted(load)
 
       <!-- Header -->
       <div class="usage-header">
-        <span class="usage-title">AI Token 用量</span>
+        <span class="usage-title">{{ t('tokenUsage.title') }}</span>
         <div class="header-right">
           <!-- Range selector -->
           <div class="range-tabs">
@@ -382,7 +385,7 @@ onMounted(load)
               v-for="r in RANGES" :key="r.key"
               class="range-tab" :class="{ active: range === r.key }"
               @click="range = r.key"
-            >{{ r.label }}</button>
+            >{{ t('tokenUsage.' + r.key) }}</button>
           </div>
           <button class="btn-close" @click="emit('close')">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -393,26 +396,26 @@ onMounted(load)
       </div>
 
       <!-- Loading -->
-      <div v-if="loading" class="usage-loading">加载中…</div>
+      <div v-if="loading" class="usage-loading">{{ t('tokenUsage.loading') }}</div>
 
       <div v-else class="usage-body">
 
         <!-- Summary cards -->
         <div class="summary-cards">
           <div class="summary-card">
-            <span class="card-label">总 Input Tokens</span>
+            <span class="card-label">{{ t('tokenUsage.totalInput') }}</span>
             <span class="card-value input-color">{{ fmtT(totalInput) }}</span>
           </div>
           <div class="summary-card">
-            <span class="card-label">总 Output Tokens</span>
+            <span class="card-label">{{ t('tokenUsage.totalOutput') }}</span>
             <span class="card-value output-color">{{ fmtT(totalOutput) }}</span>
           </div>
           <div v-if="totalCost !== null" class="summary-card">
-            <span class="card-label">费用（人民币）</span>
+            <span class="card-label">{{ t('tokenUsage.cost') }}</span>
             <span class="card-value cost-color">{{ totalCost < 0.001 ? '¥0.00' : '¥' + totalCost.toFixed(2) }}</span>
           </div>
           <div class="summary-card dim">
-            <span class="card-label">调用次数</span>
+            <span class="card-label">{{ t('tokenUsage.calls') }}</span>
             <span class="card-value">{{ filteredRecords.length }}</span>
           </div>
         </div>
@@ -421,12 +424,12 @@ onMounted(load)
         <div class="chart-card time-chart-card">
           <div class="chart-head">
             <div>
-              <div class="chart-title">按时间分布</div>
-              <div class="chart-subtitle">不同模型 token 用量的日常变化</div>
+              <div class="chart-title">{{ t('tokenUsage.byTime') }}</div>
+              <div class="chart-subtitle">{{ t('tokenUsage.byTimeSub') }}</div>
             </div>
           </div>
 
-          <div v-if="filteredRecords.length === 0" class="chart-empty">该时间段内暂无数据</div>
+          <div v-if="filteredRecords.length === 0" class="chart-empty">{{ t('tokenUsage.noData') }}</div>
           <div v-else class="chart-wrap">
             <div class="bars-area">
               <div
@@ -468,7 +471,7 @@ onMounted(load)
               </template>
               <span v-if="modelRanking.length > modelLegend.length" class="legend-hint">+{{ modelRanking.length - modelLegend.length }}</span>
               <template v-if="!hasCostData">
-                <span class="legend-hint">在设置→AI 服务中配置单价或使用 OpenRouter 后显示花费</span>
+                <span class="legend-hint">{{ t('tokenUsage.priceHint') }}</span>
               </template>
             </div>
           </div>
@@ -478,8 +481,8 @@ onMounted(load)
         <div v-if="modelRanking.length > 0" class="chart-card model-chart-card">
           <div class="chart-head">
             <div>
-              <div class="chart-title">按模型分布</div>
-              <div class="chart-subtitle">当前时间范围内的模型用量排行</div>
+              <div class="chart-title">{{ t('tokenUsage.byModel') }}</div>
+              <div class="chart-subtitle">{{ t('tokenUsage.byModelSub') }}</div>
             </div>
           </div>
           <div class="model-list">

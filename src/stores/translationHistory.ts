@@ -58,7 +58,7 @@ export function startTranslation(sourceText: string) {
 
 export function appendTranslationChunk(delta: string) {
   currentTranslation.result += delta
-  currentTranslation.loading = false
+  // loading stays true during streaming; only finish/fail clears it.
 }
 
 export function finishTranslation() {

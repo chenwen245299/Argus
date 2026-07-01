@@ -466,7 +466,7 @@ pub async fn translate_text_stream(
     tauri::async_runtime::spawn(async move {
         let _ = crate::llm::chat_completion_stream(
             &provider, &api_key, &model, &messages,
-            &event_name, &app, false, None, "translate",
+            &event_name, &app, false, None, "translate", None,
         )
         .await;
     });
@@ -1238,10 +1238,13 @@ pub async fn chat_with_paper_event(
     reasoning_effort: Option<String>,
     context_mode: Option<String>,
     use_pdf: Option<bool>,
+    request_id: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
+    // Register a cancel flag; the guard unregisters it on every exit path.
+    let (_cancel_guard, cancel) = crate::cancel::CancelGuard::new(request_id);
     copilot::chat_with_paper_on_event(
         &root,
         &slug,
@@ -1254,6 +1257,7 @@ pub async fn chat_with_paper_event(
         reasoning_effort.as_deref(),
         context_mode.as_deref().unwrap_or("fulltext"),
         use_pdf.unwrap_or(false),
+        cancel,
     )
     .await
 }
@@ -1461,6 +1465,7 @@ pub async fn chat_with_library(
     knowledge_source: Option<String>,
     selected_paper_slugs: Option<Vec<String>>,
     attachments: Option<Vec<crate::models::ChatContentPart>>,
+    request_id: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -1468,6 +1473,8 @@ pub async fn chat_with_library(
     let event_name = event_name.unwrap_or_else(|| "library-chat".to_string());
     let sources_event_name =
         sources_event_name.unwrap_or_else(|| "library-chat-sources".to_string());
+    // Register a cancel flag; the guard unregisters it on every exit path.
+    let (_cancel_guard, cancel) = crate::cancel::CancelGuard::new(request_id);
     copilot::chat_with_library(
         &root,
         messages,
@@ -1479,6 +1486,7 @@ pub async fn chat_with_library(
         selected_paper_slugs.as_deref(),
         attachments.as_deref(),
         &app,
+        cancel,
     )
     .await
 }

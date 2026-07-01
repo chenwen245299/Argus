@@ -835,11 +835,15 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
 
     let concurrency = config.ai_analysis_concurrency.clamp(1, 10) as usize;
 
-    if analysis_running().load(Ordering::SeqCst) {
+    // Atomically claim the "running" flag: only the caller that flips it from
+    // false→true proceeds; concurrent callers see it already set and bail out.
+    if analysis_running()
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Ok(());
     }
     analysis_cancel().store(false, Ordering::SeqCst);
-    analysis_running().store(true, Ordering::SeqCst);
     analysis_progress_done().store(0, Ordering::SeqCst);
     analysis_progress_total().store(0, Ordering::SeqCst);
 

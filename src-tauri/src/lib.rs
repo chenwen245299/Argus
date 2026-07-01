@@ -2,6 +2,7 @@ mod ai_manager;
 mod ai_summary;
 mod arxiv;
 mod arxiv_scheduler;
+mod cancel;
 mod canvas;
 mod canvas_enhance;
 mod collections;
@@ -183,6 +184,7 @@ pub fn run() {
             commands::search_library_chunks,
             // ── M7: Library chat ──
             commands::chat_with_library,
+            cancel::cancel_ai_request,
             commands::open_note_window,
             commands::open_paper_ai_window,
             commands::open_library_chat_window,

@@ -1,9 +1,9 @@
 <template>
   <div class="mermaid-block">
-    <div v-if="status === 'pending'" class="mermaid-loading">渲染图表中…</div>
+    <div v-if="status === 'pending'" class="mermaid-loading">{{ t('mermaid.rendering') }}</div>
     <div v-else-if="status === 'done'" class="mermaid-svg-wrap">
       <div class="mermaid-inner" v-html="svgHtml" />
-      <button class="mermaid-copy-btn" title="复制图片" @click="copyAsImage">
+      <button class="mermaid-copy-btn" :title="t('mermaid.copyImage')" @click="copyAsImage">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
       </button>
     </div>
@@ -16,9 +16,12 @@
 
 <script setup lang="ts">
 import { ref, watch, onMounted } from 'vue'
+import { useI18n } from 'vue-i18n'
 import DOMPurify from 'dompurify'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
+
+const { t } = useI18n()
 
 const props = defineProps<{ src: string; streaming?: boolean }>()
 
@@ -40,9 +43,9 @@ async function copyAsImage() {
   try {
     const pngBlob = await svgStringToPngBlob(svgHtml.value)
     await copyPngBlobToClipboard(pngBlob)
-    showToast('图片已复制到剪贴板')
+    showToast(t('mermaid.copied'))
   } catch {
-    showToast('复制失败')
+    showToast(t('mermaid.copyFailed'))
   }
 }
 

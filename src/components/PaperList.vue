@@ -2296,7 +2296,9 @@ async function reExtract(item: PaperIndexEntry) {
   flex-wrap: wrap;
   gap: 4px;
   max-width: 190px;
-  max-height: 150px;
+  /* Show at most ~3 rows (chip ≈18px + 4px gap); the rest scrolls. The extra
+     few px reveal a sliver of the next row as a scroll affordance. */
+  max-height: 72px;
   overflow-y: auto;
   padding-right: 4px;
 }

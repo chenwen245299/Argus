@@ -80,7 +80,8 @@ export const useReaderStore = defineStore('reader', () => {
   function switchTab(slug: string) {
     if (activeSlug.value === slug) return
     if (!tabs.value.find(t => t.slug === slug)) return
-    recordPaperAccess(slug)
+    // Note: switching to an already-open tab is NOT a new "open" — recency is
+    // recorded only in openPaper, so "最近阅读" stays ordered by open order.
     activeSlug.value = slug
   }
 

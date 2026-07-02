@@ -28,7 +28,7 @@ import { renderMarkdown } from '../utils/renderMarkdown'
 import { useCanvasStore } from '../stores/canvas'
 import { useLibraryStore } from '../stores/library'
 import { useCanvasHistory, type CanvasSnapshot } from '../composables/useCanvasHistory'
-import { recordPaperAccess, sortPapersByRecentAccess } from '../utils/recentPapers'
+import { sortPapersByRecentAccess } from '../utils/recentPapers'
 import PaperNode from '../components/canvas/PaperNode.vue'
 import AdjustableEdge from '../components/canvas/AdjustableEdge.vue'
 import TextNode from '../components/canvas/TextNode.vue'
@@ -644,7 +644,7 @@ function openPaperPicker() {
 }
 
 function addPaperToCanvas(paper: PaperIndexEntry) {
-  recordPaperAccess(paper.slug)
+  // Adding a paper to the canvas isn't "reading" — don't touch recency.
   const cv = canvasStore.currentCanvas
   if (!cv) return
 

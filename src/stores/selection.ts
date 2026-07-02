@@ -1,7 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { NavItem, SearchHit } from '../types'
-import { recordPaperAccess } from '../utils/recentPapers'
 
 export const useSelectionStore = defineStore('selection', () => {
   const selectedSlug = ref<string | null>(null)
@@ -15,7 +14,8 @@ export const useSelectionStore = defineStore('selection', () => {
   const searchResults = ref<SearchHit[]>([])
 
   function selectPaper(slug: string | null) {
-    recordPaperAccess(slug)
+    // Selecting a row only previews it — it is not "opening/reading", so it must
+    // not affect "最近阅读" order (that's recorded in reader.openPaper).
     selectedSlug.value = slug
   }
 

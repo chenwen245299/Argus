@@ -11,7 +11,7 @@ import { renderMarkdown, getSegments } from '../utils/renderMarkdown'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
 import { buildChunks } from '../utils/chunker'
-import { recordPaperAccess, sortPapersByRecentAccess } from '../utils/recentPapers'
+import { sortPapersByRecentAccess } from '../utils/recentPapers'
 import type { ChatContentPart, ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
 
 const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag'] }>()
@@ -331,7 +331,7 @@ function openPaperPicker() {
 }
 
 function addSelectedPaper(paper: PaperIndexEntry) {
-  recordPaperAccess(paper.slug)
+  // Adding a paper to the chat context isn't "reading" — don't touch recency.
   if (!selectedPaperSlugs.value.includes(paper.slug)) {
     setActiveSelectedPaperSlugs([...selectedPaperSlugs.value, paper.slug])
   }

@@ -11,6 +11,7 @@ import { useRagStore } from '../stores/rag'
 import CollectionNode from './CollectionNode.vue'
 import type { CanvasIndexEntry, Collection, NavItem } from '../types'
 import { updateStore } from '../stores/update'
+import { filterRecentlyRead, recentPapersVersion } from '../utils/recentPapers'
 import { libraries as snippetLibraries, snippets as allSnippets, createLibrary as createSnippetLibrary, deleteLibrary as deleteSnippetLibrary, renameLibrary as renameSnippetLibrary, loadAll as reloadSnippets } from '../stores/snippetLibrary'
 
 const { t } = useI18n()
@@ -20,6 +21,12 @@ const collectionsStore = useCollectionsStore()
 const canvasStore = useCanvasStore()
 const readerStore = useReaderStore()
 const ragStore = useRagStore()
+
+// Count of papers that have actually been opened (still present in the library).
+const recentCount = computed(() => {
+  void recentPapersVersion.value
+  return filterRecentlyRead(library.papers).length
+})
 
 const showSettings = defineModel<boolean>('showSettings', { default: false })
 const props = defineProps<{ snippetLibraryVisible?: boolean }>()
@@ -845,6 +852,22 @@ onUnmounted(() => {
               </svg>
               {{ t('sidebar.allPapers') }}
               <span class="badge">{{ library.papers.length }}</span>
+            </button>
+          </div>
+
+          <!-- Recently Read -->
+          <div class="all-papers-section">
+            <button
+              class="nav-item"
+              :class="{ active: selection.activeNav === 'recent' }"
+              @click="select('recent')"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9"/>
+                <polyline points="12 7 12 12 15 14"/>
+              </svg>
+              {{ t('sidebar.recentPapers') }}
+              <span class="badge">{{ recentCount }}</span>
             </button>
           </div>
 

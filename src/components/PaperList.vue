@@ -19,6 +19,7 @@ import StatusBadges from './StatusBadges.vue'
 import CollectionCascadeMenu from './CollectionCascadeMenu.vue'
 import { titleInitialCaps } from '../utils/text'
 import { noteBadgeStyle } from '../utils/noteBadges'
+import { filterRecentlyRead, recentPapersVersion } from '../utils/recentPapers'
 import type { Collection, Note, PaperIndexEntry, PaperMeta, SortField, SortDir } from '../types'
 
 const { t } = useI18n()
@@ -464,6 +465,11 @@ watch(() => library.papers, () => {
 const filtered = computed<PaperIndexEntry[]>(() => {
   const nav = selection.activeNav
   if (nav === 'inbox' || nav === 'search') return []
+  if (nav === 'recent') {
+    // Touch the reactive version so the list refreshes when papers are opened.
+    void recentPapersVersion.value
+    return filterRecentlyRead(library.papers)
+  }
   let list = nav.startsWith('collection:') ? collectionPapers.value : library.papers
   const activeTag = selection.tagFilter ?? (nav.startsWith('tag:') ? nav.slice(4) : null)
   if (activeTag) list = list.filter(p => p.tags?.includes(activeTag))
@@ -1308,6 +1314,15 @@ async function reExtract(item: PaperIndexEntry) {
       </svg>
       <p>{{ t('list.inboxEmpty') }}</p>
       <span>{{ t('list.inboxHint') }}</span>
+    </div>
+
+    <!-- ── Recently read (empty) ─────────────────────────────────────────── -->
+    <div v-else-if="selection.activeNav === 'recent' && sorted.length === 0 && !library.isLoading" class="empty-state">
+      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <circle cx="12" cy="12" r="9"/>
+        <polyline points="12 7 12 12 15 14"/>
+      </svg>
+      <p>{{ t('sidebar.recentEmpty') }}</p>
     </div>
 
     <!-- ── Empty state ───────────────────────────────────────────────────── -->

@@ -22,7 +22,7 @@ export const useSelectionStore = defineStore('selection', () => {
   function selectNav(item: NavItem) {
     navSelectionSeq.value += 1
     activeNav.value = item
-    if (item === 'all' || item === 'inbox') {
+    if (item === 'all' || item === 'recent' || item === 'inbox') {
       tagFilter.value = null
       activeCollectionId.value = null
     } else if (item.startsWith('tag:')) {

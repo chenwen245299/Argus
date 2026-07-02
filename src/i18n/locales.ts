@@ -43,6 +43,8 @@ export const zh = {
   sidebar: {
     library: '文献库',
     allPapers: '所有论文',
+    recentPapers: '最近阅读',
+    recentEmpty: '还没有最近阅读的论文',
     inbox: '收件箱',
     soon: '即将',
     tags: '标签',
@@ -972,6 +974,8 @@ export const en: typeof zh = {
   sidebar: {
     library: 'Library',
     allPapers: 'All Papers',
+    recentPapers: 'Recently Read',
+    recentEmpty: 'No recently read papers yet',
     inbox: 'Inbox',
     soon: 'Soon',
     tags: 'Tags',

@@ -1426,6 +1426,18 @@ onUnmounted(() => {
   border-bottom: 1px solid var(--border-subtle);
 }
 
+/* All Papers + Recently Read read as one group — no divider between them:
+   drop the first section's bottom border/margin and the next's top border. */
+.all-papers-section:has(+ .all-papers-section) {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+.all-papers-section + .all-papers-section {
+  padding-top: 0;
+  border-top: none;
+}
+
 .all-papers-section .nav-item {
   margin-top: 0;
   margin-bottom: 0;

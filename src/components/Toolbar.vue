@@ -243,6 +243,10 @@ function onDocClick(e: MouseEvent) {
     const strip = document.querySelector('.batch-progress-strip')
     if (strip && !strip.contains(e.target as Node)) showBatchDetail.value = false
   }
+  if (showPaperTaskDetail.value) {
+    const strip = document.querySelector('.paper-task-strip')
+    if (strip && !strip.contains(e.target as Node)) showPaperTaskDetail.value = false
+  }
 }
 
 function submitUrl() {
@@ -366,10 +370,13 @@ async function startBatchAnalysis() {
     return
   }
 
-  // Get papers for current view
+  // Get papers for current view. Use the recursive tree walk (same as PaperList)
+  // so a top-level category picks up papers held only in its sub-collections —
+  // list_papers_in_collection returns only directly-assigned papers and would
+  // yield nothing for a parent category, aborting the batch before it starts.
   const collId = selection.activeCollectionId
   let papers = collId
-    ? await collectionsStore.listPapersInCollection(collId).catch(() => [] as typeof library.papers)
+    ? collectionsStore.listAllPapersInTree(collId)
     : [...library.papers]
 
   // Apply tag filter consistent with PaperList
@@ -521,8 +528,13 @@ const paperTaskItems = computed<PaperTaskStatusItem[]>(() => {
 
   return items
 })
-const visiblePaperTaskItems = computed(() => paperTaskItems.value.slice(0, 2))
-const hiddenPaperTaskCount = computed(() => Math.max(0, paperTaskItems.value.length - visiblePaperTaskItems.value.length))
+// When several manual tasks run at once, merge them into one chip (like batch)
+// instead of one badge per task, which eats toolbar space.
+const paperTaskActiveCount = computed(() => paperTaskItems.value.filter(i => i.active).length)
+const paperTaskDoneCount = computed(() => paperTaskItems.value.length - paperTaskActiveCount.value)
+const showPaperTaskDetail = ref(false)
+// Collapse the detail popover once we're back to fewer than 2 tasks.
+watch(() => paperTaskItems.value.length, len => { if (len < 2) showPaperTaskDetail.value = false })
 
 // arXiv button state
 const arxivNewCount = ref(0)
@@ -750,21 +762,63 @@ onUnmounted(() => {
       </Transition>
     </div>
 
+    <!-- Manual AI tasks: single chip when one, merged chip + popover when many -->
     <div v-if="paperTaskItems.length && !batchRunning" class="paper-task-strip">
+      <!-- Single task → plain chip -->
       <span
-        v-for="item in visiblePaperTaskItems"
-        :key="item.id"
+        v-if="paperTaskItems.length === 1"
+        :key="paperTaskItems[0].id"
         class="paper-task-chip"
-        :class="{ 'is-active': item.active }"
-        :title="item.detail || item.label"
+        :class="{ 'is-active': paperTaskItems[0].active }"
+        :title="paperTaskItems[0].detail || paperTaskItems[0].label"
       >
-        <span v-if="item.active" class="paper-task-spinner" />
+        <span v-if="paperTaskItems[0].active" class="paper-task-spinner" />
         <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="20 6 9 17 4 12"/>
         </svg>
-        <span class="paper-task-label">{{ item.label }}</span>
+        <span class="paper-task-label">{{ paperTaskItems[0].label }}</span>
       </span>
-      <span v-if="hiddenPaperTaskCount" class="paper-task-more">+{{ hiddenPaperTaskCount }}</span>
+
+      <!-- Multiple tasks → one merged chip with a detail popover -->
+      <template v-else>
+        <span
+          class="paper-task-chip batch-chip-clickable"
+          :class="{ 'is-active': paperTaskActiveCount > 0 }"
+          @click.stop="showPaperTaskDetail = !showPaperTaskDetail"
+        >
+          <span v-if="paperTaskActiveCount > 0" class="paper-task-spinner" />
+          <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+          <span class="paper-task-label">{{ t('paper.summarizeAi') }} {{ paperTaskDoneCount }}/{{ paperTaskItems.length }}</span>
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
+            <polyline :points="showPaperTaskDetail ? '18 15 12 9 6 15' : '6 9 12 15 18 9'"/>
+          </svg>
+        </span>
+
+        <Transition name="batch-detail">
+          <div v-if="showPaperTaskDetail" class="batch-detail-popover" @click.stop>
+            <div class="batch-detail-header">
+              <span class="batch-detail-title-text">{{ t('paper.summarizeAi') }}</span>
+              <span class="batch-detail-count">{{ paperTaskDoneCount }}/{{ paperTaskItems.length }}</span>
+            </div>
+            <div class="batch-detail-list">
+              <div
+                v-for="item in paperTaskItems"
+                :key="item.id"
+                class="batch-detail-item"
+              >
+                <span v-if="item.active" class="paper-task-spinner batch-item-spinner" />
+                <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+                <span class="batch-item-name">{{ item.detail?.split('\n')[0] ?? item.id }}</span>
+                <span class="batch-item-stage">{{ item.stage }}</span>
+              </div>
+            </div>
+          </div>
+        </Transition>
+      </template>
     </div>
 
     <!-- Embed-vector build progress (started from a collection's context menu) -->
@@ -1155,6 +1209,7 @@ onUnmounted(() => {
 }
 
 .paper-task-strip {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -1206,21 +1261,6 @@ onUnmounted(() => {
   border-radius: 50%;
   flex-shrink: 0;
   animation: spin 0.75s linear infinite;
-}
-
-.paper-task-more {
-  height: 22px;
-  min-width: 22px;
-  padding: 0 6px;
-  border-radius: var(--radius-pill);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--bg-hover);
-  color: var(--text-tertiary);
-  font-size: 11px;
-  font-weight: 600;
-  flex-shrink: 0;
 }
 
 /* Import status */
@@ -1320,7 +1360,11 @@ onUnmounted(() => {
 
 .ai-hub-btn {
   width: auto;
-  padding: 0 10px;
+  /* Reserve the left lane for the status dot in EVERY state (not just when
+     busy) so the button width is identical with or without a running task —
+     otherwise the button grows when a task starts and shifts its neighbours,
+     risking misclicks. The dot itself is absolutely positioned (no width). */
+  padding: 0 10px 0 18px;
   gap: 4px;
   position: relative;
   color: var(--text-secondary);
@@ -1329,8 +1373,6 @@ onUnmounted(() => {
 
 .ai-hub-btn.ai-busy {
   animation: arxiv-breathe 1.8s ease-in-out infinite;
-  /* reserve space on the left for the pulse dot so it never overlaps text */
-  padding-left: 18px;
 }
 
 .ai-hub-menu {
@@ -1375,13 +1417,15 @@ onUnmounted(() => {
 }
 
 .arxiv-pulse-dot {
-  /* corner indicator: out of flex flow so it never affects button width */
+  /* status indicator: out of flex flow so it never affects button width,
+     vertically centered in the reserved left lane */
   position: absolute;
-  top: 4px; left: 6px;
+  top: 50%;
+  left: 7px;
+  margin-top: -3px; /* half the dot height → true vertical center */
   width: 6px; height: 6px;
   border-radius: 50%;
   background: #ff4d7d;
-  flex-shrink: 0;
   animation: dot-pulse 1.8s ease-in-out infinite;
 }
 @keyframes dot-pulse {

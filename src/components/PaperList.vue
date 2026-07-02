@@ -823,7 +823,9 @@ async function deletePaper(item: PaperIndexEntry) {
     collectionsStore.file.assignments = collectionsStore.file.assignments.filter(a => a.paper_id !== item.id)
     collectionPapers.value = collectionPapers.value.filter(p => p.slug !== item.slug)
     if (selection.selectedSlug === item.slug) selection.selectPaper('')
-    if (reader.openSlug === item.slug) reader.closePaper()
+    // Close the deleted paper's tab whether or not it's the active one
+    // (closeTab is a no-op if it isn't open).
+    reader.closeTab(item.slug)
   } catch (e: unknown) { showError(String(e)) }
 }
 

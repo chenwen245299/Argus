@@ -18,10 +18,20 @@ import PDFWorkerLegacyUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = PDFWorkerLegacyUrl
 
+// One instance per open tab (MainView renders a v-for of viewers and shows only
+// the active one). `slug` is this tab's identity and never changes for an
+// instance — always operate on props.slug, not reader.activeSlug (the *visible*
+// tab). The instance is destroyed when its tab closes, releasing the PDF.
+const props = defineProps<{ slug: string }>()
+
 // ── Store & i18n ──────────────────────────────────────────────────────────────
 const reader = useReaderStore()
 const library = useLibraryStore()
 const { t } = useI18n()
+
+// True only while THIS tab is the one on screen — used to ignore global
+// commands/shortcuts that should hit the active viewer alone.
+const isActiveTab = computed(() => reader.activeSlug === props.slug)
 
 // ── State ──────────────────────────────────────────────────────────────────────
 const containerRef = ref<HTMLDivElement | null>(null)
@@ -36,6 +46,136 @@ const renderingPages = new Set<number>() // guard against concurrent renders
 // detect they're stale and discard their work instead of leaving a page
 // rendered at the wrong size (the zoom "ghost page" glitch).
 let renderGeneration = 0
+
+// ── Text-layer selection anchoring ──────────────────────────────────────────
+// PDF.js's bare TextLayer (used below) renders only the absolutely-positioned
+// text spans; it does NOT add the `endOfContent` element that the official
+// viewer's TextLayerBuilder relies on to keep drag-selection well-behaved.
+// Without it, dragging the mouse into whitespace makes the browser's native
+// selection latch onto content in DOM order (e.g. the page title/header),
+// producing a wildly over-extended selection. We replicate that mechanism here:
+// each text layer gets a hidden `endOfContent` div that we reposition into the
+// DOM at the live selection anchor, so dragging into blank space stays anchored
+// to the nearest text in reading order.
+const selTextLayers = new Map<HTMLElement, HTMLElement>() // textLayer div → endOfContent div
+let selListenersAbort: AbortController | null = null
+let selPointerDown = false
+let selPrevRange: Range | null = null
+
+function resetTextLayerSelecting(end: HTMLElement, textLayer: HTMLElement) {
+  textLayer.append(end)
+  end.style.width = ''
+  end.style.height = ''
+  textLayer.classList.remove('selecting')
+}
+
+function pruneDetachedTextLayers() {
+  // Drop entries for text layers removed by re-render (zoom/scale changes).
+  for (const layer of selTextLayers.keys()) {
+    if (!layer.isConnected) selTextLayers.delete(layer)
+  }
+}
+
+function onSelectionChange() {
+  const selection = document.getSelection()
+  if (!selection || selection.rangeCount === 0) {
+    selTextLayers.forEach(resetTextLayerSelecting)
+    return
+  }
+  pruneDetachedTextLayers()
+
+  // Mark which text layers the selection currently intersects.
+  const active = new Set<HTMLElement>()
+  for (let i = 0; i < selection.rangeCount; i++) {
+    const range = selection.getRangeAt(i)
+    for (const layer of selTextLayers.keys()) {
+      if (!active.has(layer) && range.intersectsNode(layer)) active.add(layer)
+    }
+  }
+  for (const [layer, end] of selTextLayers) {
+    if (active.has(layer)) layer.classList.add('selecting')
+    else resetTextLayerSelecting(end, layer)
+  }
+
+  // Move the endOfContent div next to the live anchor so the browser extends
+  // the selection toward it (in reading order) instead of into arbitrary DOM.
+  const range = selection.getRangeAt(0)
+  const modifyStart = !!selPrevRange &&
+    (range.compareBoundaryPoints(Range.END_TO_END, selPrevRange) === 0 ||
+     range.compareBoundaryPoints(Range.START_TO_END, selPrevRange) === 0)
+  let anchor: Node = modifyStart ? range.startContainer : range.endContainer
+  if (anchor.nodeType === Node.TEXT_NODE) anchor = anchor.parentNode as Node
+  if (!modifyStart && range.endOffset === 0) {
+    do {
+      while (!(anchor as ChildNode).previousSibling) anchor = anchor.parentNode as Node
+      anchor = (anchor as ChildNode).previousSibling as Node
+    } while (!anchor.childNodes.length)
+  }
+  const parentTextLayer = (anchor as HTMLElement).parentElement?.closest('.textLayer') as HTMLElement | null
+  const end = parentTextLayer ? selTextLayers.get(parentTextLayer) : null
+  if (end && parentTextLayer) {
+    end.style.width = parentTextLayer.style.width
+    end.style.height = parentTextLayer.style.height
+    end.style.userSelect = 'text'
+    ;(anchor as HTMLElement).parentElement?.insertBefore(
+      end, modifyStart ? (anchor as ChildNode) : (anchor as ChildNode).nextSibling)
+  }
+  selPrevRange = range.cloneRange()
+}
+
+// Register a text layer for selection anchoring: append its endOfContent div
+// and start `selecting` mode on mousedown so the endOfContent expands to cover
+// the layer while dragging.
+function setupTextLayerSelection(textLayerDiv: HTMLElement) {
+  const end = document.createElement('div')
+  end.className = 'endOfContent'
+  textLayerDiv.append(end)
+  selTextLayers.set(textLayerDiv, end)
+  textLayerDiv.addEventListener('mousedown', (e) => {
+    // Only begin a selection when the drag starts on an actual glyph span.
+    // Starting on blank space (the layer container itself or the endOfContent
+    // catch) must be a no-op — otherwise the browser anchors to the nearest
+    // text and a tiny drag balloons into a whole-page selection.
+    const target = e.target as HTMLElement
+    if (target === textLayerDiv || target.classList.contains('endOfContent')) {
+      // Blank space: don't begin a new selection (preventDefault stops the
+      // browser anchoring to nearby text), but still collapse any existing
+      // selection — otherwise preventDefault leaves it (and its popup) up.
+      e.preventDefault()
+      const sel = window.getSelection()
+      if (sel && !sel.isCollapsed) sel.removeAllRanges()
+      return
+    }
+    textLayerDiv.classList.add('selecting')
+  })
+}
+
+function installSelectionListeners() {
+  if (selListenersAbort) return
+  selListenersAbort = new AbortController()
+  const signal = selListenersAbort.signal
+  document.addEventListener('pointerdown', () => { selPointerDown = true }, { signal })
+  document.addEventListener('pointerup', () => {
+    selPointerDown = false
+    selTextLayers.forEach(resetTextLayerSelecting)
+  }, { signal })
+  window.addEventListener('blur', () => {
+    selPointerDown = false
+    selTextLayers.forEach(resetTextLayerSelecting)
+  }, { signal })
+  document.addEventListener('keyup', () => {
+    if (!selPointerDown) selTextLayers.forEach(resetTextLayerSelecting)
+  }, { signal })
+  document.addEventListener('selectionchange', onSelectionChange, { signal })
+}
+
+function teardownSelectionListeners() {
+  selListenersAbort?.abort()
+  selListenersAbort = null
+  selTextLayers.clear()
+  selPrevRange = null
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const pageRenderTasks = new Map<number, any>() // pdfjs RenderTask per page
 const inflightRenders = new Map<number, Promise<void>>()
@@ -51,7 +191,8 @@ function requestRenderPage(idx: number): Promise<void> {
 const scale = ref(1.25)
 const displayPage = ref(1) // shown in toolbar (1-based)
 const pageInputValue = ref('1')
-const displayOpenTitle = computed(() => titleInitialCaps(reader.openTitle))
+const displayOpenTitle = computed(() =>
+  titleInitialCaps(reader.tabs.find(t => t.slug === props.slug)?.title ?? ''))
 const PDF_PAGE_MARGIN = 3
 const SCROLL_THUMB_INSET = 4
 const SCROLL_THUMB_MIN_SIZE = 32
@@ -79,7 +220,7 @@ function loadSavedZoom(slug: string): number | null {
 }
 
 function saveZoom() {
-  const slug = reader.openSlug
+  const slug = props.slug
   if (!slug) return
   try {
     localStorage.setItem(zoomStorageKey(slug), String(scale.value))
@@ -93,7 +234,14 @@ const loading = ref(true)
 
 // Highlight interaction
 // rects/text stored at popup-open time so mousedown on color dot can't clear the selection
-const selectionPopup = ref<{ x: number; y: number; pageIndex: number; rects: Rect[]; text: string } | null>(null)
+// A selection can span multiple pages, so rects are grouped per page (each page
+// becomes its own highlight). `pages` is ordered by page index.
+const selectionPopup = ref<{
+  x: number
+  y: number
+  text: string
+  pages: { pageIndex: number; rects: Rect[] }[]
+} | null>(null)
 const activeColor = ref('#FFEB3B') // default yellow
 
 const HIGHLIGHT_STYLE_KEY = 'argus:highlight-style'
@@ -135,7 +283,7 @@ eventBus.on('pagechanging', ({ pageNumber }: { pageNumber: number }) => {
 
 // ── Computed ──────────────────────────────────────────────────────────────────
 const sortedHighlights = computed(() => {
-  return [...reader.highlights].sort((a, b) => {
+  return [...reader.highlightsFor(props.slug)].sort((a, b) => {
     if (a.page !== b.page) return a.page - b.page
     const aY = a.rects[0]?.y ?? 0
     const bY = b.rects[0]?.y ?? 0
@@ -145,23 +293,55 @@ const sortedHighlights = computed(() => {
 
 function pageHighlights(pageIndex: number): Highlight[] {
   // pageIndex is 0-based; Highlight.page is 1-based
-  return reader.highlights.filter(h => h.page === pageIndex + 1)
+  return reader.highlightsFor(props.slug).filter(h => h.page === pageIndex + 1)
 }
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────────
-onMounted(async () => {
-  await loadPdf()
+// Every open tab has a live viewer instance, but only the VISIBLE one may own the
+// global (window/document) listeners — otherwise every open viewer would react to
+// the same keypress/selection. So they follow the active state, not mount/unmount.
+function addGlobalListeners() {
+  installSelectionListeners()
   window.addEventListener('mouseup', onWindowMouseUp)
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('argus-snippet-highlight', onSnippetHighlight)
   window.addEventListener('resize', updateScrollThumbs)
-})
+}
 
-onUnmounted(() => {
+function removeGlobalListeners() {
+  teardownSelectionListeners()
   window.removeEventListener('mouseup', onWindowMouseUp)
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('argus-snippet-highlight', onSnippetHighlight)
   window.removeEventListener('resize', updateScrollThumbs)
+}
+
+onMounted(async () => {
+  await loadPdf()
+})
+
+// Backgrounded viewers are hidden with v-show (display:none), which can drop the
+// scroll position — stash it on hide and restore on show.
+let _savedScrollTop: number | null = null
+
+watch(isActiveTab, (active) => {
+  if (active) {
+    addGlobalListeners()
+    if (_savedScrollTop !== null) {
+      const top = _savedScrollTop
+      nextTick(() => { if (containerRef.value) containerRef.value.scrollTop = top })
+    }
+  } else {
+    if (containerRef.value) _savedScrollTop = containerRef.value.scrollTop
+    removeGlobalListeners()
+    flushReadingState() // persist scroll position before this tab goes to the background
+  }
+}, { immediate: true })
+
+// Fires when the tab is closed (removed from the open-tabs list) — the PDF is
+// fully released here.
+onUnmounted(() => {
+  removeGlobalListeners()
   observer?.disconnect()
   if (progressDebounce) clearTimeout(progressDebounce)
   if (scrollThumbHideTimer) clearTimeout(scrollThumbHideTimer)
@@ -169,6 +349,9 @@ onUnmounted(() => {
   pageTextCache.clear()
   _translateUnlisten?.()
   pdfDoc.value?.destroy()
+  // This viewer is gone for good (tab closed or evicted from cache) — drop its
+  // cached highlights/reading-state from the store.
+  reader.discardTabState(props.slug)
 })
 
 // ── Inline translation ────────────────────────────────────────────────────────
@@ -220,18 +403,20 @@ const SNIPPET_HIGHLIGHT_COLOR = '#CE93D8'
 
 function addToSnippetLibrary() {
   const popup = selectionPopup.value
-  if (!popup || popup.rects.length === 0) { selectionPopup.value = null; return }
+  if (!popup || popup.pages.length === 0) { selectionPopup.value = null; return }
   window.getSelection()?.removeAllRanges()
   selectionPopup.value = null
-  const paper = library.papers.find(p => p.slug === reader.activeSlug)
+  const paper = library.papers.find(p => p.slug === props.slug)
+  // A snippet anchors to a single page — use the page the selection starts on.
+  const first = popup.pages[0]
   openAddSnippetModal({
     text: popup.text,
-    paperId: reader.activeSlug ?? '',
-    paperTitle: paper?.title ?? reader.activeSlug ?? '',
-    page: popup.pageIndex + 1,
+    paperId: props.slug,
+    paperTitle: paper?.title ?? props.slug,
+    page: first.pageIndex + 1,
     color: SNIPPET_HIGHLIGHT_COLOR,
-    rects: popup.rects,
-    pageIndex: popup.pageIndex,
+    rects: first.rects,
+    pageIndex: first.pageIndex,
   })
 }
 
@@ -251,14 +436,14 @@ function onSnippetHighlight(e: Event) {
 }
 
 function addHighlightToSnippetLibrary(hlId: string) {
-  const hl = reader.highlights.find(h => h.id === hlId)
+  const hl = reader.highlightsFor(props.slug).find(h => h.id === hlId)
   if (!hl) return
   hlColorPopup.value = null
-  const paper = library.papers.find(p => p.slug === reader.activeSlug)
+  const paper = library.papers.find(p => p.slug === props.slug)
   openAddSnippetModal({
     text: hl.text,
-    paperId: reader.activeSlug ?? '',
-    paperTitle: paper?.title ?? reader.activeSlug ?? '',
+    paperId: props.slug,
+    paperTitle: paper?.title ?? props.slug,
     page: hl.page,
     color: hl.color,
   })
@@ -355,7 +540,7 @@ async function writeTextToClipboard(text: string) {
 }
 
 async function copyHighlightText(hlId: string) {
-  const hl = reader.highlights.find(h => h.id === hlId)
+  const hl = reader.highlightsFor(props.slug).find(h => h.id === hlId)
   const text = hl?.text?.trim()
   hlColorPopup.value = null
   if (!text) return
@@ -436,7 +621,7 @@ async function extractFulltextIfNeeded(doc: PDFDocumentProxy, slug: string) {
 async function loadPdf() {
   loading.value = true
   error.value = null
-  const slug = reader.openSlug
+  const slug = props.slug
   if (!slug) return
   scale.value = loadSavedZoom(slug) ?? 1.0 // temporary; replaced by fitWidth below if no saved zoom
 
@@ -446,8 +631,8 @@ async function loadPdf() {
       invoke<Highlight[]>('get_highlights', { slug }),
       invoke<{ page: number; scroll_ratio: number; updated_at: string } | null>('get_reading_state', { slug }),
     ])
-    reader.setHighlights(hls)
-    reader.setReadingState(rs)
+    reader.setHighlights(slug, hls)
+    reader.setReadingState(slug, rs)
   } catch (e) {
     console.error('Failed to load highlights/state:', e)
   }
@@ -611,6 +796,8 @@ async function renderPage(idx: number) {
         viewport: logicalVp,
       })
       await textLayer.render()
+      // Anchor drag-selection so dragging into whitespace doesn't over-select.
+      setupTextLayerSelection(textLayerDiv)
     } catch (e) {
       console.warn('TextLayer render failed:', e)
     }
@@ -741,7 +928,7 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
         div.addEventListener('click', (e) => {
           e.stopPropagation()
           const bounding = div.getBoundingClientRect()
-          hlNoteText.value = reader.highlights.find(h => h.id === hl.id)?.note ?? ''
+          hlNoteText.value = reader.highlightsFor(props.slug).find(h => h.id === hl.id)?.note ?? ''
           hlNoteEditing.value = false
           hlNotePopup.value = { x: bounding.left, y: bounding.bottom + 4, hlId: hl.id }
           hlColorPopup.value = null
@@ -778,7 +965,7 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
         r.addEventListener('click', (e) => {
           e.stopPropagation()
           const bounding = r.getBoundingClientRect()
-          hlNoteText.value = reader.highlights.find(h => h.id === hl.id)?.note ?? ''
+          hlNoteText.value = reader.highlightsFor(props.slug).find(h => h.id === hl.id)?.note ?? ''
           hlNoteEditing.value = false
           hlNotePopup.value = { x: bounding.left, y: bounding.bottom + 4, hlId: hl.id }
           hlColorPopup.value = null
@@ -801,8 +988,8 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
   })
 }
 
-// Re-render highlight overlays when highlights change
-watch(() => reader.highlights, () => {
+// Re-render highlight overlays when THIS tab's highlights change
+watch(() => reader.highlightsFor(props.slug), () => {
   renderedPages.value.forEach(idx => {
     const el = pageRefs.value[idx]
     if (!el) return
@@ -814,8 +1001,9 @@ watch(() => reader.highlights, () => {
 // Re-render highlight overlays when scale changes (handled by full page re-render above)
 
 // ── Jump to highlight ─────────────────────────────────────────────────────────
+// These commands target the visible tab; ignore them in backgrounded viewers.
 watch(() => reader.pendingPageJump, async (page) => {
-  if (page === null) return
+  if (page === null || !isActiveTab.value) return
   reader.pendingPageJump = null
   const pageIndex = page - 1
   await ensurePageRendered(pageIndex)
@@ -823,8 +1011,8 @@ watch(() => reader.pendingPageJump, async (page) => {
 })
 
 watch(() => reader.scrollToHighlightId, async (id) => {
-  if (!id) return
-  const hl = reader.highlights.find(h => h.id === id)
+  if (!id || !isActiveTab.value) return
+  const hl = reader.highlightsFor(props.slug).find(h => h.id === id)
   if (!hl) return
   reader.scrollToHighlightId = null
   const pageIndex = hl.page - 1
@@ -975,7 +1163,7 @@ function flushReadingState() {
 
 // ── Restore scroll position ───────────────────────────────────────────────────
 async function restorePosition() {
-  const rs = reader.readingState
+  const rs = reader.readingStateFor(props.slug)
   if (!rs || !containerRef.value) return
   const gap = 12
   let cumY = 0
@@ -1322,6 +1510,65 @@ function onWheel(e: WheelEvent) {
 }
 
 // ── Text selection → highlight creation ──────────────────────────────────────
+// Collect the selection's rects grouped per page. We DON'T use
+// range.getClientRects() directly: on a cross-page selection that also returns
+// the box rects of the block elements between the two text runs (page
+// containers, canvases, overlays), which are full-page-sized and would highlight
+// an entire page. Instead we walk only the text nodes the range touches and take
+// rects from a per-text-node sub-range — those are always tight line boxes.
+function collectSelectionRectsByPage(range: Range): { pageIndex: number; rects: Rect[] }[] {
+  const rootNode = range.commonAncestorContainer
+  const rootEl = (rootNode.nodeType === Node.ELEMENT_NODE ? rootNode : rootNode.parentNode) as HTMLElement | null
+  if (!rootEl) return []
+
+  // pageIndex → { pageEl, domRects }
+  const byPage = new Map<number, { pageEl: HTMLElement; domRects: DOMRect[] }>()
+
+  const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue) return NodeFilter.FILTER_REJECT
+      return range.intersectsNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+    },
+  })
+
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const parent = node.parentElement
+    // Only text inside a page's PDF text layer counts.
+    if (!parent?.closest('.textLayer')) continue
+    const pageEl = parent.closest('[data-page-index]') as HTMLElement | null
+    if (!pageEl) continue
+    const pageIndex = Number(pageEl.dataset.pageIndex)
+
+    const startOffset = node === range.startContainer ? range.startOffset : 0
+    const endOffset = node === range.endContainer ? range.endOffset : (node.nodeValue?.length ?? 0)
+    if (endOffset <= startOffset) continue
+
+    const sub = document.createRange()
+    sub.setStart(node, startOffset)
+    sub.setEnd(node, endOffset)
+
+    const bucket = byPage.get(pageIndex) ?? { pageEl, domRects: [] }
+    for (const r of Array.from(sub.getClientRects())) {
+      if (r.width > 0 && r.height > 0) bucket.domRects.push(r)
+    }
+    byPage.set(pageIndex, bucket)
+  }
+
+  const pages: { pageIndex: number; rects: Rect[] }[] = []
+  for (const [pageIndex, { pageEl, domRects }] of byPage) {
+    const pageRect = pageEl.getBoundingClientRect()
+    const rects = domRects.map(r => ({
+      x: (r.left - pageRect.left) / scale.value,
+      y: (r.top - pageRect.top) / scale.value,
+      width: r.width / scale.value,
+      height: r.height / scale.value,
+    }))
+    if (rects.length) pages.push({ pageIndex, rects })
+  }
+  pages.sort((a, b) => a.pageIndex - b.pageIndex)
+  return pages
+}
+
 function onWindowMouseUp(e: MouseEvent) {
   // Dismiss popups on outside click
   if ((e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup')) return
@@ -1335,71 +1582,47 @@ function onWindowMouseUp(e: MouseEvent) {
     return
   }
 
-  // Find which page the selection starts on
-  const range = sel.getRangeAt(0)
-  const anchor = range.startContainer.parentElement
-  const pageEl = anchor?.closest('[data-page-index]') as HTMLElement | null
-  if (!pageEl) { selectionPopup.value = null; return }
-
-  const pageIndex = Number(pageEl.dataset.pageIndex)
-  const domRects = Array.from(range.getClientRects())
-  if (domRects.length === 0) { selectionPopup.value = null; return }
-
-  // Pre-compute rects NOW while selection is active.
-  // If we read them later in createHighlight(), mousedown on a color dot will have already cleared the selection.
-  const pageRect = pageEl.getBoundingClientRect()
-  // A selection can span multiple pages; getClientRects() returns rects on every
-  // page it touches. Keep only rects whose center lands inside the starting page,
-  // otherwise off-page rects get mapped into this page's coords and misalign.
-  const rects: Rect[] = domRects
-    .filter(r => r.width > 0 && r.height > 0)
-    .filter(r => {
-      const cy = r.top + r.height / 2
-      const cx = r.left + r.width / 2
-      return cy >= pageRect.top && cy <= pageRect.bottom &&
-             cx >= pageRect.left && cx <= pageRect.right
-    })
-    .map(r => ({
-      x: (r.left - pageRect.left) / scale.value,
-      y: (r.top - pageRect.top) / scale.value,
-      width: r.width / scale.value,
-      height: r.height / scale.value,
-    }))
+  // Pre-compute rects NOW while the selection is still active — reading them
+  // later (after a mousedown on a color dot) would find it already cleared.
+  const pages = collectSelectionRectsByPage(sel.getRangeAt(0))
   const text = sel.toString().trim()
-  if (rects.length === 0) { selectionPopup.value = null; return }
+  if (pages.length === 0) { selectionPopup.value = null; return }
 
-  const lastRect = domRects[domRects.length - 1]
+  // Anchor the toolbar to where the mouse was released rather than the bottom
+  // of the selection — feels more direct and stays near the cursor.
   selectionPopup.value = {
-    x: lastRect.left,
-    y: lastRect.bottom + 6,
-    pageIndex,
-    rects,
+    x: e.clientX,
+    y: e.clientY + 12,
     text,
+    pages,
   }
 }
 
 function createHighlight(color?: string) {
   const popup = selectionPopup.value
-  if (!popup || popup.rects.length === 0) { selectionPopup.value = null; return }
+  if (!popup || popup.pages.length === 0) { selectionPopup.value = null; return }
 
-  const hl: Highlight = {
-    id: crypto.randomUUID(),
-    page: popup.pageIndex + 1,
-    rects: popup.rects,
-    text: popup.text,
-    color: color ?? activeColor.value,
-    created_at: new Date().toISOString(),
-    style: highlightStyle.value,
+  const c = color ?? activeColor.value
+  const created_at = new Date().toISOString()
+  // One highlight per page the selection covers, each with only that page's rects.
+  for (const { pageIndex, rects } of popup.pages) {
+    reader.addHighlight({
+      id: crypto.randomUUID(),
+      page: pageIndex + 1,
+      rects,
+      text: popup.text,
+      color: c,
+      created_at,
+      style: highlightStyle.value,
+    })
   }
-
-  reader.addHighlight(hl)
   window.getSelection()?.removeAllRanges()
   selectionPopup.value = null
 }
 
 // ── Highlight popup actions ───────────────────────────────────────────────────
 async function translateHighlight(hlId: string) {
-  const hl = reader.highlights.find(h => h.id === hlId)
+  const hl = reader.highlightsFor(props.slug).find(h => h.id === hlId)
   if (!hl) return
   hlColorPopup.value = null
   await startStreamTranslate(hl.text)
@@ -1964,6 +2187,21 @@ function triggerInitialRender() {
 
 :deep(.textLayer ::selection) {
   background: rgba(0, 100, 255, 0.25);
+}
+
+/* endOfContent anchor: sits below the layer by default, expands to cover it
+   while selecting so drag-into-whitespace stays anchored in reading order. */
+:deep(.textLayer .endOfContent) {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  user-select: none;
+}
+
+:deep(.textLayer.selecting .endOfContent) {
+  top: 0;
 }
 
 /* ── Highlight overlay ── */

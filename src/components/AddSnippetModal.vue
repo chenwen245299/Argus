@@ -84,6 +84,9 @@ async function submitNewLib() {
 }
 
 function handleTagInput(e: KeyboardEvent) {
+  // Ignore Enter/comma fired while an IME is composing (e.g. selecting Chinese
+  // characters) — otherwise confirming the candidate commits a half-typed tag.
+  if (e.isComposing || e.keyCode === 229) return
   if (e.key === 'Enter' || e.key === ',') {
     e.preventDefault()
     commitTag()

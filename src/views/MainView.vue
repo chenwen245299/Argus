@@ -121,7 +121,19 @@ function saveLayoutNumber(key: string, value: number) {
 
 const rightSidebarVisible = ref(loadLayoutBoolean(MAIN_RIGHT_VISIBLE_KEY, true))
 const sidebarTab = ref<string>(loadSidebarTab())
-const pdfViewerRef = ref<{ closeToList: () => void } | null>(null)
+// Slugs whose viewer has been created ("materialized"). A tab is materialized
+// the first time it becomes active, then kept mounted while it stays open — so
+// restored-but-unvisited tabs don't eagerly load on startup, and closed tabs
+// drop out (their viewer unmounts, releasing the PDF).
+const materializedSlugs = ref<Set<string>>(new Set())
+watch(() => readerStore.activeSlug, (slug) => {
+  if (slug && !materializedSlugs.value.has(slug)) {
+    materializedSlugs.value = new Set(materializedSlugs.value).add(slug)
+  }
+}, { immediate: true })
+const liveViewerSlugs = computed(() =>
+  readerStore.tabs.filter(t => materializedSlugs.value.has(t.slug)).map(t => t.slug))
+
 const showCanvas = ref(false)
 const showSnippetLibrary = ref(false)
 const activeSnippetLibraryId = ref<string | null>(null)
@@ -532,29 +544,38 @@ watch(
       />
 
       <div class="paper-list-col center-col">
+        <!-- One live viewer per open tab, created lazily on first view and kept
+             mounted while the tab stays open — so switching between tabs is
+             instant (no re-fetch / re-parse). Only the active tab is shown.
+             Closing a tab removes it from this list, unmounting its viewer and
+             fully releasing the PDF (see PdfViewer's onUnmounted). -->
         <PdfViewer
-          v-if="readerStore.activeSlug"
-          ref="pdfViewerRef"
-          :key="readerStore.activeSlug"
+          v-for="s in liveViewerSlugs"
+          v-show="s === readerStore.activeSlug"
+          :key="s"
+          :slug="s"
           class="center-fill"
           :right-sidebar-open="rightSidebarVisible"
           @toggle-right-sidebar="rightSidebarVisible = !rightSidebarVisible"
         />
-        <CanvasPanel
-          v-else-if="showCanvas"
-          class="center-fill"
-          @select-paper="onCanvasSelectPaper"
-          @close="closeCanvas()"
-        />
-        <SnippetLibraryView
-          v-else-if="showSnippetLibrary && activeSnippetLibraryId"
-          :library-id="activeSnippetLibraryId"
-          class="center-fill"
-          @open-paper="onSnippetOpenPaper"
-        />
-        <div v-else class="center-fill">
-          <PaperList />
-        </div>
+        <!-- Non-PDF center views (shown only when no PDF tab is active) -->
+        <template v-if="!readerStore.activeSlug">
+          <CanvasPanel
+            v-if="showCanvas"
+            class="center-fill"
+            @select-paper="onCanvasSelectPaper"
+            @close="closeCanvas()"
+          />
+          <SnippetLibraryView
+            v-else-if="showSnippetLibrary && activeSnippetLibraryId"
+            :library-id="activeSnippetLibraryId"
+            class="center-fill"
+            @open-paper="onSnippetOpenPaper"
+          />
+          <div v-else class="center-fill">
+            <PaperList />
+          </div>
+        </template>
       </div>
 
       <Transition name="right-panel">

@@ -18,19 +18,41 @@ export const useReaderStore = defineStore('reader', () => {
   const openSlug  = computed(() => activeSlug.value)
   const openTitle = computed(() => tabs.value.find(t => t.slug === activeSlug.value)?.title ?? '')
 
-  // Per-active-tab state (reset on tab switch; PdfViewer reloads from disk)
-  const pdfDoc              = shallowRef<PDFDocumentProxy | null>(null)
-  const highlights          = ref<Highlight[]>([])
-  const readingState        = ref<ReadingState | null>(null)
+  // Per-slug state, keyed by slug and kept across tab switches. This lets each
+  // tab's PdfViewer be preserved (via <KeepAlive>) and switched to instantly:
+  // its highlights/reading-state are still here, so nothing reloads from disk.
+  const pdfDoc              = shallowRef<PDFDocumentProxy | null>(null) // active tab's doc
+  const highlightsBySlug    = ref<Record<string, Highlight[]>>({})
+  const readingStateBySlug  = ref<Record<string, ReadingState | null>>({})
+  // Transient commands aimed at the currently-active viewer.
   const scrollToHighlightId = ref<string | null>(null)
   const pendingPageJump     = ref<number | null>(null)
 
-  function _resetTabState() {
-    pdfDoc.value              = null
-    highlights.value          = []
-    readingState.value        = null
-    scrollToHighlightId.value = null
-    pendingPageJump.value     = null
+  const EMPTY_HIGHLIGHTS: Highlight[] = []
+  // Active-tab views — the right sidebar / highlights tab read these.
+  const highlights = computed<Highlight[]>(() =>
+    activeSlug.value ? (highlightsBySlug.value[activeSlug.value] ?? EMPTY_HIGHLIGHTS) : EMPTY_HIGHLIGHTS)
+  const readingState = computed<ReadingState | null>(() =>
+    activeSlug.value ? (readingStateBySlug.value[activeSlug.value] ?? null) : null)
+
+  // Per-slug accessors — each PdfViewer reads its OWN tab's data (not the active
+  // tab's) so a backgrounded viewer keeps showing the right highlights.
+  function highlightsFor(slug: string): Highlight[] {
+    return highlightsBySlug.value[slug] ?? EMPTY_HIGHLIGHTS
+  }
+  function readingStateFor(slug: string): ReadingState | null {
+    return readingStateBySlug.value[slug] ?? null
+  }
+
+  // Free a tab's cached per-slug state. Called when the viewer instance is
+  // actually destroyed (evicted from KeepAlive / closed) or its paper is gone.
+  function discardTabState(slug: string) {
+    if (slug in highlightsBySlug.value) {
+      const next = { ...highlightsBySlug.value }; delete next[slug]; highlightsBySlug.value = next
+    }
+    if (slug in readingStateBySlug.value) {
+      const next = { ...readingStateBySlug.value }; delete next[slug]; readingStateBySlug.value = next
+    }
   }
 
   function openPaper(slug: string, title: string) {
@@ -41,10 +63,7 @@ export const useReaderStore = defineStore('reader', () => {
     } else {
       existing.title = title  // update title in case it changed
     }
-    if (activeSlug.value !== slug) {
-      activeSlug.value = slug
-      _resetTabState()
-    }
+    activeSlug.value = slug
   }
 
   function replacePaperSlug(oldSlug: string, newSlug: string, title?: string) {
@@ -63,7 +82,6 @@ export const useReaderStore = defineStore('reader', () => {
     if (!tabs.value.find(t => t.slug === slug)) return
     recordPaperAccess(slug)
     activeSlug.value = slug
-    _resetTabState()
   }
 
   function closeTab(slug: string) {
@@ -73,8 +91,10 @@ export const useReaderStore = defineStore('reader', () => {
     if (activeSlug.value === slug) {
       const next = tabs.value[Math.min(idx, tabs.value.length - 1)]
       activeSlug.value = next?.slug ?? null
-      _resetTabState()
     }
+    // Note: per-slug state is freed when the viewer instance is actually
+    // destroyed (see PdfViewer's discardTabState on unmount), NOT here — the
+    // KeepAlive'd instance may linger in cache and be reused if reopened.
   }
 
   function closePaper() {
@@ -97,10 +117,11 @@ export const useReaderStore = defineStore('reader', () => {
   /** Remove any tabs whose slugs are no longer in the library paper list. */
   function pruneStaleTabs(validSlugs: Set<string>) {
     const before = tabs.value.length
+    const removed = tabs.value.filter(t => !validSlugs.has(t.slug))
     tabs.value = tabs.value.filter(t => validSlugs.has(t.slug))
+    removed.forEach(t => discardTabState(t.slug))
     if (tabs.value.length !== before && activeSlug.value && !validSlugs.has(activeSlug.value)) {
       activeSlug.value = tabs.value[0]?.slug ?? null
-      _resetTabState()
     }
   }
 
@@ -135,36 +156,44 @@ export const useReaderStore = defineStore('reader', () => {
     pdfDoc.value = doc
   }
 
-  function setHighlights(hl: Highlight[]) {
-    highlights.value = hl
+  function setHighlights(slug: string, hl: Highlight[]) {
+    highlightsBySlug.value = { ...highlightsBySlug.value, [slug]: hl }
   }
 
-  function setReadingState(rs: ReadingState | null) {
-    readingState.value = rs
+  function setReadingState(slug: string, rs: ReadingState | null) {
+    readingStateBySlug.value = { ...readingStateBySlug.value, [slug]: rs }
   }
 
   async function saveHighlights() {
     const slug = activeSlug.value
     if (!slug) return
     try {
-      await invoke('save_highlights', { slug, highlights: highlights.value })
+      await invoke('save_highlights', { slug, highlights: highlightsBySlug.value[slug] ?? [] })
     } catch (e) {
       console.error('Failed to save highlights:', e)
     }
   }
 
+  // add/update/remove act on the active tab — only the visible viewer and the
+  // sidebar (which mirror the active tab) ever mutate highlights.
   function addHighlight(h: Highlight) {
-    highlights.value = [...highlights.value, h]
+    const slug = activeSlug.value
+    if (!slug) return
+    setHighlights(slug, [...(highlightsBySlug.value[slug] ?? []), h])
     saveHighlights()
   }
 
   function updateHighlight(id: string, changes: Partial<Pick<Highlight, 'note' | 'color' | 'style'>>) {
-    highlights.value = highlights.value.map(h => h.id === id ? { ...h, ...changes } : h)
+    const slug = activeSlug.value
+    if (!slug) return
+    setHighlights(slug, (highlightsBySlug.value[slug] ?? []).map(h => h.id === id ? { ...h, ...changes } : h))
     saveHighlights()
   }
 
   function removeHighlight(id: string) {
-    highlights.value = highlights.value.filter(h => h.id !== id)
+    const slug = activeSlug.value
+    if (!slug) return
+    setHighlights(slug, (highlightsBySlug.value[slug] ?? []).filter(h => h.id !== id))
     saveHighlights()
   }
 
@@ -173,9 +202,9 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   async function persistReadingState(rs: ReadingState) {
-    readingState.value = rs
     const slug = activeSlug.value
     if (!slug) return
+    setReadingState(slug, rs)
     try {
       await invoke('update_reading_state', { slug, readingState: rs })
     } catch (e) {
@@ -191,6 +220,9 @@ export const useReaderStore = defineStore('reader', () => {
     pdfDoc,
     highlights,
     readingState,
+    highlightsFor,
+    readingStateFor,
+    discardTabState,
     scrollToHighlightId,
     pendingPageJump,
     openPaper,

@@ -129,6 +129,7 @@ pub async fn chat_with_paper(
         None,
         "fulltext",
         false,
+        &[],
         None,
     )
     .await
@@ -146,6 +147,7 @@ pub async fn chat_with_paper_on_event(
     reasoning_effort: Option<&str>,
     context_mode: &str,
     use_pdf: bool,
+    section_titles: &[String],
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String, String> {
     let (provider, api_key, model) =
@@ -207,6 +209,19 @@ pub async fn chat_with_paper_on_event(
         }
     }
 
+    // User-selected chapters — injected as an extra context block on top of
+    // whatever context_mode already added (metadata / summary / fulltext).
+    let sent_sections = crate::sections::extract_selected_sections_text(root, slug, section_titles);
+    if !sent_sections.is_empty() {
+        all_messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: format!(
+                "以下是用户选定的论文章节内容，请优先依据这些内容回答：\n\n{sent_sections}"
+            )
+            .into(),
+        });
+    }
+
     // Emit the actually-sent context so the frontend can display it transparently.
     let _ = app.emit(
         &format!("{event_name}-context"),
@@ -214,6 +229,7 @@ pub async fn chat_with_paper_on_event(
             "metadata": sent_metadata,
             "summary":  sent_summary,
             "fulltext": sent_fulltext,
+            "sections": sent_sections,
         }),
     );
 

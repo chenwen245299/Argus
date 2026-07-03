@@ -11,7 +11,7 @@ use crate::LibraryRoot;
 use crate::{
     ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas,
     canvas_enhance, collections, copilot, extraction, library, llm, metadata, paper, rag, search,
-    security_bookmark, settings, snippets, url_import,
+    sections, security_bookmark, settings, snippets, url_import,
 };
 // ── Library management ────────────────────────────────────────────────────────
 
@@ -394,6 +394,46 @@ pub async fn save_fulltext(
     status.text_extracted = !text.trim().is_empty();
     status.last_updated = chrono::Utc::now().to_rfc3339();
     paper::write_status(&root, &slug, &status)
+}
+
+// ── Sections (chapter structure) ─────────────────────────────────────────────
+
+/// Read the stored section index for a paper (None if not yet computed).
+#[tauri::command]
+pub async fn get_sections(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<Option<sections::PaperSections>, String> {
+    let root = get_root(&state)?;
+    Ok(sections::read_sections(&root, &slug))
+}
+
+/// Persist a section index computed by the frontend (embedded outline / heuristics).
+#[tauri::command]
+pub async fn save_sections(
+    slug: String,
+    data: sections::PaperSections,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    let dir = paper::paper_dir(&root, &slug);
+    if !dir.exists() {
+        return Err(format!("Paper not found: {slug}"));
+    }
+    sections::write_sections(&root, &slug, &data)
+}
+
+/// LLM fallback: segment the paper into sections when structural detection failed.
+/// Manually triggered from the paper context menu — never runs automatically.
+#[tauri::command]
+pub async fn ai_split_sections(
+    slug: String,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    state: State<'_, LibraryRoot>,
+) -> Result<sections::PaperSections, String> {
+    let root = get_root(&state)?;
+    sections::ai_split_sections(&root, &slug, provider_id.as_deref(), model_id.as_deref()).await
 }
 
 /// OCR a single page image (base64-encoded JPEG).
@@ -1052,8 +1092,10 @@ pub async fn test_ai_provider(id: String, state: State<'_, LibraryRoot>) -> Resu
         .iter()
         .find(|p| p.id == id)
         .ok_or_else(|| format!("Provider not found: {id}"))?;
-    let key =
-        ai_manager::get_api_key(&root, &id).ok_or("No API key configured for this provider")?;
+    // Ollama is normally keyless (local); allow an empty key for it.
+    let key = ai_manager::get_api_key(&root, &id)
+        .or_else(|| (provider.kind == "ollama").then(String::new))
+        .ok_or("No API key configured for this provider")?;
     llm::test_connection(provider, &key).await
 }
 
@@ -1071,8 +1113,10 @@ pub async fn fetch_provider_models(
         .iter()
         .find(|p| p.id == id)
         .ok_or_else(|| format!("Provider not found: {id}"))?;
-    let key =
-        ai_manager::get_api_key(&root, &id).ok_or("No API key configured for this provider")?;
+    // Ollama is normally keyless (local); allow an empty key for it.
+    let key = ai_manager::get_api_key(&root, &id)
+        .or_else(|| (provider.kind == "ollama").then(String::new))
+        .ok_or("No API key configured for this provider")?;
     llm::list_models(provider, &key).await
 }
 
@@ -1238,6 +1282,7 @@ pub async fn chat_with_paper_event(
     reasoning_effort: Option<String>,
     context_mode: Option<String>,
     use_pdf: Option<bool>,
+    section_titles: Option<Vec<String>>,
     request_id: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
@@ -1245,6 +1290,7 @@ pub async fn chat_with_paper_event(
     let root = get_root(&state)?;
     // Register a cancel flag; the guard unregisters it on every exit path.
     let (_cancel_guard, cancel) = crate::cancel::CancelGuard::new(request_id);
+    let section_titles = section_titles.unwrap_or_default();
     copilot::chat_with_paper_on_event(
         &root,
         &slug,
@@ -1257,6 +1303,7 @@ pub async fn chat_with_paper_event(
         reasoning_effort.as_deref(),
         context_mode.as_deref().unwrap_or("fulltext"),
         use_pdf.unwrap_or(false),
+        &section_titles,
         cancel,
     )
     .await

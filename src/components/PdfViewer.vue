@@ -11,7 +11,8 @@ import { EventBus, SimpleLinkService } from 'pdfjs-dist/web/pdf_viewer.mjs'
 import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
-import type { Highlight, Rect } from '../types'
+import { computeSections } from '../utils/sections'
+import type { Highlight, Rect, PaperSections } from '../types'
 // The legacy build includes its own Promise.withResolvers polyfill, so the worker
 // runs correctly on Ventura (WebKit < 17.4) without a custom wrapper.
 import PDFWorkerLegacyUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
@@ -617,6 +618,23 @@ async function extractFulltextIfNeeded(doc: PDFDocumentProxy, slug: string) {
   }
 }
 
+// ── Section (chapter) auto-detection ─────────────────────────────────────────
+async function ensureSectionsComputed(doc: PDFDocumentProxy, slug: string) {
+  try {
+    // Skip if we already have a stored index (any source, including a prior AI run).
+    const existing = await invoke<PaperSections | null>('get_sections', { slug })
+    if (existing && existing.sections.length) return
+
+    const result = await computeSections(doc)
+    if (!result || !result.sections.length) return
+
+    await invoke('save_sections', { slug, data: result })
+    window.dispatchEvent(new CustomEvent('argus-sections-updated', { detail: { slug } }))
+  } catch (e) {
+    console.error('Section detection failed:', e)
+  }
+}
+
 // ── Load PDF ──────────────────────────────────────────────────────────────────
 async function loadPdf() {
   loading.value = true
@@ -684,8 +702,22 @@ async function loadPdf() {
     triggerInitialRender()
     updateScrollThumbs()
 
+    // A page jump requested before this viewer finished mounting (e.g. opened
+    // from the sections outline or a snippet) is missed by the reactive watch,
+    // which only fires on later changes — apply any pending jump now.
+    if (reader.pendingPageJump != null && isActiveTab.value) {
+      const target = reader.pendingPageJump
+      reader.pendingPageJump = null
+      await ensurePageRendered(target - 1)
+      scrollToPageIndex(target - 1, 0)
+    }
+
     // Auto-extract fulltext via pdfjs if lopdf/pdftotext extraction previously failed
     extractFulltextIfNeeded(doc, slug)
+
+    // Auto-detect chapter structure (embedded outline → heading heuristic).
+    // The AI fallback is never triggered here — it stays a manual action.
+    ensureSectionsComputed(doc, slug)
 
     // Auto-update reading status: unread → reading when PDF is opened
     const entry = library.papers.find(p => p.slug === slug)

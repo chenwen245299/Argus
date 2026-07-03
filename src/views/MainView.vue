@@ -78,7 +78,7 @@ const MAIN_LEFT_WIDTH_KEY = 'argus:layout:left-width'
 const MAIN_RIGHT_WIDTH_KEY = 'argus:layout:right-width'
 const MAIN_RIGHT_VISIBLE_KEY = 'argus:layout:right-visible'
 const MAIN_RIGHT_TAB_KEY = 'argus:layout:right-tab'
-const PAPER_TABS = ['notes', 'highlights', 'ai', 'metadata']
+const PAPER_TABS = ['notes', 'highlights', 'sections', 'ai', 'metadata']
 // Tabs available while the canvas/graph is shown (翻译/批注 hidden, 绘图 added).
 const CANVAS_TABS = ['draw', 'notes', 'ai', 'metadata']
 const MIN_LEFT_WIDTH = 240
@@ -515,7 +515,10 @@ watch(
   <!-- Library loaded → 3-column layout -->
   <div v-else class="main-layout">
     <!-- Title bar: sits above everything, drag region + tabs next to traffic lights -->
-    <TabBar />
+    <TabBar
+      :right-sidebar-open="rightSidebarVisible"
+      @toggle-right-sidebar="rightSidebarVisible = !rightSidebarVisible"
+    />
 
     <Toolbar
       :left-sidebar-width="leftWidth"

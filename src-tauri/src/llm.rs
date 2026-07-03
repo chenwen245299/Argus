@@ -18,6 +18,24 @@ fn is_anthropic_protocol(provider: &AiProvider) -> bool {
     provider.kind == "anthropic" || is_kimi_coding_endpoint(provider)
 }
 
+/// Ollama's native REST API (as opposed to its OpenAI-compatible `/v1` shim).
+/// Selected explicitly by the provider kind so users can pick between the two.
+fn is_ollama(provider: &AiProvider) -> bool {
+    provider.kind == "ollama"
+}
+
+/// Ollama's native endpoints live at `/api/*` off the server root. Accept a
+/// base URL configured either as the bare root (`http://localhost:11434`) or
+/// with a trailing OpenAI-compat `/v1` segment, and reduce it to the root so
+/// `{root}/api/chat`, `{root}/api/embed`, `{root}/api/tags` resolve correctly.
+fn ollama_root(provider: &AiProvider) -> String {
+    let base = provider.base_url.trim_end_matches('/');
+    base.strip_suffix("/v1")
+        .unwrap_or(base)
+        .trim_end_matches('/')
+        .to_string()
+}
+
 pub async fn chat_completion(
     provider: &AiProvider,
     api_key: &str,
@@ -25,7 +43,9 @@ pub async fn chat_completion(
     messages: &[ChatMessage],
     source: &str,
 ) -> Result<String, String> {
-    if is_anthropic_protocol(provider) {
+    if is_ollama(provider) {
+        chat_ollama(provider, api_key, model, messages, source).await
+    } else if is_anthropic_protocol(provider) {
         chat_anthropic(provider, api_key, model, messages, source).await
     } else {
         chat_openai_compat(provider, api_key, model, messages, source).await
@@ -48,7 +68,21 @@ pub async fn chat_completion_stream(
     source: &str,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
-    if is_anthropic_protocol(provider) {
+    if is_ollama(provider) {
+        stream_ollama(
+            provider,
+            api_key,
+            model,
+            messages,
+            event_name,
+            app,
+            use_reasoning,
+            reasoning_effort,
+            source,
+            cancel,
+        )
+        .await
+    } else if is_anthropic_protocol(provider) {
         stream_anthropic(
             provider,
             api_key,
@@ -113,6 +147,11 @@ pub async fn chat_completion_stream_with_pdf(
 /// OpenAI-compatible: GET {base_url}/models
 /// Anthropic: returns a hardcoded well-known list (no public /models endpoint).
 pub async fn list_models(provider: &AiProvider, api_key: &str) -> Result<Vec<AiModel>, String> {
+    if is_ollama(provider) {
+        // Ollama exposes locally-pulled models via GET /api/tags, and per-model
+        // capabilities via POST /api/show.
+        return fetch_ollama_models(provider, api_key).await;
+    }
     if provider.kind == "kimi" || provider.base_url.to_lowercase().contains("api.kimi.com") {
         // Kimi Code / Moonshot does not expose a public /models endpoint for
         // ordinary API keys (it typically returns 401). Return a hard-coded
@@ -130,6 +169,33 @@ pub async fn list_models(provider: &AiProvider, api_key: &str) -> Result<Vec<AiM
 /// expose a public model-list endpoint.
 pub async fn test_connection(provider: &AiProvider, api_key: &str) -> Result<String, String> {
     let client = build_client()?;
+
+    // Ollama's native API has no /chat/completions; probe /api/tags instead,
+    // which also confirms the local server is reachable.
+    if is_ollama(provider) {
+        let url = format!("{}/api/tags", ollama_root(provider));
+        let mut req = client.get(&url).timeout(REQUEST_TIMEOUT);
+        if !api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {api_key}"));
+        }
+        let resp = req.send().await.map_err(|e| {
+            format!("Network error: {e}. Is Ollama running at {}?", ollama_root(provider))
+        })?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status >= 400 {
+            return Err(friendly_error(status, &text));
+        }
+        let count = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|j| j["models"].as_array().map(|a| a.len()))
+            .unwrap_or(0);
+        return Ok(format!(
+            "Connected to Ollama at {} ({count} local model(s)).",
+            ollama_root(provider)
+        ));
+    }
+
     let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
     let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
     let is_kimi = provider.kind == "kimi"
@@ -220,6 +286,9 @@ pub async fn embeddings(
     texts: &[String],
     source: &str,
 ) -> Result<Vec<Vec<f32>>, String> {
+    if is_ollama(provider) {
+        return embed_ollama(provider, api_key, model, texts, source).await;
+    }
     if provider.kind.as_str() == "anthropic" {
         return Err(
             "Anthropic does not support embeddings. Use an OpenAI-compatible provider.".to_string(),
@@ -575,6 +644,7 @@ async fn stream_with_pdf_injected(
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
+    let mut cache_hit_tokens: u64 = 0;
     let mut cost_usd: Option<f64> = None;
     let mut usage_emitted = false;
 
@@ -619,6 +689,7 @@ async fn stream_with_pdf_injected(
                                     output_tokens,
                                     input_tokens.saturating_add(output_tokens),
                                     cost_usd,
+                                    cache_hit_tokens,
                                 );
                             }
                             crate::token_usage::record_with_cost(
@@ -641,6 +712,9 @@ async fn stream_with_pdf_injected(
                                 if let Some(v) = usage["completion_tokens"].as_u64() {
                                     output_tokens = v;
                                 }
+                                if let Some(v) = usage["prompt_cache_hit_tokens"].as_u64() {
+                                    cache_hit_tokens = v;
+                                }
                                 if let Some(v) = usage_cost_usd(usage) {
                                     cost_usd = Some(v);
                                 }
@@ -654,6 +728,7 @@ async fn stream_with_pdf_injected(
                                     output_tokens,
                                     total_tokens,
                                     cost_usd,
+                                    cache_hit_tokens,
                                 );
                                 usage_emitted = true;
                             }
@@ -708,6 +783,7 @@ async fn stream_with_pdf_injected(
             output_tokens,
             input_tokens.saturating_add(output_tokens),
             cost_usd,
+            cache_hit_tokens,
         );
     }
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
@@ -910,6 +986,7 @@ async fn stream_openai_compat(
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
+    let mut cache_hit_tokens: u64 = 0;
     let mut cost_usd: Option<f64> = None;
     let mut usage_emitted = false;
 
@@ -953,6 +1030,7 @@ async fn stream_openai_compat(
                                     output_tokens,
                                     input_tokens.saturating_add(output_tokens),
                                     if is_openrouter || is_kimi { cost_usd } else { None },
+                                    cache_hit_tokens,
                                 );
                             }
                             crate::token_usage::record_with_cost(
@@ -976,6 +1054,9 @@ async fn stream_openai_compat(
                                 if let Some(v) = usage["completion_tokens"].as_u64() {
                                     output_tokens = v;
                                 }
+                                if let Some(v) = usage["prompt_cache_hit_tokens"].as_u64() {
+                                    cache_hit_tokens = v;
+                                }
                                 if is_openrouter || is_kimi {
                                     if let Some(v) = usage_cost_usd(usage) {
                                         cost_usd = Some(v);
@@ -991,6 +1072,7 @@ async fn stream_openai_compat(
                                     output_tokens,
                                     total_tokens,
                                     if is_openrouter || is_kimi { cost_usd } else { None },
+                                    cache_hit_tokens,
                                 );
                                 usage_emitted = true;
                             }
@@ -1053,10 +1135,400 @@ async fn stream_openai_compat(
             output_tokens,
             input_tokens.saturating_add(output_tokens),
             if is_openrouter || is_kimi { cost_usd } else { None },
+            cache_hit_tokens,
         );
     }
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
+}
+
+// ── Ollama native (/api/chat, /api/embed, /api/tags) ──────────────────────────
+
+/// Convert our internal `ChatMessage` into an Ollama chat message. Ollama takes
+/// a plain-string `content` plus a separate `images` array of **raw base64**
+/// strings (no `data:` prefix). PDF `file` parts have no native Ollama block and
+/// are dropped (vision models can't ingest PDFs directly).
+fn to_ollama_message(m: &ChatMessage) -> serde_json::Value {
+    match &m.content {
+        ChatContent::Text(s) => serde_json::json!({"role": m.role, "content": s}),
+        ChatContent::Parts(parts) => {
+            let mut text = String::new();
+            let mut images: Vec<String> = Vec::new();
+            for part in parts {
+                match part {
+                    ChatContentPart::Text { text: t } => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(t);
+                    }
+                    ChatContentPart::ImageUrl { image_url } => {
+                        // Ollama wants the raw base64 payload. Strip a data URI
+                        // wrapper when present; otherwise pass through anything
+                        // that isn't a remote URL (Ollama can't fetch http(s)).
+                        if let Some((media, data)) = parse_data_uri(&image_url.url) {
+                            if media.starts_with("image/") {
+                                images.push(data);
+                            }
+                        } else if !image_url.url.starts_with("http") {
+                            images.push(image_url.url.clone());
+                        }
+                    }
+                    ChatContentPart::File { .. } => {}
+                }
+            }
+            let mut obj = serde_json::json!({"role": m.role, "content": text});
+            if !images.is_empty() {
+                obj["images"] = serde_json::json!(images);
+            }
+            obj
+        }
+    }
+}
+
+/// Non-streaming Ollama chat completion. Returns the full response text.
+async fn chat_ollama(
+    provider: &AiProvider,
+    api_key: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    source: &str,
+) -> Result<String, String> {
+    let client = build_client()?;
+    let url = format!("{}/api/chat", ollama_root(provider));
+    let msgs: Vec<serde_json::Value> = messages.iter().map(to_ollama_message).collect();
+    let body = serde_json::json!({"model": model, "messages": msgs, "stream": false});
+
+    let mut req = client
+        .post(&url)
+        .timeout(REQUEST_TIMEOUT)
+        .header("Content-Type", "application/json");
+    // Ollama is usually keyless (local), but Ollama Cloud / an auth proxy accepts
+    // a bearer token — send it when the user configured one.
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let resp = req
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}. Is Ollama running at {}?", ollama_root(provider)))?;
+
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if status >= 400 {
+        return Err(friendly_error(status, &text));
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from Ollama: {e}"))?;
+
+    let input_tokens = json["prompt_eval_count"].as_u64().unwrap_or(0);
+    let output_tokens = json["eval_count"].as_u64().unwrap_or(0);
+    crate::token_usage::record_with_cost(source, &provider.id, model, input_tokens, output_tokens, None);
+
+    json["message"]["content"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Unexpected response format from Ollama".to_string())
+}
+
+/// Streaming Ollama chat completion. Ollama streams **newline-delimited JSON**
+/// (one full object per line — no `data:` prefix, no `[DONE]` sentinel). Each
+/// object carries `message.content` (answer) and, for thinking models,
+/// `message.thinking` (reasoning); the final object has `done:true` plus token
+/// stats (`prompt_eval_count`, `eval_count`). `message.tool_calls` (when the
+/// model requests a tool) is accumulated and emitted on `{event_name}-tools`.
+#[allow(clippy::too_many_arguments)]
+async fn stream_ollama(
+    provider: &AiProvider,
+    api_key: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    event_name: &str,
+    app: &tauri::AppHandle,
+    use_reasoning: bool,
+    reasoning_effort: Option<&str>,
+    source: &str,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<String, String> {
+    let client = build_client()?;
+    let url = format!("{}/api/chat", ollama_root(provider));
+    let msgs: Vec<serde_json::Value> = messages.iter().map(to_ollama_message).collect();
+
+    let mut body = serde_json::json!({"model": model, "messages": msgs, "stream": true});
+    // Thinking control. Ollama's `think` accepts a level string ("low"/"medium"/
+    // "high") for all thinking-capable models (and gpt-oss *requires* a level
+    // rather than a boolean), so send the effort level. Only send it when the
+    // user enabled reasoning — passing `think` to a non-thinking model errors.
+    if use_reasoning {
+        body["think"] = serde_json::json!(reasoning_effort.unwrap_or("high"));
+    }
+
+    let mut req = client
+        .post(&url)
+        .header("Content-Type", "application/json");
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let resp = req
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}. Is Ollama running at {}?", ollama_root(provider)))?;
+
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(friendly_error(status, &text));
+    }
+
+    let reasoning_event = format!("{event_name}-reasoning");
+    let tools_event = format!("{event_name}-tools");
+    let mut stream = resp.bytes_stream();
+    let mut byte_buf: Vec<u8> = Vec::new();
+    let mut buf = String::new();
+    let mut accumulated = String::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        if let Some(flag) = &cancel {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        byte_buf.extend_from_slice(&bytes);
+        // Decode up to the last complete UTF-8 boundary; keep trailing partial
+        // bytes (a multi-byte char split across chunks) for the next round.
+        let valid_up_to = match std::str::from_utf8(&byte_buf) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_up_to > 0 {
+            buf.push_str(unsafe { std::str::from_utf8_unchecked(&byte_buf[..valid_up_to]) });
+            byte_buf.drain(..valid_up_to);
+        }
+
+        loop {
+            let Some(pos) = buf.find('\n') else { break };
+            let line = buf[..pos].trim().to_string();
+            buf.drain(..pos + 1);
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+
+            // Answer delta.
+            if let Some(delta) = json["message"]["content"].as_str().filter(|s| !s.is_empty()) {
+                accumulated.push_str(delta);
+                let _ = app.emit(event_name, serde_json::json!({"delta": delta, "done": false}));
+            }
+            // Reasoning/thinking delta.
+            if let Some(r) = json["message"]["thinking"].as_str().filter(|s| !s.is_empty()) {
+                let _ = app.emit(&reasoning_event, serde_json::json!({"delta": r, "done": false}));
+            }
+            // Tool calls (accumulate — arguments are already a JSON object).
+            if let Some(calls) = json["message"]["tool_calls"].as_array() {
+                for c in calls {
+                    tool_calls.push(c.clone());
+                }
+            }
+
+            if json["done"].as_bool().unwrap_or(false) {
+                input_tokens = json["prompt_eval_count"].as_u64().unwrap_or(input_tokens);
+                output_tokens = json["eval_count"].as_u64().unwrap_or(output_tokens);
+                break;
+            }
+        }
+    }
+
+    if !tool_calls.is_empty() {
+        let _ = app.emit(tools_event.as_str(), serde_json::json!({"tool_calls": tool_calls}));
+    }
+    crate::token_usage::record_with_cost(source, &provider.id, model, input_tokens, output_tokens, None);
+    emit_stream_usage(
+        app,
+        event_name,
+        input_tokens,
+        output_tokens,
+        input_tokens.saturating_add(output_tokens),
+        None,
+        0,
+    );
+    let _ = app.emit(event_name, serde_json::json!({"delta": "", "done": true}));
+    Ok(accumulated)
+}
+
+/// Embed texts via Ollama's POST /api/embed (batch `input` array). Returns one
+/// vector per input, in order. L2-normalized unit vectors per Ollama's docs.
+async fn embed_ollama(
+    provider: &AiProvider,
+    api_key: &str,
+    model: &str,
+    texts: &[String],
+    source: &str,
+) -> Result<Vec<Vec<f32>>, String> {
+    let client = build_client()?;
+    let url = format!("{}/api/embed", ollama_root(provider));
+    let body = serde_json::json!({"model": model, "input": texts});
+
+    let mut req = client
+        .post(&url)
+        .timeout(REQUEST_TIMEOUT)
+        .header("Content-Type", "application/json");
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let resp = req
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}. Is Ollama running at {}?", ollama_root(provider)))?;
+
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if status >= 400 {
+        return Err(friendly_error(status, &text));
+    }
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Invalid JSON from Ollama /api/embed: {e}"))?;
+
+    let rows = json["embeddings"].as_array().ok_or_else(|| {
+        format!(
+            "No 'embeddings' array in Ollama response: {}",
+            char_prefix(&text, 200)
+        )
+    })?;
+    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let v: Vec<f32> = row
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default();
+        if v.is_empty() {
+            return Err("Empty embedding vector from Ollama — check the model name.".to_string());
+        }
+        vecs.push(v);
+    }
+
+    let total_tokens = json["prompt_eval_count"].as_u64().unwrap_or(0);
+    crate::token_usage::record(source, &provider.id, model, total_tokens, 0);
+    Ok(vecs)
+}
+
+/// List locally-available Ollama models (GET /api/tags) and enrich each with its
+/// capabilities from POST /api/show (vision / tools / thinking / embedding),
+/// mapped onto Argus's canonical capability tags.
+async fn fetch_ollama_models(provider: &AiProvider, api_key: &str) -> Result<Vec<AiModel>, String> {
+    let client = build_client()?;
+    let root = ollama_root(provider);
+    let mut req = client.get(format!("{root}/api/tags")).timeout(REQUEST_TIMEOUT);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}. Is Ollama running at {root}?"))?;
+
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if status >= 400 {
+        return Err(friendly_error(status, &text));
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from /api/tags: {e}"))?;
+    let list = json["models"].as_array().cloned().unwrap_or_default();
+
+    // Fetch capabilities concurrently via /api/show, keeping input order. Each
+    // future owns its data ('static) — borrowing an iterator item across
+    // `buffered` trips rustc's higher-ranked lifetime inference (see embed_openrouter).
+    let names: Vec<String> = list
+        .iter()
+        .map(|m| m["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let shows = names.into_iter().map(|name| {
+        let client = client.clone();
+        let root = root.clone();
+        let api_key = api_key.to_string();
+        async move {
+            let mut req = client
+                .post(format!("{root}/api/show"))
+                .timeout(REQUEST_TIMEOUT)
+                .header("Content-Type", "application/json");
+            if !api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {api_key}"));
+            }
+            let caps = match req.json(&serde_json::json!({"model": name})).send().await {
+                Ok(r) => r
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .map(|j| j["capabilities"].clone())
+                    .unwrap_or(serde_json::Value::Null),
+                Err(_) => serde_json::Value::Null,
+            };
+            caps
+        }
+    });
+    let caps_list: Vec<serde_json::Value> = futures::stream::iter(shows)
+        .buffered(6)
+        .collect::<Vec<_>>()
+        .await;
+
+    let models = list
+        .iter()
+        .zip(caps_list.into_iter())
+        .filter_map(|(item, caps_json)| {
+            let id = item["name"].as_str()?.to_string();
+            let mut caps: Vec<String> = Vec::new();
+            if let Some(arr) = caps_json.as_array() {
+                for c in arr {
+                    match c.as_str().unwrap_or("").to_lowercase().as_str() {
+                        "vision" => add_capability(&mut caps, "vision"),
+                        "tools" => add_capability(&mut caps, "tool_calling"),
+                        "thinking" => add_capability(&mut caps, "reasoning"),
+                        "embedding" => add_capability(&mut caps, "embedding"),
+                        _ => {}
+                    }
+                }
+            }
+            // Fall back to name-based heuristics when /api/show gave nothing.
+            let lower = id.to_lowercase();
+            if caps.is_empty() {
+                if looks_like_embedding_model(&lower) {
+                    add_capability(&mut caps, "embedding");
+                }
+                if looks_like_reasoning_model(&lower) {
+                    add_capability(&mut caps, "reasoning");
+                }
+            }
+            let context_length = item["details"]["context_length"].as_u64();
+            Some(AiModel {
+                id: id.clone(),
+                display_name: id,
+                capabilities: caps,
+                context_length,
+                enabled: true,
+                input_price_per_million: None,
+                output_price_per_million: None,
+                peak_pricing: false,
+                peak_input_price_per_million: None,
+                peak_output_price_per_million: None,
+                cache_hit_input_price_per_million: None,
+                input_price_usd_per_million: None,
+                output_price_usd_per_million: None,
+                provider_order: vec![],
+            })
+        })
+        .collect();
+
+    Ok(models)
 }
 
 // ── Anthropic native ──────────────────────────────────────────────────────────
@@ -1268,6 +1740,7 @@ async fn stream_anthropic(
                                         output_tokens,
                                         input_tokens.saturating_add(output_tokens),
                                         None,
+                                        0,
                                     );
                                     crate::token_usage::record(
                                         source,
@@ -1299,6 +1772,7 @@ async fn stream_anthropic(
         output_tokens,
         input_tokens.saturating_add(output_tokens),
         None,
+        0,
     );
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
@@ -1311,6 +1785,7 @@ fn emit_stream_usage(
     output_tokens: u64,
     total_tokens: u64,
     cost_usd: Option<f64>,
+    cache_hit_tokens: u64,
 ) {
     if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 && cost_usd.is_none() {
         return;
@@ -1323,6 +1798,9 @@ fn emit_stream_usage(
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
             "cost_usd": cost_usd,
+            // Cached (prompt-cache-hit) input tokens, when the provider reports
+            // them (e.g. DeepSeek). Used to estimate cost at the cheaper cache rate.
+            "cache_hit_tokens": cache_hit_tokens,
         }),
     );
 }
@@ -1435,6 +1913,10 @@ fn parse_model_item(item: &serde_json::Value) -> Option<AiModel> {
         enabled: true,
         input_price_per_million: None,
         output_price_per_million: None,
+        peak_pricing: false,
+        peak_input_price_per_million: None,
+        peak_output_price_per_million: None,
+        cache_hit_input_price_per_million: None,
         input_price_usd_per_million,
         output_price_usd_per_million,
         provider_order: vec![],
@@ -1619,6 +2101,10 @@ pub fn kimi_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            peak_pricing: false,
+            peak_input_price_per_million: None,
+            peak_output_price_per_million: None,
+            cache_hit_input_price_per_million: None,
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
             provider_order: vec![],
@@ -1636,6 +2122,10 @@ fn anthropic_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            peak_pricing: false,
+            peak_input_price_per_million: None,
+            peak_output_price_per_million: None,
+            cache_hit_input_price_per_million: None,
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
             provider_order: vec![],
@@ -1648,6 +2138,10 @@ fn anthropic_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            peak_pricing: false,
+            peak_input_price_per_million: None,
+            peak_output_price_per_million: None,
+            cache_hit_input_price_per_million: None,
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
             provider_order: vec![],
@@ -1660,6 +2154,10 @@ fn anthropic_known_models() -> Vec<AiModel> {
             enabled: true,
             input_price_per_million: None,
             output_price_per_million: None,
+            peak_pricing: false,
+            peak_input_price_per_million: None,
+            peak_output_price_per_million: None,
+            cache_hit_input_price_per_million: None,
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
             provider_order: vec![],

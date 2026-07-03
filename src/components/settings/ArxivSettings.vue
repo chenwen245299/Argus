@@ -44,9 +44,9 @@ function normalizeConfig(config: ArxivConfig): ArxivConfig {
   }
 }
 
-// Providers with configured keys can be used for arXiv analysis.
+// Providers with configured keys (or keyless local Ollama) can be used for arXiv analysis.
 const availableProviders = computed(() =>
-  (aiStore.settings.providers ?? []).filter((p: any) => p.enabled && p.has_key)
+  (aiStore.settings.providers ?? []).filter((p: any) => p.enabled && (p.has_key || p.kind === 'ollama'))
 )
 
 const selectedProvider = computed(() =>

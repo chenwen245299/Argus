@@ -83,7 +83,7 @@ function modelHasEmbeddingCapability(model: AiModel) {
 
 const embeddingModels = computed<EmbeddingModelOption[]>(() =>
   (aiStore.settings.providers ?? [])
-    .filter(provider => provider.kind !== 'anthropic' && provider.enabled && provider.has_key)
+    .filter(provider => provider.kind !== 'anthropic' && provider.enabled && (provider.has_key || provider.kind === 'ollama'))
     .flatMap(provider =>
       (provider.models ?? [])
         .filter(model => model.enabled !== false && modelHasEmbeddingCapability(model))

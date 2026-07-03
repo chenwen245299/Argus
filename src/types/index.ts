@@ -56,6 +56,23 @@ export interface Note {
   updated_at: string
 }
 
+/** One section heading in a paper's chapter structure. */
+export interface PaperSection {
+  title: string
+  /** 1 = top-level section, 2 = subsection, 3 = sub-subsection. */
+  level: number
+  /** 1-based page number to jump to; 0 = unknown. */
+  page: number
+}
+
+/** Persisted section index for a paper (sections.json). */
+export interface PaperSections {
+  /** How the sections were derived. */
+  source: 'outline' | 'heuristic' | 'ai'
+  generated_at: string
+  sections: PaperSection[]
+}
+
 export interface PaperIndexEntry {
   slug: string
   id: string
@@ -155,8 +172,12 @@ export interface AiModel {
   capabilities: string[]
   context_length?: number
   enabled: boolean
-  input_price_per_million?: number   // CNY per 1M input tokens
-  output_price_per_million?: number  // CNY per 1M output tokens
+  input_price_per_million?: number   // CNY per 1M input tokens (off-peak/standard)
+  output_price_per_million?: number  // CNY per 1M output tokens (off-peak/standard)
+  peak_pricing?: boolean             // time-based peak/off-peak pricing (e.g. DeepSeek)
+  peak_input_price_per_million?: number   // CNY per 1M input tokens at peak hours
+  peak_output_price_per_million?: number  // CNY per 1M output tokens at peak hours
+  cache_hit_input_price_per_million?: number // CNY per 1M cached (cache-hit) input tokens
   input_price_usd_per_million?: number   // USD per 1M input tokens
   output_price_usd_per_million?: number  // USD per 1M output tokens
   provider_order?: string[]          // OpenRouter provider preference order
@@ -165,7 +186,7 @@ export interface AiModel {
 export interface AiProviderInfo {
   id: string
   name: string
-  kind: 'openai_compatible' | 'anthropic' | string
+  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'ollama' | string
   base_url: string
   enabled: boolean
   has_key: boolean

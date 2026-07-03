@@ -319,12 +319,15 @@ pub fn resolve_provider_model(
         .ok_or_else(|| format!("Provider '{pid}' not found or is disabled."))?
         .clone();
 
-    let key = get_api_key(root, &pid).ok_or_else(|| {
-        format!(
-            "No API key set for '{}'. Configure it in Settings → AI Services.",
-            provider.name
-        )
-    })?;
+    // Ollama runs locally and is normally keyless, so an empty key is valid.
+    let key = get_api_key(root, &pid)
+        .or_else(|| (provider.kind == "ollama").then(String::new))
+        .ok_or_else(|| {
+            format!(
+                "No API key set for '{}'. Configure it in Settings → AI Services.",
+                provider.name
+            )
+        })?;
 
     Ok((provider, key, mid))
 }

@@ -39,7 +39,7 @@ const DEFAULT_USD_TO_CNY_RATE = 7.2
 // ── Price lookup ───────────────────────────────────────────────────────────────
 
 const priceMap = computed(() => {
-  const map = new Map<string, { inputCny?: number; outputCny?: number; inputUsd?: number; outputUsd?: number }>()
+  const map = new Map<string, { inputCny?: number; outputCny?: number; inputUsd?: number; outputUsd?: number; peakPricing?: boolean; peakInputCny?: number; peakOutputCny?: number }>()
   for (const p of (aiSettings.value?.providers ?? [])) {
     for (const m of p.models) {
       map.set(`${p.id}::${m.id}`, {
@@ -47,11 +47,23 @@ const priceMap = computed(() => {
         outputCny: m.output_price_per_million,
         inputUsd: m.input_price_usd_per_million,
         outputUsd: m.output_price_usd_per_million,
+        peakPricing: m.peak_pricing,
+        peakInputCny: m.peak_input_price_per_million,
+        peakOutputCny: m.peak_output_price_per_million,
       })
     }
   }
   return map
 })
+
+// DeepSeek-style peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00.
+// Everything else is off-peak. Uses UTC so it's correct regardless of the user's
+// local timezone.
+function isPeakHour(date: Date): boolean {
+  const minutes = ((date.getUTCHours() + 8) % 24) * 60 + date.getUTCMinutes()
+  const h = minutes / 60
+  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+}
 
 const usdToCnyRate = computed(() => {
   const rate = Number(appSettings.value?.usd_to_cny_rate)
@@ -121,8 +133,13 @@ function recordCost(r: UsageRecord) {
     if (prices.outputUsd != null) c += (r.output_tokens / 1_000_000) * prices.outputUsd * usdToCnyRate.value
     return c
   }
-  if (prices.inputCny != null)  c += (r.input_tokens  / 1_000_000) * prices.inputCny
-  if (prices.outputCny != null) c += (r.output_tokens / 1_000_000) * prices.outputCny
+  // Peak/off-peak: price each record by whether its own timestamp falls in the
+  // peak window (falls back to the standard price if the peak price isn't set).
+  const peak = prices.peakPricing && isPeakHour(new Date(r.ts))
+  const inputCny = peak && prices.peakInputCny != null ? prices.peakInputCny : prices.inputCny
+  const outputCny = peak && prices.peakOutputCny != null ? prices.peakOutputCny : prices.outputCny
+  if (inputCny != null)  c += (r.input_tokens  / 1_000_000) * inputCny
+  if (outputCny != null) c += (r.output_tokens / 1_000_000) * outputCny
   return c
 }
 

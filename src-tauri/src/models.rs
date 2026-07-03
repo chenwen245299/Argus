@@ -455,6 +455,21 @@ pub struct AiModel {
     /// CNY price per 1 million output tokens
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_price_per_million: Option<f64>,
+    /// Time-based peak/off-peak pricing (e.g. DeepSeek). When true, the prices
+    /// above are the off-peak (standard) prices and the peak_* fields hold the
+    /// higher peak-hour prices.
+    #[serde(default)]
+    pub peak_pricing: bool,
+    /// CNY peak-hour price per 1 million input tokens
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_input_price_per_million: Option<f64>,
+    /// CNY peak-hour price per 1 million output tokens
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_output_price_per_million: Option<f64>,
+    /// CNY price per 1 million cached (prompt-cache-hit) input tokens, e.g.
+    /// DeepSeek's much cheaper cache-hit rate. Used to estimate per-message cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_input_price_per_million: Option<f64>,
     /// USD price per 1 million input tokens, as returned by providers like OpenRouter
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_price_usd_per_million: Option<f64>,

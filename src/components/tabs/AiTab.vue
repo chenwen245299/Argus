@@ -10,7 +10,7 @@ import MermaidBlock from '../MermaidBlock.vue'
 import { renderMarkdown, getSegments } from '../../utils/renderMarkdown'
 import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
-import type { ChatContentPart, ChatMessage, PaperMeta, PaperStatus } from '../../types'
+import type { ChatContentPart, ChatMessage, PaperMeta, PaperStatus, PaperSection } from '../../types'
 import { askAiText } from '../../stores/translationHistory'
 
 const props = withDefaults(defineProps<{ slug: string | null; standalone?: boolean }>(), {
@@ -56,12 +56,15 @@ interface AssistantAnswer {
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
+  cacheHitTokens?: number
   costUsd?: number | null
   contextMode?: string
   usedPdf?: boolean
+  // Titles of the paper sections selected as context for this turn.
+  sectionTitles?: string[]
   source?: 'chat' | 'metadataExtraction'
   // Actual content injected into the system prompt, received via -context event
-  contextContent?: { metadata: string; summary: string; fulltext: string }
+  contextContent?: { metadata: string; summary: string; fulltext: string; sections?: string }
 }
 
 interface Conversation {
@@ -84,6 +87,7 @@ interface StreamUsagePayload {
   output_tokens?: number
   total_tokens?: number
   cost_usd?: number | null
+  cache_hit_tokens?: number
 }
 
 interface ExtractionProgressPayload {
@@ -150,6 +154,7 @@ const useReasoning = ref(false)
 const reasoningLevel = ref<'low' | 'medium' | 'high'>('high')
 const reasoningOpen = ref(false)
 const reasoningRoot = ref<HTMLElement | null>(null)
+const sectionMenuRoot = ref<HTMLElement | null>(null)
 
 // Context mode: how much paper content to inject as system prompt context
 // Possible values: 'none' | 'metadata' | 'summary' | 'fulltext' | 'summary+fulltext'
@@ -157,6 +162,68 @@ const reasoningRoot = ref<HTMLElement | null>(null)
 const contextMode = ref<PaperContextMode>('none')
 const usePdf = ref(false)
 const summaryAvailable = ref(false)
+
+// Chapter (section) context: multi-select of the paper's detected sections.
+const availableSections = ref<PaperSection[]>([])
+const selectedSectionTitles = ref<string[]>([])
+const showSectionMenu = ref(false)
+const sectionsActive = computed(() => selectedSectionTitles.value.length > 0)
+
+async function loadSections(slug: string | null) {
+  availableSections.value = []
+  selectedSectionTitles.value = []
+  showSectionMenu.value = false
+  if (!slug) return
+  try {
+    const data = await invoke<{ sections: PaperSection[] } | null>('get_sections', { slug })
+    availableSections.value = data?.sections ?? []
+  } catch {
+    availableSections.value = []
+  }
+}
+
+function toggleSectionMenu() {
+  if (!availableSections.value.length) return
+  showSectionMenu.value = !showSectionMenu.value
+}
+
+// A section plus its descendants: the consecutive following entries whose level
+// is deeper than its own. Selecting a parent recursively (de)selects children.
+function sectionWithDescendants(i: number): string[] {
+  const secs = availableSections.value
+  const level = secs[i].level
+  const titles = [secs[i].title]
+  for (let j = i + 1; j < secs.length; j++) {
+    if (secs[j].level > level) titles.push(secs[j].title)
+    else break
+  }
+  return titles
+}
+
+function toggleSection(i: number) {
+  const titles = sectionWithDescendants(i)
+  const isSelected = selectedSectionTitles.value.includes(availableSections.value[i].title)
+  if (isSelected) {
+    selectedSectionTitles.value = selectedSectionTitles.value.filter(t => !titles.includes(t))
+  } else {
+    const set = new Set(selectedSectionTitles.value)
+    titles.forEach(t => set.add(t))
+    selectedSectionTitles.value = [...set]
+  }
+}
+
+function selectAllSections() {
+  selectedSectionTitles.value = availableSections.value.map(s => s.title)
+}
+
+function clearSelectedSections() {
+  selectedSectionTitles.value = []
+}
+
+function onSectionsUpdatedEvent(e: Event) {
+  const slug = (e as CustomEvent<{ slug?: string }>).detail?.slug
+  if (slug && slug === props.slug) loadSections(slug)
+}
 
 // PDF mode uses OpenAI-compatible inline file content parts, which only
 // OpenRouter reliably supports. Kimi / Moonshot endpoints reject the "file"
@@ -184,60 +251,17 @@ const effectiveContextMode = computed(() => {
   return contextMode.value
 })
 
-function contextSectionsForMode(mode?: string | null) {
-  const sections = new Set<PaperContextSection>()
-  if (mode === 'metadata') sections.add('metadata')
-  if (mode === 'summary' || mode === 'summary+fulltext') sections.add('summary')
-  if (mode === 'fulltext' || mode === 'summary+fulltext') sections.add('fulltext')
-  return sections
-}
-
-function contextModeForSections(sections: Set<PaperContextSection>): PaperContextMode {
-  if (sections.has('metadata')) return 'metadata'
-  const hasSummarySection = sections.has('summary')
-  const hasFulltextSection = sections.has('fulltext')
-  if (hasSummarySection && hasFulltextSection) return 'summary+fulltext'
-  if (hasSummarySection) return 'summary'
-  if (hasFulltextSection) return 'fulltext'
-  return 'none'
-}
-
-function answerSentContextSections(answer: AssistantAnswer) {
-  const sections = new Set<PaperContextSection>()
-  if (answer.contextContent) {
-    if (answer.contextContent.metadata?.trim()) sections.add('metadata')
-    if (answer.contextContent.summary?.trim()) sections.add('summary')
-    if (answer.contextContent.fulltext?.trim()) sections.add('fulltext')
-    if (answer.usedPdf) sections.add('fulltext')
-    return sections
-  }
-  contextSectionsForMode(answer.contextMode).forEach(section => sections.add(section))
-  if (answer.usedPdf) sections.add('fulltext')
-  return sections
-}
-
-function conversationSentContextSections(conv: Conversation) {
-  const sections = new Set<PaperContextSection>()
-  for (const node of conv.nodes) {
-    if (node.role !== 'assistantGroup') continue
-    for (const answer of node.answers) {
-      answerSentContextSections(answer).forEach(section => sections.add(section))
-    }
-  }
-  return sections
-}
-
-function contextPlanForConversation(conv: Conversation) {
-  const sentSections = conversationSentContextSections(conv)
-  const missingSections = contextSectionsForMode(effectiveContextMode.value)
-  for (const section of sentSections) missingSections.delete(section)
-
-  const usePdfForThisTurn = usePdf.value && pdfSupported.value && !sentSections.has('fulltext')
-  if (usePdfForThisTurn) missingSections.delete('fulltext')
-
+// The model is stateless: anything it should keep "seeing" (the full text,
+// summary, selected chapters…) must be resent on EVERY turn. So each turn sends
+// the currently-selected context in full. We deliberately do NOT strip context
+// that already appeared in an earlier turn — that older behaviour made the model
+// lose the paper after the first message. "Not sending it twice" is already
+// guaranteed within a single request (one context block per turn).
+function contextPlanForConversation() {
   return {
-    contextMode: contextModeForSections(missingSections),
-    usePdf: usePdfForThisTurn,
+    contextMode: effectiveContextMode.value,
+    usePdf: usePdf.value && pdfSupported.value,
+    sectionTitles: [...selectedSectionTitles.value],
   }
 }
 
@@ -771,8 +795,19 @@ function buildHistoryUntil(conv: Conversation, stopGroupId?: string): ChatMessag
   for (const node of conv.nodes) {
     if (node.role === 'assistantGroup') {
       if (node.id === stopGroupId) break
-      const answer = node.answers.find(a => !a.error && a.content.trim()) ?? node.answers.find(a => a.content.trim())
-      if (answer) messages.push({ role: 'assistant', content: answer.content })
+      // Use the answer the user is actually viewing for this group; only fall
+      // back to "first non-empty" if that branch is empty/errored. The old
+      // "first non-empty" logic could pick a different model's (shorter) answer
+      // in multi-model turns, dropping the real reply from the history.
+      const active = activeAnswerForGroup(node)
+      const answer =
+        active && !active.error && active.content.trim()
+          ? active
+          : node.answers.find(a => !a.error && a.content.trim()) ??
+            node.answers.find(a => a.content.trim())
+      if (answer && answer.content.trim()) {
+        messages.push({ role: 'assistant', content: answer.content })
+      }
     } else if (node.role === 'user') {
       if (node.attachments?.length) {
         messages.push({ role: 'user', content: buildUserContentParts(node.content, node.attachments) })
@@ -793,7 +828,7 @@ async function sendMessage() {
   const text = input.value.trim()
   const conv = activeConversation.value ?? createBlankConversation(props.slug)
   activeConversation.value = conv
-  const contextPlan = contextPlanForConversation(conv)
+  const contextPlan = contextPlanForConversation()
 
   const userNode: ChatNode = {
     id: newId('user'),
@@ -807,7 +842,7 @@ async function sendMessage() {
     role: 'assistantGroup',
     promptId: userNode.id,
     createdAt: nowIso(),
-    answers: selectedModels.value.map(model => modelToAnswer(model, contextPlan.contextMode, contextPlan.usePdf)),
+    answers: selectedModels.value.map(model => modelToAnswer(model, contextPlan.contextMode, contextPlan.usePdf, contextPlan.sectionTitles)),
   }
   if (group.answers[0]) setActiveAnswer(group.id, group.answers[0].id)
   conv.nodes.push(userNode, group)
@@ -823,7 +858,12 @@ async function sendMessage() {
   await Promise.all(group.answers.map(answer => streamAnswer(conv, answer, history)))
 }
 
-function modelToAnswer(model: ModelOption, contextModeToSend: PaperContextMode, usePdfToSend: boolean): AssistantAnswer {
+function modelToAnswer(
+  model: ModelOption,
+  contextModeToSend: PaperContextMode,
+  usePdfToSend: boolean,
+  sectionTitlesToSend: string[],
+): AssistantAnswer {
   return {
     id: newId('answer'),
     providerId: model.providerId,
@@ -835,6 +875,7 @@ function modelToAnswer(model: ModelOption, contextModeToSend: PaperContextMode, 
     createdAt: nowIso(),
     contextMode: contextModeToSend,
     usedPdf: usePdfToSend,
+    sectionTitles: sectionTitlesToSend,
   }
 }
 
@@ -884,14 +925,14 @@ async function submitEdit(node: UserNode) {
   // Truncate everything after this user node
   const idx = conv.nodes.indexOf(node)
   if (idx >= 0) conv.nodes.splice(idx + 1)
-  const contextPlan = contextPlanForConversation(conv)
+  const contextPlan = contextPlanForConversation()
 
   const group: ChatNode = {
     id: newId('group'),
     role: 'assistantGroup',
     promptId: node.id,
     createdAt: nowIso(),
-    answers: selectedModels.value.map(model => modelToAnswer(model, contextPlan.contextMode, contextPlan.usePdf)),
+    answers: selectedModels.value.map(model => modelToAnswer(model, contextPlan.contextMode, contextPlan.usePdf, contextPlan.sectionTitles)),
   }
   if (group.answers[0]) setActiveAnswer(group.id, group.answers[0].id)
   conv.nodes.push(group)
@@ -1018,7 +1059,7 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
   unlisteners.set(`${answer.id}-usage`, unlistenUsage)
 
   // Receive the actual context injected into the system prompt for the transparency banner
-  const unlistenCtx = await listen<{ metadata: string; summary: string; fulltext: string }>(
+  const unlistenCtx = await listen<{ metadata: string; summary: string; fulltext: string; sections?: string }>(
     `${eventName}-context`,
     (event) => {
       const reactiveAns = findReactiveAnswer(answer.id)
@@ -1059,6 +1100,7 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
       reasoningEffort: useReasoning.value ? effortToSend : null,
       contextMode: answer.contextMode ?? 'none',
       usePdf: !!answer.usedPdf,
+      sectionTitles: answer.sectionTitles ?? [],
       requestId,
     })
     const reactiveAns = findReactiveAnswer(answer.id)
@@ -1104,11 +1146,56 @@ function estimateTokens(text: string) {
   return Math.max(1, Math.round(cjk * 0.8 + other / 4))
 }
 
+// Estimated tokens of just THIS turn's user prompt (the text you typed),
+// separate from the full \u2191 context (which also includes history + full text).
+function currentTurnInputTokens(answer: AssistantAnswer): number {
+  const conv = activeConversation.value
+  if (!conv) return 0
+  const group = conv.nodes.find(
+    n => n.role === 'assistantGroup' && (n as AssistantGroupNode).answers.some(a => a.id === answer.id),
+  ) as AssistantGroupNode | undefined
+  if (!group) return 0
+  const userNode = conv.nodes.find(n => n.role === 'user' && n.id === group.promptId)
+  if (!userNode || userNode.role !== 'user') return 0
+  return estimateTokens(userNode.content)
+}
+
 function applyUsage(answer: AssistantAnswer, usage: StreamUsagePayload) {
   if (typeof usage.input_tokens === 'number') answer.inputTokens = usage.input_tokens
   if (typeof usage.output_tokens === 'number') answer.outputTokens = usage.output_tokens
   if (typeof usage.total_tokens === 'number') answer.totalTokens = usage.total_tokens
+  if (typeof usage.cache_hit_tokens === 'number') answer.cacheHitTokens = usage.cache_hit_tokens
   if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) answer.costUsd = usage.cost_usd
+}
+
+// DeepSeek-style peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00.
+function isPeakHour(date: Date): boolean {
+  const minutes = ((date.getUTCHours() + 8) % 24) * 60 + date.getUTCMinutes()
+  const h = minutes / 60
+  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+}
+
+// Estimated CNY cost for models whose provider doesn't return a cost (e.g.
+// DeepSeek), using the configured prices: cache-hit vs miss input + output, and
+// peak/off-peak by the current time. Returns null when no CNY prices are set.
+function estimatedCostCny(answer: AssistantAnswer): number | null {
+  if (typeof answer.inputTokens !== 'number' || typeof answer.outputTokens !== 'number') return null
+  const provider = ai.settings.providers.find(p => p.id === answer.providerId)
+  const m = provider?.models.find(x => x.id === answer.modelId)
+  if (!m || (m.input_price_per_million == null && m.output_price_per_million == null)) return null
+  const peak = !!m.peak_pricing && isPeakHour(new Date())
+  const inPrice = (peak && m.peak_input_price_per_million != null ? m.peak_input_price_per_million : m.input_price_per_million) ?? 0
+  const outPrice = (peak && m.peak_output_price_per_million != null ? m.peak_output_price_per_million : m.output_price_per_million) ?? 0
+  const cacheHit = answer.cacheHitTokens ?? 0
+  const cacheMiss = Math.max(0, answer.inputTokens - cacheHit)
+  const cacheHitPrice = m.cache_hit_input_price_per_million != null ? m.cache_hit_input_price_per_million : inPrice
+  const cost = (cacheMiss / 1e6) * inPrice + (cacheHit / 1e6) * cacheHitPrice + (answer.outputTokens / 1e6) * outPrice
+  return Number.isFinite(cost) && cost > 0 ? cost : null
+}
+
+function fmtCny(cny: number): string {
+  if (cny < 0.01) return '<0.01'
+  return cny.toFixed(cny < 1 ? 3 : 2)
 }
 
 function hasUsage(answer: AssistantAnswer) {
@@ -1219,6 +1306,9 @@ function closeFloating(e: MouseEvent) {
   if (reasoningRoot.value && !reasoningRoot.value.contains(e.target as Node)) {
     reasoningOpen.value = false
   }
+  if (sectionMenuRoot.value && !sectionMenuRoot.value.contains(e.target as Node)) {
+    showSectionMenu.value = false
+  }
 }
 
 watch(() => props.slug, async (slug) => {
@@ -1234,6 +1324,7 @@ watch(() => props.slug, async (slug) => {
   applyFulltextReady(false, true)
   abstractAvailable.value = false
   summaryAvailable.value = false
+  loadSections(slug)
   if (slug) {
     await Promise.all([
       refreshFulltextAvailability(slug, true),
@@ -1258,6 +1349,7 @@ onMounted(async () => {
   window.addEventListener('focus', onWindowFocus)
   window.addEventListener('argus-paper-fulltext-updated', onPaperFulltextUpdated)
   window.addEventListener('argus-paper-meta-updated', onPaperMetaUpdated)
+  window.addEventListener('argus-sections-updated', onSectionsUpdatedEvent)
   unlistenExtractionProgress = await listen<ExtractionProgressPayload>('extraction_progress', (event) => {
     if (event.payload.slug === props.slug && event.payload.ok) {
       applyFulltextReady(true)
@@ -1357,6 +1449,7 @@ onUnmounted(() => {
   window.removeEventListener('focus', onWindowFocus)
   window.removeEventListener('argus-paper-fulltext-updated', onPaperFulltextUpdated)
   window.removeEventListener('argus-paper-meta-updated', onPaperMetaUpdated)
+  window.removeEventListener('argus-sections-updated', onSectionsUpdatedEvent)
   unlistenExtractionProgress?.()
   unlistenMetaStart?.()
   unlistenMetaDone?.()
@@ -1377,15 +1470,71 @@ function getFirstAnswer(userNodeId: string): AssistantAnswer | undefined {
   return group?.answers[0]
 }
 
-function hasContextBanner(userNodeId: string): boolean {
-  const ans = getFirstAnswer(userNodeId)
-  if (!ans) return false
-  if (ans.contextContent) {
-    return !!(ans.contextContent.metadata || ans.contextContent.summary || ans.contextContent.fulltext) || !!ans.usedPdf
+interface CtxFlags {
+  metadata: boolean
+  summary: boolean
+  fulltext: boolean
+  sections: boolean
+  pdf: boolean
+}
+
+// Which context types a single answer actually carried.
+function answerContextFlags(ans: AssistantAnswer): CtxFlags {
+  const c = ans.contextContent
+  if (c) {
+    return {
+      metadata: !!c.metadata?.trim(),
+      summary: !!c.summary?.trim(),
+      fulltext: !!c.fulltext?.trim(),
+      sections: !!c.sections?.trim(),
+      pdf: !!ans.usedPdf,
+    }
   }
-  // Fallback for old conversations without contextContent
   const mode = ans.contextMode ?? 'none'
-  return (mode !== 'none' && mode !== '') || !!ans.usedPdf
+  return {
+    metadata: mode === 'metadata',
+    summary: mode === 'summary' || mode === 'summary+fulltext',
+    fulltext: mode === 'fulltext' || mode === 'summary+fulltext',
+    sections: !!ans.sectionTitles?.length,
+    pdf: !!ans.usedPdf,
+  }
+}
+
+// Context this turn introduces for the FIRST time (vs. earlier turns). The model
+// still receives the context every turn (it's stateless), but the badge is only
+// shown on the message that first added it — like an attachment shown once, not
+// re-announced on every follow-up.
+function newlyAddedContext(userNodeId: string): CtxFlags {
+  const empty: CtxFlags = { metadata: false, summary: false, fulltext: false, sections: false, pdf: false }
+  const conv = activeConversation.value
+  if (!conv) return empty
+  const prev = { ...empty }
+  for (const node of conv.nodes) {
+    if (node.role !== 'assistantGroup') continue
+    const ans = node.answers[0]
+    if (!ans) continue
+    const flags = answerContextFlags(ans)
+    if (node.promptId === userNodeId) {
+      return {
+        metadata: flags.metadata && !prev.metadata,
+        summary: flags.summary && !prev.summary,
+        fulltext: flags.fulltext && !prev.fulltext,
+        sections: flags.sections && !prev.sections,
+        pdf: flags.pdf && !prev.pdf,
+      }
+    }
+    prev.metadata = prev.metadata || flags.metadata
+    prev.summary = prev.summary || flags.summary
+    prev.fulltext = prev.fulltext || flags.fulltext
+    prev.sections = prev.sections || flags.sections
+    prev.pdf = prev.pdf || flags.pdf
+  }
+  return empty
+}
+
+function hasContextBanner(userNodeId: string): boolean {
+  const f = newlyAddedContext(userNodeId)
+  return f.metadata || f.summary || f.fulltext || f.sections || f.pdf
 }
 
 function toggleContextPanel(nodeId: string) {
@@ -1557,38 +1706,34 @@ function toggleContextPanel(nodeId: string) {
                 <!-- Context banner: shows what was ACTUALLY sent to the AI for this message -->
                 <div v-if="hasContextBanner(node.id)" class="context-banner">
                   <button class="ctx-pills" @click="toggleContextPanel(node.id)" :title="expandedContextId === node.id ? '收起' : '查看发送给 AI 的上下文'">
-                    <template v-if="getFirstAnswer(node.id)?.contextContent">
-                      <span v-if="getFirstAnswer(node.id)!.contextContent!.metadata" class="ctx-pill ctx-meta">元数据</span>
-                      <span v-if="getFirstAnswer(node.id)!.contextContent!.summary" class="ctx-pill ctx-summary">AI 总结</span>
-                      <span v-if="getFirstAnswer(node.id)!.contextContent!.fulltext" class="ctx-pill ctx-fulltext">全文</span>
-                      <span v-if="getFirstAnswer(node.id)!.usedPdf" class="ctx-pill ctx-pdf">PDF</span>
-                    </template>
-                    <template v-else>
-                      <!-- contextContent not yet received or old conversation: fall back to contextMode -->
-                      <span v-if="getFirstAnswer(node.id)?.contextMode === 'metadata'" class="ctx-pill ctx-meta">元数据</span>
-                      <span v-if="getFirstAnswer(node.id)?.contextMode === 'summary' || getFirstAnswer(node.id)?.contextMode === 'summary+fulltext'" class="ctx-pill ctx-summary">AI 总结</span>
-                      <span v-if="getFirstAnswer(node.id)?.contextMode === 'fulltext' || getFirstAnswer(node.id)?.contextMode === 'summary+fulltext'" class="ctx-pill ctx-fulltext">全文</span>
-                      <span v-if="getFirstAnswer(node.id)?.usedPdf" class="ctx-pill ctx-pdf">PDF</span>
-                    </template>
+                    <span v-if="newlyAddedContext(node.id).metadata" class="ctx-pill ctx-meta">元数据</span>
+                    <span v-if="newlyAddedContext(node.id).summary" class="ctx-pill ctx-summary">AI 总结</span>
+                    <span v-if="newlyAddedContext(node.id).sections" class="ctx-pill ctx-sections">章节</span>
+                    <span v-if="newlyAddedContext(node.id).fulltext" class="ctx-pill ctx-fulltext">全文</span>
+                    <span v-if="newlyAddedContext(node.id).pdf" class="ctx-pill ctx-pdf">PDF</span>
                     <svg class="ctx-chevron" :class="{ open: expandedContextId === node.id }" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                       <polyline points="6 9 12 15 18 9"/>
                     </svg>
                   </button>
                   <div v-if="expandedContextId === node.id" class="ctx-preview">
                     <template v-if="getFirstAnswer(node.id)?.contextContent">
-                      <div v-if="getFirstAnswer(node.id)!.contextContent!.metadata" class="ctx-section">
+                      <div v-if="newlyAddedContext(node.id).metadata && getFirstAnswer(node.id)!.contextContent!.metadata" class="ctx-section">
                         <div class="ctx-section-label">元数据</div>
                         <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.metadata }}</pre>
                       </div>
-                      <div v-if="getFirstAnswer(node.id)!.contextContent!.summary" class="ctx-section">
+                      <div v-if="newlyAddedContext(node.id).summary && getFirstAnswer(node.id)!.contextContent!.summary" class="ctx-section">
                         <div class="ctx-section-label">AI 总结</div>
                         <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.summary }}</pre>
                       </div>
-                      <div v-if="getFirstAnswer(node.id)!.contextContent!.fulltext" class="ctx-section">
+                      <div v-if="newlyAddedContext(node.id).sections && getFirstAnswer(node.id)!.contextContent!.sections" class="ctx-section">
+                        <div class="ctx-section-label">章节</div>
+                        <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.sections }}</pre>
+                      </div>
+                      <div v-if="newlyAddedContext(node.id).fulltext && getFirstAnswer(node.id)!.contextContent!.fulltext" class="ctx-section">
                         <div class="ctx-section-label">全文</div>
                         <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.fulltext }}</pre>
                       </div>
-                      <div v-if="getFirstAnswer(node.id)!.usedPdf && !getFirstAnswer(node.id)!.contextContent!.fulltext" class="ctx-section">
+                      <div v-if="newlyAddedContext(node.id).pdf && !newlyAddedContext(node.id).fulltext" class="ctx-section">
                         <pre class="ctx-preview-text">PDF 文件已直接发送给模型</pre>
                       </div>
                     </template>
@@ -1714,10 +1859,18 @@ function toggleContextPanel(nodeId: string) {
                   </button>
                 </div>
                 <div v-if="hasUsage(answer) || answer.error" class="msg-usage">
-                  <span v-if="typeof answer.inputTokens === 'number'" class="usage-tokens" title="上下文输入 tokens">↑{{ formatTokenCount(answer.inputTokens) }}</span>
+                  <span v-if="currentTurnInputTokens(answer) > 0" class="usage-tokens usage-turn-input" title="本轮你输入的内容（估算 tokens，不含历史与全文）">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 20h9"/>
+                      <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>
+                    </svg>
+                    {{ formatTokenCount(currentTurnInputTokens(answer)) }}
+                  </span>
+                  <span v-if="typeof answer.inputTokens === 'number'" class="usage-tokens" title="上下文输入 tokens（含历史与全文）">↑{{ formatTokenCount(answer.inputTokens) }}</span>
                   <span v-if="typeof answer.outputTokens === 'number'" class="usage-tokens" title="本次输出 tokens">↓{{ formatTokenCount(answer.outputTokens) }}</span>
                   <span v-if="answerSpeed(answer)" class="msg-speed">{{ answerSpeed(answer) }}</span>
                   <span v-if="answer.costUsd != null && formatCostCny(answer.costUsd)" class="usage-cost" :title="`约 ¥${formatCostCny(answer.costUsd)} / $${answer.costUsd.toFixed(6)}`">¥{{ formatCostCny(answer.costUsd) }}</span>
+                  <span v-else-if="answer.costUsd == null && estimatedCostCny(answer) != null" class="usage-cost usage-cost-est" :title="`按配置单价估算（含缓存命中/峰谷），约 ¥${estimatedCostCny(answer)!.toFixed(6)}`">≈¥{{ fmtCny(estimatedCostCny(answer)!) }}</span>
                   <span v-if="answer.error" class="error-badge">出错</span>
                 </div>
               </div>
@@ -1767,6 +1920,49 @@ function toggleContextPanel(nodeId: string) {
             :title="summaryAvailable ? 'AI 总结（可与全文同时选择）' : '尚无 AI 总结，请先生成'"
             @click="toggleContext('summary')"
           >AI 总结</button>
+          <div ref="sectionMenuRoot" class="context-section-wrap">
+            <button
+              class="context-btn context-btn-sections"
+              :class="{ active: sectionsActive }"
+              :disabled="!availableSections.length"
+              :title="availableSections.length ? '按章节作为上下文（可多选）' : '尚未识别到章节，请先在「章节」页签识别'"
+              @click="toggleSectionMenu"
+            >
+              <span class="context-btn-label">章节</span>
+              <span v-if="sectionsActive" class="context-count">{{ selectedSectionTitles.length }}</span>
+              <svg class="context-caret" :class="{ open: showSectionMenu }" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </button>
+            <Transition name="section-menu">
+              <div v-if="showSectionMenu" class="section-menu">
+                <div class="section-menu-head">
+                  <span class="section-menu-title">选择章节作为上下文</span>
+                  <div class="section-menu-actions">
+                    <button class="section-menu-link" @click="selectAllSections">全选</button>
+                    <button class="section-menu-link" @click="clearSelectedSections">清空</button>
+                  </div>
+                </div>
+                <div class="section-menu-list">
+                  <label
+                    v-for="(sec, i) in availableSections"
+                    :key="i"
+                    class="section-menu-item"
+                    :class="`level-${sec.level}`"
+                    :title="sec.title"
+                  >
+                    <input
+                      type="checkbox"
+                      :checked="selectedSectionTitles.includes(sec.title)"
+                      @change="toggleSection(i)"
+                    />
+                    <span class="section-menu-item-title">{{ sec.title }}</span>
+                    <span v-if="sec.page > 0" class="section-menu-item-page">p.{{ sec.page }}</span>
+                  </label>
+                </div>
+              </div>
+            </Transition>
+          </div>
           <button
             class="context-btn"
             :class="{ active: hasFulltext }"
@@ -1810,7 +2006,6 @@ function toggleContextPanel(nodeId: string) {
             v-model="input"
             class="composer-input"
             rows="1"
-            :disabled="hasStreaming"
             placeholder="问这篇论文里的任何问题…"
             @keydown="handleKeydown"
             @paste="onPaste"
@@ -2664,15 +2859,18 @@ function toggleContextPanel(nodeId: string) {
   color: var(--text-tertiary);
 }
 .usage-tokens { color: var(--text-tertiary); }
+.usage-turn-input { display: inline-flex; align-items: center; gap: 2px; }
 .msg-speed { color: color-mix(in srgb, var(--accent) 74%, var(--text-tertiary)); }
 .usage-cost {
   color: var(--text-secondary);
   font-weight: 500;
   margin-left: 2px;
 }
+.usage-cost-est { color: var(--text-tertiary); font-weight: 400; }
 .error-badge { color: #ef4444; }
 
 .composer {
+  position: relative;
   flex-shrink: 0;
   padding: 6px 10px 10px;
   border-top: 1px solid var(--border-subtle);
@@ -2778,6 +2976,129 @@ function toggleContextPanel(nodeId: string) {
   border-color: color-mix(in srgb, #b91c1c 32%, var(--border-default));
   background: color-mix(in srgb, #b91c1c 10%, transparent);
 }
+
+.context-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+  background: var(--accent);
+}
+
+/* ── Section (chapter) context dropdown — opens upward, spans the composer ── */
+.context-section-wrap { display: inline-flex; }
+/* Reserve enough width up front so adding the count badge doesn't shift layout. */
+.context-btn-sections {
+  min-width: 74px;
+  justify-content: center;
+}
+.context-btn-label { flex-shrink: 0; }
+.context-caret {
+  flex-shrink: 0;
+  opacity: 0.55;
+  transition: transform 0.16s ease;
+}
+.context-caret.open { transform: rotate(180deg); }
+
+.section-menu {
+  position: absolute;
+  bottom: 100%;
+  left: 10px;
+  right: 10px;
+  margin-bottom: 6px;
+  z-index: 40;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.section-menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.section-menu-title { font-size: 11.5px; font-weight: 600; color: var(--text-secondary); }
+.section-menu-actions { display: flex; gap: 8px; }
+.section-menu-link {
+  font-size: 11px;
+  color: var(--accent);
+  cursor: pointer;
+}
+.section-menu-link:hover { text-decoration: underline; }
+.section-menu-list {
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.section-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 7px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+}
+.section-menu-item:hover { background: var(--bg-hover); }
+/* Custom checkbox: the native control renders as an ugly black box in some
+   themes; draw our own rounded box with an accent check instead. */
+.section-menu-item input {
+  appearance: none;
+  -webkit-appearance: none;
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  border: 1.5px solid var(--border-default);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.12s, border-color 0.12s;
+}
+.section-menu-item input:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-default)); }
+.section-menu-item input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.section-menu-item input:checked::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.section-menu-item.level-2 { padding-left: 20px; color: var(--text-secondary); }
+.section-menu-item.level-3 { padding-left: 34px; color: var(--text-tertiary); font-size: var(--font-size-xs); }
+.section-menu-item-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.section-menu-item-page {
+  flex-shrink: 0;
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.section-menu-enter-active,
+.section-menu-leave-active { transition: opacity 0.12s ease, transform 0.12s ease; }
+.section-menu-enter-from,
+.section-menu-leave-to { opacity: 0; transform: translateY(6px); }
 
 .composer-input {
   flex: 1;
@@ -3182,6 +3503,7 @@ function toggleContextPanel(nodeId: string) {
 .ctx-meta    { background: color-mix(in srgb, #6b7280 15%, transparent); color: #4b5563; }
 .ctx-summary { background: color-mix(in srgb, #7c3aed 14%, transparent); color: #6d28d9; }
 .ctx-fulltext{ background: color-mix(in srgb, #059669 14%, transparent); color: #047857; }
+.ctx-sections{ background: color-mix(in srgb, #2563eb 14%, transparent); color: #1d4ed8; }
 .ctx-pdf     { background: #fee2e2; color: #b91c1c; }
 .ctx-chevron {
   color: var(--text-tertiary);

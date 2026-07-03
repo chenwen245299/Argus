@@ -19,6 +19,7 @@ mod paper;
 mod path_guard;
 mod rag;
 mod search;
+mod sections;
 mod security_bookmark;
 mod settings;
 mod snippets;
@@ -62,6 +63,16 @@ pub fn run() {
                     let mut guard = state.0.lock().unwrap();
                     *guard = Some(path.clone());
                     token_usage::set_root(&path);
+
+                    // Initialize the arXiv scheduler's enabled flag from the
+                    // restored library's config. A normal startup restores the
+                    // library directly (without `open_library`), so without this
+                    // the scheduler's flag stays false and background auto-fetch
+                    // never runs until the user re-opens the library or the arXiv
+                    // view — which is exactly the "only fetches when I open arXiv"
+                    // bug.
+                    let arxiv_cfg = arxiv::get_arxiv_config(&path);
+                    arxiv_scheduler::set_enabled(arxiv_cfg.auto_fetch_enabled);
                 }
             }
 
@@ -100,6 +111,9 @@ pub fn run() {
             commands::get_paper_status,
             commands::save_pdfjs_fulltext,
             commands::save_fulltext,
+            commands::get_sections,
+            commands::save_sections,
+            commands::ai_split_sections,
             commands::ocr_page_base64,
             commands::translate_text,
             commands::translate_text_stream,

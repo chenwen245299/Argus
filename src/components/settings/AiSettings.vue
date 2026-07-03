@@ -17,7 +17,7 @@ const PRESETS = [
   { label: 'OpenRouter',   base_url: 'https://openrouter.ai/api/v1',      kind: 'openrouter' },
   { label: 'DeepSeek',     base_url: 'https://api.deepseek.com/v1',       kind: 'openai_compatible' },
   { label: 'Kimi Code',    base_url: 'https://api.kimi.com/coding/v1',    kind: 'kimi' },
-  { label: 'Ollama (local)',base_url:'http://localhost:11434/v1',          kind: 'openai_compatible' },
+  { label: 'Ollama',       base_url: 'http://localhost:11434',            kind: 'ollama' },
   { label: 'Anthropic',    base_url: 'https://api.anthropic.com/v1',      kind: 'anthropic' },
 ]
 
@@ -40,8 +40,12 @@ type ModelForm = {
   display_name: string
   context_length: string
   capabilities: string[]
-  input_price: string   // CNY per 1M input tokens, empty = not set
-  output_price: string  // CNY per 1M output tokens, empty = not set
+  input_price: string   // CNY per 1M input tokens (off-peak/standard), empty = not set
+  output_price: string  // CNY per 1M output tokens (off-peak/standard), empty = not set
+  peak_pricing: boolean // time-based peak/off-peak pricing (e.g. DeepSeek)
+  peak_input_price: string   // CNY per 1M input tokens at peak hours
+  peak_output_price: string  // CNY per 1M output tokens at peak hours
+  cache_hit_input_price: string // CNY per 1M cached (cache-hit) input tokens
   provider_order: string[] // OpenRouter provider preference order
 }
 
@@ -52,7 +56,7 @@ interface OrEndpoint {
 }
 
 function emptyModelForm(): ModelForm {
-  return { id: '', display_name: '', context_length: '', capabilities: [], input_price: '', output_price: '', provider_order: [] }
+  return { id: '', display_name: '', context_length: '', capabilities: [], input_price: '', output_price: '', peak_pricing: false, peak_input_price: '', peak_output_price: '', cache_hit_input_price: '', provider_order: [] }
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -372,7 +376,7 @@ function parsePrice(s: string): number | undefined {
 }
 
 function submitAddModel() {
-  const { id, display_name, context_length, capabilities, input_price, output_price, provider_order } = newModel.value
+  const { id, display_name, context_length, capabilities, input_price, output_price, peak_pricing, peak_input_price, peak_output_price, cache_hit_input_price, provider_order } = newModel.value
   if (!id) return
   editModels.value.push({
     id,
@@ -382,6 +386,10 @@ function submitAddModel() {
     enabled: true,
     input_price_per_million: parsePrice(input_price),
     output_price_per_million: parsePrice(output_price),
+    peak_pricing,
+    peak_input_price_per_million: peak_pricing ? parsePrice(peak_input_price) : undefined,
+    peak_output_price_per_million: peak_pricing ? parsePrice(peak_output_price) : undefined,
+    cache_hit_input_price_per_million: parsePrice(cache_hit_input_price),
     provider_order: [...provider_order],
   })
   newModel.value = emptyModelForm()
@@ -398,6 +406,10 @@ function startEditModel(idx: number) {
     capabilities: [...m.capabilities],
     input_price: m.input_price_per_million?.toString() ?? '',
     output_price: m.output_price_per_million?.toString() ?? '',
+    peak_pricing: !!m.peak_pricing,
+    peak_input_price: m.peak_input_price_per_million?.toString() ?? '',
+    peak_output_price: m.peak_output_price_per_million?.toString() ?? '',
+    cache_hit_input_price: m.cache_hit_input_price_per_million?.toString() ?? '',
     provider_order: [...(m.provider_order ?? [])],
   }
   if (isOpenRouterProvider.value && orEndpoints.value.length === 0 && orEndpointStatus.value !== 'fetching') {
@@ -407,7 +419,7 @@ function startEditModel(idx: number) {
 
 function submitEditModel() {
   if (editModelIdx.value === null) return
-  const { id, display_name, context_length, capabilities, input_price, output_price, provider_order } = editModelForm.value
+  const { id, display_name, context_length, capabilities, input_price, output_price, peak_pricing, peak_input_price, peak_output_price, cache_hit_input_price, provider_order } = editModelForm.value
   editModels.value[editModelIdx.value] = {
     ...editModels.value[editModelIdx.value],
     id,
@@ -417,6 +429,10 @@ function submitEditModel() {
     enabled: true,
     input_price_per_million: parsePrice(input_price),
     output_price_per_million: parsePrice(output_price),
+    peak_pricing,
+    peak_input_price_per_million: peak_pricing ? parsePrice(peak_input_price) : undefined,
+    peak_output_price_per_million: peak_pricing ? parsePrice(peak_output_price) : undefined,
+    cache_hit_input_price_per_million: parsePrice(cache_hit_input_price),
     provider_order: [...provider_order],
   }
   editModelIdx.value = null
@@ -731,12 +747,13 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="openrouter">{{ t('aiService.openrouter') }}</option>
             <option value="kimi">{{ t('aiService.kimi') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
+            <option value="ollama">{{ t('aiService.ollama') }}</option>
           </select>
         </div>
         <div class="field-group">
           <div class="field-label">{{ t('aiService.apiKey') }}</div>
-          <input v-model="addForm.api_key" type="password" class="text-input" :placeholder="t('aiService.apiKeyPlaceholder')" />
-          <div class="field-note">{{ t('aiService.apiKeyNote') }}</div>
+          <input v-model="addForm.api_key" type="password" class="text-input" :placeholder="addForm.kind === 'ollama' ? t('aiService.ollamaKeyPlaceholder') : t('aiService.apiKeyPlaceholder')" />
+          <div class="field-note">{{ addForm.kind === 'ollama' ? t('aiService.ollamaKeyHint') : t('aiService.apiKeyNote') }}</div>
         </div>
         <div class="action-row">
           <button class="btn-primary" @click="submitAdd" :disabled="!addForm.name || !addForm.base_url">
@@ -797,17 +814,18 @@ function toggleCapability(form: ModelForm, cap: string) {
               {{ t('aiService.modifyKey') }}
             </button>
           </div>
+          <div v-if="editKind === 'ollama' && !editKeyMode" class="field-note">{{ t('aiService.ollamaKeyHint') }}</div>
           <template v-if="editKeyMode">
             <input
               v-model="editKey"
               type="password"
               class="text-input"
               style="margin-top:6px"
-              :placeholder="t('aiService.apiKeyPlaceholder')"
+              :placeholder="editKind === 'ollama' ? t('aiService.ollamaKeyPlaceholder') : t('aiService.apiKeyPlaceholder')"
               @keydown.enter="saveProvider"
               @blur="saveProvider"
             />
-            <div class="field-note">{{ t('aiService.apiKeyNote') }}</div>
+            <div class="field-note">{{ editKind === 'ollama' ? t('aiService.ollamaKeyHint') : t('aiService.apiKeyNote') }}</div>
           </template>
         </div>
 
@@ -823,6 +841,7 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="openrouter">{{ t('aiService.openrouter') }}</option>
             <option value="kimi">{{ t('aiService.kimi') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
+            <option value="ollama">{{ t('aiService.ollama') }}</option>
           </select>
         </div>
 
@@ -966,6 +985,34 @@ function toggleCapability(form: ModelForm, cap: string) {
               </label>
               <p v-else class="embedding-price-note">{{ t('aiService.embeddingPriceNote') }}</p>
             </div>
+            <div v-if="!newModel.capabilities.includes('embedding')" class="model-form-price-row">
+              <label class="model-form-field">
+                <span>{{ t('aiService.cacheHitPrice') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                <input v-model="newModel.cache_hit_input_price" class="text-input sm" :placeholder="t('aiService.cacheHitPricePh')" type="number" min="0" step="0.001" />
+              </label>
+              <p class="embedding-price-note">{{ t('aiService.cacheHitHint') }}</p>
+            </div>
+            <div v-if="!newModel.capabilities.includes('embedding')" class="peak-pricing">
+              <div class="peak-toggle" role="switch" :aria-checked="newModel.peak_pricing" @click="newModel.peak_pricing = !newModel.peak_pricing">
+                <span class="toggle-switch" :class="{ on: newModel.peak_pricing }"><span class="switch-knob" /></span>
+                <span class="peak-toggle-text">
+                  <span class="peak-toggle-title">{{ t('aiService.peakPricing') }}</span>
+                  <span class="peak-toggle-hint">{{ t('aiService.peakPricingHint') }}</span>
+                </span>
+              </div>
+              <Transition name="peak-expand">
+                <div v-if="newModel.peak_pricing" class="model-form-price-row peak-price-row">
+                  <label class="model-form-field">
+                    <span>{{ t('aiService.peakPriceInput') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                    <input v-model="newModel.peak_input_price" class="text-input sm" :placeholder="t('aiService.pricePh2')" type="number" min="0" step="0.01" />
+                  </label>
+                  <label class="model-form-field">
+                    <span>{{ t('aiService.peakPriceOutput') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                    <input v-model="newModel.peak_output_price" class="text-input sm" :placeholder="t('aiService.pricePh8')" type="number" min="0" step="0.01" />
+                  </label>
+                </div>
+              </Transition>
+            </div>
             <div class="capability-editor">
               <span class="capability-label">{{ t('aiService.capabilities') }}</span>
               <div class="capability-options">
@@ -1036,6 +1083,34 @@ function toggleCapability(form: ModelForm, cap: string) {
                         <input v-model="editModelForm.output_price" class="text-input sm" :placeholder="t('aiService.pricePh8')" type="number" min="0" step="0.01" />
                       </label>
                       <p v-else class="embedding-price-note">{{ t('aiService.embeddingPriceNote') }}</p>
+                    </div>
+                    <div v-if="!editModelForm.capabilities.includes('embedding')" class="model-form-price-row">
+                      <label class="model-form-field">
+                        <span>{{ t('aiService.cacheHitPrice') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                        <input v-model="editModelForm.cache_hit_input_price" class="text-input sm" :placeholder="t('aiService.cacheHitPricePh')" type="number" min="0" step="0.001" />
+                      </label>
+                      <p class="embedding-price-note">{{ t('aiService.cacheHitHint') }}</p>
+                    </div>
+                    <div v-if="!editModelForm.capabilities.includes('embedding')" class="peak-pricing">
+                      <div class="peak-toggle" role="switch" :aria-checked="editModelForm.peak_pricing" @click="editModelForm.peak_pricing = !editModelForm.peak_pricing">
+                        <span class="toggle-switch" :class="{ on: editModelForm.peak_pricing }"><span class="switch-knob" /></span>
+                        <span class="peak-toggle-text">
+                          <span class="peak-toggle-title">{{ t('aiService.peakPricing') }}</span>
+                          <span class="peak-toggle-hint">{{ t('aiService.peakPricingHint') }}</span>
+                        </span>
+                      </div>
+                      <Transition name="peak-expand">
+                        <div v-if="editModelForm.peak_pricing" class="model-form-price-row peak-price-row">
+                          <label class="model-form-field">
+                            <span>{{ t('aiService.peakPriceInput') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                            <input v-model="editModelForm.peak_input_price" class="text-input sm" :placeholder="t('aiService.pricePh2')" type="number" min="0" step="0.01" />
+                          </label>
+                          <label class="model-form-field">
+                            <span>{{ t('aiService.peakPriceOutput') }} <small>{{ t('aiService.priceUnit') }}</small></span>
+                            <input v-model="editModelForm.peak_output_price" class="text-input sm" :placeholder="t('aiService.pricePh8')" type="number" min="0" step="0.01" />
+                          </label>
+                        </div>
+                      </Transition>
                     </div>
                     <div class="capability-editor">
                       <span class="capability-label">{{ t('aiService.capabilities') }}</span>
@@ -1125,6 +1200,15 @@ function toggleCapability(form: ModelForm, cap: string) {
                         <span v-if="priceCnyPerMillion(m.output_price_usd_per_million, m.output_price_per_million) != null">
                           {{ t('aiService.priceOutPrefix') }} {{ fmtPricePerMillion(priceCnyPerMillion(m.output_price_usd_per_million, m.output_price_per_million)) }}
                         </span>
+                      </span>
+                      <span
+                        v-if="m.peak_pricing && (m.peak_input_price_per_million != null || m.peak_output_price_per_million != null)"
+                        class="price-hint price-hint-peak"
+                        :title="t('aiService.peakPricing')"
+                      >
+                        <span class="peak-tag">{{ t('aiService.peakBadge') }}</span>
+                        <span v-if="m.peak_input_price_per_million != null">{{ t('aiService.priceInPrefix') }} {{ fmtPricePerMillion(m.peak_input_price_per_million) }}</span>
+                        <span v-if="m.peak_output_price_per_million != null">{{ t('aiService.priceOutPrefix') }} {{ fmtPricePerMillion(m.peak_output_price_per_million) }}</span>
                       </span>
                       <span v-if="m.provider_order && m.provider_order.length > 0" class="provider-order-hint" :title="m.provider_order.join(' → ')">
                         Provider: {{ m.provider_order.slice(0, 2).join(' → ') }}{{ m.provider_order.length > 2 ? ' …' : '' }}
@@ -1595,6 +1679,53 @@ function toggleCapability(form: ModelForm, cap: string) {
   align-items: end;
 }
 .model-form-field.full-width { grid-column: 1 / -1; }
+
+/* Peak / off-peak pricing */
+.peak-pricing {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.peak-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.peak-toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.peak-toggle-title {
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--text-primary);
+}
+.peak-toggle-hint {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  line-height: 1.35;
+}
+.peak-price-row {
+  padding: 10px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg-secondary));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 16%, var(--border-subtle));
+}
+.peak-expand-enter-active,
+.peak-expand-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+.peak-expand-enter-from,
+.peak-expand-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
 .embedding-price-note {
   margin: 0;
   font-size: var(--font-size-xs);
@@ -1736,6 +1867,11 @@ function toggleCapability(form: ModelForm, cap: string) {
   font-size: 11px; color: var(--text-tertiary);
 }
 .price-hint span { white-space: nowrap; }
+.price-hint-peak { color: color-mix(in srgb, #d97706 80%, var(--text-tertiary)); }
+.peak-tag {
+  font-weight: 600;
+  color: #d97706;
+}
 
 .provider-order-hint {
   font-size: 11px;

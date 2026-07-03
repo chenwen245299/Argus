@@ -10,9 +10,11 @@ import { useSelectionStore } from '../stores/selection'
 import { usePaperTasksStore, type AiSummaryJob } from '../stores/paperTasks'
 import { useCollectionsStore } from '../stores/collections'
 import { useRagStore } from '../stores/rag'
+import { useAiStore } from '../stores/ai'
 import { titleInitialCaps } from '../utils/text'
 import type { SearchHit, Note, PaperStatus } from '../types'
 import TokenUsageModal from './TokenUsageModal.vue'
+import dpskIconUrl from '../assets/models/deepseek.svg?url'
 
 const { t } = useI18n()
 const library = useLibraryStore()
@@ -21,6 +23,23 @@ const selection = useSelectionStore()
 const paperTasks = usePaperTasksStore()
 const collectionsStore = useCollectionsStore()
 const ragStore = useRagStore()
+const ai = useAiStore()
+
+// ── DeepSeek-style peak/off-peak price indicator ────────────────────────────
+// Peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00; else off-peak.
+const priceClockTs = ref(Date.now())
+let priceClockTimer: ReturnType<typeof setInterval> | null = null
+
+const hasPeakModel = computed(() =>
+  (ai.settings?.providers ?? []).some(p => p.models.some(m => m.peak_pricing)),
+)
+
+const isPeakPriceNow = computed(() => {
+  const d = new Date(priceClockTs.value)
+  const minutes = ((d.getUTCHours() + 8) % 24) * 60 + d.getUTCMinutes()
+  const h = minutes / 60
+  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+})
 
 // Aggregate embed-vector progress across all running collection jobs so the
 // toolbar shows a single status chip while embeddings are being built.
@@ -112,6 +131,12 @@ const baseSidebarTabs = computed((): SidebarTabDef[] => [
     ],
   },
   {
+    id: 'sections',
+    label: t('toolbarTabs.sections'),
+    // Table-of-contents / list icon
+    paths: ['M8 6h13', 'M8 12h13', 'M8 18h13', 'M3 6h.01', 'M3 12h.01', 'M3 18h.01'],
+  },
+  {
     id: 'metadata',
     label: t('toolbarTabs.metadata'),
     paths: ['M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z', 'M12 16v-4', 'M12 8h.01'],
@@ -146,10 +171,11 @@ const importTitle = computed(() => canImport.value ? t('import.btnTitle') : t('i
 const leftReserveStyle = computed(() => ({
   width: `${Math.max(140, props.leftSidebarWidth ?? 200)}px`,
 }))
+// Always report the open width: the reserve only renders while the sidebar is
+// open (and during its leave transition), so keeping the full width lets the
+// collapse animate from full → 0 instead of snapping.
 const rightReserveStyle = computed(() => ({
-  width: props.rightSidebarOpen
-    ? `${Math.max(40, (props.rightSidebarWidth ?? 300) + 1)}px`
-    : '50px',
+  width: `${Math.max(40, (props.rightSidebarWidth ?? 300) + 1)}px`,
 }))
 
 // ── Import dropdown menu ─────────────────────────────────────────────────────
@@ -660,6 +686,11 @@ onMounted(async () => {
   await syncArxivStatus()
   // Poll every 5 s so the indicator stays correct even if events were missed
   statusPollTimer = setInterval(syncArxivStatus, 5000)
+
+  // Load AI settings so we know whether any model uses peak pricing, and tick
+  // the price clock every 30 s so the peak/off-peak chip flips on time.
+  if (!ai.loaded) ai.load().catch(() => {})
+  priceClockTimer = setInterval(() => { priceClockTs.value = Date.now() }, 30_000)
 })
 
 onUnmounted(() => {
@@ -671,6 +702,7 @@ onUnmounted(() => {
   if (unlistenArxivWinClose) unlistenArxivWinClose()
   if (aiLabelToggleTimer) { clearInterval(aiLabelToggleTimer); aiLabelToggleTimer = null }
   if (statusPollTimer) { clearInterval(statusPollTimer); statusPollTimer = null }
+  if (priceClockTimer) { clearInterval(priceClockTimer); priceClockTimer = null }
   if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
   document.removeEventListener('pointerdown', onDocClick, true)
 })
@@ -852,6 +884,29 @@ onUnmounted(() => {
       <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
         <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
       </svg>
+    </div>
+
+    <!-- DeepSeek peak / off-peak price indicator -->
+    <div
+      v-if="library.currentPath && hasPeakModel"
+      class="dpsk-price-chip"
+      :class="isPeakPriceNow ? 'is-peak' : 'is-offpeak'"
+      :title="isPeakPriceNow
+        ? '当前为波峰时段（价格较高）：北京时间 09:00–12:00、14:00–18:00'
+        : '当前为波谷时段（价格较低）：北京时间波峰以外的时间'"
+    >
+      <img :src="dpskIconUrl" class="dpsk-logo" alt="" />
+      <span class="dpsk-provider">DeepSeek</span>
+      <span class="dpsk-sep" />
+      <svg v-if="isPeakPriceNow" class="dpsk-trend" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="3 17 9 11 13 15 21 7" />
+        <polyline points="15 7 21 7 21 13" />
+      </svg>
+      <svg v-else class="dpsk-trend" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="3 7 9 13 13 9 21 17" />
+        <polyline points="15 17 21 17 21 11" />
+      </svg>
+      <span class="dpsk-price-label">{{ isPeakPriceNow ? '波峰' : '波谷' }}</span>
     </div>
 
     <!-- Import (file / URL) -->
@@ -1043,9 +1098,10 @@ onUnmounted(() => {
       </Transition>
     </Teleport>
 
-    <div v-if="library.currentPath" class="right-toolbar-reserve" :style="rightReserveStyle">
-      <!-- Sidebar tab icons (shown when sidebar is open) -->
-      <template v-if="props.rightSidebarOpen">
+    <!-- Sidebar tab icons — only while the sidebar is open (toggle lives in the title bar).
+         Collapses/expands its width in sync with the sidebar panel below. -->
+    <Transition name="right-toolbar">
+      <div v-if="library.currentPath && props.rightSidebarOpen" class="right-toolbar-reserve" :style="rightReserveStyle">
         <button
           v-for="tab in sidebarTabs"
           :key="tab.id"
@@ -1059,24 +1115,8 @@ onUnmounted(() => {
           </svg>
           <span class="sidebar-tab-label">{{ tab.label }}</span>
         </button>
-        <div class="tb-sep" />
-      </template>
-
-      <!-- Right sidebar toggle -->
-      <button
-        class="tb-btn sidebar-toggle-btn"
-        :class="{ active: props.rightSidebarOpen, 'sidebar-collapsed': !props.rightSidebarOpen }"
-        :title="props.rightSidebarOpen ? t('pdf.hideSidebar') : t('pdf.showSidebar')"
-        @click="emit('toggle-right-sidebar')"
-      >
-        <svg class="sidebar-toggle-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <rect x="3.5" y="4" width="17" height="16" rx="4"/>
-          <path d="M14.5 4v16"/>
-          <path d="M17.5 9h.01"/>
-          <path d="M17.5 12h.01"/>
-        </svg>
-      </button>
-    </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -1663,6 +1703,23 @@ onUnmounted(() => {
   padding-left: 8px;
   padding-right: 10px;
   box-sizing: border-box;
+  overflow: hidden;
+  will-change: width, opacity;
+}
+
+/* Collapse/expand in sync with the sidebar panel below (see MainView .right-panel). */
+.right-toolbar-enter-active,
+.right-toolbar-leave-active {
+  transition:
+    width 0.18s ease,
+    min-width 0.18s ease,
+    opacity 0.14s ease;
+}
+.right-toolbar-enter-from,
+.right-toolbar-leave-to {
+  width: 0 !important;
+  min-width: 0 !important;
+  opacity: 0;
 }
 .right-toolbar-reserve::before {
   content: '';
@@ -1741,6 +1798,58 @@ onUnmounted(() => {
 .import-wrap {
   position: relative;
   flex-shrink: 0;
+}
+
+/* DeepSeek peak / off-peak price chip */
+.dpsk-price-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px 0 9px;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  flex-shrink: 0;
+  border: 1px solid transparent;
+  cursor: default;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+.dpsk-price-chip.is-peak {
+  color: #c2410c;
+  background: linear-gradient(135deg,
+    color-mix(in srgb, #f97316 16%, var(--bg-primary)),
+    color-mix(in srgb, #ef4444 15%, var(--bg-primary)));
+  border-color: color-mix(in srgb, #f97316 34%, transparent);
+}
+.dpsk-price-chip.is-offpeak {
+  color: #0f766e;
+  background: linear-gradient(135deg,
+    color-mix(in srgb, #14b8a6 15%, var(--bg-primary)),
+    color-mix(in srgb, #10b981 14%, var(--bg-primary)));
+  border-color: color-mix(in srgb, #14b8a6 32%, transparent);
+}
+.dpsk-trend { flex-shrink: 0; }
+.dpsk-price-label { letter-spacing: 0.02em; }
+.dpsk-logo {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.dpsk-provider {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.dpsk-sep {
+  width: 1px;
+  height: 11px;
+  background: currentColor;
+  opacity: 0.28;
+  flex-shrink: 0;
+  margin: 0 1px;
 }
 
 .import-caret {

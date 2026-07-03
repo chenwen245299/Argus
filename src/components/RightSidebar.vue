@@ -8,6 +8,7 @@ import { useReaderStore } from '../stores/reader'
 import MetadataTab from './tabs/MetadataTab.vue'
 import NotesTab from './tabs/NotesTab.vue'
 import HighlightsTab from './tabs/HighlightsTab.vue'
+import SectionsTab from './tabs/SectionsTab.vue'
 import AnalysisTab from './tabs/AnalysisTab.vue'
 import TranslationHistoryTab from './tabs/TranslationHistoryTab.vue'
 import DrawTab from './tabs/DrawTab.vue'
@@ -117,6 +118,7 @@ async function onSlugChanged(newSlug: string) {
           @update:canvas-notes="onCanvasNotesUpdated"
         />
         <HighlightsTab v-else-if="paperTab === 'highlights'" />
+        <SectionsTab v-else-if="paperTab === 'sections'" :slug="activePaperSlug" />
         <AnalysisTab
           v-show="paperTab === 'ai'"
           :slug="activePaperSlug"

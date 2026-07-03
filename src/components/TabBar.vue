@@ -14,6 +14,10 @@ const reader = useReaderStore()
 const selection = useSelectionStore()
 const collections = useCollectionsStore()
 const canvasStore = useCanvasStore()
+
+defineProps<{ rightSidebarOpen?: boolean }>()
+const emit = defineEmits<{ 'toggle-right-sidebar': [] }>()
+
 const isFullscreenLayout = ref(false)
 const appWindow = getCurrentWebviewWindow()
 let unlistenResize: UnlistenFn | null = null
@@ -204,8 +208,23 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Right blank area — draggable -->
-    <div class="tl-right" data-tauri-drag-region @mousedown="startDrag" />
+    <!-- Right area — draggable filler + right-sidebar toggle -->
+    <div class="tl-right" data-tauri-drag-region @mousedown="startDrag">
+      <button
+        class="titlebar-toggle-btn"
+        :class="{ active: rightSidebarOpen }"
+        :title="rightSidebarOpen ? t('pdf.hideSidebar') : t('pdf.showSidebar')"
+        @mousedown.stop
+        @click="emit('toggle-right-sidebar')"
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <rect x="3.5" y="4" width="17" height="16" rx="4" />
+          <path d="M14.5 4v16" />
+          <path d="M17.5 9h.01" />
+          <path d="M17.5 12h.01" />
+        </svg>
+      </button>
+    </div>
   </div>
 </template>
 
@@ -237,9 +256,28 @@ onUnmounted(() => {
 
 .tl-right {
   flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 10px;
   -webkit-app-region: drag;
   cursor: default;
 }
+
+.titlebar-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 26px;
+  border-radius: var(--radius-md);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  transition: background 0.12s, color 0.12s;
+}
+.titlebar-toggle-btn:hover { background: var(--bg-hover); color: var(--text-secondary); }
+.titlebar-toggle-btn.active { color: var(--accent); }
 
 .tabs-scroll {
   display: flex;

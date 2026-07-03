@@ -95,8 +95,10 @@ fn should_fetch_now(root: &str) -> bool {
 
 pub fn start_scheduler(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // Wait 10 minutes after startup before the first check.
-        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        // Give the main window a moment to mount and register the
+        // `arxiv-fetch-due` listener, then check promptly — so an overdue daily
+        // fetch runs shortly after launch instead of 10 minutes later.
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
 
         loop {
             let sleep_secs: u64 = match get_root(&app) {
@@ -118,6 +120,12 @@ pub fn start_scheduler(app: tauri::AppHandle) {
             if should_fetch_now(&root) {
                 // Ask the frontend to do the fetch (TypeScript handles HTTP).
                 let _ = app.emit("arxiv-fetch-due", serde_json::json!({}));
+                // Cool down after asking: the fetch runs on the frontend and only
+                // persists `last_fetch_date` once it finishes, so without this
+                // pause `should_fetch_now` stays true and we'd re-emit every
+                // second (and could kick off overlapping fetches). This also
+                // serves as a retry interval if the frontend fetch fails.
+                tokio::time::sleep(std::time::Duration::from_secs(180)).await;
             }
         }
     });

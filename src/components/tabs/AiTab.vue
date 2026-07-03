@@ -691,16 +691,19 @@ function modelLogo(modelId: string, providerName = '', providerId = '') {
   const haystack = `${modelId} ${providerName} ${providerId}`.toLowerCase()
   if (haystack.includes('deepseek')) return modelIconMap.deepseek
   if (haystack.includes('claude') || haystack.includes('anthropic')) return modelIconMap.claude
+  if (haystack.includes('gemma')) return modelIconMap.gemma
   if (haystack.includes('gemini') || haystack.includes('google')) return modelIconMap.gemini
   if (haystack.includes('qwen') || haystack.includes('通义') || haystack.includes('alibaba')) return modelIconMap.qwen ?? modelIconMap.alibaba
   if (haystack.includes('kimi') || haystack.includes('moonshot')) return modelIconMap.kimi
   if (haystack.includes('grok') || haystack.includes('xai')) return modelIconMap.grok ?? modelIconMap.xai
-  if (haystack.includes('ollama')) return modelIconMap['ollama-color']
   if (haystack.includes('zhipu') || haystack.includes('智谱') || haystack.includes('glm')) return modelIconMap.zhipu
   if (haystack.includes('baidu') || haystack.includes('ernie')) return modelIconMap.baidu
   if (haystack.includes('doubao') || haystack.includes('bytedance')) return modelIconMap.bytedance
   if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
   if (haystack.includes('gpt') || haystack.includes('openai')) return modelIconMap.openai
+  // Ollama is a host, not a model brand — the provider name pollutes the
+  // haystack, so match its mark only after every real model brand above.
+  if (haystack.includes('ollama')) return modelIconMap['ollama-color']
   for (const key of Object.keys(modelIconMap)) {
     if (haystack.includes(key)) return modelIconMap[key]
   }

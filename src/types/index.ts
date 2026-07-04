@@ -152,6 +152,10 @@ export interface AppSettings {
   title_ai_provider_id?: string
   title_ai_model_id?: string
   title_ai_prompt?: string
+  sections_ai_provider_id?: string
+  sections_ai_model_id?: string
+  sections_ai_prompt?: string
+  auto_check_updates?: boolean
 }
 
 // ── M4: Search ────────────────────────────────────────────────────────────────

@@ -608,6 +608,54 @@ async function saveLegacyActiveHistory(conv: Conversation) {
   await invoke('save_chat_history', { slug: props.slug, messages })
 }
 
+// Persist after an in-place edit to the active conversation's nodes. If the
+// conversation is now empty, drop it from history and reset to a blank one.
+function afterConversationMutation() {
+  const conv = activeConversation.value
+  if (!conv) return
+  if (conv.nodes.length === 0) {
+    conversations.value = conversations.value.filter(c => c.id !== conv.id)
+    if (props.slug) saveConversationsToPaper(props.slug).catch(() => {})
+    startNewConversation(false)
+  } else {
+    persistActiveConversation()
+  }
+}
+
+// Delete a whole exchange: the user message and its answer group (answers
+// reference the prompt via promptId, so they can't stand on their own).
+function deleteExchange(userNodeId: string) {
+  const conv = activeConversation.value
+  if (!conv || hasStreaming.value) return
+  const removedGroupIds = conv.nodes
+    .filter(n => n.role === 'assistantGroup' && n.promptId === userNodeId)
+    .map(n => n.id)
+  conv.nodes = conv.nodes.filter(
+    n => n.id !== userNodeId && !(n.role === 'assistantGroup' && n.promptId === userNodeId),
+  )
+  if (removedGroupIds.length) {
+    const next = { ...activeAnswerTabs.value }
+    removedGroupIds.forEach(id => delete next[id])
+    activeAnswerTabs.value = next
+  }
+  afterConversationMutation()
+}
+
+// Delete a single AI answer. With multiple model variants, remove just that
+// variant; if it is the only answer, remove the whole exchange.
+function deleteAnswer(group: ChatNode, answer: AssistantAnswer) {
+  if (group.role !== 'assistantGroup' || hasStreaming.value || answer.streaming) return
+  if (group.answers.length > 1) {
+    group.answers = group.answers.filter(a => a.id !== answer.id)
+    if (activeAnswerTabs.value[group.id] === answer.id && group.answers[0]) {
+      setActiveAnswer(group.id, group.answers[0].id)
+    }
+    afterConversationMutation()
+  } else {
+    deleteExchange(group.promptId)
+  }
+}
+
 function firstUserTitle(nodes: ChatNode[]) {
   const first = nodes.find((n): n is Extract<ChatNode, { role: 'user' }> => n.role === 'user')
   if (!first) return ''
@@ -1778,6 +1826,14 @@ function toggleContextPanel(nodeId: string) {
                         <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                       </svg>
                     </button>
+                    <button class="action-btn danger" title="删除该对话" :disabled="hasStreaming" @click="deleteExchange(node.id)">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="3 6 5 6 21 6"/>
+                        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                        <path d="M10 11v6M14 11v6"/>
+                        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                      </svg>
+                    </button>
                   </div>
                 </div>
               </template>
@@ -1858,6 +1914,14 @@ function toggleContextPanel(nodeId: string) {
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                       <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
                       <path d="M21 3v6h-6"/>
+                    </svg>
+                  </button>
+                  <button class="action-btn danger" :disabled="answer.streaming || hasStreaming" title="删除该回答" @click="deleteAnswer(node, answer)">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <polyline points="3 6 5 6 21 6"/>
+                      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                      <path d="M10 11v6M14 11v6"/>
+                      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                     </svg>
                   </button>
                 </div>
@@ -2849,6 +2913,7 @@ function toggleContextPanel(nodeId: string) {
 }
 .action-btn:disabled { opacity: .4; cursor: not-allowed; }
 .action-btn.done { color: #22c55e; }
+.action-btn.danger:hover:not(:disabled) { color: #ef4444; background: color-mix(in srgb, #ef4444 12%, transparent); }
 .msg-usage {
   display: flex;
   align-items: center;

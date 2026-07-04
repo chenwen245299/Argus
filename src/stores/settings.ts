@@ -10,6 +10,7 @@ export const useSettingsStore = defineStore('settings', () => {
     usd_to_cny_rate: 7.2,
     metadata_ai_prompt: '',
     ai_summary_prompt: '',
+    auto_check_updates: true,
   })
   const loaded = ref(false)
 

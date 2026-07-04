@@ -260,10 +260,42 @@ pub struct AppSettings {
     /// User-editable prompt for chat title generation.
     #[serde(default = "default_title_ai_prompt")]
     pub title_ai_prompt: String,
+    /// AI provider ID for AI section splitting (None = default)
+    #[serde(default)]
+    pub sections_ai_provider_id: Option<String>,
+    /// AI model ID for AI section splitting (None = default)
+    #[serde(default)]
+    pub sections_ai_model_id: Option<String>,
+    /// User-editable system prompt for AI section splitting.
+    #[serde(default = "default_sections_ai_prompt")]
+    pub sections_ai_prompt: String,
+    /// Automatically check for app updates (daily at 9am + shortly after launch).
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
 }
 
 pub fn default_usd_to_cny_rate() -> f64 {
     7.20
+}
+
+pub fn default_auto_check_updates() -> bool {
+    true
+}
+
+pub fn default_sections_ai_prompt() -> String {
+    "You are an expert at analyzing the structure of academic papers. \
+Given the full text of a paper, list its section headings in reading order. \
+Return ONLY a compact JSON array — no markdown fences, no commentary. \
+Each element is an object: {\"title\": string, \"level\": number}. \
+level 1 = top-level section (e.g. Abstract, Introduction, Related Work, Method, \
+Experiments, Results, Discussion, Conclusion, References, Appendix), \
+level 2 = subsection, level 3 = sub-subsection. \
+If the document begins with or contains a table of contents, outline, or index/summary \
+block that merely lists section names (often with page numbers, dot leaders, or arrows), \
+IGNORE it — report each heading only once, using the wording exactly as it appears at the \
+START of that section's actual body, not as it appears in the list. \
+Do not invent headings that are not present, and do not emit the same heading twice."
+        .to_string()
 }
 
 pub fn default_metadata_ai_prompt() -> String {
@@ -419,6 +451,10 @@ impl Default for AppSettings {
             title_ai_provider_id: None,
             title_ai_model_id: None,
             title_ai_prompt: default_title_ai_prompt(),
+            sections_ai_provider_id: None,
+            sections_ai_model_id: None,
+            sections_ai_prompt: default_sections_ai_prompt(),
+            auto_check_updates: default_auto_check_updates(),
         }
     }
 }

@@ -114,9 +114,13 @@ const translatePromptDraft = ref('')
 const translatePromptSaved = ref(false)
 const titlePromptDraft = ref('')
 const titlePromptSaved = ref(false)
+const sectionsPromptDraft = ref('')
+const sectionsPromptSaved = ref(false)
 
 const DEFAULT_TRANSLATE_AI_PROMPT = '请将以下英文文本翻译成中文，保持学术风格，直接输出翻译结果，不需要任何额外说明：\n\n{text}'
 const DEFAULT_TITLE_AI_PROMPT = '请根据以下对话内容生成一个简洁的标题（不超过20字，直接输出标题文字，不要引号和多余说明）：\n\n用户：{user_msg}\n\nAI：{ai_msg}'
+// Must match the Rust `default_sections_ai_prompt()` in src-tauri/src/models.rs.
+const DEFAULT_SECTIONS_AI_PROMPT = `You are an expert at analyzing the structure of academic papers. Given the full text of a paper, list its section headings in reading order. Return ONLY a compact JSON array — no markdown fences, no commentary. Each element is an object: {"title": string, "level": number}. level 1 = top-level section (e.g. Abstract, Introduction, Related Work, Method, Experiments, Results, Discussion, Conclusion, References, Appendix), level 2 = subsection, level 3 = sub-subsection. If the document begins with or contains a table of contents, outline, or index/summary block that merely lists section names (often with page numbers, dot leaders, or arrows), IGNORE it — report each heading only once, using the wording exactly as it appears at the START of that section's actual body, not as it appears in the list. Do not invent headings that are not present, and do not emit the same heading twice.`
 
 function normalizeMetadataPrompt(prompt?: string) {
   const trimmed = prompt?.trim()
@@ -294,6 +298,39 @@ const selectedTitleProvider = computed(() =>
 )
 const availableTitleModels = computed(() => selectedTitleProvider.value?.models ?? [])
 
+async function setSectionsProvider(providerId: string) {
+  const id = providerId || undefined
+  await settingsStore.save({ sections_ai_provider_id: id, sections_ai_model_id: undefined })
+}
+
+async function setSectionsModel(modelId: string) {
+  await settingsStore.save({ sections_ai_model_id: modelId || undefined })
+}
+
+async function setSectionsPrompt(prompt: string) {
+  const val = prompt.trim() || DEFAULT_SECTIONS_AI_PROMPT
+  await settingsStore.save({ sections_ai_prompt: val })
+  sectionsPromptDraft.value = val
+  sectionsPromptSaved.value = true
+  setTimeout(() => { sectionsPromptSaved.value = false }, 1800)
+}
+
+async function resetSectionsPrompt() {
+  await settingsStore.save({ sections_ai_prompt: DEFAULT_SECTIONS_AI_PROMPT })
+  sectionsPromptDraft.value = DEFAULT_SECTIONS_AI_PROMPT
+  sectionsPromptSaved.value = true
+  setTimeout(() => { sectionsPromptSaved.value = false }, 1800)
+}
+
+const selectedSectionsProvider = computed(() =>
+  aiStore.settings.providers.find(p => p.id === settingsStore.settings.sections_ai_provider_id)
+)
+const availableSectionsModels = computed(() => selectedSectionsProvider.value?.models ?? [])
+
+const sectionsPromptValue = computed(() =>
+  (settingsStore.settings.sections_ai_prompt?.trim() || DEFAULT_SECTIONS_AI_PROMPT)
+)
+
 const titlePromptValue = computed(() =>
   (settingsStore.settings.title_ai_prompt?.trim() || DEFAULT_TITLE_AI_PROMPT)
 )
@@ -357,6 +394,7 @@ let summaryPromptTimer: ReturnType<typeof setTimeout> | null = null
 let abstractPromptTimer: ReturnType<typeof setTimeout> | null = null
 let translatePromptTimer: ReturnType<typeof setTimeout> | null = null
 let titlePromptTimer: ReturnType<typeof setTimeout> | null = null
+let sectionsPromptTimer: ReturnType<typeof setTimeout> | null = null
 
 watch(
   titlePromptValue,
@@ -394,6 +432,20 @@ watch(translatePromptDraft, (val) => {
   if (val === translatePromptValue.value) return
   if (translatePromptTimer) clearTimeout(translatePromptTimer)
   translatePromptTimer = setTimeout(() => setTranslatePrompt(val), 800)
+})
+
+watch(
+  sectionsPromptValue,
+  (value) => {
+    if (sectionsPromptDraft.value !== value) sectionsPromptDraft.value = value
+  },
+  { immediate: true }
+)
+
+watch(sectionsPromptDraft, (val) => {
+  if (val === sectionsPromptValue.value) return
+  if (sectionsPromptTimer) clearTimeout(sectionsPromptTimer)
+  sectionsPromptTimer = setTimeout(() => setSectionsPrompt(val), 800)
 })
 
 </script>
@@ -715,6 +767,69 @@ watch(translatePromptDraft, (val) => {
         v-model="summaryPromptDraft"
         spellcheck="false"
         @blur="setSummaryPrompt(summaryPromptDraft)"
+      />
+    </div>
+
+    <!-- AI section splitting model and prompt -->
+    <div class="setting-group">
+      <div class="setting-label">{{ t('settings.sectionsAiSection') }}</div>
+      <div class="setting-hint" style="margin-bottom: 10px">{{ t('settings.sectionsAiDesc') }}</div>
+
+      <div v-if="aiStore.settings.providers.length === 0" class="no-providers">
+        {{ t('settings.metaAiNoProviders') }}
+      </div>
+      <template v-else>
+        <div class="field-row">
+          <label class="field-label">{{ t('settings.metaAiProvider') }}</label>
+          <select
+            class="field-select"
+            :value="settingsStore.settings.sections_ai_provider_id ?? ''"
+            @change="setSectionsProvider(($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">{{ t('settings.metaAiDefault') }}</option>
+            <option
+              v-for="p in aiStore.settings.providers.filter(p => p.enabled)"
+              :key="p.id"
+              :value="p.id"
+            >{{ p.name }}</option>
+          </select>
+        </div>
+
+        <div v-if="selectedSectionsProvider && availableSectionsModels.length > 0" class="field-row">
+          <label class="field-label">{{ t('settings.metaAiModel') }}</label>
+          <select
+            class="field-select"
+            :value="settingsStore.settings.sections_ai_model_id ?? ''"
+            @change="setSectionsModel(($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">{{ t('settings.metaAiDefault') }}</option>
+            <option
+              v-for="m in availableSectionsModels"
+              :key="m.id"
+              :value="m.id"
+            >{{ m.display_name || m.id }}</option>
+          </select>
+        </div>
+      </template>
+
+      <div class="prompt-head">
+        <div>
+          <label class="field-label prompt-label">{{ t('settings.sectionsPrompt') }}</label>
+          <div class="setting-hint">{{ t('settings.sectionsPromptHint') }}</div>
+        </div>
+        <div class="prompt-actions">
+          <span v-if="sectionsPromptSaved" class="saved-pill">{{ t('settings.saved') }}</span>
+          <button class="text-btn" @click="resetSectionsPrompt">{{ t('settings.sectionsPromptReset') }}</button>
+          <button class="prompt-save-btn" @click="setSectionsPrompt(sectionsPromptDraft)">
+            {{ t('settings.save') }}
+          </button>
+        </div>
+      </div>
+      <textarea
+        class="prompt-textarea abstract-prompt"
+        v-model="sectionsPromptDraft"
+        spellcheck="false"
+        @blur="setSectionsPrompt(sectionsPromptDraft)"
       />
     </div>
 

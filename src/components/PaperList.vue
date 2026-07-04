@@ -389,11 +389,15 @@ function cleanupColumnDrag() {
 }
 
 function onColClick(col: { sortField?: SortField }) {
+  // Recently Read has a fixed last-open ordering; disable column sorting so a
+  // header click can't silently change the shared sort used by other navs.
+  if (selection.activeNav === 'recent') return
   if (Date.now() < _suppressColClickUntil) return
   if (col.sortField) toggleSort(col.sortField)
 }
 
 function onColContextMenu(col: { sortField?: SortField }) {
+  if (selection.activeNav === 'recent') return
   clearSort(col.sortField)
 }
 
@@ -477,6 +481,10 @@ const filtered = computed<PaperIndexEntry[]>(() => {
 })
 
 const sorted = computed(() => {
+  // "Recently Read" is strictly ordered by last-open time (via filterRecentlyRead
+  // in `filtered`). Never apply the column sort here — the default `added_at` sort
+  // would otherwise mask recency and keep newly-opened papers from moving to top.
+  if (selection.activeNav === 'recent') return filtered.value
   if (!sortField.value) return [...filtered.value]
   return [...filtered.value].sort((a, b) => {
     const cmp = compareValue(a, b)
@@ -1200,7 +1208,7 @@ async function reExtract(item: PaperIndexEntry) {
             :data-col-id="col.id"
             class="hdr-col optional-hdr"
             :class="{
-              active:        col.sortField === sortField,
+              active:        selection.activeNav !== 'recent' && col.sortField === sortField,
               dragging:      dragColId === col.id,
             }"
             @pointerdown="onColPointerDown($event, col.id)"
@@ -1208,7 +1216,7 @@ async function reExtract(item: PaperIndexEntry) {
             @contextmenu.prevent.stop="onColContextMenu(col)"
           >
             <span class="hdr-label">{{ t(col.labelKey) }}</span>
-            <span v-if="col.sortField && sortField === col.sortField" class="sort-arrow">
+            <span v-if="selection.activeNav !== 'recent' && col.sortField && sortField === col.sortField" class="sort-arrow">
               {{ sortDir === 'asc' ? '↑' : '↓' }}
             </span>
             <div

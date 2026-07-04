@@ -22,6 +22,7 @@ import PaperList from '../components/PaperList.vue'
 import TabBar from '../components/TabBar.vue'
 import RightSidebar from '../components/RightSidebar.vue'
 import AddSnippetModal from '../components/AddSnippetModal.vue'
+import UpdatePrompt from '../components/UpdatePrompt.vue'
 
 // Conditionally-rendered heavyweights (pdfjs / vue-flow / settings panels) are
 // code-split so the main window paints before any of them download.
@@ -632,6 +633,9 @@ watch(
       :pending="pendingSnippet"
       @close="pendingSnippet = null"
     />
+
+    <!-- Global update-available prompt (auto checks fire even when settings is closed) -->
+    <UpdatePrompt />
   </div>
 </template>
 

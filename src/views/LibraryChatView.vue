@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import LibraryChat from '../components/LibraryChat.vue'
 import SettingsModal from '../components/SettingsModal.vue'
+import UpdatePrompt from '../components/UpdatePrompt.vue'
 
 const showSettings = ref(false)
 const settingsSection = ref('ai')
@@ -20,6 +21,7 @@ function openSettings(section: 'ai' | 'rag' = 'ai') {
       :initial-section="settingsSection"
       @close="showSettings = false"
     />
+    <UpdatePrompt />
   </div>
 </template>
 

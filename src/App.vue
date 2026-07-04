@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, defineAsyncComponent } from 'vue'
+import { ref, watch, onMounted, defineAsyncComponent } from 'vue'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useLibraryStore } from './stores/library'
 import { useArxivStore } from './stores/arxiv'
 import { useSettingsStore } from './stores/settings'
-import { checkForUpdates } from './stores/update'
+import { startAutoUpdateSchedule, stopAutoUpdateSchedule } from './stores/update'
 
 // Async views: each window label renders exactly one view, so code-split them.
 // This keeps every window from loading all other windows' code (pdfjs, vue-flow,
@@ -49,7 +49,14 @@ onMounted(async () => {
   // Scheduler triggers a catch-up fetch via event (only the main window handles this)
   if (windowLabel.value === 'main') {
     await listen('arxiv-fetch-due', () => { arxivStore.fetchCatchUp() })
-    setTimeout(() => checkForUpdates(false), 2 * 60 * 1000)
+    // Auto update checks (startup catch-up + daily at 9am), gated on the user
+    // setting. Defaults to on; reacts live when the toggle changes. Runs only in
+    // the main window so a single window owns the schedule.
+    watch(
+      () => settingsStore.settings.auto_check_updates,
+      (enabled) => { enabled === false ? stopAutoUpdateSchedule() : startAutoUpdateSchedule() },
+      { immediate: true },
+    )
   }
 })
 </script>

@@ -1,10 +1,21 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
-import { currentTranslation, translationHistory, clearTranslationHistory, deleteTranslationEntry } from '../../stores/translationHistory'
+import { ref, computed, watch } from 'vue'
+import {
+  currentTranslation,
+  translationHistory,
+  clearTranslationHistory,
+  deleteTranslationEntry,
+  regenerateTranslation,
+} from '../../stores/translationHistory'
+import { useAiStore } from '../../stores/ai'
+import { useSettingsStore } from '../../stores/settings'
 
 type View = 'current' | 'history'
 const view = ref<View>('current')
 const sourceExpanded = ref(false)
+
+const ai = useAiStore()
+const settingsStore = useSettingsStore()
 
 // When a new translation starts, switch back to current view and reset expand state.
 watch(() => currentTranslation.sourceText, () => {
@@ -16,6 +27,96 @@ function fmtTime(iso: string) {
   const d = new Date(iso)
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
+
+// ── Copy / regenerate actions ──────────────────────────────────────────────
+const copied = ref(false)
+async function copyResult() {
+  if (!currentTranslation.result) return
+  await navigator.clipboard.writeText(currentTranslation.result).catch(() => {})
+  copied.value = true
+  setTimeout(() => { copied.value = false }, 2000)
+}
+
+// ── Usage / cost formatting (mirrors the AI chat footer) ────────────────────
+const usdToCnyRate = computed(() => {
+  const r = Number(settingsStore.settings.usd_to_cny_rate)
+  return Number.isFinite(r) && r > 0 ? r : 7.2
+})
+
+function fmtCny(cny: number): string {
+  if (cny < 0.01) return '<0.01'
+  return cny.toFixed(cny < 1 ? 3 : 2)
+}
+
+function formatCostCny(costUsd: number | null | undefined) {
+  if (typeof costUsd !== 'number' || !Number.isFinite(costUsd) || costUsd < 0) return ''
+  const cny = costUsd * usdToCnyRate.value
+  return fmtCny(cny)
+}
+
+// DeepSeek-style peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00.
+function isPeakHour(date: Date): boolean {
+  const minutes = ((date.getUTCHours() + 8) % 24) * 60 + date.getUTCMinutes()
+  const h = minutes / 60
+  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+}
+
+// Estimated CNY cost for providers that don't return a cost (e.g. DeepSeek),
+// using the configured per-million prices. Returns null when unavailable.
+const estimatedCostCny = computed<number | null>(() => {
+  const inTok = currentTranslation.inputTokens
+  const outTok = currentTranslation.outputTokens
+  if (typeof inTok !== 'number' || typeof outTok !== 'number') return null
+  const provider = ai.settings.providers.find(p => p.id === currentTranslation.providerId)
+  const m = provider?.models.find(x => x.id === currentTranslation.modelId)
+  if (!m || (m.input_price_per_million == null && m.output_price_per_million == null)) return null
+  const peak = !!m.peak_pricing && isPeakHour(new Date())
+  const inPrice = (peak && m.peak_input_price_per_million != null ? m.peak_input_price_per_million : m.input_price_per_million) ?? 0
+  const outPrice = (peak && m.peak_output_price_per_million != null ? m.peak_output_price_per_million : m.output_price_per_million) ?? 0
+  const cacheHit = currentTranslation.cacheHitTokens ?? 0
+  const cacheMiss = Math.max(0, inTok - cacheHit)
+  const cacheHitPrice = m.cache_hit_input_price_per_million != null ? m.cache_hit_input_price_per_million : inPrice
+  const cost = (cacheMiss / 1e6) * inPrice + (cacheHit / 1e6) * cacheHitPrice + (outTok / 1e6) * outPrice
+  return Number.isFinite(cost) && cost > 0 ? cost : null
+})
+
+const hasUsage = computed(() =>
+  typeof currentTranslation.inputTokens === 'number' || typeof currentTranslation.outputTokens === 'number'
+)
+
+const modelLabel = computed(() => currentTranslation.modelName || '')
+
+// Model brand icons (same set/matching as the AI chat).
+const modelSvgModules = import.meta.glob<{ default: string }>('/src/assets/models/*.svg', { eager: true })
+const modelIconMap: Record<string, string> = {}
+for (const [path, mod] of Object.entries(modelSvgModules)) {
+  modelIconMap[path.replace(/^.*\//, '').replace(/\.svg$/, '')] = mod.default
+}
+
+function modelLogo(modelId = '', providerName = '', providerId = '') {
+  const haystack = `${modelId} ${providerName} ${providerId}`.toLowerCase()
+  if (haystack.includes('deepseek')) return modelIconMap.deepseek
+  if (haystack.includes('claude') || haystack.includes('anthropic')) return modelIconMap.claude
+  if (haystack.includes('gemma')) return modelIconMap.gemma
+  if (haystack.includes('gemini') || haystack.includes('google')) return modelIconMap.gemini
+  if (haystack.includes('qwen') || haystack.includes('通义') || haystack.includes('alibaba')) return modelIconMap.qwen ?? modelIconMap.alibaba
+  if (haystack.includes('kimi') || haystack.includes('moonshot')) return modelIconMap.kimi
+  if (haystack.includes('grok') || haystack.includes('xai')) return modelIconMap.grok ?? modelIconMap.xai
+  if (haystack.includes('zhipu') || haystack.includes('智谱') || haystack.includes('glm')) return modelIconMap.zhipu
+  if (haystack.includes('baidu') || haystack.includes('ernie')) return modelIconMap.baidu
+  if (haystack.includes('doubao') || haystack.includes('bytedance')) return modelIconMap.bytedance
+  if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
+  if (haystack.includes('gpt') || haystack.includes('openai')) return modelIconMap.openai
+  if (haystack.includes('ollama')) return modelIconMap['ollama-color']
+  for (const key of Object.keys(modelIconMap)) {
+    if (haystack.includes(key)) return modelIconMap[key]
+  }
+  return ''
+}
+
+const modelIcon = computed(() =>
+  modelLogo(currentTranslation.modelId, currentTranslation.providerName, currentTranslation.providerId)
+)
 </script>
 
 <template>
@@ -106,6 +207,36 @@ function fmtTime(iso: string) {
             <span v-if="currentTranslation.loading" class="cursor">▋</span>
           </template>
         </div>
+
+        <!-- Footer: actions (left) + model / token / cost usage (right) -->
+        <div v-if="currentTranslation.result || currentTranslation.error" class="msg-footer">
+          <div class="msg-actions">
+            <button class="action-btn" :class="{ done: copied }" title="复制译文" :disabled="!currentTranslation.result" @click="copyResult">
+              <svg v-if="copied" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polyline points="20 6 9 17 4 12"/>
+              </svg>
+              <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>
+                <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
+              </svg>
+            </button>
+            <button class="action-btn" title="重新生成" :disabled="currentTranslation.loading" @click="regenerateTranslation">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+                <path d="M21 3v6h-6"/>
+              </svg>
+            </button>
+          </div>
+          <div v-if="modelLabel || hasUsage || currentTranslation.error" class="msg-usage">
+            <span v-if="modelLabel" class="usage-model" :title="modelLabel">
+              <img v-if="modelIcon" :src="modelIcon" class="usage-model-icon" alt="" />
+              {{ modelLabel }}
+            </span>
+            <span v-if="currentTranslation.costUsd != null && formatCostCny(currentTranslation.costUsd)" class="usage-cost" :title="`约 ¥${formatCostCny(currentTranslation.costUsd)} / $${currentTranslation.costUsd.toFixed(6)}`">¥{{ formatCostCny(currentTranslation.costUsd) }}</span>
+            <span v-else-if="currentTranslation.costUsd == null && estimatedCostCny != null" class="usage-cost usage-cost-est" :title="`按配置单价估算，约 ¥${estimatedCostCny.toFixed(6)}`">≈¥{{ fmtCny(estimatedCostCny) }}</span>
+            <span v-if="currentTranslation.error" class="error-badge">出错</span>
+          </div>
+        </div>
       </template>
     </div>
 
@@ -131,6 +262,13 @@ function fmtTime(iso: string) {
           <div class="entry-source selectable-text">{{ entry.sourceText }}</div>
           <div class="entry-divider" />
           <div class="entry-result selectable-text">{{ entry.result }}</div>
+          <div v-if="entry.modelName || entry.costUsd != null" class="entry-usage">
+            <span v-if="entry.modelName" class="usage-model" :title="entry.modelName">
+              <img v-if="modelLogo(entry.modelName, entry.providerName)" :src="modelLogo(entry.modelName, entry.providerName)" class="usage-model-icon" alt="" />
+              {{ entry.modelName }}
+            </span>
+            <span v-if="entry.costUsd != null && formatCostCny(entry.costUsd)" class="usage-cost">¥{{ formatCostCny(entry.costUsd) }}</span>
+          </div>
         </li>
       </ul>
     </template>
@@ -267,7 +405,6 @@ function fmtTime(iso: string) {
   color: var(--text-primary);
   line-height: 1.7;
   white-space: pre-wrap;
-  flex: 1;
   min-height: 60px;
 }
 
@@ -351,5 +488,89 @@ function fmtTime(iso: string) {
 @keyframes blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
+}
+
+/* ── Footer: actions + model/token/cost usage (mirrors the AI chat footer) ── */
+.msg-footer {
+  display: flex;
+  align-items: center;
+  min-height: 22px;
+  gap: 4px;
+  padding-top: 2px;
+  justify-content: space-between;
+}
+
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.action-btn {
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background .1s ease, color .1s ease;
+  flex-shrink: 0;
+}
+.action-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+.action-btn:disabled { opacity: .4; cursor: not-allowed; }
+.action-btn.done { color: #22c55e; }
+
+.msg-usage {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-left: auto;
+  padding-left: 8px;
+  justify-content: flex-end;
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+}
+.usage-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  word-break: break-word;
+}
+.usage-model-icon {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+.usage-tokens { color: var(--text-tertiary); }
+.usage-cost {
+  color: var(--text-secondary);
+  font-weight: 500;
+  margin-left: 2px;
+}
+.usage-cost-est { color: var(--text-tertiary); font-weight: 400; }
+.error-badge { color: #ef4444; }
+
+.entry-usage {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+  margin-top: 2px;
 }
 </style>

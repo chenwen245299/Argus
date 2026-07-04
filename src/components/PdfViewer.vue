@@ -2,8 +2,7 @@
 import { ref, shallowRef, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { startTranslation, appendTranslationChunk, finishTranslation, failTranslation, triggerAskAi } from '../stores/translationHistory'
+import { runTranslation, triggerAskAi } from '../stores/translationHistory'
 import { openAddSnippetModal } from '../stores/snippetLibrary'
 import * as pdfjsLib from 'pdfjs-dist'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
@@ -348,7 +347,6 @@ onUnmounted(() => {
   if (scrollThumbHideTimer) clearTimeout(scrollThumbHideTimer)
   if (searchDebounce) clearTimeout(searchDebounce)
   pageTextCache.clear()
-  _translateUnlisten?.()
   pdfDoc.value?.destroy()
   // This viewer is gone for good (tab closed or evicted from cache) — drop its
   // cached highlights/reading-state from the store.
@@ -356,41 +354,13 @@ onUnmounted(() => {
 })
 
 // ── Inline translation ────────────────────────────────────────────────────────
-let _translateUnlisten: UnlistenFn | null = null
-
-async function startStreamTranslate(text: string) {
-  _translateUnlisten?.()
-  _translateUnlisten = null
-
-  const eventId = crypto.randomUUID()
-  startTranslation(text)
-
-  try {
-    _translateUnlisten = await listen<{ delta: string; done: boolean }>(
-      `translate-stream-${eventId}`,
-      ({ payload }) => {
-        if (payload.done) {
-          finishTranslation()
-          _translateUnlisten?.()
-          _translateUnlisten = null
-          return
-        }
-        appendTranslationChunk(payload.delta)
-      },
-    )
-    await invoke('translate_text_stream', { text, eventId })
-  } catch (e) {
-    failTranslation(String(e))
-    _translateUnlisten?.()
-    _translateUnlisten = null
-  }
-}
-
+// The streaming + model-resolution + usage tracking lives in the translation
+// store so the translation tab (regenerate) can drive it too.
 async function translateSelection() {
   if (!selectionPopup.value) return
   const { text } = selectionPopup.value
   selectionPopup.value = null
-  await startStreamTranslate(text)
+  await runTranslation(text)
 }
 
 function askAiWithSelection() {
@@ -1657,7 +1627,7 @@ async function translateHighlight(hlId: string) {
   const hl = reader.highlightsFor(props.slug).find(h => h.id === hlId)
   if (!hl) return
   hlColorPopup.value = null
-  await startStreamTranslate(hl.text)
+  await runTranslation(hl.text)
 }
 
 function deleteHighlight(id: string) {

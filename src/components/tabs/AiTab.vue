@@ -1331,6 +1331,54 @@ function scrollToBottom(force = false) {
   })
 }
 
+// Left-rail message navigation: one tick per user message, hover previews the
+// text, click scrolls to it.
+const messageNav = computed(() =>
+  (activeConversation.value?.nodes ?? [])
+    .filter((n): n is UserNode => n.role === 'user')
+    .map(n => ({ id: n.id, preview: n.content.trim() || '（空消息）' })),
+)
+
+function scrollToMessage(id: string) {
+  const container = messagesEl.value
+  if (!container) return
+  const el = container.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`)
+  if (!el) return
+  const top = container.scrollTop + el.getBoundingClientRect().top - container.getBoundingClientRect().top - 12
+  container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+}
+
+// The rail preview is teleported to <body> so no ancestor's `overflow: hidden`
+// (the chat container / the rail itself) can clip it.
+const navTip = ref<{ preview: string; x: number; y: number } | null>(null)
+// Index of the hovered tick, driving the Codex-style "wave": the hovered tick is
+// longest and its neighbours elongate progressively less with distance.
+const hoveredNavIndex = ref<number | null>(null)
+
+const RAIL_BASE = 9
+const RAIL_PEAK = 24
+const RAIL_FALLOFF = 5
+
+function railLineWidth(index: number): number {
+  const h = hoveredNavIndex.value
+  if (h === null) return RAIL_BASE
+  const d = Math.abs(index - h)
+  return Math.max(RAIL_BASE, RAIL_PEAK - d * RAIL_FALLOFF)
+}
+
+function onNavHover(index: number, preview: string, e: Event) {
+  hoveredNavIndex.value = index
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  const y = Math.min(Math.max(r.top + r.height / 2, 56), window.innerHeight - 56)
+  // Anchor to the rail's left edge + the widest possible line + a gap, so the
+  // tooltip never overlaps the tick as it animates out to its peak width.
+  navTip.value = { preview, x: r.left + RAIL_PEAK + 14, y }
+}
+function clearNavHover() {
+  hoveredNavIndex.value = null
+  navTip.value = null
+}
+
 function formatTime(iso: string) {
   const date = new Date(iso)
   const now = new Date()
@@ -1722,6 +1770,31 @@ function toggleContextPanel(nodeId: string) {
           </div>
         </div>
 
+        <div class="messages-wrap">
+        <nav
+          v-if="!activeConversationIsMetadataExtraction && messageNav.length > 1"
+          class="rail-nav"
+          aria-label="消息导航"
+          @mouseleave="clearNavHover"
+        >
+          <button
+            v-for="(item, index) in messageNav"
+            :key="item.id"
+            type="button"
+            class="rail-tick"
+            @click="scrollToMessage(item.id)"
+            @mouseenter="onNavHover(index, item.preview, $event)"
+            @focus="onNavHover(index, item.preview, $event)"
+            @blur="clearNavHover"
+          >
+            <span class="rail-line" :class="{ active: index === hoveredNavIndex }" :style="{ width: `${railLineWidth(index)}px` }" />
+          </button>
+        </nav>
+        <Teleport to="body">
+          <div v-if="navTip" class="rail-tooltip-float" :style="{ left: `${navTip.x}px`, top: `${navTip.y}px` }">
+            {{ navTip.preview }}
+          </div>
+        </Teleport>
         <div
           ref="messagesEl"
           class="messages"
@@ -1740,7 +1813,7 @@ function toggleContextPanel(nodeId: string) {
         </div>
 
         <template v-for="node in activeConversation?.nodes ?? []" :key="node.id">
-          <div v-if="node.role === 'user'" class="user-row">
+          <div v-if="node.role === 'user'" class="user-row" :data-node-id="node.id">
             <div class="user-msg-wrap">
               <!-- Edit mode -->
               <template v-if="editingNodeId === node.id">
@@ -1978,6 +2051,7 @@ function toggleContextPanel(nodeId: string) {
             </div>
           </div>
         </template>
+        </div>
         </div>
 
         <footer class="composer">
@@ -2326,7 +2400,7 @@ function toggleContextPanel(nodeId: string) {
 .center-hint p { max-width: 230px; font-size: var(--font-size-sm); line-height: 1.5; }
 
 .ai-header {
-  height: 40px;
+  height: var(--content-header-height);
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -2385,7 +2459,7 @@ function toggleContextPanel(nodeId: string) {
 .model-picker { position: relative; }
 .floating-model-picker {
   position: absolute;
-  top: 58px;
+  top: calc(var(--content-header-height) + 18px);
   left: 50%;
   transform: translateX(-50%);
   z-index: 70;
@@ -2567,11 +2641,82 @@ function toggleContextPanel(nodeId: string) {
   color: var(--text-tertiary);
 }
 
+.messages-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Left navigation rail: one tick per user message (Codex-style). */
+.rail-nav {
+  position: absolute;
+  left: 2px;
+  top: 0;
+  bottom: 0;
+  width: 28px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 16px 0;
+  overflow: hidden;
+  pointer-events: none;   /* only the ticks are interactive */
+}
+.rail-tick {
+  pointer-events: auto;
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 8px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+.rail-line {
+  display: block;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--border-default);
+  /* width is set inline (distance-based magnification); animate it. */
+  transition: width .18s cubic-bezier(.34, 1.56, .64, 1), background .16s ease;
+}
+.rail-tick:hover .rail-line,
+.rail-line.active {
+  background: var(--accent);
+}
+/* Teleported to <body> so no ancestor overflow clips it. */
+.rail-tooltip-float {
+  position: fixed;
+  transform: translateY(-50%);
+  max-width: 260px;
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  padding: 8px 11px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-lg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  text-align: left;
+  pointer-events: none;
+  z-index: 9999;
+}
+
 .messages {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 58px 12px 12px;
+  padding: calc(var(--content-header-height) + 18px) 12px 12px;
 }
 .messages--no-floating-model {
   padding-top: 12px;
@@ -2580,7 +2725,7 @@ function toggleContextPanel(nodeId: string) {
   padding: 24px 20px 0;
 }
 .empty-chat {
-  min-height: calc(100% - 44px);
+  min-height: calc(100% - var(--content-header-height));
   display: flex;
   flex-direction: column;
   align-items: center;

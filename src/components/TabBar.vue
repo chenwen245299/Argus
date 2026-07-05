@@ -15,11 +15,30 @@ const selection = useSelectionStore()
 const collections = useCollectionsStore()
 const canvasStore = useCanvasStore()
 
-defineProps<{ rightSidebarOpen?: boolean }>()
-const emit = defineEmits<{ 'toggle-right-sidebar': [] }>()
+type SnippetLibraryTab = {
+  id: string
+  name: string
+  emoji?: string
+}
+
+const props = defineProps<{
+  rightSidebarOpen?: boolean
+  snippetLibraryTabs?: SnippetLibraryTab[]
+  snippetLibraryVisible?: boolean
+  activeSnippetLibraryId?: string | null
+}>()
+const emit = defineEmits<{
+  'toggle-right-sidebar': []
+  'show-home': []
+  'show-canvas': []
+  'switch-snippet-library': [libraryId: string]
+  'close-snippet-library-tab': [libraryId: string]
+}>()
 
 const isFullscreenLayout = ref(false)
+const isMaximized = ref(false)
 const appWindow = getCurrentWebviewWindow()
+const isWindows = navigator.userAgent.toLowerCase().includes('windows')
 let unlistenResize: UnlistenFn | null = null
 let refreshTimers: number[] = []
 
@@ -42,7 +61,7 @@ function onTabMouseDown(e: MouseEvent, idx: number) {
       dragFrom.value = idx
     }
     // Find drop position from live tab positions
-    const tabs = tabsScrollRef.value?.querySelectorAll<HTMLElement>('.tab:not(.tab-home)')
+    const tabs = tabsScrollRef.value?.querySelectorAll<HTMLElement>('.tab.tab-paper')
     if (!tabs) return
     let di = reader.tabs.length
     tabs.forEach((el, i) => {
@@ -75,11 +94,13 @@ const homeTitle = computed(() => {
 function showHome() {
   canvasStore.isShown = false
   reader.showList()
+  emit('show-home')
 }
 
 function showCanvas() {
   canvasStore.isShown = true
   reader.showList()
+  emit('show-canvas')
 }
 
 function closeCanvasTab() {
@@ -92,6 +113,12 @@ function switchTab(slug: string) {
   reader.switchTab(slug)
 }
 
+function switchSnippetLibrary(libraryId: string) {
+  canvasStore.isShown = false
+  reader.showList()
+  emit('switch-snippet-library', libraryId)
+}
+
 function startDrag(e: MouseEvent) {
   if (e.button === 0) appWindow.startDragging()
 }
@@ -102,6 +129,13 @@ async function refreshWindowLayout() {
     isFullscreenLayout.value = fullscreen
   } catch {
     isFullscreenLayout.value = false
+  }
+
+  if (!isWindows) return
+  try {
+    isMaximized.value = await appWindow.isMaximized()
+  } catch {
+    isMaximized.value = false
   }
 }
 
@@ -131,10 +165,27 @@ onUnmounted(() => {
   unlistenResize?.()
   window.removeEventListener('resize', scheduleWindowLayoutRefresh)
 })
+
+async function minimizeWindow() {
+  await appWindow.minimize().catch(() => {})
+}
+
+async function toggleMaximizeWindow() {
+  await appWindow.toggleMaximize().catch(() => {})
+  scheduleWindowLayoutRefresh()
+}
+
+async function closeWindow() {
+  await appWindow.close().catch(() => {})
+}
 </script>
 
 <template>
-  <div class="titlebar" :class="{ 'fullscreen-layout': isFullscreenLayout }" data-tauri-drag-region>
+  <div
+    class="titlebar"
+    :class="{ 'fullscreen-layout': isFullscreenLayout, 'windows-layout': isWindows }"
+    data-tauri-drag-region
+  >
     <!-- Space for macOS traffic lights (~76px) — draggable -->
     <div class="tl-space" data-tauri-drag-region @mousedown="startDrag" />
 
@@ -143,7 +194,7 @@ onUnmounted(() => {
       <!-- Permanent home tab (current collection, cannot be closed) -->
       <div
         class="tab tab-home"
-        :class="{ active: !reader.activeSlug && !canvasStore.isShown }"
+        :class="{ active: !reader.activeSlug && !canvasStore.isShown && !props.snippetLibraryVisible }"
         :title="homeTitle"
         @click="showHome()"
       >
@@ -179,11 +230,33 @@ onUnmounted(() => {
         </button>
       </div>
 
+      <!-- Snippet library tabs -->
+      <div
+        v-for="tab in props.snippetLibraryTabs ?? []"
+        :key="`snippet:${tab.id}`"
+        class="tab tab-snippet"
+        :class="{ active: props.snippetLibraryVisible && props.activeSnippetLibraryId === tab.id && !reader.activeSlug && !canvasStore.isShown }"
+        :title="tab.name"
+        @click="switchSnippetLibrary(tab.id)"
+      >
+        <span v-if="tab.emoji" class="snippet-tab-emoji">{{ tab.emoji }}</span>
+        <svg v-else class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span class="tab-title">{{ tab.name }}</span>
+        <button class="tab-close" @click.stop="emit('close-snippet-library-tab', tab.id)">
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
       <!-- PDF tabs -->
       <div
         v-for="(tab, idx) in reader.tabs"
         :key="tab.slug"
-        class="tab"
+        class="tab tab-paper"
         :class="{
           active: tab.slug === reader.activeSlug && !canvasStore.isShown,
           'tab-dragging': dragFrom === idx,
@@ -212,8 +285,8 @@ onUnmounted(() => {
     <div class="tl-right" data-tauri-drag-region @mousedown="startDrag">
       <button
         class="titlebar-toggle-btn"
-        :class="{ active: rightSidebarOpen }"
-        :title="rightSidebarOpen ? t('pdf.hideSidebar') : t('pdf.showSidebar')"
+        :class="{ active: props.rightSidebarOpen }"
+        :title="props.rightSidebarOpen ? t('pdf.hideSidebar') : t('pdf.showSidebar')"
         @mousedown.stop
         @click="emit('toggle-right-sidebar')"
       >
@@ -224,6 +297,28 @@ onUnmounted(() => {
           <path d="M17.5 12h.01" />
         </svg>
       </button>
+
+      <div v-if="isWindows" class="window-controls" @mousedown.stop>
+        <button class="window-control-btn" title="最小化" @click="minimizeWindow">
+          <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
+            <path d="M1.5 5.5h8" />
+          </svg>
+        </button>
+        <button class="window-control-btn" :title="isMaximized ? '还原' : '最大化'" @click="toggleMaximizeWindow">
+          <svg v-if="isMaximized" width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
+            <path d="M3.5 1.5h6v6h-6z" />
+            <path d="M1.5 3.5v6h6" />
+          </svg>
+          <svg v-else width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
+            <path d="M1.5 1.5h8v8h-8z" />
+          </svg>
+        </button>
+        <button class="window-control-btn close" title="关闭" @click="closeWindow">
+          <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
+            <path d="M2 2l7 7M9 2L2 9" />
+          </svg>
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -231,6 +326,7 @@ onUnmounted(() => {
 <style scoped>
 .titlebar {
   --traffic-space: 76px;
+  --right-controls-space: 60px;
   height: 38px;
   display: flex;
   align-items: stretch;
@@ -243,6 +339,10 @@ onUnmounted(() => {
 }
 .titlebar.fullscreen-layout {
   --traffic-space: 0px;
+}
+.titlebar.windows-layout {
+  --traffic-space: 0px;
+  --right-controls-space: 174px;
 }
 
 .tl-space {
@@ -259,9 +359,13 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 4px;
   padding-right: 10px;
   -webkit-app-region: drag;
   cursor: default;
+}
+.titlebar.windows-layout .tl-right {
+  padding-right: 0;
 }
 
 .titlebar-toggle-btn {
@@ -279,12 +383,44 @@ onUnmounted(() => {
 .titlebar-toggle-btn:hover { background: var(--bg-hover); color: var(--text-secondary); }
 .titlebar-toggle-btn.active { color: var(--accent); }
 
+.window-controls {
+  align-self: stretch;
+  display: flex;
+  align-items: stretch;
+  -webkit-app-region: no-drag;
+}
+
+.window-control-btn {
+  width: 46px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.window-control-btn svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+}
+.window-control-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.window-control-btn.close:hover {
+  background: #e81123;
+  color: white;
+}
+
 .tabs-scroll {
   display: flex;
   align-items: stretch;
   overflow-x: auto;
   overflow-y: hidden;
-  max-width: calc(100% - var(--traffic-space) - 60px);
+  max-width: calc(100% - var(--traffic-space) - var(--right-controls-space));
   scrollbar-width: none;
   -webkit-app-region: no-drag;
   padding: 5px 3px 0;
@@ -332,6 +468,17 @@ onUnmounted(() => {
   opacity: 0.55;
 }
 .tab.active .tab-icon { opacity: 1; color: var(--accent); }
+
+.snippet-tab-emoji {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+}
 
 .tab-title {
   flex: 1;

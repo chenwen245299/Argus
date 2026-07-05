@@ -280,6 +280,11 @@ async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
   }
 }
 
+function addToLibraryIfAllowed(paper: ArxivPaper, col: Collection) {
+  if (!collectionsStore.canReceivePapers(col.id)) return
+  addToLibrary(paper, col.id)
+}
+
 async function doFetch() {
   store.fetchMessage = ''
   await store.fetchManual()
@@ -1073,9 +1078,12 @@ function jumpToDate(dateStr: string) {
                           v-for="col in cascadePanels[0].items"
                           :key="col.id"
                           class="col-picker-item"
-                          :class="{ 'col-item-open': hoveredPath[0] === col.id }"
+                          :class="{
+                            'col-item-open': hoveredPath[0] === col.id,
+                            'col-picker-item-disabled': !collectionsStore.canReceivePapers(col.id),
+                          }"
                           @mouseenter="onColHover(col, 0, $event)"
-                          @click="addToLibrary(selectedPaper, col.id)"
+                          @click="addToLibraryIfAllowed(selectedPaper, col)"
                         >
                           <span class="col-emoji">{{ col.emoji ?? '📁' }}</span>
                           <span class="col-name">{{ col.name }}</span>
@@ -1094,14 +1102,17 @@ function jumpToDate(dateStr: string) {
                     :style="{ left: panel.left + 'px', top: panel.top + 'px' }"
                   >
                     <div class="col-picker-list">
-                      <button
-                        v-for="col in panel.items"
-                        :key="col.id"
-                        class="col-picker-item"
-                        :class="{ 'col-item-open': hoveredPath[idx + 1] === col.id }"
-                        @mouseenter="onColHover(col, idx + 1, $event)"
-                        @click="addToLibrary(selectedPaper, col.id)"
-                      >
+                        <button
+                          v-for="col in panel.items"
+                          :key="col.id"
+                          class="col-picker-item"
+                          :class="{
+                            'col-item-open': hoveredPath[idx + 1] === col.id,
+                            'col-picker-item-disabled': !collectionsStore.canReceivePapers(col.id),
+                          }"
+                          @mouseenter="onColHover(col, idx + 1, $event)"
+                          @click="addToLibraryIfAllowed(selectedPaper, col)"
+                        >
                         <span class="col-emoji">{{ col.emoji ?? '📁' }}</span>
                         <span class="col-name">{{ col.name }}</span>
                         <svg v-if="colHasChildren(col.id)" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="col-chevron-right">
@@ -1962,6 +1973,10 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 }
 .col-picker-item:hover,
 .col-picker-item.col-item-open { background: var(--bg-hover); }
+.col-picker-item-disabled {
+  color: var(--text-secondary);
+  cursor: default;
+}
 .col-emoji { font-size: 13px; flex-shrink: 0; }
 .col-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .col-chevron-right { flex-shrink: 0; color: var(--text-tertiary); }

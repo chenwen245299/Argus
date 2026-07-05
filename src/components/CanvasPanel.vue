@@ -34,6 +34,7 @@ import AdjustableEdge from './canvas/AdjustableEdge.vue'
 import TextNode from './canvas/TextNode.vue'
 import ShapeNode from './canvas/ShapeNode.vue'
 import LineNode from './canvas/LineNode.vue'
+import ImageNode from './canvas/ImageNode.vue'
 import SuggestPanel from './canvas/SuggestPanel.vue'
 import ExportDialog from './canvas/ExportDialog.vue'
 import type { PaperIndexEntry, CanvasNode as CNode, CanvasEdge as CEdge, SuggestedEdge, NodePosition } from '../types'
@@ -51,7 +52,7 @@ const emit = defineEmits<{
 
 // ── Vue Flow setup ────────────────────────────────────────────────────────────
 
-const nodeTypes = markRaw({ paper: PaperNode, text: TextNode, shape: ShapeNode, line: LineNode })
+const nodeTypes = markRaw({ paper: PaperNode, text: TextNode, shape: ShapeNode, line: LineNode, image: ImageNode })
 const edgeTypes = markRaw({ adjustable: AdjustableEdge })
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -95,6 +96,8 @@ const pendingLineKind = ref<LineKind>('arrow')
 const DEFAULT_SHAPE_WIDTH = 160
 const DEFAULT_SHAPE_HEIGHT = 100
 const MIN_SHAPE_SIZE = 12
+const PASTED_IMAGE_MAX_WIDTH = 420
+const PASTED_IMAGE_MAX_HEIGHT = 320
 const isDraftTool = computed(() => activeTool.value === 'shape' || activeTool.value === 'line')
 
 type ShapeDraft = {
@@ -105,6 +108,7 @@ type ShapeDraft = {
 }
 const shapeDraft = ref<ShapeDraft | null>(null)
 const flowContainerRef = ref<HTMLElement | null>(null)
+const lastCanvasPointer = ref<{ x: number; y: number } | null>(null)
 const isPointerPanMode = computed(() => activeTool.value === 'pointer' && pointerDragMode.value === 'pan')
 const pointerPanOnDrag = computed(() => {
   if (activeTool.value !== 'pointer') return false
@@ -590,6 +594,28 @@ function buildVfNodes(cnodes: CNode[]): VfNode[] {
         },
       } satisfies VfNode
     }
+    if (nt === 'image') {
+      return {
+        id: cn.node_id,
+        type: 'image',
+        position: { x: cn.x, y: cn.y },
+        zIndex: cn.z_index,
+        style: {
+          width: `${cn.width ?? PASTED_IMAGE_MAX_WIDTH}px`,
+          height: `${cn.height ?? PASTED_IMAGE_MAX_HEIGHT}px`,
+        },
+        data: {
+          nodeId: cn.node_id,
+          src: cn.image_src ?? cn.content ?? '',
+          alt: cn.image_alt,
+          width: cn.width ?? PASTED_IMAGE_MAX_WIDTH,
+          height: cn.height ?? PASTED_IMAGE_MAX_HEIGHT,
+          cornerRadius: cn.corner_radius,
+          rotation: cn.rotation,
+          opacity: cn.opacity,
+        },
+      } satisfies VfNode
+    }
     const paper = paperById(cn.paper_id)
     return {
       id: cn.node_id,
@@ -692,6 +718,24 @@ function extractCanvasNodes(): CNode[] {
         corner_radius: nt === 'shape' && Number.isFinite(d.cornerRadius) ? d.cornerRadius : undefined,
         rotation: Number.isFinite(d.rotation) ? d.rotation : undefined,
         opacity: Number.isFinite(d.opacity) ? d.opacity : undefined,
+      }
+    }
+    if (nt === 'image') {
+      return {
+        node_id: n.id,
+        paper_id: '',
+        x: n.position.x,
+        y: n.position.y,
+        z_index: Number.isFinite(n.zIndex) ? (n.zIndex as number) : undefined,
+        hover_source: undefined,
+        node_type: 'image',
+        width: Number.isFinite(d.width) ? d.width : undefined,
+        height: Number.isFinite(d.height) ? d.height : undefined,
+        corner_radius: Number.isFinite(d.cornerRadius) ? d.cornerRadius : undefined,
+        rotation: Number.isFinite(d.rotation) ? d.rotation : undefined,
+        opacity: Number.isFinite(d.opacity) ? d.opacity : undefined,
+        image_src: d.src as string | undefined,
+        image_alt: d.alt as string | undefined,
       }
     }
     return {
@@ -948,7 +992,7 @@ watch(getSelectedNodes, (sel) => {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function snapshotFromVf(n: any): DrawNodeSnapshot {
   const d = n.data ?? {}
-  const type = (n.type ?? 'paper') as 'paper' | 'text' | 'shape' | 'line'
+  const type = (n.type ?? 'paper') as 'paper' | 'text' | 'shape' | 'line' | 'image'
   return {
     nodeId: n.id,
     type,
@@ -970,6 +1014,8 @@ function snapshotFromVf(n: any): DrawNodeSnapshot {
     bold: d.bold,
     italic: d.italic,
     textAlign: d.textAlign,
+    imageSrc: d.src,
+    imageAlt: d.alt,
   }
 }
 
@@ -994,7 +1040,9 @@ function applyNodePatch(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
     else {
       if (k === 'width') newW = v as number
       else if (k === 'height') newH = v as number
-      dataPatch[k] = v
+      if (k === 'imageSrc') dataPatch.src = v
+      else if (k === 'imageAlt') dataPatch.alt = v
+      else dataPatch[k] = v
     }
   }
 
@@ -1191,6 +1239,99 @@ function pasteClipboard() {
   nextTick(() => selectOnly(clones.map(c => c.node_id)))
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null
+  return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+}
+
+function measureImage(src: string): Promise<{ width: number; height: number }> {
+  return new Promise(resolve => {
+    const img = new Image()
+    img.onload = () => resolve({ width: img.naturalWidth || PASTED_IMAGE_MAX_WIDTH, height: img.naturalHeight || PASTED_IMAGE_MAX_HEIGHT })
+    img.onerror = () => resolve({ width: PASTED_IMAGE_MAX_WIDTH, height: PASTED_IMAGE_MAX_HEIGHT })
+    img.src = src
+  })
+}
+
+function fitPastedImageSize(width: number, height: number) {
+  const safeWidth = width > 0 ? width : PASTED_IMAGE_MAX_WIDTH
+  const safeHeight = height > 0 ? height : PASTED_IMAGE_MAX_HEIGHT
+  const scale = Math.min(PASTED_IMAGE_MAX_WIDTH / safeWidth, PASTED_IMAGE_MAX_HEIGHT / safeHeight, 1)
+  return {
+    width: Math.max(80, Math.round(safeWidth * scale)),
+    height: Math.max(60, Math.round(safeHeight * scale)),
+  }
+}
+
+function pastedImagePosition(width: number, height: number) {
+  const container = flowContainerRef.value
+  const fallback = container?.getBoundingClientRect()
+  const client = lastCanvasPointer.value ?? (fallback
+    ? { x: fallback.left + fallback.width / 2, y: fallback.top + fallback.height / 2 }
+    : { x: window.innerWidth / 2, y: window.innerHeight / 2 })
+  const flowPos = screenToFlowCoordinate(client)
+  return { x: flowPos.x - width / 2, y: flowPos.y - height / 2 }
+}
+
+async function addImageFileToCanvas(file: File) {
+  if (!file.type.startsWith('image/')) return
+  const src = await readFileAsDataUrl(file)
+  const measured = await measureImage(src)
+  const size = fitPastedImageSize(measured.width, measured.height)
+  const position = pastedImagePosition(size.width, size.height)
+  const nodeId = newNodeId()
+  const newNode: VfNode = {
+    id: nodeId,
+    type: 'image',
+    position,
+    style: {
+      width: `${size.width}px`,
+      height: `${size.height}px`,
+    },
+    data: {
+      nodeId,
+      src,
+      alt: file.name || 'Pasted image',
+      width: size.width,
+      height: size.height,
+      cornerRadius: 8,
+      opacity: 1,
+    },
+  }
+  addNodes([newNode])
+  activeTool.value = 'pointer'
+  triggerSave()
+  recordHistory()
+  await nextTick()
+  selectOnly([nodeId])
+}
+
+async function onCanvasPaste(e: ClipboardEvent) {
+  if (!canvasStore.isShown || !canvasStore.currentCanvas || isEditableTarget(e.target)) return
+  const items = Array.from(e.clipboardData?.items ?? [])
+  const imageItem = items.find(item => item.kind === 'file' && item.type.startsWith('image/'))
+  if (imageItem) {
+    const file = imageItem.getAsFile()
+    if (!file) return
+    e.preventDefault()
+    await addImageFileToCanvas(file)
+    return
+  }
+  if (clipboardCnodes.length) {
+    e.preventDefault()
+    pasteClipboard()
+  }
+}
+
 function deleteSelection() {
   const ids = canvasStore.selectedNodeIds
   if (!ids.length) return
@@ -1221,15 +1362,13 @@ watch(
 // ── Keyboard shortcuts (canvas only) ──────────────────────────────────────────
 function onCanvasKeydown(e: KeyboardEvent) {
   if (!canvasStore.isShown) return
-  const el = e.target as HTMLElement | null
-  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return
+  if (isEditableTarget(e.target)) return
   const meta = e.metaKey || e.ctrlKey
   const lower = e.key.toLowerCase()
   if (meta && lower === 'z' && !e.shiftKey) { e.preventDefault(); history.undo() }
   else if (meta && ((lower === 'z' && e.shiftKey) || lower === 'y')) { e.preventDefault(); history.redo() }
   else if (meta && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); duplicateSelection() }
   else if (meta && (e.key === 'c' || e.key === 'C')) { copySelection() }
-  else if (meta && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); pasteClipboard() }
   else if (meta && e.key === ']') { e.preventDefault(); setZOrder('front') }
   else if (meta && e.key === '[') { e.preventDefault(); setZOrder('back') }
   else if ((e.key === 'Delete' || e.key === 'Backspace') && canvasStore.selectedNodeIds.length) {
@@ -1242,6 +1381,7 @@ function onNodeDblClick(event: NodeMouseEvent) {
     openAnnotationEditor(event.node.id)
     return
   }
+  if (event.node.type === 'image' || event.node.type === 'line') return
   const paperId = event.node.data?.paperId as string | undefined
   if (paperId) openPaperById(paperId)
 }
@@ -1302,6 +1442,7 @@ function onNodeMouseEnter(event: NodeMouseEvent) {
     return
   }
   const nd = event.node
+  if (nd.type !== 'paper') return
   const mouseEvt = event.event as MouseEvent
   hoverPos.value = { x: mouseEvt.clientX, y: mouseEvt.clientY }
   if (hoverTimer) clearTimeout(hoverTimer)
@@ -1685,6 +1826,7 @@ onMounted(async () => {
   await canvasStore.loadSettings()
   document.addEventListener('keydown', onKeydown)
   document.addEventListener('keydown', onCanvasKeydown)
+  document.addEventListener('paste', onCanvasPaste)
   document.addEventListener('pointerdown', onDocClick)
   window.addEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
   window.addEventListener('argus-canvas-notes-updated', onCanvasNotesUpdated)
@@ -1695,6 +1837,7 @@ onMounted(async () => {
 onUnmounted(() => {
   document.removeEventListener('keydown', onKeydown)
   document.removeEventListener('keydown', onCanvasKeydown)
+  document.removeEventListener('paste', onCanvasPaste)
   document.removeEventListener('pointerdown', onDocClick)
   window.removeEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
   window.removeEventListener('argus-canvas-notes-updated', onCanvasNotesUpdated)
@@ -1812,6 +1955,7 @@ watch(() => library.papers, () => {
         v-if="canvasStore.currentCanvas"
         class="flow-wrap"
         ref="flowContainerRef"
+        @pointermove="lastCanvasPointer = { x: $event.clientX, y: $event.clientY }"
         @pointerdown="onFlowPointerDown"
       >
         <VueFlow
@@ -2116,6 +2260,16 @@ watch(() => library.papers, () => {
                 <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M9 6V4h6v2"/>
               </svg>
               删除
+            </button>
+          </template>
+
+          <!-- Image node -->
+          <template v-else-if="ctxMenu.nodeType === 'image'">
+            <button class="ctx-item ctx-item--danger" @click="ctxRemoveNode">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M9 6V4h6v2"/>
+              </svg>
+              删除图片
             </button>
           </template>
 

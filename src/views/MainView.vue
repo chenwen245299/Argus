@@ -14,8 +14,9 @@ import { useAiStore } from '../stores/ai'
 import { useSelectionStore } from '../stores/selection'
 import { useCanvasStore } from '../stores/canvas'
 import { useRagStore } from '../stores/rag'
+import { useActivityStore } from '../stores/activity'
 import { switchToTranslationsTab, askAiText } from '../stores/translationHistory'
-import { pendingSnippet, initSnippetStore } from '../stores/snippetLibrary'
+import { pendingSnippet, initSnippetStore, libraries as snippetLibraries } from '../stores/snippetLibrary'
 import { isEbookFileType } from '../types'
 import Toolbar from '../components/Toolbar.vue'
 import LeftSidebar from '../components/LeftSidebar.vue'
@@ -43,6 +44,7 @@ const aiStore = useAiStore()
 const selectionStore = useSelectionStore()
 const canvasStore = useCanvasStore()
 const ragStore = useRagStore()
+const activityStore = useActivityStore()
 
 // ── Window size persistence ────────────────────────────────────────────────────
 const WIN_SIZE_KEY = 'argus:window:size'
@@ -146,12 +148,29 @@ function fileTypeFor(slug: string): string {
     ?? libraryStore.papers.find(p => p.slug === slug)?.file_type
     ?? 'pdf'
 }
+function activePaperInfo() {
+  const slug = readerStore.activeSlug
+  if (!slug) return null
+  const paper = libraryStore.papers.find(p => p.slug === slug)
+  const tab = readerStore.tabs.find(t => t.slug === slug)
+  return {
+    slug,
+    title: paper?.title ?? tab?.title ?? slug,
+    fileType: paper?.file_type ?? tab?.fileType ?? 'pdf',
+  }
+}
 const livePdfSlugs = computed(() => liveViewerSlugs.value.filter(s => !isEbookFileType(fileTypeFor(s))))
 const liveEbookSlugs = computed(() => liveViewerSlugs.value.filter(s => isEbookFileType(fileTypeFor(s))))
 
 const showCanvas = ref(false)
 const showSnippetLibrary = ref(false)
 const activeSnippetLibraryId = ref<string | null>(null)
+const openSnippetLibraryIds = ref<string[]>([])
+const openSnippetLibraryTabs = computed(() =>
+  openSnippetLibraryIds.value
+    .map(id => snippetLibraries.value.find(lib => lib.id === id))
+    .filter((lib): lib is NonNullable<typeof lib> => Boolean(lib))
+)
 
 // Sync showCanvas with canvasStore.isShown so TabBar close button works
 watch(() => canvasStore.isShown, (v) => { showCanvas.value = v })
@@ -176,17 +195,44 @@ function closeCanvas() {
   if (!PAPER_TABS.includes(sidebarTab.value)) sidebarTab.value = 'metadata'
 }
 
-function onOpenSnippetLibrary(libraryId: string) {
+function rememberSnippetLibraryTab(libraryId: string) {
+  if (!openSnippetLibraryIds.value.includes(libraryId)) {
+    openSnippetLibraryIds.value = [...openSnippetLibraryIds.value, libraryId]
+  }
+}
+
+function activateSnippetLibrary(libraryId: string) {
   readerStore.showList()
   showCanvas.value = false
   canvasStore.isShown = false
+  rememberSnippetLibraryTab(libraryId)
   activeSnippetLibraryId.value = libraryId
   showSnippetLibrary.value = true
 }
 
-function closeSnippetLibrary() {
+function onOpenSnippetLibrary(libraryId: string) {
+  activateSnippetLibrary(libraryId)
+}
+
+function hideSnippetLibrary() {
   showSnippetLibrary.value = false
-  activeSnippetLibraryId.value = null
+}
+
+function closeSnippetLibraryTab(libraryId: string) {
+  const idx = openSnippetLibraryIds.value.indexOf(libraryId)
+  if (idx === -1) return
+  const nextIds = openSnippetLibraryIds.value.filter(id => id !== libraryId)
+  openSnippetLibraryIds.value = nextIds
+
+  if (activeSnippetLibraryId.value !== libraryId) return
+
+  const nextId = nextIds[Math.min(idx, nextIds.length - 1)]
+  if (nextId) {
+    activateSnippetLibrary(nextId)
+  } else {
+    showSnippetLibrary.value = false
+    activeSnippetLibraryId.value = null
+  }
 }
 
 function onSnippetOpenPaper(slug: string, page: number, title: string) {
@@ -246,9 +292,64 @@ function onKeydown(e: KeyboardEvent) {
 onMounted(() => window.addEventListener('keydown', onKeydown))
 onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
+// ── Activity tracking ─────────────────────────────────────────────────────────
+let activityStatusReady = false
+const knownReadingStatus = new Map<string, string>()
+const knownAiSummaryDone = new Map<string, boolean>()
+
+function syncActivityReading() {
+  const info = activePaperInfo()
+  const canTrack =
+    !!libraryStore.currentPath &&
+    !!info &&
+    document.visibilityState !== 'hidden' &&
+    document.hasFocus()
+
+  if (canTrack && info) {
+    activityStore.beginReading(info.slug, info.title, info.fileType)
+  } else {
+    activityStore.endReading()
+  }
+}
+
+function onActivityFocusChange() {
+  syncActivityReading()
+}
+
+function onActivityUnload() {
+  activityStore.endReading()
+}
+
+function syncActivityLibrary(path: string | null) {
+  activityStore.load(path)
+  knownReadingStatus.clear()
+  knownAiSummaryDone.clear()
+  libraryStore.papers.forEach(paper => {
+    knownReadingStatus.set(paper.slug, paper.reading_status)
+    knownAiSummaryDone.set(paper.slug, paper.status.ai_summary_done)
+  })
+  activityStatusReady = true
+  syncActivityReading()
+}
+
 // ── Drag-drop ──────────────────────────────────────────────────────────────────
 const isDragging = ref(false)
 const isPaperDragging = ref(false)
+const canImportIntoActiveCollection = computed(() =>
+  collectionsStore.canReceivePapers(selectionStore.activeCollectionId)
+)
+const dragDropTitle = computed(() => {
+  if (canImportIntoActiveCollection.value) return t('import.dropHere')
+  return selectionStore.activeCollectionId
+    ? t('import.dropSelectSubCollection')
+    : t('import.dropSelectCollection')
+})
+const dragDropSubtitle = computed(() => {
+  if (canImportIntoActiveCollection.value) return t('import.dropSub')
+  return selectionStore.activeCollectionId
+    ? t('import.dropSelectSubCollectionSub')
+    : t('import.dropSelectCollectionSub')
+})
 let unlistenDragDrop: (() => void) | null = null
 let unlistenOpenPaper: UnlistenFn | null = null
 let unlistenLibraryPaperAdded: UnlistenFn | null = null
@@ -287,9 +388,15 @@ onMounted(async () => {
   window.addEventListener('mousemove', onMouseMove)
   window.addEventListener('mouseup', onMouseUp)
   window.addEventListener('resize', onWinResize)
+  window.addEventListener('focus', onActivityFocusChange)
+  window.addEventListener('blur', onActivityFocusChange)
+  window.addEventListener('beforeunload', onActivityUnload)
+  document.addEventListener('visibilitychange', onActivityFocusChange)
   document.addEventListener('argus-paper-drag-start', onPaperDragStart)
   document.addEventListener('argus-paper-drag-end', onPaperDragEnd)
   window.addEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)
+  activityStore.startHeartbeat()
+  syncActivityLibrary(libraryStore.currentPath)
   restoreWindowSize()
 
   unlistenLibraryPaperAdded = await listen('library-paper-added', () => {
@@ -338,7 +445,7 @@ onMounted(async () => {
         isDragging.value = false
       } else if (payload.type === 'drop') {
         isDragging.value = false
-        if (!libraryStore.currentPath || !selectionStore.activeCollectionId) return
+        if (!libraryStore.currentPath || !selectionStore.activeCollectionId || !canImportIntoActiveCollection.value) return
         const docs = payload.paths.filter((p: string) => IMPORTABLE_RE.test(p))
         if (docs.length > 0) {
           importStore.importFiles(docs, selectionStore.activeCollectionId)
@@ -354,6 +461,11 @@ onUnmounted(() => {
   window.removeEventListener('mousemove', onMouseMove)
   window.removeEventListener('mouseup', onMouseUp)
   window.removeEventListener('resize', onWinResize)
+  window.removeEventListener('focus', onActivityFocusChange)
+  window.removeEventListener('blur', onActivityFocusChange)
+  window.removeEventListener('beforeunload', onActivityUnload)
+  document.removeEventListener('visibilitychange', onActivityFocusChange)
+  activityStore.stopHeartbeat()
   if (winResizeTimer) clearTimeout(winResizeTimer)
   if (mainFocusRetryTimer) clearTimeout(mainFocusRetryTimer)
   document.removeEventListener('argus-paper-drag-start', onPaperDragStart)
@@ -421,7 +533,54 @@ watch(
     if (newPath && newPath !== oldPath) {
       await onLibraryOpened()
     }
+    if (newPath !== oldPath) syncActivityLibrary(newPath)
   }
+)
+
+watch(
+  () => readerStore.activeSlug,
+  () => {
+    const info = activePaperInfo()
+    if (info && libraryStore.currentPath) {
+      activityStore.recordOpenPaper(info.slug, info.title, info.fileType)
+    }
+    syncActivityReading()
+  },
+  { immediate: true }
+)
+
+watch(
+  () => libraryStore.papers.map(p => ({
+    slug: p.slug,
+    title: p.title,
+    fileType: p.file_type,
+    readingStatus: p.reading_status,
+    aiDone: p.status.ai_summary_done,
+  })),
+  (items) => {
+    if (!activityStatusReady) {
+      items.forEach(item => {
+        knownReadingStatus.set(item.slug, item.readingStatus)
+        knownAiSummaryDone.set(item.slug, item.aiDone)
+      })
+      activityStatusReady = true
+      return
+    }
+
+    for (const item of items) {
+      const prevReading = knownReadingStatus.get(item.slug)
+      const prevAi = knownAiSummaryDone.get(item.slug)
+      if (prevReading !== undefined && prevReading !== 'read' && item.readingStatus === 'read') {
+        activityStore.recordCompletedPaper(item.slug, item.title, item.fileType)
+      }
+      if (prevAi !== undefined && !prevAi && item.aiDone) {
+        activityStore.recordAiAnalysis(item.slug, item.title, item.fileType)
+      }
+      knownReadingStatus.set(item.slug, item.readingStatus)
+      knownAiSummaryDone.set(item.slug, item.aiDone)
+    }
+  },
+  { deep: true, immediate: true }
 )
 
 watch(rightSidebarVisible, (visible) => {
@@ -533,7 +692,14 @@ watch(
     <!-- Title bar: sits above everything, drag region + tabs next to traffic lights -->
     <TabBar
       :right-sidebar-open="rightSidebarVisible"
+      :snippet-library-tabs="openSnippetLibraryTabs"
+      :snippet-library-visible="showSnippetLibrary"
+      :active-snippet-library-id="activeSnippetLibraryId"
       @toggle-right-sidebar="rightSidebarVisible = !rightSidebarVisible"
+      @show-home="hideSnippetLibrary"
+      @show-canvas="hideSnippetLibrary"
+      @switch-snippet-library="activateSnippetLibrary"
+      @close-snippet-library-tab="closeSnippetLibraryTab"
     />
 
     <Toolbar
@@ -550,6 +716,7 @@ watch(
       <LeftSidebar
         v-model:show-settings="showSettings"
         :snippet-library-visible="showSnippetLibrary"
+        :active-snippet-library-id="activeSnippetLibraryId"
         :style="{ width: leftWidth + 'px', minWidth: leftWidth + 'px' }"
         @open-canvas="onOpenCanvas"
         @open-snippet-library="onOpenSnippetLibrary"
@@ -638,8 +805,8 @@ watch(
             <polyline points="17 8 12 3 7 8"/>
             <line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
-          <p>{{ selectionStore.activeCollectionId ? t('import.dropHere') : t('import.dropSelectCollection') }}</p>
-          <span>{{ selectionStore.activeCollectionId ? t('import.dropSub') : t('import.dropSelectCollectionSub') }}</span>
+          <p>{{ dragDropTitle }}</p>
+          <span>{{ dragDropSubtitle }}</span>
         </div>
       </div>
     </Transition>
@@ -872,9 +1039,10 @@ watch(
 .divider {
   width: 1px;
   flex-shrink: 0;
-  background: transparent;
+  background: var(--border-default);
   cursor: col-resize;
   position: relative;
+  z-index: 2;
 }
 .divider::after {
   content: '';
@@ -890,7 +1058,7 @@ watch(
   left: 50%;
   width: 1px;
   transform: translateX(-50%);
-  background: var(--border-default);
+  background: transparent;
   transition: width 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
 }
 .divider:hover::before,

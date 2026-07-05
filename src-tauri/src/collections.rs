@@ -143,6 +143,38 @@ pub fn collection_folder_path_for(root: &str, collection_id: &str) -> Result<Pat
     Ok(folder)
 }
 
+fn ensure_collection_can_receive_papers_in_file(
+    file: &CollectionsFile,
+    collection_id: &str,
+) -> Result<(), String> {
+    if collection_id.trim().is_empty() {
+        return Err("Choose a sub-collection before importing papers.".to_string());
+    }
+
+    let collection = file
+        .collections
+        .iter()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| format!("Collection {collection_id} not found"))?;
+
+    if collection.parent_id.is_none() {
+        return Err(
+            "Top-level collections cannot contain papers. Choose a sub-collection.".to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+pub fn ensure_collection_can_receive_papers(
+    root: &str,
+    collection_id: &str,
+) -> Result<(), String> {
+    let _g = lock_collections();
+    let file = read_collections(root);
+    ensure_collection_can_receive_papers_in_file(&file, collection_id)
+}
+
 fn move_paper_folder_to_collection(
     root: &str,
     collections: &[Collection],
@@ -495,9 +527,7 @@ pub fn add_paper_to_collection(
     let _g = lock_collections();
     let mut file = read_collections(root);
 
-    if !file.collections.iter().any(|c| c.id == collection_id) {
-        return Err(format!("Collection {collection_id} not found"));
-    }
+    ensure_collection_can_receive_papers_in_file(&file, collection_id)?;
 
     let exists = file
         .assignments
@@ -522,9 +552,7 @@ pub fn move_paper_to_collection(
     let _g = lock_collections();
     let mut file = read_collections(root);
 
-    if !file.collections.iter().any(|c| c.id == collection_id) {
-        return Err(format!("Collection {collection_id} not found"));
-    }
+    ensure_collection_can_receive_papers_in_file(&file, collection_id)?;
 
     let slug =
         find_paper_slug(root, paper_id).ok_or_else(|| format!("Paper {paper_id} not found"))?;
@@ -685,6 +713,46 @@ mod tests {
         let file = read_collections(&root_str);
         assert!(file.collections.is_empty());
         assert!(file.assignments.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn top_level_collections_cannot_receive_papers() {
+        let root = test_root();
+        let root_str = root.to_string_lossy().to_string();
+        std::fs::create_dir_all(root.join(".argus")).unwrap();
+
+        write_collections(
+            &root_str,
+            &CollectionsFile {
+                collections: vec![
+                    Collection {
+                        id: "top".to_string(),
+                        name: "Top".to_string(),
+                        emoji: None,
+                        parent_id: None,
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                    },
+                    Collection {
+                        id: "child".to_string(),
+                        name: "Child".to_string(),
+                        emoji: None,
+                        parent_id: Some("top".to_string()),
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                    },
+                ],
+                assignments: vec![],
+            },
+        )
+        .unwrap();
+
+        assert!(add_paper_to_collection(&root_str, "paper-1", "top").is_err());
+        add_paper_to_collection(&root_str, "paper-1", "child").unwrap();
+
+        let file = read_collections(&root_str);
+        assert_eq!(file.assignments.len(), 1);
+        assert_eq!(file.assignments[0].collection_id, "child");
 
         let _ = std::fs::remove_dir_all(root);
     }

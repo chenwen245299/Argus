@@ -40,6 +40,15 @@ export const useImportStore = defineStore('import', () => {
 
   const EBOOK_EXT_RE = /\.(epub|mobi|azw3|azw|fb2|txt|zip)$/i
 
+  function canImportIntoCollection(collectionId: string): boolean {
+    const collections = useCollectionsStore()
+    if (!collections.canReceivePapers(collectionId)) {
+      console.warn('Import blocked: select a sub-collection')
+      return false
+    }
+    return true
+  }
+
   /**
    * Import a single ebook file path. The whole pipeline (parse → copy →
    * metadata from the book itself → sections → fulltext → index → rename)
@@ -72,8 +81,7 @@ export const useImportStore = defineStore('import', () => {
    * Ebook paths are routed to their own (fully backend-side) pipeline.
    */
   async function importFile(sourcePath: string, collectionId: string) {
-    if (!collectionId) {
-      console.warn('Import blocked: no collection selected')
+    if (!collectionId || !canImportIntoCollection(collectionId)) {
       return
     }
 
@@ -167,8 +175,7 @@ export const useImportStore = defineStore('import', () => {
    * Routes to the appropriate handler based on URL pattern.
    */
   async function importPaperUrl(url: string, collectionId: string) {
-    if (!collectionId) {
-      console.warn('URL import blocked: no collection selected')
+    if (!collectionId || !canImportIntoCollection(collectionId)) {
       return
     }
 
@@ -215,8 +222,7 @@ export const useImportStore = defineStore('import', () => {
 
   /** Import multiple files, one at a time (to avoid API rate limiting). */
   async function importFiles(paths: string[], collectionId: string) {
-    if (!collectionId) {
-      console.warn('Import blocked: no collection selected')
+    if (!collectionId || !canImportIntoCollection(collectionId)) {
       return
     }
 

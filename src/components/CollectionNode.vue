@@ -45,7 +45,9 @@ function isSubCollIMEActive() { return Date.now() - _subCollCompositionEndedAt <
 
 const children = computed(() => cStore.childrenOf(props.collection.id))
 const isExpanded = computed(() => props.expanded.has(props.collection.id))
-const isActive = computed(() => selection.activeCollectionId === props.collection.id)
+const isActive = computed(() =>
+  (selection.highlightedCollectionId ?? selection.activeCollectionId) === props.collection.id
+)
 const isDragOver = computed(() => props.dragOverId === props.collection.id)
 const isCollectionDragOver = computed(() => props.collectionDragOverId === props.collection.id)
 const isCollectionDragging = computed(() => props.collectionDraggingId === props.collection.id)

@@ -7,6 +7,7 @@ export const useSelectionStore = defineStore('selection', () => {
   const activeNav = ref<NavItem>('all')
   const tagFilter = ref<string | null>(null)
   const activeCollectionId = ref<string | null>(null)
+  const highlightedCollectionId = ref<string | null>(null)
   const navSelectionSeq = ref(0)
 
   // Search state
@@ -25,15 +26,19 @@ export const useSelectionStore = defineStore('selection', () => {
     if (item === 'all' || item === 'recent' || item === 'inbox') {
       tagFilter.value = null
       activeCollectionId.value = null
+      highlightedCollectionId.value = null
     } else if (item.startsWith('tag:')) {
       tagFilter.value = item.slice(4)
       activeCollectionId.value = null
+      highlightedCollectionId.value = null
     } else if (item.startsWith('collection:')) {
       activeCollectionId.value = item.slice('collection:'.length)
+      highlightedCollectionId.value = activeCollectionId.value
       tagFilter.value = null
     } else if (item === 'search') {
       tagFilter.value = null
       activeCollectionId.value = null
+      highlightedCollectionId.value = null
     }
     selectedSlug.value = null
   }
@@ -44,6 +49,7 @@ export const useSelectionStore = defineStore('selection', () => {
       activeNav.value = 'all'
       activeCollectionId.value = null
     }
+    highlightedCollectionId.value = null
     tagFilter.value = tagFilter.value === tag ? null : tag
     selectedSlug.value = null
   }
@@ -56,6 +62,7 @@ export const useSelectionStore = defineStore('selection', () => {
     selectedSlug.value = null
     tagFilter.value = null
     activeCollectionId.value = null
+    highlightedCollectionId.value = null
   }
 
   function clearSearch() {
@@ -68,13 +75,7 @@ export const useSelectionStore = defineStore('selection', () => {
 
   // Update the sidebar highlight only — does NOT change the center view or selectedSlug
   function highlightCollection(collectionId: string | null) {
-    if (collectionId) {
-      activeNav.value = `collection:${collectionId}` as NavItem
-      activeCollectionId.value = collectionId
-    } else {
-      activeNav.value = 'all'
-      activeCollectionId.value = null
-    }
+    highlightedCollectionId.value = collectionId
   }
 
   return {
@@ -83,6 +84,7 @@ export const useSelectionStore = defineStore('selection', () => {
     navSelectionSeq,
     tagFilter,
     activeCollectionId,
+    highlightedCollectionId,
     searchQuery,
     searchResults,
     selectPaper,

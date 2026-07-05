@@ -32,11 +32,25 @@ const importStore = useImportStore()
 const paperTasks = usePaperTasksStore()
 const { aiSummaryJobs, aiMetaSlug, abstractSlug } = storeToRefs(paperTasks)
 const ragStore = useRagStore()
-const isCollectionView = computed(() => !!selection.activeCollectionId)
+const canImportIntoActiveCollection = computed(() =>
+  collectionsStore.canReceivePapers(selection.activeCollectionId)
+)
+const importHint = computed(() => {
+  if (canImportIntoActiveCollection.value) return t('import.collectionHint')
+  return selection.activeCollectionId
+    ? t('import.selectSubCollectionHint')
+    : t('import.selectCollectionHint')
+})
+const importButtonTitle = computed(() => {
+  if (canImportIntoActiveCollection.value) return t('import.btnTitle')
+  return selection.activeCollectionId
+    ? t('import.selectSubCollectionTitle')
+    : t('import.selectCollectionTitle')
+})
 
 async function pickAndImport() {
   const collectionId = selection.activeCollectionId
-  if (!library.currentPath || !collectionId) return
+  if (!library.currentPath || !collectionId || !collectionsStore.canReceivePapers(collectionId)) return
   try {
     const paths = await invoke<string[]>('pick_import_files')
     if (paths.length > 0) importStore.importFiles(paths, collectionId)
@@ -584,7 +598,7 @@ function onRowMouseDown(e: MouseEvent, item: PaperIndexEntry) {
 
   function effectiveDragTarget(x: number, y: number): string | null {
     const id = findCollId(x, y)
-    if (!id || collectionsStore.isTopLevel(id)) return null
+    if (!collectionsStore.canReceivePapers(id)) return null
     return id
   }
 
@@ -1343,11 +1357,11 @@ async function reExtract(item: PaperIndexEntry) {
         <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
       </svg>
       <p>{{ selection.activeNav.startsWith('collection:') ? t('collections.empty') : t('list.noPapers') }}</p>
-      <span>{{ isCollectionView ? t('import.collectionHint') : t('import.selectCollectionHint') }}</span>
+      <span>{{ importHint }}</span>
       <button
         class="import-btn"
-        :disabled="!isCollectionView"
-        :title="isCollectionView ? t('import.btnTitle') : t('import.selectCollectionTitle')"
+        :disabled="!canImportIntoActiveCollection"
+        :title="importButtonTitle"
         @click="pickAndImport"
       >
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
@@ -1689,7 +1703,7 @@ async function reExtract(item: PaperIndexEntry) {
 /* ── Column header ─────────────────────────────────────────────────────────── */
 .header-shell {
   position: relative;
-  height: 40px;
+  height: var(--content-header-height);
   flex-shrink: 0;
   display: flex;
   background: var(--bg-secondary);
@@ -1709,7 +1723,7 @@ async function reExtract(item: PaperIndexEntry) {
   display: grid;
   grid-template-columns: v-bind(gridCols);
   align-items: stretch;
-  height: 40px;
+  height: var(--content-header-height);
   min-width: v-bind(tableWidthPx);
   width: max(100%, v-bind(tableWidthPx));
   background: var(--bg-secondary);
@@ -2101,7 +2115,7 @@ async function reExtract(item: PaperIndexEntry) {
 /* ── Search results ────────────────────────────────────────────────────────── */
 .search-header {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 0 14px; height: 28px;
+  padding: 0 14px; height: var(--content-header-height);
   font-size: 11px; font-weight: 500; color: var(--text-tertiary);
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-secondary); flex-shrink: 0;

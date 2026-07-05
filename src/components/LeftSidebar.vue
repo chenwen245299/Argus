@@ -29,11 +29,14 @@ const recentCount = computed(() => {
 })
 
 const showSettings = defineModel<boolean>('showSettings', { default: false })
-const props = defineProps<{ snippetLibraryVisible?: boolean }>()
+const props = defineProps<{ snippetLibraryVisible?: boolean; activeSnippetLibraryId?: string | null }>()
 const emit = defineEmits<{ 'open-canvas': [canvasId: string]; 'open-snippet-library': [libraryId: string] }>()
+
+type SidebarMode = 'library' | 'canvas' | 'snippets'
 
 const expanded = ref<Set<string>>(new Set())
 const libraryCollapsed = ref(false)
+const SIDEBAR_MODE_KEY = 'argus:sidebar:mode'
 const EXPANDED_COLLECTIONS_KEY_PREFIX = 'argus:sidebar:expanded-collections'
 const CANVAS_HEIGHT_KEY = 'argus:sidebar:canvas-height'
 const canvasPanelHeight = ref(loadCanvasPanelHeight())
@@ -42,6 +45,44 @@ const showNewCanvasInput = ref(false)
 const newCanvasName = ref('')
 const TAGS_HEIGHT_KEY = 'argus:sidebar:tags-height'
 const tagsPanelHeight = ref(loadTagsPanelHeight())
+const sidebarMode = ref<SidebarMode>(loadSidebarMode())
+const showWorkspaceMenu = ref(false)
+const sidebarScrollRef = ref<HTMLElement | null>(null)
+const collectionScrollRef = ref<HTMLElement | null>(null)
+
+function loadSidebarMode(): SidebarMode {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_MODE_KEY)
+    if (raw === 'canvas' || raw === 'snippets' || raw === 'library') return raw
+  } catch {}
+  return 'library'
+}
+
+function saveSidebarMode(mode: SidebarMode) {
+  try {
+    localStorage.setItem(SIDEBAR_MODE_KEY, mode)
+  } catch {}
+}
+
+function sidebarModeLabel(mode: SidebarMode): string {
+  if (mode === 'canvas') return t('sidebar.canvas')
+  if (mode === 'snippets') return t('snippets.title')
+  return t('sidebar.library')
+}
+
+const activeSidebarModeLabel = computed(() => sidebarModeLabel(sidebarMode.value))
+
+function setSidebarMode(mode: SidebarMode) {
+  sidebarMode.value = mode
+  saveSidebarMode(mode)
+  showWorkspaceMenu.value = false
+  closeCtx()
+  if (mode === 'canvas') {
+    void canvasStore.loadList()
+  } else if (mode === 'snippets') {
+    void reloadSnippets()
+  }
+}
 
 function loadCanvasPanelHeight() {
   try {
@@ -73,7 +114,7 @@ const COLLECTION_EMOJIS = [
 function loadTagsPanelHeight() {
   try {
     const raw = Number(localStorage.getItem(TAGS_HEIGHT_KEY))
-    if (Number.isFinite(raw) && raw > 0) return Math.min(360, Math.max(72, raw))
+    if (Number.isFinite(raw) && raw > 0) return Math.min(360, Math.max(56, raw))
   } catch {}
   return 128
 }
@@ -113,11 +154,13 @@ onMounted(async () => {
 })
 
 function onGlobalMousedown(e: MouseEvent) {
-  const anyMenuOpen = ctxMenu.value || canvasCtxMenu.value || libCtxMenu.value || snippetCtxMenu.value
+  const anyMenuOpen = showWorkspaceMenu.value || ctxMenu.value || canvasCtxMenu.value || libCtxMenu.value || snippetCtxMenu.value
   if (!anyMenuOpen) return
   const target = e.target as Element | null
+  if (target?.closest('.workspace-switcher')) return
   if (target?.closest('.ctx-menu')) return
   closeCtx()
+  showWorkspaceMenu.value = false
 }
 
 function select(item: NavItem) {
@@ -172,38 +215,69 @@ watch(
   { immediate: true }
 )
 
-// ── Sync sidebar selection to active tab ──────────────────────────────────────
+function dataAttrSelectorValue(value: string) {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+async function scrollToCollection(collectionId: string | null) {
+  await nextTick()
+  window.requestAnimationFrame(() => {
+    const scrollEl = collectionScrollRef.value ?? sidebarScrollRef.value
+    if (!scrollEl) return
+    if (!collectionId) {
+      scrollEl.scrollTo({ top: 0, behavior: 'smooth' })
+      return
+    }
+    const target = scrollEl.querySelector<HTMLElement>(
+      `[data-collection-id="${dataAttrSelectorValue(collectionId)}"]`
+    )
+    target?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' })
+  })
+}
+
+async function syncSidebarToPaper(slug: string | null) {
+  if (!slug) return
+  const paper = library.papers.find(p => p.slug === slug)
+  if (!paper) return
+
+  if (sidebarMode.value !== 'library') {
+    setSidebarMode('library')
+  }
+  libraryCollapsed.value = false
+
+  const assignment = collectionsStore.file.assignments.find(a => a.paper_id === paper.id)
+  if (!assignment) {
+    selection.highlightCollection(null)
+    await scrollToCollection(null)
+    return
+  }
+
+  const collectionId = assignment.collection_id
+  let cur = collectionsStore.collectionById(collectionId)
+  const toExpand: string[] = []
+  while (cur?.parent_id) {
+    toExpand.push(cur.parent_id)
+    cur = collectionsStore.collectionById(cur.parent_id)
+  }
+  toExpand.forEach(id => expanded.value.add(id))
+  if (toExpand.length) saveExpandedCollections()
+
+  selection.highlightCollection(collectionId)
+  await scrollToCollection(collectionId)
+}
+
+// ── Sync sidebar position to selected/open paper ─────────────────────────────
 watch(
   () => readerStore.activeSlug,
   (slug) => {
-    if (!slug) return
-    const paper = library.papers.find(p => p.slug === slug)
-    if (!paper) return
+    void syncSidebarToPaper(slug)
+  }
+)
 
-    // Find direct assignment for this paper
-    const assignment = collectionsStore.file.assignments.find(a => a.paper_id === paper.id)
-    if (!assignment) {
-      // Paper not in any collection — highlight "all papers"
-      selection.highlightCollection(null)
-      libraryCollapsed.value = false
-      return
-    }
-
-    const collectionId = assignment.collection_id
-
-    // Expand all ancestors so the collection is visible
-    libraryCollapsed.value = false
-    let cur = collectionsStore.collectionById(collectionId)
-    const toExpand: string[] = []
-    while (cur?.parent_id) {
-      toExpand.push(cur.parent_id)
-      cur = collectionsStore.collectionById(cur.parent_id)
-    }
-    toExpand.forEach(id => expanded.value.add(id))
-    if (toExpand.length) saveExpandedCollections()
-
-    // Only update the sidebar highlight — center view keeps showing the PDF
-    selection.highlightCollection(collectionId)
+watch(
+  () => selection.selectedSlug,
+  (slug) => {
+    void syncSidebarToPaper(slug)
   }
 )
 
@@ -360,6 +434,7 @@ async function openCollectionInFinder(col: Collection) {
 
 // ── Canvas panel ──────────────────────────────────────────────────────────────
 function startNewCanvas() {
+  setSidebarMode('canvas')
   newCanvasName.value = t('canvas.newCanvasName')
   showNewCanvasInput.value = true
   canvasCollapsed.value = false
@@ -380,6 +455,8 @@ async function submitNewCanvas() {
 
 async function openSpecificCanvas(canvasId?: string) {
   if (!canvasId) return
+  sidebarMode.value = 'canvas'
+  saveSidebarMode('canvas')
   try {
     await canvasStore.openCanvas(canvasId)
     emit('open-canvas', canvasId)
@@ -471,6 +548,7 @@ function loadSnippetPanelHeight() {
 }
 
 function startNewSnippetLib() {
+  setSidebarMode('snippets')
   newSnippetLibName.value = ''
   showNewSnippetLibInput.value = true
   snippetCollapsed.value = false
@@ -486,6 +564,8 @@ async function submitNewSnippetLib() {
 }
 
 function openSnippetLibrary(id: string) {
+  sidebarMode.value = 'snippets'
+  saveSidebarMode('snippets')
   activeSnippetLibraryId.value = id
   emit('open-snippet-library', id)
 }
@@ -752,7 +832,7 @@ let isResizingTags = false
 
 function clampTagsHeight(height: number) {
   const max = Math.min(360, Math.max(120, window.innerHeight * 0.48))
-  return Math.min(max, Math.max(72, height))
+  return Math.min(max, Math.max(56, height))
 }
 
 function startResizeTags(e: MouseEvent) {
@@ -796,173 +876,292 @@ onUnmounted(() => {
 <template>
   <div class="left-sidebar" @click="closeCtx">
     <div
+      ref="sidebarScrollRef"
       class="sidebar-scroll"
-      :class="{ 'collection-root-drop-zone': collectionRootDragOver }"
-      data-collection-root="true"
+      :class="{ 'collection-root-drop-zone': sidebarMode === 'library' && collectionRootDragOver }"
+      :data-collection-root="sidebarMode === 'library' ? 'true' : undefined"
     >
-      <!-- Library section (collapsible) -->
-      <div class="section">
-        <!-- Section header: click to collapse, + to new collection -->
-        <div class="section-header" @click.stop="libraryCollapsed = !libraryCollapsed">
-          <span class="section-title">{{ t('sidebar.library') }}</span>
-          <div class="section-header-right">
-            <button class="icon-action" :title="t('toolbar.refreshTitle')" :disabled="refreshSpinning" @click.stop="handleLibraryRefresh()">
-              <svg
-                width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                :class="{ spin: refreshSpinning }"
-              >
-                <polyline points="23 4 23 10 17 10"/>
-                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+      <div class="workspace-header">
+        <div class="workspace-switcher">
+          <button class="workspace-switcher-btn" @click.stop="showWorkspaceMenu = !showWorkspaceMenu">
+            <span class="workspace-icon" aria-hidden="true">
+              <svg v-if="sidebarMode === 'library'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
               </svg>
-            </button>
-            <button class="icon-action" :title="t('collections.new')" @click.stop="startNew()">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <line x1="12" y1="5" x2="12" y2="19"/>
-                <line x1="5" y1="12" x2="19" y2="12"/>
+              <svg v-else-if="sidebarMode === 'canvas'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="8" cy="8" r="2"/><circle cx="16" cy="8" r="2"/><circle cx="12" cy="17" r="2"/>
+                <line x1="9.8" y1="8.8" x2="13.2" y2="15.4"/><line x1="14.2" y1="8.8" x2="10.8" y2="15.4"/><line x1="10" y1="8" x2="14" y2="8"/>
               </svg>
-            </button>
+              <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              </svg>
+            </span>
+            <span class="workspace-title">{{ activeSidebarModeLabel }}</span>
             <svg
-              width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-              class="collapse-chevron"
-              :class="{ 'is-collapsed': libraryCollapsed }"
+              width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+              class="workspace-caret"
+              :class="{ 'is-open': showWorkspaceMenu }"
             >
               <polyline points="6 9 12 15 18 9"/>
             </svg>
-          </div>
+          </button>
+
+          <Transition name="workspace-menu">
+            <div v-if="showWorkspaceMenu" class="workspace-menu" @click.stop>
+              <button
+                class="workspace-menu-item"
+                :class="{ active: sidebarMode === 'library' }"
+                @click="setSidebarMode('library')"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                  <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+                </svg>
+                {{ t('sidebar.library') }}
+              </button>
+              <button
+                class="workspace-menu-item"
+                :class="{ active: sidebarMode === 'canvas' }"
+                @click="setSidebarMode('canvas')"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="8" cy="8" r="2"/><circle cx="16" cy="8" r="2"/><circle cx="12" cy="17" r="2"/>
+                  <line x1="9.8" y1="8.8" x2="13.2" y2="15.4"/><line x1="14.2" y1="8.8" x2="10.8" y2="15.4"/><line x1="10" y1="8" x2="14" y2="8"/>
+                </svg>
+                {{ t('sidebar.canvas') }}
+              </button>
+              <button
+                class="workspace-menu-item"
+                :class="{ active: sidebarMode === 'snippets' }"
+                @click="setSidebarMode('snippets')"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                </svg>
+                {{ t('snippets.title') }}
+              </button>
+            </div>
+          </Transition>
         </div>
 
-        <template v-if="!libraryCollapsed">
-          <!-- All Papers -->
-          <div
-            class="all-papers-section"
-            :class="{ 'collection-root-drop-over': collectionRootDragOver }"
-            data-collection-root="true"
-          >
-            <button
-              class="nav-item"
-              :class="{ active: selection.activeNav === 'all' }"
-              @click="select('all')"
-              @contextmenu.prevent="openLibCtx($event)"
-            >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="3" y="3" width="7" height="7"/>
-                <rect x="14" y="3" width="7" height="7"/>
-                <rect x="14" y="14" width="7" height="7"/>
-                <rect x="3" y="14" width="7" height="7"/>
-              </svg>
-              {{ t('sidebar.allPapers') }}
-              <span class="badge">{{ library.papers.length }}</span>
-            </button>
-          </div>
-
-          <!-- Recently Read -->
-          <div class="all-papers-section">
-            <button
-              class="nav-item"
-              :class="{ active: selection.activeNav === 'recent' }"
-              @click="select('recent')"
-            >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="9"/>
-                <polyline points="12 7 12 12 15 14"/>
-              </svg>
-              {{ t('sidebar.recentPapers') }}
-              <span class="badge">{{ recentCount }}</span>
-            </button>
-          </div>
-
-          <!-- Collections directly below All Papers -->
-          <div
-            class="coll-list"
-            :class="{ 'collection-root-drop-over': collectionRootDragOver }"
-            data-collection-root="true"
-          >
-            <!-- New top-level collection input -->
-            <div v-if="showNewInput && !newCollParent" class="new-coll-row">
-              <input
-                id="new-coll-input"
-                v-model="newCollName"
-                class="coll-name-input"
-                :placeholder="t('collections.namePlaceholder')"
-                @compositionend="onNewCollCompositionEnd"
-                @keydown.enter="() => { if (!isNewCollIMEActive()) submitNew() }"
-                @keydown.escape="showNewInput = false"
-                @blur="submitNew"
-              />
-            </div>
-
-            <div v-if="collectionsStore.topLevel.length === 0 && !showNewInput" class="no-collections">
-              {{ t('collections.noCollections') }}
-            </div>
-
-            <CollectionNode
-              v-for="col in collectionsStore.topLevel"
-              :key="col.id"
-              :collection="col"
-              :depth="0"
-              :expanded="expanded"
-              :renaming-id="renamingId"
-              :rename-value="renameValue"
-              :drag-over-id="dragOverId"
-              :collection-drag-over-id="collectionDragOverId"
-              :collection-dragging-id="collectionDraggingId"
-              :show-new-input="showNewInput"
-              :new-coll-parent="newCollParent"
-              :new-coll-name="newCollName"
-              @toggle-expand="toggleExpand"
-              @open-ctx="openCtx"
-              @start-rename="startRename"
-              @submit-rename="submitRename"
-              @delete="deleteCollection"
-              @start-new="startNew"
-              @collection-drag-start="startCollectionDrag"
-              @submit-new="submitNew"
-              @update:renameValue="renameValue = $event"
-              @update:newCollName="newCollName = $event"
-              @update:showNewInput="showNewInput = $event"
-            />
-          </div>
-        </template>
-      </div>
-    </div>
-
-    <!-- Canvas / 论文关系图谱 section -->
-    <div
-      v-if="library.currentPath"
-      class="canvas-section"
-      :class="{ 'canvas-section--collapsed': canvasCollapsed }"
-      :style="{ height: `${canvasPanelHeight}px` }"
-    >
-      <div v-if="!canvasCollapsed" class="canvas-resize-handle" @mousedown.stop.prevent="startResizeCanvas" />
-
-      <div class="section-header" @click.stop="canvasCollapsed = !canvasCollapsed">
-        <span class="section-title">{{ t('sidebar.canvas') }}</span>
         <div class="section-header-right">
-          <button v-if="!canvasCollapsed" class="icon-action" :title="t('toolbar.refreshTitle')" :disabled="canvasRefreshSpinning" @click.stop="handleCanvasRefresh()">
+          <button
+            v-if="sidebarMode === 'library'"
+            class="icon-action"
+            :title="t('toolbar.refreshTitle')"
+            :disabled="refreshSpinning"
+            @click.stop="handleLibraryRefresh()"
+          >
+            <svg
+              width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              :class="{ spin: refreshSpinning }"
+            >
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+          <button
+            v-else-if="sidebarMode === 'canvas'"
+            class="icon-action"
+            :title="t('toolbar.refreshTitle')"
+            :disabled="canvasRefreshSpinning"
+            @click.stop="handleCanvasRefresh()"
+          >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               :class="{ spin: canvasRefreshSpinning }">
               <polyline points="23 4 23 10 17 10"/>
               <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
             </svg>
           </button>
-          <button v-if="!canvasCollapsed" class="icon-action" :title="t('canvas.newCanvas')" @click.stop="startNewCanvas()">
+          <button
+            v-else
+            class="icon-action"
+            :title="t('toolbar.refreshTitle')"
+            :disabled="snippetRefreshSpinning"
+            @click.stop="handleSnippetRefresh()"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              :class="{ spin: snippetRefreshSpinning }">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+
+          <button
+            v-if="sidebarMode === 'library'"
+            class="icon-action"
+            :title="t('collections.new')"
+            @click.stop="startNew()"
+          >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
               <line x1="12" y1="5" x2="12" y2="19"/>
               <line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
           </button>
-          <svg
-            width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-            class="collapse-chevron"
-            :class="{ 'is-collapsed': canvasCollapsed }"
+          <button
+            v-else-if="sidebarMode === 'canvas'"
+            class="icon-action"
+            :title="t('canvas.newCanvas')"
+            @click.stop="startNewCanvas()"
           >
-            <polyline points="6 9 12 15 18 9"/>
-          </svg>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </button>
+          <button
+            v-else
+            class="icon-action"
+            :title="t('snippets.newLibrary')"
+            @click.stop="startNewSnippetLib()"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </button>
         </div>
       </div>
 
-      <template v-if="!canvasCollapsed">
-        <div class="canvas-list">
+      <template v-if="sidebarMode === 'library'">
+        <div class="library-content">
+          <div class="library-pinned-nav">
+            <div
+              class="all-papers-section"
+              :class="{ 'collection-root-drop-over': collectionRootDragOver }"
+              data-collection-root="true"
+            >
+              <button
+              class="nav-item"
+              :class="{ active: selection.activeNav === 'all' && !selection.highlightedCollectionId }"
+                @click="select('all')"
+                @contextmenu.prevent="openLibCtx($event)"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="3" width="7" height="7"/>
+                  <rect x="14" y="3" width="7" height="7"/>
+                  <rect x="14" y="14" width="7" height="7"/>
+                  <rect x="3" y="14" width="7" height="7"/>
+                </svg>
+                {{ t('sidebar.allPapers') }}
+                <span class="badge">{{ library.papers.length }}</span>
+              </button>
+            </div>
+
+            <div class="all-papers-section">
+              <button
+              class="nav-item"
+              :class="{ active: selection.activeNav === 'recent' && !selection.highlightedCollectionId }"
+                @click="select('recent')"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="9"/>
+                  <polyline points="12 7 12 12 15 14"/>
+                </svg>
+                {{ t('sidebar.recentPapers') }}
+                <span class="badge">{{ recentCount }}</span>
+              </button>
+            </div>
+          </div>
+
+          <div
+            ref="collectionScrollRef"
+            class="library-main-scroll"
+            :class="{ 'collection-root-drop-over': collectionRootDragOver }"
+            data-collection-root="true"
+          >
+            <div
+              class="coll-list"
+              :class="{ 'collection-root-drop-over': collectionRootDragOver }"
+              data-collection-root="true"
+            >
+              <div v-if="showNewInput && !newCollParent" class="new-coll-row">
+                <input
+                  id="new-coll-input"
+                  v-model="newCollName"
+                  class="coll-name-input"
+                  :placeholder="t('collections.namePlaceholder')"
+                  @compositionend="onNewCollCompositionEnd"
+                  @keydown.enter="() => { if (!isNewCollIMEActive()) submitNew() }"
+                  @keydown.escape="showNewInput = false"
+                  @blur="submitNew"
+                />
+              </div>
+
+              <div v-if="collectionsStore.topLevel.length === 0 && !showNewInput" class="no-collections">
+                {{ t('collections.noCollections') }}
+              </div>
+
+              <CollectionNode
+                v-for="col in collectionsStore.topLevel"
+                :key="col.id"
+                :collection="col"
+                :depth="0"
+                :expanded="expanded"
+                :renaming-id="renamingId"
+                :rename-value="renameValue"
+                :drag-over-id="dragOverId"
+                :collection-drag-over-id="collectionDragOverId"
+                :collection-dragging-id="collectionDraggingId"
+                :show-new-input="showNewInput"
+                :new-coll-parent="newCollParent"
+                :new-coll-name="newCollName"
+                @toggle-expand="toggleExpand"
+                @open-ctx="openCtx"
+                @start-rename="startRename"
+                @submit-rename="submitRename"
+                @delete="deleteCollection"
+                @start-new="startNew"
+                @collection-drag-start="startCollectionDrag"
+                @submit-new="submitNew"
+                @update:renameValue="renameValue = $event"
+                @update:newCollName="newCollName = $event"
+                @update:showNewInput="showNewInput = $event"
+              />
+            </div>
+          </div>
+
+          <div
+            v-if="library.allTags.length > 0"
+            class="tags-panel tags-panel-fixed"
+            :style="{ maxHeight: `${tagsPanelHeight}px` }"
+          >
+            <div class="tags-resize-handle" @mousedown.prevent.stop="startResizeTags" />
+            <div class="section-title tags-title">{{ t('sidebar.tags') }}</div>
+            <div class="tag-cloud">
+              <div
+                v-for="tag in library.allTags"
+                :key="tag"
+                class="tag-chip"
+                :class="{ active: selection.tagFilter === tag }"
+                :style="selection.tagFilter === tag ? {} : categoryStyleFor(tag)"
+                @click="toggleTag(tag)"
+              >
+                <span
+                  v-if="CATEGORY_ICONS[tag]"
+                  class="tag-chip-icon"
+                  v-html="CATEGORY_ICONS[tag]"
+                />
+                <span class="tag-chip-text">{{ tag }}</span>
+                <button
+                  class="tag-chip-delete"
+                  :title="t('common.delete')"
+                  @click.stop="deleteTag(tag)"
+                >
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                    <path d="M18 6L6 18M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <template v-else-if="sidebarMode === 'canvas'">
+        <div class="workspace-panel">
+          <div class="canvas-list mode-list">
           <div v-if="showNewCanvasInput" class="new-coll-row">
             <input
               id="new-canvas-input"
@@ -1014,46 +1213,12 @@ onUnmounted(() => {
             </template>
           </div>
         </div>
-      </template>
-    </div>
-
-    <!-- Snippet Library section -->
-    <div
-      v-if="library.currentPath"
-      class="canvas-section"
-      :class="{ 'canvas-section--collapsed': snippetCollapsed }"
-      :style="{ height: `${snippetPanelHeight}px` }"
-    >
-      <div v-if="!snippetCollapsed" class="canvas-resize-handle" @mousedown.stop.prevent="startResizeSnippet" />
-
-      <div class="section-header" @click.stop="snippetCollapsed = !snippetCollapsed">
-        <span class="section-title">{{ t('snippets.title') }}</span>
-        <div class="section-header-right">
-          <button v-if="!snippetCollapsed" class="icon-action" :title="t('toolbar.refreshTitle')" :disabled="snippetRefreshSpinning" @click.stop="handleSnippetRefresh()">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-              :class="{ spin: snippetRefreshSpinning }">
-              <polyline points="23 4 23 10 17 10"/>
-              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-            </svg>
-          </button>
-          <button v-if="!snippetCollapsed" class="icon-action" :title="t('snippets.newLibrary')" @click.stop="startNewSnippetLib()">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="12" y1="5" x2="12" y2="19"/>
-              <line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
-          </button>
-          <svg
-            width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-            class="collapse-chevron"
-            :class="{ 'is-collapsed': snippetCollapsed }"
-          >
-            <polyline points="6 9 12 15 18 9"/>
-          </svg>
         </div>
-      </div>
+      </template>
 
-      <template v-if="!snippetCollapsed">
-        <div class="canvas-list">
+      <template v-else>
+        <div class="workspace-panel">
+          <div class="canvas-list mode-list">
           <div v-if="showNewSnippetLibInput" class="new-coll-row">
             <input
               id="new-snippet-lib-input"
@@ -1075,7 +1240,7 @@ onUnmounted(() => {
             :key="lib.id"
             class="nav-item"
             :class="{
-              active: props.snippetLibraryVisible && activeSnippetLibraryId === lib.id,
+              active: props.snippetLibraryVisible && (props.activeSnippetLibraryId ?? activeSnippetLibraryId) === lib.id,
               'drag-over': snippetDragOverLibraryId === lib.id,
             }"
             :data-snippet-library-id="lib.id"
@@ -1106,43 +1271,8 @@ onUnmounted(() => {
             </template>
           </div>
         </div>
-      </template>
-    </div>
-
-    <!-- Tags section -->
-    <div
-      v-if="library.allTags.length > 0"
-      class="tags-panel"
-      :style="{ height: `${tagsPanelHeight}px` }"
-    >
-      <div class="tags-resize-handle" @mousedown.stop.prevent="startResizeTags" />
-      <div class="section-title tags-title">{{ t('sidebar.tags') }}</div>
-      <div class="tag-cloud">
-        <div
-          v-for="tag in library.allTags"
-          :key="tag"
-          class="tag-chip"
-          :class="{ active: selection.tagFilter === tag }"
-          :style="selection.tagFilter === tag ? {} : categoryStyleFor(tag)"
-          @click="toggleTag(tag)"
-        >
-          <span
-            v-if="CATEGORY_ICONS[tag]"
-            class="tag-chip-icon"
-            v-html="CATEGORY_ICONS[tag]"
-          />
-          <span class="tag-chip-text">{{ tag }}</span>
-          <button
-            class="tag-chip-delete"
-            :title="t('common.delete')"
-            @click.stop="deleteTag(tag)"
-          >
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-              <path d="M18 6L6 18M6 6l12 12" />
-            </svg>
-          </button>
         </div>
-      </div>
+      </template>
     </div>
 
     <div class="sidebar-footer">
@@ -1348,17 +1478,136 @@ onUnmounted(() => {
 .sidebar-scroll {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  padding: 0 0 10px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
 }
 .sidebar-scroll.collection-root-drop-zone {
   background: linear-gradient(
     to bottom,
     transparent 0,
-    transparent 72px,
-    color-mix(in srgb, var(--accent) 4%, transparent) 72px,
+    transparent 46px,
+    color-mix(in srgb, var(--accent) 4%, transparent) 46px,
     color-mix(in srgb, var(--accent) 4%, transparent) 100%
   );
+}
+
+.workspace-header {
+  flex-shrink: 0;
+  position: relative;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  height: var(--content-header-height);
+  min-height: var(--content-header-height);
+  padding: 0 8px 0 10px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.workspace-switcher {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.workspace-switcher-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 0 7px 0 6px;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  transition: background 0.12s, color 0.12s;
+}
+.workspace-switcher-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.workspace-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.workspace-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+
+.workspace-caret {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  transition: transform 0.16s ease;
+}
+.workspace-caret.is-open { transform: rotate(180deg); }
+
+.workspace-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  width: min(218px, calc(100vw - 24px));
+  padding: 5px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  box-shadow: var(--shadow-md);
+  z-index: 50;
+}
+
+.workspace-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: left;
+}
+.workspace-menu-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.workspace-menu-item.active {
+  background: var(--bg-active);
+  color: var(--accent);
+  font-weight: 600;
+}
+.workspace-menu-item svg { flex-shrink: 0; }
+
+.workspace-menu-enter-active,
+.workspace-menu-leave-active {
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.workspace-menu-enter-from,
+.workspace-menu-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.workspace-panel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 0 10px;
 }
 
 .section { margin-bottom: 4px; }
@@ -1387,6 +1636,7 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 2px;
+  flex-shrink: 0;
 }
 
 .icon-action {
@@ -1415,6 +1665,29 @@ onUnmounted(() => {
 }
 .spin { animation: spin 0.7s linear infinite; }
 
+.library-content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.library-pinned-nav {
+  position: relative;
+  flex-shrink: 0;
+  z-index: 15;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.library-main-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-bottom: 8px;
+}
+
 .coll-list {
   padding-left: 0;
 }
@@ -1437,6 +1710,10 @@ onUnmounted(() => {
   padding-top: 0;
   border-top: none;
 }
+.library-pinned-nav .all-papers-section:last-child {
+  margin-bottom: 0;
+  border-bottom: none;
+}
 
 .all-papers-section .nav-item {
   margin-top: 0;
@@ -1451,6 +1728,10 @@ onUnmounted(() => {
 
 .coll-list.collection-root-drop-over {
   background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+
+.library-main-scroll.collection-root-drop-over {
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
 }
 
 /* macOS Finder-style nav items */
@@ -1594,6 +1875,13 @@ onUnmounted(() => {
   padding-bottom: 4px;
 }
 
+.canvas-list.mode-list {
+  flex: initial;
+  min-height: auto;
+  overflow: visible;
+  padding: 2px 0 8px;
+}
+
 .canvas-name-text {
   flex: 1;
   min-width: 0;
@@ -1605,11 +1893,16 @@ onUnmounted(() => {
 .tags-panel {
   flex-shrink: 0;
   position: relative;
-  min-height: 72px;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding: 13px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  padding: 10px 12px 9px;
   border-top: 1px solid var(--border-subtle);
+}
+
+.tags-panel.tags-panel-fixed {
+  max-height: min(48vh, 360px);
 }
 
 .tags-resize-handle {
@@ -1636,16 +1929,22 @@ onUnmounted(() => {
 }
 
 .tags-title {
+  flex-shrink: 0;
   display: block;
-  margin-bottom: 7px;
+  margin-bottom: 6px;
 }
 
 .tag-cloud {
+  flex: 0 1 auto;
+  min-height: 0;
   display: flex;
   flex-wrap: wrap;
   align-content: flex-start;
   gap: 6px;
   min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
 }
 
 .tag-chip {

@@ -113,6 +113,12 @@ pub struct ResourceEntry {
     pub data: ResourceData,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EbookLinkTarget {
+    External(String),
+    Chapter { chapter: u32, anchor: Option<String> },
+}
+
 /// The normalized in-memory form of a parsed book.
 #[derive(Debug)]
 pub struct ParsedEbook {
@@ -591,13 +597,65 @@ pub fn neutralize_links(html: &str) -> String {
     a_href_re.replace_all(html, "$1").into_owned()
 }
 
-/// Neutralize `<a href>` so clicks never navigate the WebView, and rewrite
-/// image references to `data-argus-res` placeholders the viewer resolves to
-/// blob URLs. `resolve` maps a raw href to the normalized resource key (or
-/// `None` to drop the image).
-pub fn rewrite_chapter_html<F>(html: &str, resolve: F) -> String
+fn escape_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn link_target_attrs(target: EbookLinkTarget) -> String {
+    match target {
+        EbookLinkTarget::External(url) => {
+            format!(r#" data-argus-link-url="{}""#, escape_attr(&url))
+        }
+        EbookLinkTarget::Chapter { chapter, anchor } => {
+            let mut attrs = format!(r#" data-argus-link-chapter="{chapter}""#);
+            if let Some(anchor) = anchor.as_deref().filter(|s| !s.is_empty()) {
+                attrs.push_str(&format!(r#" data-argus-link-anchor="{}""#, escape_attr(anchor)));
+            }
+            attrs
+        }
+    }
+}
+
+fn rewrite_links<G>(html: &str, resolve: G) -> String
+where
+    G: Fn(&str) -> Option<EbookLinkTarget>,
+{
+    use regex::Regex;
+    static A_HREF_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let a_href_re = A_HREF_RE
+        .get_or_init(|| Regex::new(r#"(?i)(<a\b[^>]*?)\shref\s*=\s*("([^"]*)"|'([^']*)')"#).unwrap());
+
+    a_href_re
+        .replace_all(html, |caps: &regex::Captures| {
+            let before = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let href = caps.get(3).or(caps.get(4)).map(|m| m.as_str()).unwrap_or("");
+            match resolve(href) {
+                Some(target) => format!("{before}{}", link_target_attrs(target)),
+                None => before.to_string(),
+            }
+        })
+        .into_owned()
+}
+
+/// Rewrite image references to `data-argus-res` placeholders the viewer
+/// resolves to blob URLs, and rewrite safe ebook links to inert data attrs
+/// that the frontend handles explicitly. Raw `<a href>` values are never kept
+/// in the WebView.
+pub fn rewrite_chapter_html<F, G>(html: &str, resolve_image: F, resolve_link: G) -> String
 where
     F: Fn(&str) -> Option<String>,
+    G: Fn(&str) -> Option<EbookLinkTarget>,
 {
     use regex::Regex;
     static IMG_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
@@ -618,10 +676,10 @@ where
         let tag = caps.get(0).map(|m| m.as_str()).unwrap_or("");
         if let Some(c) = src_re.captures(tag) {
             let href = c.get(2).or(c.get(3)).map(|m| m.as_str()).unwrap_or("");
-            if let Some(key) = resolve(href) {
+            if let Some(key) = resolve_image(href) {
                 // Replace the src attribute, keep the rest of the tag (alt, …).
                 return src_re
-                    .replace(tag, format!(r#" data-argus-res="{key}""#).as_str())
+                    .replace(tag, format!(r#" data-argus-res="{}""#, escape_attr(&key)).as_str())
                     .into_owned();
             }
         }
@@ -633,14 +691,14 @@ where
         let block = caps.get(0).map(|m| m.as_str()).unwrap_or("");
         if let Some(c) = xlink_re.captures(block) {
             let href = c.get(2).or(c.get(3)).map(|m| m.as_str()).unwrap_or("");
-            if let Some(key) = resolve(href) {
-                return format!(r#"<img data-argus-res="{key}" alt="">"#);
+            if let Some(key) = resolve_image(href) {
+                return format!(r#"<img data-argus-res="{}" alt="">"#, escape_attr(&key));
             }
         }
         String::new()
     });
 
-    neutralize_links(&svg_replaced)
+    rewrite_links(&svg_replaced, resolve_link)
 }
 
 /// Pull the first h1/h2/h3 text out of chapter HTML (title fallback).
@@ -705,9 +763,15 @@ mod tests {
     fn rewrite_images_and_links() {
         let html = r#"<p><a href="ch2.xhtml">next</a><img src="../img/pic.png" alt="p"/></p>
             <svg xmlns="s"><image xlink:href="cover.jpg"/></svg>"#;
-        let out = rewrite_chapter_html(html, |h| Some(normalize_zip_path(h)));
+        let out = rewrite_chapter_html(
+            html,
+            |h| Some(normalize_zip_path(h)),
+            |_| Some(EbookLinkTarget::Chapter { chapter: 2, anchor: Some("frag".into()) }),
+        );
         assert!(out.contains(r#"data-argus-res="img/pic.png""#) || out.contains(r#"data-argus-res="../img/pic.png""#));
         assert!(!out.contains("href=\"ch2.xhtml\""));
+        assert!(out.contains(r#"data-argus-link-chapter="2""#));
+        assert!(out.contains(r#"data-argus-link-anchor="frag""#));
         assert!(out.contains(r#"<img data-argus-res="cover.jpg" alt="">"#));
         assert!(out.contains(r#"alt="p""#));
     }

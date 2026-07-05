@@ -693,6 +693,10 @@ pub async fn import_ebook(
     state: State<'_, LibraryRoot>,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
+    if let Some(cid) = collection_id.as_deref().filter(|c| !c.trim().is_empty()) {
+        collections::ensure_collection_can_receive_papers(&root, cid)?;
+    }
+
     let src = std::path::PathBuf::from(&source_path);
     let format = ebook::detect_format(&src)
         .ok_or_else(|| format!("Unsupported ebook format: {source_path}"))?;
@@ -805,7 +809,7 @@ pub async fn import_ebook(
     refresh_search_index(&root, &final_slug);
 
     if let Some(cid) = collection_id.filter(|c| !c.trim().is_empty()) {
-        let _ = collections::move_paper_to_collection(&root, &id.to_string(), &cid);
+        collections::move_paper_to_collection(&root, &id.to_string(), &cid)?;
     }
 
     Ok(final_slug)
@@ -2348,6 +2352,9 @@ pub async fn add_arxiv_to_library(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
+    if let Some(cid) = collection_id.as_deref().filter(|c| !c.trim().is_empty()) {
+        collections::ensure_collection_can_receive_papers(&root, cid)?;
+    }
     arxiv::add_to_library(&root, &arxiv_id, collection_id.as_deref(), &app).await
 }
 
@@ -2362,6 +2369,7 @@ pub async fn import_paper_url(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
+    collections::ensure_collection_can_receive_papers(&root, &collection_id)?;
     url_import::import_by_url(&root, &url, &collection_id, &app).await
 }
 
@@ -2374,6 +2382,7 @@ pub async fn import_arxiv_url(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
+    collections::ensure_collection_can_receive_papers(&root, &collection_id)?;
     arxiv::import_by_url(&root, &url, &collection_id, &app).await
 }
 

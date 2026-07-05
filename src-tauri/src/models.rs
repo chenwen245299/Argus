@@ -1039,7 +1039,7 @@ pub struct CanvasNode {
     /// Node-level override for hover content source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hover_source: Option<String>,
-    /// "paper" (default/None), "text", or "shape"
+    /// "paper" (default/None), "text", "shape", "line", or "image"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_type: Option<String>,
     /// Text content for text/shape nodes.
@@ -1090,6 +1090,12 @@ pub struct CanvasNode {
     /// Line node endpoints as offsets within the node's bounding box.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub line_points: Vec<CanvasEdgePoint>,
+    /// Data URL or local-safe image source for pasted image nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_src: Option<String>,
+    /// Optional display/accessibility label for image nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_alt: Option<String>,
     /// Stacking order (z-index) for layering (置顶/置底).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub z_index: Option<f64>,

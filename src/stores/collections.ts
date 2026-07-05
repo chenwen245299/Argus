@@ -87,6 +87,12 @@ export const useCollectionsStore = defineStore('collections', () => {
     return !!col && !col.parent_id
   }
 
+  function canReceivePapers(collectionId: string | null | undefined): boolean {
+    if (!collectionId) return false
+    const col = file.value.collections.find(c => c.id === collectionId)
+    return !!col?.parent_id
+  }
+
   function listAllPapersInTree(collectionId: string): PaperIndexEntry[] {
     // Collect every collection id in this subtree (including the root itself).
     const collectionIds = new Set<string>([collectionId])
@@ -227,6 +233,7 @@ export const useCollectionsStore = defineStore('collections', () => {
     paperCountsByCollection,
     collectionPaperCount,
     isTopLevel,
+    canReceivePapers,
     listAllPapersInTree,
     load,
     create,

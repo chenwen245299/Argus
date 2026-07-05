@@ -11,8 +11,8 @@ use std::path::Path;
 
 use super::{
     decode_entities, extract_body_html, first_heading_text, html_to_text, normalize_zip_path,
-    resolve_href, rewrite_chapter_html, EbookMeta, EbookTocEntry, ParsedEbook, ResourceData,
-    ResourceEntry,
+    resolve_href, rewrite_chapter_html, EbookLinkTarget, EbookMeta, EbookTocEntry, ParsedEbook,
+    ResourceData, ResourceEntry,
 };
 
 type Archive = zip::ZipArchive<std::io::BufReader<std::fs::File>>;
@@ -65,34 +65,63 @@ pub fn parse(path: &Path) -> Result<ParsedEbook, String> {
     if opf.spine.is_empty() {
         return Err("EPUB spine is empty".to_string());
     }
-    let mut chapter_html: Vec<String> = Vec::with_capacity(opf.spine.len());
-    let mut chapter_paths: Vec<String> = Vec::with_capacity(opf.spine.len());
-    for zip_path in &opf.spine {
-        let raw = read_zip_string(&mut archive, zip_path).unwrap_or_default();
-        let body = extract_body_html(&raw);
-        let chapter_dir_file = zip_path.clone();
-        let html = rewrite_chapter_html(&body, |href| {
-            let h = href.trim();
-            if h.is_empty()
-                || h.starts_with("data:")
-                || h.starts_with("http:")
-                || h.starts_with("https:")
-            {
-                return None;
-            }
-            let resolved = resolve_href(&chapter_dir_file, h);
-            resources.contains_key(&resolved).then_some(resolved)
-        });
-        chapter_html.push(html);
-        chapter_paths.push(zip_path.clone());
-    }
-
-    // 5. TOC: EPUB3 nav first, then NCX
-    let spine_index: HashMap<&str, u32> = chapter_paths
+    let spine_index: HashMap<&str, u32> = opf
+        .spine
         .iter()
         .enumerate()
         .map(|(i, p)| (p.as_str(), (i + 1) as u32))
         .collect();
+    let mut chapter_html: Vec<String> = Vec::with_capacity(opf.spine.len());
+    for (i, zip_path) in opf.spine.iter().enumerate() {
+        let raw = read_zip_string(&mut archive, zip_path).unwrap_or_default();
+        let body = extract_body_html(&raw);
+        let chapter_dir_file = zip_path.clone();
+        let current_chapter = (i + 1) as u32;
+        let html = rewrite_chapter_html(
+            &body,
+            |href| {
+                let h = href.trim();
+                let lower = h.to_ascii_lowercase();
+                if h.is_empty()
+                    || lower.starts_with("data:")
+                    || lower.starts_with("http:")
+                    || lower.starts_with("https:")
+                {
+                    return None;
+                }
+                let resolved = resolve_href(&chapter_dir_file, h);
+                resources.contains_key(&resolved).then_some(resolved)
+            },
+            |href| {
+                let h = href.trim();
+                if h.is_empty() {
+                    return None;
+                }
+                let lower = h.to_ascii_lowercase();
+                if lower.starts_with("http://") || lower.starts_with("https://") {
+                    return Some(EbookLinkTarget::External(h.to_string()));
+                }
+                if lower.starts_with("data:")
+                    || lower.starts_with("javascript:")
+                    || lower.starts_with("mailto:")
+                    || lower.starts_with("file:")
+                {
+                    return None;
+                }
+                if let Some(anchor) = h.strip_prefix('#') {
+                    return Some(EbookLinkTarget::Chapter {
+                        chapter: current_chapter,
+                        anchor: (!anchor.is_empty()).then(|| anchor.to_string()),
+                    });
+                }
+                href_to_chapter(h, &chapter_dir_file, &spine_index)
+                    .map(|(chapter, anchor)| EbookLinkTarget::Chapter { chapter, anchor })
+            },
+        );
+        chapter_html.push(html);
+    }
+
+    // 5. TOC: EPUB3 nav first, then NCX
     let mut toc: Vec<EbookTocEntry> = Vec::new();
     if let Some(nav_path) = &opf.nav_path {
         if let Ok(nav_xml) = read_zip_string(&mut archive, nav_path) {
@@ -535,10 +564,11 @@ mod tests {
         assert_eq!(book.toc[1], _entry("第一节", 2, 1, Some("s2")));
         assert_eq!(book.toc[2], _entry("第二章", 1, 2, None));
 
-        // Chapter HTML: style stripped, img rewritten, links neutralized
+        // Chapter HTML: style stripped, img rewritten, links made app-handled
         assert!(!book.chapter_html[0].contains("<style"));
         assert!(book.chapter_html[0].contains(r#"data-argus-res="OEBPS/images/pic.png""#));
         assert!(!book.chapter_html[1].contains(r#"href="ch1.xhtml""#));
+        assert!(book.chapter_html[1].contains(r#"data-argus-link-chapter="1""#));
 
         // Titles + text
         assert_eq!(book.chapter_titles[0].as_deref(), Some("第一章"));

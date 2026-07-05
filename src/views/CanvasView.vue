@@ -34,6 +34,7 @@ import AdjustableEdge from '../components/canvas/AdjustableEdge.vue'
 import TextNode from '../components/canvas/TextNode.vue'
 import ShapeNode from '../components/canvas/ShapeNode.vue'
 import LineNode from '../components/canvas/LineNode.vue'
+import ImageNode from '../components/canvas/ImageNode.vue'
 import SuggestPanel from '../components/canvas/SuggestPanel.vue'
 import ExportDialog from '../components/canvas/ExportDialog.vue'
 import type { PaperIndexEntry, CanvasNode as CNode, CanvasEdge as CEdge, Canvas, SuggestedEdge, NodePosition } from '../types'
@@ -74,9 +75,11 @@ async function watchWindowSize() {
 
 // ── Vue Flow setup ────────────────────────────────────────────────────────────
 
-const nodeTypes = markRaw({ paper: PaperNode, text: TextNode, shape: ShapeNode, line: LineNode })
+const nodeTypes = markRaw({ paper: PaperNode, text: TextNode, shape: ShapeNode, line: LineNode, image: ImageNode })
 const edgeTypes = markRaw({ adjustable: AdjustableEdge })
 const PAN_ON_DRAG_BUTTONS = [1, 2]
+const PASTED_IMAGE_MAX_WIDTH = 420
+const PASTED_IMAGE_MAX_HEIGHT = 320
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const nodes = ref<any[]>([])
@@ -98,6 +101,7 @@ const {
   getViewport,
   setViewport,
   fitView,
+  screenToFlowCoordinate,
 } = useVueFlow()
 
 // Unique id generators — random + index guards against collisions when several
@@ -192,6 +196,12 @@ const ctxMenu = ref<{
   nodeId: string | null; edgeId: string | null
 }>({ show: false, x: 0, y: 0, nodeId: null, edgeId: null })
 
+const ctxCurrentNode = computed(() => {
+  const id = ctxMenu.value.nodeId
+  return id ? (nodes.value as VfNode[]).find(n => n.id === id) : undefined
+})
+const ctxCurrentNodeIsImage = computed(() => ctxCurrentNode.value?.type === 'image')
+
 // ── Edge label editor ─────────────────────────────────────────────────────────
 
 const editingEdgeId = ref<string | null>(null)
@@ -208,6 +218,7 @@ const applyingLayout = ref(false)
 // ── M10: Export dialog ────────────────────────────────────────────────────────
 const showExportDialog = ref(false)
 const flowContainerRef = ref<HTMLElement | null>(null)
+const lastCanvasPointer = ref<{ x: number; y: number } | null>(null)
 
 // ── M10: paperNames map for SuggestPanel ─────────────────────────────────────
 const paperNames = computed<Record<string, string>>(() => {
@@ -305,6 +316,28 @@ function buildVfNodes(cnodes: CNode[]): VfNode[] {
           y1: cn.line_points?.[0]?.y ?? 0,
           x2: cn.line_points?.[1]?.x ?? (cn.width ?? 0),
           y2: cn.line_points?.[1]?.y ?? (cn.height ?? 0),
+        },
+      } satisfies VfNode
+    }
+    if (nt === 'image') {
+      return {
+        id: cn.node_id,
+        type: 'image',
+        position: { x: cn.x, y: cn.y },
+        zIndex: cn.z_index,
+        style: {
+          width: `${cn.width ?? PASTED_IMAGE_MAX_WIDTH}px`,
+          height: `${cn.height ?? PASTED_IMAGE_MAX_HEIGHT}px`,
+        },
+        data: {
+          nodeId: cn.node_id,
+          src: cn.image_src ?? cn.content ?? '',
+          alt: cn.image_alt,
+          width: cn.width ?? PASTED_IMAGE_MAX_WIDTH,
+          height: cn.height ?? PASTED_IMAGE_MAX_HEIGHT,
+          cornerRadius: cn.corner_radius,
+          rotation: cn.rotation,
+          opacity: cn.opacity,
         },
       } satisfies VfNode
     }
@@ -410,6 +443,24 @@ function extractCanvasNodes(): CNode[] {
         corner_radius: nt === 'shape' && Number.isFinite(d.cornerRadius) ? d.cornerRadius : undefined,
         rotation: Number.isFinite(d.rotation) ? d.rotation : undefined,
         opacity: Number.isFinite(d.opacity) ? d.opacity : undefined,
+      }
+    }
+    if (nt === 'image') {
+      return {
+        node_id: n.id,
+        paper_id: '',
+        x: n.position.x,
+        y: n.position.y,
+        z_index: Number.isFinite(n.zIndex) ? (n.zIndex as number) : undefined,
+        hover_source: undefined,
+        node_type: 'image',
+        width: Number.isFinite(d.width) ? d.width : undefined,
+        height: Number.isFinite(d.height) ? d.height : undefined,
+        corner_radius: Number.isFinite(d.cornerRadius) ? d.cornerRadius : undefined,
+        rotation: Number.isFinite(d.rotation) ? d.rotation : undefined,
+        opacity: Number.isFinite(d.opacity) ? d.opacity : undefined,
+        image_src: d.src as string | undefined,
+        image_alt: d.alt as string | undefined,
       }
     }
     return {
@@ -684,10 +735,95 @@ function addPaperToCanvas(paper: PaperIndexEntry) {
   recordHistory()
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null
+  return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+}
+
+function measureImage(src: string): Promise<{ width: number; height: number }> {
+  return new Promise(resolve => {
+    const img = new Image()
+    img.onload = () => resolve({ width: img.naturalWidth || PASTED_IMAGE_MAX_WIDTH, height: img.naturalHeight || PASTED_IMAGE_MAX_HEIGHT })
+    img.onerror = () => resolve({ width: PASTED_IMAGE_MAX_WIDTH, height: PASTED_IMAGE_MAX_HEIGHT })
+    img.src = src
+  })
+}
+
+function fitPastedImageSize(width: number, height: number) {
+  const safeWidth = width > 0 ? width : PASTED_IMAGE_MAX_WIDTH
+  const safeHeight = height > 0 ? height : PASTED_IMAGE_MAX_HEIGHT
+  const scale = Math.min(PASTED_IMAGE_MAX_WIDTH / safeWidth, PASTED_IMAGE_MAX_HEIGHT / safeHeight, 1)
+  return {
+    width: Math.max(80, Math.round(safeWidth * scale)),
+    height: Math.max(60, Math.round(safeHeight * scale)),
+  }
+}
+
+function pastedImagePosition(width: number, height: number) {
+  const container = flowContainerRef.value
+  const fallback = container?.getBoundingClientRect()
+  const client = lastCanvasPointer.value ?? (fallback
+    ? { x: fallback.left + fallback.width / 2, y: fallback.top + fallback.height / 2 }
+    : { x: window.innerWidth / 2, y: window.innerHeight / 2 })
+  const flowPos = screenToFlowCoordinate(client)
+  return { x: flowPos.x - width / 2, y: flowPos.y - height / 2 }
+}
+
+async function addImageFileToCanvas(file: File) {
+  if (!file.type.startsWith('image/')) return
+  const src = await readFileAsDataUrl(file)
+  const measured = await measureImage(src)
+  const size = fitPastedImageSize(measured.width, measured.height)
+  const position = pastedImagePosition(size.width, size.height)
+  const nodeId = newNodeId()
+  const newNode: VfNode = {
+    id: nodeId,
+    type: 'image',
+    position,
+    style: {
+      width: `${size.width}px`,
+      height: `${size.height}px`,
+    },
+    data: {
+      nodeId,
+      src,
+      alt: file.name || 'Pasted image',
+      width: size.width,
+      height: size.height,
+      cornerRadius: 8,
+      opacity: 1,
+    },
+  }
+  addNodes([newNode])
+  triggerSave()
+  recordHistory()
+}
+
+async function onCanvasPaste(e: ClipboardEvent) {
+  if (!canvasStore.currentCanvas || isEditableTarget(e.target)) return
+  const items = Array.from(e.clipboardData?.items ?? [])
+  const imageItem = items.find(item => item.kind === 'file' && item.type.startsWith('image/'))
+  if (!imageItem) return
+  const file = imageItem.getAsFile()
+  if (!file) return
+  e.preventDefault()
+  await addImageFileToCanvas(file)
+}
+
 // ── Node hover tooltip ────────────────────────────────────────────────────────
 
 function onNodeMouseEnter(event: NodeMouseEvent) {
   const nd = event.node
+  if (nd.type !== 'paper') return
   const mouseEvt = event.event as MouseEvent
   hoverPos.value = { x: mouseEvt.clientX, y: mouseEvt.clientY }
 
@@ -1057,8 +1193,7 @@ function onKeydown(e: KeyboardEvent) {
 
   // Undo / redo. Skip when the user is typing in an input / editable region so
   // the browser's native text undo keeps working there.
-  const el = e.target as HTMLElement | null
-  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return
+  if (isEditableTarget(e.target)) return
   const meta = e.metaKey || e.ctrlKey
   if (!meta) return
   const key = e.key.toLowerCase()
@@ -1118,6 +1253,7 @@ onMounted(async () => {
   }).catch(() => null)
 
   document.addEventListener('keydown', onKeydown)
+  document.addEventListener('paste', onCanvasPaste)
   document.addEventListener('pointerdown', onDocClick)
   window.addEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
   window.addEventListener('argus-canvas-export-fit', onExportFit)
@@ -1128,6 +1264,7 @@ onUnmounted(() => {
   unlistenSwitch?.()
   unlistenWindowResize?.()
   document.removeEventListener('keydown', onKeydown)
+  document.removeEventListener('paste', onCanvasPaste)
   document.removeEventListener('pointerdown', onDocClick)
   window.removeEventListener('argus-canvas-edge-control-changed', onEdgeControlChanged)
   window.removeEventListener('argus-canvas-export-fit', onExportFit)
@@ -1328,7 +1465,12 @@ watch(() => library.papers, () => {
 
       <!-- Vue Flow canvas + Suggest Panel side-by-side -->
       <div class="canvas-content">
-      <div v-if="canvasStore.currentCanvas" class="flow-wrap" ref="flowContainerRef">
+      <div
+        v-if="canvasStore.currentCanvas"
+        class="flow-wrap"
+        ref="flowContainerRef"
+        @pointermove="lastCanvasPointer = { x: $event.clientX, y: $event.clientY }"
+      >
         <VueFlow
           v-model:nodes="nodes"
           v-model:edges="edges"
@@ -1446,7 +1588,7 @@ watch(() => library.papers, () => {
         <!-- Node context -->
         <template v-if="ctxMenu.nodeId">
           <!-- Node color picker -->
-          <div class="ctx-style-section">
+          <div v-if="!ctxCurrentNodeIsImage" class="ctx-style-section">
             <span class="ctx-style-label">颜色</span>
             <div class="ctx-color-row">
               <button
@@ -1467,21 +1609,21 @@ watch(() => library.papers, () => {
               </button>
             </div>
           </div>
-          <div class="ctx-divider" />
-          <button class="ctx-item" @click="ctxOpenInMain">
+          <div v-if="!ctxCurrentNodeIsImage" class="ctx-divider" />
+          <button v-if="!ctxCurrentNodeIsImage" class="ctx-item" @click="ctxOpenInMain">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
               <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
             </svg>
             {{ t('canvas.openInMain') }}
           </button>
-          <div class="ctx-divider" />
+          <div v-if="!ctxCurrentNodeIsImage" class="ctx-divider" />
           <button class="ctx-item ctx-item--danger" @click="ctxRemoveNode">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/>
               <path d="M9 6V4h6v2"/>
             </svg>
-            {{ t('canvas.removePaper') }}
+            {{ ctxCurrentNodeIsImage ? '删除图片' : t('canvas.removePaper') }}
           </button>
         </template>
         <!-- Edge context -->

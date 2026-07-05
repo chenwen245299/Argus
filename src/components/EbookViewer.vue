@@ -35,6 +35,9 @@ const chapterEls = ref<(HTMLElement | null)[]>([])
 const renderedChapters = ref<Set<number>>(new Set())   // 0-based
 const renderingChapters = new Set<number>()
 const displayChapter = ref(1)                          // 1-based SPINE index of the topmost visible chapter
+const displayPage = ref(1)
+const pageCount = ref(1)
+const pageMarkers = ref<Array<{ page: number; top: number }>>([])
 
 let observer: IntersectionObserver | null = null
 let progressDebounce: ReturnType<typeof setTimeout> | null = null
@@ -73,11 +76,24 @@ async function setFontSize(next: number) {
   } catch {}
   await nextTick()
   if (anchor) scrollToChapter(anchor.chapter - 1, anchor.ratio)
+  schedulePageMetricsUpdate()
   refreshAllOverlays()
   paintSelection()
 }
 function fontSmaller() { setFontSize(fontSize.value - 1) }
 function fontLarger()  { setFontSize(fontSize.value + 1) }
+
+function onFontSizeInputChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  const next = parseInt(input.value, 10)
+  if (isNaN(next)) {
+    input.value = String(fontSize.value)
+    return
+  }
+  const clamped = Math.max(FONT_MIN, Math.min(FONT_MAX, next))
+  input.value = String(clamped)
+  void setFontSize(clamped)
+}
 
 // Cmd+wheel (mac) / Ctrl+wheel (win) — Windows trackpad pinches also arrive
 // as ctrl+wheel in Chromium. Font size moves in 1px steps, so wheel deltas
@@ -283,7 +299,7 @@ const PURIFY_CONFIG = {
   USE_PROFILES: { html: true },
   FORBID_TAGS: ['style', 'link', 'meta', 'base', 'form', 'input', 'button', 'select', 'textarea', 'iframe', 'object', 'embed', 'video', 'audio', 'canvas', 'dialog'],
   FORBID_ATTR: ['style'],
-  ADD_ATTR: ['data-argus-res'],
+  ADD_ATTR: ['data-argus-res', 'data-argus-link-url', 'data-argus-link-chapter', 'data-argus-link-anchor'],
 } as const
 
 async function renderChapter(idx: number) {
@@ -313,6 +329,7 @@ async function renderChapter(idx: number) {
 
     resolveChapterImages(content, idx)
     renderChapterHighlights(idx)
+    schedulePageMetricsUpdate()
   } catch (e) {
     console.error(`Failed to render chapter ${idx + 1}:`, e)
   } finally {
@@ -334,7 +351,10 @@ function resolveChapterImages(content: HTMLElement, chapterIdx: number) {
     const url = await fetchResource(href)
     if (url) {
       // Image sizes shift the layout — recompute this chapter's overlays once loaded.
-      img.addEventListener('load', () => renderChapterHighlights(chapterIdx), { once: true })
+      img.addEventListener('load', () => {
+        renderChapterHighlights(chapterIdx)
+        schedulePageMetricsUpdate()
+      }, { once: true })
       img.src = url
     } else {
       img.alt = t('ebook.imageMissing')
@@ -369,6 +389,85 @@ async function fetchResource(href: string): Promise<string | null> {
   })()
   blobFetches.set(href, p)
   return p
+}
+
+function cssEscape(value: string): string {
+  const escape = (globalThis.CSS as { escape?: (s: string) => string } | undefined)?.escape
+  return escape ? escape(value) : value.replace(/[^a-zA-Z0-9_-]/g, ch => `\\${ch}`)
+}
+
+function attrSelectorValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+function anchorCandidates(anchor: string): string[] {
+  const candidates = [anchor]
+  try {
+    const decoded = decodeURIComponent(anchor)
+    if (decoded && decoded !== anchor) candidates.push(decoded)
+  } catch {}
+  return candidates
+}
+
+async function openEbookExternalLink(url: string) {
+  try {
+    await invoke('open_url', { url })
+  } catch (e) {
+    console.warn('Failed to open ebook link:', e)
+  }
+}
+
+async function scrollToChapterAnchor(chapter: number, anchor?: string) {
+  const max = manifest.value?.chapters.length ?? 0
+  if (max <= 0) return
+  const idx = Math.max(0, Math.min(max - 1, chapter - 1))
+  if (!containerRef.value || idx < 0) return
+
+  await ensureChapterRendered(idx)
+  await nextTick()
+
+  const scrollEl = containerRef.value
+  const wrapper = chapterEls.value[idx]
+  if (!scrollEl || !wrapper) return
+
+  if (anchor) {
+    for (const candidate of anchorCandidates(anchor)) {
+      const selector = `#${cssEscape(candidate)}, [name="${attrSelectorValue(candidate)}"]`
+      const target = wrapper.querySelector<HTMLElement>(selector)
+      if (target) {
+        const wrapperRect = wrapper.getBoundingClientRect()
+        const targetRect = target.getBoundingClientRect()
+        scrollEl.scrollTop = Math.max(0, wrapper.offsetTop + targetRect.top - wrapperRect.top - 12)
+        updateDisplayChapter()
+        updatePageMetrics()
+        return
+      }
+    }
+  }
+
+  await scrollToChapter(idx, 0)
+}
+
+async function onContainerClick(e: MouseEvent) {
+  hlNotePopup.value = null
+  hlColorPopup.value = null
+
+  const target = e.target as Element | null
+  const link = target?.closest('a[data-argus-link-url], a[data-argus-link-chapter]') as HTMLElement | null
+  if (!link || !containerRef.value?.contains(link)) return
+
+  e.preventDefault()
+  e.stopPropagation()
+
+  const url = link.dataset.argusLinkUrl
+  if (url) {
+    await openEbookExternalLink(url)
+    return
+  }
+
+  const chapter = Number(link.dataset.argusLinkChapter)
+  if (!Number.isFinite(chapter) || chapter < 1) return
+  await scrollToChapterAnchor(chapter, link.dataset.argusLinkAnchor)
 }
 
 // ── Custom selection painting ─────────────────────────────────────────────────
@@ -689,6 +788,7 @@ watch(() => reader.highlightsFor(props.slug), () => { nextTick(refreshAllOverlay
 function onWindowResize() {
   if (resizeDebounce) clearTimeout(resizeDebounce)
   resizeDebounce = setTimeout(() => {
+    updatePageMetrics()
     refreshAllOverlays()
     paintSelection()
   }, 200)
@@ -759,6 +859,7 @@ function currentPosition(): { chapter: number; ratio: number } | null {
 
 function onScroll() {
   updateDisplayChapter()
+  updateDisplayPage()
   if (progressDebounce) clearTimeout(progressDebounce)
   progressDebounce = setTimeout(() => {
     if (isActiveTab.value) flushReadingState()
@@ -768,6 +869,46 @@ function onScroll() {
 function updateDisplayChapter() {
   const pos = currentPosition()
   if (pos) displayChapter.value = pos.chapter
+}
+
+function virtualPageStep(): number {
+  const scrollEl = containerRef.value
+  if (!scrollEl) return 1
+  const typographicPage = fontSize.value * 58
+  const viewportPage = scrollEl.clientHeight * 1.35
+  return Math.max(680, Math.floor(Math.max(typographicPage, viewportPage)))
+}
+
+function updatePageMetrics() {
+  const scrollEl = containerRef.value
+  if (!scrollEl) {
+    displayPage.value = 1
+    pageCount.value = 1
+    pageMarkers.value = []
+    return
+  }
+  const step = virtualPageStep()
+  const maxScroll = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight)
+  const total = Math.max(1, Math.floor(maxScroll / step) + 1)
+  pageCount.value = total
+  pageMarkers.value = Array.from({ length: Math.max(0, total - 1) }, (_, idx) => ({
+    page: idx + 2,
+    top: (idx + 1) * step,
+  }))
+  updateDisplayPage()
+}
+
+function updateDisplayPage() {
+  const scrollEl = containerRef.value
+  if (!scrollEl) return
+  const step = virtualPageStep()
+  displayPage.value = Math.max(1, Math.min(pageCount.value, Math.floor(scrollEl.scrollTop / step) + 1))
+}
+
+function schedulePageMetricsUpdate() {
+  nextTick(() => {
+    window.requestAnimationFrame(updatePageMetrics)
+  })
 }
 
 function flushReadingState() {
@@ -785,6 +926,7 @@ async function restorePosition() {
   if (!rs || !containerRef.value) {
     // No saved position: render the beginning.
     await ensureChapterRendered(0)
+    schedulePageMetricsUpdate()
     return
   }
   const idx = Math.max(0, Math.min((manifest.value?.chapters.length ?? 1) - 1, rs.page - 1))
@@ -799,6 +941,7 @@ async function scrollToChapter(idx: number, ratio = 0) {
   if (!el) return
   scrollEl.scrollTop = el.offsetTop + ratio * el.offsetHeight - (ratio > 0 ? 0 : 8)
   updateDisplayChapter()
+  updatePageMetrics()
 }
 
 watch(() => reader.pendingPageJump, async (page) => {
@@ -847,11 +990,18 @@ const displayCurrent = computed(() => {
   return ord
 })
 
-function onChapterInputChange(e: Event) {
-  const val = parseInt((e.target as HTMLInputElement).value)
-  if (isNaN(val) || val < 1 || val > displayTotal.value) return
-  const spineIdx = useLogicalChapters.value ? level1Toc.value[val - 1].chapter - 1 : val - 1
-  scrollToChapter(spineIdx, 0)
+const displayChapterHint = computed(() => `${displayCurrent.value}/${displayTotal.value}`)
+
+function onPageInputChange(e: Event) {
+  const val = parseInt((e.target as HTMLInputElement).value, 10)
+  if (isNaN(val)) return
+  const target = Math.max(1, Math.min(pageCount.value, val))
+  const scrollEl = containerRef.value
+  if (!scrollEl) return
+  const maxScroll = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight)
+  scrollEl.scrollTop = Math.min(maxScroll, (target - 1) * virtualPageStep())
+  updateDisplayChapter()
+  updatePageMetrics()
 }
 
 // ── Keyboard ──────────────────────────────────────────────────────────────────
@@ -882,24 +1032,48 @@ defineExpose({ closeToList: handleBack })
 
       <div class="toolbar-spacer" />
 
-      <div class="chapter-indicator" v-if="chapterCount > 0">
-        <span class="chapter-word">{{ t('ebook.chapterShort') }}</span>
-        <input
-          class="chapter-input"
-          type="number"
-          :min="1"
-          :max="displayTotal"
-          :value="displayCurrent"
-          @change="onChapterInputChange"
-          @keydown.enter="($event.target as HTMLInputElement).blur()"
-        />
-        <span class="chapter-sep">/ {{ displayTotal }}</span>
-      </div>
+      <div class="reading-position" v-if="chapterCount > 0">
+        <span class="position-group">
+          <span class="control-label">{{ t('ebook.chapterShort') }}</span>
+          <span class="position-value">{{ displayChapterHint }}</span>
+        </span>
+        <span class="position-group">
+          <span class="control-label">{{ t('ebook.pageShort') }}</span>
+          <input
+            class="toolbar-number-input page-input"
+            type="number"
+            :min="1"
+            :max="pageCount"
+            :value="displayPage"
+            @change="onPageInputChange"
+            @keydown.enter="($event.target as HTMLInputElement).blur()"
+          />
+          <span class="page-sep">/ {{ pageCount }}</span>
+        </span>
 
-      <div class="font-controls">
-        <button @click="fontSmaller" :title="t('ebook.fontSmaller')" :disabled="fontSize <= FONT_MIN">A−</button>
-        <span class="font-label">{{ fontSize }}</span>
-        <button @click="fontLarger" :title="t('ebook.fontLarger')" :disabled="fontSize >= FONT_MAX">A+</button>
+        <span class="position-group font-controls">
+          <span class="control-label">{{ t('ebook.fontSize') }}</span>
+          <button class="font-step-btn" @click="fontSmaller" :title="t('ebook.fontSmaller')" :disabled="fontSize <= FONT_MIN">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+          <input
+            class="toolbar-number-input font-size-input"
+            type="number"
+            :min="FONT_MIN"
+            :max="FONT_MAX"
+            :value="fontSize"
+            @change="onFontSizeInputChange"
+            @keydown.enter="($event.target as HTMLInputElement).blur()"
+          />
+          <button class="font-step-btn" @click="fontLarger" :title="t('ebook.fontLarger')" :disabled="fontSize >= FONT_MAX">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+        </span>
       </div>
 
       <div class="color-picker">
@@ -939,13 +1113,23 @@ defineExpose({ closeToList: handleBack })
       :class="{ 'native-sel': useNativeSel }"
       :style="{ '--ebook-font-size': `${fontSize}px` }"
       @scroll.passive="onScroll"
-      @click="hlNotePopup = null; hlColorPopup = null"
+      @click="onContainerClick"
       @wheel="onWheelZoom"
       @gesturestart="onGestureStart"
       @gesturechange="onGestureChange"
       @gestureend="onGestureEnd"
     >
       <div class="ebook-chapters">
+        <div v-if="pageMarkers.length > 0" class="page-break-layer" aria-hidden="true">
+          <div
+            v-for="marker in pageMarkers"
+            :key="marker.page"
+            class="page-break-marker"
+            :style="{ top: `${marker.top}px` }"
+          >
+            <span class="page-break-label">{{ t('ebook.pageShort') }} {{ marker.page }}</span>
+          </div>
+        </div>
         <section
           v-for="(ch, idx) in manifest?.chapters ?? []"
           :key="ch.index"
@@ -1089,11 +1273,12 @@ defineExpose({ closeToList: handleBack })
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 6px 12px;
+  height: var(--content-header-height);
+  min-height: var(--content-header-height);
+  padding: 0 12px;
   border-bottom: 1px solid var(--divider);
   background: var(--bg-secondary);
   flex-shrink: 0;
-  min-height: 40px;
 }
 .toolbar-title {
   font-size: 13px;
@@ -1106,49 +1291,105 @@ defineExpose({ closeToList: handleBack })
 }
 .toolbar-spacer { flex: 1; }
 
-.chapter-indicator {
+.reading-position {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 0;
+  height: 28px;
+  padding: 0 4px;
+  border: 1px solid color-mix(in srgb, var(--border-default) 70%, var(--border-subtle));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-secondary) 74%, var(--bg-primary));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bg-primary) 42%, transparent);
   font-size: 12px;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
-.chapter-word { font-size: 11px; }
-.chapter-input {
-  width: 44px;
-  padding: 2px 4px;
+.position-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 10px;
+  position: relative;
+}
+.position-group + .position-group::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 1px;
+  background: color-mix(in srgb, var(--text-tertiary) 32%, var(--divider));
+}
+.control-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+.position-value {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+.toolbar-number-input {
+  height: 24px;
+  padding: 0 4px;
   font-size: 12px;
   text-align: center;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  background: var(--bg-primary);
+  background: transparent;
   color: var(--text-primary);
+  transition: background 0.12s, border-color 0.12s;
 }
-.chapter-input::-webkit-outer-spin-button,
-.chapter-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.toolbar-number-input:hover,
+.toolbar-number-input:focus {
+  border-color: var(--border-subtle);
+  background: var(--bg-primary);
+  outline: none;
+}
+.page-input {
+  width: 48px;
+}
+.page-input::-webkit-outer-spin-button,
+.page-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.page-sep {
+  min-width: 36px;
+  color: var(--text-secondary);
+}
 
 .font-controls {
-  display: flex;
-  align-items: center;
   gap: 4px;
+  padding-right: 4px;
 }
-.font-controls button {
-  padding: 2px 8px;
-  font-size: 12px;
-  border: 1px solid var(--border-subtle);
+.font-step-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
   border-radius: var(--radius-sm);
-  background: var(--bg-primary);
-  color: var(--text-primary);
-  cursor: pointer;
-}
-.font-controls button:disabled { opacity: 0.4; cursor: default; }
-.font-controls button:not(:disabled):hover { background: var(--bg-hover, var(--bg-secondary)); }
-.font-label {
-  font-size: 12px;
+  background: transparent;
   color: var(--text-secondary);
-  min-width: 20px;
-  text-align: center;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
 }
+.font-step-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.font-step-btn:not(:disabled):hover {
+  background: var(--bg-hover, var(--bg-secondary));
+  color: var(--text-primary);
+}
+.font-size-input {
+  width: 34px;
+}
+.font-size-input::-webkit-outer-spin-button,
+.font-size-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 
 .color-picker { display: flex; gap: 5px; }
 .color-dot {
@@ -1199,6 +1440,62 @@ defineExpose({ closeToList: handleBack })
   padding: 24px 0 60vh;
   font-size: var(--ebook-font-size, 17px);
 }
+.page-break-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+.page-break-marker {
+  position: absolute;
+  right: -88px;
+  width: 82px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  transform: translateY(-12px);
+  color: color-mix(in srgb, var(--text-secondary) 84%, var(--text-tertiary));
+  opacity: 0.9;
+}
+.page-break-marker::before {
+  content: '';
+  width: 26px;
+  height: 2px;
+  margin-right: 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-tertiary) 42%, var(--divider));
+}
+.page-break-label {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--bg-primary) 96%, var(--bg-secondary));
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--text-tertiary) 24%, var(--divider)),
+    0 4px 12px rgba(15, 23, 42, 0.08);
+  backdrop-filter: blur(6px);
+}
+@media (max-width: 960px) {
+  .page-break-marker {
+    right: 6px;
+    width: auto;
+    opacity: 0.78;
+  }
+  .page-break-marker::before {
+    display: none;
+  }
+  .page-break-label {
+    background: color-mix(in srgb, var(--bg-primary) 78%, transparent);
+  }
+}
 
 /* Live-selection overlay: same glyph-tight rect visuals as saved highlights.
    Native selection is hidden inside book text (it paints full line boxes,
@@ -1225,6 +1522,7 @@ defineExpose({ closeToList: handleBack })
 .chapter-wrapper {
   position: relative;
   padding: 8px 0;
+  z-index: 1;
 }
 .chapter-overlay {
   position: absolute;
@@ -1277,7 +1575,8 @@ defineExpose({ closeToList: handleBack })
   border-left: 3px solid var(--border-subtle);
   color: var(--text-secondary);
 }
-.chapter-content :deep(a) { color: var(--accent); text-decoration: none; cursor: default; }
+.chapter-content :deep(a) { color: var(--accent); text-decoration: none; cursor: pointer; }
+.chapter-content :deep(a:hover) { text-decoration: underline; }
 .chapter-content :deep(table) { border-collapse: collapse; margin: 1em 0; max-width: 100%; }
 .chapter-content :deep(td), .chapter-content :deep(th) {
   border: 1px solid var(--border-subtle);

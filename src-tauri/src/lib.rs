@@ -52,6 +52,11 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(LibraryRoot(Mutex::new(None)))
         .setup(|app| {
+            #[cfg(target_os = "windows")]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_decorations(false);
+            }
+
             // Restore last-opened library path into in-memory state.
             use tauri_plugin_store::StoreExt;
             if let Ok(store) = app.store("settings.json") {

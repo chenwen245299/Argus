@@ -1121,6 +1121,10 @@ pub async fn add_to_library(
     collection_id: Option<&str>,
     app: &tauri::AppHandle,
 ) -> Result<String, String> {
+    if let Some(cid) = collection_id.filter(|s| !s.is_empty()) {
+        crate::collections::ensure_collection_can_receive_papers(root, cid)?;
+    }
+
     // Find paper in inbox
     let inbox = get_inbox(root);
     let paper = inbox
@@ -1248,7 +1252,7 @@ pub async fn add_to_library(
 
     // Assign to collection and physically move folder into it
     if let Some(cid) = collection_id.filter(|s| !s.is_empty()) {
-        let _ = crate::collections::move_paper_to_collection(root, &meta.id, cid);
+        crate::collections::move_paper_to_collection(root, &meta.id, cid)?;
     }
 
     // Fulltext extraction + FTS indexing in background
@@ -1739,6 +1743,10 @@ pub async fn import_by_url(
     collection_id: &str,
     app: &tauri::AppHandle,
 ) -> Result<String, String> {
+    if !collection_id.is_empty() {
+        collections::ensure_collection_can_receive_papers(root, collection_id)?;
+    }
+
     use tauri::Emitter;
 
     let arxiv_id =

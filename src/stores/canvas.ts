@@ -7,7 +7,7 @@ import type { Canvas, CanvasIndexEntry, CanvasSettings } from '../types'
  *  canvas (CanvasPanel) and the right-sidebar properties panel (DrawTab). */
 export interface DrawNodeSnapshot {
   nodeId: string
-  type: 'paper' | 'text' | 'shape' | 'line'
+  type: 'paper' | 'text' | 'shape' | 'line' | 'image'
   lineKind?: 'line' | 'arrow'
   x: number
   y: number
@@ -27,6 +27,8 @@ export interface DrawNodeSnapshot {
   bold?: boolean
   italic?: boolean
   textAlign?: 'left' | 'center' | 'right'
+  imageSrc?: string
+  imageAlt?: string
 }
 
 export const useCanvasStore = defineStore('canvas', () => {

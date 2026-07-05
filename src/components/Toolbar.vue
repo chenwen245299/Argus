@@ -14,6 +14,7 @@ import { useAiStore } from '../stores/ai'
 import { titleInitialCaps } from '../utils/text'
 import type { SearchHit, Note, PaperStatus } from '../types'
 import TokenUsageModal from './TokenUsageModal.vue'
+import ActivityLogModal from './ActivityLogModal.vue'
 import dpskIconUrl from '../assets/models/deepseek.svg?url'
 
 const { t } = useI18n()
@@ -154,7 +155,7 @@ function shortPath(p: string): string {
 
 async function pickAndImport() {
   const collectionId = selection.activeCollectionId
-  if (!library.currentPath || !collectionId) return
+  if (!library.currentPath || !collectionId || !collectionsStore.canReceivePapers(collectionId)) return
   try {
     const paths = await invoke<string[]>('pick_import_files')
     if (paths.length > 0) {
@@ -166,8 +167,16 @@ async function pickAndImport() {
 }
 
 const activeJobs = computed(() => importStore.activeCount)
-const canImport = computed(() => !!library.currentPath && !!selection.activeCollectionId)
-const importTitle = computed(() => canImport.value ? t('import.btnTitle') : t('import.selectCollectionTitle'))
+const canImportIntoActiveCollection = computed(() =>
+  collectionsStore.canReceivePapers(selection.activeCollectionId)
+)
+const canImport = computed(() => !!library.currentPath && canImportIntoActiveCollection.value)
+const importTitle = computed(() => {
+  if (canImport.value) return t('import.btnTitle')
+  return selection.activeCollectionId
+    ? t('import.selectSubCollectionTitle')
+    : t('import.selectCollectionTitle')
+})
 const leftReserveStyle = computed(() => ({
   width: `${Math.max(140, props.leftSidebarWidth ?? 200)}px`,
 }))
@@ -180,6 +189,7 @@ const rightReserveStyle = computed(() => ({
 
 // ── Import dropdown menu ─────────────────────────────────────────────────────
 const showImportMenu = ref(false)
+const showStatsMenu = ref(false)
 
 function toggleImportMenu() {
   if (showImportMenu.value) {
@@ -188,6 +198,7 @@ function toggleImportMenu() {
   }
   showUrlPopover.value = false
   showAiMenu.value = false
+  showStatsMenu.value = false
   showImportMenu.value = true
 }
 
@@ -201,6 +212,7 @@ function toggleAiMenu() {
   }
   showImportMenu.value = false
   showUrlPopover.value = false
+  showStatsMenu.value = false
   showAiMenu.value = true
 }
 
@@ -221,7 +233,29 @@ function chooseEmbeddingMap() {
 
 function chooseUsage() {
   showAiMenu.value = false
+  showStatsMenu.value = false
   showUsage.value = true
+}
+
+function chooseActivityLog() {
+  showStatsMenu.value = false
+  showActivityLog.value = true
+}
+
+function chooseBatchAnalysis() {
+  showAiMenu.value = false
+  startBatchAnalysis()
+}
+
+function toggleStatsMenu() {
+  if (showStatsMenu.value) {
+    showStatsMenu.value = false
+    return
+  }
+  showImportMenu.value = false
+  showUrlPopover.value = false
+  showAiMenu.value = false
+  showStatsMenu.value = true
 }
 
 function chooseFileImport() {
@@ -265,6 +299,10 @@ function onDocClick(e: MouseEvent) {
     const wrap = document.querySelector('.ai-hub-wrap')
     if (wrap && !wrap.contains(e.target as Node)) showAiMenu.value = false
   }
+  if (showStatsMenu.value) {
+    const wrap = document.querySelector('.stats-wrap')
+    if (wrap && !wrap.contains(e.target as Node)) showStatsMenu.value = false
+  }
   if (showBatchDetail.value) {
     const strip = document.querySelector('.batch-progress-strip')
     if (strip && !strip.contains(e.target as Node)) showBatchDetail.value = false
@@ -279,8 +317,10 @@ function submitUrl() {
   const url = urlInput.value.trim()
   if (!url) return
   const collectionId = selection.activeCollectionId
-  if (!collectionId) {
-    urlImportError.value = t('import.selectCollectionFirst')
+  if (!collectionId || !collectionsStore.canReceivePapers(collectionId)) {
+    urlImportError.value = collectionId
+      ? t('import.selectSubCollectionFirst')
+      : t('import.selectCollectionFirst')
     return
   }
   importStore.clearUrlError()
@@ -447,6 +487,7 @@ async function startBatchAnalysis() {
 
 // Token usage modal
 const showUsage = ref(false)
+const showActivityLog = ref(false)
 
 interface PaperTaskStatusItem {
   id: string
@@ -909,6 +950,8 @@ onUnmounted(() => {
       <span class="dpsk-price-label">{{ isPeakPriceNow ? '波峰' : '波谷' }}</span>
     </div>
 
+    <div v-if="library.currentPath && hasPeakModel" class="tb-sep" />
+
     <!-- Import (file / URL) -->
     <div v-if="library.currentPath" class="import-wrap">
       <button
@@ -1050,6 +1093,61 @@ onUnmounted(() => {
             {{ t('toolbar.embeddingMap') }}
           </button>
           <div class="menu-divider" />
+          <button
+            class="import-menu-item"
+            :class="{ 'menu-item-danger': batchRunning && !batchStopping }"
+            :disabled="batchStopping"
+            :title="batchStopping ? t('toolbar.batchStopping') : batchRunning ? t('toolbar.batchStopTitle') : t('toolbar.batchAnalysisTitle')"
+            @click="chooseBatchAnalysis"
+          >
+            <svg v-if="!batchRunning" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3 13.7 8.3 19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z"/>
+              <path d="M19 15v4"/>
+              <path d="M17 17h4"/>
+            </svg>
+            <span v-else-if="batchStopping" class="paper-task-spinner menu-item-spinner" />
+            <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="4" y="4" width="16" height="16" rx="2"/>
+            </svg>
+            {{ batchStopping ? t('toolbar.batchStopping') : batchRunning ? t('toolbar.batchStop') : t('toolbar.batchAnalysis') }}
+          </button>
+        </div>
+      </Transition>
+    </div>
+
+    <div v-if="library.currentPath" class="tb-sep global-feature-sep" />
+
+    <!-- Statistics dropdown -->
+    <div v-if="library.currentPath" class="stats-wrap">
+      <button
+        class="tb-btn batch-btn stats-btn"
+        :title="t('toolbar.statsTitle')"
+        @click="toggleStatsMenu"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 3v18h18"/>
+          <rect x="7" y="11" width="3" height="6" rx="1"/>
+          <rect x="12" y="7" width="3" height="10" rx="1"/>
+          <rect x="17" y="5" width="3" height="12" rx="1"/>
+        </svg>
+        <span class="batch-btn-label">{{ t('toolbar.stats') }}</span>
+        <svg class="import-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
+      </button>
+
+      <Transition name="popover">
+        <div v-if="showStatsMenu" class="import-menu stats-menu">
+          <button class="import-menu-item" :title="t('toolbar.activityLogTitle')" @click="chooseActivityLog">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 19V5"/>
+              <path d="M4 19h16"/>
+              <path d="M8 15l3-4 3 2 4-7"/>
+              <path d="M18 6h-4"/>
+              <path d="M18 6v4"/>
+            </svg>
+            {{ t('toolbar.activityLog') }}
+          </button>
           <button class="import-menu-item" :title="t('toolbar.aiUsageTitle')" @click="chooseUsage">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <ellipse cx="12" cy="6" rx="7" ry="3"/>
@@ -1063,38 +1161,17 @@ onUnmounted(() => {
       </Transition>
     </div>
 
-    <div v-if="library.currentPath" class="tb-sep global-feature-sep" />
-
-    <!-- Batch analysis button -->
-    <button
-      v-if="library.currentPath"
-      class="tb-btn batch-btn"
-      :class="{ 'batch-running': batchRunning, 'batch-stopping': batchStopping }"
-      :disabled="batchStopping"
-      :title="batchStopping ? t('toolbar.batchStopping') : batchRunning ? t('toolbar.batchStopTitle') : t('toolbar.batchAnalysisTitle')"
-      @click="startBatchAnalysis"
-    >
-      <!-- Sparkle icon when idle -->
-      <svg v-if="!batchRunning" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3 13.7 8.3 19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z"/>
-        <path d="M19 15v4"/>
-        <path d="M17 17h4"/>
-      </svg>
-      <!-- Spinner when stopping -->
-      <span v-else-if="batchStopping" class="paper-task-spinner" />
-      <!-- Stop icon when running -->
-      <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-        <rect x="4" y="4" width="16" height="16" rx="2"/>
-      </svg>
-      <span class="batch-btn-label">{{ batchStopping ? t('toolbar.batchStopping') : batchRunning ? t('toolbar.batchStop') : t('toolbar.batchAnalysis') }}</span>
-    </button>
-
     </div><!-- /toolbar-center -->
 
     <!-- Token usage modal -->
     <Teleport to="body">
       <Transition name="usage-fade">
         <TokenUsageModal v-if="showUsage" @close="showUsage = false" />
+      </Transition>
+    </Teleport>
+    <Teleport to="body">
+      <Transition name="usage-fade">
+        <ActivityLogModal v-if="showActivityLog" @close="showActivityLog = false" />
       </Transition>
     </Teleport>
 
@@ -1398,6 +1475,11 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
+.stats-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
 .ai-hub-btn {
   width: auto;
   /* Reserve the left lane for the status dot in EVERY state (not just when
@@ -1417,6 +1499,10 @@ onUnmounted(() => {
 
 .ai-hub-menu {
   min-width: 188px;
+}
+
+.stats-menu {
+  min-width: 140px;
 }
 
 .menu-badge {
@@ -1725,11 +1811,10 @@ onUnmounted(() => {
   content: '';
   position: absolute;
   left: 0;
-  top: 50%;
-  transform: translateY(-50%);
+  top: 0;
+  bottom: 0;
   width: 1px;
-  height: 18px;
-  background: var(--border-subtle);
+  background: var(--border-default);
 }
 
 .sidebar-tab-btn.active {
@@ -1890,6 +1975,14 @@ onUnmounted(() => {
 }
 .import-menu-item:hover { background: var(--bg-hover); }
 .import-menu-item svg { color: var(--accent); flex-shrink: 0; }
+.import-menu-item.menu-item-danger { color: #ef4444; }
+.import-menu-item.menu-item-danger svg { color: #ef4444; }
+.import-menu-item:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.import-menu-item:disabled:hover { background: transparent; }
+.menu-item-spinner { flex-shrink: 0; }
 
 .url-import-popover {
   position: absolute;

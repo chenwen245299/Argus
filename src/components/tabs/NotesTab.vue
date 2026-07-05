@@ -396,7 +396,7 @@ function fmtDate(iso: string) {
 .list-toolbar {
   display: flex;
   align-items: center;
-  height: 40px;
+  height: var(--content-header-height);
   padding: 0 10px 0 12px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-subtle);
@@ -524,7 +524,7 @@ function fmtDate(iso: string) {
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-secondary);
   flex-shrink: 0;
-  height: 40px;
+  height: var(--content-header-height);
   position: relative;
   z-index: 2;
 }

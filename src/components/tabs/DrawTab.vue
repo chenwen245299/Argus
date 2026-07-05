@@ -11,6 +11,7 @@ const count = computed(() => canvasStore.selectedNodeIds.length)
 const isShape = computed(() => node.value?.type === 'shape')
 const isText = computed(() => node.value?.type === 'text')
 const isLine = computed(() => node.value?.type === 'line')
+const isImage = computed(() => node.value?.type === 'image')
 
 function action(type: string, payload?: unknown) {
   canvasStore.requestAction(type, payload)
@@ -132,7 +133,7 @@ const opacityPct = computed({
             <input type="number" :value="node.y" @change="patch({ y: num($event) })" />
           </label>
         </div>
-        <div v-if="isShape" class="field-pair">
+        <div v-if="isShape || isImage" class="field-pair">
           <label class="mini-field">
             <span class="mini-label">W</span>
             <input type="number" min="1" :value="node.width" @change="patch({ width: Math.max(1, num($event)) })" />
@@ -142,7 +143,7 @@ const opacityPct = computed({
             <input type="number" min="1" :value="node.height" @change="patch({ height: Math.max(1, num($event)) })" />
           </label>
         </div>
-        <div v-if="isShape || isText" class="field-pair">
+        <div v-if="isShape || isText || isImage" class="field-pair">
           <label class="mini-field">
             <span class="mini-label">{{ t('drawTab.rotation') }}</span>
             <input type="number" :value="node.rotation ?? 0" @change="patch({ rotation: num($event) })" />
@@ -152,7 +153,7 @@ const opacityPct = computed({
       </section>
 
       <!-- Appearance -->
-      <section v-if="isShape || isText" class="prop-group">
+      <section v-if="isShape || isText || isImage" class="prop-group">
         <h4 class="group-title">{{ t('drawTab.appearance') }}</h4>
         <label class="row-field">
           <span class="row-label">{{ t('drawTab.opacity') }}</span>
@@ -161,13 +162,13 @@ const opacityPct = computed({
             <input type="number" min="0" max="100" v-model.number="opacityPct" class="num-sm" />
           </div>
         </label>
-        <label v-if="isShape" class="row-field">
+        <label v-if="isShape || isImage" class="row-field">
           <span class="row-label">{{ t('drawTab.cornerRadius') }}</span>
           <input
             type="number" min="0"
             class="num-sm"
             :value="node.cornerRadius ?? 6"
-            :disabled="node.shapeKind === 'ellipse' || node.shapeKind === 'diamond'"
+            :disabled="isShape && (node.shapeKind === 'ellipse' || node.shapeKind === 'diamond')"
             @change="patch({ cornerRadius: Math.max(0, num($event)) })"
           />
         </label>

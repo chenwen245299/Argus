@@ -440,7 +440,7 @@ export interface CanvasNode {
   y: number
   color?: string
   hover_source?: string
-  node_type?: 'paper' | 'text' | 'shape' | 'line'
+  node_type?: 'paper' | 'text' | 'shape' | 'line' | 'image'
   content?: string
   font_size?: number
   font_bold?: boolean
@@ -457,6 +457,8 @@ export interface CanvasNode {
   text_align?: 'left' | 'center' | 'right'
   line_kind?: 'line' | 'arrow'
   line_points?: { x: number; y: number }[]
+  image_src?: string
+  image_alt?: string
   z_index?: number
 }
 

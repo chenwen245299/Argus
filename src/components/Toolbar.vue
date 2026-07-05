@@ -156,7 +156,7 @@ async function pickAndImport() {
   const collectionId = selection.activeCollectionId
   if (!library.currentPath || !collectionId) return
   try {
-    const paths = await invoke<string[]>('pick_pdf_files')
+    const paths = await invoke<string[]>('pick_import_files')
     if (paths.length > 0) {
       importStore.importFiles(paths, collectionId)
     }

@@ -51,15 +51,17 @@ export async function buildChunks(
     }
   }
 
-  // 3. Highlights – one chunk per highlight (with optional user note)
+  // 3. Highlights – one chunk per highlight (with optional user note).
+  // Ebook highlights anchor to chapters, not pages.
+  const unit = input.file_type && input.file_type !== 'pdf' ? '章' : '页'
   for (const h of input.highlights) {
-    let text = `高亮文本 (第${h.page}页): ${h.text}`
+    let text = `高亮文本 (第${h.page}${unit}): ${h.text}`
     if (h.note) text += `\n用户批注: ${h.note}`
     chunks.push({
       text,
       source_type: 'highlight',
       source_id: h.id,
-      source_label: `第${h.page}页批注`,
+      source_label: `第${h.page}${unit}批注`,
     })
   }
 

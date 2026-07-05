@@ -8,6 +8,7 @@ mod canvas_enhance;
 mod collections;
 mod commands;
 mod copilot;
+mod ebook;
 mod extraction;
 mod fsutil;
 mod library;
@@ -126,6 +127,12 @@ pub fn run() {
             // ── M0-M3: Import + metadata ──
             commands::pick_pdf_files,
             commands::import_pdf,
+            commands::pick_import_files,
+            commands::import_ebook,
+            commands::read_ebook_manifest,
+            commands::read_ebook_chapter,
+            commands::read_ebook_resource,
+            commands::regen_ebook_sections,
             commands::fetch_metadata,
             commands::fetch_citation_count,
             commands::extract_metadata_ai,

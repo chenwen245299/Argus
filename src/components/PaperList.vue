@@ -15,6 +15,7 @@ import { usePaperTasksStore, type AiSummaryJob, type PaperTaskKind } from '../st
 import { useRagStore } from '../stores/rag'
 import { buildChunks } from '../utils/chunker'
 import type { PaperVectorizeInput, ChunkInput } from '../types'
+import { isEbookFileType } from '../types'
 import StatusBadges from './StatusBadges.vue'
 import CollectionCascadeMenu from './CollectionCascadeMenu.vue'
 import { titleInitialCaps } from '../utils/text'
@@ -37,13 +38,13 @@ async function pickAndImport() {
   const collectionId = selection.activeCollectionId
   if (!library.currentPath || !collectionId) return
   try {
-    const paths = await invoke<string[]>('pick_pdf_files')
+    const paths = await invoke<string[]>('pick_import_files')
     if (paths.length > 0) importStore.importFiles(paths, collectionId)
   } catch (e) { console.error('Import pick failed:', e) }
 }
 
 function openInReader(item: PaperIndexEntry) {
-  reader.openPaper(item.slug, item.title)
+  reader.openPaper(item.slug, item.title, item.file_type)
 }
 
 function displayTitle(title: string) {
@@ -1391,6 +1392,7 @@ async function reExtract(item: PaperIndexEntry) {
               />
               <template v-for="col in orderedVisibleCols" :key="col.id">
                 <div v-if="col.id === 'title'" class="row-cell row-title" :title="displayTitle(item.title)">
+                  <span v-if="isEbookFileType(item.file_type)" class="format-badge">{{ item.file_type!.toUpperCase() }}</span>
                   {{ displayTitle(item.title) }}
                 </div>
                 <div v-else-if="col.id === 'notes'" class="row-cell row-notes" :title="canvasNotesFor(item).join(', ')">
@@ -1491,7 +1493,7 @@ async function reExtract(item: PaperIndexEntry) {
           {{ t('collections.removeFromColl') }}
         </button>
         <div class="ctx-sep" />
-        <button class="ctx-item" @click="copyPaperPdf(ctxMenu!.item)">
+        <button v-if="!isEbookFileType(ctxMenu!.item.file_type)" class="ctx-item" @click="copyPaperPdf(ctxMenu!.item)">
           {{ t('paper.copyPdf') }}
         </button>
         <button class="ctx-item" @click="openPaperInFinder(ctxMenu!.item)">
@@ -1935,6 +1937,18 @@ async function reExtract(item: PaperIndexEntry) {
   align-items: center;
   gap: 6px;
   overflow: hidden;
+}
+.format-badge {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  opacity: 0.85;
+  line-height: 1.4;
 }
 .row-year { text-align: left; }
 .row-date { font-size: 11px; }

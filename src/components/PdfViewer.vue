@@ -1511,6 +1511,49 @@ function onWheel(e: WheelEvent) {
   })
 }
 
+// ── Trackpad pinch zoom (macOS WKWebView) ─────────────────────────────────────
+// Safari/WKWebView reports trackpad pinches as proprietary gesture events
+// (gesturestart/gesturechange with a cumulative `scale`), NOT as ctrl+wheel
+// like Chromium — so Windows pinch already lands in onWheel above, and this
+// handles the Mac. The scale is quantized to 0.125 steps because every scale
+// commit tears down and re-renders the visible pages.
+let gestureStartScale = 1
+
+function onGestureStart(e: Event) {
+  e.preventDefault()
+  gestureStartScale = scale.value
+}
+
+function onGestureChange(e: Event) {
+  e.preventDefault()
+  const gs = (e as unknown as { scale?: number }).scale
+  if (!gs) return
+  const next = Math.max(0.5, Math.min(4, Math.round((gestureStartScale * gs) / 0.125) * 0.125))
+  if (next === scale.value) return
+
+  const container = containerRef.value
+  const oldScale = scale.value
+  if (!container) { scale.value = next; return }
+
+  const rect = container.getBoundingClientRect()
+  const ev = e as unknown as { clientX?: number; clientY?: number }
+  const relX = (ev.clientX ?? rect.left + rect.width / 2) - rect.left
+  const relY = (ev.clientY ?? rect.top + rect.height / 2) - rect.top
+  const oldScrollLeft = container.scrollLeft
+  const oldScrollTop  = container.scrollTop
+
+  scale.value = next
+  const ratio = next / oldScale
+  nextTick(() => {
+    container.scrollLeft = (oldScrollLeft + relX) * ratio - relX
+    container.scrollTop  = (oldScrollTop  + relY) * ratio - relY
+  })
+}
+
+function onGestureEnd(e: Event) {
+  e.preventDefault()
+}
+
 // ── Text selection → highlight creation ──────────────────────────────────────
 // Collect the selection's rects grouped per page. We DON'T use
 // range.getClientRects() directly: on a cross-page selection that also returns
@@ -1742,6 +1785,9 @@ function triggerInitialRender() {
         @scroll.passive="onScroll"
         @click="hlNotePopup = null; hlColorPopup = null"
         @wheel="onWheel"
+        @gesturestart="onGestureStart"
+        @gesturechange="onGestureChange"
+        @gestureend="onGestureEnd"
         @pointermove.passive="showScrollThumbs"
       >
         <div class="pdf-pages">

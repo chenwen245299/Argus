@@ -15,6 +15,8 @@ export interface PaperMeta {
   canvas_notes?: string[]
   import_source?: string
   cite_count?: number
+  /** Main document format: absent/"pdf" for papers, or "epub" | "mobi" | "azw3" | "fb2" | "txt". */
+  file_type?: string
 }
 
 export interface PaperStatus {
@@ -40,6 +42,7 @@ export interface Rect {
 
 export interface Highlight {
   id: string
+  /** PDF: 1-based page number. Ebooks: 1-based chapter (spine) index. */
   page: number
   rects: Rect[]
   text: string
@@ -47,6 +50,11 @@ export interface Highlight {
   note?: string
   created_at: string
   style?: 'highlight' | 'underline'
+  /** Ebook-only reflow-safe anchor (char offsets into the sanitized chapter DOM text). */
+  start_offset?: number
+  end_offset?: number
+  anchor_prefix?: string
+  anchor_suffix?: string
 }
 
 export interface Note {
@@ -87,6 +95,50 @@ export interface PaperIndexEntry {
   meta_mtime?: number
   import_source?: string
   cite_count?: number
+  /** Main document format (see PaperMeta.file_type). Absent = pdf. */
+  file_type?: string
+}
+
+/** True when a paper's main document is an ebook rather than a PDF. */
+export function isEbookFileType(fileType?: string | null): boolean {
+  return !!fileType && fileType !== 'pdf'
+}
+
+// ── Ebooks ────────────────────────────────────────────────────────────────────
+
+export interface EbookMeta {
+  title: string
+  authors: string[]
+  year?: number
+  language?: string
+  publisher?: string
+  identifier?: string
+  description?: string
+}
+
+export interface EbookTocEntry {
+  title: string
+  /** 1 = top-level, deeper levels are nested TOC entries. */
+  level: number
+  /** 1-based chapter (spine) index. */
+  chapter: number
+  /** Optional intra-chapter element id. */
+  anchor?: string
+}
+
+export interface EbookChapterMeta {
+  /** 1-based chapter index. */
+  index: number
+  title?: string
+  /** Plain-text character count (used to estimate unrendered chapter heights). */
+  char_count: number
+}
+
+export interface EbookManifest {
+  format: string
+  meta: EbookMeta
+  toc: EbookTocEntry[]
+  chapters: EbookChapterMeta[]
 }
 
 export interface LibraryConfig {
@@ -283,6 +335,8 @@ export interface PaperVectorizeInput {
   fulltext: string
   highlights: HighlightInput[]
   notes: NoteInput[]
+  /** Main document format (see PaperMeta.file_type). Absent = pdf. */
+  file_type?: string
 }
 
 export interface ChunkInput {

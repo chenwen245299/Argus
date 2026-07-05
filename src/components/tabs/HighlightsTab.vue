@@ -2,11 +2,23 @@
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useReaderStore } from '../../stores/reader'
+import { useLibraryStore } from '../../stores/library'
+import { isEbookFileType } from '../../types'
 
 const { t } = useI18n()
 const reader = useReaderStore()
+const library = useLibraryStore()
 
 const isReaderActive = computed(() => !!reader.openSlug)
+
+// Ebook highlights anchor to spine chapters (cover/preface files count too),
+// so the raw number would mislead — hide it and rely on the jump button.
+const isEbook = computed(() => {
+  const slug = reader.openSlug
+  if (!slug) return false
+  const tab = reader.tabs.find(tb => tb.slug === slug)
+  return isEbookFileType(tab?.fileType ?? library.papers.find(p => p.slug === slug)?.file_type)
+})
 
 const sortedHighlights = computed(() => {
   return [...reader.highlights].sort((a, b) => {
@@ -77,7 +89,7 @@ function colorStyle(color: string, alpha = 0.35): string {
         <div class="hl-body">
           <p class="hl-text" :style="{ background: colorStyle(hl.color) }">{{ hl.text }}</p>
           <div class="hl-meta">
-            <span class="hl-page">p.{{ hl.page }}</span>
+            <span v-if="!isEbook" class="hl-page">p.{{ hl.page }}</span>
             <span v-if="hl.note" class="hl-note">{{ hl.note }}</span>
           </div>
 

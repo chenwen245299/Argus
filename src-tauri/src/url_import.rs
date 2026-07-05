@@ -135,6 +135,7 @@ mod pdf_url {
             canvas_notes: vec![],
             import_source: Some("url".to_string()),
             cite_count: None,
+            file_type: None,
         };
 
         if let Err(e) =
@@ -507,6 +508,7 @@ mod acl {
             canvas_notes: vec![],
             import_source: Some("url".to_string()),
             cite_count: None,
+            file_type: None,
         };
 
         if let Err(e) = super::finalize_paper(
@@ -733,6 +735,7 @@ mod aaai {
             canvas_notes: vec![],
             import_source: Some("url".to_string()),
             cite_count: None,
+            file_type: None,
         };
 
         if let Err(e) = super::finalize_paper(
@@ -935,6 +938,7 @@ mod openreview {
             canvas_notes: vec![],
             import_source: Some("url".to_string()),
             cite_count: None,
+            file_type: None,
         };
 
         if let Err(e) = super::finalize_paper(

@@ -605,6 +605,7 @@ pub fn list_papers_in_collection(
             meta_mtime: 0,
             import_source: Some(import_source),
             cite_count: meta.cite_count,
+            file_type: meta.file_type,
         });
     }
 
@@ -650,6 +651,7 @@ mod tests {
             canvas_notes: vec![],
             import_source: Some("file".to_string()),
             cite_count: None,
+            file_type: None,
         };
         std::fs::write(
             paper_dir.join("meta.json"),

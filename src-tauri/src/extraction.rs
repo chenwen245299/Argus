@@ -82,6 +82,17 @@ pub enum ExtractionResult {
 /// Stage 1: lopdf  →  Stage 2: pdftotext  →  Stage 3: OCR (pdftoppm + tesseract).
 /// Writes `fulltext.txt` and updates `.status.json` on success.
 pub fn extract_and_write(root: &str, slug: &str, _settings: &AppSettings) -> ExtractionResult {
+    // Ebook papers never touch the PDF pipeline — dispatch before the
+    // PDF-exists check below (an ebook folder has no .pdf at all).
+    if let Ok(meta) = crate::paper::read_meta(root, slug) {
+        if crate::ebook::is_ebook_file_type(meta.file_type.as_deref()) {
+            return match crate::ebook::extract_fulltext_and_write(root, slug) {
+                Ok(_) => ExtractionResult::Text,
+                Err(e) => ExtractionResult::Failed(e),
+            };
+        }
+    }
+
     let pdf_path = crate::metadata::find_pdf_in_dir(root, slug);
 
     if !pdf_path.exists() {

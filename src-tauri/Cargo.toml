@@ -37,6 +37,10 @@ lopdf = "0.34"
 pdf-extract = "0.7"
 rusqlite = { version = "0.31", features = ["bundled"] }
 base64 = "0.22"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"
+encoding_rs = "0.8"
+mobi = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFData", "CFError", "CFString", "CFURL"] }

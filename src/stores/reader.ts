@@ -8,6 +8,10 @@ import { recordPaperAccess } from '../utils/recentPapers'
 export interface Tab {
   slug: string
   title: string
+  /** Main document format (see PaperMeta.file_type). Absent = pdf.
+   *  Tabs persisted before this field existed lack it — MainView falls back
+   *  to the library index when routing to a viewer. */
+  fileType?: string
 }
 
 export const useReaderStore = defineStore('reader', () => {
@@ -55,13 +59,14 @@ export const useReaderStore = defineStore('reader', () => {
     }
   }
 
-  function openPaper(slug: string, title: string) {
+  function openPaper(slug: string, title: string, fileType?: string) {
     recordPaperAccess(slug)
     const existing = tabs.value.find(t => t.slug === slug)
     if (!existing) {
-      tabs.value.push({ slug, title })
+      tabs.value.push({ slug, title, fileType })
     } else {
       existing.title = title  // update title in case it changed
+      if (fileType && !existing.fileType) existing.fileType = fileType
     }
     activeSlug.value = slug
   }
@@ -184,7 +189,10 @@ export const useReaderStore = defineStore('reader', () => {
     saveHighlights()
   }
 
-  function updateHighlight(id: string, changes: Partial<Pick<Highlight, 'note' | 'color' | 'style'>>) {
+  function updateHighlight(
+    id: string,
+    changes: Partial<Pick<Highlight, 'note' | 'color' | 'style' | 'start_offset' | 'end_offset'>>,
+  ) {
     const slug = activeSlug.value
     if (!slug) return
     setHighlights(slug, (highlightsBySlug.value[slug] ?? []).map(h => h.id === id ? { ...h, ...changes } : h))

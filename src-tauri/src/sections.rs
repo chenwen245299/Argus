@@ -276,7 +276,16 @@ pub async fn ai_split_sections(
         return Err("AI did not return any sections.".to_string());
     }
 
-    resolve_pages(root, slug, &mut sections);
+    // Ebook papers have no PDF pages — resolve section positions against the
+    // parsed book's chapters instead (page = 1-based chapter index).
+    let is_ebook = crate::paper::read_meta(root, slug)
+        .map(|m| crate::ebook::is_ebook_file_type(m.file_type.as_deref()))
+        .unwrap_or(false);
+    if is_ebook {
+        resolve_chapters(root, slug, &mut sections);
+    } else {
+        resolve_pages(root, slug, &mut sections);
+    }
 
     let data = PaperSections {
         source: "ai".to_string(),
@@ -404,6 +413,62 @@ fn resolve_pages(root: &str, slug: &str, sections: &mut [PaperSection]) {
     // Fill unresolved pages by carrying the previous section's page forward.
     // Sections are in reading order, so an approximate page beats a dead
     // (non-clickable, no-context) entry.
+    let mut last = 0u32;
+    for sec in sections.iter_mut() {
+        if sec.page == 0 {
+            sec.page = last;
+        } else {
+            last = sec.page;
+        }
+    }
+}
+
+/// Ebook counterpart of [`resolve_pages`]: fill in a 1-based CHAPTER index for
+/// each AI-returned section by matching its title against the parsed book's
+/// chapter titles first, then chapter body text. Sections are in reading
+/// order, so matching scans forward from the previously resolved chapter and
+/// only rewinds when nothing is found ahead.
+fn resolve_chapters(root: &str, slug: &str, sections: &mut [PaperSection]) {
+    let Ok(parsed) = crate::ebook::get_parsed(root, slug) else {
+        return;
+    };
+    let chapter_texts: Vec<String> = parsed.chapter_text.iter().map(|t| normalize(t)).collect();
+    let chapter_title_keys: Vec<String> = parsed
+        .chapter_titles
+        .iter()
+        .map(|t| t.as_deref().map(content_key).unwrap_or_default())
+        .collect();
+
+    let mut cursor = 0usize;
+    for sec in sections.iter_mut() {
+        let key = content_key(&sec.title);
+        if key.is_empty() {
+            sec.page = 0;
+            continue;
+        }
+        let short: String = key.split(' ').take(5).collect::<Vec<_>>().join(" ");
+        let title_match = |i: usize| -> bool {
+            let t = &chapter_title_keys[i];
+            !t.is_empty() && (*t == key || t.contains(&key))
+        };
+        let text_match = |i: usize| -> bool {
+            let t = &chapter_texts[i];
+            t.contains(&key) || (short.len() > 3 && t.contains(&short))
+        };
+        let found = (cursor..chapter_texts.len())
+            .find(|&i| title_match(i))
+            .or_else(|| (cursor..chapter_texts.len()).find(|&i| text_match(i)))
+            .or_else(|| (0..chapter_texts.len()).find(|&i| title_match(i) || text_match(i)));
+        match found {
+            Some(i) => {
+                sec.page = (i + 1) as u32;
+                cursor = i;
+            }
+            None => sec.page = 0,
+        }
+    }
+
+    // Carry the previous section's chapter forward for unresolved entries.
     let mut last = 0u32;
     for sec in sections.iter_mut() {
         if sec.page == 0 {

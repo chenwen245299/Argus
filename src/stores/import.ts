@@ -38,14 +38,47 @@ export const useImportStore = defineStore('import', () => {
     }
   }
 
+  const EBOOK_EXT_RE = /\.(epub|mobi|azw3|azw|fb2|txt|zip)$/i
+
+  /**
+   * Import a single ebook file path. The whole pipeline (parse → copy →
+   * metadata from the book itself → sections → fulltext → index → rename)
+   * runs inside the `import_ebook` command; no online metadata fetch.
+   */
+  async function importEbookFile(sourcePath: string, collectionId: string) {
+    const filename = sourcePath.split(/[/\\]/).pop() ?? sourcePath
+    const library = useLibraryStore()
+    const selection = useSelectionStore()
+    const collections = useCollectionsStore()
+
+    const jobId = `ebook_${Date.now()}`
+    _addJob(jobId, filename)
+    try {
+      const finalSlug = await invoke<string>('import_ebook', { sourcePath, collectionId })
+      _updateSlug(jobId, finalSlug)
+      _setStatus(finalSlug, 'done')
+      await collections.load()
+      await library.refresh()
+      selection.selectPaper(finalSlug)
+    } catch (e) {
+      _setStatus(jobId, 'error', String(e))
+    }
+  }
+
   /**
    * Import a single PDF file path.
    * Pipeline: copy → move to collection → fetch_metadata → rename → extract.
    * A collectionId is required so every imported paper belongs to a category.
+   * Ebook paths are routed to their own (fully backend-side) pipeline.
    */
   async function importFile(sourcePath: string, collectionId: string) {
     if (!collectionId) {
       console.warn('Import blocked: no collection selected')
+      return
+    }
+
+    if (EBOOK_EXT_RE.test(sourcePath)) {
+      await importEbookFile(sourcePath, collectionId)
       return
     }
 

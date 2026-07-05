@@ -466,11 +466,17 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
     }
 
     // ── 3. Highlight chunks ──────────────────────────────────────────────────
+    // Ebook highlights anchor to chapters, not pages — label accordingly.
+    let unit = if crate::ebook::is_ebook_file_type(meta.file_type.as_deref()) {
+        "章"
+    } else {
+        "页"
+    };
     for h in paper::read_highlights(root, slug) {
         if h.text.trim().is_empty() {
             continue;
         }
-        let mut text = format!("高亮文本 (第{}页): {}", h.page, h.text.trim());
+        let mut text = format!("高亮文本 (第{}{unit}): {}", h.page, h.text.trim());
         if let Some(ref note) = h.note {
             if !note.trim().is_empty() {
                 text.push_str(&format!("\n用户批注: {}", note.trim()));
@@ -480,7 +486,7 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
             text,
             source_type: "highlight",
             source_id: Some(h.id.clone()),
-            source_label: Some(format!("第{}页批注", h.page)),
+            source_label: Some(format!("第{}{unit}批注", h.page)),
         });
     }
 
@@ -691,6 +697,7 @@ pub fn get_paper_vectorize_input(
         fulltext: extraction::read_fulltext(root, slug),
         highlights,
         notes,
+        file_type: meta.file_type,
     })
 }
 

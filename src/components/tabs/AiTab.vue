@@ -228,7 +228,11 @@ function onSectionsUpdatedEvent(e: Event) {
 // PDF mode uses OpenAI-compatible inline file content parts, which only
 // OpenRouter reliably supports. Kimi / Moonshot endpoints reject the "file"
 // part type, so we keep the toggle disabled for those providers.
+// Ebook papers have no PDF at all — the toggle is disabled and the fulltext
+// context modes carry the book content instead.
+const paperIsEbook = ref(false)
 const pdfSupported = computed(() =>
+  !paperIsEbook.value &&
   selectedModels.value.some(m => {
     const p = ai.settings.providers.find(p => p.id === m.providerId)
     if (!p) return false
@@ -473,10 +477,13 @@ async function refreshSummaryAvailability(slug = props.slug) {
 }
 
 async function refreshAbstractAvailability(slug = props.slug) {
-  if (!slug) { abstractAvailable.value = false; return }
+  if (!slug) { abstractAvailable.value = false; paperIsEbook.value = false; return }
   try {
     const meta = await invoke<PaperMeta>('get_paper_meta', { slug })
-    if (props.slug === slug) abstractAvailable.value = !!meta.abstract?.trim()
+    if (props.slug === slug) {
+      abstractAvailable.value = !!meta.abstract?.trim()
+      paperIsEbook.value = !!meta.file_type && meta.file_type !== 'pdf'
+    }
   } catch {
     if (props.slug === slug) abstractAvailable.value = false
   }

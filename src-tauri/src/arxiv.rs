@@ -1217,6 +1217,7 @@ pub async fn add_to_library(
         canvas_notes: vec![],
         import_source: Some(paper.source.clone().unwrap_or_else(|| "arxiv".to_string())),
         cite_count: None,
+        file_type: None,
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);
@@ -1851,6 +1852,7 @@ pub async fn import_by_url(
         canvas_notes: vec![],
         import_source: Some("url".to_string()),
         cite_count: None,
+        file_type: None,
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);

@@ -10,8 +10,8 @@ use crate::models::{
 use crate::LibraryRoot;
 use crate::{
     ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas,
-    canvas_enhance, collections, copilot, extraction, library, llm, metadata, paper, rag, search,
-    sections, security_bookmark, settings, snippets, url_import,
+    canvas_enhance, collections, copilot, ebook, extraction, library, llm, metadata, paper, rag,
+    search, sections, security_bookmark, settings, snippets, url_import,
 };
 // ── Library management ────────────────────────────────────────────────────────
 
@@ -646,6 +646,7 @@ pub async fn import_pdf(
         canvas_notes: vec![],
         import_source: Some("file".to_string()),
         cite_count: None,
+        file_type: None,
     };
     paper::write_meta(&root, &temp_slug, &meta)?;
 
@@ -654,6 +655,233 @@ pub async fn import_pdf(
     refresh_search_index(&root, &temp_slug);
 
     Ok(temp_slug)
+}
+
+// ── Ebook import / reading ────────────────────────────────────────────────────
+
+/// Pick documents (PDF or ebooks) via the native file dialog.
+/// `pick_pdf_files` is kept untouched for any PDF-only flows.
+#[tauri::command]
+pub async fn pick_import_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<tauri_plugin_dialog::FilePath>>>();
+    app.dialog()
+        .file()
+        .add_filter(
+            "PDF / Ebooks",
+            &["pdf", "epub", "mobi", "azw3", "azw", "fb2", "txt", "zip"],
+        )
+        .pick_files(move |result| {
+            let _ = tx.send(result);
+        });
+    match rx.await.map_err(|e| e.to_string())? {
+        Some(paths) => Ok(paths.iter().map(|p| p.to_string()).collect()),
+        None => Ok(vec![]),
+    }
+}
+
+/// Import an ebook (EPUB / MOBI / AZW3 / FB2 / TXT) into the library.
+///
+/// Unlike `import_pdf` (which returns a temp slug and lets the frontend drive
+/// metadata fetching / renaming / extraction), the whole ebook pipeline runs
+/// here: books carry their own metadata, so there is no online lookup stage.
+/// Returns the final slug.
+#[tauri::command]
+pub async fn import_ebook(
+    source_path: String,
+    collection_id: Option<String>,
+    state: State<'_, LibraryRoot>,
+) -> Result<String, String> {
+    let root = get_root(&state)?;
+    let src = std::path::PathBuf::from(&source_path);
+    let format = ebook::detect_format(&src)
+        .ok_or_else(|| format!("Unsupported ebook format: {source_path}"))?;
+
+    // Parse fully before creating anything — a broken/DRM'd book must not
+    // leave a half-imported folder behind.
+    let src_c = src.clone();
+    let parsed =
+        tauri::async_runtime::spawn_blocking(move || ebook::parse(&src_c, format))
+            .await
+            .map_err(|e| e.to_string())??;
+
+    let id = uuid::Uuid::new_v4();
+    let short_id: String = id.to_string().replace('-', "").chars().take(8).collect();
+    let temp_slug = format!("importing_{}", short_id);
+
+    let filename = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let title = if parsed.meta.title.trim().is_empty() {
+        src.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled")
+            .to_string()
+    } else {
+        parsed.meta.title.trim().to_string()
+    };
+
+    let papers_dir = std::path::Path::new(&root).join("papers");
+    let paper_dir = papers_dir.join(&temp_slug);
+    std::fs::create_dir_all(&paper_dir).map_err(|e| format!("Cannot create paper dir: {e}"))?;
+
+    // Copy the book file, named after the sanitized title with its original extension.
+    let lower_name = filename.to_ascii_lowercase();
+    let ext = if lower_name.ends_with(".fb2.zip") {
+        "fb2.zip".to_string()
+    } else {
+        src.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or(format)
+            .to_ascii_lowercase()
+    };
+    let mut stem: String = metadata::sanitize_filename(&title).chars().take(150).collect();
+    // Never collide with companion files (fulltext.txt / notes.md) or produce
+    // a hidden dotfile from an all-symbols title.
+    if stem.trim().is_empty() || stem.eq_ignore_ascii_case("fulltext") || stem.eq_ignore_ascii_case("notes") {
+        stem = "book".to_string();
+    }
+    let book_filename = format!("{stem}.{ext}");
+    let dest = paper_dir.join(&book_filename);
+    let source_path_c = source_path.clone();
+    tauri::async_runtime::spawn_blocking(move || std::fs::copy(&source_path_c, &dest))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("Cannot copy ebook: {e}"))?;
+
+    // meta.json straight from the book's own metadata — no online lookup.
+    let meta = PaperMeta {
+        id: id.to_string(),
+        title,
+        authors: parsed.meta.authors.clone(),
+        year: parsed.meta.year,
+        doi: None,
+        arxiv_id: None,
+        venue: parsed.meta.publisher.clone(),
+        tags: vec![],
+        added_at: chrono::Utc::now().to_rfc3339(),
+        original_filename: Some(filename),
+        reading_status: "unread".to_string(),
+        paper_abstract: parsed.meta.description.clone(),
+        bibtex: None,
+        canvas_notes: vec![],
+        import_source: Some("file".to_string()),
+        cite_count: None,
+        file_type: Some(format.to_string()),
+    };
+    paper::write_meta(&root, &temp_slug, &meta)?;
+    paper::ensure_paper_files(&root, &temp_slug);
+
+    // Chapter structure from the book's own TOC.
+    if let Some(secs) = ebook::sections_from(&parsed) {
+        let _ = sections::write_sections(&root, &temp_slug, &secs);
+    }
+
+    // Fulltext + status flag (search/RAG/AI all read fulltext.txt).
+    let fulltext = ebook::fulltext_from(&parsed);
+    if !fulltext.trim().is_empty() {
+        let ft_path = paper::paper_dir(&root, &temp_slug).join("fulltext.txt");
+        if crate::fsutil::atomic_write_str(&ft_path, &fulltext).is_ok() {
+            let mut status = paper::read_status_for(&root, &temp_slug);
+            status.text_extracted = true;
+            status.last_updated = chrono::Utc::now().to_rfc3339();
+            let _ = paper::write_status(&root, &temp_slug, &status);
+        }
+    }
+
+    // Canonical folder name (title-based).
+    let root_c = root.clone();
+    let temp_c = temp_slug.clone();
+    let final_slug =
+        tauri::async_runtime::spawn_blocking(move || metadata::rename_folder(&root_c, &temp_c))
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|_| temp_slug.clone());
+    if final_slug != temp_slug {
+        let _ = search::remove_paper(&root, &temp_slug);
+    }
+    refresh_search_index(&root, &final_slug);
+
+    if let Some(cid) = collection_id.filter(|c| !c.trim().is_empty()) {
+        let _ = collections::move_paper_to_collection(&root, &id.to_string(), &cid);
+    }
+
+    Ok(final_slug)
+}
+
+/// Book manifest for the viewer: metadata + TOC + chapter list (no HTML yet).
+#[tauri::command]
+pub async fn read_ebook_manifest(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<ebook::EbookManifest, String> {
+    let root = get_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        ebook::get_parsed(&root, &slug).map(|p| p.manifest())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One chapter's sanitize-ready HTML (1-based index).
+#[tauri::command]
+pub async fn read_ebook_chapter(
+    slug: String,
+    index: u32,
+    state: State<'_, LibraryRoot>,
+) -> Result<String, String> {
+    let root = get_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = ebook::get_parsed(&root, &slug)?;
+        let i = (index as usize)
+            .checked_sub(1)
+            .ok_or_else(|| "Chapter index is 1-based".to_string())?;
+        parsed
+            .chapter_html
+            .get(i)
+            .cloned()
+            .ok_or_else(|| format!("Chapter {index} out of range"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One image resource, base64-encoded. `href` is looked up in the parsed
+/// book's resource map only — it never becomes a filesystem path.
+#[tauri::command]
+pub async fn read_ebook_resource(
+    slug: String,
+    href: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<ebook::EbookResource, String> {
+    let root = get_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = ebook::get_parsed(&root, &slug)?;
+        ebook::read_resource(&parsed, &href)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Rebuild sections.json from the book's own TOC (the ebook counterpart of
+/// the PDF outline/heuristic re-detect).
+#[tauri::command]
+pub async fn regen_ebook_sections(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<sections::PaperSections, String> {
+    let root = get_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = ebook::get_parsed(&root, &slug)?;
+        let secs = ebook::sections_from(&parsed)
+            .ok_or_else(|| "No chapter structure found in this book".to_string())?;
+        sections::write_sections(&root, &slug, &secs)?;
+        Ok(secs)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Delete a paper by removing its entire directory from the library.
@@ -670,6 +898,8 @@ pub async fn delete_paper(slug: String, state: State<'_, LibraryRoot>) -> Result
     if let Ok(meta) = paper::read_meta(&root, &slug) {
         let _ = rag::delete_paper_chunks(&root, &meta.id).await;
     }
+    // Drop any cached parsed ebook so its Arc doesn't outlive the paper
+    ebook::evict_from_cache(&slug);
     std::fs::remove_dir_all(&dir).map_err(|e| format!("Cannot delete paper: {e}"))
 }
 

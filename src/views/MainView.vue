@@ -16,6 +16,7 @@ import { useCanvasStore } from '../stores/canvas'
 import { useRagStore } from '../stores/rag'
 import { switchToTranslationsTab, askAiText } from '../stores/translationHistory'
 import { pendingSnippet, initSnippetStore } from '../stores/snippetLibrary'
+import { isEbookFileType } from '../types'
 import Toolbar from '../components/Toolbar.vue'
 import LeftSidebar from '../components/LeftSidebar.vue'
 import PaperList from '../components/PaperList.vue'
@@ -27,6 +28,7 @@ import UpdatePrompt from '../components/UpdatePrompt.vue'
 // Conditionally-rendered heavyweights (pdfjs / vue-flow / settings panels) are
 // code-split so the main window paints before any of them download.
 const PdfViewer = defineAsyncComponent(() => import('../components/PdfViewer.vue'))
+const EbookViewer = defineAsyncComponent(() => import('../components/EbookViewer.vue'))
 const CanvasPanel = defineAsyncComponent(() => import('../components/CanvasPanel.vue'))
 const SettingsModal = defineAsyncComponent(() => import('../components/SettingsModal.vue'))
 const SnippetLibraryView = defineAsyncComponent(() => import('../components/SnippetLibraryView.vue'))
@@ -135,6 +137,18 @@ watch(() => readerStore.activeSlug, (slug) => {
 const liveViewerSlugs = computed(() =>
   readerStore.tabs.filter(t => materializedSlugs.value.has(t.slug)).map(t => t.slug))
 
+// Viewer routing: PDFs keep the untouched PdfViewer; ebooks get their own
+// viewer. Tab.fileType is set at open time; tabs persisted before that field
+// existed fall back to the library index entry.
+function fileTypeFor(slug: string): string {
+  const tab = readerStore.tabs.find(t => t.slug === slug)
+  return tab?.fileType
+    ?? libraryStore.papers.find(p => p.slug === slug)?.file_type
+    ?? 'pdf'
+}
+const livePdfSlugs = computed(() => liveViewerSlugs.value.filter(s => !isEbookFileType(fileTypeFor(s))))
+const liveEbookSlugs = computed(() => liveViewerSlugs.value.filter(s => isEbookFileType(fileTypeFor(s))))
+
 const showCanvas = ref(false)
 const showSnippetLibrary = ref(false)
 const activeSnippetLibraryId = ref<string | null>(null)
@@ -177,7 +191,7 @@ function closeSnippetLibrary() {
 
 function onSnippetOpenPaper(slug: string, page: number, title: string) {
   showSnippetLibrary.value = false
-  readerStore.openPaper(slug, title)
+  readerStore.openPaper(slug, title, libraryStore.papers.find(p => p.slug === slug)?.file_type)
   readerStore.pendingPageJump = page
 }
 
@@ -289,7 +303,7 @@ onMounted(async () => {
     selectionStore.selectPaper(slug)
     showCanvas.value = false
     canvasStore.isShown = false
-    readerStore.openPaper(slug, event.payload.title || paper?.title || slug)
+    readerStore.openPaper(slug, event.payload.title || paper?.title || slug, paper?.file_type)
     rightSidebarVisible.value = true
     if (!PAPER_TABS.includes(sidebarTab.value)) {
       sidebarTab.value = 'metadata'
@@ -314,9 +328,10 @@ onMounted(async () => {
         return
       }
 
+      const IMPORTABLE_RE = /\.(pdf|epub|mobi|azw3|azw|fb2|txt|zip)$/i
       if (payload.type === 'enter') {
-        const pdfs = payload.paths.filter((p: string) => p.toLowerCase().endsWith('.pdf'))
-        isDragging.value = pdfs.length > 0
+        const docs = payload.paths.filter((p: string) => IMPORTABLE_RE.test(p))
+        isDragging.value = docs.length > 0
       } else if (payload.type === 'over') {
         // Keep the current state from the enter event; over events don't include paths.
       } else if (payload.type === 'leave') {
@@ -324,9 +339,9 @@ onMounted(async () => {
       } else if (payload.type === 'drop') {
         isDragging.value = false
         if (!libraryStore.currentPath || !selectionStore.activeCollectionId) return
-        const pdfs = payload.paths.filter((p: string) => p.toLowerCase().endsWith('.pdf'))
-        if (pdfs.length > 0) {
-          importStore.importFiles(pdfs, selectionStore.activeCollectionId)
+        const docs = payload.paths.filter((p: string) => IMPORTABLE_RE.test(p))
+        if (docs.length > 0) {
+          importStore.importFiles(docs, selectionStore.activeCollectionId)
         }
       }
     })
@@ -554,9 +569,18 @@ watch(
              Closing a tab removes it from this list, unmounting its viewer and
              fully releasing the PDF (see PdfViewer's onUnmounted). -->
         <PdfViewer
-          v-for="s in liveViewerSlugs"
+          v-for="s in livePdfSlugs"
           v-show="s === readerStore.activeSlug"
           :key="s"
+          :slug="s"
+          class="center-fill"
+          :right-sidebar-open="rightSidebarVisible"
+          @toggle-right-sidebar="rightSidebarVisible = !rightSidebarVisible"
+        />
+        <EbookViewer
+          v-for="s in liveEbookSlugs"
+          v-show="s === readerStore.activeSlug"
+          :key="`ebook:${s}`"
           :slug="s"
           class="center-fill"
           :right-sidebar-open="rightSidebarVisible"

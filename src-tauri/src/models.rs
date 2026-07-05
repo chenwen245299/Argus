@@ -36,6 +36,10 @@ pub struct PaperMeta {
     /// User-provided citation count (e.g. from Google Scholar).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cite_count: Option<u32>,
+    /// Main document format: None/"pdf" for papers, or an ebook format
+    /// ("epub" | "mobi" | "azw3" | "fb2" | "txt"). Set once at import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
 }
 
 pub fn normalize_import_source(import_source: Option<&str>, arxiv_id: Option<&str>) -> String {
@@ -99,6 +103,7 @@ impl Default for ReadingState {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Highlight {
     pub id: String,
+    /// PDF: 1-based page number. Ebooks: 1-based chapter (spine) index.
     pub page: u32,
     pub rects: Vec<Rect>,
     pub text: String,
@@ -107,6 +112,17 @@ pub struct Highlight {
     pub created_at: String,
     #[serde(default = "default_highlight_style")]
     pub style: String,
+    /// Ebook-only reflow-safe anchor: character offsets into the sanitized
+    /// chapter DOM's text content, plus short context for fuzzy re-anchoring.
+    /// Always None for PDF highlights.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_offset: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_offset: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_suffix: Option<String>,
 }
 
 fn default_highlight_style() -> String {
@@ -146,6 +162,9 @@ pub struct PaperIndexEntry {
     /// User-provided citation count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cite_count: Option<u32>,
+    /// Main document format (see `PaperMeta::file_type`). None = pdf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
 }
 
 fn default_reading_status_entry() -> String {
@@ -813,6 +832,10 @@ pub struct PaperVectorizeInput {
     pub fulltext: String,
     pub highlights: Vec<HighlightInput>,
     pub notes: Vec<NoteInput>,
+    /// Main document format (see `PaperMeta::file_type`). None = pdf. Lets the
+    /// frontend chunker label ebook highlights by chapter instead of page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
 }
 
 /// A single pre-chunked piece of text sent from frontend back to Rust for embedding.

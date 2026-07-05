@@ -1,17 +1,29 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { useReaderStore } from '../../stores/reader'
 import { useLibraryStore } from '../../stores/library'
 import { computeSections, detectSectionsForSlug } from '../../utils/sections'
 import type { PaperSections } from '../../types'
+import { isEbookFileType } from '../../types'
 
 const props = defineProps<{ slug: string }>()
 
 const { t } = useI18n()
 const reader = useReaderStore()
 const library = useLibraryStore()
+
+// Ebook papers: sections come from the book's own TOC, jump targets are
+// chapters, and re-detect must never touch reader.pdfDoc — that can hold
+// another tab's PDF document. The stored `page` is a SPINE index (counts
+// cover/preface files too), so it is hidden in the UI for ebooks.
+const isEbook = computed(() =>
+  isEbookFileType(
+    reader.tabs.find(tb => tb.slug === props.slug)?.fileType
+      ?? library.papers.find(p => p.slug === props.slug)?.file_type
+  )
+)
 
 const data = ref<PaperSections | null>(null)
 const loading = ref(false)
@@ -46,21 +58,27 @@ onBeforeUnmount(() => window.removeEventListener('argus-sections-updated', onSec
 function jumpTo(page: number) {
   if (page <= 0) return
   // Open the paper first if it isn't the active tab; the viewer consumes the
-  // pending jump once it has loaded (see PdfViewer.loadPdf).
+  // pending jump once it has loaded (see PdfViewer.loadPdf / EbookViewer.loadBook).
   if (reader.activeSlug !== props.slug) {
-    const title = library.papers.find(p => p.slug === props.slug)?.title ?? props.slug
-    reader.openPaper(props.slug, title)
+    const entry = library.papers.find(p => p.slug === props.slug)
+    reader.openPaper(props.slug, entry?.title ?? props.slug, entry?.file_type)
   }
   reader.pendingPageJump = page
 }
 
 // Manual structural re-detection (embedded outline → heading heuristic).
 // Prefers the already-open document; otherwise loads the PDF just for this.
+// Ebooks branch FIRST — reader.pdfDoc may hold a different tab's document.
 async function runDetect() {
   if (detecting.value || !props.slug) return
   detecting.value = true
   error.value = ''
   try {
+    if (isEbook.value) {
+      data.value = await invoke<PaperSections>('regen_ebook_sections', { slug: props.slug })
+      window.dispatchEvent(new CustomEvent('argus-sections-updated', { detail: { slug: props.slug } }))
+      return
+    }
     const result =
       reader.openSlug === props.slug && reader.pdfDoc
         ? await computeSections(reader.pdfDoc)
@@ -147,7 +165,7 @@ function sourceLabel(source: string): string {
           @click="jumpTo(sec.page)"
         >
           <span class="section-title">{{ sec.title }}</span>
-          <span v-if="sec.page > 0" class="section-page">p.{{ sec.page }}</span>
+          <span v-if="sec.page > 0 && !isEbook" class="section-page">p.{{ sec.page }}</span>
         </button>
       </div>
     </template>

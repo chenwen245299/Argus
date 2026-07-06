@@ -304,6 +304,14 @@ function onGlobalKeydown(e: KeyboardEvent) {
 
 async function testConnection() {
   if (!selectedId.value) return
+  // Ollama probes /api/tags and Kimi Code has a known fallback id, so neither
+  // needs a configured model. Everything else must have one — otherwise we'd
+  // have to guess a model id (which used to silently probe with "gpt-4o-mini").
+  if (editKind.value !== 'ollama' && editKind.value !== 'kimi' && editModels.value.length === 0) {
+    testMsg.value = t('aiService.testNoModel')
+    testStatus.value = 'fail'
+    return
+  }
   testStatus.value = 'testing'
   testMsg.value = ''
   try {

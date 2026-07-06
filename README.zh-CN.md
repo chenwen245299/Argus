@@ -5,7 +5,7 @@
 <h1 align="center">Argus</h1>
 
 <p align="center">
-  <strong>一个本地优先的论文工作台，整合文献管理、笔记、arXiv、RAG 和 AI 辅助阅读。</strong>
+  <strong>轻量、AI 原生的文献阅读软件，让你在读论文时就能分析、检索与对话。</strong>
 </p>
 
 <p align="center">
@@ -28,7 +28,7 @@
 > Argus 目前仍在持续 debug 和 improve。请谨慎使用，并保留文献库备份。
 
 <p align="center">
-  <img src="./docs/images/main.png" width="900" alt="Argus screenshot placeholder" />
+  <img src="./docs/public/main.png" width="900" alt="Argus screenshot placeholder" />
 </p>
 
 Argus 是一个面向学术论文的桌面应用。它把 PDF 阅读、元数据提取、笔记、arXiv 跟踪、论文关系图谱，以及基于文献库的 AI 问答放在同一个本地优先的工作流里。

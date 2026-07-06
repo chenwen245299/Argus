@@ -190,28 +190,55 @@ function normalizeSelectedPaperSlugs(value: unknown): string[] {
   return [...new Set(value.filter((v): v is string => typeof v === 'string'))].slice(0, 50)
 }
 
-function loadFromStorage(): LibraryConversation[] {
+function normalizeConversations(parsed: unknown): LibraryConversation[] {
+  if (!Array.isArray(parsed)) return []
+  return parsed
+    .filter((conv): conv is Partial<LibraryConversation> =>
+      !!conv &&
+      typeof conv === 'object' &&
+      typeof conv.id === 'string' &&
+      Array.isArray(conv.messages)
+    )
+    .map(conv => ({
+      id: conv.id!,
+      title: conv.title || t('libraryChat.untitled'),
+      messages: conv.messages!,
+      selectedPaperSlugs: normalizeSelectedPaperSlugs(conv.selectedPaperSlugs),
+      createdAt: conv.createdAt || new Date().toISOString(),
+      updatedAt: conv.updatedAt || conv.createdAt || new Date().toISOString(),
+    }))
+}
+
+// Legacy conversations lived in a single global localStorage key, so they were
+// shared across every library (data bleed). Read them once for migration.
+function readLegacyLocalConversations(): LibraryConversation[] {
   try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .filter((conv): conv is Partial<LibraryConversation> =>
-        !!conv &&
-        typeof conv === 'object' &&
-        typeof conv.id === 'string' &&
-        Array.isArray(conv.messages)
-      )
-      .map(conv => ({
-        id: conv.id!,
-        title: conv.title || t('libraryChat.untitled'),
-        messages: conv.messages!,
-        selectedPaperSlugs: normalizeSelectedPaperSlugs(conv.selectedPaperSlugs),
-        createdAt: conv.createdAt || new Date().toISOString(),
-        updatedAt: conv.updatedAt || conv.createdAt || new Date().toISOString(),
-      }))
+    return normalizeConversations(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]'))
   } catch {
     return []
   }
+}
+
+// Load conversations for the currently-open library from the library folder
+// (`.argus/library_chats.json`). On first run after upgrade, migrate any
+// conversations left in the old global localStorage cache into this library,
+// then clear the legacy key so it never re-imports into a second library.
+async function loadConversations(): Promise<LibraryConversation[]> {
+  let convs: LibraryConversation[] = []
+  try {
+    convs = normalizeConversations(await invoke<unknown>('get_library_conversations'))
+  } catch {
+    convs = []
+  }
+  const legacy = readLegacyLocalConversations()
+  if (legacy.length > 0) {
+    try { localStorage.removeItem(STORAGE_KEY) } catch {}
+    if (convs.length === 0) {
+      convs = legacy
+      persistConversations(convs)
+    }
+  }
+  return convs
 }
 
 function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
@@ -229,15 +256,14 @@ function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
   return clone
 }
 
-function saveToStorage(convs: LibraryConversation[]) {
-  try {
-    const serializable = convs.slice(0, 50).map(conv => ({
-      ...conv,
-      selectedPaperSlugs: normalizeSelectedPaperSlugs(conv.selectedPaperSlugs),
-      messages: conv.messages.map(stripTransientContext),
-    }))
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable))
-  } catch {}
+function persistConversations(convs: LibraryConversation[]) {
+  const serializable = convs.slice(0, 50).map(conv => ({
+    ...conv,
+    selectedPaperSlugs: normalizeSelectedPaperSlugs(conv.selectedPaperSlugs),
+    messages: conv.messages.map(stripTransientContext),
+  }))
+  // Fire-and-forget: persisted into the active library's `.argus/` folder.
+  invoke('save_library_conversations', { conversations: serializable }).catch(() => {})
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -306,7 +332,7 @@ function setActiveSelectedPaperSlugs(slugs: string[]) {
   const conv = conversations.value.find(c => c.id === activeConvId.value)
   if (!conv) return
   conv.selectedPaperSlugs = normalizeSelectedPaperSlugs(slugs)
-  saveToStorage(conversations.value)
+  persistConversations(conversations.value)
 }
 
 const selectedPapers = computed(() => {
@@ -922,7 +948,7 @@ function newConversation() {
   }
   conversations.value.unshift(conv)
   activeConvId.value = conv.id
-  saveToStorage(conversations.value)
+  persistConversations(conversations.value)
 }
 
 function startNewConversation() {
@@ -938,7 +964,7 @@ function deleteConversation(id: string) {
     if (conversations.value.length > 0) activeConvId.value = conversations.value[0].id
     else newConversation()
   }
-  saveToStorage(conversations.value)
+  persistConversations(conversations.value)
 }
 
 function persistActive() {
@@ -949,7 +975,7 @@ function persistActive() {
     const [conv] = conversations.value.splice(idx, 1)
     conversations.value.unshift(conv)
   }
-  saveToStorage(conversations.value)
+  persistConversations(conversations.value)
 }
 
 // ── Messaging ─────────────────────────────────────────────────────────────────
@@ -1374,12 +1400,18 @@ watch(activeConvId, () => {
   loading.value = false
 })
 
-onMounted(async () => {
-  await settingsStore.load()
-  const saved = loadFromStorage()
+async function refreshConversations() {
+  const saved = await loadConversations()
   conversations.value = saved
   if (saved.length > 0) activeConvId.value = saved[0].id
   else newConversation()
+}
+
+let unlistenLibraryChanged: UnlistenFn | null = null
+
+onMounted(async () => {
+  await settingsStore.load()
+  await refreshConversations()
 
   if (!ai.loaded) await ai.load()
   restoreLastModel()
@@ -1388,6 +1420,24 @@ onMounted(async () => {
   document.addEventListener('mousedown', closeModelMenu)
 
   messagesEl.value?.addEventListener('copy-code', onCopyCode)
+
+  // The library-chat window persists across library switches, so reload all
+  // per-library data when the active library changes — otherwise it would show
+  // (and, worse, save) the previous library's conversations against the new one.
+  unlistenLibraryChanged = await listen('library-changed', async () => {
+    for (const id of [...activeUnlisteners.keys()]) {
+      stoppedTargetIds.add(id)
+      detachListeners(id)
+    }
+    clearAllStreamRenderTimers()
+    loading.value = false
+    resetNewConversationContext()
+    await ai.load()
+    await ragStore.load()
+    restoreLastModel()
+    await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts(), loadSnippetStoreCounts()])
+    await refreshConversations()
+  })
 
   // Window size is persisted by the Tauri window event handler.
 })
@@ -1399,6 +1449,7 @@ onUnmounted(() => {
   messagesEl.value?.removeEventListener('copy-code', onCopyCode)
   for (const id of [...activeUnlisteners.keys()]) detachListeners(id)
   clearAllStreamRenderTimers()
+  unlistenLibraryChanged?.()
 })
 </script>
 

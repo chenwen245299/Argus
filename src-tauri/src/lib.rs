@@ -192,6 +192,8 @@ pub fn run() {
             commands::get_library_chat_history,
             commands::save_library_chat_history,
             commands::clear_library_chat_history,
+            commands::get_library_conversations,
+            commands::save_library_conversations,
             // ── M7: RAG Settings ──
             commands::get_rag_settings,
             commands::save_rag_settings,

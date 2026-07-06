@@ -63,6 +63,11 @@ pub async fn open_library(
     persist_library_path(&app, &root);
     security_bookmark::persist_library_bookmark(&app, &root);
 
+    // Notify secondary windows (e.g. the "智能问答" library-chat window) that the
+    // active library changed, so they can reload per-library data instead of
+    // showing / persisting stale data against the wrong library.
+    let _ = app.emit("library-changed", root.clone());
+
     // Track current root for token usage recording.
     crate::token_usage::set_root(&root);
 
@@ -1608,6 +1613,23 @@ pub async fn save_library_chat_history(
 pub async fn clear_library_chat_history(state: State<'_, LibraryRoot>) -> Result<(), String> {
     let root = get_root(&state)?;
     copilot::clear_library_chat_history(&root)
+}
+
+#[tauri::command]
+pub async fn get_library_conversations(
+    state: State<'_, LibraryRoot>,
+) -> Result<serde_json::Value, String> {
+    let root = get_root(&state)?;
+    Ok(copilot::read_library_conversations(&root))
+}
+
+#[tauri::command]
+pub async fn save_library_conversations(
+    conversations: serde_json::Value,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    copilot::write_library_conversations(&root, &conversations)
 }
 
 // ── M7: RAG Settings ─────────────────────────────────────────────────────────

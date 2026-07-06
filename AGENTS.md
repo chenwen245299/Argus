@@ -215,7 +215,8 @@ The library root contains:
 │   ├── ai_providers.json    # AI provider configs
 │   ├── api_keys.json        # Encrypted API keys
 │   ├── token_usage.jsonl    # Token usage log
-│   ├── library_chat.json    # Library chat history
+│   ├── library_chat.json    # Legacy single-thread library chat history (unused by UI)
+│   ├── library_chats.json   # Library "智能问答" conversations (multi-conversation)
 │   └── collections.json     # Collection tree and assignments
 ├── papers/<slug>/           # One folder per paper
 │   ├── meta.json

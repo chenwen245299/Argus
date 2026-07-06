@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, Teleport } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, Teleport } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   libraries,
   snippets,
@@ -9,12 +11,71 @@ import {
   moveSnippet,
   type Snippet,
 } from '../stores/snippetLibrary'
+import { useRagStore } from '../stores/rag'
 
 const props = defineProps<{ libraryId: string }>()
-const emit = defineEmits<{ 'open-paper': [slug: string, page: number, title: string] }>()
+const emit = defineEmits<{
+  'open-paper': [slug: string, page: number, title: string]
+  'open-settings': [section?: 'rag']
+}>()
 const { t } = useI18n()
+const ragStore = useRagStore()
 
 const searchQuery = ref('')
+
+// ── Snippet embedding (RAG vectorization) ───────────────────────────────────────
+// Embedding is a store-wide operation: `embed_all_snippets` vectorizes every
+// unembedded snippet across all libraries, and `get_snippet_store_info` reports
+// the store-wide embedded count. So the counter/button here reflect all snippets,
+// not just the current library.
+const embeddedCount = ref(0)
+const syncing = ref(false)
+const syncProgress = ref({ done: 0, total: 0, failed: 0 })
+const totalCount = computed(() => snippets.value.length)
+const unembeddedCount = computed(() => Math.max(0, totalCount.value - embeddedCount.value))
+
+async function loadEmbeddedCount() {
+  try {
+    const info = await invoke<{ embedded_count: number }>('get_snippet_store_info')
+    embeddedCount.value = info.embedded_count
+  } catch {
+    embeddedCount.value = 0
+  }
+}
+
+let unlistenEmbedProgress: UnlistenFn | null = null
+
+async function syncEmbeddings() {
+  if (syncing.value || !ragStore.isConfigured || unembeddedCount.value === 0) return
+  syncing.value = true
+  syncProgress.value = { done: 0, total: unembeddedCount.value, failed: 0 }
+  unlistenEmbedProgress = await listen<{ done: number; failed: number; total: number }>(
+    'snippet-embed-progress',
+    (ev) => {
+      syncProgress.value = { done: ev.payload.done, total: ev.payload.total, failed: ev.payload.failed }
+    },
+  )
+  try {
+    const [done, failed] = await invoke<[number, number]>('embed_all_snippets')
+    syncProgress.value = { done, total: done + failed, failed }
+    await loadEmbeddedCount()
+  } catch {
+    /* surfaced to the user via the counter staying unchanged */
+  } finally {
+    unlistenEmbedProgress?.()
+    unlistenEmbedProgress = null
+    syncing.value = false
+  }
+}
+
+onMounted(() => {
+  if (!ragStore.loaded) ragStore.load()
+  loadEmbeddedCount()
+})
+
+onUnmounted(() => {
+  unlistenEmbedProgress?.()
+})
 
 const library = computed(() => libraries.value.find(l => l.id === props.libraryId))
 
@@ -242,6 +303,47 @@ async function commitTags(s: Snippet) {
         <span class="lib-name">{{ library?.name ?? t('snippets.title') }}</span>
         <span class="item-count">{{ items.length }}</span>
       </div>
+
+      <!-- Embedding (RAG vectorization) control -->
+      <div class="embed-control">
+        <button
+          v-if="!ragStore.isConfigured"
+          class="embed-config-btn"
+          :title="t('snippetLibrary.embedConfigTip')"
+          @click="emit('open-settings', 'rag')"
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          {{ t('snippetLibrary.embedConfig') }}
+        </button>
+        <template v-else>
+          <span v-if="syncing" class="embed-progress">{{ syncProgress.done }}/{{ syncProgress.total }}</span>
+          <button
+            class="embed-refresh-btn"
+            :class="{ refreshing: syncing }"
+            :title="t('snippetLibrary.embedRefreshTip')"
+            :disabled="syncing"
+            @click="loadEmbeddedCount"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+          </button>
+          <div class="embed-counter" :title="t('snippetLibrary.embedCounterTip')">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+            <span>{{ embeddedCount }}/{{ totalCount }}</span>
+          </div>
+          <button
+            class="embed-sync-btn"
+            :class="{ 'all-done': unembeddedCount === 0 && totalCount > 0 }"
+            :title="unembeddedCount > 0 ? t('snippetLibrary.embedNTip', { n: unembeddedCount }) : t('snippetLibrary.embedDone')"
+            :disabled="syncing || unembeddedCount === 0"
+            @click="syncEmbeddings"
+          >
+            <svg v-if="unembeddedCount > 0" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+            <svg v-else width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+            {{ syncing ? t('snippetLibrary.embedding') : unembeddedCount > 0 ? t('snippetLibrary.embedN', { n: unembeddedCount }) : (totalCount > 0 ? t('snippetLibrary.embedDone') : t('snippetLibrary.embedNone')) }}
+          </button>
+        </template>
+      </div>
+
       <div class="search-wrap">
         <svg class="search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
           <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -453,6 +555,105 @@ async function commitTags(s: Snippet) {
   width: 160px;
 }
 .search-input::placeholder { color: var(--text-tertiary); }
+
+/* Embedding (RAG vectorization) control */
+.embed-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.embed-config-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.embed-config-btn:hover { background: var(--bg-hover); color: var(--text-secondary); }
+
+.embed-progress {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent);
+  min-width: 36px;
+  text-align: center;
+}
+
+.embed-refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  line-height: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.12s, color 0.12s;
+}
+.embed-refresh-btn svg { display: block; }
+.embed-refresh-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
+.embed-refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.embed-refresh-btn.refreshing svg { animation: embed-spin 0.7s linear infinite; }
+
+@keyframes embed-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.embed-counter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.embed-sync-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 11px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.12s, color 0.12s, opacity 0.12s;
+}
+.embed-sync-btn:hover:not(:disabled) { background: var(--accent-hover); }
+.embed-sync-btn.all-done,
+.embed-sync-btn:disabled {
+  color: var(--text-tertiary);
+  background: var(--bg-secondary);
+  cursor: default;
+  opacity: 0.75;
+}
 
 /* Empty state */
 .empty-state {

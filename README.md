@@ -5,7 +5,7 @@
 <h1 align="center">Argus</h1>
 
 <p align="center">
-  <strong>A local-first research workspace for papers, notes, arXiv, RAG, and AI-assisted reading.</strong>
+  <strong>A lightweight, AI-native literature reader for reading, analyzing, and chatting with your papers.</strong>
 </p>
 
 <p align="center">
@@ -28,7 +28,7 @@
 > Argus is still being actively debugged and improved. Please use it with care and keep backups of your literature library.
 
 <p align="center">
-  <img src="./docs/images/main.png" width="900" alt="Argus screenshot placeholder" />
+  <img src="./docs/public/main.png" width="900" alt="Argus screenshot placeholder" />
 </p>
 
 Argus is a desktop app for managing academic papers and working with them through AI. It brings PDF reading, metadata extraction, notes, arXiv tracking, paper relationship maps, and library-level Q&A into one local-first workflow.

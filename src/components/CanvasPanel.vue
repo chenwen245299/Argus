@@ -1394,6 +1394,63 @@ function openPaperPicker() {
   showPaperPicker.value = true
 }
 
+// Pick a spot for a newly-added node that is inside the current viewport and not
+// overlapping an existing node. Scans a grid spiralling out from the viewport
+// centre and returns the first blank spot that still fits on screen, so the node
+// never lands off-screen where the user has to pan around to find it.
+function findBlankViewportPosition(): { x: number; y: number } {
+  const NODE_W = 200, NODE_H = 130, GAP = 28, EDGE = 24
+
+  let minX: number, minY: number, maxX: number, maxY: number
+  const el = flowContainerRef.value
+  if (el) {
+    const rect = el.getBoundingClientRect()
+    const tl = screenToFlowCoordinate({ x: rect.left, y: rect.top })
+    const br = screenToFlowCoordinate({ x: rect.right, y: rect.bottom })
+    minX = Math.min(tl.x, br.x); maxX = Math.max(tl.x, br.x)
+    minY = Math.min(tl.y, br.y); maxY = Math.max(tl.y, br.y)
+  } else {
+    const vp = getViewport()
+    const w = 800, h = 600
+    minX = -vp.x / vp.zoom; maxX = (w - vp.x) / vp.zoom
+    minY = -vp.y / vp.zoom; maxY = (h - vp.y) / vp.zoom
+  }
+
+  const centerX = (minX + maxX) / 2 - NODE_W / 2
+  const centerY = (minY + maxY) / 2 - NODE_H / 2
+  const loX = minX + EDGE, loY = minY + EDGE
+  const hiX = maxX - EDGE - NODE_W, hiY = maxY - EDGE - NODE_H
+  if (hiX <= loX || hiY <= loY) return { x: centerX, y: centerY }
+
+  const others = nodes.value.map(n => ({
+    x: n.position.x,
+    y: n.position.y,
+    w: n.dimensions?.width || (n.type === 'paper' ? NODE_W : 160),
+    h: n.dimensions?.height || (n.type === 'paper' ? NODE_H : 90),
+  }))
+  const fits = (x: number, y: number) => others.every(o =>
+    x + NODE_W + GAP <= o.x || x >= o.x + o.w + GAP ||
+    y + NODE_H + GAP <= o.y || y >= o.y + o.h + GAP
+  )
+
+  const stepX = NODE_W / 2 + GAP
+  const stepY = NODE_H / 2 + GAP
+  const maxRing = Math.ceil(Math.max((maxX - minX) / stepX, (maxY - minY) / stepY))
+
+  for (let r = 0; r <= maxRing; r++) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (r > 0 && Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue
+        const x = centerX + dx * stepX
+        const y = centerY + dy * stepY
+        if (x < loX || x > hiX || y < loY || y > hiY) continue
+        if (fits(x, y)) return { x, y }
+      }
+    }
+  }
+  return { x: centerX, y: centerY }
+}
+
 function addPaperToCanvas(paper: PaperIndexEntry) {
   // Adding a paper to the canvas isn't "reading" — don't touch recency.
   const cv = canvasStore.currentCanvas
@@ -1404,8 +1461,7 @@ function addPaperToCanvas(paper: PaperIndexEntry) {
     return
   }
   const nodeId = `node-${Date.now()}`
-  const x = 100 + (nodes.value.length % 5) * 240
-  const y = 100 + Math.floor(nodes.value.length / 5) * 180
+  const { x, y } = findBlankViewportPosition()
   const newNode: VfNode = {
     id: nodeId,
     type: 'paper',

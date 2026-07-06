@@ -80,6 +80,7 @@ async function restoreWindowSize() {
 
 const showSettings = ref(false)
 const settingsAiSection = ref(false)  // true = open settings on AI Services tab
+const settingsSection = ref<string | undefined>(undefined)  // explicit section to open on
 const MAIN_LEFT_WIDTH_KEY = 'argus:layout:left-width'
 const MAIN_RIGHT_WIDTH_KEY = 'argus:layout:right-width'
 const MAIN_RIGHT_VISIBLE_KEY = 'argus:layout:right-visible'
@@ -346,6 +347,11 @@ function onSwitchSidebarTab(event: Event) {
 
 function openSettingsOnAi() {
   settingsAiSection.value = true
+  showSettings.value = true
+}
+
+function openSettingsSection(section?: 'rag') {
+  settingsSection.value = section
   showSettings.value = true
 }
 
@@ -844,6 +850,7 @@ watch(
             :library-id="activeSnippetLibraryId"
             class="center-fill"
             @open-paper="onSnippetOpenPaper"
+            @open-settings="openSettingsSection"
           />
           <div v-else class="center-fill">
             <PaperList />
@@ -892,8 +899,8 @@ watch(
     <!-- Unified settings modal -->
     <SettingsModal
       v-if="showSettings"
-      :initial-section="settingsAiSection ? 'ai' : undefined"
-      @close="showSettings = false; settingsAiSection = false"
+      :initial-section="settingsSection ?? (settingsAiSection ? 'ai' : undefined)"
+      @close="showSettings = false; settingsAiSection = false; settingsSection = undefined"
     />
 
     <!-- Add to Snippet Library modal -->

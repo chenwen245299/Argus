@@ -211,11 +211,15 @@ pub async fn test_connection(provider: &AiProvider, api_key: &str) -> Result<Str
             .map(|m| m.id.as_str())
             .unwrap_or("kimi-for-coding")
     } else {
+        // No hardcoded fallback: without a configured model we cannot know which
+        // model id this provider accepts. The UI blocks this case, but guard here
+        // too so a missing model surfaces as a clear message instead of silently
+        // probing with an unrelated default (which providers reject as invalid).
         provider
             .models
             .first()
             .map(|m| m.id.as_str())
-            .unwrap_or("gpt-4o-mini")
+            .ok_or("No model configured for this provider. Add and select a model before testing the connection.")?
     };
 
     let is_kimi_k2 = is_kimi && model.starts_with("kimi-k2");

@@ -103,6 +103,44 @@ pub fn clear_library_chat_history(root: &str) -> Result<(), String> {
     }
 }
 
+// Library-wide "智能问答" conversations (multi-conversation model with titles,
+// selected papers, timestamps). Stored per-library under `.argus/` so switching
+// libraries never bleeds conversation data between them. The frontend owns the
+// shape, so we persist it as an opaque JSON array (same pattern as
+// `ai_conversations.json` for per-paper chat).
+fn library_conversations_path(root: &str) -> PathBuf {
+    Path::new(root).join(".argus").join("library_chats.json")
+}
+
+pub fn read_library_conversations(root: &str) -> serde_json::Value {
+    let path = library_conversations_path(root);
+    if !path.exists() {
+        return serde_json::json!([]);
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .filter(|v: &serde_json::Value| v.is_array())
+        .unwrap_or_else(|| serde_json::json!([]))
+}
+
+pub fn write_library_conversations(
+    root: &str,
+    conversations: &serde_json::Value,
+) -> Result<(), String> {
+    if !conversations.is_array() {
+        return Err("Library conversations must be an array.".to_string());
+    }
+    let path = library_conversations_path(root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Create .argus dir: {e}"))?;
+    }
+    let content = serde_json::to_string_pretty(conversations)
+        .map_err(|e| format!("Serialize library conversations: {e}"))?;
+    crate::fsutil::atomic_write_str(&path, &content)
+        .map_err(|e| format!("Write library_chats.json: {e}"))
+}
+
 // ── Copilot chat ──────────────────────────────────────────────────────────────
 
 /// Build the paper context for injection into the LLM system prompt.
@@ -323,17 +361,24 @@ pub async fn chat_with_library(
     if use_selected_papers {
         let slugs = selected_paper_slugs.unwrap_or(&[]);
         let use_inline_pdf = provider_supports_inline_pdf(&provider);
-        pdf_attachments = slugs
-            .iter()
-            .filter_map(|slug| {
-                let slug = slug.trim();
-                if slug.is_empty() {
-                    return None;
-                }
-                let pdf_path = crate::metadata::find_pdf_in_dir(root, slug);
-                encode_pdf_attachment(&pdf_path)
-            })
-            .collect();
+        // Only attach raw PDFs for providers that accept inline `file` content
+        // parts (OpenRouter). For everyone else (DeepSeek, etc.) we fall back to
+        // injecting the extracted fulltext as text via
+        // `build_selected_papers_system_prompt` below — attaching the PDF here
+        // would send an unsupported `file` part and trigger an API 400.
+        if use_inline_pdf {
+            pdf_attachments = slugs
+                .iter()
+                .filter_map(|slug| {
+                    let slug = slug.trim();
+                    if slug.is_empty() {
+                        return None;
+                    }
+                    let pdf_path = crate::metadata::find_pdf_in_dir(root, slug);
+                    encode_pdf_attachment(&pdf_path)
+                })
+                .collect();
+        }
         let use_pdf = use_inline_pdf && !pdf_attachments.is_empty();
         let (selected_system, selected_sources, selected_contexts) = if use_pdf {
             build_selected_papers_pdf_system_prompt(root, slugs)

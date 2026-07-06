@@ -5,6 +5,10 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 
+# VitePress docs build output & cache
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+
 # Claude Code memory (local AI assistant context — not for public repo)
 .claude/
 

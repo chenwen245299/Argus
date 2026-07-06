@@ -1,0 +1,398 @@
+/* ============================================================
+   Argus docs — theme customization
+   ============================================================ */
+
+:root {
+  /* Brand: a cherry rose → violet identity */
+  --vp-c-brand-1: #d6336c;
+  --vp-c-brand-2: #c02a5d;
+  --vp-c-brand-3: #a61e4d;
+  --vp-c-brand-soft: rgba(214, 51, 108, 0.14);
+
+  --argus-grad: linear-gradient(135deg, #f43f5e 0%, #a855f7 100%);
+  --argus-grad-soft: linear-gradient(135deg, rgba(244, 63, 94, 0.12), rgba(168, 85, 247, 0.12));
+
+  /* Home hero brand tint (also used if the default home layout appears) */
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: var(--argus-grad);
+}
+
+.dark {
+  --vp-c-brand-1: #f472a6;
+  --vp-c-brand-2: #ec5f97;
+  --vp-c-brand-3: #e14b88;
+  --vp-c-brand-soft: rgba(244, 114, 166, 0.16);
+}
+
+/* ---- Nav bar: slightly larger menu links, a bit shorter bar ---- */
+.VPNavBarMenuLink {
+  font-size: 15px;
+}
+/* Shorter nav on desktop. Content offset and the hero's top padding both use
+   --vp-nav-height, so they stay in sync automatically. */
+@media (min-width: 960px) {
+  :root {
+    --vp-nav-height: 54px;
+  }
+}
+
+/* ---- Wider doc pages: fill the available viewport width ----
+   VitePress caps the layout at 1440px and the prose column at ~688px,
+   which leaves big empty margins on wide screens. */
+:root {
+  --vp-layout-max-width: 100%;
+}
+.VPDoc.has-aside .content-container,
+.VPDoc:not(.has-aside) .content-container {
+  max-width: none;
+}
+
+/* ---- Landing: give the page layout full control of width ---- */
+.VPContent.is-page .VPPage {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Hide the nav search box on the landing page only (kept on doc pages).
+   The .VPNavBarSearch flex spacer stays so nav items remain right-aligned. */
+.landing-page #local-search,
+.landing-page .DocSearch-Button {
+  display: none;
+}
+
+/* Landing: transparent, borderless nav so the hero gradient flows behind it
+   continuously instead of being cut off by the nav bar's white bar + divider.
+   !important is needed because VitePress applies `.VPNavBar:not(.top)` bg at the
+   same specificity, and stays transparent on scroll too (no bg after scrolling). */
+.landing-page .VPNav,
+.landing-page .VPNavBar {
+  background-color: transparent !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+.landing-page .VPNavBar::after,
+.landing-page .VPNavBar .divider {
+  display: none !important;
+}
+/* Once scrolled, restore a solid nav background so it separates from content. */
+html.argus-scrolled .landing-page .VPNavBar {
+  background-color: var(--vp-nav-bg-color) !important;
+  -webkit-backdrop-filter: saturate(50%) blur(8px) !important;
+  backdrop-filter: saturate(50%) blur(8px) !important;
+  box-shadow: 0 1px 0 var(--vp-c-divider);
+}
+/* Home only: let the hero gradient fill the area behind the fixed nav.
+   VitePress offsets content by `padding-top: var(--vp-nav-height)`; removing it
+   makes the hero start at the very top (behind the transparent nav), and the
+   hero's own padding pushes its text back down below the nav. Scoped to
+   `.home-hero` so the download page keeps its content below the nav. */
+.home-hero .VPContent {
+  padding-top: 0 !important;
+}
+.home-hero .al-hero {
+  padding-top: calc(var(--vp-nav-height) + 64px);
+}
+
+.argus-landing {
+  overflow-x: hidden;
+}
+
+.al-container {
+  max-width: 1152px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* ---- Shared type ---- */
+.al-h2 {
+  text-align: center;
+  font-size: clamp(26px, 3.4vw, 38px);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+.al-lead {
+  text-align: center;
+  max-width: 880px;
+  margin: 14px auto 0;
+  color: var(--vp-c-text-2);
+  font-size: 16px;
+  line-height: 1.6;
+  text-wrap: balance;
+}
+
+/* ---- Hero ---- */
+.al-hero {
+  position: relative;
+  overflow: hidden;
+  padding: 72px 0 8px;
+}
+.al-hero::before {
+  content: '';
+  position: absolute;
+  top: -240px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 900px;
+  height: 620px;
+  background: radial-gradient(closest-side, rgba(168, 85, 247, 0.22), transparent 70%),
+    radial-gradient(closest-side, rgba(244, 63, 94, 0.22), transparent 70%);
+  background-position: 30% 40%, 70% 40%;
+  background-repeat: no-repeat;
+  filter: blur(10px);
+  pointer-events: none;
+  z-index: 0;
+}
+.al-hero__inner {
+  position: relative;
+  z-index: 1;
+  text-align: center;
+}
+.al-eyebrow {
+  display: inline-block;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--vp-c-brand-1);
+  background: var(--vp-c-brand-soft);
+  border: 1px solid var(--vp-c-brand-soft);
+}
+.al-title {
+  font-size: clamp(56px, 9vw, 96px);
+  font-weight: 900;
+  /* line-height + padding leave room for descenders; background-clip:text
+     otherwise crops the tail of the "g". */
+  line-height: 1.14;
+  padding-bottom: 0.12em;
+  letter-spacing: -0.04em;
+  margin: 18px 0 0;
+  background: var(--argus-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.al-tagline {
+  font-size: clamp(20px, 3vw, 30px);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 16px 0 0;
+  color: var(--vp-c-text-1);
+}
+.al-sub {
+  max-width: 62ch;
+  margin: 16px auto 0;
+  font-size: 17px;
+  line-height: 1.6;
+  color: var(--vp-c-text-2);
+}
+
+/* ---- Buttons ---- */
+.al-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 30px;
+  justify-content: center;
+}
+.al-actions--center {
+  margin-top: 26px;
+}
+.al-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 24px;
+  height: 46px;
+  border-radius: 999px;
+  font-size: 15px;
+  font-weight: 600;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+  white-space: nowrap;
+}
+.al-btn:hover {
+  text-decoration: none;
+  transform: translateY(-2px);
+}
+.al-btn--primary {
+  color: #fff;
+  background: var(--argus-grad);
+  box-shadow: 0 10px 28px -10px var(--vp-c-brand-3);
+}
+.al-btn--primary:hover {
+  box-shadow: 0 14px 34px -10px var(--vp-c-brand-3);
+}
+.al-btn--secondary {
+  color: var(--vp-c-text-1);
+  background: var(--vp-c-bg-soft);
+  border: 1px solid var(--vp-c-divider);
+}
+.al-btn--secondary:hover {
+  border-color: var(--vp-c-brand-1);
+  color: var(--vp-c-brand-1);
+}
+.al-btn--ghost {
+  color: var(--vp-c-text-2);
+  background: transparent;
+  border: 1px solid transparent;
+}
+.al-btn--ghost:hover {
+  color: var(--vp-c-brand-1);
+}
+.al-platforms {
+  margin-top: 18px;
+  font-size: 13px;
+  color: var(--vp-c-text-3);
+}
+
+/* ---- Hero screenshot ---- */
+.al-hero__shot {
+  position: relative;
+  margin: 44px auto 0;
+  max-width: 980px;
+}
+.al-hero__shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 16px;
+  border: 1px solid var(--vp-c-divider);
+  box-shadow: 0 40px 80px -30px rgba(0, 0, 0, 0.35);
+}
+
+/* ---- Feature grid ---- */
+.al-features {
+  padding: 84px 0;
+}
+.al-grid {
+  margin-top: 44px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+}
+.al-fcard {
+  padding: 26px;
+  border-radius: 16px;
+  border: 1px solid var(--vp-c-divider);
+  background: var(--vp-c-bg-soft);
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.al-fcard:hover {
+  transform: translateY(-4px);
+  border-color: var(--vp-c-brand-1);
+  box-shadow: 0 18px 40px -24px var(--vp-c-brand-3);
+}
+.al-fcard__icon {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  font-size: 24px;
+  border-radius: 12px;
+  background: var(--argus-grad-soft);
+}
+.al-fcard__title {
+  margin: 16px 0 0;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.al-fcard__desc {
+  margin: 8px 0 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--vp-c-text-2);
+}
+
+/* ---- Showcase rows ---- */
+.al-showcases {
+  padding: 20px 0 84px;
+}
+.al-show {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: 48px;
+  align-items: center;
+  margin-top: 64px;
+}
+.al-show--reverse .al-show__media {
+  order: 2;
+}
+.al-show__title {
+  font-size: clamp(22px, 2.6vw, 28px);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  margin: 0;
+}
+.al-show__desc {
+  margin: 14px 0 0;
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--vp-c-text-2);
+}
+.al-show__media :deep(.argus-media) {
+  margin: 0;
+}
+.al-link {
+  display: inline-block;
+  margin-top: 18px;
+  font-weight: 600;
+  color: var(--vp-c-brand-1);
+}
+
+/* ---- Download CTA ---- */
+.al-ctawrap {
+  padding: 0 0 96px;
+}
+.al-cta {
+  text-align: center;
+  padding: 64px 32px;
+  border-radius: 24px;
+  border: 1px solid var(--vp-c-divider);
+  background: var(--argus-grad-soft);
+}
+.al-cta__title {
+  font-size: clamp(26px, 3.4vw, 36px);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+.al-cta__sub {
+  max-width: 52ch;
+  margin: 14px auto 0;
+  color: var(--vp-c-text-2);
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 860px) {
+  .al-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .al-show,
+  .al-show--reverse .al-show__media {
+    grid-template-columns: 1fr;
+    order: 0;
+  }
+  .al-show {
+    gap: 24px;
+    margin-top: 48px;
+  }
+}
+@media (max-width: 560px) {
+  .al-hero {
+    padding-top: 52px;
+  }
+  .al-grid {
+    grid-template-columns: 1fr;
+  }
+  .al-btn {
+    flex: 1 1 auto;
+  }
+}

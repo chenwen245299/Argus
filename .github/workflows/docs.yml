@@ -29,6 +29,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # needed for VitePress lastUpdated git timestamps
+          lfs: true # pull real video/image media stored via Git LFS, not pointer files
 
       - uses: actions/configure-pages@v4
 

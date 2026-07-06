@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 
 export type ActivityRange = 'today' | 'week' | 'month' | 'year'
 
@@ -96,6 +97,10 @@ function normalizeData(input: unknown): ActivityData {
   return { version: 1, days: days as Record<string, DailyActivity> }
 }
 
+function hasActivityData(input: ActivityData) {
+  return Object.keys(input.days).length > 0
+}
+
 function clampReasonableDuration(ms: number) {
   if (!Number.isFinite(ms) || ms <= 0) return 0
   return Math.min(ms, 5 * 60 * 1000)
@@ -107,14 +112,16 @@ export const useActivityStore = defineStore('activity', () => {
   const activeSession = ref<ActiveReadingSession | null>(null)
   const activeNow = ref(Date.now())
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  let saveChain: Promise<unknown> = Promise.resolve()
 
   const storageKey = computed(() =>
     libraryPath.value ? `argus:activity:${libraryPath.value}` : null
   )
 
   function save() {
+    const root = libraryPath.value
     const key = storageKey.value
-    if (!key) return
+    if (!root || !key) return
     try {
       const cutoff = new Date()
       cutoff.setDate(cutoff.getDate() - 370)
@@ -123,21 +130,38 @@ export const useActivityStore = defineStore('activity', () => {
         Object.entries(data.value.days).filter(([date]) => date >= cutoffKey)
       )
       data.value = { version: 1, days }
-      localStorage.setItem(key, JSON.stringify(data.value))
+      const snapshot = JSON.parse(JSON.stringify(data.value)) as ActivityData
+      localStorage.setItem(key, JSON.stringify(snapshot))
+      saveChain = saveChain
+        .catch(() => undefined)
+        .then(() => invoke('save_activity_log', { root, data: snapshot }))
+        .catch(e => console.error('[activity] save activity.json failed:', e))
     } catch {}
   }
 
-  function load(path: string | null) {
+  async function load(path: string | null) {
     endReading()
     libraryPath.value = path
     if (!path) {
       data.value = { version: 1, days: {} }
       return
     }
+    let legacyData: ActivityData | null = null
     try {
-      data.value = normalizeData(JSON.parse(localStorage.getItem(`argus:activity:${path}`) || 'null'))
-    } catch {
-      data.value = { version: 1, days: {} }
+      legacyData = normalizeData(JSON.parse(localStorage.getItem(`argus:activity:${path}`) || 'null'))
+    } catch {}
+
+    try {
+      const fileData = normalizeData(await invoke('get_activity_log', { root: path }))
+      if (hasActivityData(fileData) || !legacyData || !hasActivityData(legacyData)) {
+        data.value = fileData
+      } else {
+        data.value = legacyData
+        save()
+      }
+    } catch (e) {
+      console.error('[activity] load activity.json failed:', e)
+      data.value = legacyData ?? { version: 1, days: {} }
     }
   }
 

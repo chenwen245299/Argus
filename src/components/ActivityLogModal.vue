@@ -447,7 +447,7 @@ function fileTypeLabel(fileType?: string) {
         </div>
 
         <div class="content-grid">
-          <div class="panel-card">
+          <div class="panel-card session-card">
             <div class="panel-head">
               <span class="panel-title">{{ t('activityLog.sessions') }}</span>
               <span class="panel-meta">{{ sessionRows.length }}</span>
@@ -894,6 +894,7 @@ function fileTypeLabel(fileType?: string) {
   min-width: 0;
 }
 
+.session-card,
 .paper-reading-card {
   display: flex;
   flex-direction: column;
@@ -1035,6 +1036,14 @@ function fileTypeLabel(fileType?: string) {
   border-radius: 12px;
   border: 1px solid #e8eef7;
   background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+}
+
+.session-card .session-timeline {
+  margin-bottom: 12px;
+}
+
+.session-card .day-map {
+  margin-top: auto;
 }
 
 .paper-compare-head {

@@ -9,6 +9,34 @@ const containerEl = ref<HTMLDivElement | null>(null)
 let vd: VditorType | null = null
 let destroyed = false
 
+function normalizeDisplayMathDelimiters(markdown: string) {
+  const blocks: string[] = []
+  const placeholder = (prefix: string, index: number) => `\u0000${prefix}_${index}\u0000`
+  let text = markdown.replace(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g, (match) => {
+    blocks.push(match)
+    return placeholder('CODE_BLOCK', blocks.length - 1)
+  })
+
+  const inlineCodes: string[] = []
+  text = text.replace(/`[^`\n]*`/g, (match) => {
+    inlineCodes.push(match)
+    return placeholder('INLINE_CODE', inlineCodes.length - 1)
+  })
+
+  text = text.replace(/\\\[([\s\S]+?)\\\]/g, (match, tex: string) => {
+    const body = tex.trim()
+    return body ? `$$\n${body}\n$$` : match
+  })
+  text = text.replace(/\\\(([\s\S]+?)\\\)/g, (match, tex: string) => {
+    const body = tex.trim()
+    return body ? `$${body}$` : match
+  })
+
+  text = text.replace(/\u0000INLINE_CODE_(\d+)\u0000/g, (_, index) => inlineCodes[Number(index)] ?? '')
+  text = text.replace(/\u0000CODE_BLOCK_(\d+)\u0000/g, (_, index) => blocks[Number(index)] ?? '')
+  return text
+}
+
 onMounted(async () => {
   // Vditor (JS + CSS) is heavyweight — load it when an editor actually mounts
   // instead of in every window's startup bundle.
@@ -19,7 +47,7 @@ onMounted(async () => {
   await nextTick()
   if (!containerEl.value || destroyed) return
 
-  const content = props.initialContent
+  const content = normalizeDisplayMathDelimiters(props.initialContent)
 
   vd = new Vditor(containerEl.value, {
     mode: 'ir',

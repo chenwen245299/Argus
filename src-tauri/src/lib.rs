@@ -283,6 +283,12 @@ pub fn run() {
             // ── Token usage ──
             commands::get_token_usage,
             commands::clear_token_usage,
+            // ── Activity + per-library UI state ──
+            commands::get_activity_log,
+            commands::save_activity_log,
+            commands::get_library_ui_state,
+            commands::save_library_ui_state,
+            commands::patch_library_ui_state,
             // ── Snippet Library ──
             commands::list_snippet_libraries,
             commands::create_snippet_library,

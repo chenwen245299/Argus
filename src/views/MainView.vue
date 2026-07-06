@@ -2,6 +2,7 @@
 import { computed, ref, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import { Window as TauriWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalSize } from '@tauri-apps/api/dpi'
@@ -122,6 +123,78 @@ function saveLayoutNumber(key: string, value: number) {
   try {
     localStorage.setItem(key, String(Math.round(value)))
   } catch {}
+}
+
+interface MainLayoutState {
+  leftWidth?: number
+  rightWidth?: number
+  rightVisible?: boolean
+  rightTab?: string
+}
+
+let mainLayoutSaveChain: Promise<unknown> = Promise.resolve()
+let isRestoringMainLayout = false
+
+function readLegacyMainLayout(): MainLayoutState {
+  return {
+    leftWidth: loadLayoutNumber(MAIN_LEFT_WIDTH_KEY, DEFAULT_LEFT_WIDTH, MIN_LEFT_WIDTH, MAX_LEFT_WIDTH),
+    rightWidth: loadLayoutNumber(MAIN_RIGHT_WIDTH_KEY, DEFAULT_RIGHT_WIDTH, MIN_RIGHT_WIDTH, MAX_RIGHT_WIDTH),
+    rightVisible: loadLayoutBoolean(MAIN_RIGHT_VISIBLE_KEY, true),
+    rightTab: loadSidebarTab(),
+  }
+}
+
+function normalizeMainLayout(input: unknown): MainLayoutState | null {
+  if (!input || typeof input !== 'object') return null
+  const raw = input as MainLayoutState
+  return {
+    leftWidth: Number.isFinite(raw.leftWidth) ? Math.min(MAX_LEFT_WIDTH, Math.max(MIN_LEFT_WIDTH, Number(raw.leftWidth))) : undefined,
+    rightWidth: Number.isFinite(raw.rightWidth) ? Math.min(MAX_RIGHT_WIDTH, Math.max(MIN_RIGHT_WIDTH, Number(raw.rightWidth))) : undefined,
+    rightVisible: typeof raw.rightVisible === 'boolean' ? raw.rightVisible : undefined,
+    rightTab: raw.rightTab && PAPER_TABS.includes(raw.rightTab) ? raw.rightTab : undefined,
+  }
+}
+
+function applyMainLayout(layout: MainLayoutState | null) {
+  if (!layout) return
+  isRestoringMainLayout = true
+  if (layout.leftWidth) leftWidth.value = layout.leftWidth
+  if (layout.rightWidth) rightWidth.value = layout.rightWidth
+  if (typeof layout.rightVisible === 'boolean') rightSidebarVisible.value = layout.rightVisible
+  if (layout.rightTab) sidebarTab.value = layout.rightTab
+  nextTick(() => { isRestoringMainLayout = false })
+}
+
+async function loadMainLayout(path: string) {
+  try {
+    const uiState = await invoke<Record<string, unknown>>('get_library_ui_state', { root: path })
+    const fromFile = normalizeMainLayout(uiState.mainLayout)
+    if (fromFile) {
+      applyMainLayout(fromFile)
+      return
+    }
+  } catch (e) {
+    console.error('[main] load ui_state layout failed:', e)
+  }
+  applyMainLayout(readLegacyMainLayout())
+  saveMainLayout(path)
+}
+
+function saveMainLayout(path = libraryStore.currentPath) {
+  if (!path || isRestoringMainLayout) return
+  const layout: MainLayoutState = {
+    leftWidth: Math.round(leftWidth.value),
+    rightWidth: Math.round(rightWidth.value),
+    rightVisible: rightSidebarVisible.value,
+    rightTab: PAPER_TABS.includes(sidebarTab.value) ? sidebarTab.value : 'metadata',
+  }
+  mainLayoutSaveChain = mainLayoutSaveChain
+    .catch(() => undefined)
+    .then(() => invoke('patch_library_ui_state', {
+      root: path,
+      patch: { version: 1, mainLayout: layout },
+    }))
+    .catch(e => console.error('[main] save ui_state layout failed:', e))
 }
 
 const rightSidebarVisible = ref(loadLayoutBoolean(MAIN_RIGHT_VISIBLE_KEY, true))
@@ -320,8 +393,8 @@ function onActivityUnload() {
   activityStore.endReading()
 }
 
-function syncActivityLibrary(path: string | null) {
-  activityStore.load(path)
+async function syncActivityLibrary(path: string | null) {
+  await activityStore.load(path)
   knownReadingStatus.clear()
   knownAiSummaryDone.clear()
   libraryStore.papers.forEach(paper => {
@@ -396,7 +469,7 @@ onMounted(async () => {
   document.addEventListener('argus-paper-drag-end', onPaperDragEnd)
   window.addEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)
   activityStore.startHeartbeat()
-  syncActivityLibrary(libraryStore.currentPath)
+  await syncActivityLibrary(libraryStore.currentPath)
   restoreWindowSize()
 
   unlistenLibraryPaperAdded = await listen('library-paper-added', () => {
@@ -421,7 +494,8 @@ onMounted(async () => {
   // Load settings and collections on startup (independent — load in parallel).
   if (libraryStore.currentPath) {
     await Promise.all([settingsStore.load(), collectionsStore.load(), aiStore.load(), ragStore.load()])
-    readerStore.loadTabs(libraryStore.currentPath)
+    await readerStore.loadTabs(libraryStore.currentPath)
+    await loadMainLayout(libraryStore.currentPath)
     initSnippetStore()
   }
 
@@ -515,11 +589,13 @@ function onMouseUp() {
   } else if (finishedSide === 'right') {
     saveLayoutNumber(MAIN_RIGHT_WIDTH_KEY, rightWidth.value)
   }
+  saveMainLayout()
 }
 
 async function onLibraryOpened() {
   await Promise.all([settingsStore.load(), collectionsStore.load(), aiStore.load(), ragStore.load()])
-  readerStore.loadTabs(libraryStore.currentPath!)
+  await readerStore.loadTabs(libraryStore.currentPath!)
+  await loadMainLayout(libraryStore.currentPath!)
   initSnippetStore()
 }
 
@@ -533,7 +609,7 @@ watch(
     if (newPath && newPath !== oldPath) {
       await onLibraryOpened()
     }
-    if (newPath !== oldPath) syncActivityLibrary(newPath)
+    if (newPath !== oldPath) await syncActivityLibrary(newPath)
   }
 )
 
@@ -587,6 +663,7 @@ watch(rightSidebarVisible, (visible) => {
   try {
     localStorage.setItem(MAIN_RIGHT_VISIBLE_KEY, String(visible))
   } catch {}
+  saveMainLayout()
 })
 
 watch(sidebarTab, (tab) => {
@@ -594,6 +671,7 @@ watch(sidebarTab, (tab) => {
   try {
     localStorage.setItem(MAIN_RIGHT_TAB_KEY, tab)
   } catch {}
+  saveMainLayout()
 })
 
 watch(switchToTranslationsTab, (val) => {

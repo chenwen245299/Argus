@@ -31,6 +31,7 @@ export const useReaderStore = defineStore('reader', () => {
   // Transient commands aimed at the currently-active viewer.
   const scrollToHighlightId = ref<string | null>(null)
   const pendingPageJump     = ref<number | null>(null)
+  let tabSaveChain: Promise<unknown> = Promise.resolve()
 
   const EMPTY_HIGHLIGHTS: Highlight[] = []
   // Active-tab views — the right sidebar / highlights tab read these.
@@ -137,21 +138,58 @@ export const useReaderStore = defineStore('reader', () => {
 
   function saveTabs(libraryPath: string) {
     try {
-      localStorage.setItem(_tabKey(libraryPath), JSON.stringify({
+      const snapshot = JSON.parse(JSON.stringify({
         tabs: tabs.value,
         activeSlug: activeSlug.value,
-      }))
+      })) as { tabs: Tab[]; activeSlug: string | null }
+      localStorage.setItem(_tabKey(libraryPath), JSON.stringify(snapshot))
+      tabSaveChain = tabSaveChain
+        .catch(() => undefined)
+        .then(() => invoke('patch_library_ui_state', {
+          root: libraryPath,
+          patch: { version: 1, tabs: snapshot },
+        }))
+        .catch(e => console.error('[reader] save ui_state tabs failed:', e))
     } catch {}
   }
 
-  function loadTabs(libraryPath: string) {
+  async function loadTabs(libraryPath: string) {
+    let legacyState: { tabs: Tab[]; activeSlug: string | null } | null = null
     try {
       const raw = localStorage.getItem(_tabKey(libraryPath))
-      if (!raw) return
-      const state = JSON.parse(raw) as { tabs: Tab[]; activeSlug: string | null }
-      tabs.value = Array.isArray(state.tabs) ? state.tabs : []
-      activeSlug.value = state.activeSlug ?? null
+      if (raw) {
+        const state = JSON.parse(raw) as { tabs: Tab[]; activeSlug: string | null }
+        legacyState = {
+          tabs: Array.isArray(state.tabs) ? state.tabs : [],
+          activeSlug: typeof state.activeSlug === 'string' ? state.activeSlug : null,
+        }
+      }
     } catch {}
+
+    try {
+      const uiState = await invoke<Record<string, unknown>>('get_library_ui_state', { root: libraryPath })
+      const state = uiState.tabs as { tabs?: unknown; activeSlug?: unknown } | undefined
+      if (state && Array.isArray(state.tabs)) {
+        tabs.value = state.tabs as Tab[]
+        activeSlug.value = typeof state.activeSlug === 'string' ? state.activeSlug : null
+        return
+      }
+      if (legacyState) {
+        tabs.value = legacyState.tabs
+        activeSlug.value = legacyState.activeSlug
+        saveTabs(libraryPath)
+        return
+      }
+    } catch (e) {
+      console.error('[reader] load ui_state tabs failed:', e)
+      if (legacyState) {
+        tabs.value = legacyState.tabs
+        activeSlug.value = legacyState.activeSlug
+        return
+      }
+    }
+    tabs.value = []
+    activeSlug.value = null
   }
 
   function setPdfDoc(doc: PDFDocumentProxy, slug?: string) {

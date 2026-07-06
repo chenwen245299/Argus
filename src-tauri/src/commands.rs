@@ -2697,6 +2697,78 @@ pub fn clear_token_usage(state: State<'_, LibraryRoot>) -> Result<(), String> {
     crate::token_usage::clear(&root)
 }
 
+// ── Activity log ─────────────────────────────────────────────────────────────
+
+fn activity_log_path(root: &str) -> std::path::PathBuf {
+    std::path::Path::new(root).join(".argus").join("activity.json")
+}
+
+fn empty_activity_log() -> serde_json::Value {
+    serde_json::json!({ "version": 1, "days": {} })
+}
+
+#[tauri::command]
+pub fn get_activity_log(root: String) -> Result<serde_json::Value, String> {
+    let path = activity_log_path(&root);
+    if !path.exists() {
+        return Ok(empty_activity_log());
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Read activity.json: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("Parse activity.json: {e}"))
+}
+
+#[tauri::command]
+pub fn save_activity_log(root: String, data: serde_json::Value) -> Result<(), String> {
+    let argus_dir = std::path::Path::new(&root).join(".argus");
+    std::fs::create_dir_all(&argus_dir).map_err(|e| format!("Create .argus: {e}"))?;
+    let content =
+        serde_json::to_string_pretty(&data).map_err(|e| format!("Serialize activity.json: {e}"))?;
+    crate::fsutil::atomic_write_str(&argus_dir.join("activity.json"), &content)
+        .map_err(|e| format!("Write activity.json: {e}"))
+}
+
+// ── Per-library UI state ─────────────────────────────────────────────────────
+
+fn ui_state_path(root: &str) -> std::path::PathBuf {
+    std::path::Path::new(root).join(".argus").join("ui_state.json")
+}
+
+#[tauri::command]
+pub fn get_library_ui_state(root: String) -> Result<serde_json::Value, String> {
+    let path = ui_state_path(&root);
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("Read ui_state.json: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("Parse ui_state.json: {e}"))
+}
+
+#[tauri::command]
+pub fn save_library_ui_state(root: String, state: serde_json::Value) -> Result<(), String> {
+    let argus_dir = std::path::Path::new(&root).join(".argus");
+    std::fs::create_dir_all(&argus_dir).map_err(|e| format!("Create .argus: {e}"))?;
+    let content =
+        serde_json::to_string_pretty(&state).map_err(|e| format!("Serialize ui_state.json: {e}"))?;
+    crate::fsutil::atomic_write_str(&argus_dir.join("ui_state.json"), &content)
+        .map_err(|e| format!("Write ui_state.json: {e}"))
+}
+
+#[tauri::command]
+pub fn patch_library_ui_state(root: String, patch: serde_json::Value) -> Result<(), String> {
+    let mut state = get_library_ui_state(root.clone()).unwrap_or_else(|_| serde_json::json!({}));
+    if !state.is_object() {
+        state = serde_json::json!({});
+    }
+    if let (Some(target), Some(source)) = (state.as_object_mut(), patch.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    save_library_ui_state(root, state)
+}
+
 // ── Folder paths ─────────────────────────────────────────────────────────────
 
 #[tauri::command]

@@ -7,6 +7,7 @@ import { useAiStore, type ModelOption } from '../stores/ai'
 import { useRagStore } from '../stores/rag'
 import { useSettingsStore } from '../stores/settings'
 import MermaidBlock from './MermaidBlock.vue'
+import WindowControls from './WindowControls.vue'
 import { renderMarkdown, getSegments } from '../utils/renderMarkdown'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
@@ -16,6 +17,9 @@ import type { ChatContentPart, ChatMessage, ModelSelection, RetrievedChunk, Pape
 
 const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag'] }>()
 const { t } = useI18n()
+// On Windows the native decorations are off, so we drop the macOS traffic-light
+// gutter and render our own window controls (see WindowControls).
+const isWindows = navigator.userAgent.toLowerCase().includes('windows')
 const ai = useAiStore()
 const ragStore = useRagStore()
 const settingsStore = useSettingsStore()
@@ -102,7 +106,14 @@ interface LibraryAnswerVariant {
   createdAt: string
   model?: ModelSelection | null
   modelLabel?: string
+  // Accumulated thinking/reasoning tokens (shown in the collapsible 思考过程 box)
+  // when reasoning mode was on for this turn.
+  reasoningContent?: string
   contextContent?: LibrarySentContextPayload
+  // Titles of the papers sent as context on this turn. Kept when persisting (the
+  // heavy `contextContent` is stripped) so the per-message badge + dedup survive
+  // a reload — mirrors how AiTab persists its context flags.
+  contextPaperLabels?: string[]
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
@@ -125,7 +136,9 @@ interface LibraryUiMessage {
   modelLabel?: string
   variants?: LibraryAnswerVariant[]
   activeVariantId?: string
+  reasoningContent?: string
   contextContent?: LibrarySentContextPayload
+  contextPaperLabels?: string[]
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
@@ -307,6 +320,38 @@ function loadKnowledgeSource(): KnowledgeSource {
 
 const knowledgeSource = ref<KnowledgeSource>(loadKnowledgeSource())
 const sourcePickerOpen = ref(false)
+
+// Reasoning / thinking-mode state (mirrors AiTab). DeepSeek exposes high/max;
+// everyone else low/medium/high — the backend maps DeepSeek's levels.
+const useReasoning = ref(false)
+const reasoningLevel = ref<'low' | 'medium' | 'high'>('high')
+const reasoningOpen = ref(false)
+const isDeepSeekSelected = computed(() => {
+  const sel = effectiveModel()
+  if (!sel) return false
+  const provider = ai.settings.providers.find(p => p.id === sel.providerId)
+  return !!provider?.base_url.toLowerCase().includes('deepseek')
+})
+
+// Per-answer "思考过程" collapse state. Absence = expanded (the default, so the
+// user sees the model think); presence = the user collapsed it. Keyed by answer id.
+const collapsedReasoning = ref<Set<string>>(new Set())
+function isReasoningCollapsed(id: string) {
+  return collapsedReasoning.value.has(id)
+}
+function toggleReasoning(id: string) {
+  const next = new Set(collapsedReasoning.value)
+  next.has(id) ? next.delete(id) : next.add(id)
+  collapsedReasoning.value = next
+}
+// "126 词 · 147 字符" — CJK chars count as one word each, Latin runs as one word.
+function reasoningStats(text: string) {
+  const chars = text.length
+  const cjk = (text.match(/[一-鿿぀-ヿ가-힯]/g) ?? []).length
+  const latin = (text.match(/[A-Za-z0-9]+/g) ?? []).length
+  return `${cjk + latin} 词 · ${chars} 字符`
+}
+
 const paperPickerOpen = ref(false)
 const paperPickerSearch = ref('')
 const selectedPaperSlugs = computed(() => {
@@ -365,6 +410,16 @@ function addSelectedPaper(paper: PaperIndexEntry) {
 
 function removeSelectedPaper(slug: string) {
   setActiveSelectedPaperSlugs(selectedPaperSlugs.value.filter(s => s !== slug))
+}
+
+// The picker is now the only place to manage the selection (the above-input strip
+// was removed), so a click there toggles a paper in or out.
+function toggleSelectedPaper(paper: PaperIndexEntry) {
+  if (selectedPaperSlugs.value.includes(paper.slug)) {
+    removeSelectedPaper(paper.slug)
+  } else {
+    addSelectedPaper(paper)
+  }
 }
 
 function clearSelectedPapers() {
@@ -544,6 +599,55 @@ const activeConv = computed(() =>
   conversations.value.find(c => c.id === activeConvId.value) ?? null
 )
 const activeMessages = computed(() => activeConv.value?.messages ?? [])
+
+// Left-rail message navigation: one tick per user message, hover previews the
+// text, click scrolls to it. Mirrors the per-paper AI chat (AiTab) rail.
+const messageNav = computed(() =>
+  activeMessages.value
+    .filter(m => m.role === 'user')
+    .map(m => ({ id: m.id, preview: m.content.trim() || '（空消息）' })),
+)
+
+function scrollToMessage(id: string) {
+  const container = messagesEl.value
+  if (!container) return
+  const el = container.querySelector<HTMLElement>(`[data-msg-id="${CSS.escape(id)}"]`)
+  if (!el) return
+  const top = container.scrollTop + el.getBoundingClientRect().top - container.getBoundingClientRect().top - 12
+  container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+}
+
+// The rail preview is teleported to <body> so no ancestor's `overflow: hidden`
+// can clip it.
+const navTip = ref<{ preview: string; x: number; y: number } | null>(null)
+// Index of the hovered tick, driving the "wave": the hovered tick is longest and
+// its neighbours elongate progressively less with distance.
+const hoveredNavIndex = ref<number | null>(null)
+
+const RAIL_BASE = 9
+const RAIL_PEAK = 24
+const RAIL_FALLOFF = 5
+
+function railLineWidth(index: number): number {
+  const h = hoveredNavIndex.value
+  if (h === null) return RAIL_BASE
+  const d = Math.abs(index - h)
+  return Math.max(RAIL_BASE, RAIL_PEAK - d * RAIL_FALLOFF)
+}
+
+function onNavHover(index: number, preview: string, e: Event) {
+  hoveredNavIndex.value = index
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  const y = Math.min(Math.max(r.top + r.height / 2, 56), window.innerHeight - 56)
+  // Anchor to the rail's left edge + the widest possible line + a gap, so the
+  // tooltip never overlaps the tick as it animates out to its peak width.
+  navTip.value = { preview, x: r.left + RAIL_PEAK + 14, y }
+}
+function clearNavHover() {
+  hoveredNavIndex.value = null
+  navTip.value = null
+}
+
 const canSend = computed(() =>
   (input.value.trim().length > 0 || attachments.value.length > 0) &&
   !loading.value &&
@@ -776,7 +880,9 @@ function activeAnswer(msg: LibraryUiMessage): LibraryAnswerVariant {
     createdAt: msg.createdAt,
     model: msg.model,
     modelLabel: msg.modelLabel,
+    reasoningContent: msg.reasoningContent,
     contextContent: msg.contextContent,
+    contextPaperLabels: msg.contextPaperLabels,
     inputTokens: msg.inputTokens,
     outputTokens: msg.outputTokens,
     totalTokens: msg.totalTokens,
@@ -822,8 +928,50 @@ function answerContextSections(answer: LibraryAnswerVariant) {
   return answer.contextContent?.sections?.filter(s => s.content?.trim()) ?? []
 }
 
-function hasAnswerContext(answer: LibraryAnswerVariant) {
-  return answerContextSections(answer).length > 0
+// The assistant answer that replies to a given user turn. Each user message is
+// immediately followed by its assistant message, whose active answer carries the
+// context the backend emitted for that turn.
+function answerForUserTurn(userMsg: LibraryUiMessage): LibraryAnswerVariant | null {
+  const msgs = activeMessages.value
+  const idx = msgs.findIndex(m => m.id === userMsg.id)
+  if (idx < 0) return null
+  const ans = msgs[idx + 1]
+  if (!ans || ans.role !== 'assistant') return null
+  return activeAnswer(ans)
+}
+
+// Titles of the papers attached to this user turn. Prefers the persisted labels
+// (they survive a reload); falls back to the transient section list.
+function turnPaperLabels(userMsg: LibraryUiMessage): string[] {
+  const a = answerForUserTurn(userMsg)
+  if (!a) return []
+  if (a.contextPaperLabels?.length) return a.contextPaperLabels
+  return answerContextSections(a).map(s => s.label)
+}
+
+// Full text of a paper label on this turn, for the expandable preview — present
+// only while the transient content is still in memory (gone after a reload, where
+// the badge still shows but the preview can't).
+function turnPaperContent(userMsg: LibraryUiMessage, label: string): string {
+  const a = answerForUserTurn(userMsg)
+  return a?.contextContent?.sections?.find(s => s.label === label)?.content ?? ''
+}
+
+// Papers this user turn introduces for the FIRST time (vs. earlier turns). The
+// model still receives every selected paper each turn — they live in the system
+// prompt, so we never stop sending them — but the badge is only shown on the turn
+// that first added a paper, like an attachment announced once, not on every reply.
+function newlyAddedPapers(userMsg: LibraryUiMessage): string[] {
+  const seen = new Set<string>()
+  for (const m of activeMessages.value) {
+    if (m.role !== 'user') continue
+    const labels = turnPaperLabels(m)
+    if (m.id === userMsg.id) {
+      return labels.filter(l => !seen.has(l))
+    }
+    for (const l of labels) seen.add(l)
+  }
+  return []
 }
 
 function answerUsedPdf(answer: LibraryAnswerVariant) {
@@ -1075,6 +1223,7 @@ async function runAssistantRequest(
   const sourcesEventName = `${eventName}-sources`
   const contextEventName = `${eventName}-context`
   const usageEventName = `${eventName}-usage`
+  const reasoningEventName = `${eventName}-reasoning`
   // Sources are collected per-request in a closure local (was a shared
   // module-level array that concurrent requests overwrote).
   let pendingSources: RetrievedChunk[] = []
@@ -1083,7 +1232,9 @@ async function runAssistantRequest(
   target.error = false
   target.streaming = true
   target.sources = undefined
+  target.reasoningContent = undefined
   target.contextContent = undefined
+  target.contextPaperLabels = undefined
   target.inputTokens = undefined
   target.outputTokens = undefined
   target.totalTokens = undefined
@@ -1114,8 +1265,25 @@ async function runAssistantRequest(
   offs.push(await listen<LibrarySentContextPayload>(contextEventName, (e) => {
     const sections = e.payload?.sections?.filter(s => s.content?.trim()) ?? []
     target.contextContent = { mode: e.payload?.mode, sections }
+    // Persist just the labels (survives the transient-content strip) so the badge
+    // and its dedup keep working after the conversation is reloaded.
+    target.contextPaperLabels = sections.map(s => s.label)
     persistActive()
   }))
+
+  // Only collect reasoning when the user turned thinking mode on — some models
+  // (e.g. DeepSeek) stream reasoning_content by default, and we don't want the
+  // 思考过程 box to appear unless it was explicitly requested.
+  if (useReasoning.value) {
+    offs.push(await listen<{ delta?: string; done?: boolean }>(reasoningEventName, (e) => {
+      if (e.payload.done) return
+      if (stoppedTargetIds.has(target.id)) return
+      const delta = e.payload.delta ?? ''
+      if (!delta) return
+      target.reasoningContent = (target.reasoningContent ?? '') + delta
+      scrollToBottom()
+    }))
+  }
 
   offs.push(await listen<StreamUsagePayload>(usageEventName, (e) => {
     const usage = e.payload
@@ -1140,6 +1308,12 @@ async function runAssistantRequest(
     const requestPaperSlugs = knowledgeSource.value === 'papers'
       ? normalizeSelectedPaperSlugs(conv.selectedPaperSlugs)
       : []
+    // DeepSeek only exposes two levels; the backend maps 'medium'->high, 'high'->max.
+    const provider = ai.settings.providers.find(p => p.id === sel?.providerId)
+    const isDeepseek = !!provider?.base_url.toLowerCase().includes('deepseek')
+    const effortToSend = isDeepseek
+      ? (reasoningLevel.value === 'high' ? 'high' : 'medium')
+      : reasoningLevel.value
     const finalText = await invoke<string>('chat_with_library', {
       messages: history,
       providerId: sel?.providerId ?? null,
@@ -1149,6 +1323,8 @@ async function runAssistantRequest(
       knowledgeSource: knowledgeSource.value,
       selectedPaperSlugs: requestPaperSlugs,
       attachments: null,
+      useReasoning: useReasoning.value,
+      reasoningEffort: useReasoning.value ? effortToSend : null,
       requestId,
     })
     // If the user pressed stop, don't refill content the backend produced anyway.
@@ -1373,6 +1549,9 @@ function closeModelMenu(e: MouseEvent) {
   if (!target.closest('.ks-picker')) {
     sourcePickerOpen.value = false
   }
+  if (!target.closest('.reasoning-picker')) {
+    reasoningOpen.value = false
+  }
 }
 
 watch(selectedModel, (sel) => {
@@ -1457,7 +1636,7 @@ onUnmounted(() => {
   <div class="lc-root">
 
     <!-- ── Unified titlebar (full-width, drag region) ───────────────────────── -->
-    <div class="lc-titlebar" data-tauri-drag-region>
+    <div class="lc-titlebar" :class="{ 'win-titlebar': isWindows }" data-tauri-drag-region>
       <div class="tl-space" data-tauri-drag-region />
       <template v-if="ai.loaded && ai.isConfigured">
         <div class="header-avatar" data-tauri-drag-region>
@@ -1491,7 +1670,7 @@ onUnmounted(() => {
             <!-- Snippet RAG controls -->
             <span v-if="snippetSyncing" class="rag-sync-progress">{{ snippetSyncProgress.done }}/{{ snippetSyncProgress.total }}</span>
             <button class="rag-refresh-btn" :class="{ refreshing: snippetSyncing }" title="刷新素材库嵌入状态" :disabled="snippetSyncing" @click="loadSnippetStoreCounts">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10"/><path d="M3.51 15a9 9 0 0 0 14.85 3.36L23 14"/></svg>
             </button>
             <div class="rag-counter" title="素材库：已嵌入素材 / 总素材数">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
@@ -1513,7 +1692,7 @@ onUnmounted(() => {
           <template v-else-if="knowledgeSource === 'paper-rag'">
             <span v-if="syncingMissing" class="rag-sync-progress">{{ syncProgress.done }}/{{ syncProgress.total }}</span>
             <button class="rag-refresh-btn" :class="{ refreshing: refreshingCounts || syncingMissing }" title="刷新嵌入状态" :disabled="refreshingCounts || syncingMissing" @click="refreshCounts">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10"/><path d="M3.51 15a9 9 0 0 0 14.85 3.36L23 14"/></svg>
             </button>
             <div class="rag-counter" title="向量库：已嵌入论文 / 总论文数">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
@@ -1559,6 +1738,7 @@ onUnmounted(() => {
       <template v-else>
         <div class="lc-titlebar-fill" data-tauri-drag-region />
       </template>
+      <WindowControls />
     </div>
 
     <!-- ── No AI provider ────────────────────────────────────────────────────── -->
@@ -1778,6 +1958,31 @@ onUnmounted(() => {
         </div>
 
         <!-- Messages -->
+        <div class="messages-wrap">
+        <nav
+          v-if="messageNav.length > 1"
+          class="rail-nav"
+          aria-label="消息导航"
+          @mouseleave="clearNavHover"
+        >
+          <button
+            v-for="(item, index) in messageNav"
+            :key="item.id"
+            type="button"
+            class="rail-tick"
+            @click="scrollToMessage(item.id)"
+            @mouseenter="onNavHover(index, item.preview, $event)"
+            @focus="onNavHover(index, item.preview, $event)"
+            @blur="clearNavHover"
+          >
+            <span class="rail-line" :class="{ active: index === hoveredNavIndex }" :style="{ width: `${railLineWidth(index)}px` }" />
+          </button>
+        </nav>
+        <Teleport to="body">
+          <div v-if="navTip" class="rail-tooltip-float" :style="{ left: `${navTip.x}px`, top: `${navTip.y}px` }">
+            {{ navTip.preview }}
+          </div>
+        </Teleport>
         <div ref="messagesEl" class="messages" @click="onMsgContainerClick">
 
           <!-- Empty state -->
@@ -1808,7 +2013,7 @@ onUnmounted(() => {
           <template v-for="msg in activeMessages" :key="msg.id">
 
             <!-- User -->
-            <div v-if="msg.role === 'user'" class="msg-row user">
+            <div v-if="msg.role === 'user'" class="msg-row user" :data-msg-id="msg.id">
               <div v-if="editingMsgId === msg.id" class="user-edit-card">
                 <textarea
                   :id="`edit-${msg.id}`"
@@ -1825,6 +2030,35 @@ onUnmounted(() => {
               </div>
               <template v-else>
                 <div class="user-message-stack">
+                  <!-- Papers first attached on this turn (deduped against earlier turns) -->
+                  <div v-if="newlyAddedPapers(msg).length" class="context-banner user-context-banner">
+                    <button
+                      class="ctx-pills"
+                      :title="expandedContextId === msg.id ? '收起' : '查看发送给 AI 的文献'"
+                      @click="toggleContextPanel(msg.id)"
+                    >
+                      <span
+                        v-for="(label, ci) in newlyAddedPapers(msg)"
+                        :key="`${msg.id}-ctx-${ci}`"
+                        class="ctx-pill ctx-paper"
+                        :title="label"
+                      >{{ label }}</span>
+                      <svg class="ctx-chevron" :class="{ open: expandedContextId === msg.id }" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <path d="m6 9 6 6 6-6"/>
+                      </svg>
+                    </button>
+                    <div v-if="expandedContextId === msg.id" class="ctx-preview">
+                      <div
+                        v-for="(label, ci) in newlyAddedPapers(msg)"
+                        :key="`${msg.id}-ctx-preview-${ci}`"
+                        class="ctx-section"
+                      >
+                        <div class="ctx-section-label">{{ label }}</div>
+                        <pre v-if="turnPaperContent(msg, label)" class="ctx-preview-text">{{ turnPaperContent(msg, label) }}</pre>
+                        <div v-else class="ctx-preview-text ctx-preview-empty">全文预览不可用（重新打开对话后不再保留）。</div>
+                      </div>
+                    </div>
+                  </div>
                   <div v-if="msg.attachments && msg.attachments.length" class="user-attachments">
                     <button
                       v-for="att in msg.attachments"
@@ -1867,32 +2101,27 @@ onUnmounted(() => {
                   <span v-else>{{ modelFallbackInitial(activeAnswer(msg)) }}</span>
                 </div>
                 <div class="assistant-content">
-                  <div v-if="hasAnswerContext(activeAnswer(msg))" class="context-banner">
+                  <!-- Thinking / reasoning content (collapsible) -->
+                  <div v-if="activeAnswer(msg).reasoningContent" class="reasoning-section">
                     <button
-                      class="ctx-pills"
-                      :title="expandedContextId === activeAnswer(msg).id ? '收起' : '查看发送给 AI 的上下文'"
-                      @click="toggleContextPanel(activeAnswer(msg).id)"
+                      class="reasoning-summary"
+                      @click="toggleReasoning(activeAnswer(msg).id)"
                     >
-                      <span
-                        v-for="(section, ci) in answerContextSections(activeAnswer(msg))"
-                        :key="`${activeAnswer(msg).id}-ctx-${ci}`"
-                        class="ctx-pill ctx-paper"
-                        :title="section.label"
-                      >{{ section.label }}</span>
-                      <svg class="ctx-chevron" :class="{ open: expandedContextId === activeAnswer(msg).id }" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                      <svg
+                        width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                        class="reasoning-chevron"
+                        :class="{ collapsed: isReasoningCollapsed(activeAnswer(msg).id) }"
+                      >
                         <path d="m6 9 6 6 6-6"/>
                       </svg>
+                      思考过程
+                      <span v-if="activeAnswer(msg).streaming && !activeAnswer(msg).content" class="reasoning-live-dot" />
+                      <span class="reasoning-count">{{ reasoningStats(activeAnswer(msg).reasoningContent || '') }}</span>
                     </button>
-                    <div v-if="expandedContextId === activeAnswer(msg).id" class="ctx-preview">
-                      <div
-                        v-for="(section, ci) in answerContextSections(activeAnswer(msg))"
-                        :key="`${activeAnswer(msg).id}-ctx-preview-${ci}`"
-                        class="ctx-section"
-                      >
-                        <div class="ctx-section-label">{{ section.label }}</div>
-                        <pre class="ctx-preview-text">{{ section.content }}</pre>
-                      </div>
-                    </div>
+                    <pre
+                      v-show="!isReasoningCollapsed(activeAnswer(msg).id)"
+                      class="reasoning-body"
+                    >{{ activeAnswer(msg).reasoningContent }}</pre>
                   </div>
 
                   <div
@@ -1900,9 +2129,11 @@ onUnmounted(() => {
                     :class="{ streaming: activeAnswer(msg).streaming, error: activeAnswer(msg).error }"
                   >
                     <!-- Streaming: render the throttled displayContent copy, not the
-                         raw content, so long answers don't re-render on every token. -->
+                         raw content, so long answers don't re-render on every token.
+                         Before any content arrives we show just a blinking cursor —
+                         no "思考中" placeholder (the 思考过程 box already covers thinking). -->
                     <template v-if="activeAnswer(msg).streaming">
-                      <div v-html="renderMarkdown((activeAnswer(msg).displayContent ?? activeAnswer(msg).content) || '<em style=\'opacity:.5\'>' + t('copilot.thinking') + '</em>')" />
+                      <div v-if="activeAnswer(msg).content" v-html="renderMarkdown(activeAnswer(msg).displayContent ?? activeAnswer(msg).content)" />
                       <span class="cursor-blink"/>
                     </template>
                     <!-- Done: Mermaid-aware segment rendering -->
@@ -2037,23 +2268,10 @@ onUnmounted(() => {
 
           </template>
         </div>
+        </div>
 
         <!-- Input area -->
         <div class="input-area">
-          <div v-if="knowledgeSource === 'papers' && selectedPapers.length > 0" class="selected-paper-strip input-context-strip">
-            <button
-              v-for="paper in selectedPapers"
-              :key="paper.slug"
-              class="selected-paper-chip"
-              :title="paper.title"
-              @click="removeSelectedPaper(paper.slug)"
-            >
-              <span>{{ paper.title }}</span>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
-          </div>
           <div class="composer">
             <div v-if="attachments.length" class="attachment-row">
               <div
@@ -2096,6 +2314,12 @@ onUnmounted(() => {
             />
             <div class="composer-footer">
               <div class="footer-left">
+                <button class="toolbar-btn" title="新建对话" @click="startNewConversation">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                    <path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"/>
+                  </svg>
+                </button>
                 <button
                   class="attach-btn"
                   title="添加图片或 PDF 附件"
@@ -2106,6 +2330,60 @@ onUnmounted(() => {
                     <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                   </svg>
                 </button>
+                <!-- Reasoning / thinking mode picker -->
+                <div class="reasoning-picker" @click.stop>
+                  <button
+                    class="toolbar-btn"
+                    :class="{ 'toolbar-btn-active': useReasoning }"
+                    title="思考模式"
+                    @click="reasoningOpen = !reasoningOpen"
+                  >
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
+                      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
+                      <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
+                      <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
+                    </svg>
+                    <span v-if="useReasoning" class="reasoning-badge">
+                      {{ isDeepSeekSelected
+                          ? (reasoningLevel === 'high' ? 'max' : 'high')
+                          : (reasoningLevel === 'low' ? '低' : reasoningLevel === 'medium' ? '中' : '高') }}
+                    </span>
+                  </button>
+                  <Transition name="reasoning-drop">
+                    <div v-if="reasoningOpen" class="reasoning-popover">
+                      <div class="reasoning-row">
+                        <span class="reasoning-label">思考模式</span>
+                        <button
+                          class="reasoning-toggle"
+                          :class="{ on: useReasoning }"
+                          @click="useReasoning = !useReasoning"
+                        >
+                          <span class="toggle-knob" />
+                        </button>
+                      </div>
+                      <div v-if="useReasoning" class="reasoning-levels">
+                        <template v-if="isDeepSeekSelected">
+                          <button
+                            v-for="lv in (['high', 'max'] as const)"
+                            :key="lv"
+                            class="level-btn"
+                            :class="{ active: lv === 'high' ? reasoningLevel === 'medium' : reasoningLevel === 'high' }"
+                            @click="reasoningLevel = lv === 'max' ? 'high' : 'medium'"
+                          >{{ lv }}</button>
+                        </template>
+                        <template v-else>
+                          <button
+                            v-for="lv in (['low', 'medium', 'high'] as const)"
+                            :key="lv"
+                            class="level-btn"
+                            :class="{ active: reasoningLevel === lv }"
+                            @click="reasoningLevel = lv"
+                          >{{ lv === 'low' ? '低' : lv === 'medium' ? '中' : '高' }}</button>
+                        </template>
+                      </div>
+                    </div>
+                  </Transition>
+                </div>
                 <!-- Knowledge source picker -->
                 <div class="ks-picker" @click.stop>
                   <button
@@ -2164,12 +2442,14 @@ onUnmounted(() => {
                 <button
                   v-if="knowledgeSource === 'papers'"
                   class="add-paper-context-btn"
-                  title="添加文献"
+                  :class="{ 'has-count': selectedPapers.length > 0 }"
+                  :title="selectedPapers.length > 0 ? `已选 ${selectedPapers.length} 篇文献` : '添加文献'"
                   @click="openPaperPicker"
                 >
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
                     <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
                   </svg>
+                  <span v-if="selectedPapers.length > 0" class="paper-count">{{ selectedPapers.length }}</span>
                 </button>
               </div>
               <div class="footer-right">
@@ -2235,14 +2515,14 @@ onUnmounted(() => {
             :key="paper.slug"
             class="paper-picker-item"
             :class="{ selected: selectedPaperSlugs.includes(paper.slug) }"
-            @click="addSelectedPaper(paper)"
+            @click="toggleSelectedPaper(paper)"
           >
             <span class="paper-picker-item-title">{{ paper.title }}</span>
             <span class="paper-picker-item-meta">
               {{ paper.authors.slice(0, 2).join(', ') }}{{ paper.authors.length > 2 ? ' 等' : '' }}
               <template v-if="paper.year"> · {{ paper.year }}</template>
             </span>
-            <span v-if="selectedPaperSlugs.includes(paper.slug)" class="paper-picker-badge">已添加</span>
+            <span v-if="selectedPaperSlugs.includes(paper.slug)" class="paper-picker-badge">点击移除</span>
           </button>
         </div>
       </div>
@@ -2294,6 +2574,9 @@ onUnmounted(() => {
   background: color-mix(in srgb, var(--bg-primary) 85%, var(--bg-secondary));
 }
 .lc-titlebar .tl-space { width: 96px; flex-shrink: 0; }
+/* Windows: no traffic lights, custom controls sit flush to the right edge. */
+.lc-titlebar.win-titlebar { padding-right: 0; padding-left: 12px; }
+.lc-titlebar.win-titlebar .tl-space { width: 0; }
 .lc-titlebar-fill {
   flex: 1 1 auto;
   min-width: 12px;
@@ -2890,6 +3173,77 @@ onUnmounted(() => {
 
 /* ── Messages ────────────────────────────────────────────────────────────── */
 
+.messages-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Left navigation rail: one tick per user message (Codex-style). */
+.rail-nav {
+  position: absolute;
+  left: 2px;
+  top: 0;
+  bottom: 0;
+  width: 28px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 16px 0;
+  overflow: hidden;
+  pointer-events: none;   /* only the ticks are interactive */
+}
+.rail-tick {
+  pointer-events: auto;
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 8px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+.rail-line {
+  display: block;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--border-default);
+  /* width is set inline (distance-based magnification); animate it. */
+  transition: width .18s cubic-bezier(.34, 1.56, .64, 1), background .16s ease;
+}
+.rail-tick:hover .rail-line,
+.rail-line.active {
+  background: var(--accent);
+}
+/* Teleported to <body> so no ancestor overflow clips it. */
+.rail-tooltip-float {
+  position: fixed;
+  transform: translateY(-50%);
+  max-width: 260px;
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  padding: 8px 11px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-lg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  text-align: left;
+  pointer-events: none;
+  z-index: 9999;
+}
+
 .messages {
   flex: 1;
   min-height: 0;
@@ -3063,6 +3417,69 @@ onUnmounted(() => {
   gap: 3px;
 }
 
+/* ── Thinking / reasoning box (思考过程) ───────────────────────────────────── */
+.reasoning-section {
+  margin-bottom: 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  overflow: hidden;
+}
+.reasoning-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.reasoning-summary:hover { color: var(--text-primary); }
+.reasoning-chevron {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  transform: rotate(180deg);
+  transition: transform 0.15s ease;
+}
+.reasoning-chevron.collapsed { transform: rotate(0deg); }
+.reasoning-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: reasoning-pulse 1.15s infinite;
+}
+@keyframes reasoning-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.reasoning-count {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+/* The body is capped so it shows a preview and the rest scrolls — "显示一部分，
+   剩下的折叠起来" — and the whole box collapses from the header. */
+.reasoning-body {
+  margin: 0;
+  padding: 4px 13px 12px;
+  max-height: 220px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border-subtle);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.62;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .assistant-bubble {
   padding: 2px 0;
   background: transparent;
@@ -3224,6 +3641,16 @@ onUnmounted(() => {
   margin-bottom: 4px;
 }
 
+/* On the user turn the banner sits above the right-aligned bubble, so its pills
+   and expanded preview hug the right edge. */
+.user-context-banner {
+  align-items: flex-end;
+  margin-bottom: 6px;
+}
+.user-context-banner .ctx-preview {
+  align-self: stretch;
+}
+
 .ctx-pills {
   display: inline-flex;
   align-items: center;
@@ -3304,6 +3731,10 @@ onUnmounted(() => {
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.ctx-preview-empty {
+  color: var(--text-tertiary);
+  font-style: italic;
 }
 
 .user-edit-card {
@@ -3637,47 +4068,6 @@ onUnmounted(() => {
 .chat-input:focus { outline: none; }
 .chat-input:disabled { opacity: 0.5; }
 
-.selected-paper-strip {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  padding: 2px 0 6px;
-}
-
-.input-context-strip {
-  padding: 0;
-  margin: 0 auto 8px;
-}
-
-.selected-paper-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  max-width: 210px;
-  height: 24px;
-  padding: 0 8px;
-  border-radius: var(--radius-pill);
-  background: color-mix(in srgb, var(--accent) 9%, var(--bg-secondary));
-  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border-subtle));
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 600;
-}
-.selected-paper-chip span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.selected-paper-chip:hover {
-  background: color-mix(in srgb, var(--accent) 14%, var(--bg-secondary));
-}
-.selected-paper-empty {
-  font-size: 11px;
-  color: var(--text-tertiary);
-}
-
 .composer-footer {
   display: flex;
   align-items: center;
@@ -3690,22 +4080,22 @@ onUnmounted(() => {
 .footer-right { display: flex; align-items: center; gap: 8px; }
 
 .attach-btn {
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  color: var(--text-secondary);
-  background: var(--bg-secondary);
+  border: none;
+  border-radius: 8px;
+  color: var(--text-tertiary);
+  background: transparent;
   flex-shrink: 0;
   cursor: pointer;
+  transition: background .12s ease, color .12s ease;
 }
 .attach-btn:hover:not(:disabled) {
   background: var(--bg-hover);
-  border-color: color-mix(in srgb, var(--accent) 34%, var(--border-default));
-  color: var(--accent);
+  color: var(--text-primary);
 }
 .attach-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
@@ -3841,20 +4231,39 @@ onUnmounted(() => {
 .lightbox-close:hover { background: rgba(0, 0, 0, 0.65); }
 
 .add-paper-context-btn {
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  color: var(--accent);
-  background: var(--bg-secondary);
+  gap: 3px;
+  border: none;
+  border-radius: 8px;
+  color: var(--text-tertiary);
+  background: transparent;
   flex-shrink: 0;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
 }
 .add-paper-context-btn:hover {
   background: var(--bg-hover);
-  border-color: color-mix(in srgb, var(--accent) 34%, var(--border-default));
+  color: var(--text-primary);
+}
+/* When papers are selected the button widens to show the count and tints to the
+   accent — a subtle state, not a solid fill, so the toolbar stays flat. */
+.add-paper-context-btn.has-count {
+  width: auto;
+  padding: 0 8px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.add-paper-context-btn.has-count:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.add-paper-context-btn .paper-count {
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 /* Knowledge source picker */
@@ -3866,23 +4275,22 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  height: 24px;
+  height: 26px;
   padding: 0 8px;
-  border-radius: var(--radius-pill);
-  background: var(--bg-secondary);
-  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  border: none;
   font-size: 11px;
   font-weight: 600;
   color: var(--text-tertiary);
   cursor: pointer;
-  transition: background 0.1s, color 0.1s, border-color 0.1s;
+  transition: background 0.12s ease, color 0.12s ease;
   white-space: nowrap;
 }
 .ks-trigger:hover,
 .ks-trigger.active {
   background: var(--bg-hover);
-  border-color: var(--border-subtle);
-  color: var(--text-secondary);
+  color: var(--text-primary);
 }
 .ks-trigger.on {
   color: var(--accent);
@@ -3896,6 +4304,115 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 .ks-trigger.on .ks-dot { background: var(--accent); }
+
+/* ── Reasoning / thinking-mode picker (flat toolbar button + popover) ──────── */
+.toolbar-btn {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.toolbar-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
+.toolbar-btn:disabled { opacity: .4; cursor: not-allowed; }
+.toolbar-btn-active { color: var(--accent) !important; background: color-mix(in srgb, var(--accent) 8%, transparent) !important; }
+.reasoning-badge {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.4;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, var(--bg-primary));
+  border-radius: 3px;
+  padding: 0 2px;
+}
+.reasoning-picker { position: relative; }
+.reasoning-popover {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 90;
+  min-width: 160px;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--border-default) 85%, transparent);
+  background: color-mix(in srgb, var(--bg-primary) 96%, transparent);
+  backdrop-filter: blur(18px) saturate(1.4);
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, .18);
+}
+.reasoning-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.reasoning-label {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+.reasoning-toggle {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  border: none;
+  border-radius: 10px;
+  background: var(--border-default);
+  transition: background .2s ease;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.reasoning-toggle.on { background: var(--accent); }
+.toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .2);
+  transition: transform .2s ease;
+}
+.reasoning-toggle.on .toggle-knob { transform: translateX(14px); }
+.reasoning-levels {
+  display: flex;
+  gap: 5px;
+}
+.level-btn {
+  flex: 1;
+  padding: 4px 6px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-default);
+  background: transparent;
+  cursor: pointer;
+  transition: all .15s ease;
+}
+.level-btn:hover { color: var(--accent); border-color: var(--accent); }
+.level-btn.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.reasoning-drop-enter-active,
+.reasoning-drop-leave-active { transition: opacity .15s ease, transform .15s ease; }
+.reasoning-drop-enter-from,
+.reasoning-drop-leave-to { opacity: 0; transform: translateY(4px); }
 
 .ks-chevron {
   flex-shrink: 0;

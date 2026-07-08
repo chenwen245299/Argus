@@ -6,7 +6,7 @@ import { runTranslation, triggerAskAi } from '../stores/translationHistory'
 import { openAddSnippetModal } from '../stores/snippetLibrary'
 import * as pdfjsLib from 'pdfjs-dist'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
-import { EventBus, SimpleLinkService } from 'pdfjs-dist/web/pdf_viewer.mjs'
+import { EventBus, PDFLinkService } from 'pdfjs-dist/web/pdf_viewer.mjs'
 import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
@@ -273,13 +273,79 @@ let progressDebounce: ReturnType<typeof setTimeout> | null = null
 // IntersectionObserver for lazy rendering
 let observer: IntersectionObserver | null = null
 
-// PDF.js link/annotation handling
-const eventBus = new EventBus()
-const linkService = new SimpleLinkService({ eventBus, externalLinkTarget: 2 })
+// PDF.js link/annotation handling.
+//
+// `SimpleLinkService` is a navigation no-op — its `setDocument`/`goToDestination`
+// do nothing — so internal jump links (table-of-contents entries, cross-references,
+// "see figure N") never moved the viewport. This subclass of `PDFLinkService`
+// resolves each destination to a page + Y offset and drives our own page scroller,
+// so those links actually jump to the target.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+class ArgusLinkService extends PDFLinkService {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async goToDestination(dest: string | any[]) {
+    const doc = pdfDoc.value
+    if (!doc) return
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let explicitDest: any[] | null
+    try {
+      explicitDest = typeof dest === 'string' ? await doc.getDestination(dest) : await dest
+    } catch {
+      return
+    }
+    if (!Array.isArray(explicitDest)) return
 
-eventBus.on('pagechanging', ({ pageNumber }: { pageNumber: number }) => {
-  scrollToPageIndex(pageNumber - 1, 0)
-})
+    const destRef = explicitDest[0]
+    let pageIndex: number | null = null
+    if (destRef && typeof destRef === 'object') {
+      try {
+        pageIndex = await doc.getPageIndex(destRef)
+      } catch {
+        return
+      }
+    } else if (Number.isInteger(destRef)) {
+      pageIndex = destRef as number
+    }
+    if (pageIndex === null || pageIndex < 0 || pageIndex >= doc.numPages) return
+
+    // Resolve the target Y (scale-1 CSS pixels from the page top) from the
+    // destination's fit spec; fall back to the page top when it has no coordinate.
+    let offsetY = 0
+    try {
+      const page = await doc.getPage(pageIndex + 1)
+      offsetY = destOffsetY(page.getViewport({ scale: 1 }), explicitDest)
+      page.cleanup()
+    } catch {
+      // fall back to page top
+    }
+
+    await ensurePageRendered(pageIndex)
+    scrollToPageIndex(pageIndex, offsetY)
+  }
+
+  goToPage(val: number | string) {
+    const doc = pdfDoc.value
+    if (!doc) return
+    const pageNumber = typeof val === 'number' ? val : parseInt(val, 10)
+    if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > doc.numPages) return
+    void ensurePageRendered(pageNumber - 1).then(() => scrollToPageIndex(pageNumber - 1, 0))
+  }
+
+  executeNamedAction(action: string) {
+    const doc = pdfDoc.value
+    if (!doc) return
+    switch (action) {
+      case 'NextPage': this.goToPage(displayPage.value + 1); break
+      case 'PrevPage': this.goToPage(displayPage.value - 1); break
+      case 'FirstPage': this.goToPage(1); break
+      case 'LastPage': this.goToPage(doc.numPages); break
+      default: break
+    }
+  }
+}
+
+const eventBus = new EventBus()
+const linkService = new ArgusLinkService({ eventBus, externalLinkTarget: 2 })
 
 // ── Computed ──────────────────────────────────────────────────────────────────
 const sortedHighlights = computed(() => {
@@ -424,7 +490,10 @@ function onAnnotationLayerClick(e: MouseEvent) {
   const target = e.target as HTMLElement
   const link = target.closest('a')
   if (!link) return
-  if (link.hasAttribute('data-internal-link')) return
+  // Internal jump links (GoTo destinations, named actions) carry `data-internal-link`
+  // on their container section. The annotation layer already wired their <a>.onclick
+  // to our link service, so let that handle navigation — don't treat them as URLs.
+  if (link.closest('[data-internal-link]')) return
   const href = link.getAttribute('href')
   if (!href) return
   e.preventDefault()
@@ -437,6 +506,30 @@ async function openExternalLink(url: string) {
     await invoke('open_url', { url })
   } catch (e) {
     console.error('Failed to open URL:', e)
+  }
+}
+
+// Convert a PDF destination array's target position into a scale-1 CSS-pixel
+// offset from the top of the page. Supports the common fit types that carry a
+// vertical anchor (XYZ/FitH/FitBH/FitR); other types scroll to the page top.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function destOffsetY(viewport: any, explicitDest: any[]): number {
+  const fit = explicitDest[1]
+  if (!fit || typeof fit !== 'object') return 0
+  let top: number | null = null
+  switch (fit.name) {
+    case 'XYZ': top = explicitDest[3]; break
+    case 'FitH':
+    case 'FitBH': top = explicitDest[2]; break
+    case 'FitR': top = explicitDest[5]; break
+    default: return 0
+  }
+  if (typeof top !== 'number') return 0
+  try {
+    const [, vy] = viewport.convertToViewportPoint(0, top)
+    return Math.max(0, vy)
+  } catch {
+    return 0
   }
 }
 

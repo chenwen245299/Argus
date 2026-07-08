@@ -1342,6 +1342,12 @@ pub fn open_arxiv_window(app: &tauri::AppHandle) -> Result<(), String> {
         .hidden_title(true)
         .traffic_light_position(tauri::LogicalPosition { x: 14.0, y: 22.0 });
 
+    // Windows has no overlay titlebar; drop the native decorations so the window
+    // uses our custom in-app titlebar (WindowControls) instead of showing an
+    // extra native title row above it — matching the main window.
+    #[cfg(target_os = "windows")]
+    let builder = builder.decorations(false);
+
     let win = builder
         .build()
         .map_err(|e| format!("Open arXiv window: {e}"))?;

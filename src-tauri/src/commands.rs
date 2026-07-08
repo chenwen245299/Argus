@@ -1768,6 +1768,8 @@ pub async fn chat_with_library(
     knowledge_source: Option<String>,
     selected_paper_slugs: Option<Vec<String>>,
     attachments: Option<Vec<crate::models::ChatContentPart>>,
+    use_reasoning: Option<bool>,
+    reasoning_effort: Option<String>,
     request_id: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
@@ -1788,6 +1790,8 @@ pub async fn chat_with_library(
         knowledge_source.as_deref(),
         selected_paper_slugs.as_deref(),
         attachments.as_deref(),
+        use_reasoning.unwrap_or(false),
+        reasoning_effort.as_deref(),
         &app,
         cancel,
     )

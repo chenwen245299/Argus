@@ -343,6 +343,8 @@ pub async fn chat_with_library(
     knowledge_source: Option<&str>,
     selected_paper_slugs: Option<&[String]>,
     attachments: Option<&[ChatContentPart]>,
+    use_reasoning: bool,
+    reasoning_effort: Option<&str>,
     app: &tauri::AppHandle,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String, String> {
@@ -483,8 +485,8 @@ pub async fn chat_with_library(
         &all_messages,
         event_name,
         app,
-        false,
-        None,
+        use_reasoning,
+        reasoning_effort,
         "library_chat",
         cancel,
     )
@@ -694,6 +696,12 @@ pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
         .traffic_light_position(tauri::LogicalPosition { x: 14.0, y: 22.0 });
+
+    // Windows has no overlay titlebar; drop the native decorations so the window
+    // uses our custom in-app titlebar (WindowControls) instead of showing an
+    // extra native title row above it — matching the main window.
+    #[cfg(target_os = "windows")]
+    let builder = builder.decorations(false);
 
     let win = builder
         .build()

@@ -9,6 +9,11 @@ import { useArxivStore } from '../stores/arxiv'
 import { useAiStore } from '../stores/ai'
 import { useCollectionsStore } from '../stores/collections'
 import type { ArxivPaper, Collection } from '../types'
+import WindowControls from '../components/WindowControls.vue'
+
+// On Windows the native decorations are off, so we drop the macOS traffic-light
+// gutter and render our own window controls (see WindowControls).
+const isWindows = navigator.userAgent.toLowerCase().includes('windows')
 
 function openUrl(url: string) {
   invoke('open_url', { url }).catch(console.error)
@@ -618,7 +623,7 @@ function jumpToDate(dateStr: string) {
 <template>
   <div class="arxiv-view">
     <!-- Top bar -->
-    <div class="arxiv-topbar" data-tauri-drag-region>
+    <div class="arxiv-topbar" :class="{ 'win-titlebar': isWindows }" data-tauri-drag-region>
       <div class="tl-space" data-tauri-drag-region />
       <div class="topbar-left" data-tauri-drag-region>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="topbar-icon" data-tauri-drag-region>
@@ -670,6 +675,7 @@ function jumpToDate(dateStr: string) {
           设置
         </button>
       </div>
+      <WindowControls />
     </div>
 
     <!-- Status bar (progress / errors) -->
@@ -1258,6 +1264,9 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   gap: 0;
 }
 .tl-space { width: 96px; flex-shrink: 0; }
+/* Windows: no traffic lights, custom controls sit flush to the right edge. */
+.arxiv-topbar.win-titlebar { padding-right: 0; padding-left: 12px; }
+.arxiv-topbar.win-titlebar .tl-space { width: 0; }
 .topbar-left { display: flex; align-items: center; gap: 7px; min-width: 0; flex: 1; }
 .topbar-icon { color: var(--accent); flex-shrink: 0; }
 .topbar-title { font-size: 14px; font-weight: 650; white-space: nowrap; letter-spacing: -0.01em; }

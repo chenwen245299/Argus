@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, onUnmounted, Teleport } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch, Teleport } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -24,20 +24,18 @@ const ragStore = useRagStore()
 const searchQuery = ref('')
 
 // ── Snippet embedding (RAG vectorization) ───────────────────────────────────────
-// Embedding is a store-wide operation: `embed_all_snippets` vectorizes every
-// unembedded snippet across all libraries, and `get_snippet_store_info` reports
-// the store-wide embedded count. So the counter/button here reflect all snippets,
-// not just the current library.
+// Scoped to the current library: the counter shows this library's embedded/total
+// and the button embeds only this library's unembedded snippets via
+// `embed_library_snippets`.
 const embeddedCount = ref(0)
 const syncing = ref(false)
 const syncProgress = ref({ done: 0, total: 0, failed: 0 })
-const totalCount = computed(() => snippets.value.length)
+const totalCount = computed(() => snippets.value.filter(s => s.libraryId === props.libraryId).length)
 const unembeddedCount = computed(() => Math.max(0, totalCount.value - embeddedCount.value))
 
 async function loadEmbeddedCount() {
   try {
-    const info = await invoke<{ embedded_count: number }>('get_snippet_store_info')
-    embeddedCount.value = info.embedded_count
+    embeddedCount.value = await invoke<number>('get_library_embedded_count', { libraryId: props.libraryId })
   } catch {
     embeddedCount.value = 0
   }
@@ -56,7 +54,7 @@ async function syncEmbeddings() {
     },
   )
   try {
-    const [done, failed] = await invoke<[number, number]>('embed_all_snippets')
+    const [done, failed] = await invoke<[number, number]>('embed_library_snippets', { libraryId: props.libraryId })
     syncProgress.value = { done, total: done + failed, failed }
     await loadEmbeddedCount()
   } catch {
@@ -72,6 +70,10 @@ onMounted(() => {
   if (!ragStore.loaded) ragStore.load()
   loadEmbeddedCount()
 })
+
+// The component instance is reused across libraries (no :key), so reload the
+// embedded count whenever the active library changes.
+watch(() => props.libraryId, () => { loadEmbeddedCount() })
 
 onUnmounted(() => {
   unlistenEmbedProgress?.()

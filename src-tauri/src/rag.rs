@@ -1761,6 +1761,33 @@ pub async fn get_snippet_store_info(root: &str) -> Result<crate::models::Snippet
     .map_err(|e| e.to_string())?
 }
 
+/// Count how many of one library's snippets are already embedded. Computed by
+/// intersecting the library's live snippet ids with the embedded-id set (rather
+/// than trusting `snippet_chunks.library_id`), so orphaned chunks left by a
+/// deleted/moved snippet can never push the count above the library's total.
+pub async fn get_library_embedded_count(root: &str, library_id: &str) -> Result<usize, String> {
+    let root = root.to_string();
+    let library_id = library_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let snippets = crate::snippets::get_snippets(&root, &library_id).unwrap_or_default();
+        if snippets.is_empty() {
+            return Ok(0);
+        }
+        let conn = open_db_with_snippet_table(&root)?;
+        let mut stmt = conn
+            .prepare("SELECT snippet_id FROM snippet_chunks")
+            .map_err(|e| e.to_string())?;
+        let embedded_ids: std::collections::HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(snippets.iter().filter(|s| embedded_ids.contains(&s.id)).count())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 pub async fn delete_snippet_chunk(root: &str, snippet_id: &str) -> Result<(), String> {
     let root = root.to_string();
     let snippet_id = snippet_id.to_string();

@@ -717,6 +717,7 @@ function sourceTypeLabel(type: string): string {
     text: t('libraryChat.sourceText'),
     highlight: t('libraryChat.sourceHighlight'),
     note: t('libraryChat.sourceNote'),
+    snippet: t('libraryChat.sourceSnippet'),
   }
   return map[type] ?? type
 }
@@ -4023,6 +4024,11 @@ onUnmounted(() => {
 .st-note {
   background: color-mix(in srgb, #2da44e 14%, transparent);
   color: #2da44e;
+}
+
+.st-snippet {
+  background: color-mix(in srgb, #8b5cf6 14%, transparent);
+  color: #8b5cf6;
 }
 
 /* ── Input area ──────────────────────────────────────────────────────────── */

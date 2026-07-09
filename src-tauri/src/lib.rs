@@ -225,6 +225,8 @@ pub fn run() {
             // ── Snippet RAG ──
             commands::get_snippet_store_info,
             commands::embed_all_snippets,
+            commands::get_library_embedded_count,
+            commands::embed_library_snippets,
             commands::embed_all_snippets_force,
             commands::delete_snippet_vector,
             // ── M8: arXiv window ──

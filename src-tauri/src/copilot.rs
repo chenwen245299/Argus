@@ -418,7 +418,26 @@ pub async fn chat_with_library(
             vec![]
         };
 
-        let _ = app.emit(sources_event_name, Vec::<crate::models::RetrievedChunk>::new());
+        // Surface the retrieved snippets as sources, reusing the library-chat
+        // `RetrievedChunk` shape so the same UI renders them. A snippet's
+        // `paper_id` stores the source paper's slug, so it doubles as `slug`
+        // for click-to-open.
+        let snippet_sources: Vec<crate::models::RetrievedChunk> = retrieved
+            .iter()
+            .map(|s| crate::models::RetrievedChunk {
+                chunk_id: s.snippet_id.clone(),
+                paper_id: s.paper_id.clone(),
+                slug: s.paper_id.clone(),
+                chunk_index: 0,
+                text: s.text.clone(),
+                score: s.score,
+                paper_title: s.paper_title.clone(),
+                source_type: "snippet".to_string(),
+                source_id: Some(s.snippet_id.clone()),
+                source_label: None,
+            })
+            .collect();
+        let _ = app.emit(sources_event_name, snippet_sources);
         system = build_snippet_system_prompt(&retrieved);
     } else {
         let settings = rag::get_rag_settings(root);

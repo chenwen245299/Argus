@@ -2135,6 +2135,30 @@ pub async fn embed_all_snippets(
 }
 
 #[tauri::command]
+pub async fn get_library_embedded_count(
+    library_id: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<usize, String> {
+    let root = get_root(&state)?;
+    rag::get_library_embedded_count(&root, &library_id).await
+}
+
+#[tauri::command]
+pub async fn embed_library_snippets(
+    library_id: String,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<(usize, usize), String> {
+    let root = get_root(&state)?;
+    // Reuse the store-wide "unembedded" scan, then keep only this library's.
+    let snippets: Vec<_> = rag::get_unembedded_snippets(&root)?
+        .into_iter()
+        .filter(|s| s.library_id == library_id)
+        .collect();
+    rag::embed_and_store_snippets(&root, snippets, &app).await
+}
+
+#[tauri::command]
 pub async fn embed_all_snippets_force(
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,

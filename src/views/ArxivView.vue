@@ -183,6 +183,7 @@ onMounted(async () => {
   void aiLoadPromise
   void collectionsLoadPromise
   window.addEventListener('keydown', onKeydown)
+  window.addEventListener('mousedown', onGlobalMousedown)
   emitTo('main', 'arxiv-window-opened').catch(() => {})
 })
 
@@ -192,11 +193,13 @@ onUnmounted(() => {
   if (addMsgTimer) clearTimeout(addMsgTimer)
   window.removeEventListener('resize', saveWindowSizeToStorage)
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('mousedown', onGlobalMousedown)
   emitTo('main', 'arxiv-window-closed').catch(() => {})
 })
 
 function onKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') {
+    if (arxivCtxMenu.value) { closeArxivCtx(); return }
     if (deletingSelectedConfirm.value) { deletingSelectedConfirm.value = false; return }
     if (hasSelection.value || activeSelectionDates.size > 0) { clearSelection(); return }
     if (deletingDate.value) { deletingDate.value = null; return }
@@ -528,6 +531,43 @@ async function deleteSelected() {
   } finally {
     deletingSelectedInProgress.value = false
   }
+}
+
+// Remove a single "not interested" paper from the recommendation list. Reuses
+// the same backend command as the batch delete.
+async function dismissPaper(arxivId: string) {
+  closeArxivCtx()
+  try {
+    await invoke('delete_arxiv_papers', { arxivIds: [arxivId] })
+    await store.loadInbox()
+    selectedPaperIds.delete(arxivId)
+    if (selectedId.value === arxivId) selectedId.value = null
+  } catch (e) {
+    console.error('dismiss arxiv paper failed:', e)
+  }
+}
+
+// ── List item right-click menu ──────────────────────────────────────────────
+const arxivCtxMenu = ref<{ x: number; y: number; arxivId: string } | null>(null)
+
+function openArxivCtx(e: MouseEvent, arxivId: string) {
+  e.preventDefault()
+  const MARGIN = 10
+  const menuW = 160
+  const menuH = 44
+  const x = Math.min(e.clientX, window.innerWidth - menuW - MARGIN)
+  const y = Math.min(e.clientY, window.innerHeight - menuH - MARGIN)
+  arxivCtxMenu.value = { x: Math.max(MARGIN, x), y: Math.max(MARGIN, y), arxivId }
+}
+
+function closeArxivCtx() {
+  arxivCtxMenu.value = null
+}
+
+function onGlobalMousedown(e: MouseEvent) {
+  if (!arxivCtxMenu.value) return
+  if ((e.target as Element | null)?.closest('.arxiv-ctx-menu')) return
+  closeArxivCtx()
 }
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -955,6 +995,7 @@ function jumpToDate(dateStr: string) {
                     unread: !paper.read
                   }"
                   @click="selectPaper(paper.arxiv_id)"
+                  @contextmenu.prevent.stop="openArxivCtx($event, paper.arxiv_id)"
                 >
                   <div class="item-check-zone">
                     <div
@@ -1171,6 +1212,13 @@ function jumpToDate(dateStr: string) {
                 <polyline points="10 9 9 9 8 9"/>
               </svg>
             </button>
+            <button class="btn-dismiss" title="从推荐中移除这篇文章" @click="dismissPaper(selectedPaper.arxiv_id)">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"/>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+              </svg>
+              移除
+            </button>
           </div>
 
           <!-- AI Summary -->
@@ -1210,6 +1258,24 @@ function jumpToDate(dateStr: string) {
             <ArxivSettingsPanel :standalone="true" @close="showSettings = false" />
           </div>
         </Transition>
+      </div>
+    </Teleport>
+
+    <!-- List item right-click menu -->
+    <Teleport to="body">
+      <div
+        v-if="arxivCtxMenu"
+        class="arxiv-ctx-menu"
+        :style="{ left: arxivCtxMenu.x + 'px', top: arxivCtxMenu.y + 'px' }"
+        @click.stop
+      >
+        <button class="arxiv-ctx-item danger" @click="dismissPaper(arxivCtxMenu.arxivId)">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          </svg>
+          移除
+        </button>
       </div>
     </Teleport>
 
@@ -2004,6 +2070,45 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   text-decoration: none; transition: background 0.1s, color 0.1s;
 }
 .btn-arxiv:hover, .btn-pdf:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+.btn-dismiss {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; color: var(--text-secondary);
+  border: 1px solid var(--border-default);
+  padding: 5px 12px; border-radius: var(--radius-pill);
+  background: var(--bg-primary);
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.btn-dismiss:hover {
+  background: color-mix(in srgb, #e5484d 12%, transparent);
+  color: #e5484d;
+  border-color: color-mix(in srgb, #e5484d 45%, transparent);
+}
+
+/* List item right-click menu */
+.arxiv-ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 132px;
+  padding: 4px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+}
+.arxiv-ctx-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none; background: transparent;
+  border-radius: var(--radius-sm);
+  font-size: 13px; color: var(--text-primary);
+  text-align: left; cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+.arxiv-ctx-item:hover { background: var(--bg-hover); }
+.arxiv-ctx-item.danger { color: #e5484d; }
+.arxiv-ctx-item.danger:hover { background: color-mix(in srgb, #e5484d 12%, transparent); }
 
 /* AI analysis trigger row */
 .analysis-trigger {

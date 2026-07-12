@@ -911,6 +911,12 @@ async function renderPage(idx: number) {
     // Annotation layer (links, forms) — rendered on top so links are clickable
     const annotationLayerDiv = document.createElement('div')
     annotationLayerDiv.className = 'annotationLayer'
+    // Same as the text layer: pdfjs sizes this container via setLayerDimensions,
+    // which writes `width: calc(var(--total-scale-factor) * <pageWidth>px)`. Without
+    // this variable the calc is invalid-at-computed-value-time, so the layer
+    // collapses to auto/0 and its percent-positioned link boxes shrink to nothing —
+    // links render but can't be clicked. Set it before render so links get real size.
+    annotationLayerDiv.style.setProperty('--total-scale-factor', String(scenScale))
     el.appendChild(annotationLayerDiv)
     appended.push(annotationLayerDiv)
 
@@ -2355,12 +2361,16 @@ function triggerInitialRender() {
 }
 
 /* ── PDF.js annotation layer (links) ── */
+/* `inset: 0` (not width/height) is deliberate: pdfjs writes an inline
+   `width/height: round(down, var(--total-scale-factor)*Npx, var(--scale-round-x))`.
+   When those CSS vars are unset the value is invalid-at-computed-value-time and
+   collapses to `auto`, which would shrink an absolutely-positioned layer with only
+   top/left to 0×0 — making its percent-positioned links zero-sized and unclickable
+   (the text layer below then steals hover, showing an I-beam). `inset: 0` stretches
+   it to fill the page box regardless, exactly like pdfjs's own `.textLayer`. */
 :deep(.annotationLayer) {
   position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
+  inset: 0;
   pointer-events: none;
 }
 
@@ -2373,6 +2383,7 @@ function triggerInitialRender() {
   display: block;
   width: 100%;
   height: 100%;
+  cursor: pointer;
 }
 
 /* ── Plain-text URL linkification overlay ── */

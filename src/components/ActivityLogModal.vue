@@ -251,72 +251,78 @@ function colorForDuration(ms: number) {
   return '#ef7a7a'
 }
 
-interface TimeOfDaySegment {
-  id: string
-  title: string
-  startPct: number
-  widthPct: number
+interface DayBucket {
+  ms: number
   color: string
-  label: string
+  title: string
 }
+
+// Fold every session onto a single 24h clock, split into evenly-spaced buckets
+// (status-page style). Each bucket accumulates how many ms were read during that
+// slot across all days in range, then colors by that total — busier slot, warmer bar.
+const DAY_BUCKET_COUNT = 48 // 30-minute resolution
+const MINUTES_PER_BUCKET = 1440 / DAY_BUCKET_COUNT
 
 function minuteOfDay(ts: number) {
   const d = new Date(ts)
   return d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60
 }
 
-function splitSessionIntoDaySegments(row: SessionRow): TimeOfDaySegment[] {
-  const start = new Date(row.start_at).getTime()
-  const end = Math.max(start, new Date(row.end_at).getTime())
-  const segments: TimeOfDaySegment[] = []
-  let cursor = start
-  let idx = 0
-
-  while (cursor < end) {
-    const d = new Date(cursor)
-    const nextDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime()
-    const segEnd = Math.min(end, nextDay)
-    const startMin = minuteOfDay(cursor)
-    const durationMin = Math.max(0.2, (segEnd - cursor) / 60_000)
-    const startPct = (startMin / 1440) * 100
-    const rawWidthPct = (durationMin / 1440) * 100
-    const widthPct = Math.min(100 - startPct, Math.max(rawWidthPct, 0.42))
-    segments.push({
-      id: `${row.id}:${idx}`,
-      title: row.title,
-      startPct,
-      widthPct,
-      color: colorForDuration(segEnd - cursor),
-      label: `${row.title} · ${formatSessionClock(row)} · ${fmtDuration(row.duration_ms)}`,
-    })
-    cursor = segEnd
-    idx += 1
-  }
-  return segments
-}
-
-const timeOfDaySegments = computed(() =>
-  sessionRows.value
-    .flatMap(splitSessionIntoDaySegments)
-    .sort((a, b) => a.startPct - b.startPct)
-)
-
-const paperShareSegments = computed(() => {
-  const total = paperRows.value.reduce((sum, row) => sum + row.duration_ms, 0)
-  if (!total) return []
-  let left = 0
-  return paperRows.value.slice(0, 8).map(row => {
-    const width = Math.max(2, (row.duration_ms / total) * 100)
-    const seg = {
-      slug: row.slug,
-      title: row.title,
-      leftPct: left,
-      widthPct: width,
-      color: row.color ?? colorForDuration(row.duration_ms),
-      label: `${row.title} · ${fmtDuration(row.duration_ms)}`,
+const dayBuckets = computed<DayBucket[]>(() => {
+  const bucketMs = new Array<number>(DAY_BUCKET_COUNT).fill(0)
+  for (const row of sessionRows.value) {
+    let cursor = new Date(row.start_at).getTime()
+    const end = Math.max(cursor, new Date(row.end_at).getTime())
+    while (cursor < end) {
+      const d = new Date(cursor)
+      const nextDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime()
+      const segEnd = Math.min(end, nextDay)
+      let minute = minuteOfDay(cursor)
+      let remainingMin = (segEnd - cursor) / 60_000
+      let bi = Math.min(DAY_BUCKET_COUNT - 1, Math.floor(minute / MINUTES_PER_BUCKET))
+      while (remainingMin > 0 && bi < DAY_BUCKET_COUNT) {
+        const bucketEndMin = (bi + 1) * MINUTES_PER_BUCKET
+        const take = Math.min(remainingMin, bucketEndMin - minute)
+        bucketMs[bi] += take * 60_000
+        remainingMin -= take
+        minute += take
+        bi += 1
+      }
+      cursor = segEnd
     }
-    left += width
-    return seg
+  }
+  return bucketMs.map((ms, i) => {
+    if (ms <= 0) return { ms: 0, color: '', title: '' }
+    const startMin = i * MINUTES_PER_BUCKET
+    const endMin = (i + 1) * MINUTES_PER_BUCKET
+    const hhmm = (m: number) =>
+      `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(Math.round(m % 60)).padStart(2, '0')}`
+    return { ms, color: colorForDuration(ms), title: `${hhmm(startMin)}–${hhmm(endMin)} · ${fmtDuration(ms)}` }
+  })
+})
+
+const hasDayActivity = computed(() => dayBuckets.value.some(b => b.ms > 0))
+
+// Paper time proportion as a uniform bar strip — same look as the reading
+// timeline's day-map. Each of the N bars is colored by whichever paper occupies
+// that slice of total reading time (colored by its duration category, so the
+// legend is shared with the timeline).
+const paperShareBuckets = computed(() => {
+  const rows = paperRows.value
+  const total = rows.reduce((sum, row) => sum + row.duration_ms, 0)
+  if (!total) return []
+  let acc = 0
+  const cumulative = rows.map(row => {
+    acc += row.duration_ms
+    return { end: acc / total, row }
+  })
+  return Array.from({ length: DAY_BUCKET_COUNT }, (_, i) => {
+    const frac = (i + 0.5) / DAY_BUCKET_COUNT
+    const hit = cumulative.find(c => frac <= c.end) ?? cumulative[cumulative.length - 1]
+    return {
+      color: hit.row.color ?? colorForDuration(hit.row.duration_ms),
+      title: `${hit.row.title} · ${fmtDuration(hit.row.duration_ms)}`,
+    }
   })
 })
 
@@ -475,19 +481,15 @@ function fileTypeLabel(fileType?: string) {
                 </div>
               </div>
             </div>
-            <div v-if="timeOfDaySegments.length" class="day-map">
-              <div class="day-map-track">
-                <span class="day-tick tick-0" />
-                <span class="day-tick tick-6" />
-                <span class="day-tick tick-12" />
-                <span class="day-tick tick-18" />
-                <span class="day-tick tick-24" />
+            <div v-if="hasDayActivity" class="day-map">
+              <div class="day-bars">
                 <span
-                  v-for="seg in timeOfDaySegments"
-                  :key="seg.id"
-                  class="day-segment"
-                  :title="seg.label"
-                  :style="{ left: `${seg.startPct}%`, width: `${seg.widthPct}%`, background: seg.color }"
+                  v-for="(b, i) in dayBuckets"
+                  :key="i"
+                  class="day-bar"
+                  :class="{ empty: !b.ms }"
+                  :title="b.title"
+                  :style="b.ms ? { background: b.color } : {}"
                 />
               </div>
               <div class="day-map-labels">
@@ -526,18 +528,26 @@ function fileTypeLabel(fileType?: string) {
                 </div>
               </div>
               <div class="paper-compare">
-                <div class="paper-compare-head">
-                  <span>{{ t('activityLog.paperCompare') }}</span>
-                  <span>{{ fmtDuration(totalReadingMs) }}</span>
-                </div>
-                <div class="paper-share-track">
+                <div class="day-bars">
                   <span
-                    v-for="seg in paperShareSegments"
-                    :key="seg.slug"
-                    class="paper-share-segment"
-                    :title="seg.label"
-                    :style="{ width: `${seg.widthPct}%`, background: seg.color }"
+                    v-for="(b, i) in paperShareBuckets"
+                    :key="i"
+                    class="day-bar"
+                    :title="b.title"
+                    :style="{ background: b.color }"
                   />
+                </div>
+                <!-- Invisible clone of the timeline's 0–24 axis row so the bars
+                     and legend line up exactly with the left panel. -->
+                <div class="day-map-labels axis-spacer" aria-hidden="true">
+                  <span>0</span><span>6</span><span>12</span><span>18</span><span>24</span>
+                </div>
+                <div class="duration-legend">
+                  <span><i style="background:#8fc5ff" />&lt;1m</span>
+                  <span><i style="background:#4f8df7" />1-3m</span>
+                  <span><i style="background:#48b884" />3-8m</span>
+                  <span><i style="background:#f2b44b" />8-20m</span>
+                  <span><i style="background:#ef7a7a" />20m+</span>
                 </div>
               </div>
             </template>
@@ -1046,53 +1056,31 @@ function fileTypeLabel(fileType?: string) {
   margin-top: auto;
 }
 
-.paper-compare-head {
+.axis-spacer {
+  visibility: hidden;
+}
+
+.day-bars {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
-  font-size: 11px;
-  color: var(--activity-faint);
+  align-items: stretch;
+  gap: 2px;
+  height: 30px;
 }
 
-.paper-compare-head span:first-child {
-  font-weight: 700;
-  color: var(--activity-muted);
+.day-bar {
+  flex: 1 1 0;
+  min-width: 0;
+  border-radius: 3px;
+  background: #e6ecf5;
+  transition: transform 0.1s ease, filter 0.1s ease;
 }
-
-.day-map-track {
-  position: relative;
-  height: 28px;
-  border-radius: 999px;
-  border: 1px solid #dfe8f4;
-  background:
-    linear-gradient(90deg, rgba(148, 163, 184, 0.11) 1px, transparent 1px) 0 0 / 25% 100%,
-    #f1f5fb;
-  overflow: hidden;
+.day-bar:not(.empty) {
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.12);
 }
-
-.day-segment {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  min-width: 4px;
-  border-radius: 999px;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.26), 0 1px 5px rgba(15, 23, 42, 0.13);
+.day-bar:not(.empty):hover {
+  transform: scaleY(1.12);
+  filter: saturate(1.1);
 }
-
-.day-tick {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 1px;
-  background: rgba(148, 163, 184, 0.18);
-}
-.tick-0 { left: 0; }
-.tick-6 { left: 25%; }
-.tick-12 { left: 50%; }
-.tick-18 { left: 75%; }
-.tick-24 { right: 0; }
 
 .day-map-labels {
   display: grid;
@@ -1130,12 +1118,13 @@ function fileTypeLabel(fileType?: string) {
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.8);
 }
 
+/* Mirror the reading timeline's .day-map exactly so both panels are symmetric. */
 .paper-compare {
-  margin-top: 12px;
-  padding: 16px 12px 17px;
+  margin-top: 8px;
+  padding: 10px 10px 8px;
   border-radius: 12px;
   border: 1px solid #e8eef7;
-  background: #fff;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
 }
 
 .paper-reading-card .paper-time-list {
@@ -1146,22 +1135,6 @@ function fileTypeLabel(fileType?: string) {
 
 .paper-reading-card .paper-compare {
   margin-top: auto;
-}
-
-.paper-share-track {
-  display: flex;
-  height: 28px;
-  padding: 2px;
-  gap: 2px;
-  border-radius: 999px;
-  background: #eef3fa;
-  overflow: hidden;
-}
-
-.paper-share-segment {
-  min-width: 5px;
-  border-radius: 999px;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32);
 }
 
 .paper-mini-bar {

@@ -306,6 +306,40 @@ const chartMax = computed(() => {
   return m
 })
 
+// ── Time-of-day density (status-page style) ─────────────────────────────────────
+// Fold every record onto a single 24h clock, split into 15-min buckets. Each bar's
+// color intensity scales with the tokens used in that slot — busier slot, deeper blue.
+// This card spans the full modal width, so it needs more (thinner) bars than the
+// activity-log strip to get the same slim status-page look.
+const HOUR_BUCKET_COUNT = 96
+const HOUR_MINUTES_PER_BUCKET = 1440 / HOUR_BUCKET_COUNT
+
+const hourlyDensity = computed(() => {
+  const bucketTokens = new Array<number>(HOUR_BUCKET_COUNT).fill(0)
+  for (const r of filteredRecords.value) {
+    const d = new Date(r.ts)
+    const minute = d.getHours() * 60 + d.getMinutes()
+    const bi = Math.min(HOUR_BUCKET_COUNT - 1, Math.floor(minute / HOUR_MINUTES_PER_BUCKET))
+    bucketTokens[bi] += r.input_tokens + r.output_tokens
+  }
+  const max = Math.max(...bucketTokens, 1)
+  return bucketTokens.map((tokens, i) => {
+    if (tokens <= 0) return { tokens: 0, color: '', title: '' }
+    const pct = Math.round(30 + (tokens / max) * 70) // 30%..100% blend toward accent
+    const startMin = i * HOUR_MINUTES_PER_BUCKET
+    const endMin = (i + 1) * HOUR_MINUTES_PER_BUCKET
+    const hhmm = (m: number) =>
+      `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(Math.round(m % 60)).padStart(2, '0')}`
+    return {
+      tokens,
+      color: `color-mix(in srgb, #5b8def ${pct}%, #e9eef7)`,
+      title: `${hhmm(startMin)}–${hhmm(endMin)} · ${fmtT(tokens)} tokens`,
+    }
+  })
+})
+
+const hasHourlyDensity = computed(() => hourlyDensity.value.some(b => b.tokens > 0))
+
 // ── Model ranking ──────────────────────────────────────────────────────────────
 
 interface ModelRow {
@@ -491,6 +525,29 @@ onMounted(load)
                 <span class="legend-hint">{{ t('tokenUsage.priceHint') }}</span>
               </template>
             </div>
+          </div>
+        </div>
+
+        <!-- Time-of-day density (status-page style) -->
+        <div v-if="hasHourlyDensity" class="chart-card hour-density-card">
+          <div class="chart-head">
+            <div>
+              <div class="chart-title">{{ t('tokenUsage.byHour') }}</div>
+              <div class="chart-subtitle">{{ t('tokenUsage.byHourSub') }}</div>
+            </div>
+          </div>
+          <div class="hour-bars">
+            <span
+              v-for="(b, i) in hourlyDensity"
+              :key="i"
+              class="hour-bar"
+              :class="{ empty: !b.tokens }"
+              :title="b.title"
+              :style="b.tokens ? { background: b.color } : {}"
+            />
+          </div>
+          <div class="hour-labels">
+            <span>0</span><span>6</span><span>12</span><span>18</span><span>24</span>
           </div>
         </div>
 
@@ -761,6 +818,33 @@ onMounted(load)
 .input-bg  { background: var(--usage-blue); }
 .output-bg { background: var(--usage-purple); }
 .legend-hint { margin-left: 6px; font-size: 10px; font-style: italic; }
+
+/* Time-of-day density card */
+.hour-density-card { min-height: 0; height: auto; }
+.hour-bars {
+  display: flex; align-items: stretch; gap: 2px;
+  height: 30px;
+}
+.hour-bar {
+  flex: 1 1 0;
+  min-width: 0;
+  border-radius: 3px;
+  background: #e9eef7;
+  transition: transform 0.1s ease, filter 0.1s ease;
+}
+.hour-bar:not(.empty) { box-shadow: 0 1px 2px rgba(15, 23, 42, 0.1); }
+.hour-bar:not(.empty):hover { transform: scaleY(1.12); filter: saturate(1.12); }
+.hour-labels {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  margin-top: 5px;
+  font-size: 10px;
+  color: var(--usage-faint);
+}
+.hour-labels span:nth-child(2),
+.hour-labels span:nth-child(3),
+.hour-labels span:nth-child(4) { text-align: center; }
+.hour-labels span:last-child { text-align: right; }
 
 /* Model ranking */
 .model-list { display: flex; flex-direction: column; gap: 12px; }

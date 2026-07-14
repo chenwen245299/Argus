@@ -537,6 +537,106 @@ function toggleContext(option: 'metadata' | 'summary' | 'fulltext') {
   }
 }
 
+// ── Context badge selection persistence ─────────────────────────────────────
+// The badge selection (context mode / PDF / sections) is persisted per paper in
+// localStorage, which is shared across webviews. This keeps the sidebar tab and
+// the standalone popup in sync, and lets us restore the selection when a
+// conversation from history is reopened.
+const CONTEXT_STORAGE_PREFIX = 'argus:ai-context'
+function contextStorageKey(slug: string) {
+  return `${CONTEXT_STORAGE_PREFIX}:${slug}`
+}
+
+interface ContextSelection {
+  contextMode?: string
+  usePdf?: boolean
+  sectionTitles?: string[]
+}
+
+// Guards programmatic selection changes (paper switch, history open, cross-window
+// sync) so they aren't re-persisted and echoed back into an update loop.
+let restoringContext = false
+
+function readContextSelection(slug: string): ContextSelection | null {
+  try {
+    const raw = localStorage.getItem(contextStorageKey(slug))
+    return raw ? (JSON.parse(raw) as ContextSelection) : null
+  } catch {
+    return null
+  }
+}
+
+function persistContextSelection() {
+  if (!props.slug) return
+  try {
+    const sel: ContextSelection = {
+      contextMode: contextMode.value,
+      usePdf: usePdf.value,
+      sectionTitles: selectedSectionTitles.value,
+    }
+    localStorage.setItem(contextStorageKey(props.slug), JSON.stringify(sel))
+  } catch {
+    // storage full / disabled — non-fatal
+  }
+}
+
+// Apply a saved/derived badge selection, downgrading to what this paper actually
+// supports (e.g. can't select fulltext before it's extracted, or summary before
+// it's generated).
+function applyContextSelection(sel: ContextSelection | null) {
+  if (!sel) return
+  const mode = (sel.contextMode as PaperContextMode) || 'none'
+  const wantsSummary =
+    (mode === 'summary' || mode === 'summary+fulltext') && summaryAvailable.value
+  const wantsFulltext =
+    (mode === 'fulltext' || mode === 'summary+fulltext') && fulltextReady.value
+  if (wantsFulltext && wantsSummary) contextMode.value = 'summary+fulltext'
+  else if (wantsFulltext) contextMode.value = 'fulltext'
+  else if (wantsSummary) contextMode.value = 'summary'
+  else contextMode.value = mode === 'metadata' ? 'metadata' : 'none'
+  usePdf.value = !!sel.usePdf && pdfSupported.value
+  selectedSectionTitles.value = Array.isArray(sel.sectionTitles) ? [...sel.sectionTitles] : []
+}
+
+// Restore the badges that were actually used in a saved conversation (from its
+// most recent assistant turn) so reopening history reflects that turn's context.
+function restoreContextFromConversation(conv: Conversation) {
+  const nodes = conv.nodes ?? []
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const node = nodes[i]
+    if (node.role === 'assistantGroup' && node.answers.length > 0) {
+      const a = node.answers[0]
+      const prev = restoringContext
+      restoringContext = true
+      try {
+        applyContextSelection({
+          contextMode: a.contextMode,
+          usePdf: a.usedPdf,
+          sectionTitles: a.sectionTitles,
+        })
+      } finally {
+        restoringContext = prev
+      }
+      return
+    }
+  }
+}
+
+// Live cross-window sync: when the other webview persists a new selection for the
+// current paper, adopt it here too.
+function onContextStorageSync(e: StorageEvent) {
+  if (!props.slug || e.key !== contextStorageKey(props.slug) || e.newValue == null) return
+  const prev = restoringContext
+  restoringContext = true
+  try {
+    applyContextSelection(JSON.parse(e.newValue) as ContextSelection)
+  } catch {
+    // ignore malformed payloads
+  } finally {
+    restoringContext = prev
+  }
+}
+
 function onWindowFocus() {
   if (props.slug) {
     refreshFulltextAvailability(props.slug).catch(() => {})
@@ -578,6 +678,8 @@ function openConversation(id: string) {
   const conv = conversations.value.find(c => c.id === id)
   if (!conv) return
   activeConversation.value = cloneConversation(conv)
+  // Restore the badge selection this conversation was last used with.
+  restoreContextFromConversation(conv)
   activeAnswerTabs.value = {}
   showHistory.value = false
   nextTick(() => {
@@ -1418,28 +1520,48 @@ function closeFloating(e: MouseEvent) {
 }
 
 watch(() => props.slug, async (slug) => {
-  for (const off of unlisteners.values()) off()
-  unlisteners.clear()
-  clearAllStreamRenderTimers()
-  showHistory.value = false
-  showModelMenu.value = false
-  activeConversation.value = null
-  conversations.value = []
-  activeAnswerTabs.value = {}
-  input.value = ''
-  applyFulltextReady(false, true)
-  abstractAvailable.value = false
-  summaryAvailable.value = false
-  loadSections(slug)
-  if (slug) {
-    await Promise.all([
-      refreshFulltextAvailability(slug, true),
-      refreshAbstractAvailability(slug),
-      refreshSummaryAvailability(slug),
-    ])
-    await loadConversations(slug)
+  // Guard the whole (re)initialization: every contextMode/usePdf/section change
+  // below is programmatic, so it must not be persisted (and thus not broadcast
+  // to the other window). The `savedSel` we read here is the source of truth.
+  restoringContext = true
+  try {
+    for (const off of unlisteners.values()) off()
+    unlisteners.clear()
+    clearAllStreamRenderTimers()
+    showHistory.value = false
+    showModelMenu.value = false
+    activeConversation.value = null
+    conversations.value = []
+    activeAnswerTabs.value = {}
+    input.value = ''
+    applyFulltextReady(false, true)
+    abstractAvailable.value = false
+    summaryAvailable.value = false
+    loadSections(slug)
+    if (slug) {
+      const savedSel = readContextSelection(slug)
+      await Promise.all([
+        refreshFulltextAvailability(slug, true),
+        refreshAbstractAvailability(slug),
+        refreshSummaryAvailability(slug),
+      ])
+      await loadConversations(slug)
+      // Restore the last badge selection for this paper (shared across windows
+      // via localStorage) so the sidebar tab and the standalone popup open in sync.
+      if (savedSel) applyContextSelection(savedSel)
+    }
+  } finally {
+    restoringContext = false
   }
 }, { immediate: true })
+
+// Persist the badge selection whenever the user changes it. `flush: 'sync'` is
+// required so the write happens while `restoringContext` is still set during a
+// programmatic change — otherwise the (async) callback would run after the flag
+// was cleared and defeat the guard.
+watch([contextMode, usePdf, selectedSectionTitles], () => {
+  if (!restoringContext) persistContextSelection()
+}, { deep: true, flush: 'sync' })
 
 watch(() => allSelectableModels.value.map(modelKey).join('|'), ensureDefaultModels, { immediate: true })
 watch(input, resizeTextarea)
@@ -1456,6 +1578,7 @@ onMounted(async () => {
   window.addEventListener('argus-paper-fulltext-updated', onPaperFulltextUpdated)
   window.addEventListener('argus-paper-meta-updated', onPaperMetaUpdated)
   window.addEventListener('argus-sections-updated', onSectionsUpdatedEvent)
+  window.addEventListener('storage', onContextStorageSync)
   unlistenExtractionProgress = await listen<ExtractionProgressPayload>('extraction_progress', (event) => {
     if (event.payload.slug === props.slug && event.payload.ok) {
       applyFulltextReady(true)
@@ -1556,6 +1679,7 @@ onUnmounted(() => {
   window.removeEventListener('argus-paper-fulltext-updated', onPaperFulltextUpdated)
   window.removeEventListener('argus-paper-meta-updated', onPaperMetaUpdated)
   window.removeEventListener('argus-sections-updated', onSectionsUpdatedEvent)
+  window.removeEventListener('storage', onContextStorageSync)
   unlistenExtractionProgress?.()
   unlistenMetaStart?.()
   unlistenMetaDone?.()

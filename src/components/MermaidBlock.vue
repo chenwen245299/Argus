@@ -25,6 +25,11 @@ const { t } = useI18n()
 
 const props = defineProps<{ src: string; streaming?: boolean }>()
 
+// Upper bound on diagram source length. Real mermaid diagrams are a few KB at
+// most; a pathologically large source can hang the renderer, so past this we
+// fall back to showing the raw text instead of rendering.
+const MAX_MERMAID_SRC = 50_000
+
 const status  = ref<'pending' | 'done' | 'error'>('pending')
 const svgHtml = ref('')
 let   rendered = false
@@ -62,6 +67,10 @@ async function loadMermaid(): Promise<MermaidMod> {
 
 async function tryRender() {
   if (props.streaming || rendered) return
+  if (props.src.length > MAX_MERMAID_SRC) {
+    status.value = 'error'
+    return
+  }
   try {
     const m = await loadMermaid()
     const stage = document.createElement('div')

@@ -61,7 +61,7 @@ fn rebuild_index_from_disk(root: &str) -> Vec<CanvasIndexEntry> {
                     entries.push(CanvasIndexEntry {
                         id: canvas.id,
                         name: canvas.name,
-                        node_count: canvas.nodes.len() as u32,
+                        node_count: canvas.nodes.len().min(u32::MAX as usize) as u32,
                         updated_at: canvas.updated_at,
                     });
                 }
@@ -137,13 +137,13 @@ fn upsert_index(root: &str, canvas: &Canvas) {
     let mut index = read_index(root);
     if let Some(entry) = index.iter_mut().find(|e| e.id == canvas.id) {
         entry.name = canvas.name.clone();
-        entry.node_count = canvas.nodes.len() as u32;
+        entry.node_count = canvas.nodes.len().min(u32::MAX as usize) as u32;
         entry.updated_at = canvas.updated_at.clone();
     } else {
         index.push(CanvasIndexEntry {
             id: canvas.id.clone(),
             name: canvas.name.clone(),
-            node_count: canvas.nodes.len() as u32,
+            node_count: canvas.nodes.len().min(u32::MAX as usize) as u32,
             updated_at: canvas.updated_at.clone(),
         });
     }

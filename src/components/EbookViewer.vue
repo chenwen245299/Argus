@@ -78,6 +78,7 @@ async function setFontSize(next: number) {
   if (anchor) scrollToChapter(anchor.chapter - 1, anchor.ratio)
   schedulePageMetricsUpdate()
   refreshAllOverlays()
+  refreshSearchOverlays()
   paintSelection()
 }
 function fontSmaller() { setFontSize(fontSize.value - 1) }
@@ -329,6 +330,7 @@ async function renderChapter(idx: number) {
 
     resolveChapterImages(content, idx)
     renderChapterHighlights(idx)
+    if (searchOpen.value) renderChapterSearchMatches(idx)
     schedulePageMetricsUpdate()
   } catch (e) {
     console.error(`Failed to render chapter ${idx + 1}:`, e)
@@ -790,9 +792,224 @@ function onWindowResize() {
   resizeDebounce = setTimeout(() => {
     updatePageMetrics()
     refreshAllOverlays()
+    refreshSearchOverlays()
     paintSelection()
   }, 200)
 }
+
+// ── In-book search (Cmd/Ctrl+F) ─────────────────────────────────────────────
+// Matches the PDF reader's search UX. Default scope is the ~10 pages around the
+// current position ("nearby"); the user can toggle to the whole book. Matches
+// are located by character offset into each chapter's sanitized text — the same
+// offset convention used for user highlights — so they map cleanly to DOM
+// ranges (rangeFromOffsets) and glyph-tight rects (collectTightRects).
+interface EbookSearchMatch {
+  chapterIdx: number // 0-based
+  charStart: number
+  charEnd: number
+}
+const MAX_SEARCH_MATCHES = 2000
+const searchOpen = ref(false)
+const searchQuery = ref('')
+const searchScope = ref<'nearby' | 'whole'>('nearby')
+const searchMatches = ref<EbookSearchMatch[]>([])
+const searchMatchIndex = ref(0)
+const searchBusy = ref(false)
+const searchInputRef = ref<HTMLInputElement | null>(null)
+// Plain-text per-chapter cache for chapters not currently in the DOM (whole-book
+// search). Sanitized identically to render, so offsets line up on navigation.
+const chapterTextCache = new Map<number, string>()
+let searchDebounce: ReturnType<typeof setTimeout> | null = null
+let searchSeq = 0 // cancels an in-flight search when the query/scope changes
+
+const searchCountLabel = computed(() => {
+  if (searchBusy.value) return t('ebook.searching')
+  if (!searchQuery.value.trim()) return ''
+  const n = searchMatches.value.length
+  if (n === 0) return t('ebook.searchNoResults')
+  return `${searchMatchIndex.value + 1}/${n}`
+})
+
+/** Chapters that intersect a scroll window of ±5 virtual pages (~10 pages). */
+function nearbyChapterRange(): [number, number] {
+  const total = manifest.value?.chapters.length ?? 0
+  if (total === 0) return [0, 0]
+  const scrollEl = containerRef.value
+  if (!scrollEl) { const c = Math.max(0, displayChapter.value - 1); return [c, c] }
+  const margin = 5 * virtualPageStep()
+  const top = scrollEl.scrollTop - margin
+  const bottom = scrollEl.scrollTop + scrollEl.clientHeight + margin
+  let lo = -1
+  let hi = -1
+  for (let i = 0; i < total; i++) {
+    const el = chapterEls.value[i]
+    if (!el) continue
+    const elTop = el.offsetTop
+    const elBottom = elTop + el.offsetHeight
+    if (elBottom >= top && elTop <= bottom) {
+      if (lo === -1) lo = i
+      hi = i
+    }
+  }
+  if (lo === -1) { const c = Math.max(0, displayChapter.value - 1); return [c, c] }
+  return [lo, hi]
+}
+
+/** Plain text of a chapter, using the live DOM when rendered (exact offsets)
+ *  and a sanitized fetch (cached) otherwise. */
+async function getChapterText(idx: number): Promise<string> {
+  const content = chapterContentEl(idx)
+  if (content && renderedChapters.value.has(idx)) return content.textContent ?? ''
+  const cached = chapterTextCache.get(idx)
+  if (cached != null) return cached
+  try {
+    const html = await invoke<string>('read_ebook_chapter', { slug: props.slug, index: idx + 1 })
+    const div = document.createElement('div')
+    div.innerHTML = DOMPurify.sanitize(html, PURIFY_CONFIG as any) as unknown as string
+    const text = div.textContent ?? ''
+    chapterTextCache.set(idx, text)
+    return text
+  } catch {
+    return ''
+  }
+}
+
+async function runSearch() {
+  const q = searchQuery.value
+  const seq = ++searchSeq
+  clearSearchOverlays()
+  if (!q.trim()) {
+    searchMatches.value = []
+    searchMatchIndex.value = 0
+    searchBusy.value = false
+    return
+  }
+  searchBusy.value = true
+  const total = manifest.value?.chapters.length ?? 0
+  let lo = 0
+  let hi = total - 1
+  if (searchScope.value === 'nearby') [lo, hi] = nearbyChapterRange()
+  const needle = q.toLowerCase()
+  const found: EbookSearchMatch[] = []
+  for (let idx = lo; idx <= hi; idx++) {
+    const hay = (await getChapterText(idx)).toLowerCase()
+    if (seq !== searchSeq) return // superseded by a newer query
+    let from = 0
+    while (found.length < MAX_SEARCH_MATCHES) {
+      const at = hay.indexOf(needle, from)
+      if (at < 0) break
+      found.push({ chapterIdx: idx, charStart: at, charEnd: at + q.length })
+      from = at + Math.max(1, q.length)
+    }
+    if (found.length >= MAX_SEARCH_MATCHES) break
+  }
+  if (seq !== searchSeq) return
+  searchMatches.value = found
+  searchMatchIndex.value = 0
+  searchBusy.value = false
+  if (found.length) await navigateToMatch(0)
+  else refreshSearchOverlays()
+}
+
+async function navigateToMatch(i: number) {
+  const n = searchMatches.value.length
+  if (n === 0) { refreshSearchOverlays(); return }
+  const idx = ((i % n) + n) % n
+  searchMatchIndex.value = idx
+  const m = searchMatches.value[idx]
+  await ensureChapterRendered(m.chapterIdx)
+  await nextTick()
+  const content = chapterContentEl(m.chapterIdx)
+  const wrapper = chapterEls.value[m.chapterIdx]
+  const scrollEl = containerRef.value
+  if (content && wrapper && scrollEl) {
+    const range = rangeFromOffsets(content, m.charStart, m.charEnd)
+    const rects = range ? collectTightRects(range) : []
+    if (rects.length) {
+      const wrapperRect = wrapper.getBoundingClientRect()
+      const targetTop = wrapper.offsetTop + (rects[0].top - wrapperRect.top)
+      scrollEl.scrollTop = Math.max(0, targetTop - scrollEl.clientHeight * 0.3)
+    }
+  }
+  await nextTick()
+  refreshSearchOverlays()
+}
+
+function nextMatch() { void navigateToMatch(searchMatchIndex.value + 1) }
+function prevMatch() { void navigateToMatch(searchMatchIndex.value - 1) }
+
+// Enter / Shift+Enter inside the search box move between matches. (Esc and
+// Cmd/Ctrl+G are handled by the global onKeyDown before its input-focus guard.)
+function onSearchInputKey(e: KeyboardEvent) {
+  if (e.key === 'Enter') {
+    e.preventDefault()
+    if (e.shiftKey) prevMatch()
+    else nextMatch()
+  }
+}
+
+function renderChapterSearchMatches(idx: number) {
+  const wrapper = chapterEls.value[idx]
+  const content = chapterContentEl(idx)
+  if (!wrapper || !content || !renderedChapters.value.has(idx)) return
+  const overlay = wrapper.querySelector('.chapter-search-overlay') as HTMLElement | null
+  if (!overlay) return
+  overlay.innerHTML = ''
+  if (!searchOpen.value || !searchQuery.value.trim() || searchMatches.value.length === 0) return
+  const wrapperRect = wrapper.getBoundingClientRect()
+  const activeIdx = searchMatchIndex.value
+  searchMatches.value.forEach((m, mi) => {
+    if (m.chapterIdx !== idx) return
+    const range = rangeFromOffsets(content, m.charStart, m.charEnd)
+    if (!range) return
+    const isActive = mi === activeIdx
+    for (const r of collectTightRects(range)) {
+      if (r.width <= 0 || r.height <= 0) continue
+      const div = document.createElement('div')
+      div.className = isActive ? 'search-rect active' : 'search-rect'
+      div.style.cssText = `left:${r.left - wrapperRect.left}px;top:${r.top - wrapperRect.top}px;width:${r.width}px;height:${r.height}px;`
+      overlay.appendChild(div)
+    }
+  })
+}
+
+function refreshSearchOverlays() {
+  for (const idx of renderedChapters.value) renderChapterSearchMatches(idx)
+}
+
+function clearSearchOverlays() {
+  for (const idx of renderedChapters.value) {
+    const ov = chapterEls.value[idx]?.querySelector('.chapter-search-overlay') as HTMLElement | null
+    if (ov) ov.innerHTML = ''
+  }
+}
+
+function openSearch() {
+  searchOpen.value = true
+  nextTick(() => { searchInputRef.value?.focus(); searchInputRef.value?.select() })
+  if (searchQuery.value.trim()) void runSearch()
+}
+
+function closeSearch() {
+  searchOpen.value = false
+  searchSeq++ // cancel any in-flight whole-book search
+  searchBusy.value = false
+  searchMatches.value = []
+  searchMatchIndex.value = 0
+  clearSearchOverlays()
+}
+
+function setSearchScope(scope: 'nearby' | 'whole') {
+  if (searchScope.value === scope) return
+  searchScope.value = scope
+}
+
+watch(searchQuery, () => {
+  if (searchDebounce) clearTimeout(searchDebounce)
+  if (!searchOpen.value) return
+  searchDebounce = setTimeout(() => { void runSearch() }, 250)
+})
+watch(searchScope, () => { if (searchOpen.value && searchQuery.value.trim()) void runSearch() })
 
 // ── Highlight popup actions ───────────────────────────────────────────────────
 async function copyHighlightText(hlId: string) {
@@ -1007,9 +1224,22 @@ function onPageInputChange(e: Event) {
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 function onKeyDown(e: KeyboardEvent) {
   if (!isActiveTab.value) return
+  const mod = e.metaKey || e.ctrlKey
+  // Search shortcuts must run BEFORE the input-focus guard so they work even
+  // while the search box itself is focused.
+  if (mod && (e.key === 'f' || e.key === 'F')) { e.preventDefault(); openSearch(); return }
+  if (searchOpen.value) {
+    if (e.key === 'Escape') { e.preventDefault(); closeSearch(); return }
+    if (mod && (e.key === 'g' || e.key === 'G')) {
+      e.preventDefault()
+      if (e.shiftKey) prevMatch()
+      else nextMatch()
+      return
+    }
+  }
   const target = e.target as HTMLElement
   if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return
-  if (e.metaKey || e.ctrlKey) {
+  if (mod) {
     if (e.key === '=' || e.key === '+') { e.preventDefault(); fontLarger() }
     else if (e.key === '-') { e.preventDefault(); fontSmaller() }
   }
@@ -1076,6 +1306,12 @@ defineExpose({ closeToList: handleBack })
         </span>
       </div>
 
+      <button class="ebook-search-btn" @click="openSearch" :title="t('ebook.search')">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+        </svg>
+      </button>
+
       <div class="color-picker">
         <div
           v-for="c in COLORS"
@@ -1140,10 +1376,50 @@ defineExpose({ closeToList: handleBack })
         >
           <div class="chapter-content" />
           <div class="chapter-overlay" />
+          <div class="chapter-search-overlay" />
         </section>
         <!-- Live-selection rects (glyph-tight, replaces the native selection) -->
         <div ref="selOverlayRef" class="selection-overlay" />
       </div>
+    </div>
+
+    <!-- In-book search -->
+    <div v-if="searchOpen" class="ebook-search-bar" @click.stop>
+      <svg class="ebook-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+        <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+      </svg>
+      <input
+        ref="searchInputRef"
+        v-model="searchQuery"
+        class="ebook-search-input"
+        :placeholder="t('ebook.searchPlaceholder')"
+        @keydown="onSearchInputKey"
+      />
+      <span
+        class="ebook-search-count"
+        :class="{ 'no-match': searchQuery.trim() && !searchBusy && searchMatches.length === 0 }"
+      >{{ searchCountLabel }}</span>
+      <div class="ebook-search-scope">
+        <button
+          :class="{ active: searchScope === 'nearby' }"
+          @click="setSearchScope('nearby')"
+          :title="t('ebook.searchNearbyTip')"
+        >{{ t('ebook.searchNearby') }}</button>
+        <button
+          :class="{ active: searchScope === 'whole' }"
+          @click="setSearchScope('whole')"
+          :title="t('ebook.searchWholeBookTip')"
+        >{{ t('ebook.searchWholeBook') }}</button>
+      </div>
+      <button class="ebook-search-nav" :disabled="searchMatches.length === 0" @click="prevMatch" :title="t('ebook.searchPrev')">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15" /></svg>
+      </button>
+      <button class="ebook-search-nav" :disabled="searchMatches.length === 0" @click="nextMatch" :title="t('ebook.searchNext')">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9" /></svg>
+      </button>
+      <button class="ebook-search-close" @click="closeSearch" :title="t('ebook.searchClose')">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+      </button>
     </div>
 
     <!-- Selection popup -->
@@ -1529,6 +1805,124 @@ defineExpose({ closeToList: handleBack })
   inset: 0;
   pointer-events: none;
   z-index: 1;
+}
+.chapter-search-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+.search-rect {
+  position: absolute;
+  background: rgba(255, 213, 79, 0.42);
+  border-radius: 2px;
+}
+.search-rect.active {
+  background: rgba(255, 150, 0, 0.5);
+  box-shadow: 0 0 0 1.5px rgba(240, 120, 0, 0.9);
+}
+
+/* ── In-book search ── */
+.ebook-search-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  flex-shrink: 0;
+}
+.ebook-search-btn:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--text-primary);
+}
+.ebook-search-bar {
+  position: absolute;
+  top: calc(var(--content-header-height) + 8px);
+  right: 16px;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-primary);
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.13);
+  padding: 6px 8px;
+  user-select: none;
+}
+.ebook-search-icon {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+.ebook-search-input {
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font-size: 13px;
+  color: var(--text-primary);
+  width: 180px;
+  min-width: 120px;
+}
+.ebook-search-count {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  min-width: 42px;
+  text-align: right;
+  white-space: nowrap;
+}
+.ebook-search-count.no-match {
+  color: #e5484d;
+}
+.ebook-search-scope {
+  display: inline-flex;
+  border: 1px solid var(--divider);
+  border-radius: 7px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.ebook-search-scope button {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 3px 8px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.ebook-search-scope button.active {
+  background: #5b8def;
+  color: #fff;
+}
+.ebook-search-nav,
+.ebook-search-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.ebook-search-nav:hover:not(:disabled),
+.ebook-search-close:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--text-primary);
+}
+.ebook-search-nav:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 /* Book typography: publisher CSS is stripped upstream; we own the look. */

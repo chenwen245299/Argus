@@ -189,6 +189,7 @@ pub fn rebuild_index(root: &str) -> Result<(), String> {
     conn.execute("DELETE FROM papers_fts", [])
         .map_err(|e| format!("Clear index: {e}"))?;
 
+    let mut failed = 0u32;
     for (slug, path) in paper::list_paper_dirs(root)? {
         let meta_content = match std::fs::read_to_string(path.join("meta.json")) {
             Ok(c) => c,
@@ -204,18 +205,21 @@ pub fn rebuild_index(root: &str) -> Result<(), String> {
         let notes = all_notes_text(root, &slug);
         let content = search_content(&meta, &fulltext, &notes);
 
-        conn.execute(
+        // Keep indexing the rest even if one paper fails, but count failures so
+        // a partial rebuild isn't reported as a clean success only in silence.
+        if let Err(e) = conn.execute(
             "INSERT INTO papers_fts (paper_id, slug, title, authors, content)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![meta.id, slug, meta.title, authors_str, content],
-        )
-        .map_err(|e| {
+        ) {
+            failed += 1;
             eprintln!("[search] index {slug}: {e}");
-            e.to_string()
-        })
-        .ok();
+        }
     }
 
+    if failed > 0 {
+        eprintln!("[search] rebuild_index: {failed} paper(s) failed to index");
+    }
     Ok(())
 }
 

@@ -2,8 +2,7 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
+import { renderMarkdown } from '../utils/renderMarkdown'
 import { updateStore, startUpdate } from '../stores/update'
 
 const { t } = useI18n()
@@ -12,15 +11,12 @@ function openGitHub() {
   invoke('open_url', { url: 'https://github.com/chenwen245299/Argus' }).catch(console.error)
 }
 
+// Route release notes (fetched from the remote GitHub release) through the
+// shared renderer, which sanitizes with DOMPurify and forces external links to
+// open with rel="noopener" — no bespoke, laxer sanitize config here.
 const renderedNotes = computed(() => {
   if (!updateStore.releaseNotes) return ''
-  try {
-    return DOMPurify.sanitize(marked.parse(updateStore.releaseNotes) as string, {
-      ADD_ATTR: ['target', 'rel', 'title'],
-    })
-  } catch {
-    return DOMPurify.sanitize(updateStore.releaseNotes)
-  }
+  return renderMarkdown(updateStore.releaseNotes)
 })
 </script>
 

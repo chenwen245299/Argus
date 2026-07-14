@@ -15,6 +15,7 @@ mod library;
 mod llm;
 mod metadata;
 mod models;
+mod net;
 mod ocr;
 mod paper;
 mod path_guard;
@@ -66,7 +67,10 @@ pub fn run() {
                 {
                     let path = security_bookmark::ensure_library_access(app.handle(), &path);
                     let state: tauri::State<LibraryRoot> = app.state();
-                    let mut guard = state.0.lock().unwrap();
+                    // Recover from a poisoned lock instead of panicking at
+                    // startup: a prior panic while holding this mutex must not
+                    // brick every subsequent launch.
+                    let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
                     *guard = Some(path.clone());
                     token_usage::set_root(&path);
 

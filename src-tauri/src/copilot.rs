@@ -221,7 +221,6 @@ pub async fn chat_with_paper_on_event(
         }
         "summary+fulltext" => {
             let summary = ai_summary::read_summary(root, slug);
-            let summary_ctx = if summary.trim().is_empty() { None } else { Some(summary.as_str()) };
             let (context, truncated) = get_fulltext_context(root, slug, &provider, &model);
             sent_summary = summary.clone();
             sent_fulltext = if truncated {
@@ -229,9 +228,28 @@ pub async fn chat_with_paper_on_event(
             } else {
                 context.clone()
             };
-            // meta=None: user did not select 元数据
-            let system = build_system_prompt(None, &context, truncated, false, summary_ctx);
-            all_messages.push(ChatMessage { role: "system".to_string(), content: system.into() });
+            // Leading, cache-stable paper block (identical across tasks/turns),
+            // then task-specific persona and any extra context after it.
+            all_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: build_paper_context_block(meta.as_ref(), &context).into(),
+            });
+            all_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: PAPER_ASSISTANT_PERSONA.into(),
+            });
+            if !summary.trim().is_empty() {
+                all_messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("--- AI SUMMARY ---\n{}", summary.trim()).into(),
+                });
+            }
+            if truncated {
+                all_messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: "[Content truncated due to length. This is a partial view of the paper.]".into(),
+                });
+            }
         }
         _ => {
             // "fulltext"
@@ -241,9 +259,20 @@ pub async fn chat_with_paper_on_event(
             } else {
                 context.clone()
             };
-            // meta=None: user did not select 元数据
-            let system = build_system_prompt(None, &context, truncated, false, None);
-            all_messages.push(ChatMessage { role: "system".to_string(), content: system.into() });
+            all_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: build_paper_context_block(meta.as_ref(), &context).into(),
+            });
+            all_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: PAPER_ASSISTANT_PERSONA.into(),
+            });
+            if truncated {
+                all_messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: "[Content truncated due to length. This is a partial view of the paper.]".into(),
+                });
+            }
         }
     }
 
@@ -774,6 +803,56 @@ fn build_metadata_string(meta: Option<&crate::models::PaperMeta>) -> String {
     s
 }
 
+/// Shared budget (in chars) for how much paper fulltext to hand `model_id`.
+/// Used by BOTH the chat and the summary/analysis paths so the truncated text —
+/// and therefore the leading context block — is byte-identical across tasks,
+/// which is what lets the provider reuse the cached prompt prefix.
+pub fn paper_context_budget(provider: &crate::models::AiProvider, model_id: &str) -> usize {
+    provider
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .and_then(|m| m.context_length)
+        .map(|cl| ((cl as usize * 7 / 10) * 4).min(300_000))
+        .unwrap_or(60_000)
+        // Reserve space for the instructions and conversation history (~10K chars).
+        .saturating_sub(10_000)
+}
+
+/// Canonical, byte-stable "paper context" block. Every full-text paper task
+/// (AI chat, AI summary/analysis) emits THIS as its first system message so the
+/// large paper text sits at an identical prompt prefix and the provider can
+/// serve it from cache instead of re-billing it on every call. Anything
+/// task-specific (persona, instructions, the user's question) must come AFTER.
+pub fn build_paper_context_block(meta: Option<&PaperMeta>, fulltext: &str) -> String {
+    let mut s = String::from("--- PAPER CONTEXT ---\n");
+    if let Some(m) = meta {
+        s.push_str(&format!("Title: {}\n", m.title));
+        if !m.authors.is_empty() {
+            s.push_str(&format!("Authors: {}\n", m.authors.join(", ")));
+        }
+        if let Some(y) = m.year {
+            s.push_str(&format!("Year: {y}\n"));
+        }
+        if let Some(ref v) = m.venue {
+            s.push_str(&format!("Venue: {v}\n"));
+        }
+        if let Some(ref a) = m.paper_abstract {
+            if !a.trim().is_empty() {
+                s.push_str(&format!("Abstract: {}\n", a.trim()));
+            }
+        }
+    }
+    s.push_str("\n--- PAPER CONTENT ---\n");
+    s.push_str(fulltext);
+    s
+}
+
+/// Stable research-assistant persona for single-paper chat. Sent as a system
+/// message AFTER the canonical context block (task-specific, so kept out of the
+/// shared cacheable prefix).
+pub const PAPER_ASSISTANT_PERSONA: &str = "You are a research assistant helping the user understand and analyze a specific paper. Answer questions clearly and accurately based on the paper content provided.";
+
 fn get_fulltext_context(
     root: &str,
     slug: &str,
@@ -784,17 +863,7 @@ fn get_fulltext_context(
     if fulltext.is_empty() {
         return (String::new(), false);
     }
-
-    // Reserve space for the system prompt template and conversation history (~10K chars).
-    let max_chars = provider
-        .models
-        .iter()
-        .find(|m| m.id == model_id)
-        .and_then(|m| m.context_length)
-        .map(|cl| ((cl as usize * 7 / 10) * 4).min(300_000))
-        .unwrap_or(60_000)
-        .saturating_sub(10_000);
-
+    let max_chars = paper_context_budget(provider, model_id);
     let total = fulltext.chars().count();
     let truncated = total > max_chars;
     let context: String = fulltext.chars().take(max_chars).collect();

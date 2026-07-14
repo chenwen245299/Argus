@@ -6,7 +6,6 @@
 //! frontend's DOMPurify pass is the actual sanitizer.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 
 use super::{
@@ -179,8 +178,7 @@ fn read_zip_string(archive: &mut Archive, name: &str) -> Result<String, String> 
             .ok_or_else(|| format!("{name} not in archive"))?
     };
     let mut zf = archive.by_name(&exact).map_err(|e| e.to_string())?;
-    let mut buf = Vec::new();
-    zf.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let buf = super::read_capped(&mut zf)?;
     let mut s = String::from_utf8_lossy(&buf).into_owned();
     if s.starts_with('\u{feff}') {
         s.remove(0);

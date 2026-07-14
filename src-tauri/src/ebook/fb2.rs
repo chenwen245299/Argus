@@ -3,7 +3,6 @@
 //! `<section>`s, and base64 `<binary>` blobs for images.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 
 use super::{
@@ -104,9 +103,7 @@ fn load_fb2_xml(path: &Path) -> Result<String, String> {
             .map(|s| s.to_string())
             .ok_or_else(|| "No .fb2 entry inside the zip".to_string())?;
         let mut zf = archive.by_name(&inner).map_err(|e| e.to_string())?;
-        let mut buf = Vec::new();
-        zf.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        buf
+        super::read_capped(&mut zf)?
     } else {
         std::fs::read(path).map_err(|e| format!("Read FB2: {e}"))?
     };

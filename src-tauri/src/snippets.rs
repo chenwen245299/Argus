@@ -202,13 +202,17 @@ pub fn update_snippet(
     ensure_snippets_dir(root)?;
     validate_library_id(library_id)?;
     let mut snippets = read_snippets(root, library_id);
-    if let Some(s) = snippets.iter_mut().find(|s| s.id == id) {
-        if let Some(t) = tags {
-            s.tags = t;
-        }
-        if let Some(n) = note {
-            s.note = n;
-        }
+    let Some(s) = snippets.iter_mut().find(|s| s.id == id) else {
+        // Nothing to update: skip the rewrite and leave a trace rather than
+        // silently reporting success on a no-op.
+        eprintln!("[snippets] update_snippet: id '{id}' not found in library '{library_id}'");
+        return Ok(());
+    };
+    if let Some(t) = tags {
+        s.tags = t;
+    }
+    if let Some(n) = note {
+        s.note = n;
     }
     write_snippets(root, library_id, &snippets)
 }
@@ -218,7 +222,13 @@ pub fn delete_snippet(root: &str, library_id: &str, id: &str) -> Result<(), Stri
     ensure_snippets_dir(root)?;
     validate_library_id(library_id)?;
     let mut snippets = read_snippets(root, library_id);
+    let before = snippets.len();
     snippets.retain(|s| s.id != id);
+    if snippets.len() == before {
+        // Idempotent: deleting an absent snippet is not an error, but note it.
+        eprintln!("[snippets] delete_snippet: id '{id}' not found in library '{library_id}'");
+        return Ok(());
+    }
     write_snippets(root, library_id, &snippets)
 }
 

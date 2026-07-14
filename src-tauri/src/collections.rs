@@ -501,7 +501,10 @@ fn unique_paper_target(papers_root: &Path, slug: &str) -> PathBuf {
 fn collect_subtree(collections: &[Collection], root_id: &str) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     set.insert(root_id.to_string());
-    loop {
+    // Each pass either adds at least one id or terminates, so `len + 1` passes
+    // is a provable upper bound. The explicit cap simply guarantees the scan can
+    // never spin, even on malformed/cyclic parent data.
+    for _ in 0..=collections.len() {
         let before = set.len();
         for col in collections {
             if let Some(ref pid) = col.parent_id {
@@ -577,6 +580,22 @@ pub fn remove_paper_from_collection(
     let before = file.assignments.len();
     file.assignments
         .retain(|a| !(a.paper_id == paper_id && a.collection_id == collection_id));
+
+    if file.assignments.len() != before {
+        write_collections(root, &file)?;
+    }
+
+    Ok(())
+}
+
+/// Remove every collection assignment for `paper_id`. Called when a paper is
+/// deleted so its membership records don't linger in collections.json as
+/// orphans pointing at a folder that no longer exists.
+pub fn purge_paper(root: &str, paper_id: &str) -> Result<(), String> {
+    let _g = lock_collections();
+    let mut file = read_collections(root);
+    let before = file.assignments.len();
+    file.assignments.retain(|a| a.paper_id != paper_id);
 
     if file.assignments.len() != before {
         write_collections(root, &file)?;

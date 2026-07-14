@@ -2,9 +2,6 @@ use crate::models::{ChatMessage, Note, PaperMeta};
 use crate::{ai_manager, extraction, llm, paper, search, settings};
 use tauri::Emitter;
 
-// Reserve ~8K chars for system prompt, meta, and conversation overhead.
-const CONTEXT_OVERHEAD: usize = 8_000;
-
 pub fn read_summary(root: &str, slug: &str) -> String {
     paper::get_note_by_title(root, slug, "AI总结").unwrap_or_else(|| {
         let legacy = paper::paper_dir(root, slug).join("ai_summary.md");
@@ -60,16 +57,42 @@ pub async fn generate_summary(
     let (provider, api_key, model) =
         ai_manager::resolve_provider_model(root, configured_provider_id, configured_model_id)?;
 
-    let max_chars = context_budget(&provider, &model);
+    // Use the SAME budget as the chat path so the truncated fulltext — and thus
+    // the leading context block — is byte-identical across tasks (cache reuse).
+    let max_chars = crate::copilot::paper_context_budget(&provider, &model);
     let truncated = fulltext_chars > max_chars;
     let context: String = fulltext.chars().take(max_chars).collect();
     let context_chars = context.chars().count();
 
-    let system = "你是一名严谨的研究助理。请只输出 Markdown 正文，不要输出代码块包裹。总结必须忠于论文内容，信息不足时明确说明。".to_string();
-    let mut user = render_prompt(&app_settings.ai_summary_prompt, &meta, &context);
-    if truncated {
-        user.push_str("\n\n> 注：由于模型上下文限制，本次摘要基于截断后的论文全文生成。");
-    }
+    const SUMMARY_PERSONA: &str = "你是一名严谨的研究助理。请只输出 Markdown 正文，不要输出代码块包裹。总结必须忠于论文内容，信息不足时明确说明。";
+    let truncation_note = "\n\n> 注：由于模型上下文限制，本次摘要基于截断后的论文全文生成。";
+    let template = app_settings.ai_summary_prompt.clone();
+    let messages: Vec<ChatMessage> = if template.contains("{fulltext}") {
+        // Custom template that positions the fulltext inline — honor it exactly
+        // so user-tuned prompts keep working unchanged.
+        let mut user = render_prompt(&template, &meta, &context);
+        if truncated {
+            user.push_str(truncation_note);
+        }
+        vec![
+            ChatMessage { role: "system".to_string(), content: SUMMARY_PERSONA.into() },
+            ChatMessage { role: "user".to_string(), content: user.into() },
+        ]
+    } else {
+        // Default / no-{fulltext} template: front-load the SAME canonical paper
+        // block the chat path emits, so the (large) paper text is cached and
+        // reused across tasks — e.g. a later chat about the same paper.
+        let doc = crate::copilot::build_paper_context_block(Some(&meta), &context);
+        let mut instruction = render_instruction(&template, &meta);
+        if truncated {
+            instruction.push_str(truncation_note);
+        }
+        vec![
+            ChatMessage { role: "system".to_string(), content: doc.into() },
+            ChatMessage { role: "system".to_string(), content: SUMMARY_PERSONA.into() },
+            ChatMessage { role: "user".to_string(), content: instruction.into() },
+        ]
+    };
 
     let event_name = format!("ai-summary-{}", slug_to_event_id(slug));
     emit_progress(
@@ -89,16 +112,7 @@ pub async fn generate_summary(
         &provider,
         &api_key,
         &model,
-        &[
-            ChatMessage {
-                role: "system".to_string(),
-                content: system.into(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: user.into(),
-            },
-        ],
+        &messages,
         &event_name,
         app,
         false,
@@ -221,19 +235,43 @@ fn render_prompt(template: &str, meta: &PaperMeta, fulltext: &str) -> String {
     prompt
 }
 
-fn context_budget(provider: &crate::models::AiProvider, model_id: &str) -> usize {
-    provider
-        .models
-        .iter()
-        .find(|m| m.id == model_id)
-        .and_then(|m| m.context_length)
-        .map(|cl| {
-            // 70% of context window, assuming ~4 chars/token, capped at 300K chars
-            ((cl as usize * 7 / 10) * 4).min(300_000)
-        })
-        .unwrap_or(60_000)
-        .saturating_sub(CONTEXT_OVERHEAD)
+/// Like `render_prompt` but WITHOUT the fulltext — used when the paper text is
+/// sent as a separate leading context block. Only metadata placeholders are
+/// filled; the fulltext is neither substituted nor appended.
+fn render_instruction(template: &str, meta: &PaperMeta) -> String {
+    let mut prompt = if template.trim().is_empty() {
+        crate::models::default_ai_summary_prompt()
+    } else {
+        template.to_string()
+    };
+    let authors = if meta.authors.is_empty() {
+        "未知".to_string()
+    } else {
+        meta.authors.join(", ")
+    };
+    let year = meta
+        .year
+        .map(|y| y.to_string())
+        .unwrap_or_else(|| "未知".to_string());
+    let venue = meta.venue.clone().unwrap_or_else(|| "未知".to_string());
+    let doi = meta.doi.clone().unwrap_or_else(|| "无".to_string());
+    let arxiv_id = meta.arxiv_id.clone().unwrap_or_else(|| "无".to_string());
+    let replacements = [
+        ("{title}", meta.title.as_str()),
+        ("{authors}", authors.as_str()),
+        ("{year}", year.as_str()),
+        ("{venue}", venue.as_str()),
+        ("{doi}", doi.as_str()),
+        ("{arxiv_id}", arxiv_id.as_str()),
+        ("{abstract}", ""),
+        ("{fulltext}", ""),
+    ];
+    for (key, value) in replacements {
+        prompt = prompt.replace(key, value);
+    }
+    prompt
 }
+
 
 fn slug_to_event_id(slug: &str) -> String {
     slug.chars()

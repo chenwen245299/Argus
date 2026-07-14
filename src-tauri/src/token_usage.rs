@@ -3,6 +3,10 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub ts: String,
@@ -13,6 +17,11 @@ pub struct UsageRecord {
     pub output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// Portion of `input_tokens` served from the provider's prompt cache (a
+    /// cache *hit*). 0 when the provider reported no cache usage. Older records
+    /// written before this field existed deserialize to 0 via `default`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_hit_tokens: u64,
 }
 
 // Current library root — set whenever a library is opened.
@@ -58,10 +67,26 @@ pub fn record_with_cost(
     output_tokens: u64,
     cost_usd: Option<f64>,
 ) {
+    record_full(source, provider, model, input_tokens, output_tokens, cost_usd, 0);
+}
+
+/// Like `record_with_cost` but also records how many input tokens were served
+/// from the provider's prompt cache (a cache hit). `cache_hit_tokens` must be a
+/// subset of `input_tokens`; it is clamped to that range defensively.
+pub fn record_full(
+    source: &str,
+    provider: &str,
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: Option<f64>,
+    cache_hit_tokens: u64,
+) {
     let cost_usd = cost_usd.filter(|v| v.is_finite() && *v >= 0.0);
     if input_tokens == 0 && output_tokens == 0 && cost_usd.unwrap_or(0.0) == 0.0 {
         return;
     }
+    let cache_hit_tokens = cache_hit_tokens.min(input_tokens);
     let Some(root) = current_root() else { return };
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let rec = UsageRecord {
@@ -72,6 +97,7 @@ pub fn record_with_cost(
         input_tokens,
         output_tokens,
         cost_usd,
+        cache_hit_tokens,
     };
     let Ok(line) = serde_json::to_string(&rec) else {
         return;

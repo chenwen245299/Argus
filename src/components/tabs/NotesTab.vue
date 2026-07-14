@@ -56,6 +56,30 @@ function createNoteWindowLabel() {
   return `note-window-${Date.now()}-${suffix}`
 }
 
+// ── Remember which note was open (per paper) ────────────────────────────────
+// The Notes tab is unmounted when the user switches to another right-sidebar
+// tab, so persist the open note id and restore it on remount instead of dumping
+// the user back on the list.
+function openNoteStorageKey(slug: string) {
+  return `argus:notes-open:${slug}`
+}
+function persistOpenNote(noteId: string | null) {
+  if (!props.slug) return
+  try {
+    if (noteId) localStorage.setItem(openNoteStorageKey(props.slug), noteId)
+    else localStorage.removeItem(openNoteStorageKey(props.slug))
+  } catch {
+    // storage disabled — non-fatal
+  }
+}
+function readOpenNote(slug: string): string | null {
+  try {
+    return localStorage.getItem(openNoteStorageKey(slug))
+  } catch {
+    return null
+  }
+}
+
 // ── Load note list ─────────────────────────────────────────────────────────────
 async function loadList(slug: string) {
   loadingList.value = true
@@ -90,6 +114,7 @@ async function openNote(note: Note) {
   currentContent.value = md
   editorKey.value++
   view.value = 'editor'
+  persistOpenNote(note.id)
 }
 
 // ── Back to list ──────────────────────────────────────────────────────────────
@@ -105,6 +130,8 @@ async function goBack() {
   editingTitle.value = false
   activeNote.value = null
   view.value = 'list'
+  // Returning to the list is an explicit choice — don't reopen on remount.
+  persistOpenNote(null)
 
   if (!slug || !note) return
 
@@ -152,6 +179,7 @@ async function deleteNote(note: Note, e: MouseEvent) {
     if (activeNote.value?.id === note.id) {
       activeNote.value = null
       view.value = 'list'
+      persistOpenNote(null)
     }
   } catch (e) {
     console.error('Failed to delete note:', e)
@@ -214,18 +242,30 @@ watch(() => props.slug, async (newSlug) => {
   activeNote.value = null
   view.value = 'list'
   notes.value = []
-  if (newSlug) await loadList(newSlug)
+  if (newSlug) {
+    await loadList(newSlug)
+    // Restore the note that was open before the tab was switched away (or the
+    // paper reopened), so the user isn't dumped back on the list every time.
+    const savedId = readOpenNote(newSlug)
+    if (savedId) {
+      const note = notes.value.find(n => n.id === savedId)
+      if (note) await openNote(note)
+    }
+  }
 }, { immediate: true })
 
 async function handleNotesUpdated(event: Event) {
-  const slug = (event as CustomEvent<{ slug: string }>).detail?.slug
+  const detail = (event as CustomEvent<{ slug: string; openSummary?: boolean }>).detail
+  const slug = detail?.slug
   if (!slug || slug !== props.slug) return
   // If the user is currently editing the AI总结 note, don't re-open it — that would
-  // blow away their in-progress edits with the freshly regenerated version. Only
-  // auto-open the refreshed summary when they're on the list (or editing something else).
+  // blow away their in-progress edits with the freshly regenerated version.
   const editingSummary = view.value === 'editor' && activeNote.value?.title === 'AI总结'
   await loadList(slug)
-  if (!editingSummary) {
+  // Only auto-open the AI总结 note when this event was raised by summary
+  // generation completing (`openSummary`). Ordinary refreshes triggered by a
+  // rename/delete must leave the user's current note/selection untouched.
+  if (detail?.openSummary && !editingSummary) {
     const refreshed = notes.value.find(n => n.title === 'AI总结')
     if (refreshed) await openNote(refreshed)
   }

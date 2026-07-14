@@ -189,6 +189,9 @@ function requestRenderPage(idx: number): Promise<void> {
 }
 
 const scale = ref(1.25)
+// First-open fit-to-width may be requested while the tab is backgrounded (0
+// width); this defers it until the tab becomes visible.
+const needsInitialFit = ref(false)
 const displayPage = ref(1) // shown in toolbar (1-based)
 const pageInputValue = ref('1')
 const displayOpenTitle = computed(() =>
@@ -393,6 +396,9 @@ let _savedScrollTop: number | null = null
 watch(isActiveTab, (active) => {
   if (active) {
     addGlobalListeners()
+    // Complete a first-open fit-to-width that was deferred because the tab was
+    // still backgrounded (0 width) when the PDF finished loading.
+    if (needsInitialFit.value) nextTick(() => fitWidth())
     if (_savedScrollTop !== null) {
       const top = _savedScrollTop
       nextTick(() => { if (containerRef.value) containerRef.value.scrollTop = top })
@@ -704,7 +710,13 @@ async function loadPdf() {
   error.value = null
   const slug = props.slug
   if (!slug) return
-  scale.value = loadSavedZoom(slug) ?? 1.0 // temporary; replaced by fitWidth below if no saved zoom
+  // Restore the saved zoom if this paper was opened before; otherwise leave the
+  // default and fit-to-width once page sizes are known (below). Captured into a
+  // local so the async `scale` save-watcher can't clobber the "never opened"
+  // signal before we check it — writing a temporary scale here used to persist
+  // it mid-load, which permanently suppressed the first-open fit-to-width.
+  const savedZoom = loadSavedZoom(slug)
+  if (savedZoom !== null) scale.value = savedZoom
 
   // Load highlights and reading state
   try {
@@ -757,8 +769,14 @@ async function loadPdf() {
     loading.value = false
     await nextTick()
 
-    // If no saved zoom, default to fit-width instead of a fixed scale
-    if (loadSavedZoom(slug) === null) fitWidth()
+    // First time opening this paper: fit to the page width. Subsequent opens
+    // restore the saved zoom above. fitWidth() updates `scale`, which the
+    // save-watcher then persists for next time. If the tab is backgrounded now
+    // (0 width), the flag makes it fit once it's shown.
+    if (savedZoom === null) {
+      needsInitialFit.value = true
+      fitWidth()
+    }
 
     setupObserver()
     await restorePosition()
@@ -1297,8 +1315,13 @@ function zoomOut() { scale.value = Math.max(0.5, +(scale.value - 0.25).toFixed(2
 function fitWidth() {
   if (!containerRef.value || pageSizes.value.length === 0) return
   const containerW = containerRef.value.clientWidth - PDF_PAGE_MARGIN * 2
+  // A backgrounded tab is `display:none`, so its width is 0 — defer the fit
+  // until the tab is shown (see the isActiveTab watch) rather than snapping to
+  // a bogus minimum scale.
+  if (containerW <= 0) return
   const pageW = pageSizes.value[0].width
   scale.value = Math.max(0.5, Math.min(4, +(containerW / pageW).toFixed(3)))
+  needsInitialFit.value = false
 }
 
 // ── Page jump ─────────────────────────────────────────────────────────────────

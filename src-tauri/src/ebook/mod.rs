@@ -30,6 +30,29 @@ pub const EBOOK_EXTENSIONS: [&str; 5] = ["epub", "mobi", "azw3", "fb2", "txt"];
 /// the book itself.
 const EXCLUDED_FILES: [&str; 2] = ["fulltext.txt", "notes.md"];
 
+/// Hard ceiling on any single ebook archive entry decompressed into memory.
+/// EPUB/FB2 are zip files; a malicious book can advertise a tiny compressed
+/// size that expands to gigabytes ("zip bomb"). 200 MiB comfortably exceeds any
+/// real chapter or embedded image while stopping the bomb.
+const MAX_EBOOK_ENTRY_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Read `r` to end, but refuse to buffer more than [`MAX_EBOOK_ENTRY_BYTES`].
+/// Uses a hard `take` so the cap holds regardless of the (attacker-controlled)
+/// size the archive header claims. Shared by the epub/fb2 parsers via `super::`.
+fn read_capped(r: &mut impl std::io::Read) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    r.take(MAX_EBOOK_ENTRY_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    if buf.len() as u64 > MAX_EBOOK_ENTRY_BYTES {
+        return Err(format!(
+            "Ebook entry exceeds {MAX_EBOOK_ENTRY_BYTES} bytes (possible decompression bomb)"
+        ));
+    }
+    Ok(buf)
+}
+
 // ── Wire / storage types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,10 +318,7 @@ pub fn read_resource(parsed: &ParsedEbook, href: &str) -> Result<EbookResource, 
             let mut zf = archive
                 .by_name(inner_path)
                 .map_err(|e| format!("Resource {inner_path}: {e}"))?;
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut zf, &mut buf)
-                .map_err(|e| format!("Read resource: {e}"))?;
-            buf
+            read_capped(&mut zf)?
         }
     };
     use base64::Engine;

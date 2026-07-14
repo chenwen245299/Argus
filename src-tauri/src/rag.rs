@@ -268,20 +268,31 @@ fn migrate_chunks_table(conn: &Connection, root: &str) -> Result<(), String> {
             .map(|m| m.embedding_model)
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| "legacy".to_string());
-        let m = legacy_model.replace('\'', "''");
 
+        // Copy rows with an empty model marker first, then stamp the real model
+        // via a parameterized UPDATE. Binding the value (instead of splicing it
+        // into the batch SQL) removes any reliance on manual quote-escaping and
+        // sidesteps edge cases like a model name containing a NUL that would
+        // truncate the `execute_batch` string.
         conn.execute_batch(&format!(
             "ALTER TABLE chunks RENAME TO chunks_legacy;
              {CHUNKS_SCHEMA}
              INSERT INTO chunks
                  (chunk_id, embedding_model, paper_id, slug, chunk_index, text, vector,
                   source_type, source_id, source_label, paper_title)
-             SELECT chunk_id, '{m}', paper_id, slug, chunk_index, text, vector,
+             SELECT chunk_id, '', paper_id, slug, chunk_index, text, vector,
                     source_type, source_id, source_label, paper_title
              FROM chunks_legacy;
              DROP TABLE chunks_legacy;"
         ))
-        .map_err(|e| format!("Migrate chunks to multi-model store: {e}"))
+        .map_err(|e| format!("Migrate chunks to multi-model store: {e}"))?;
+
+        conn.execute(
+            "UPDATE chunks SET embedding_model = ?1 WHERE embedding_model = ''",
+            rusqlite::params![legacy_model],
+        )
+        .map_err(|e| format!("Tag migrated chunks with model: {e}"))?;
+        Ok(())
     })();
 
     match result {
@@ -1502,6 +1513,9 @@ async fn search_chunks_internal(
 
         let mut scored: Vec<(f32, Row)> = rows
             .into_iter()
+            // Drop dimension-mismatched vectors (stale model / corrupt blob) so
+            // they don't occupy top_k slots with a 0.0 score.
+            .filter(|row| !row.vector.is_empty() && row.vector.len() == query_vec.len())
             .map(|row| {
                 let score = cosine_similarity(&query_vec, &row.vector);
                 (score, row)
@@ -1724,7 +1738,11 @@ pub async fn search_snippet_chunks_with_vec(
             .filter_map(|r| r.ok())
             .filter_map(|(snippet_id, library_id, text, blob, paper_id, paper_title, page, note, tags_json)| {
                 let vec = blob_to_vec(&blob);
-                if vec.is_empty() { return None; }
+                // Skip vectors whose dimension doesn't match the query (e.g.
+                // snippets embedded under a different model, or a truncated blob):
+                // they can only ever score a meaningless 0.0 and would otherwise
+                // dilute the ranking.
+                if vec.is_empty() || vec.len() != query_vec.len() { return None; }
                 let score = cosine_similarity(&query_vec, &vec);
                 let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
                 Some((score, crate::models::RetrievedSnippet {

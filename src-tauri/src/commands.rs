@@ -903,12 +903,19 @@ pub async fn delete_paper(slug: String, state: State<'_, LibraryRoot>) -> Result
     }
     // Remove from search index before deleting the directory
     let _ = search::remove_paper(&root, &slug);
-    // Remove RAG vector chunks so the vector DB doesn't accumulate stale data
+    // Remove RAG vector chunks (and its collection membership) so neither the
+    // vector DB nor collections.json accumulates stale data pointing at a paper
+    // that no longer exists. Library-level records — token usage and the
+    // activity log — live outside the paper folder and are intentionally kept.
     if let Ok(meta) = paper::read_meta(&root, &slug) {
         let _ = rag::delete_paper_chunks(&root, &meta.id).await;
+        let _ = collections::purge_paper(&root, &meta.id);
     }
     // Drop any cached parsed ebook so its Arc doesn't outlive the paper
     ebook::evict_from_cache(&slug);
+    // Removing the folder also deletes the paper's per-paper conversation
+    // history (chat.json, ai_conversations.json), notes, highlights, sections,
+    // reading state and extracted fulltext.
     std::fs::remove_dir_all(&dir).map_err(|e| format!("Cannot delete paper: {e}"))
 }
 
@@ -920,7 +927,8 @@ pub async fn open_paper_folder(slug: String, state: State<'_, LibraryRoot>) -> R
     if !dir.exists() {
         return Err(format!("Paper directory not found: {}", slug));
     }
-    open_in_finder(dir.to_string_lossy().to_string())
+    // `dir` is derived from the library root + slug, so it's already confined.
+    reveal_path_in_finder(&dir.to_string_lossy())
 }
 
 /// Copy the paper PDF itself to the system clipboard, so it can be pasted in Finder.
@@ -1012,6 +1020,9 @@ pub async fn rename_paper_folder(
 
     if new_slug != slug {
         let _ = search::remove_paper(&root, &slug);
+        // Drop the old slug's parsed-ebook cache entry: its cached `book_path`
+        // now points at a folder that no longer exists.
+        ebook::evict_from_cache(&slug);
     }
     refresh_search_index(&root, &new_slug);
     Ok(new_slug)
@@ -2450,10 +2461,21 @@ pub fn open_url(url: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd")
-        .args(["/c", "start", "", &url])
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    {
+        use std::os::windows::process::CommandExt;
+        // A URL query string legitimately contains '&', which `cmd` would treat
+        // as a command separator if the URL were an unquoted token. Build the
+        // command line ourselves so the URL is a single quoted argument, and
+        // reject the characters that could break out of those quotes (none of
+        // which are valid in the already scheme-checked http(s) URL).
+        if url.contains('"') || url.contains('\n') || url.contains('\r') {
+            return Err("Blocked: URL contains invalid characters".to_string());
+        }
+        std::process::Command::new("cmd")
+            .raw_arg(format!("/c start \"\" \"{url}\""))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
     #[cfg(target_os = "linux")]
     std::process::Command::new("xdg-open")
         .arg(&url)
@@ -2462,24 +2484,43 @@ pub fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn open_in_finder(path: String) -> Result<(), String> {
+/// Reveal `path` in the OS file manager. Private: callers must confine `path`
+/// to a trusted location (e.g. inside the library) before invoking.
+fn reveal_path_in_finder(path: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     std::process::Command::new("open")
-        .arg(&path)
+        .arg(path)
         .spawn()
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
     std::process::Command::new("explorer")
-        .arg(&path)
+        .arg(path)
         .spawn()
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
     std::process::Command::new("xdg-open")
-        .arg(&path)
+        .arg(path)
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn open_in_finder(path: String, state: State<'_, LibraryRoot>) -> Result<(), String> {
+    // Confine to the current library root. Every legitimate caller passes a
+    // path returned by get_*_folder_path (all under the library), so this is
+    // transparent to normal use while blocking a compromised frontend from
+    // using this command to open — and thus launch, via the OS default
+    // handler — arbitrary files or apps elsewhere on the system.
+    let root = get_root(&state)?;
+    let canonical_root =
+        std::fs::canonicalize(&root).map_err(|e| format!("Resolve library root: {e}"))?;
+    let canonical_target =
+        std::fs::canonicalize(&path).map_err(|e| format!("Resolve path: {e}"))?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err("Refused: path is outside the library".to_string());
+    }
+    reveal_path_in_finder(&path)
 }
 
 fn copy_file_to_clipboard(path: String) -> Result<(), String> {
@@ -2951,6 +2992,9 @@ pub fn write_bytes_to_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
         "pdf", "png", "jpg", "jpeg", "webp", "svg", "gif", "json", "csv", "md",
         "txt", "bib", "bibtex", "html",
     ];
+    if path.is_empty() || path.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("Refused: invalid export path".to_string());
+    }
     let ext = std::path::Path::new(&path)
         .extension()
         .and_then(|e| e.to_str())

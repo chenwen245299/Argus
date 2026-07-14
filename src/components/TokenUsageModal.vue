@@ -14,6 +14,8 @@ interface UsageRecord {
   input_tokens: number
   output_tokens: number
   cost_usd?: number
+  /** Portion of input_tokens served from the provider's prompt cache. */
+  cache_hit_tokens?: number
 }
 
 type Range = 'today' | 'week' | 'month' | 'year'
@@ -350,21 +352,30 @@ interface ModelRow {
   output: number
   total: number
   cost: number
+  cacheHit: number
 }
 
 const modelRanking = computed<ModelRow[]>(() => {
   const map = new Map<string, ModelRow>()
   for (const r of filteredRecords.value) {
     const key = `${r.provider}::${r.model}`
-    if (!map.has(key)) map.set(key, { key, model: r.model, provider: r.provider, input: 0, output: 0, total: 0, cost: 0 })
+    if (!map.has(key)) map.set(key, { key, model: r.model, provider: r.provider, input: 0, output: 0, total: 0, cost: 0, cacheHit: 0 })
     const row = map.get(key)!
     row.input  += r.input_tokens
     row.output += r.output_tokens
     row.total  += r.input_tokens + r.output_tokens
     row.cost   += recordCost(r)
+    row.cacheHit += r.cache_hit_tokens ?? 0
   }
   return [...map.values()].sort((a, b) => b.total - a.total)
 })
+
+// Cache hits are a subset of input tokens, so the rate is over input only.
+// Returns null when the model has no cached input (hide the chip entirely).
+function modelCacheRate(row: ModelRow): number | null {
+  if (row.cacheHit <= 0 || row.input <= 0) return null
+  return Math.round((row.cacheHit / row.input) * 100)
+}
 
 const rankingMax = computed(() => Math.max(...modelRanking.value.map(r => r.total), 1))
 
@@ -571,14 +582,26 @@ onMounted(load)
                   <span class="model-provider">{{ providerName(row.provider) }}</span>
                 </div>
               </div>
-              <div class="model-bar-wrap">
-                <div
-                  class="model-bar"
-                  :style="{
-                    width: (row.total / rankingMax * 100) + '%',
-                    background: colorForModel(row.key),
-                  }"
-                />
+              <div class="model-mid">
+                <div class="model-bar-wrap">
+                  <div
+                    class="model-bar"
+                    :style="{
+                      width: (row.total / rankingMax * 100) + '%',
+                      background: colorForModel(row.key),
+                    }"
+                  />
+                </div>
+                <span
+                  v-if="modelCacheRate(row) !== null"
+                  class="model-cache"
+                  :title="t('tokenUsage.cacheHitRate')"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="13 2 4 14 12 14 11 22 20 10 12 10 13 2" />
+                  </svg>
+                  {{ modelCacheRate(row) }}%
+                </span>
               </div>
               <div class="model-nums">
                 <span class="model-total">{{ fmtT(row.total) }}</span>
@@ -894,10 +917,21 @@ onMounted(load)
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .model-provider { font-size: 11px; color: var(--usage-faint); }
+.model-mid {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+}
 .model-bar-wrap {
+  flex: 1 1 auto; min-width: 0;
   height: 8px; background: #e9f0fb;
   border-radius: 999px; overflow: hidden;
 }
+.model-cache {
+  display: inline-flex; align-items: center; gap: 3px;
+  flex-shrink: 0;
+  font-size: 11px; font-weight: 600;
+  color: var(--usage-text-soft, #94a3b8);
+}
+.model-cache svg { color: #5b8def; }
 .model-bar {
   height: 100%; background: var(--usage-blue); border-radius: 999px;
   transition: width 0.4s ease;

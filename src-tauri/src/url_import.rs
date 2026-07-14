@@ -74,9 +74,14 @@ mod pdf_url {
         };
         emit("downloading");
 
+        // Only fetch public http(s) targets — blocks file://, and SSRF to
+        // loopback/private/link-local hosts (e.g. cloud metadata endpoints).
+        crate::net::validate_public_http_url(url)?;
+
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (compatible; Argus/1.0)")
             .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
 
@@ -161,20 +166,11 @@ use tauri::Emitter;
 /// links that would otherwise buffer unbounded bytes into memory.
 const MAX_PDF_BYTES: u64 = 200 * 1024 * 1024;
 
-/// Read the response body into bytes, first rejecting it if the advertised
-/// `Content-Length` exceeds `MAX_PDF_BYTES`.
+/// Read the response body into bytes, enforcing `MAX_PDF_BYTES` both against the
+/// advertised `Content-Length` and while streaming — so a server that omits the
+/// length (or lies about it) still cannot make us buffer unbounded memory.
 async fn read_bytes_capped(resp: reqwest::Response) -> Result<Vec<u8>, String> {
-    if let Some(len) = resp.content_length() {
-        if len > MAX_PDF_BYTES {
-            return Err(format!(
-                "PDF too large: {len} bytes exceeds limit of {MAX_PDF_BYTES} bytes"
-            ));
-        }
-    }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("Read PDF bytes: {e}"))
+    crate::net::fetch_bytes_capped(resp, MAX_PDF_BYTES).await
 }
 
 fn sanitize(s: &str) -> String {
@@ -683,12 +679,17 @@ mod aaai {
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (compatible; Argus/1.0)")
             .timeout(std::time::Duration::from_secs(40))
+            .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
 
         let meta = fetch_meta(&client, &id).await?;
 
         emit("downloading");
+        // `pdf_url` is scraped from the page's meta tags — validate it before
+        // fetching so a hostile page can't point the download at file:// or an
+        // internal address.
+        crate::net::validate_public_http_url(&meta.pdf_url)?;
         let resp = client
             .get(&meta.pdf_url)
             .send()
@@ -890,12 +891,17 @@ mod openreview {
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (compatible; Argus/1.0)")
             .timeout(std::time::Duration::from_secs(40))
+            .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
 
         let meta = fetch_meta(&client, &id).await?;
 
         emit("downloading");
+        // `pdf_url` is scraped from the page's meta tags — validate it before
+        // fetching so a hostile page can't point the download at file:// or an
+        // internal address.
+        crate::net::validate_public_http_url(&meta.pdf_url)?;
         let resp = client
             .get(&meta.pdf_url)
             .send()

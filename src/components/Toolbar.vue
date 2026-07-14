@@ -414,7 +414,10 @@ async function analyzeOnePaper(slug: string): Promise<void> {
     await invoke<Note>('generate_summary', { slug, providerId: null, modelId: null })
     paperTasks.setAiSummaryJob(slug, { stage: 'done' })
     await refreshSinglePaperStatus(slug)
-    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug } }))
+    // `openSummary` tells the Notes tab this refresh came from summary generation,
+    // so it should surface the freshly written AI总结 note. Plain list refreshes
+    // (rename/delete) omit the flag and must NOT hijack the current selection.
+    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug, openSummary: true } }))
   } catch (e: unknown) {
     paperTasks.setAiSummaryJob(slug, { stage: 'error', message: String(e) })
   } finally {

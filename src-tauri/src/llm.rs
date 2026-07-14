@@ -696,13 +696,14 @@ async fn stream_with_pdf_injected(
                                     cache_hit_tokens,
                                 );
                             }
-                            crate::token_usage::record_with_cost(
+                            crate::token_usage::record_full(
                                 source,
                                 &provider.id,
                                 model,
                                 input_tokens,
                                 output_tokens,
                                 cost_usd,
+                                cache_hit_tokens,
                             );
                             let _ =
                                 app.emit(event_name, serde_json::json!({"delta":"","done":true}));
@@ -717,6 +718,12 @@ async fn stream_with_pdf_injected(
                                     output_tokens = v;
                                 }
                                 if let Some(v) = usage["prompt_cache_hit_tokens"].as_u64() {
+                                    // DeepSeek reports cache hits here.
+                                    cache_hit_tokens = v;
+                                } else if let Some(v) =
+                                    usage["prompt_tokens_details"]["cached_tokens"].as_u64()
+                                {
+                                    // OpenAI / Kimi / OpenRouter report them here.
                                     cache_hit_tokens = v;
                                 }
                                 if let Some(v) = usage_cost_usd(usage) {
@@ -771,13 +778,14 @@ async fn stream_with_pdf_injected(
         }
     }
 
-    crate::token_usage::record_with_cost(
+    crate::token_usage::record_full(
         source,
         &provider.id,
         model,
         input_tokens,
         output_tokens,
         cost_usd,
+        cache_hit_tokens,
     );
     if !usage_emitted {
         emit_stream_usage(
@@ -867,18 +875,23 @@ async fn chat_openai_compat(
 
     let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
     let output_tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    let cache_hit_tokens = json["usage"]["prompt_cache_hit_tokens"]
+        .as_u64()
+        .or_else(|| json["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64())
+        .unwrap_or(0);
     let cost_usd = if is_openrouter || is_kimi {
         usage_cost_usd(&json["usage"])
     } else {
         None
     };
-    crate::token_usage::record_with_cost(
+    crate::token_usage::record_full(
         source,
         &provider.id,
         model,
         input_tokens,
         output_tokens,
         cost_usd,
+        cache_hit_tokens,
     );
 
     json["choices"][0]["message"]["content"]
@@ -1037,13 +1050,14 @@ async fn stream_openai_compat(
                                     cache_hit_tokens,
                                 );
                             }
-                            crate::token_usage::record_with_cost(
+                            crate::token_usage::record_full(
                                 source,
                                 &provider.id,
                                 model,
                                 input_tokens,
                                 output_tokens,
                                 if is_openrouter || is_kimi { cost_usd } else { None },
+                                cache_hit_tokens,
                             );
                             let _ =
                                 app.emit(event_name, serde_json::json!({"delta":"","done":true}));
@@ -1059,6 +1073,12 @@ async fn stream_openai_compat(
                                     output_tokens = v;
                                 }
                                 if let Some(v) = usage["prompt_cache_hit_tokens"].as_u64() {
+                                    // DeepSeek reports cache hits here.
+                                    cache_hit_tokens = v;
+                                } else if let Some(v) =
+                                    usage["prompt_tokens_details"]["cached_tokens"].as_u64()
+                                {
+                                    // OpenAI / Kimi / OpenRouter report them here.
                                     cache_hit_tokens = v;
                                 }
                                 if is_openrouter || is_kimi {
@@ -1123,13 +1143,14 @@ async fn stream_openai_compat(
         }
     }
 
-    crate::token_usage::record_with_cost(
+    crate::token_usage::record_full(
         source,
         &provider.id,
         model,
         input_tokens,
         output_tokens,
         if is_openrouter || is_kimi { cost_usd } else { None },
+        cache_hit_tokens,
     );
     if !usage_emitted {
         emit_stream_usage(
@@ -1546,13 +1567,16 @@ async fn chat_anthropic(
 ) -> Result<String, String> {
     let client = build_client()?;
     let url = format!("{}/messages", provider.base_url.trim_end_matches('/'));
-    let (system, conv) = split_system(messages);
     let is_kimi_coding = is_kimi_coding_endpoint(provider);
+    // Only real Anthropic gets cache_control breakpoints. The Kimi coding
+    // endpoint speaks the same protocol but may not accept the structured
+    // system-block form, so it stays on the plain-string path.
+    let (system, conv) = split_system_cached(messages, provider.kind == "anthropic");
     // Kimi Code allows larger output windows; Anthropic defaults stay conservative.
     let max_tokens: i64 = if is_kimi_coding { 8192 } else { 4096 };
     let mut body = serde_json::json!({"model": model, "max_tokens": max_tokens, "messages": conv});
-    if !system.is_empty() {
-        body["system"] = serde_json::json!(system);
+    if !system.is_null() {
+        body["system"] = system;
     }
 
     let mut req = client
@@ -1584,9 +1608,20 @@ async fn chat_anthropic(
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from Anthropic: {e}"))?;
 
-    let input_tokens = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let base_input = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let cache_read = json["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let cache_write = json["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    let input_tokens = base_input + cache_read + cache_write;
     let output_tokens = json["usage"]["output_tokens"].as_u64().unwrap_or(0);
-    crate::token_usage::record(source, &provider.id, model, input_tokens, output_tokens);
+    crate::token_usage::record_full(
+        source,
+        &provider.id,
+        model,
+        input_tokens,
+        output_tokens,
+        None,
+        cache_read,
+    );
 
     json["content"][0]["text"]
         .as_str()
@@ -1607,8 +1642,8 @@ async fn stream_anthropic(
 ) -> Result<String, String> {
     let client = build_client()?;
     let url = format!("{}/messages", provider.base_url.trim_end_matches('/'));
-    let (system, conv) = split_system(messages);
     let is_kimi_coding = is_kimi_coding_endpoint(provider);
+    let (system, conv) = split_system_cached(messages, provider.kind == "anthropic");
 
     let thinking_budget: i64 = 10_000;
     let max_tokens = if use_reasoning && !is_kimi_coding {
@@ -1624,8 +1659,8 @@ async fn stream_anthropic(
         "messages": conv,
         "stream": true
     });
-    if !system.is_empty() {
-        body["system"] = serde_json::json!(system);
+    if !system.is_null() {
+        body["system"] = system;
     }
     if use_reasoning && !is_kimi_coding {
         body["thinking"] = serde_json::json!({
@@ -1667,6 +1702,8 @@ async fn stream_anthropic(
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
+    // Anthropic reports cache hits separately from `input_tokens`.
+    let mut cache_read: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
         // Backend cancellation: if the user pressed stop, break out of the loop.
@@ -1702,11 +1739,14 @@ async fn stream_anthropic(
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                             match json["type"].as_str() {
                                 Some("message_start") => {
-                                    if let Some(v) =
-                                        json["message"]["usage"]["input_tokens"].as_u64()
-                                    {
-                                        input_tokens = v;
-                                    }
+                                    let u = &json["message"]["usage"];
+                                    let base = u["input_tokens"].as_u64().unwrap_or(0);
+                                    cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                                    let cache_write =
+                                        u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                                    // Count cached + freshly-written input in the total so the
+                                    // hit ratio (cache_read / input) reflects the real prompt.
+                                    input_tokens = base + cache_read + cache_write;
                                 }
                                 Some("message_delta") => {
                                     if let Some(v) = json["usage"]["output_tokens"].as_u64() {
@@ -1744,14 +1784,16 @@ async fn stream_anthropic(
                                         output_tokens,
                                         input_tokens.saturating_add(output_tokens),
                                         None,
-                                        0,
+                                        cache_read,
                                     );
-                                    crate::token_usage::record(
+                                    crate::token_usage::record_full(
                                         source,
                                         &provider.id,
                                         model,
                                         input_tokens,
                                         output_tokens,
+                                        None,
+                                        cache_read,
                                     );
                                     let _ = app.emit(
                                         event_name,
@@ -1768,7 +1810,15 @@ async fn stream_anthropic(
         }
     }
 
-    crate::token_usage::record(source, &provider.id, model, input_tokens, output_tokens);
+    crate::token_usage::record_full(
+        source,
+        &provider.id,
+        model,
+        input_tokens,
+        output_tokens,
+        None,
+        cache_read,
+    );
     emit_stream_usage(
         app,
         event_name,
@@ -1776,7 +1826,7 @@ async fn stream_anthropic(
         output_tokens,
         input_tokens.saturating_add(output_tokens),
         None,
-        0,
+        cache_read,
     );
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
@@ -2251,13 +2301,23 @@ fn parse_data_uri(uri: &str) -> Option<(String, String)> {
     Some((media_type.to_string(), payload.to_string()))
 }
 
-fn split_system(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
-    let system: String = messages
+/// Split system and conversation messages for the Anthropic Messages API.
+/// When `enable_cache` is set the system prompt is the system prompt is
+/// emitted as an array of text blocks (one per system message) with an
+/// `ephemeral` cache_control breakpoint on the FIRST block. Callers put the
+/// large, stable "paper context" block first, so Anthropic serves that prefix
+/// from its prompt cache on repeat calls instead of re-billing the paper text.
+/// Returns `Value::Null` when there is no system content, an array when caching
+/// is enabled, or a plain string otherwise (unchanged behavior).
+fn split_system_cached(
+    messages: &[ChatMessage],
+    enable_cache: bool,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let sys: Vec<&str> = messages
         .iter()
         .filter(|m| m.role == "system")
         .map(|m| chat_content_text(&m.content))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
     let conv: Vec<serde_json::Value> = messages
         .iter()
         .filter(|m| m.role != "system")
@@ -2268,6 +2328,29 @@ fn split_system(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
             })
         })
         .collect();
+
+    let system = if sys.is_empty() {
+        serde_json::Value::Null
+    } else if enable_cache {
+        let blocks: Vec<serde_json::Value> = sys
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                if i == 0 {
+                    serde_json::json!({
+                        "type": "text",
+                        "text": text,
+                        "cache_control": { "type": "ephemeral" }
+                    })
+                } else {
+                    serde_json::json!({ "type": "text", "text": text })
+                }
+            })
+            .collect();
+        serde_json::Value::Array(blocks)
+    } else {
+        serde_json::Value::String(sys.join("\n"))
+    };
     (system, conv)
 }
 

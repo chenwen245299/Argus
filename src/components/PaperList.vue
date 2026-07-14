@@ -1145,7 +1145,8 @@ async function generateAiSummary(item: PaperIndexEntry) {
       modelId: null,
     })
     setAiSummaryJob(item.slug, { stage: 'done' })
-    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: item.slug } }))
+    // From summary generation → let the Notes tab surface the AI总结 note.
+    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: item.slug, openSummary: true } }))
     await library.refresh()
   } catch (e: unknown) {
     setAiSummaryJob(item.slug, { stage: 'error', message: String(e) })

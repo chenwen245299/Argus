@@ -1701,14 +1701,15 @@ pub(crate) fn unique_paper_dir(papers_root: &Path, slug: &str) -> PathBuf {
     if !base.exists() {
         return base;
     }
-    let mut n = 2u32;
-    loop {
+    // Bounded search for a free suffix; fall back to a UUID so a pathological
+    // run of collisions can never spin forever.
+    for n in 2u32..=10_000 {
         let candidate = papers_root.join(format!("{slug}-{n}"));
         if !candidate.exists() {
             return candidate;
         }
-        n += 1;
     }
+    papers_root.join(format!("{slug}-{}", uuid::Uuid::new_v4()))
 }
 
 /// Find the slug of a paper already in the library by its arXiv ID.
@@ -1785,6 +1786,11 @@ pub async fn import_by_url(
     } else {
         format!("https://arxiv.org/abs/{arxiv_id}")
     };
+
+    // Pin the scrape to arxiv.org (and subdomains). A user-supplied URL only has
+    // to *contain* "arxiv.org/abs/" to reach this branch, so without this a
+    // link like https://evil.com/arxiv.org/abs/… would be fetched verbatim.
+    crate::net::validate_host_suffix(&abs_url, &["arxiv.org"])?;
 
     let html = client
         .get(&abs_url)

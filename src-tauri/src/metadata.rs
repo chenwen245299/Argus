@@ -187,12 +187,18 @@ fn build_client() -> reqwest::Client {
     CLIENT.get_or_init(|| client).clone()
 }
 
+/// Upper bound on a metadata API response. These endpoints return small
+/// JSON/XML documents; the cap guards against a hostile or misbehaving server
+/// streaming an unbounded body into memory.
+const MAX_META_BYTES: u64 = 20 * 1024 * 1024;
+
 // ── arXiv API ─────────────────────────────────────────────────────────────────
 
 pub async fn fetch_arxiv(arxiv_id: &str) -> Option<MetaUpdate> {
     let url = format!("https://export.arxiv.org/api/query?id_list={}", arxiv_id);
     let client = build_client();
-    let xml = client.get(&url).send().await.ok()?.text().await.ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    let xml = crate::net::fetch_text_capped(resp, MAX_META_BYTES).await.ok()?;
 
     // Check there's an actual entry (not just a feed with zero results)
     if !xml.contains("<entry>") {
@@ -261,7 +267,8 @@ fn parse_arxiv_xml(xml: &str) -> Option<MetaUpdate> {
 pub async fn fetch_crossref(doi: &str) -> Option<MetaUpdate> {
     let url = format!("https://api.crossref.org/works/{}", doi);
     let client = build_client();
-    let json: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    let json: Value = crate::net::fetch_json_capped(resp, MAX_META_BYTES).await.ok()?;
     parse_crossref_json(&json)
 }
 
@@ -344,7 +351,8 @@ pub async fn fetch_semantic_scholar(
         paper_id
     );
     let client = build_client();
-    let json: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    let json: Value = crate::net::fetch_json_capped(resp, MAX_META_BYTES).await.ok()?;
     parse_s2_json(&json)
 }
 
@@ -392,7 +400,7 @@ fn parse_s2_json(json: &Value) -> Option<MetaUpdate> {
 
 pub async fn fetch_semantic_scholar_by_title(title: &str) -> Option<MetaUpdate> {
     let client = build_client();
-    let json: Value = client
+    let resp = client
         .get("https://api.semanticscholar.org/graph/v1/paper/search")
         .query(&[
             ("query", title),
@@ -401,10 +409,8 @@ pub async fn fetch_semantic_scholar_by_title(title: &str) -> Option<MetaUpdate> 
         ])
         .send()
         .await
-        .ok()?
-        .json()
-        .await
         .ok()?;
+    let json: Value = crate::net::fetch_json_capped(resp, MAX_META_BYTES).await.ok()?;
     let papers = json["data"].as_array()?;
     // Pick the first result whose title roughly matches (case-insensitive substring)
     let title_lower = title.to_lowercase();
@@ -432,7 +438,7 @@ pub async fn fetch_semantic_scholar_by_title(title: &str) -> Option<MetaUpdate> 
 
 pub async fn fetch_crossref_by_title(title: &str) -> Option<MetaUpdate> {
     let client = build_client();
-    let json: Value = client
+    let resp = client
         .get("https://api.crossref.org/works")
         .query(&[
             ("query.title", title),
@@ -444,10 +450,8 @@ pub async fn fetch_crossref_by_title(title: &str) -> Option<MetaUpdate> {
         ])
         .send()
         .await
-        .ok()?
-        .json()
-        .await
         .ok()?;
+    let json: Value = crate::net::fetch_json_capped(resp, MAX_META_BYTES).await.ok()?;
     let item = json["message"]["items"].as_array()?.first()?;
 
     let title = item["title"].as_array()?.first()?.as_str()?.to_string();

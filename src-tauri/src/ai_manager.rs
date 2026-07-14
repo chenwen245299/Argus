@@ -194,6 +194,10 @@ pub fn add_provider(
     input: AiProviderInput,
     api_key: &str,
 ) -> Result<AiProvider, String> {
+    // Reject non-http(s) base URLs so a crafted provider can't exfiltrate the
+    // API key via schemes like file:// or gopher://. Local servers (Ollama, LM
+    // Studio on http://localhost) stay allowed.
+    crate::net::validate_provider_url(&input.base_url)?;
     let mut settings = read_ai_settings(root);
     let id = uuid::Uuid::new_v4().to_string();
     let mut models = input.models;
@@ -222,6 +226,7 @@ pub fn update_provider(
     input: AiProviderInput,
     api_key: Option<&str>,
 ) -> Result<(), String> {
+    crate::net::validate_provider_url(&input.base_url)?;
     let id = input
         .id
         .as_deref()

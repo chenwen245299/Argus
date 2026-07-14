@@ -683,6 +683,20 @@ pub fn export_canvas_image(
 ) -> Result<String, String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
+    // Defense-in-depth for a command that writes to a frontend-supplied path
+    // (normally chosen via the native save dialog): reject control characters
+    // and refuse to follow a symlink at the destination, so a pre-planted link
+    // can't redirect the write outside the intended location. Mirrors the guard
+    // in `commands::write_bytes_to_file`.
+    if save_path.is_empty() || save_path.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("Refused: invalid export path".to_string());
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(save_path) {
+        if meta.file_type().is_symlink() {
+            return Err("Refused: export target is a symlink".to_string());
+        }
+    }
+
     // Create parent directory if needed
     if let Some(parent) = Path::new(save_path).parent() {
         if !parent.as_os_str().is_empty() {

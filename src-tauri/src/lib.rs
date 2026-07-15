@@ -104,6 +104,8 @@ pub fn run() {
             commands::get_paper_meta,
             commands::save_paper_meta,
             commands::delete_tag,
+            commands::add_related_paper,
+            commands::remove_related_paper,
             commands::get_notes,
             commands::save_notes,
             commands::list_notes,

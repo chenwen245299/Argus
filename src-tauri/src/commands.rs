@@ -145,10 +145,16 @@ pub async fn get_paper_meta(
 #[tauri::command]
 pub async fn save_paper_meta(
     slug: String,
-    meta: PaperMeta,
+    mut meta: PaperMeta,
     state: State<'_, LibraryRoot>,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
+    // `related_ids` is owned exclusively by add_related_paper/remove_related_paper.
+    // Preserve whatever is on disk so a (possibly stale) metadata save can't
+    // clobber links added via the related-papers popover during editing.
+    if let Ok(existing) = paper::read_meta(&root, &slug) {
+        meta.related_ids = existing.related_ids;
+    }
     paper::write_meta(&root, &slug, &meta)?;
     refresh_search_index(&root, &slug);
     Ok(())
@@ -171,6 +177,62 @@ pub async fn delete_tag(
                 refresh_search_index(&root, &slug);
             }
         }
+    }
+    Ok(())
+}
+
+/// Create a bidirectional "related paper" link between two papers. Each paper's
+/// meta.json stores the other's `id` in `related_ids`. No-op for self-links or
+/// links that already exist.
+#[tauri::command]
+pub async fn add_related_paper(
+    slug_a: String,
+    slug_b: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    if slug_a == slug_b {
+        return Ok(());
+    }
+    let root = get_root(&state)?;
+    let mut meta_a = paper::read_meta(&root, &slug_a)?;
+    let mut meta_b = paper::read_meta(&root, &slug_b)?;
+    if meta_a.id == meta_b.id {
+        return Ok(());
+    }
+    if !meta_a.related_ids.contains(&meta_b.id) {
+        meta_a.related_ids.push(meta_b.id.clone());
+        paper::write_meta(&root, &slug_a, &meta_a)?;
+        refresh_search_index(&root, &slug_a);
+    }
+    if !meta_b.related_ids.contains(&meta_a.id) {
+        meta_b.related_ids.push(meta_a.id.clone());
+        paper::write_meta(&root, &slug_b, &meta_b)?;
+        refresh_search_index(&root, &slug_b);
+    }
+    Ok(())
+}
+
+/// Remove a bidirectional related link between two papers.
+#[tauri::command]
+pub async fn remove_related_paper(
+    slug_a: String,
+    slug_b: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    let mut meta_a = paper::read_meta(&root, &slug_a)?;
+    let mut meta_b = paper::read_meta(&root, &slug_b)?;
+    let before_a = meta_a.related_ids.len();
+    meta_a.related_ids.retain(|id| id != &meta_b.id);
+    if meta_a.related_ids.len() != before_a {
+        paper::write_meta(&root, &slug_a, &meta_a)?;
+        refresh_search_index(&root, &slug_a);
+    }
+    let before_b = meta_b.related_ids.len();
+    meta_b.related_ids.retain(|id| id != &meta_a.id);
+    if meta_b.related_ids.len() != before_b {
+        paper::write_meta(&root, &slug_b, &meta_b)?;
+        refresh_search_index(&root, &slug_b);
     }
     Ok(())
 }
@@ -652,6 +714,7 @@ pub async fn import_pdf(
         import_source: Some("file".to_string()),
         cite_count: None,
         file_type: None,
+        related_ids: Vec::new(),
     };
     paper::write_meta(&root, &temp_slug, &meta)?;
 
@@ -779,6 +842,7 @@ pub async fn import_ebook(
         import_source: Some("file".to_string()),
         cite_count: None,
         file_type: Some(format.to_string()),
+        related_ids: Vec::new(),
     };
     paper::write_meta(&root, &temp_slug, &meta)?;
     paper::ensure_paper_files(&root, &temp_slug);
@@ -908,8 +972,26 @@ pub async fn delete_paper(slug: String, state: State<'_, LibraryRoot>) -> Result
     // that no longer exists. Library-level records — token usage and the
     // activity log — live outside the paper folder and are intentionally kept.
     if let Ok(meta) = paper::read_meta(&root, &slug) {
-        let _ = rag::delete_paper_chunks(&root, &meta.id).await;
-        let _ = collections::purge_paper(&root, &meta.id);
+        let deleted_id = meta.id.clone();
+        let _ = rag::delete_paper_chunks(&root, &deleted_id).await;
+        let _ = collections::purge_paper(&root, &deleted_id);
+        // Drop this paper's id from every other paper's related_ids so no
+        // dangling manual "related paper" links point at a paper that's gone.
+        if let Ok(dirs) = paper::list_paper_dirs(&root) {
+            for (other_slug, _) in dirs {
+                if other_slug == slug {
+                    continue;
+                }
+                if let Ok(mut other) = paper::read_meta(&root, &other_slug) {
+                    let before = other.related_ids.len();
+                    other.related_ids.retain(|id| id != &deleted_id);
+                    if other.related_ids.len() != before {
+                        let _ = paper::write_meta(&root, &other_slug, &other);
+                        refresh_search_index(&root, &other_slug);
+                    }
+                }
+            }
+        }
     }
     // Drop any cached parsed ebook so its Arc doesn't outlive the paper
     ebook::evict_from_cache(&slug);

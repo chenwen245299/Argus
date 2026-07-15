@@ -697,6 +697,13 @@ async function openCtx(e: MouseEvent, item: PaperIndexEntry) {
 }
 function closeCtx() { ctxMenu.value = null }
 
+function openRelatedFromCtx() {
+  if (!ctxMenu.value) return
+  // No toolbar-button anchor here, so open the popover centered.
+  library.openRelatedPopover(ctxMenu.value.item.slug, null)
+  closeCtx()
+}
+
 const suggestedContextTags = computed(() => {
   if (!ctxMenu.value) return []
   const owned = new Set(ctxMenu.value.item.tags ?? [])
@@ -1513,6 +1520,9 @@ async function reExtract(item: PaperIndexEntry) {
         </button>
         <button class="ctx-item" @click="openPaperInFinder(ctxMenu!.item)">
           {{ t('paper.openInFinder') }}
+        </button>
+        <button class="ctx-item" @click="openRelatedFromCtx">
+          {{ t('related.menuItem') }}
         </button>
         <div class="ctx-sep" />
         <div class="ctx-tags-section">

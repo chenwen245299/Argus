@@ -25,6 +25,14 @@ const { t } = useI18n()
 
 const isActiveTab = computed(() => reader.activeSlug === props.slug)
 
+// ── Related papers (manual links) ───────────────────────────────────────────
+const relatedCount = computed(() =>
+  library.papers.find(p => p.slug === props.slug)?.related_ids?.length ?? 0)
+function openRelatedFromToolbar(e: MouseEvent) {
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  library.openRelatedPopover(props.slug, { x: r.right, y: r.bottom + 4 })
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 const containerRef = ref<HTMLDivElement | null>(null)
 const manifest = ref<EbookManifest | null>(null)
@@ -1262,6 +1270,12 @@ defineExpose({ closeToList: handleBack })
 
       <div class="toolbar-spacer" />
 
+      <button class="related-btn" :title="t('related.buttonTitle')" @click="openRelatedFromToolbar">
+        <span class="related-btn-icon">🔗</span>
+        <span class="related-btn-label">{{ t('related.buttonLabel') }}</span>
+        <span v-if="relatedCount" class="related-btn-count">{{ relatedCount }}</span>
+      </button>
+
       <div class="reading-position" v-if="chapterCount > 0">
         <span class="position-group">
           <span class="control-label">{{ t('ebook.chapterShort') }}</span>
@@ -1566,6 +1580,37 @@ defineExpose({ closeToList: handleBack })
   max-width: 40%;
 }
 .toolbar-spacer { flex: 1; }
+
+.related-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.related-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+.related-btn-icon { font-size: 12px; }
+.related-btn-count {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill);
+  background: var(--accent-light);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+}
 
 .reading-position {
   display: flex;

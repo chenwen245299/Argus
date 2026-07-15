@@ -33,6 +33,11 @@ const collapsedDates = ref<Set<string>>(new Set())
 const showSortMenu = ref(false)
 const sortBtnRef = ref<HTMLElement | null>(null)
 const sortPopoverStyle = ref({ top: '0px', left: '0px' })
+// Filter the list by matched-topic tags (multi-select).
+const showTopicMenu = ref(false)
+const topicBtnRef = ref<HTMLElement | null>(null)
+const topicPopoverStyle = ref({ top: '0px', left: '0px' })
+const selectedTopics = ref<Set<string>>(new Set())
 let windowResizeTimer: ReturnType<typeof setTimeout> | null = null
 let addMsgTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -207,6 +212,7 @@ function onKeydown(e: KeyboardEvent) {
     showSortMenu.value = false
     showCalendar.value = false
     showColPicker.value = false
+    showTopicMenu.value = false
   }
 }
 
@@ -252,6 +258,28 @@ function setSortMode(mode: 'score' | 'date' | 'rating') {
 
 function setSortOrder(order: 'desc' | 'asc') {
   store.sortOrder = order
+}
+
+function toggleTopicMenu() {
+  if (!showTopicMenu.value && topicBtnRef.value) {
+    showSortMenu.value = false
+    showCalendar.value = false
+    const r = topicBtnRef.value.getBoundingClientRect()
+    const left = Math.min(r.left, window.innerWidth - 252)
+    topicPopoverStyle.value = { top: `${r.bottom + 6}px`, left: `${Math.max(8, left)}px` }
+  }
+  showTopicMenu.value = !showTopicMenu.value
+}
+
+function toggleTopic(topic: string) {
+  const next = new Set(selectedTopics.value)
+  if (next.has(topic)) next.delete(topic)
+  else next.add(topic)
+  selectedTopics.value = next
+}
+
+function clearTopics() {
+  selectedTopics.value = new Set()
 }
 
 async function refreshPapers() {
@@ -375,14 +403,35 @@ function paperDisplayDate(paper: ArxivPaper): string {
   return (paper.published || paper.fetched_at).slice(0, 10)
 }
 
+// Distinct matched-topic tags across the current recommendations, with counts,
+// ordered by frequency — used to populate the tag-filter menu.
+const availableTopics = computed(() => {
+  const counts = new Map<string, number>()
+  for (const p of store.papers) {
+    for (const topic of (p.matched_topics ?? [])) {
+      counts.set(topic, (counts.get(topic) ?? 0) + 1)
+    }
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([topic, count]) => ({ topic, count }))
+})
+
 const filteredPapers = computed(() => {
-  if (!categoryFilter.value) return store.sortedPapers
-  const f = categoryFilter.value.toLowerCase()
-  return store.sortedPapers.filter(p =>
-    p.categories.some(c => c.toLowerCase().includes(f)) ||
-    p.title.toLowerCase().includes(f) ||
-    (p.matched_topics ?? []).some(t => t.toLowerCase().includes(f))
-  )
+  let list = store.sortedPapers
+  if (selectedTopics.value.size > 0) {
+    list = list.filter(p =>
+      (p.matched_topics ?? []).some(t => selectedTopics.value.has(t)))
+  }
+  const f = categoryFilter.value.trim().toLowerCase()
+  if (f) {
+    list = list.filter(p =>
+      p.categories.some(c => c.toLowerCase().includes(f)) ||
+      p.title.toLowerCase().includes(f) ||
+      (p.matched_topics ?? []).some(t => t.toLowerCase().includes(f))
+    )
+  }
+  return list
 })
 
 // ── Batch delete ──────────────────────────────────────────────────────────────
@@ -769,6 +818,20 @@ function jumpToDate(dateStr: string) {
                 <circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/>
               </svg>
             </button>
+            <!-- Tag (topic) filter -->
+            <button
+              ref="topicBtnRef"
+              class="list-tool-btn"
+              :class="{ active: showTopicMenu || selectedTopics.size > 0 }"
+              title="按标签筛选"
+              @click="toggleTopicMenu"
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round">
+                <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/>
+                <line x1="7" y1="7" x2="7.01" y2="7"/>
+              </svg>
+              <span v-if="selectedTopics.size > 0" class="tool-badge">{{ selectedTopics.size }}</span>
+            </button>
             <!-- Calendar toggle button -->
             <button
               ref="calBtnRef"
@@ -848,6 +911,33 @@ function jumpToDate(dateStr: string) {
                 <span class="sort-check">{{ store.sortOrder === 'asc' ? '✓' : '' }}</span>
                 <span>升序</span>
               </button>
+            </div>
+          </Transition>
+        </Teleport>
+
+        <!-- Tag (topic) filter popover -->
+        <Teleport to="body">
+          <div v-if="showTopicMenu" class="sort-menu-backdrop" @click="showTopicMenu = false" />
+          <Transition name="sort-pop" appear>
+            <div v-if="showTopicMenu" class="topic-popover" :style="topicPopoverStyle">
+              <div class="topic-popover-head">
+                <span class="sort-section-title">按标签筛选</span>
+                <button v-if="selectedTopics.size > 0" class="topic-clear" @click="clearTopics">清除</button>
+              </div>
+              <div v-if="availableTopics.length === 0" class="topic-empty">暂无标签</div>
+              <div v-else class="topic-list">
+                <button
+                  v-for="{ topic, count } in availableTopics"
+                  :key="topic"
+                  class="topic-item"
+                  :class="{ selected: selectedTopics.has(topic) }"
+                  @click="toggleTopic(topic)"
+                >
+                  <span class="topic-check">{{ selectedTopics.has(topic) ? '✓' : '' }}</span>
+                  <span class="topic-chip" :style="tagStyle(topic)">{{ topic }}</span>
+                  <span class="topic-count">{{ count }}</span>
+                </button>
+              </div>
             </div>
           </Transition>
         </Teleport>
@@ -1498,7 +1588,8 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   display: flex; flex-direction: column; gap: 6px;
   flex-shrink: 0;
 }
-.search-row { display: flex; align-items: center; gap: 6px; }
+.search-row { display: flex; align-items: center; gap: 2px; }
+.search-wrap + .list-tool-btn { margin-left: 5px; }
 .search-wrap {
   position: relative; display: flex; align-items: center; flex: 1;
   min-width: 0;
@@ -2725,8 +2816,8 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 }
 
 .list-tool-btn {
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2755,6 +2846,95 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   z-index: 999;
 }
 
+.list-tool-btn { position: relative; }
+.tool-badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+.topic-popover {
+  position: fixed;
+  z-index: 1000;
+  width: 240px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-primary);
+  box-shadow: var(--shadow-lg);
+}
+.topic-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 6px 6px;
+}
+.topic-clear {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+.topic-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+.topic-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.topic-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 5px 8px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.topic-item:hover,
+.topic-item.selected { background: var(--bg-hover); }
+.topic-check {
+  width: 12px;
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: 12px;
+}
+.topic-chip {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+}
+.topic-count {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
 .sort-popover {
   position: fixed;
   z-index: 1000;

@@ -17,6 +17,8 @@ export interface PaperMeta {
   cite_count?: number
   /** Main document format: absent/"pdf" for papers, or "epub" | "mobi" | "azw3" | "fb2" | "txt". */
   file_type?: string
+  /** User-curated related papers (bidirectional): the `id` of each linked paper. */
+  related_ids?: string[]
 }
 
 export interface PaperStatus {
@@ -97,6 +99,8 @@ export interface PaperIndexEntry {
   cite_count?: number
   /** Main document format (see PaperMeta.file_type). Absent = pdf. */
   file_type?: string
+  /** Mirrors PaperMeta.related_ids (paper ids) for badge/count without a fetch. */
+  related_ids?: string[]
 }
 
 /** True when a paper's main document is an ebook rather than a PDF. */

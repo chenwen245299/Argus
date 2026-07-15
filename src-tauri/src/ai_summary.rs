@@ -298,5 +298,6 @@ fn default_meta() -> PaperMeta {
         import_source: None,
         cite_count: None,
         file_type: None,
+        related_ids: Vec::new(),
     }
 }

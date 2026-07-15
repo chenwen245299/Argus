@@ -141,6 +141,7 @@ mod pdf_url {
             import_source: Some("url".to_string()),
             cite_count: None,
             file_type: None,
+            related_ids: Vec::new(),
         };
 
         if let Err(e) =
@@ -505,6 +506,7 @@ mod acl {
             import_source: Some("url".to_string()),
             cite_count: None,
             file_type: None,
+            related_ids: Vec::new(),
         };
 
         if let Err(e) = super::finalize_paper(
@@ -737,6 +739,7 @@ mod aaai {
             import_source: Some("url".to_string()),
             cite_count: None,
             file_type: None,
+            related_ids: Vec::new(),
         };
 
         if let Err(e) = super::finalize_paper(
@@ -945,6 +948,7 @@ mod openreview {
             import_source: Some("url".to_string()),
             cite_count: None,
             file_type: None,
+            related_ids: Vec::new(),
         };
 
         if let Err(e) = super::finalize_paper(

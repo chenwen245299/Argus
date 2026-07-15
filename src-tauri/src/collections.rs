@@ -653,6 +653,7 @@ pub fn list_papers_in_collection(
             import_source: Some(import_source),
             cite_count: meta.cite_count,
             file_type: meta.file_type,
+            related_ids: meta.related_ids,
         });
     }
 
@@ -699,6 +700,7 @@ mod tests {
             import_source: Some("file".to_string()),
             cite_count: None,
             file_type: None,
+            related_ids: Vec::new(),
         };
         std::fs::write(
             paper_dir.join("meta.json"),

@@ -1222,6 +1222,7 @@ pub async fn add_to_library(
         import_source: Some(paper.source.clone().unwrap_or_else(|| "arxiv".to_string())),
         cite_count: None,
         file_type: None,
+        related_ids: Vec::new(),
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);
@@ -1873,6 +1874,7 @@ pub async fn import_by_url(
         import_source: Some("url".to_string()),
         cite_count: None,
         file_type: None,
+        related_ids: Vec::new(),
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);

@@ -170,6 +170,7 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
             import_source: Some(import_source),
             cite_count: meta.cite_count,
             file_type: meta.file_type,
+            related_ids: meta.related_ids,
         });
     }
 

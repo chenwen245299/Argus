@@ -25,6 +25,14 @@ const meta = ref<PaperMeta | null>(null)
 const activePaperSlug = computed(() => reader.openSlug ?? selection.selectedSlug)
 const paperTab = computed(() => props.activeTab === 'library' ? 'notes' : props.activeTab)
 
+// The AI (Analysis) tab is kept mounted so a running generation keeps streaming
+// in the background even when another tab or the canvas is shown. `aiSlug` is
+// sticky — it only updates to a new *non-null* paper, so navigating to the
+// canvas (which transiently clears the active paper) never remounts the tab and
+// interrupts an in-flight answer.
+const aiSlug = ref<string | null>(null)
+watch(activePaperSlug, (s) => { if (s) aiSlug.value = s }, { immediate: true })
+
 watch(activePaperSlug, async (slug) => {
   meta.value = null
   if (!slug) return
@@ -84,6 +92,17 @@ async function onSlugChanged(newSlug: string) {
 
 <template>
   <div class="right-sidebar">
+    <!-- AI (Analysis) tab: kept mounted so a running generation keeps streaming
+         in the background even when another tab or the canvas is shown. Only its
+         visibility is toggled here. -->
+    <div v-show="paperTab === 'ai' && !!activePaperSlug" class="tab-content">
+      <AnalysisTab
+        v-if="aiSlug"
+        :slug="aiSlug"
+        @open-settings="emit('open-settings')"
+      />
+    </div>
+
     <!-- Drawing properties: canvas-scoped, independent of paper selection -->
     <DrawTab v-if="props.activeTab === 'draw'" />
 
@@ -101,9 +120,9 @@ async function onSlugChanged(newSlug: string) {
       </div>
     </template>
 
-    <!-- Paper selected -->
+    <!-- Paper selected (the AI tab is handled by the persistent block above) -->
     <template v-else>
-      <div class="tab-content">
+      <div v-show="paperTab !== 'ai'" class="tab-content">
         <MetadataTab
           v-if="paperTab === 'metadata'"
           :slug="activePaperSlug"
@@ -119,11 +138,6 @@ async function onSlugChanged(newSlug: string) {
         />
         <HighlightsTab v-else-if="paperTab === 'highlights'" />
         <SectionsTab v-else-if="paperTab === 'sections'" :slug="activePaperSlug" />
-        <AnalysisTab
-          v-show="paperTab === 'ai'"
-          :slug="activePaperSlug"
-          @open-settings="emit('open-settings')"
-        />
       </div>
     </template>
   </div>

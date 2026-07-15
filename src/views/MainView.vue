@@ -26,6 +26,7 @@ import TabBar from '../components/TabBar.vue'
 import RightSidebar from '../components/RightSidebar.vue'
 import AddSnippetModal from '../components/AddSnippetModal.vue'
 import UpdatePrompt from '../components/UpdatePrompt.vue'
+import RelatedPapersPopover from '../components/RelatedPapersPopover.vue'
 
 // Conditionally-rendered heavyweights (pdfjs / vue-flow / settings panels) are
 // code-split so the main window paints before any of them download.
@@ -912,6 +913,9 @@ watch(
 
     <!-- Global update-available prompt (auto checks fire even when settings is closed) -->
     <UpdatePrompt />
+
+    <!-- Related-papers popover (opened from viewer toolbars and the list right-click menu) -->
+    <RelatedPapersPopover />
   </div>
 </template>
 

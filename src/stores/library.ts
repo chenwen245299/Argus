@@ -99,6 +99,49 @@ export const useLibraryStore = defineStore('library', () => {
     papers.value = papers.value.filter(p => p.slug !== slug)
   }
 
+  // ── Related papers (manual, bidirectional links) ──────────────────────────
+  // Which paper's "related" popover is open, and where to anchor it. `anchor`
+  // null = center on screen (right-click entry); a point = anchor near it
+  // (toolbar-button entry).
+  const relatedPopover = ref<{ slug: string; anchor: { x: number; y: number } | null } | null>(null)
+
+  function openRelatedPopover(slug: string, anchor: { x: number; y: number } | null = null) {
+    relatedPopover.value = { slug, anchor }
+  }
+  function closeRelatedPopover() {
+    relatedPopover.value = null
+  }
+
+  /** Resolve a paper's related ids to their index entries (skips missing ones). */
+  function relatedEntriesFor(slug: string): PaperIndexEntry[] {
+    const self = papers.value.find(p => p.slug === slug)
+    if (!self?.related_ids?.length) return []
+    return self.related_ids
+      .map(id => papers.value.find(p => p.id === id))
+      .filter((p): p is PaperIndexEntry => !!p)
+  }
+
+  async function linkRelated(slugA: string, slugB: string) {
+    if (slugA === slugB) return
+    await invoke('add_related_paper', { slugA, slugB })
+    const a = papers.value.find(p => p.slug === slugA)
+    const b = papers.value.find(p => p.slug === slugB)
+    if (a && b && a.id !== b.id) {
+      if (!a.related_ids?.includes(b.id)) a.related_ids = [...(a.related_ids ?? []), b.id]
+      if (!b.related_ids?.includes(a.id)) b.related_ids = [...(b.related_ids ?? []), a.id]
+    }
+  }
+
+  async function unlinkRelated(slugA: string, slugB: string) {
+    await invoke('remove_related_paper', { slugA, slugB })
+    const a = papers.value.find(p => p.slug === slugA)
+    const b = papers.value.find(p => p.slug === slugB)
+    if (a && b) {
+      if (a.related_ids) a.related_ids = a.related_ids.filter(id => id !== b.id)
+      if (b.related_ids) b.related_ids = b.related_ids.filter(id => id !== a.id)
+    }
+  }
+
   async function _doRefresh(): Promise<void> {
     isRefreshing.value = true
     try {
@@ -156,5 +199,11 @@ export const useLibraryStore = defineStore('library', () => {
     openLibrary,
     removePaper,
     refresh,
+    relatedPopover,
+    openRelatedPopover,
+    closeRelatedPopover,
+    relatedEntriesFor,
+    linkRelated,
+    unlinkRelated,
   }
 })

@@ -40,6 +40,10 @@ pub struct PaperMeta {
     /// ("epub" | "mobi" | "azw3" | "fb2" | "txt"). Set once at import.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_type: Option<String>,
+    /// User-curated related papers (bidirectional). Stores the `id` of each
+    /// linked paper; both papers' meta.json carry each other's id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_ids: Vec<String>,
 }
 
 pub fn normalize_import_source(import_source: Option<&str>, arxiv_id: Option<&str>) -> String {
@@ -165,6 +169,10 @@ pub struct PaperIndexEntry {
     /// Main document format (see `PaperMeta::file_type`). None = pdf.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_type: Option<String>,
+    /// Mirrors `PaperMeta::related_ids` so the frontend can show the related
+    /// count/list straight from the index without an extra fetch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_ids: Vec<String>,
 }
 
 fn default_reading_status_entry() -> String {

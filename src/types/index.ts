@@ -19,6 +19,39 @@ export interface PaperMeta {
   file_type?: string
   /** User-curated related papers (bidirectional): the `id` of each linked paper. */
   related_ids?: string[]
+  /** Cached journal/venue ranking from easyScholar (SCI 分区, 中科院, CCF, IF, …). */
+  journal_rank?: JournalRank
+}
+
+export interface JournalRank {
+  /** Official rank datasets keyed by easyScholar code (sci, sciif, sciUp, ccf, ssci, …). */
+  official: Record<string, string>
+  /** User-added custom datasets: abbreviation + resolved level text. */
+  custom: JournalCustomRank[]
+  /** The venue string this ranking was queried for. */
+  venue: string
+  /** RFC3339 timestamp of when the ranking was fetched. */
+  fetched_at: string
+}
+
+export interface JournalCustomRank {
+  name: string
+  rank: string
+}
+
+/** A paper cited by another (Semantic Scholar references), with library linkage. */
+export interface CitationRef {
+  paper_id?: string
+  title: string
+  authors: string[]
+  year?: number
+  venue?: string
+  doi?: string
+  arxiv_id?: string
+  cite_count?: number
+  /** Slug of the matching library paper, if this reference is in the library. */
+  library_slug?: string
+  library_id?: string
 }
 
 export interface PaperStatus {

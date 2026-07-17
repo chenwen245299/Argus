@@ -40,6 +40,10 @@ function openRelatedFromToolbar(e: MouseEvent) {
   const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
   library.openRelatedPopover(props.slug, { x: r.right, y: r.bottom + 4 })
 }
+function openCitationGraph(e: MouseEvent) {
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  library.openCitationGraph(props.slug, { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 })
+}
 
 // ── State ──────────────────────────────────────────────────────────────────────
 const containerRef = ref<HTMLDivElement | null>(null)
@@ -1857,6 +1861,11 @@ function triggerInitialRender() {
       <div class="toolbar-title" :title="displayOpenTitle">{{ displayOpenTitle }}</div>
 
       <div class="toolbar-spacer" />
+
+      <button class="related-btn" :title="t('citeGraph.buttonTitle')" @click="openCitationGraph">
+        <span class="related-btn-icon">🕸️</span>
+        <span class="related-btn-label">{{ t('citeGraph.buttonLabel') }}</span>
+      </button>
 
       <button class="related-btn" :title="t('related.buttonTitle')" @click="openRelatedFromToolbar">
         <span class="related-btn-icon">🔗</span>

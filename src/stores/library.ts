@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { LibraryConfig, PaperIndexEntry } from '../types'
 import { useReaderStore } from './reader'
+import { useRanksStore } from './ranks'
 
 export const useLibraryStore = defineStore('library', () => {
   const currentPath = ref<string | null>(null)
@@ -59,6 +60,10 @@ export const useLibraryStore = defineStore('library', () => {
       await invoke<LibraryConfig>('open_library', { root: path })
       currentPath.value = path
 
+      // Load the library-wide venue→rank cache so list/info badges render
+      // instantly without re-querying easyScholar.
+      useRanksStore().load()
+
       // Phase 1: instant display from index.json cache (best-effort — silently skipped if unavailable)
       try {
         const cached = await invoke<PaperIndexEntry[]>('load_library_cache')
@@ -110,6 +115,17 @@ export const useLibraryStore = defineStore('library', () => {
   }
   function closeRelatedPopover() {
     relatedPopover.value = null
+  }
+
+  // ── Citation graph (Semantic Scholar references) ──────────────────────────
+  // Which paper's citation-graph modal is open (null = closed). `anchor` is the
+  // triggering button's screen center, used for the open/close scale animation.
+  const citationGraph = ref<{ slug: string; anchor: { x: number; y: number } | null } | null>(null)
+  function openCitationGraph(slug: string, anchor: { x: number; y: number } | null = null) {
+    citationGraph.value = { slug, anchor }
+  }
+  function closeCitationGraph() {
+    citationGraph.value = null
   }
 
   /** Resolve a paper's related ids to their index entries (skips missing ones). */
@@ -205,5 +221,8 @@ export const useLibraryStore = defineStore('library', () => {
     relatedEntriesFor,
     linkRelated,
     unlinkRelated,
+    citationGraph,
+    openCitationGraph,
+    closeCitationGraph,
   }
 })

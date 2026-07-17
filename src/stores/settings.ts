@@ -13,6 +13,9 @@ export const useSettingsStore = defineStore('settings', () => {
     auto_check_updates: true,
   })
   const loaded = ref(false)
+  // Whether an easyScholar secret key is stored (encrypted). The key value
+  // itself never reaches the frontend.
+  const easyscholarConfigured = ref(false)
 
   async function load() {
     try {
@@ -22,6 +25,20 @@ export const useSettingsStore = defineStore('settings', () => {
     } catch (e) {
       console.error('Failed to load settings:', e)
     }
+    await loadEasyscholarStatus()
+  }
+
+  async function loadEasyscholarStatus() {
+    try {
+      easyscholarConfigured.value = await invoke<boolean>('easyscholar_key_status')
+    } catch {
+      easyscholarConfigured.value = false
+    }
+  }
+
+  async function setEasyscholarKey(key: string) {
+    await invoke('set_easyscholar_key', { key })
+    easyscholarConfigured.value = !!key.trim()
   }
 
   async function save(patch: Partial<AppSettings>) {
@@ -47,5 +64,5 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  return { settings, loaded, load, save }
+  return { settings, loaded, easyscholarConfigured, load, save, loadEasyscholarStatus, setEasyscholarKey }
 })

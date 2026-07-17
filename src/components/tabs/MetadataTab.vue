@@ -2,8 +2,13 @@
 import { ref, watch, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
-import type { PaperMeta } from '../../types'
+import type { CitationRef, PaperMeta } from '../../types'
 import { useLibraryStore } from '../../stores/library'
+import { useSettingsStore } from '../../stores/settings'
+import { useReaderStore } from '../../stores/reader'
+import { useSelectionStore } from '../../stores/selection'
+import { useRanksStore } from '../../stores/ranks'
+import { badgesFromRank, isWithdrawnVenue, type DisplayBadge } from '../../utils/rankBadges'
 
 const props = defineProps<{
   slug: string | null
@@ -17,6 +22,135 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const library = useLibraryStore()
+const settings = useSettingsStore()
+const reader = useReaderStore()
+const selection = useSelectionStore()
+const ranks = useRanksStore()
+
+// ── References (Semantic Scholar citation list) ─────────────────────────────────
+const references = ref<CitationRef[]>([])
+const referencesFetching = ref(false)
+const referencesError = ref('')
+
+// Sort: in-library first, then by citation count desc, then year desc.
+const sortedReferences = computed(() =>
+  [...references.value].sort((a, b) => {
+    const lib = Number(!!b.library_slug) - Number(!!a.library_slug)
+    if (lib) return lib
+    const cc = (b.cite_count ?? -1) - (a.cite_count ?? -1)
+    if (cc) return cc
+    return (b.year ?? 0) - (a.year ?? 0)
+  }))
+
+const referencesInLibrary = computed(() =>
+  references.value.filter(r => r.library_slug).length)
+
+async function loadCachedReferences() {
+  if (!props.slug) { references.value = []; return }
+  try {
+    references.value = await invoke<CitationRef[]>('get_cached_references', { slug: props.slug })
+  } catch {
+    references.value = []
+  }
+}
+
+async function fetchReferences() {
+  if (!props.slug || referencesFetching.value) return
+  referencesFetching.value = true
+  referencesError.value = ''
+  try {
+    references.value = await invoke<CitationRef[]>('fetch_references', { slug: props.slug })
+  } catch (e) {
+    referencesError.value = String(e)
+  } finally {
+    referencesFetching.value = false
+  }
+}
+
+// Per-session guard so a paper with no references isn't re-fetched every open.
+const refsAutoAttempted = new Set<string>()
+
+// Auto-fetch references on paper open when there's no cache yet.
+async function maybeAutoFetchReferences() {
+  if (!props.slug) return
+  await loadCachedReferences()
+  if (references.value.length) return              // cache hit — nothing to do
+  if (refsAutoAttempted.has(props.slug)) return    // already tried this session
+  if (referencesFetching.value) return
+  refsAutoAttempted.add(props.slug)
+  await fetchReferences()
+}
+
+function refAuthorLine(r: CitationRef) {
+  const first = r.authors?.[0] ?? ''
+  const etal = (r.authors?.length ?? 0) > 1 ? ' et al.' : ''
+  const parts = [first + etal, r.venue, r.year?.toString()].filter(Boolean)
+  return parts.join(' · ')
+}
+
+function openReference(r: CitationRef) {
+  if (!r.library_slug) return
+  const entry = library.papers.find(p => p.slug === r.library_slug)
+  selection.selectPaper(r.library_slug)
+  reader.openPaper(r.library_slug, entry?.title ?? r.title, entry?.file_type)
+}
+
+// ── Journal rank (easyScholar) ──────────────────────────────────────────────────
+// Ranks live in the library-wide, venue-keyed cache (ranks store), so a venue
+// looked up once is reused by every paper with that venue — no repeat API calls.
+const venueWithdrawn = computed(() => isWithdrawnVenue(props.meta?.venue))
+const journalBadges = computed<DisplayBadge[]>(() =>
+  venueWithdrawn.value ? [] : badgesFromRank(ranks.get(props.meta?.venue)))
+
+const journalRankFetching = ref(false)
+// Result feedback for a manual "查询等级" click (so the user sees what happened).
+const rankStatus = ref('')
+const rankStatusKind = ref<'ok' | 'warn' | 'error'>('ok')
+// Per-session guard so a paper with no citation record isn't re-queried on open.
+const s2AutoAttempted = new Set<string>()
+
+async function fetchJournalRank(manual = false) {
+  const venue = props.meta?.venue?.trim()
+  if (!venue) return
+  journalRankFetching.value = true
+  if (manual) rankStatus.value = ''
+  try {
+    const rank = await ranks.fetchRank(venue, manual)
+    if (manual) {
+      const n = badgesFromRank(rank).length
+      rankStatus.value = n > 0 ? t('meta.rankFound', { n }) : t('meta.rankNotFound')
+      rankStatusKind.value = n > 0 ? 'ok' : 'warn'
+    }
+  } catch (e) {
+    if (manual) {
+      rankStatus.value = String(e)
+      rankStatusKind.value = 'error'
+    } else {
+      console.error('Failed to fetch journal rank:', e)
+    }
+  } finally {
+    journalRankFetching.value = false
+  }
+}
+
+// Auto-fetch on paper open when the venue isn't cached yet and a key is set.
+// The venue cache persists across sessions, so a known venue never re-queries.
+async function maybeAutoFetchRank() {
+  const venue = props.meta?.venue?.trim()
+  if (!venue) return
+  if (isWithdrawnVenue(venue)) return   // withdrawn papers carry no venue rank
+  if (!ranks.loaded) await ranks.load()
+  if (ranks.has(venue)) return
+  if (journalRankFetching.value) return
+  if (!settings.loaded) await settings.load()
+  if (!settings.easyscholarConfigured) return
+  await fetchJournalRank(false)
+}
+
+// Open Settings → General (where the easyScholar key is entered).
+function openEasyScholarSettings() {
+  window.dispatchEvent(new CustomEvent('argus-open-settings', { detail: { section: 'general' } }))
+}
 
 // ── Source options ────────────────────────────────────────────────────────────
 type ImportSource = 'file' | 'arxiv' | 'biorxiv' | 'url'
@@ -89,6 +223,12 @@ watch(() => props.slug, () => {
   fulltextEditing.value = false
   fulltextDraft.value = ''
   fulltextError.value = ''
+  journalRankFetching.value = false
+  rankStatus.value = ''
+  references.value = []
+  referencesError.value = ''
+  referencesFetching.value = false
+  loadCachedReferences()
 })
 
 function startSourceEdit() {
@@ -160,6 +300,8 @@ async function fetchCiteCount() {
   if (!props.slug) return
   citeCountFetching.value = true
   try {
+    // Backend fetches from Semantic Scholar: sets the citation count and
+    // backfills DOI / venue when those are empty.
     const updated = await invoke<PaperMeta>('fetch_citation_count', { slug: props.slug })
     emit('saved', updated)
   } catch (e) {
@@ -168,6 +310,36 @@ async function fetchCiteCount() {
     citeCountFetching.value = false
   }
 }
+
+// Auto-fetch from Semantic Scholar on paper open when the citation count is
+// missing, or when DOI / venue are empty and could be backfilled. Guarded per
+// session so an unresolved paper isn't re-queried on every open.
+async function maybeAutoFetchCiteMeta() {
+  if (!props.slug || !props.meta) return
+  const m = props.meta
+  const needs = m.cite_count == null || !m.doi?.trim() || !m.venue?.trim()
+  if (!needs) return
+  if (s2AutoAttempted.has(props.slug)) return
+  if (citeCountFetching.value) return
+  s2AutoAttempted.add(props.slug)
+  await fetchCiteCount()
+}
+
+// Drive both auto-fetches on paper open / metadata change. Semantic Scholar runs
+// first; when it backfills the venue, the venue dep re-fires this and the rank
+// lookup then picks it up.
+watch(
+  () => [props.slug, props.meta?.venue, props.meta?.doi, props.meta?.cite_count] as const,
+  // Sequenced (not concurrent): the two meta writes could clobber each other,
+  // and the two Semantic Scholar calls (cite meta + references) are serialized to
+  // ease rate limits. Cite first also lets a backfilled venue feed the rank lookup.
+  async () => {
+    await maybeAutoFetchCiteMeta()
+    maybeAutoFetchRank()
+    await maybeAutoFetchReferences()
+  },
+  { immediate: true },
+)
 
 function startCiteCountEdit() {
   citeCountDraft.value = props.meta?.cite_count
@@ -347,7 +519,11 @@ function onFulltextUpdated(e: Event) {
   if (slug && slug === props.slug) loadFulltext(slug)
 }
 
-onMounted(() => { window.addEventListener('argus-paper-fulltext-updated', onFulltextUpdated) })
+onMounted(() => {
+  window.addEventListener('argus-paper-fulltext-updated', onFulltextUpdated)
+  loadCachedReferences()
+  if (!settings.loaded) settings.load()   // so the "no key" hint can show
+})
 onBeforeUnmount(() => { window.removeEventListener('argus-paper-fulltext-updated', onFulltextUpdated) })
 
 async function copyText(kind: 'abstract' | 'fulltext' | 'bibtex', text: string) {
@@ -426,8 +602,37 @@ async function extractAbstract() {
           <div class="value">{{ meta.year ?? '—' }}</div>
         </div>
         <div class="field">
-          <div class="label">{{ t('meta.venue') }}</div>
+          <div class="label venue-label-row">
+            <span>{{ t('meta.venue') }}</span>
+            <button
+              v-if="meta.venue && settings.easyscholarConfigured && !venueWithdrawn"
+              class="copy-section-btn"
+              :disabled="journalRankFetching"
+              @click="fetchJournalRank(true)"
+            >
+              {{ journalRankFetching ? t('meta.rankFetching') : t('meta.rankFetch') }}
+            </button>
+          </div>
           <div class="value">{{ meta.venue || '—' }}</div>
+          <div v-if="journalBadges.length" class="rank-badges">
+            <span
+              v-for="(b, i) in journalBadges"
+              :key="i"
+              class="rank-badge"
+              :style="{
+                color: b.color,
+                background: `color-mix(in srgb, ${b.color} 13%, transparent)`,
+                borderColor: `color-mix(in srgb, ${b.color} 30%, transparent)`,
+              }"
+            >{{ b.text }}</span>
+          </div>
+          <div v-if="rankStatus" class="rank-status" :class="'rank-status-' + rankStatusKind">
+            {{ rankStatus }}
+          </div>
+          <div v-if="meta.venue && settings.loaded && !settings.easyscholarConfigured && !venueWithdrawn" class="rank-hint">
+            {{ t('meta.rankNoKey') }}
+            <a class="rank-hint-link" @click.stop.prevent="openEasyScholarSettings">{{ t('meta.rankNoKeyAction') }}</a>
+          </div>
         </div>
         <div class="field">
           <div class="label">{{ t('meta.doi') }}</div>
@@ -493,6 +698,7 @@ async function extractAbstract() {
             </span>
           </div>
         </div>
+
         <div class="field">
           <div class="label">{{ t('meta.added') }}</div>
           <div class="value muted">{{ fmtDate(meta.added_at) }}</div>
@@ -671,6 +877,46 @@ async function extractAbstract() {
             <span class="src-chip" :class="'src-' + importSource(meta.import_source, meta.arxiv_id)">
               {{ SOURCE_LABEL[importSource(meta.import_source, meta.arxiv_id)] }}
             </span>
+          </div>
+        </div>
+
+        <!-- References (Semantic Scholar) — placed after 来源 -->
+        <div class="field references-field">
+          <div class="label cite-count-label-row">
+            <span>
+              {{ t('meta.references') }}
+              <span v-if="references.length" class="ref-count-note">
+                {{ t('meta.referencesInLib', { n: referencesInLibrary, total: references.length }) }}
+              </span>
+            </span>
+            <button class="copy-section-btn" :disabled="referencesFetching" @click="fetchReferences">
+              {{ referencesFetching
+                ? t('meta.referencesFetching')
+                : (references.length ? t('meta.referencesRefresh') : t('meta.referencesFetch')) }}
+            </button>
+          </div>
+          <div v-if="referencesError" class="ref-error">{{ referencesError }}</div>
+          <div v-else-if="!references.length && !referencesFetching" class="fulltext-placeholder muted">
+            {{ t('meta.referencesNone') }}
+          </div>
+          <div v-else-if="references.length" class="ref-list">
+            <div
+              v-for="(r, i) in sortedReferences"
+              :key="r.paper_id ?? r.title + i"
+              class="ref-item"
+              :class="{ 'in-lib': r.library_slug }"
+              :title="r.title"
+              @click="openReference(r)"
+            >
+              <div class="ref-item-main">
+                <div class="ref-item-title">
+                  <span v-if="r.library_slug" class="ref-lib-dot" :title="t('meta.referencesInLibDot')" />
+                  {{ r.title }}
+                </div>
+                <div class="ref-item-sub">{{ refAuthorLine(r) }}</div>
+              </div>
+              <span v-if="r.cite_count != null" class="ref-cite">{{ r.cite_count.toLocaleString() }}</span>
+            </div>
           </div>
         </div>
       </template>
@@ -1049,6 +1295,118 @@ async function extractAbstract() {
 .cite-count-val {
   font-variant-numeric: tabular-nums;
   font-weight: 600;
+}
+
+/* Journal rank badges (easyScholar) */
+.venue-label-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+}
+.rank-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+.rank-status {
+  margin-top: 6px;
+  font-size: var(--font-size-xs);
+  line-height: 1.4;
+}
+.rank-status-ok { color: #15803d; }
+.rank-status-warn { color: var(--text-tertiary); }
+.rank-status-error { color: var(--danger, #dc2626); }
+.rank-hint {
+  margin-top: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+.rank-hint-link {
+  color: var(--accent);
+  cursor: pointer;
+}
+.rank-hint-link:hover { text-decoration: underline; }
+.rank-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* References list */
+.ref-count-note {
+  font-weight: 400;
+  color: var(--text-tertiary);
+  font-size: var(--font-size-xs);
+  margin-left: 4px;
+}
+.ref-error {
+  font-size: var(--font-size-xs);
+  color: var(--danger, #dc2626);
+  padding: 4px 0;
+}
+.ref-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 320px;
+  overflow-y: auto;
+  margin-top: 4px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 4px;
+}
+.ref-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+}
+.ref-item.in-lib { cursor: pointer; }
+.ref-item.in-lib:hover { background: var(--bg-hover); }
+.ref-item:not(.in-lib) { opacity: 0.6; }
+.ref-item-main { flex: 1; min-width: 0; }
+.ref-item-title {
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.35;
+}
+.ref-lib-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.ref-item-sub {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.ref-cite {
+  flex-shrink: 0;
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
 }
 
 /* Abstract section */

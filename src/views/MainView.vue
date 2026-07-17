@@ -27,6 +27,7 @@ import RightSidebar from '../components/RightSidebar.vue'
 import AddSnippetModal from '../components/AddSnippetModal.vue'
 import UpdatePrompt from '../components/UpdatePrompt.vue'
 import RelatedPapersPopover from '../components/RelatedPapersPopover.vue'
+import CitationGraphModal from '../components/CitationGraphModal.vue'
 
 // Conditionally-rendered heavyweights (pdfjs / vue-flow / settings panels) are
 // code-split so the main window paints before any of them download.
@@ -356,6 +357,13 @@ function openSettingsSection(section?: 'rag') {
   showSettings.value = true
 }
 
+// Open the settings modal to a given section from anywhere (window event).
+function onOpenSettingsEvent(event: Event) {
+  const { section } = (event as CustomEvent<{ section?: string }>).detail ?? {}
+  settingsSection.value = section
+  showSettings.value = true
+}
+
 // ── Keyboard shortcuts ─────────────────────────────────────────────────────────
 function onKeydown(e: KeyboardEvent) {
   if ((e.metaKey || e.ctrlKey) && e.key === ',') {
@@ -475,6 +483,7 @@ onMounted(async () => {
   document.addEventListener('argus-paper-drag-start', onPaperDragStart)
   document.addEventListener('argus-paper-drag-end', onPaperDragEnd)
   window.addEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)
+  window.addEventListener('argus-open-settings', onOpenSettingsEvent)
   activityStore.startHeartbeat()
   await syncActivityLibrary(libraryStore.currentPath)
   restoreWindowSize()
@@ -552,6 +561,7 @@ onUnmounted(() => {
   document.removeEventListener('argus-paper-drag-start', onPaperDragStart)
   document.removeEventListener('argus-paper-drag-end', onPaperDragEnd)
   window.removeEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)
+  window.removeEventListener('argus-open-settings', onOpenSettingsEvent)
   unlistenOpenPaper?.()
   unlistenDragDrop?.()
   unlistenLibraryPaperAdded?.()
@@ -916,6 +926,9 @@ watch(
 
     <!-- Related-papers popover (opened from viewer toolbars and the list right-click menu) -->
     <RelatedPapersPopover />
+
+    <!-- Citation graph modal (opened from the viewer toolbar) -->
+    <CitationGraphModal />
   </div>
 </template>
 

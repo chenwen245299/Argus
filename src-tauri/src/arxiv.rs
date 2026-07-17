@@ -1223,6 +1223,7 @@ pub async fn add_to_library(
         cite_count: None,
         file_type: None,
         related_ids: Vec::new(),
+        journal_rank: None,
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);
@@ -1875,6 +1876,7 @@ pub async fn import_by_url(
         cite_count: None,
         file_type: None,
         related_ids: Vec::new(),
+        journal_rank: None,
     };
     paper::write_meta(root, &final_slug, &meta)?;
     paper::ensure_paper_files(root, &final_slug);

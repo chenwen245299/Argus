@@ -18,6 +18,23 @@ const selection = useSelectionStore()
 const state = computed(() => library.relatedPopover)
 const open = computed(() => !!state.value)
 const currentSlug = computed(() => state.value?.slug ?? '')
+
+// Cache the trigger anchor so the close animation can scale back toward the
+// button even after the store state is cleared.
+const lastAnchor = ref<{ x: number; y: number } | null>(null)
+watch(() => state.value?.anchor, (a) => { if (a) lastAnchor.value = a })
+
+// Grow from / shrink into the trigger button.
+function applyOrigin(el: Element) {
+  const p = el.querySelector('.related-popover') as HTMLElement | null
+  if (!p) return
+  const a = lastAnchor.value
+  const prev = p.style.transform
+  p.style.transform = 'none'
+  const r = p.getBoundingClientRect()
+  p.style.transform = prev
+  p.style.transformOrigin = a ? `${a.x - r.left}px ${a.y - r.top}px` : 'center center'
+}
 const current = computed(() => library.papers.find(p => p.slug === currentSlug.value) ?? null)
 const related = computed(() =>
   currentSlug.value ? library.relatedEntriesFor(currentSlug.value) : [])
@@ -181,6 +198,7 @@ async function exportList() {
 </script>
 
 <template>
+  <Transition name="genie" :duration="300" @enter="applyOrigin" @before-leave="applyOrigin">
   <div v-if="open" class="related-backdrop" @click="close">
     <div
       ref="panel"
@@ -274,9 +292,18 @@ async function exportList() {
       </div>
     </div>
   </div>
+  </Transition>
 </template>
 
 <style scoped>
+/* Open: the popover physically grows from the trigger button to full size.
+   Close: it shrinks back into the button. Pure scale — the window stays fully
+   opaque throughout (no fade). */
+.genie-enter-active .related-popover { transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1); }
+.genie-leave-active .related-popover { transition: transform 0.26s cubic-bezier(0.4, 0, 1, 1); }
+.genie-enter-from .related-popover,
+.genie-leave-to .related-popover { transform: scale(0.08); }
+
 .related-backdrop {
   position: fixed;
   inset: 0;

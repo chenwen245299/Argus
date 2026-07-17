@@ -402,6 +402,7 @@ function submitAddModel() {
   })
   newModel.value = emptyModelForm()
   showAddModel.value = false
+  saveProvider()
 }
 
 function startEditModel(idx: number) {

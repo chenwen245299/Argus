@@ -21,10 +21,17 @@ import CollectionCascadeMenu from './CollectionCascadeMenu.vue'
 import { titleInitialCaps } from '../utils/text'
 import { noteBadgeStyle } from '../utils/noteBadges'
 import { filterRecentlyRead, recentPapersVersion } from '../utils/recentPapers'
+import { badgesFromRank, isWithdrawnVenue } from '../utils/rankBadges'
+import { useRanksStore } from '../stores/ranks'
 import type { Collection, Note, PaperIndexEntry, PaperMeta, SortField, SortDir } from '../types'
 
 const { t } = useI18n()
 const library = useLibraryStore()
+const ranks = useRanksStore()
+function venueBadges(venue?: string | null) {
+  if (isWithdrawnVenue(venue)) return []   // withdrawn papers carry no venue rank
+  return badgesFromRank(ranks.get(venue))
+}
 const selection = useSelectionStore()
 const reader = useReaderStore()
 const collectionsStore = useCollectionsStore()
@@ -98,7 +105,7 @@ function compareValue(a: PaperIndexEntry, b: PaperIndexEntry): number {
 }
 
 // ── Column configuration ──────────────────────────────────────────────────────
-type ColId = 'tags' | 'title' | 'notes' | 'authors' | 'venue' | 'year' | 'added_at' | 'status' | 'source' | 'cite_count'
+type ColId = 'tags' | 'title' | 'notes' | 'authors' | 'venue' | 'venue_rank' | 'year' | 'added_at' | 'status' | 'source' | 'cite_count'
 
 const COL_META: Record<ColId, {
   id: ColId; labelKey: string; defaultWidth: number; minWidth: number; sortField?: SortField
@@ -108,13 +115,14 @@ const COL_META: Record<ColId, {
   notes:      { id: 'notes',      labelKey: 'list.notes',     defaultWidth: 150, minWidth: 90 },
   authors:    { id: 'authors',    labelKey: 'list.authors',   defaultWidth: 160, minWidth: 90,  sortField: 'authors' },
   venue:      { id: 'venue',      labelKey: 'list.venue',     defaultWidth: 130, minWidth: 80,  sortField: 'venue' },
+  venue_rank: { id: 'venue_rank', labelKey: 'list.venueRank', defaultWidth: 210, minWidth: 90 },
   year:       { id: 'year',       labelKey: 'list.year',      defaultWidth: 60,  minWidth: 48,  sortField: 'year' },
   added_at:   { id: 'added_at',   labelKey: 'list.addedAt',   defaultWidth: 90,  minWidth: 78,  sortField: 'added_at' },
   status:     { id: 'status',     labelKey: 'list.status',    defaultWidth: 160, minWidth: 120 },
   source:     { id: 'source',     labelKey: 'list.source',    defaultWidth: 72,  minWidth: 60 },
   cite_count: { id: 'cite_count', labelKey: 'list.citeCount', defaultWidth: 72,  minWidth: 56,  sortField: 'cite_count' },
 }
-const ALL_COL_IDS: ColId[] = ['tags', 'title', 'notes', 'authors', 'venue', 'year', 'added_at', 'status', 'source', 'cite_count']
+const ALL_COL_IDS: ColId[] = ['tags', 'title', 'notes', 'authors', 'venue', 'venue_rank', 'year', 'added_at', 'status', 'source', 'cite_count']
 const COL_STATE_KEY = 'argus:col-state-v9'
 const LEGACY_COL_STATE_KEYS = ['argus:col-state-v8']
 
@@ -149,9 +157,10 @@ const SOURCE_TEXT: Record<ImportSource, string> = {
 function loadColState() {
   const defaults = {
     order:   [...ALL_COL_IDS] as ColId[],
-    visible: new Set<ColId>(['tags', 'title', 'notes', 'authors', 'venue', 'year', 'status', 'source']),
+    visible: new Set<ColId>(['tags', 'title', 'notes', 'authors', 'venue', 'venue_rank', 'year', 'status', 'source']),
     widths:  Object.fromEntries(ALL_COL_IDS.map(id => [id, COL_META[id].defaultWidth])) as Record<ColId, number>,
   }
+  let addedVenueRank = false
   try {
     let raw = localStorage.getItem(COL_STATE_KEY)
     let fromLegacy = false
@@ -171,9 +180,16 @@ function loadColState() {
       const titleIdx = saved.indexOf('title')
       saved.splice(titleIdx >= 0 ? titleIdx + 1 : 0, 0, 'notes')
     }
+    // New venue-rank column: insert right after venue and show it by default.
+    if (!saved.includes('venue_rank')) {
+      const vIdx = saved.indexOf('venue')
+      saved.splice(vIdx >= 0 ? vIdx + 1 : saved.length, 0, 'venue_rank')
+      addedVenueRank = true
+    }
     for (const id of ALL_COL_IDS) if (!saved.includes(id)) saved.push(id)
     const visible = new Set<ColId>((p.visible ?? [...defaults.visible]).filter((id: string) => (ALL_COL_IDS as string[]).includes(id)) as ColId[])
     if (fromLegacy) visible.add('notes')
+    if (addedVenueRank) visible.add('venue_rank')
     return {
       order:   saved,
       visible,
@@ -1431,6 +1447,18 @@ async function reExtract(item: PaperIndexEntry) {
                   {{ formatAuthors(item.authors) }}
                 </div>
                 <div v-else-if="col.id === 'venue'" class="row-cell" :title="item.venue || ''">{{ item.venue || '—' }}</div>
+                <div v-else-if="col.id === 'venue_rank'" class="row-cell row-venue-rank">
+                  <span
+                    v-for="(b, bi) in venueBadges(item.venue)"
+                    :key="bi"
+                    class="venue-rank-chip"
+                    :style="{
+                      color: b.color,
+                      background: `color-mix(in srgb, ${b.color} 13%, transparent)`,
+                      borderColor: `color-mix(in srgb, ${b.color} 30%, transparent)`,
+                    }"
+                  >{{ b.text }}</span>
+                </div>
                 <div v-else-if="col.id === 'year'" class="row-cell row-year">{{ item.year ?? '—' }}</div>
                 <div v-else-if="col.id === 'added_at'" class="row-cell row-date">{{ formatDate(item.added_at) }}</div>
                 <div v-else-if="col.id === 'status'" class="row-right"><StatusBadges :status="item.status" /></div>
@@ -1953,6 +1981,24 @@ async function reExtract(item: PaperIndexEntry) {
   min-width: 0; font-size: 12px; color: var(--text-tertiary);
   padding: 0 8px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.row-venue-rank {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+}
+.venue-rank-chip {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
 }
 .row-title {
   font-size: 13px;

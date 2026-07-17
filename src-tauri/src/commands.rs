@@ -715,6 +715,7 @@ pub async fn import_pdf(
         cite_count: None,
         file_type: None,
         related_ids: Vec::new(),
+        journal_rank: None,
     };
     paper::write_meta(&root, &temp_slug, &meta)?;
 
@@ -843,6 +844,7 @@ pub async fn import_ebook(
         cite_count: None,
         file_type: Some(format.to_string()),
         related_ids: Vec::new(),
+        journal_rank: None,
     };
     paper::write_meta(&root, &temp_slug, &meta)?;
     paper::ensure_paper_files(&root, &temp_slug);
@@ -1041,21 +1043,119 @@ pub async fn fetch_metadata(
     Ok(meta)
 }
 
-/// Fetch only the citation count from Semantic Scholar and update meta.
+/// Fetch citation count from Semantic Scholar and update meta. Also backfills
+/// DOI and venue from the same lookup when those fields are currently empty.
 #[tauri::command]
 pub async fn fetch_citation_count(
     slug: String,
     state: State<'_, LibraryRoot>,
 ) -> Result<PaperMeta, String> {
     let root = get_root(&state)?;
-    let count = metadata::fetch_citation_count(&root, &slug).await?;
+    let update = metadata::fetch_semantic_scholar_meta(&root, &slug).await?;
     let mut meta = crate::paper::read_meta(&root, &slug)?;
-    if let Some(n) = count {
-        meta.cite_count = Some(n);
-        crate::paper::write_meta(&root, &slug, &meta)?;
-        refresh_search_index(&root, &slug);
+    if let Some(u) = update {
+        let mut changed = false;
+        if let Some(n) = u.cite_count {
+            if meta.cite_count != Some(n) {
+                meta.cite_count = Some(n);
+                changed = true;
+            }
+        }
+        // Backfill DOI only when the paper doesn't already have one.
+        if meta.doi.as_deref().unwrap_or("").trim().is_empty() {
+            if let Some(doi) = u.doi.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                meta.doi = Some(doi.to_string());
+                changed = true;
+            }
+        }
+        // Backfill venue only when the paper doesn't already have one.
+        if meta.venue.as_deref().unwrap_or("").trim().is_empty() {
+            if let Some(venue) = u.venue.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                meta.venue = Some(venue.to_string());
+                changed = true;
+            }
+        }
+        if changed {
+            crate::paper::write_meta(&root, &slug, &meta)?;
+            refresh_search_index(&root, &slug);
+        }
     }
     Ok(meta)
+}
+
+/// Fetch (or reuse the cached) easyScholar ranking for a venue string. Ranks are
+/// cached library-wide by venue, so all papers sharing a venue reuse one lookup.
+/// `force` re-queries even when cached.
+#[tauri::command]
+pub async fn fetch_journal_rank(
+    venue: String,
+    force: bool,
+    state: State<'_, LibraryRoot>,
+) -> Result<crate::models::JournalRank, String> {
+    let root = get_root(&state)?;
+    let secret_key =
+        ai_manager::get_api_key(&root, ai_manager::EASYSCHOLAR_KEY_ID).unwrap_or_default();
+    metadata::fetch_venue_rank(&root, &venue, &secret_key, force).await
+}
+
+/// Return the whole venue→ranking cache so the UI can badge every paper (list
+/// and info panel) without re-querying.
+#[tauri::command]
+pub async fn get_venue_ranks(
+    state: State<'_, LibraryRoot>,
+) -> Result<std::collections::BTreeMap<String, crate::models::JournalRank>, String> {
+    let root = get_root(&state)?;
+    Ok(metadata::read_venue_ranks(&root))
+}
+
+/// Return cached references for a paper (no network), with library membership
+/// re-computed so newly-added papers show as linked.
+#[tauri::command]
+pub async fn get_cached_references(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<Vec<crate::models::CitationRef>, String> {
+    let root = get_root(&state)?;
+    let mut refs = metadata::read_cached_references(&root, &slug);
+    metadata::match_references_to_library(&root, &mut refs);
+    Ok(refs)
+}
+
+/// Fetch the reference list from Semantic Scholar (and cache it), then annotate
+/// each reference with whether it exists in the library.
+#[tauri::command]
+pub async fn fetch_references(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<Vec<crate::models::CitationRef>, String> {
+    let root = get_root(&state)?;
+    let mut refs = metadata::fetch_references(&root, &slug).await?;
+    metadata::match_references_to_library(&root, &mut refs);
+    Ok(refs)
+}
+
+/// Store (or clear, when empty) the easyScholar secret key, encrypted at rest.
+#[tauri::command]
+pub async fn set_easyscholar_key(
+    key: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    let key = key.trim();
+    if key.is_empty() {
+        ai_manager::delete_api_key(&root, ai_manager::EASYSCHOLAR_KEY_ID);
+        Ok(())
+    } else {
+        ai_manager::save_api_key(&root, ai_manager::EASYSCHOLAR_KEY_ID, key)
+    }
+}
+
+/// Whether an easyScholar secret key is configured. The key itself is never
+/// returned to the frontend.
+#[tauri::command]
+pub async fn easyscholar_key_status(state: State<'_, LibraryRoot>) -> Result<bool, String> {
+    let root = get_root(&state)?;
+    Ok(ai_manager::has_api_key(&root, ai_manager::EASYSCHOLAR_KEY_ID))
 }
 
 /// Manually trigger AI-based metadata extraction for a paper (via context menu).

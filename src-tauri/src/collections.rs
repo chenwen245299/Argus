@@ -701,6 +701,7 @@ mod tests {
             cite_count: None,
             file_type: None,
             related_ids: Vec::new(),
+            journal_rank: None,
         };
         std::fs::write(
             paper_dir.join("meta.json"),

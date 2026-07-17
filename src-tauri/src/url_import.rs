@@ -142,6 +142,7 @@ mod pdf_url {
             cite_count: None,
             file_type: None,
             related_ids: Vec::new(),
+            journal_rank: None,
         };
 
         if let Err(e) =
@@ -507,6 +508,7 @@ mod acl {
             cite_count: None,
             file_type: None,
             related_ids: Vec::new(),
+            journal_rank: None,
         };
 
         if let Err(e) = super::finalize_paper(
@@ -740,6 +742,7 @@ mod aaai {
             cite_count: None,
             file_type: None,
             related_ids: Vec::new(),
+            journal_rank: None,
         };
 
         if let Err(e) = super::finalize_paper(
@@ -949,6 +952,7 @@ mod openreview {
             cite_count: None,
             file_type: None,
             related_ids: Vec::new(),
+            journal_rank: None,
         };
 
         if let Err(e) = super::finalize_paper(

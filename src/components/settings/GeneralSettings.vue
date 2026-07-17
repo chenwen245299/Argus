@@ -13,10 +13,30 @@ const settingsStore = useSettingsStore()
 const usdToCnyRate = ref('7.2')
 const billingSaveStatus = ref<'' | 'saving' | 'saved'>('')
 
+const easyScholarKey = ref('')
+const easyScholarSaveStatus = ref<'' | 'saving' | 'saved'>('')
+
 onMounted(async () => {
   await settingsStore.load()
   usdToCnyRate.value = formatRate(settingsStore.settings.usd_to_cny_rate)
 })
+
+// The stored key is encrypted at rest and never sent back to the UI, so the
+// input starts empty; typing a value replaces the stored key.
+async function saveEasyScholarKey() {
+  const key = easyScholarKey.value.trim()
+  if (!key) return
+  easyScholarSaveStatus.value = 'saving'
+  await settingsStore.setEasyscholarKey(key)
+  easyScholarKey.value = ''
+  easyScholarSaveStatus.value = 'saved'
+  setTimeout(() => { easyScholarSaveStatus.value = '' }, 2000)
+}
+
+async function clearEasyScholarKey() {
+  await settingsStore.setEasyscholarKey('')
+  easyScholarKey.value = ''
+}
 
 function formatRate(rate: unknown) {
   const n = Number(rate)
@@ -150,6 +170,38 @@ function shortPath(p: string): string {
     </div>
 
     <div class="setting-group">
+      <div class="setting-label">{{ t('settings.easyScholar') }}</div>
+      <div class="setting-row">
+        <input
+          v-model="easyScholarKey"
+          class="text-input"
+          type="password"
+          autocomplete="off"
+          spellcheck="false"
+          :placeholder="settingsStore.easyscholarConfigured ? t('settings.easyScholarConfigured') : t('settings.easyScholarPlaceholder')"
+          @blur="saveEasyScholarKey"
+          @keydown.enter.prevent="saveEasyScholarKey"
+        />
+        <button
+          v-if="settingsStore.easyscholarConfigured"
+          class="btn-secondary"
+          @click="clearEasyScholarKey"
+        >
+          {{ t('settings.easyScholarClear') }}
+        </button>
+        <span v-if="easyScholarSaveStatus" class="billing-save">
+          {{ easyScholarSaveStatus === 'saving' ? '…' : t('settings.saved') }}
+        </span>
+      </div>
+      <div class="setting-hint">
+        {{ t('settings.easyScholarDesc') }}
+        <a href="https://www.easyscholar.cc/console/user/open" target="_blank" rel="noreferrer">
+          {{ t('settings.easyScholarLink') }}
+        </a>
+      </div>
+    </div>
+
+    <div class="setting-group">
       <div class="setting-label">{{ t('settings.appearance') }}</div>
       <div class="theme-grid">
         <button
@@ -201,6 +253,15 @@ h2 { font-size: 18px; font-weight: 600; margin-bottom: 24px; color: var(--text-p
   align-items: center;
   gap: 12px;
 }
+
+.setting-hint {
+  margin-top: 8px;
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+.setting-hint a { color: var(--accent); }
+.setting-hint a:hover { text-decoration: underline; }
 
 .path-display {
   flex: 1;

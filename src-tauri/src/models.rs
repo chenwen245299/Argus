@@ -44,6 +44,58 @@ pub struct PaperMeta {
     /// linked paper; both papers' meta.json carry each other's id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_ids: Vec<String>,
+    /// Cached journal/venue ranking fetched from easyScholar (SCI 分区, 中科院,
+    /// CCF, 影响因子, …). None until queried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_rank: Option<JournalRank>,
+}
+
+/// Journal/venue ranking data cached from the easyScholar open API.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct JournalRank {
+    /// Official rank datasets keyed by easyScholar dataset code
+    /// (e.g. "sci", "sciif", "sciUp", "ccf", "ssci"). Value is the level text.
+    #[serde(default)]
+    pub official: std::collections::BTreeMap<String, String>,
+    /// User-added custom datasets: (abbreviation, resolved level text).
+    #[serde(default)]
+    pub custom: Vec<JournalCustomRank>,
+    /// The venue string this ranking was queried for (used to detect staleness
+    /// when the venue is later edited).
+    #[serde(default)]
+    pub venue: String,
+    /// RFC3339 timestamp of when the ranking was fetched.
+    #[serde(default)]
+    pub fetched_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct JournalCustomRank {
+    pub name: String,
+    pub rank: String,
+}
+
+/// One paper cited by another, from the Semantic Scholar references API. The
+/// `library_*` fields are filled in when the reference matches a paper already
+/// in the user's library (by arXiv id / DOI / normalized title).
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct CitationRef {
+    /// Semantic Scholar paperId (opaque), when available.
+    pub paper_id: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub authors: Vec<String>,
+    pub year: Option<u32>,
+    pub venue: Option<String>,
+    pub doi: Option<String>,
+    pub arxiv_id: Option<String>,
+    pub cite_count: Option<u32>,
+    /// Slug of the matching library paper, if this reference is in the library.
+    #[serde(default)]
+    pub library_slug: Option<String>,
+    /// Id of the matching library paper, if this reference is in the library.
+    #[serde(default)]
+    pub library_id: Option<String>,
 }
 
 pub fn normalize_import_source(import_source: Option<&str>, arxiv_id: Option<&str>) -> String {

@@ -1951,6 +1951,8 @@ onUnmounted(() => {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
+  /* Grow from the button (top-right corner) on open, shrink back on close. */
+  transform-origin: top right;
   min-width: 148px;
   background: var(--bg-primary);
   border: 1px solid var(--border-default);
@@ -1991,6 +1993,7 @@ onUnmounted(() => {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
+  transform-origin: top right;
   width: 340px;
   background: var(--bg-primary);
   border: 1px solid var(--border-default);
@@ -2095,15 +2098,18 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
-/* Popover transition */
-.popover-enter-active,
+/* Popover transition — the menu visibly grows out of the button and shrinks
+   back into it (scale from the top-right corner), with only a quick fade. */
+.popover-enter-active {
+  transition: transform 0.19s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.1s ease;
+}
 .popover-leave-active {
-  transition: opacity 0.12s ease, transform 0.12s ease;
+  transition: transform 0.16s cubic-bezier(0.4, 0, 1, 1), opacity 0.14s ease;
 }
 .popover-enter-from,
 .popover-leave-to {
   opacity: 0;
-  transform: translateY(-4px);
+  transform: scale(0.8);
 }
 
 @keyframes spin {

@@ -8,7 +8,7 @@ const activity = useActivityStore()
 
 const emit = defineEmits<{ close: [] }>()
 
-const range = ref<ActivityRange>('week')
+const range = ref<ActivityRange>('today')
 
 const RANGES: { key: ActivityRange }[] = [
   { key: 'today' },

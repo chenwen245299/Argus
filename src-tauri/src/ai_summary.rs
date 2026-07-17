@@ -299,5 +299,6 @@ fn default_meta() -> PaperMeta {
         cite_count: None,
         file_type: None,
         related_ids: Vec::new(),
+        journal_rank: None,
     }
 }

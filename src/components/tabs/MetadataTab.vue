@@ -311,13 +311,19 @@ async function fetchCiteCount() {
   }
 }
 
-// Auto-fetch from Semantic Scholar on paper open when the citation count is
-// missing, or when DOI / venue are empty and could be backfilled. Guarded per
-// session so an unresolved paper isn't re-queried on every open.
+// Auto-fetch from Semantic Scholar on paper open when any bibliographic field
+// is missing (citation count, DOI, venue, year, authors) so sparse imports get
+// completed. Guarded per session so an unresolved paper isn't re-queried on
+// every open.
 async function maybeAutoFetchCiteMeta() {
   if (!props.slug || !props.meta) return
   const m = props.meta
-  const needs = m.cite_count == null || !m.doi?.trim() || !m.venue?.trim()
+  const needs =
+    m.cite_count == null ||
+    !m.doi?.trim() ||
+    !m.venue?.trim() ||
+    m.year == null ||
+    m.authors.length === 0
   if (!needs) return
   if (s2AutoAttempted.has(props.slug)) return
   if (citeCountFetching.value) return

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { invoke } from '@tauri-apps/api/core'
 import { useLibraryStore } from '../../stores/library'
 import { useSettingsStore } from '../../stores/settings'
 import { setLocale, type Locale } from '../../i18n'
@@ -13,6 +14,9 @@ const settingsStore = useSettingsStore()
 const usdToCnyRate = ref('7.2')
 const billingSaveStatus = ref<'' | 'saving' | 'saved'>('')
 
+const semanticScholarKey = ref('')
+const semanticScholarSaveStatus = ref<'' | 'saving' | 'saved'>('')
+
 const easyScholarKey = ref('')
 const easyScholarSaveStatus = ref<'' | 'saving' | 'saved'>('')
 
@@ -21,8 +25,28 @@ onMounted(async () => {
   usdToCnyRate.value = formatRate(settingsStore.settings.usd_to_cny_rate)
 })
 
-// The stored key is encrypted at rest and never sent back to the UI, so the
-// input starts empty; typing a value replaces the stored key.
+// External links must go through the backend opener — a bare <a target="_blank">
+// does nothing inside the Tauri webview.
+function openUrl(url: string) {
+  invoke('open_url', { url }).catch(console.error)
+}
+
+// Stored keys are encrypted at rest and never sent back to the UI, so each input
+// starts empty; typing a value replaces the stored key.
+async function saveSemanticScholarKey() {
+  const key = semanticScholarKey.value.trim()
+  if (!key) return
+  semanticScholarSaveStatus.value = 'saving'
+  await settingsStore.setSemanticScholarKey(key)
+  semanticScholarKey.value = ''
+  semanticScholarSaveStatus.value = 'saved'
+  setTimeout(() => { semanticScholarSaveStatus.value = '' }, 2000)
+}
+async function clearSemanticScholarKey() {
+  await settingsStore.setSemanticScholarKey('')
+  semanticScholarKey.value = ''
+}
+
 async function saveEasyScholarKey() {
   const key = easyScholarKey.value.trim()
   if (!key) return
@@ -32,7 +56,6 @@ async function saveEasyScholarKey() {
   easyScholarSaveStatus.value = 'saved'
   setTimeout(() => { easyScholarSaveStatus.value = '' }, 2000)
 }
-
 async function clearEasyScholarKey() {
   await settingsStore.setEasyscholarKey('')
   easyScholarKey.value = ''
@@ -147,57 +170,98 @@ function shortPath(p: string): string {
       </div>
     </div>
 
-    <div class="setting-group">
-      <div class="setting-label">{{ t('settings.aiBilling') }}</div>
-      <div class="setting-row billing-row">
-        <span class="billing-desc">{{ t('settings.aiBillingDesc') }}</span>
-        <label class="billing-rate-field">
-          <span>USD/CNY</span>
-          <input
-            v-model="usdToCnyRate"
-            class="text-input sm"
-            type="number"
-            min="0.0001"
-            step="0.01"
-            @blur="saveBillingSettings"
-            @keydown.enter.prevent="saveBillingSettings"
-          />
-        </label>
-        <span v-if="billingSaveStatus" class="billing-save">
-          {{ billingSaveStatus === 'saving' ? '…' : t('settings.saved') }}
-        </span>
+    <div class="setting-group api-card">
+      <div class="card-title">{{ t('settings.aiBilling') }}</div>
+      <div class="card-field">
+        <div class="setting-row billing-row">
+          <span class="billing-desc">{{ t('settings.aiBillingDesc') }}</span>
+          <label class="billing-rate-field">
+            <span>USD/CNY</span>
+            <input
+              v-model="usdToCnyRate"
+              class="text-input sm"
+              type="number"
+              min="0.0001"
+              step="0.01"
+              @blur="saveBillingSettings"
+              @keydown.enter.prevent="saveBillingSettings"
+            />
+          </label>
+          <span v-if="billingSaveStatus" class="billing-save">
+            {{ billingSaveStatus === 'saving' ? '…' : t('settings.saved') }}
+          </span>
+        </div>
       </div>
     </div>
 
-    <div class="setting-group">
-      <div class="setting-label">{{ t('settings.easyScholar') }}</div>
-      <div class="setting-row">
-        <input
-          v-model="easyScholarKey"
-          class="text-input"
-          type="password"
-          autocomplete="off"
-          spellcheck="false"
-          :placeholder="settingsStore.easyscholarConfigured ? t('settings.easyScholarConfigured') : t('settings.easyScholarPlaceholder')"
-          @blur="saveEasyScholarKey"
-          @keydown.enter.prevent="saveEasyScholarKey"
-        />
-        <button
-          v-if="settingsStore.easyscholarConfigured"
-          class="btn-secondary"
-          @click="clearEasyScholarKey"
-        >
-          {{ t('settings.easyScholarClear') }}
-        </button>
-        <span v-if="easyScholarSaveStatus" class="billing-save">
-          {{ easyScholarSaveStatus === 'saving' ? '…' : t('settings.saved') }}
-        </span>
+    <!-- Grouped external data services (both are third-party API keys). -->
+    <div class="setting-group api-card">
+      <div class="card-title">{{ t('settings.dataServices') }}</div>
+
+      <!-- Semantic Scholar: powers automatic paper-metadata fetching -->
+      <div class="card-field">
+        <div class="setting-label">{{ t('settings.semanticScholar') }}</div>
+        <div class="setting-row">
+          <input
+            v-model="semanticScholarKey"
+            class="text-input"
+            type="password"
+            autocomplete="off"
+            spellcheck="false"
+            :placeholder="settingsStore.semanticScholarConfigured ? t('settings.semanticScholarConfigured') : t('settings.semanticScholarPlaceholder')"
+            @blur="saveSemanticScholarKey"
+            @keydown.enter.prevent="saveSemanticScholarKey"
+          />
+          <button
+            v-if="settingsStore.semanticScholarConfigured"
+            class="btn-secondary"
+            @click="clearSemanticScholarKey"
+          >
+            {{ t('settings.semanticScholarClear') }}
+          </button>
+          <span v-if="semanticScholarSaveStatus" class="billing-save">
+            {{ semanticScholarSaveStatus === 'saving' ? '…' : t('settings.saved') }}
+          </span>
+        </div>
+        <div class="setting-hint">
+          {{ t('settings.semanticScholarDesc') }}
+          <a class="ext-link" @click="openUrl('https://www.semanticscholar.org/product/api')">
+            {{ t('settings.semanticScholarLink') }}
+          </a>
+        </div>
       </div>
-      <div class="setting-hint">
-        {{ t('settings.easyScholarDesc') }}
-        <a href="https://www.easyscholar.cc/console/user/open" target="_blank" rel="noreferrer">
-          {{ t('settings.easyScholarLink') }}
-        </a>
+
+      <!-- easyScholar: journal/venue ranks -->
+      <div class="card-field">
+        <div class="setting-label">{{ t('settings.easyScholar') }}</div>
+        <div class="setting-row">
+          <input
+            v-model="easyScholarKey"
+            class="text-input"
+            type="password"
+            autocomplete="off"
+            spellcheck="false"
+            :placeholder="settingsStore.easyscholarConfigured ? t('settings.easyScholarConfigured') : t('settings.easyScholarPlaceholder')"
+            @blur="saveEasyScholarKey"
+            @keydown.enter.prevent="saveEasyScholarKey"
+          />
+          <button
+            v-if="settingsStore.easyscholarConfigured"
+            class="btn-secondary"
+            @click="clearEasyScholarKey"
+          >
+            {{ t('settings.easyScholarClear') }}
+          </button>
+          <span v-if="easyScholarSaveStatus" class="billing-save">
+            {{ easyScholarSaveStatus === 'saving' ? '…' : t('settings.saved') }}
+          </span>
+        </div>
+        <div class="setting-hint">
+          {{ t('settings.easyScholarDesc') }}
+          <a class="ext-link" @click="openUrl('https://www.easyscholar.cc/')">
+            {{ t('settings.easyScholarLink') }}
+          </a>
+        </div>
       </div>
     </div>
 
@@ -260,8 +324,33 @@ h2 { font-size: 18px; font-weight: 600; margin-bottom: 24px; color: var(--text-p
   color: var(--text-tertiary);
   line-height: 1.5;
 }
-.setting-hint a { color: var(--accent); }
-.setting-hint a:hover { text-decoration: underline; }
+.ext-link {
+  color: var(--accent);
+  cursor: pointer;
+}
+.ext-link:hover { text-decoration: underline; }
+
+/* Grouped card for the external data-service API keys — sets them apart from
+   the plain language / appearance rows and shows the two belong together. */
+.api-card {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-secondary) 55%, var(--bg-primary));
+  padding: 16px 18px 18px;
+}
+.api-card .card-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-tertiary);
+  margin-bottom: 16px;
+}
+.api-card .card-field + .card-field {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border-subtle);
+}
 
 .path-display {
   flex: 1;

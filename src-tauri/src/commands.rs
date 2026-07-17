@@ -1043,8 +1043,9 @@ pub async fn fetch_metadata(
     Ok(meta)
 }
 
-/// Fetch citation count from Semantic Scholar and update meta. Also backfills
-/// DOI and venue from the same lookup when those fields are currently empty.
+/// Fetch bibliographic metadata from Semantic Scholar and backfill any empty
+/// fields on the paper — citation count, DOI, arXiv id, venue, year, authors —
+/// without overwriting values the user already set.
 #[tauri::command]
 pub async fn fetch_citation_count(
     slug: String,
@@ -1054,28 +1055,7 @@ pub async fn fetch_citation_count(
     let update = metadata::fetch_semantic_scholar_meta(&root, &slug).await?;
     let mut meta = crate::paper::read_meta(&root, &slug)?;
     if let Some(u) = update {
-        let mut changed = false;
-        if let Some(n) = u.cite_count {
-            if meta.cite_count != Some(n) {
-                meta.cite_count = Some(n);
-                changed = true;
-            }
-        }
-        // Backfill DOI only when the paper doesn't already have one.
-        if meta.doi.as_deref().unwrap_or("").trim().is_empty() {
-            if let Some(doi) = u.doi.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                meta.doi = Some(doi.to_string());
-                changed = true;
-            }
-        }
-        // Backfill venue only when the paper doesn't already have one.
-        if meta.venue.as_deref().unwrap_or("").trim().is_empty() {
-            if let Some(venue) = u.venue.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                meta.venue = Some(venue.to_string());
-                changed = true;
-            }
-        }
-        if changed {
+        if metadata::backfill_meta(&mut meta, &u) {
             crate::paper::write_meta(&root, &slug, &meta)?;
             refresh_search_index(&root, &slug);
         }
@@ -1156,6 +1136,35 @@ pub async fn set_easyscholar_key(
 pub async fn easyscholar_key_status(state: State<'_, LibraryRoot>) -> Result<bool, String> {
     let root = get_root(&state)?;
     Ok(ai_manager::has_api_key(&root, ai_manager::EASYSCHOLAR_KEY_ID))
+}
+
+/// Store (or clear, when empty) the Semantic Scholar API key, encrypted at rest.
+/// A key raises the request quota well above the anonymous shared pool, which is
+/// the main cause of 429 "too many requests" failures when fetching references.
+#[tauri::command]
+pub async fn set_semantic_scholar_key(
+    key: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    let key = key.trim();
+    if key.is_empty() {
+        ai_manager::delete_api_key(&root, ai_manager::SEMANTIC_SCHOLAR_KEY_ID);
+        Ok(())
+    } else {
+        ai_manager::save_api_key(&root, ai_manager::SEMANTIC_SCHOLAR_KEY_ID, key)
+    }
+}
+
+/// Whether a Semantic Scholar API key is configured. The key itself is never
+/// returned to the frontend.
+#[tauri::command]
+pub async fn semantic_scholar_key_status(state: State<'_, LibraryRoot>) -> Result<bool, String> {
+    let root = get_root(&state)?;
+    Ok(ai_manager::has_api_key(
+        &root,
+        ai_manager::SEMANTIC_SCHOLAR_KEY_ID,
+    ))
 }
 
 /// Manually trigger AI-based metadata extraction for a paper (via context menu).

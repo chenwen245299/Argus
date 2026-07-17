@@ -339,9 +339,82 @@ fn parse_crossref_json(json: &Value) -> Option<MetaUpdate> {
 
 // ── Semantic Scholar API ──────────────────────────────────────────────────────
 
+/// Standard field set for a single-paper metadata lookup. Includes the
+/// structured `publicationVenue`/`journal`/`publicationDate` fields so venue and
+/// year can be recovered even when S2's flat `venue`/`year` are empty.
+const S2_META_FIELDS: &str = "title,authors,year,venue,publicationVenue,journal,publicationDate,abstract,externalIds,citationCount";
+
+/// Max attempts for a Semantic Scholar GET before giving up. The first attempt
+/// plus three backed-off retries covers transient overload without stalling the
+/// UI for too long.
+const S2_MAX_ATTEMPTS: u32 = 4;
+
+/// Read the stored Semantic Scholar API key, if configured and non-empty. A key
+/// moves requests off the anonymous shared pool onto a private quota, which is
+/// the single biggest lever against 429 rate-limit errors.
+fn s2_api_key(root: &str) -> Option<String> {
+    crate::ai_manager::get_api_key(root, crate::ai_manager::SEMANTIC_SCHOLAR_KEY_ID)
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
+/// Perform a GET against the Semantic Scholar API, attaching the configured API
+/// key (when present) and applying exponential backoff on overload.
+///
+/// Per Semantic Scholar's guidance, clients must back off when the server
+/// returns 429 ("Too Many Requests") rather than hammering it. We retry 429s,
+/// transient network failures, and 5xx responses with exponentially growing
+/// delays (0.5s → 1s → 2s …); other 4xx errors fail fast since they won't
+/// improve on retry. Crucially, a 429/error is surfaced as a distinct error
+/// string — never silently collapsed into a "paper not found" result.
+async fn s2_get_json(
+    url: &str,
+    query: &[(&str, &str)],
+    api_key: Option<&str>,
+    max_bytes: u64,
+) -> Result<Value, String> {
+    let client = build_client();
+    let mut backoff = Duration::from_millis(500);
+    let mut last_err = "Semantic Scholar 请求失败".to_string();
+    for attempt in 0..S2_MAX_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(8));
+        }
+        let mut req = client.get(url).query(query);
+        if let Some(key) = api_key {
+            req = req.header("x-api-key", key);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Transient network error — worth a backed-off retry.
+                last_err = format!("Semantic Scholar 请求失败: {e}");
+                continue;
+            }
+        };
+        let status = resp.status();
+        if status.as_u16() == 429 {
+            last_err = "Semantic Scholar 请求过于频繁，请稍后再试".to_string();
+            continue;
+        }
+        if status.is_server_error() {
+            last_err = format!("Semantic Scholar 返回错误：{status}");
+            continue;
+        }
+        if !status.is_success() {
+            // Other 4xx (e.g. 404) won't change on retry — fail fast.
+            return Err(format!("Semantic Scholar 返回错误：{status}"));
+        }
+        return crate::net::fetch_json_capped(resp, max_bytes).await;
+    }
+    Err(last_err)
+}
+
 pub async fn fetch_semantic_scholar(
     arxiv_id: Option<&str>,
     doi: Option<&str>,
+    api_key: Option<&str>,
 ) -> Option<MetaUpdate> {
     let paper_id = if let Some(id) = arxiv_id {
         format!("arXiv:{}", id)
@@ -351,12 +424,12 @@ pub async fn fetch_semantic_scholar(
         return None;
     };
     let url = format!(
-        "https://api.semanticscholar.org/graph/v1/paper/{}?fields=title,authors,year,venue,abstract,externalIds,citationCount",
+        "https://api.semanticscholar.org/graph/v1/paper/{}",
         paper_id
     );
-    let client = build_client();
-    let resp = client.get(&url).send().await.ok()?;
-    let json: Value = crate::net::fetch_json_capped(resp, MAX_META_BYTES).await.ok()?;
+    let json = s2_get_json(&url, &[("fields", S2_META_FIELDS)], api_key, MAX_META_BYTES)
+        .await
+        .ok()?;
     parse_s2_json(&json)
 }
 
@@ -373,12 +446,27 @@ fn parse_s2_json(json: &Value) -> Option<MetaUpdate> {
             .collect::<Vec<_>>()
     });
 
-    let year = json["year"].as_u64().map(|y| y as u32);
+    // Year: S2's flat `year` is usually present, but fall back to the leading
+    // year of `publicationDate` ("2023-10-08") when it isn't.
+    let year = json["year"].as_u64().map(|y| y as u32).or_else(|| {
+        json["publicationDate"]
+            .as_str()
+            .and_then(|d| d.get(0..4))
+            .and_then(|y| y.parse::<u32>().ok())
+    });
 
+    // Venue: the flat `venue` is frequently empty even when the paper has a
+    // structured venue, so fall back to publicationVenue.name, then journal.name.
     let venue = json["venue"]
         .as_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            json["publicationVenue"]["name"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| json["journal"]["name"].as_str().filter(|s| !s.trim().is_empty()))
+        .map(|s| s.trim().to_string());
 
     let doi = json["externalIds"]["DOI"].as_str().map(|s| s.to_string());
     let arxiv_id = json["externalIds"]["ArXiv"].as_str().map(|s| s.to_string());
@@ -402,19 +490,18 @@ fn parse_s2_json(json: &Value) -> Option<MetaUpdate> {
 
 // ── Semantic Scholar title search ─────────────────────────────────────────────
 
-pub async fn fetch_semantic_scholar_by_title(title: &str) -> Option<MetaUpdate> {
-    let client = build_client();
-    let resp = client
-        .get("https://api.semanticscholar.org/graph/v1/paper/search")
-        .query(&[
-            ("query", title),
-            ("fields", "title,authors,year,venue,abstract,externalIds,citationCount"),
-            ("limit", "3"),
-        ])
-        .send()
-        .await
-        .ok()?;
-    let json: Value = crate::net::fetch_json_capped(resp, MAX_META_BYTES).await.ok()?;
+pub async fn fetch_semantic_scholar_by_title(
+    title: &str,
+    api_key: Option<&str>,
+) -> Option<MetaUpdate> {
+    let json = s2_get_json(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        &[("query", title), ("fields", S2_META_FIELDS), ("limit", "3")],
+        api_key,
+        MAX_META_BYTES,
+    )
+    .await
+    .ok()?;
     let papers = json["data"].as_array()?;
     // Pick the first result whose title roughly matches (case-insensitive substring)
     let title_lower = title.to_lowercase();
@@ -614,8 +701,9 @@ pub async fn fetch_and_apply(
     };
 
     // Step 4: tier 3 — Semantic Scholar by ID
+    let s2_key = s2_api_key(root);
     let update = if update.is_none() {
-        fetch_semantic_scholar(arxiv_id.as_deref(), doi.as_deref()).await
+        fetch_semantic_scholar(arxiv_id.as_deref(), doi.as_deref(), s2_key.as_deref()).await
     } else {
         update
     };
@@ -627,7 +715,7 @@ pub async fn fetch_and_apply(
         .unwrap_or_default();
     let update = if update.is_none() && current_title.split_whitespace().count() >= 3 {
         // Try Semantic Scholar by title first, then Crossref
-        let s2_result = fetch_semantic_scholar_by_title(&current_title).await;
+        let s2_result = fetch_semantic_scholar_by_title(&current_title, s2_key.as_deref()).await;
         if s2_result.is_some() {
             s2_result
         } else {
@@ -708,21 +796,75 @@ pub async fn fetch_semantic_scholar_meta(
     slug: &str,
 ) -> Result<Option<MetaUpdate>, String> {
     let meta = crate::paper::read_meta(root, slug)?;
+    let s2_key = s2_api_key(root);
 
     // Prefer stable identifiers from meta.
-    if let Some(update) = fetch_semantic_scholar(meta.arxiv_id.as_deref(), meta.doi.as_deref()).await
+    if let Some(update) =
+        fetch_semantic_scholar(meta.arxiv_id.as_deref(), meta.doi.as_deref(), s2_key.as_deref())
+            .await
     {
         return Ok(Some(update));
     }
 
     // Fallback to title search if title is long enough to be specific.
     if meta.title.split_whitespace().count() >= 3 {
-        if let Some(update) = fetch_semantic_scholar_by_title(&meta.title).await {
+        if let Some(update) = fetch_semantic_scholar_by_title(&meta.title, s2_key.as_deref()).await {
             return Ok(Some(update));
         }
     }
 
     Ok(None)
+}
+
+/// Fill any *empty* bibliographic fields on `meta` from a metadata `update`
+/// (Semantic Scholar or SerpAPI), leaving user-provided values untouched.
+/// Returns whether anything changed. Used to auto-complete papers imported with
+/// sparse metadata (e.g. a raw PDF link) without clobbering manual edits.
+/// Backfilling the arXiv id / DOI also lets a later reference fetch resolve via
+/// a stable id instead of a fragile title search.
+pub fn backfill_meta(meta: &mut crate::models::PaperMeta, u: &MetaUpdate) -> bool {
+    fn is_blank(s: &Option<String>) -> bool {
+        s.as_deref().unwrap_or("").trim().is_empty()
+    }
+    let mut changed = false;
+
+    if meta.cite_count.is_none() {
+        if let Some(n) = u.cite_count {
+            meta.cite_count = Some(n);
+            changed = true;
+        }
+    }
+    if meta.year.is_none() {
+        if let Some(y) = u.year {
+            meta.year = Some(y);
+            changed = true;
+        }
+    }
+    if meta.authors.is_empty() {
+        if let Some(a) = u.authors.as_ref().filter(|a| !a.is_empty()) {
+            meta.authors = a.clone();
+            changed = true;
+        }
+    }
+    if is_blank(&meta.doi) {
+        if let Some(d) = u.doi.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            meta.doi = Some(d.to_string());
+            changed = true;
+        }
+    }
+    if is_blank(&meta.arxiv_id) {
+        if let Some(a) = u.arxiv_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            meta.arxiv_id = Some(a.to_string());
+            changed = true;
+        }
+    }
+    if is_blank(&meta.venue) {
+        if let Some(v) = u.venue.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            meta.venue = Some(v.to_string());
+            changed = true;
+        }
+    }
+    changed
 }
 
 // ── Venue rank cache (library-wide, keyed by venue) ─────────────────────────────
@@ -1120,37 +1262,46 @@ fn cache_references(root: &str, slug: &str, refs: &[CitationRef]) -> Result<(), 
         .map_err(|e| format!("Write references.json: {e}"))
 }
 
+/// Sentinel error for "the paper genuinely isn't in Semantic Scholar", kept
+/// distinct from transport errors (429 / network / server) so the caller never
+/// reports a rate-limit as "not found".
+const S2_NOT_FOUND: &str = "无法在 Semantic Scholar 中定位这篇论文";
+
 /// Resolve a Semantic Scholar paper identifier for a library paper: prefer the
 /// stable arXiv id / DOI, else resolve via a title search.
+///
+/// Returns `Err(S2_NOT_FOUND)` only when the paper is truly absent; a 429 or
+/// other transport failure propagates its own error so the user sees the real
+/// reason (e.g. rate-limited) instead of a misleading "not found".
 async fn s2_resolve_paper_id(
     arxiv_id: Option<&str>,
     doi: Option<&str>,
     title: &str,
-) -> Option<String> {
+    api_key: Option<&str>,
+) -> Result<String, String> {
     if let Some(a) = arxiv_id.map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(format!("arXiv:{a}"));
+        return Ok(format!("arXiv:{a}"));
     }
     if let Some(d) = doi.map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(format!("DOI:{d}"));
+        return Ok(format!("DOI:{d}"));
     }
     if title.split_whitespace().count() < 3 {
-        return None;
+        return Err(S2_NOT_FOUND.to_string());
     }
-    let client = build_client();
-    let resp = client
-        .get("https://api.semanticscholar.org/graph/v1/paper/search")
-        .query(&[("query", title), ("limit", "1"), ("fields", "title")])
-        .send()
-        .await
-        .ok()?;
-    let json: Value = crate::net::fetch_json_capped(resp, MAX_META_BYTES).await.ok()?;
-    let pid = json
-        .get("data")?
-        .as_array()?
-        .first()?
-        .get("paperId")?
-        .as_str()?;
-    Some(pid.to_string())
+    let json = s2_get_json(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        &[("query", title), ("limit", "1"), ("fields", "title")],
+        api_key,
+        MAX_META_BYTES,
+    )
+    .await?;
+    json.get("data")
+        .and_then(Value::as_array)
+        .and_then(|d| d.first())
+        .and_then(|p| p.get("paperId"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .ok_or_else(|| S2_NOT_FOUND.to_string())
 }
 
 /// Fetch the reference list (papers cited by this paper) from Semantic Scholar
@@ -1158,28 +1309,26 @@ async fn s2_resolve_paper_id(
 /// added papers get linked without a re-fetch.
 pub async fn fetch_references(root: &str, slug: &str) -> Result<Vec<CitationRef>, String> {
     let meta = paper::read_meta(root, slug)?;
-    let pid = s2_resolve_paper_id(meta.arxiv_id.as_deref(), meta.doi.as_deref(), &meta.title)
-        .await
-        .ok_or_else(|| "无法在 Semantic Scholar 中定位这篇论文".to_string())?;
+    let api_key = s2_api_key(root);
+    let pid = s2_resolve_paper_id(
+        meta.arxiv_id.as_deref(),
+        meta.doi.as_deref(),
+        &meta.title,
+        api_key.as_deref(),
+    )
+    .await?;
 
     let url = format!(
         "https://api.semanticscholar.org/graph/v1/paper/{}/references",
         pid
     );
-    let client = build_client();
-    let resp = client
-        .get(&url)
-        .query(&[("fields", S2_REF_FIELDS), ("limit", "1000")])
-        .send()
-        .await
-        .map_err(|e| format!("Semantic Scholar 请求失败: {e}"))?;
-    if resp.status().as_u16() == 429 {
-        return Err("Semantic Scholar 请求过于频繁，请稍后再试".to_string());
-    }
-    if !resp.status().is_success() {
-        return Err(format!("Semantic Scholar 返回错误：{}", resp.status()));
-    }
-    let json: Value = crate::net::fetch_json_capped(resp, MAX_REFS_BYTES).await?;
+    let json = s2_get_json(
+        &url,
+        &[("fields", S2_REF_FIELDS), ("limit", "1000")],
+        api_key.as_deref(),
+        MAX_REFS_BYTES,
+    )
+    .await?;
     let refs = parse_s2_references(&json);
     cache_references(root, slug, &refs)?;
     Ok(refs)

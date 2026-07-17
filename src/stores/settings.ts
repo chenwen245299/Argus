@@ -16,6 +16,9 @@ export const useSettingsStore = defineStore('settings', () => {
   // Whether an easyScholar secret key is stored (encrypted). The key value
   // itself never reaches the frontend.
   const easyscholarConfigured = ref(false)
+  // Whether a Semantic Scholar API key is stored (encrypted). Same treatment:
+  // the key value never reaches the frontend.
+  const semanticScholarConfigured = ref(false)
 
   async function load() {
     try {
@@ -26,6 +29,7 @@ export const useSettingsStore = defineStore('settings', () => {
       console.error('Failed to load settings:', e)
     }
     await loadEasyscholarStatus()
+    await loadSemanticScholarStatus()
   }
 
   async function loadEasyscholarStatus() {
@@ -39,6 +43,19 @@ export const useSettingsStore = defineStore('settings', () => {
   async function setEasyscholarKey(key: string) {
     await invoke('set_easyscholar_key', { key })
     easyscholarConfigured.value = !!key.trim()
+  }
+
+  async function loadSemanticScholarStatus() {
+    try {
+      semanticScholarConfigured.value = await invoke<boolean>('semantic_scholar_key_status')
+    } catch {
+      semanticScholarConfigured.value = false
+    }
+  }
+
+  async function setSemanticScholarKey(key: string) {
+    await invoke('set_semantic_scholar_key', { key })
+    semanticScholarConfigured.value = !!key.trim()
   }
 
   async function save(patch: Partial<AppSettings>) {
@@ -64,5 +81,16 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  return { settings, loaded, easyscholarConfigured, load, save, loadEasyscholarStatus, setEasyscholarKey }
+  return {
+    settings,
+    loaded,
+    easyscholarConfigured,
+    semanticScholarConfigured,
+    load,
+    save,
+    loadEasyscholarStatus,
+    setEasyscholarKey,
+    loadSemanticScholarStatus,
+    setSemanticScholarKey,
+  }
 })

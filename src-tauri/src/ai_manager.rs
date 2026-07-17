@@ -80,6 +80,11 @@ fn write_keys_map(root: &str, map: &HashMap<String, String>) -> Result<(), Strin
 /// Namespaced with underscores so it never collides with a real provider UUID.
 pub const EASYSCHOLAR_KEY_ID: &str = "__easyscholar__";
 
+/// Reserved key id for the Semantic Scholar API key in the encrypted key store.
+/// A key moves requests off the anonymous shared pool onto a private quota,
+/// which is the single biggest lever against 429 rate-limit errors.
+pub const SEMANTIC_SCHOLAR_KEY_ID: &str = "__semantic_scholar__";
+
 pub fn save_api_key(root: &str, provider_id: &str, key: &str) -> Result<(), String> {
     let master = get_or_create_master_key(root)?;
     let cipher = Aes256Gcm::new_from_slice(&master).map_err(|e| e.to_string())?;

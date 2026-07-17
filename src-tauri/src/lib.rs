@@ -152,6 +152,8 @@ pub fn run() {
             commands::fetch_references,
             commands::set_easyscholar_key,
             commands::easyscholar_key_status,
+            commands::set_semantic_scholar_key,
+            commands::semantic_scholar_key_status,
             commands::extract_metadata_ai,
             commands::extract_first_page_text,
             commands::rename_paper_folder,

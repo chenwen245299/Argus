@@ -316,15 +316,27 @@ pub fn resolve_provider_model(
 ) -> Result<(AiProvider, String, String), String> {
     let settings = read_ai_settings(root);
 
-    let pid = provider_id
-        .map(|s| s.to_string())
-        .or_else(|| settings.default_provider_id.clone())
-        .ok_or("No AI provider configured. Please add a provider in Settings → AI Services.")?;
-
-    let mid = model_id
-        .map(|s| s.to_string())
-        .or_else(|| settings.default_model_id.clone())
-        .ok_or("No default model configured. Please select a model in Settings → AI Services.")?;
+    // Resolve provider + model as a *pair*. An explicit selection is honored only
+    // when BOTH the provider and the model are present — a partial selection (e.g.
+    // a per-task provider with no model) must not be mixed with the default
+    // provider's model, which would send an unknown model id to that provider. In
+    // every incomplete case fall back to the default provider+model as a unit.
+    let (pid, mid) = match (provider_id, model_id) {
+        (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => (p.to_string(), m.to_string()),
+        _ => {
+            let p = settings
+                .default_provider_id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .ok_or("No AI provider configured. Please add a provider in Settings → AI Services.")?;
+            let m = settings
+                .default_model_id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .ok_or("No default model configured. Please select a model in Settings → AI Services.")?;
+            (p, m)
+        }
+    };
 
     let provider = settings
         .providers

@@ -102,8 +102,10 @@ const orEndpoints       = ref<OrEndpoint[]>([])
 const orEndpointStatus  = ref<'' | 'fetching' | 'ok' | 'fail'>('')
 const orEndpointErr     = ref('')
 
-// Default model selection
-const defaultSel    = ref<ModelSelection | null>(null)
+// Default model selection. Derived straight from the store so it always tracks
+// the single stored default — setting a new default automatically un-stars any
+// previous one (only one default can exist at a time).
+const defaultSel    = computed(() => ai.defaultSelection)
 
 // Save feedback
 const saveStatus    = ref<'' | 'saving' | 'saved'>('')
@@ -111,7 +113,6 @@ const providerCtxMenu = ref<{ x: number; y: number; provider: AiProviderInfo } |
 
 onMounted(async () => {
   await Promise.all([ai.load(), settingsStore.load()])
-  defaultSel.value = ai.defaultSelection
   if (ai.settings.providers.length > 0) {
     selectProvider(ai.settings.providers[0].id)
   }
@@ -526,7 +527,6 @@ function toggleOrProvider(name: string, form: ModelForm) {
 
 async function setDefaultModel(providerId: string, modelId: string) {
   await ai.setDefault({ providerId, modelId })
-  defaultSel.value = ai.defaultSelection
 }
 
 // ── Provider logo ─────────────────────────────────────────────────────────────

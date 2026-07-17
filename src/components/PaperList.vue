@@ -12,6 +12,7 @@ import { useReaderStore } from '../stores/reader'
 import { useCollectionsStore } from '../stores/collections'
 import { useImportStore } from '../stores/import'
 import { usePaperTasksStore, type AiSummaryJob, type PaperTaskKind } from '../stores/paperTasks'
+import { useBatchTasksStore } from '../stores/batchTasks'
 import { useRagStore } from '../stores/rag'
 import { buildChunks } from '../utils/chunker'
 import type { PaperVectorizeInput, ChunkInput } from '../types'
@@ -37,8 +38,12 @@ const reader = useReaderStore()
 const collectionsStore = useCollectionsStore()
 const importStore = useImportStore()
 const paperTasks = usePaperTasksStore()
-const { aiSummaryJobs, aiMetaSlug, abstractSlug } = storeToRefs(paperTasks)
+const { aiSummaryJobs, abstractSlug } = storeToRefs(paperTasks)
+const batchTasks = useBatchTasksStore()
 const ragStore = useRagStore()
+
+// Rows currently highlighted (multi-selection). Set for O(1) row lookups.
+const selectedSet = computed(() => new Set(selection.selectedSlugs))
 const canImportIntoActiveCollection = computed(() =>
   collectionsStore.canReceivePapers(selection.activeCollectionId)
 )
@@ -598,8 +603,36 @@ async function confirmRemoveTag(item: PaperIndexEntry, tag: string) {
 const dragGhostItem = ref<PaperIndexEntry | null>(null)
 const dragGhostPos  = ref({ x: 0, y: 0 })
 
+// Anchor row for Shift+click range selection.
+let selectionAnchorSlug: string | null = null
+
+function onRowClick(e: MouseEvent, item: PaperIndexEntry) {
+  // Shift+click → select the contiguous range from the anchor (in list order).
+  if (e.shiftKey && selectionAnchorSlug) {
+    const list = sorted.value
+    const a = list.findIndex(p => p.slug === selectionAnchorSlug)
+    const b = list.findIndex(p => p.slug === item.slug)
+    if (a >= 0 && b >= 0) {
+      const [lo, hi] = a <= b ? [a, b] : [b, a]
+      selection.selectRange(list.slice(lo, hi + 1).map(p => p.slug), item.slug)
+      return
+    }
+  }
+  // Cmd (mac) / Ctrl (win) + click → toggle this row in the multi-selection.
+  if (e.metaKey || e.ctrlKey) {
+    selection.togglePaper(item.slug)
+    selectionAnchorSlug = item.slug
+    return
+  }
+  // Plain click → single selection.
+  selection.selectPaper(item.slug)
+  selectionAnchorSlug = item.slug
+}
+
 function onRowMouseDown(e: MouseEvent, item: PaperIndexEntry) {
   if (e.button !== 0) return
+  // Don't start a drag on a modifier-click — that's a selection gesture.
+  if (e.metaKey || e.ctrlKey || e.shiftKey) return
   const startX = e.clientX, startY = e.clientY
   let dragging = false
   let hoverCollId: string | null = null
@@ -641,7 +674,15 @@ function onRowMouseDown(e: MouseEvent, item: PaperIndexEntry) {
     dragGhostItem.value = null
     document.dispatchEvent(new CustomEvent('argus-paper-drag-over', { detail: { collectionId: null } }))
     const collId = effectiveDragTarget(e.clientX, e.clientY)
-    if (collId) await collectionsStore.movePaper(item.id, collId)
+    if (!collId) return
+    // Dragging a row that is part of a multi-selection moves the whole set.
+    const sel = selection.selectedSlugs
+    if (sel.length > 1 && sel.includes(item.slug)) {
+      const targets = sorted.value.filter(p => sel.includes(p.slug))
+      for (const p of targets) await collectionsStore.movePaper(p.id, collId)
+    } else {
+      await collectionsStore.movePaper(item.id, collId)
+    }
   }
 
   window.addEventListener('mousemove', onMove)
@@ -708,10 +749,27 @@ async function positionContextMenu() {
 
 async function openCtx(e: MouseEvent, item: PaperIndexEntry) {
   e.preventDefault()
+  // Right-clicking a row outside the current multi-selection collapses the
+  // selection to just that row; right-clicking a member keeps the whole set.
+  if (!(selection.selectedSlugs.length > 1 && selection.selectedSlugs.includes(item.slug))) {
+    selection.selectPaper(item.slug)
+  }
   ctxMenu.value = { x: e.clientX, y: e.clientY, item, showColls: false, tagInput: '', constrained: false }
   await positionContextMenu()
 }
 function closeCtx() { ctxMenu.value = null }
+
+// Papers the context-menu action applies to: the whole multi-selection when the
+// right-clicked row is part of it, otherwise just that row.
+const ctxTargets = computed<PaperIndexEntry[]>(() => {
+  if (!ctxMenu.value) return []
+  const sel = selection.selectedSlugs
+  if (sel.length > 1 && sel.includes(ctxMenu.value.item.slug)) {
+    return sorted.value.filter(p => sel.includes(p.slug))
+  }
+  return [ctxMenu.value.item]
+})
+const ctxIsMulti = computed(() => ctxTargets.value.length > 1)
 
 function openRelatedFromCtx() {
   if (!ctxMenu.value) return
@@ -744,12 +802,18 @@ async function removeFromCurrentCollection() {
   closeCtx()
 }
 
-async function savePaperTags(item: PaperIndexEntry, tags: string[]) {
+// Persist a single paper's tags without a library refresh — used both directly
+// and by batch operations (which refresh once at the end).
+async function savePaperTagsQuiet(item: PaperIndexEntry, tags: string[]) {
   const meta = await invoke<PaperMeta>('get_paper_meta', { slug: item.slug })
   meta.tags = tags
   await invoke('save_paper_meta', { slug: item.slug, meta })
   item.tags = [...tags]
   window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug: item.slug, meta } }))
+}
+
+async function savePaperTags(item: PaperIndexEntry, tags: string[]) {
+  await savePaperTagsQuiet(item, tags)
   await library.refresh()
 }
 
@@ -1059,30 +1123,6 @@ function cleanupAiSummaryStream(slug: string) {
   aiSummaryStreamUnlisteners.delete(slug)
 }
 
-async function extractMetaAi(item: PaperIndexEntry) {
-  closeCtx()
-  paperTasks.setAiMetaTask(item.slug)
-
-  // Switch right sidebar to AI tab so the user sees the streaming response
-  window.dispatchEvent(new CustomEvent('argus-switch-sidebar-tab', { detail: { tab: 'ai' } }))
-
-  try {
-    const updated = await invoke<PaperMeta>('extract_metadata_ai', { slug: item.slug })
-    item.title = updated.title
-    item.authors = updated.authors
-    item.year = updated.year
-    item.venue = updated.venue
-    item.status.metadata_fetched = true
-    item.status.text_extracted = true
-    window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug: item.slug, meta: updated } }))
-    await library.refresh()
-  } catch (e: unknown) {
-    showError(String(e))
-  } finally {
-    paperTasks.clearAiMetaTask()
-  }
-}
-
 async function extractAbstractAi(item: PaperIndexEntry) {
   closeCtx()
   if (abstractSlug.value === item.slug) return
@@ -1140,40 +1180,41 @@ async function ensureFulltextReady(item: PaperIndexEntry, progressKind?: PaperTa
   }
 }
 
-async function generateAiSummary(item: PaperIndexEntry) {
-  closeCtx()
-  if (isAiSummaryButtonDisabled(item)) return
-  setAiSummaryJob(item.slug, { kind: 'summary', stage: 'queued', generatedChars: 0, message: undefined })
+// Core streaming summary run for one paper: sets up the live content + thinking
+// progress listeners, invokes generation, and schedules cleanup of the progress
+// entry. Shared by the single-paper action and the multi-select batch so both
+// show identical live char-count progress via the one shared chip (no duplicate
+// batch chip). Records the error on the job and rethrows on failure.
+async function streamSummary(item: PaperIndexEntry, openSummary: boolean) {
+  setAiSummaryJob(item.slug, { kind: 'summary', stage: 'queued', generatedChars: 0, reasoningChars: 0, message: undefined })
   cleanupAiSummaryStream(item.slug)
+  const eventSafeSlug = item.slug.replace(/[^A-Za-z0-9:_/-]/g, '-')
+  const unlistenStream = await listen<{ delta?: string; done?: boolean }>(`ai-summary-${eventSafeSlug}`, (ev) => {
+    const job = aiSummaryJobs.value[item.slug]
+    if (!job) return
+    if (ev.payload.delta) {
+      setAiSummaryJob(item.slug, { stage: 'ai', generatedChars: job.generatedChars + ev.payload.delta.length })
+    }
+    if (ev.payload.done && job.stage === 'ai') {
+      setAiSummaryJob(item.slug, { stage: 'saving' })
+    }
+  })
+  // Thinking-model channel (e.g. Kimi K2): count reasoning chars so progress is
+  // visible during the thinking phase instead of a static "生成中".
+  const unlistenReasoning = await listen<{ delta?: string }>(`ai-summary-${eventSafeSlug}-reasoning`, (ev) => {
+    const job = aiSummaryJobs.value[item.slug]
+    if (!job || !ev.payload.delta) return
+    setAiSummaryJob(item.slug, { stage: 'ai', reasoningChars: (job.reasoningChars ?? 0) + ev.payload.delta.length })
+  })
+  aiSummaryStreamUnlisteners.set(item.slug, () => { unlistenStream(); unlistenReasoning() })
   try {
-    const eventSafeSlug = item.slug.replace(/[^A-Za-z0-9:_/-]/g, '-')
-    const unlistenStream = await listen<{ delta?: string; done?: boolean }>(`ai-summary-${eventSafeSlug}`, (ev) => {
-      const job = aiSummaryJobs.value[item.slug]
-      if (!job) return
-      if (ev.payload.delta) {
-        setAiSummaryJob(item.slug, {
-          stage: 'ai',
-          generatedChars: job.generatedChars + ev.payload.delta.length,
-        })
-      }
-      if (ev.payload.done && job.stage === 'ai') {
-        setAiSummaryJob(item.slug, { stage: 'saving' })
-      }
-    })
-    aiSummaryStreamUnlisteners.set(item.slug, unlistenStream)
     await ensureFulltextReady(item, 'summary')
-    await invoke<Note>('generate_summary', {
-      slug: item.slug,
-      providerId: null,
-      modelId: null,
-    })
+    await invoke<Note>('generate_summary', { slug: item.slug, providerId: null, modelId: null })
     setAiSummaryJob(item.slug, { stage: 'done' })
-    // From summary generation → let the Notes tab surface the AI总结 note.
-    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: item.slug, openSummary: true } }))
-    await library.refresh()
+    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: item.slug, openSummary } }))
   } catch (e: unknown) {
     setAiSummaryJob(item.slug, { stage: 'error', message: String(e) })
-    showError(String(e))
+    throw e
   } finally {
     cleanupAiSummaryStream(item.slug)
     const finalStage = aiSummaryJobs.value[item.slug]?.stage
@@ -1182,6 +1223,17 @@ async function generateAiSummary(item: PaperIndexEntry) {
       const stage = aiSummaryJobs.value[item.slug]?.stage
       if (stage === 'done' || stage === 'error') removeAiSummaryJob(item.slug)
     }, delay)
+  }
+}
+
+async function generateAiSummary(item: PaperIndexEntry) {
+  closeCtx()
+  if (isAiSummaryButtonDisabled(item)) return
+  try {
+    await streamSummary(item, true)
+    await library.refresh()
+  } catch (e: unknown) {
+    showError(String(e))
   }
 }
 
@@ -1205,6 +1257,169 @@ async function reExtract(item: PaperIndexEntry) {
       }
     }, delay)
   }
+}
+
+// ── Batch operations (multi-selection context menu) ───────────────────────────
+// Each runs its targets concurrently in the background and reports progress
+// through the shared batchTasks store, shown in the toolbar next to the
+// AI-analysis progress chips.
+
+function batchBusy(): boolean {
+  if (batchTasks.running) { showError(t('batch.alreadyRunning')); return true }
+  return false
+}
+
+async function runBatchOp(
+  opLabel: string,
+  targets: PaperIndexEntry[],
+  worker: (item: PaperIndexEntry) => Promise<void>,
+  concurrency = 4,
+) {
+  if (!targets.length) return
+  batchTasks.start(opLabel, targets.map(p => ({ slug: p.slug, title: p.title })))
+  const queue = [...targets]
+  async function drain() {
+    while (queue.length) {
+      const item = queue.shift()!
+      batchTasks.setStatus(item.slug, 'running')
+      try {
+        await worker(item)
+        batchTasks.setStatus(item.slug, 'done')
+      } catch (e) {
+        batchTasks.setStatus(item.slug, 'error', String(e))
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, () => drain()))
+  batchTasks.finish()
+  await library.refresh()
+}
+
+async function vectorizeBatch() {
+  const targets = ctxTargets.value
+  closeCtx()
+  if (batchBusy()) return
+  await ragStore.load()
+  const s = ragStore.settings
+  await runBatchOp(t('batch.vectorize'), targets, async (item) => {
+    const input = await invoke<PaperVectorizeInput>('get_paper_vectorize_input', { slug: item.slug })
+    const chunks: ChunkInput[] = await buildChunks(input, s.chunk_size ?? 512, s.chunk_overlap ?? 50)
+    if (chunks.length === 0) return
+    await invoke('embed_and_store_chunks', {
+      slug: item.slug,
+      paperId: input.paper_id,
+      paperTitle: input.paper_title,
+      chunks,
+    })
+    item.status.vectorized = true
+  })
+}
+
+async function analyzeBatch() {
+  const targets = ctxTargets.value.filter(p => !p.status.ai_summary_done && !isAiSummaryActive(p.slug))
+  closeCtx()
+  if (!targets.length) return
+  // AI analysis runs through the same per-paper streaming path as single-paper
+  // analysis (paperTasks), so progress — including live char counts — shows in
+  // the shared AI-analysis chip. We deliberately do NOT use runBatchOp/batchTasks
+  // here: that would add a second progress chip for the same operation.
+  // Mark all upfront so the merged chip shows a correct total from the start.
+  targets.forEach(p => setAiSummaryJob(p.slug, { kind: 'summary', stage: 'queued', generatedChars: 0, reasoningChars: 0, message: undefined }))
+  const CONCURRENCY = 3
+  const queue = [...targets]
+  async function drain() {
+    while (queue.length) {
+      const item = queue.shift()!
+      try {
+        await streamSummary(item, false)
+      } catch { /* streamSummary already recorded the error on the job */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, targets.length) }, () => drain()))
+  await library.refresh()
+}
+
+async function reExtractBatch() {
+  const targets = ctxTargets.value
+  closeCtx()
+  if (batchBusy()) return
+  await runBatchOp(t('batch.extract'), targets, async (item) => {
+    await ensureFulltextReady(item)
+  })
+}
+
+async function abstractBatch() {
+  const targets = ctxTargets.value
+  closeCtx()
+  if (batchBusy()) return
+  await runBatchOp(t('batch.abstract'), targets, async (item) => {
+    const meta = await invoke<PaperMeta>('extract_abstract_ai', { slug: item.slug, providerId: null, modelId: null })
+    window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug: item.slug, meta } }))
+  }, 3)
+}
+
+async function setReadingStatusBatch(status: string) {
+  const targets = ctxTargets.value
+  closeCtx()
+  if (batchBusy()) return
+  await runBatchOp(STATUS_LABELS[status] ?? t('batch.readingStatus'), targets, async (item) => {
+    await invoke('set_reading_status', { slug: item.slug, status })
+    item.reading_status = status
+  })
+}
+
+async function toggleCategoryBatch(tag: string) {
+  const targets = ctxTargets.value
+  closeCtx()
+  if (batchBusy()) return
+  // If every target already carries the tag, the batch removes it; otherwise it
+  // adds the tag to those missing it.
+  const allHave = targets.every(p => p.tags?.includes(tag))
+  await runBatchOp(tag, targets, async (item) => {
+    let tags = [...(item.tags ?? [])]
+    if (allHave) tags = tags.filter(x => x !== tag)
+    else if (!tags.includes(tag)) tags.push(tag)
+    else return
+    await savePaperTagsQuiet(item, tags)
+  })
+}
+
+async function addToCollectionBatch(collectionId: string) {
+  const targets = ctxTargets.value
+  closeCtx()
+  if (batchBusy()) return
+  // Collection assignments live in one shared file → serialize the writes.
+  await runBatchOp(t('batch.addToCollection'), targets, async (item) => {
+    await collectionsStore.addPaper(item.id, collectionId)
+  }, 1)
+}
+
+async function removeFromCollectionBatch() {
+  const collId = selection.activeCollectionId
+  const targets = ctxTargets.value
+  closeCtx()
+  if (!collId || batchBusy()) return
+  await runBatchOp(t('batch.removeFromCollection'), targets, async (item) => {
+    await collectionsStore.removePaper(item.id, collId)
+  }, 1)
+  await refreshCollectionPapers(collId)
+}
+
+async function deleteBatch() {
+  const targets = ctxTargets.value
+  closeCtx()
+  if (batchBusy()) return
+  if (!targets.length) return
+  if (!confirm(t('batch.deleteConfirm').replace('{n}', String(targets.length)))) return
+  // Deletion mutates shared library/collection state → serialize for safety.
+  await runBatchOp(t('batch.delete'), targets, async (item) => {
+    await invoke('delete_paper', { slug: item.slug })
+    library.removePaper(item.slug)
+    collectionsStore.file.assignments = collectionsStore.file.assignments.filter(a => a.paper_id !== item.id)
+    collectionPapers.value = collectionPapers.value.filter(p => p.slug !== item.slug)
+    reader.closeTab(item.slug)
+  }, 1)
+  selection.selectPaper('')
 }
 </script>
 
@@ -1417,9 +1632,9 @@ async function reExtract(item: PaperIndexEntry) {
           <template #default="{ item }: { item: PaperIndexEntry }">
             <div
               class="paper-row"
-              :class="{ selected: item.slug === selection.selectedSlug }"
+              :class="{ selected: selectedSet.has(item.slug) }"
               @mousedown="onRowMouseDown($event, item)"
-              @click="selection.selectPaper(item.slug)"
+              @click="onRowClick($event, item)"
               @dblclick="openInReader(item)"
               @contextmenu.prevent="openCtx($event, item)"
             >
@@ -1521,6 +1736,73 @@ async function reExtract(item: PaperIndexEntry) {
         :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
         @click.stop
       >
+        <!-- ── Multi-selection menu: actions apply to every selected paper ── -->
+        <template v-if="ctxIsMulti">
+          <div class="ctx-multi-header">{{ t('batch.selectedCount', { n: ctxTargets.length }) }}</div>
+          <div class="ctx-item-group" @mouseenter="ctxMenu!.showColls = true" @mouseleave="ctxMenu!.showColls = false">
+            <button class="ctx-item has-sub">
+              {{ t('collections.addToColl') }}
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-left:auto">
+                <polyline points="9 18 15 12 9 6"/>
+              </svg>
+            </button>
+            <div v-if="ctxMenu.showColls && collectionsStore.file.collections.length === 0" class="ctx-submenu">
+              <div class="ctx-item disabled">{{ t('collections.noCollections') }}</div>
+            </div>
+            <CollectionCascadeMenu
+              v-else-if="ctxMenu.showColls"
+              :collections="contextMenuRootCollections"
+              @select="addToCollectionBatch"
+            />
+          </div>
+          <button v-if="selection.activeNav.startsWith('collection:')" class="ctx-item" @click="removeFromCollectionBatch">
+            {{ t('collections.removeFromColl') }}
+          </button>
+          <div class="ctx-sep" />
+          <div class="ctx-status-row">
+            <button
+              v-for="s in ['unread', 'reading', 'read']"
+              :key="s"
+              class="ctx-status-btn"
+              :class="{ 'ctx-status-btn-active': ctxTargets.every(p => p.reading_status === s) }"
+              @click="setReadingStatusBatch(s)"
+            >
+              <span class="ctx-status-dot" :style="{ background: STATUS_COLORS[s] }" />
+              {{ STATUS_LABELS[s] }}
+            </button>
+          </div>
+          <div class="ctx-sep" />
+          <div class="ctx-category-row">
+            <button
+              v-for="cat in PAPER_CATEGORIES"
+              :key="cat.tag"
+              class="ctx-category-btn"
+              :class="{ 'ctx-category-btn-active': ctxTargets.every(p => p.tags?.includes(cat.tag)) }"
+              :style="{
+                color: ctxTargets.every(p => p.tags?.includes(cat.tag)) ? cat.color : 'var(--text-secondary)',
+                background: ctxTargets.every(p => p.tags?.includes(cat.tag)) ? cat.bg : 'var(--bg-secondary)',
+              }"
+              @click="toggleCategoryBatch(cat.tag)"
+            >
+              <span class="ctx-category-icon" v-html="cat.icon" />
+              {{ cat.tag }}
+            </button>
+          </div>
+          <div class="ctx-sep" />
+          <button class="ctx-item" @click="reExtractBatch">{{ t('extraction.reExtract') }}</button>
+          <div class="ctx-sep" />
+          <button class="ctx-item" @click="analyzeBatch">{{ t('paper.summarizeAi') }}</button>
+          <button class="ctx-item" @click="abstractBatch">{{ t('paper.extractAbstractAi') }}</button>
+          <template v-if="ragStore.isConfigured">
+            <div class="ctx-sep" />
+            <button class="ctx-item" @click="vectorizeBatch">{{ t('batch.vectorize') }}</button>
+          </template>
+          <div class="ctx-sep" />
+          <button class="ctx-item danger" @click="deleteBatch">{{ t('paper.delete') }}</button>
+        </template>
+
+        <!-- ── Single-paper menu ─────────────────────────────────────────── -->
+        <template v-else>
         <div class="ctx-item-group" @mouseenter="ctxMenu!.showColls = true" @mouseleave="ctxMenu!.showColls = false">
           <button class="ctx-item has-sub">
             {{ t('collections.addToColl') }}
@@ -1656,9 +1938,6 @@ async function reExtract(item: PaperIndexEntry) {
         <button class="ctx-item" :disabled="abstractSlug === ctxMenu!.item.slug" @click="extractAbstractAi(ctxMenu!.item)">
           {{ abstractSlug === ctxMenu!.item.slug ? t('paper.extractAbstractAiIng') : t('paper.extractAbstractAi') }}
         </button>
-        <button class="ctx-item" :disabled="aiMetaSlug === ctxMenu!.item.slug" @click="extractMetaAi(ctxMenu!.item)">
-          {{ aiMetaSlug === ctxMenu!.item.slug ? t('paper.extractMetaAiIng') : t('paper.extractMetaAi') }}
-        </button>
         <template v-if="ragStore.isConfigured">
           <div class="ctx-sep" />
           <button
@@ -1671,6 +1950,7 @@ async function reExtract(item: PaperIndexEntry) {
         </template>
         <div class="ctx-sep" />
         <button class="ctx-item danger" @click="deletePaper(ctxMenu!.item)">{{ t('paper.delete') }}</button>
+        </template>
       </div>
     </Teleport>
   </div>
@@ -2205,6 +2485,14 @@ async function reExtract(item: PaperIndexEntry) {
   max-height: calc(100vh - 20px);
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+:global(.ctx-multi-header) {
+  padding: 5px 10px 7px;
+  font-size: var(--font-size-xs, 11px);
+  font-weight: 600;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 3px;
 }
 :global(.ctx-item) {
   display: flex; align-items: center; width: 100%;

@@ -31,3 +31,7 @@ app.use(createPinia())
 app.use(VirtualScroller)
 app.use(i18n)
 app.mount('#app')
+
+// Warm up the Fluent Emoji SVGs in the background so collection icons upgrade
+// from the native fallback shortly after startup (non-blocking).
+import('./utils/fluentEmoji').then(m => m.ensureFluentIcons())

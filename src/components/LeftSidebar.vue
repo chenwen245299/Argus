@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -13,6 +14,7 @@ import CollectionNode from './CollectionNode.vue'
 import type { CanvasIndexEntry, Collection, NavItem } from '../types'
 import { updateStore } from '../stores/update'
 import { filterRecentlyRead, recentPapersVersion } from '../utils/recentPapers'
+import { ensureFluentIcons, fluentReady, fluentEmojiList, type FluentEmojiEntry } from '../utils/fluentEmoji'
 import { libraries as snippetLibraries, snippets as allSnippets, createLibrary as createSnippetLibrary, deleteLibrary as deleteSnippetLibrary, renameLibrary as renameSnippetLibrary, loadAll as reloadSnippets } from '../stores/snippetLibrary'
 
 const { t } = useI18n()
@@ -92,25 +94,7 @@ function loadCanvasPanelHeight() {
   } catch {}
   return 160
 }
-const EMOJI_PAGE_SIZE = 60
-const COLLECTION_EMOJIS = [
-  '📚', '📖', '📘', '📙', '📗', '📕', '📓', '📔', '📒', '🗂️',
-  '🗃️', '🗄️', '📁', '📂', '🧾', '📝', '📄', '📑', '📰', '🏷️',
-  '🔖', '📌', '📍', '🧷', '✏️', '🖊️', '🖋️', '🖍️', '📐', '📏',
-  '🔎', '🔍', '🧠', '💡', '🎯', '🧩', '🧭', '🧪', '🔬', '🔭',
-  '⚗️', '🧬', '🧮', '📊', '📈', '📉', '💻', '⌨️', '🖥️', '🖨️',
-  '⚙️', '🛠️', '🔧', '🔨', '⛓️', '🧱', '🧰', '💾', '💿', '📡',
-  '🚀', '🛰️', '🌐', '🗺️', '🧳', '🏛️', '🏫', '🏢', '🏗️', '🏁',
-  '⭐', '🌟', '✨', '💫', '🔥', '🌱', '🌿', '☘️', '🌲', '🌳',
-  '🌊', '☀️', '🌙', '☁️', '⚡', '❄️', '🌈', '💎', '🔮', '🪄',
-  '❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💭',
-  '🕯️', '🪞', '🧵', '🪡', '🎨', '🖼️', '🎼', '🎧', '🎬', '🎮',
-  '🏆', '🥇', '🎲', '🃏', '♟️', '🧿', '🪬', '🔐', '🗝️', '🚦',
-  '✅', '☑️', '✔️', '❌', '⭕', '❗', '❓', '➕', '➖', '➗',
-  '🔴', '🟠', '🟡', '🟢', '🔵', '🟣', '🟤', '⚪', '⚫', '🔺',
-  '🔻', '🔸', '🔹', '🔶', '🔷', '◼️', '◻️', '◾', '◽', '⬛',
-  '⬜', '🟦', '🟩', '🟨', '🟧', '🟥', '🟪', '🟫', '🔳', '🔲',
-]
+const EMOJI_PAGE_SIZE = 90
 
 function loadTagsPanelHeight() {
   try {
@@ -367,28 +351,43 @@ async function submitRename(id: string) {
   renamingId.value = null
 }
 
-// ── Emoji picker ─────────────────────────────────────────────────────────────
+// ── Emoji picker (Fluent Emoji, full set) ────────────────────────────────────
 const emojiPicker = ref<{ col: Collection } | null>(null)
 const emojiDraft = ref('')
+const emojiQuery = ref('')
 const emojiPage = ref(0)
-const emojiPageCount = computed(() => Math.ceil(COLLECTION_EMOJIS.length / EMOJI_PAGE_SIZE))
+
+const filteredEmojis = computed<FluentEmojiEntry[]>(() => {
+  const all = fluentEmojiList()
+  const q = emojiQuery.value.trim().toLowerCase()
+  if (!q) return all
+  // Match the icon's descriptive name (e.g. "rocket", "red-heart") or the raw
+  // character the user typed.
+  const terms = q.split(/[\s-]+/).filter(Boolean)
+  return all.filter(e => e.char === q || terms.every(term => e.name.includes(term)))
+})
+const emojiPageCount = computed(() => Math.max(1, Math.ceil(filteredEmojis.value.length / EMOJI_PAGE_SIZE)))
 const visibleEmojis = computed(() => {
   const start = emojiPage.value * EMOJI_PAGE_SIZE
-  return COLLECTION_EMOJIS.slice(start, start + EMOJI_PAGE_SIZE)
+  return filteredEmojis.value.slice(start, start + EMOJI_PAGE_SIZE)
 })
+// Reset to the first page whenever the search changes.
+watch(emojiQuery, () => { emojiPage.value = 0 })
 
 function openEmojiPicker(col: Collection) {
   closeCtx()
+  ensureFluentIcons()
   emojiPicker.value = { col }
   emojiDraft.value = col.emoji ?? ''
-  const currentIndex = COLLECTION_EMOJIS.indexOf(col.emoji ?? '')
-  emojiPage.value = currentIndex >= 0 ? Math.floor(currentIndex / EMOJI_PAGE_SIZE) : 0
-  nextTick(() => (document.getElementById('collection-emoji-input') as HTMLInputElement | null)?.focus())
+  emojiQuery.value = ''
+  emojiPage.value = 0
+  nextTick(() => (document.getElementById('collection-emoji-search') as HTMLInputElement | null)?.focus())
 }
 
 function closeEmojiPicker() {
   emojiPicker.value = null
   emojiDraft.value = ''
+  emojiQuery.value = ''
   emojiPage.value = 0
 }
 
@@ -1427,16 +1426,27 @@ onUnmounted(() => {
             </button>
           </div>
 
+          <input
+            id="collection-emoji-search"
+            v-model="emojiQuery"
+            class="emoji-search"
+            :placeholder="t('collections.emojiSearchPlaceholder')"
+            @keydown.escape.prevent="closeEmojiPicker"
+          />
+
           <div class="emoji-grid" role="listbox">
             <button
-              v-for="emoji in visibleEmojis"
-              :key="emoji"
+              v-for="entry in visibleEmojis"
+              :key="entry.name"
               class="emoji-option"
-              :class="{ active: emoji === emojiDraft }"
-              @click="saveCollectionEmoji(emoji)"
+              :class="{ active: entry.char === emojiDraft }"
+              :title="entry.name"
+              @click="saveCollectionEmoji(entry.char)"
             >
-              {{ emoji }}
+              <Icon v-if="fluentReady" :icon="`fluent-emoji-flat:${entry.name}`" width="24" height="24" />
+              <template v-else>{{ entry.char }}</template>
             </button>
+            <div v-if="!visibleEmojis.length" class="emoji-empty">{{ t('collections.emojiNoMatch') }}</div>
           </div>
 
           <div class="emoji-pager">
@@ -2219,10 +2229,34 @@ onUnmounted(() => {
   color: var(--text-primary);
 }
 
+:global(.emoji-search) {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  outline: none;
+}
+:global(.emoji-search:focus) {
+  border-color: var(--accent);
+}
+
 :global(.emoji-grid) {
   display: grid;
   grid-template-columns: repeat(10, 1fr);
   gap: 6px;
+}
+
+:global(.emoji-empty) {
+  grid-column: 1 / -1;
+  padding: 24px 0;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: var(--font-size-sm);
 }
 
 :global(.emoji-option) {

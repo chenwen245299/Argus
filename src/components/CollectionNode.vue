@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
 import { useRagStore } from '../stores/rag'
+import { fluentIconFor, fluentReady } from '../utils/fluentEmoji'
 import type { Collection } from '../types'
 
 const props = defineProps<{
@@ -53,6 +55,11 @@ const isCollectionDragOver = computed(() => props.collectionDragOverId === props
 const isCollectionDragging = computed(() => props.collectionDraggingId === props.collection.id)
 const paperCount = computed(() => cStore.collectionPaperCount(props.collection.id))
 const displayEmoji = computed(() => props.collection.emoji?.trim() || '📚')
+// Prefer the Fluent Emoji SVG; fall back to the native character until the SVG
+// set has loaded (or when the set has no matching glyph).
+const displayEmojiIcon = computed(() =>
+  fluentReady.value ? fluentIconFor(displayEmoji.value) : null
+)
 
 // Embed progress for this collection (started from the context menu in LeftSidebar)
 const embedJob = computed(() => ragStore.collectionEmbedJobs[props.collection.id] ?? null)
@@ -85,7 +92,10 @@ function onCollectionMouseDown(e: MouseEvent) {
       @click="selectCollection"
       @contextmenu.prevent="$emit('openCtx', $event, collection)"
     >
-      <span v-if="depth === 0" class="collection-emoji" aria-hidden="true">{{ displayEmoji }}</span>
+      <span v-if="depth === 0" class="collection-emoji" aria-hidden="true">
+        <Icon v-if="displayEmojiIcon" :icon="displayEmojiIcon" width="15" height="15" />
+        <template v-else>{{ displayEmoji }}</template>
+      </span>
 
       <!-- Rename input or label -->
       <template v-if="renamingId === collection.id">

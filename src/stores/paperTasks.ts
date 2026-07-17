@@ -21,6 +21,10 @@ export interface AiSummaryJob {
   kind: PaperTaskKind
   stage: AiSummaryStage
   generatedChars: number
+  // Characters emitted on the model's reasoning/thinking channel (e.g. Kimi K2
+  // with thinking enabled). Tracked separately so we can show live "thinking …"
+  // progress before the answer (content) starts streaming.
+  reasoningChars?: number
   fulltextChars?: number
   contextChars?: number
   provider?: string

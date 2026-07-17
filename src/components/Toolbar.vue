@@ -8,6 +8,7 @@ import { useLibraryStore } from '../stores/library'
 import { useImportStore } from '../stores/import'
 import { useSelectionStore } from '../stores/selection'
 import { usePaperTasksStore, type AiSummaryJob } from '../stores/paperTasks'
+import { useBatchTasksStore } from '../stores/batchTasks'
 import { useCollectionsStore } from '../stores/collections'
 import { useRagStore } from '../stores/rag'
 import { useAiStore } from '../stores/ai'
@@ -22,6 +23,7 @@ const library = useLibraryStore()
 const importStore = useImportStore()
 const selection = useSelectionStore()
 const paperTasks = usePaperTasksStore()
+const batchTasks = useBatchTasksStore()
 const collectionsStore = useCollectionsStore()
 const ragStore = useRagStore()
 const ai = useAiStore()
@@ -311,6 +313,10 @@ function onDocClick(e: MouseEvent) {
     const strip = document.querySelector('.paper-task-strip')
     if (strip && !strip.contains(e.target as Node)) showPaperTaskDetail.value = false
   }
+  if (showBatchOpDetail.value) {
+    const strip = document.querySelector('.batch-op-strip')
+    if (strip && !strip.contains(e.target as Node)) showBatchOpDetail.value = false
+  }
 }
 
 function submitUrl() {
@@ -334,13 +340,27 @@ const importStatusLabel = computed(() => {
   const active = jobs.filter(j => j.status !== 'done' && j.status !== 'error')
   if (active.length) {
     const first = active[0]
-    if (first.status === 'downloading') return t('import.downloading')
-    if (first.status === 'importing') return t('import.importing')
-    if (first.status === 'fetching_meta') return t('import.fetchingMeta')
-    if (first.status === 'renaming') return t('import.renaming')
+    const suffix = active.length > 1 ? ` (${active.length})` : ''
+    const label = importStageLabel(first.status)
+    if (label) return label + suffix
   }
   return ''
 })
+
+function importStageLabel(status: string): string {
+  switch (status) {
+    case 'downloading': return t('import.downloading')
+    case 'importing': return t('import.importing')
+    case 'queued': return t('import.queued')
+    case 'extracting': return t('import.extracting')
+    case 'ai_meta': return t('import.aiMeta')
+    case 'renaming': return t('import.renaming')
+    case 'fetching_meta': return t('import.fetchingMeta')
+    case 'fetching_refs': return t('import.fetchingRefs')
+    case 'ranking': return t('import.ranking')
+    default: return ''
+  }
+}
 
 function onSearchInput() {
   if (searchTimer) clearTimeout(searchTimer)
@@ -393,7 +413,7 @@ async function refreshSinglePaperStatus(slug: string) {
 
 async function analyzeOnePaper(slug: string): Promise<void> {
   if (batchCancelled) return
-  paperTasks.setAiSummaryJob(slug, { kind: 'summary', stage: 'queued', generatedChars: 0, message: undefined })
+  paperTasks.setAiSummaryJob(slug, { kind: 'summary', stage: 'queued', generatedChars: 0, reasoningChars: 0, message: undefined })
 
   const eventSafeSlug = slug.replace(/[^A-Za-z0-9:_/-]/g, '-')
   const unlistenStream = await listen<{ delta?: string; done?: boolean }>(`ai-summary-${eventSafeSlug}`, (ev) => {
@@ -409,6 +429,14 @@ async function analyzeOnePaper(slug: string): Promise<void> {
       paperTasks.setAiSummaryJob(slug, { stage: 'saving' })
     }
   })
+  // Thinking-model channel (e.g. Kimi K2): count reasoning chars so the chip
+  // shows live progress during the (often long) thinking phase instead of
+  // sitting on a static "生成中" with no number.
+  const unlistenReasoning = await listen<{ delta?: string }>(`ai-summary-${eventSafeSlug}-reasoning`, (ev) => {
+    const job = aiSummaryJobs.value[slug]
+    if (!job || !ev.payload.delta) return
+    paperTasks.setAiSummaryJob(slug, { stage: 'ai', reasoningChars: (job.reasoningChars ?? 0) + ev.payload.delta.length })
+  })
 
   try {
     await invoke<Note>('generate_summary', { slug, providerId: null, modelId: null })
@@ -422,6 +450,7 @@ async function analyzeOnePaper(slug: string): Promise<void> {
     paperTasks.setAiSummaryJob(slug, { stage: 'error', message: String(e) })
   } finally {
     unlistenStream()
+    unlistenReasoning()
     const delay = aiSummaryJobs.value[slug]?.stage === 'error' ? 5000 : 1800
     setTimeout(() => {
       const job = aiSummaryJobs.value[slug]
@@ -540,9 +569,11 @@ function aiSummaryStageLabel(job?: AiSummaryJob): string {
     }
     case 'ai': {
       const count = formatSummaryCount(job.generatedChars)
-      return count
-        ? t('paper.summaryStageGeneratingWithCount', { count })
-        : t('paper.summaryStageAi')
+      if (count) return t('paper.summaryStageGeneratingWithCount', { count })
+      // No answer chars yet — if the model is still thinking, show that progress.
+      const thinking = formatSummaryCount(job.reasoningChars)
+      if (thinking) return t('paper.summaryStageThinkingWithCount', { count: thinking })
+      return t('paper.summaryStageAi')
     }
     case 'saving': return isExtract ? t('extraction.stageIndexing') : t('paper.summaryStageSaving')
     case 'done': return isExtract ? t('extraction.done') : t('paper.summaryStageDone')
@@ -605,6 +636,10 @@ const paperTaskDoneCount = computed(() => paperTaskItems.value.length - paperTas
 const showPaperTaskDetail = ref(false)
 // Collapse the detail popover once we're back to fewer than 2 tasks.
 watch(() => paperTaskItems.value.length, len => { if (len < 2) showPaperTaskDetail.value = false })
+
+// ── Multi-select batch operations progress (from the paper list) ─────────────
+const showBatchOpDetail = ref(false)
+watch(() => batchTasks.running, running => { if (!running) showBatchOpDetail.value = false })
 
 // arXiv button state
 const arxivNewCount = ref(0)
@@ -897,6 +932,51 @@ onUnmounted(() => {
       </template>
     </div>
 
+    <!-- Multi-select batch operations progress (from the paper list) -->
+    <div v-if="batchTasks.items.length" class="batch-op-strip">
+      <span
+        class="paper-task-chip batch-chip-clickable"
+        :class="{ 'is-active': batchTasks.running }"
+        @click.stop="showBatchOpDetail = !showBatchOpDetail"
+      >
+        <span v-if="batchTasks.running" class="paper-task-spinner" />
+        <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+        <span class="paper-task-label">{{ batchTasks.label }} {{ batchTasks.doneCount }}/{{ batchTasks.total }}</span>
+        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
+          <polyline :points="showBatchOpDetail ? '18 15 12 9 6 15' : '6 9 12 15 18 9'"/>
+        </svg>
+      </span>
+
+      <Transition name="batch-detail">
+        <div v-if="showBatchOpDetail" class="batch-detail-popover" @click.stop>
+          <div class="batch-detail-header">
+            <span class="batch-detail-title-text">{{ batchTasks.label }}</span>
+            <span class="batch-detail-count">{{ batchTasks.doneCount }}/{{ batchTasks.total }}</span>
+          </div>
+          <div class="batch-detail-list">
+            <div
+              v-for="item in batchTasks.items"
+              :key="item.slug"
+              class="batch-detail-item"
+            >
+              <span v-if="item.status === 'running'" class="paper-task-spinner batch-item-spinner" />
+              <svg v-else-if="item.status === 'error'" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+              </svg>
+              <svg v-else-if="item.status === 'done'" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"/>
+              </svg>
+              <span v-else class="batch-item-pending-dot" />
+              <span class="batch-item-name">{{ titleInitialCaps(item.title) }}</span>
+              <span class="batch-item-stage">{{ item.message ? t('batch.itemError') : t(`batch.status.${item.status}`) }}</span>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </div>
+
     <!-- Embed-vector build progress (started from a collection's context menu) -->
     <div v-if="embedJobAgg" class="embed-progress-strip">
       <span class="paper-task-chip" :class="{ 'is-active': embedJobAgg.running }">
@@ -976,7 +1056,7 @@ onUnmounted(() => {
       </button>
 
       <!-- Dropdown: choose import method -->
-      <Transition name="popover">
+      <Transition name="menu-expand">
         <div v-if="showImportMenu" class="import-menu">
           <button class="import-menu-item" :title="t('import.btnTitle')" @click="chooseFileImport">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
@@ -1063,7 +1143,7 @@ onUnmounted(() => {
       </button>
 
       <!-- Dropdown: arXiv / library chat -->
-      <Transition name="popover">
+      <Transition name="menu-expand">
         <div v-if="showAiMenu" class="import-menu ai-hub-menu">
           <button class="import-menu-item" :title="t('toolbar.arxivTitle')" @click="chooseArxiv">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1139,7 +1219,7 @@ onUnmounted(() => {
         </svg>
       </button>
 
-      <Transition name="popover">
+      <Transition name="menu-expand">
         <div v-if="showStatsMenu" class="import-menu stats-menu">
           <button class="import-menu-item" :title="t('toolbar.activityLogTitle')" @click="chooseActivityLog">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1328,7 +1408,8 @@ onUnmounted(() => {
   overflow-y: visible;
 }
 
-.paper-task-strip {
+.paper-task-strip,
+.batch-op-strip {
   position: relative;
   display: flex;
   align-items: center;
@@ -1337,6 +1418,15 @@ onUnmounted(() => {
   min-width: 0;
   max-width: min(520px, 36vw);
   flex: 0 1 auto;
+}
+
+.batch-item-pending-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--text-tertiary);
+  flex-shrink: 0;
+  opacity: 0.6;
 }
 
 .embed-progress-strip {
@@ -1951,8 +2041,8 @@ onUnmounted(() => {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  /* Grow from the button (top-right corner) on open, shrink back on close. */
-  transform-origin: top right;
+  /* Unfold downward from the top edge on open, roll back up on close. */
+  transform-origin: top center;
   min-width: 148px;
   background: var(--bg-primary);
   border: 1px solid var(--border-default);
@@ -2110,6 +2200,21 @@ onUnmounted(() => {
 .popover-leave-to {
   opacity: 0;
   transform: scale(0.8);
+}
+
+/* Dropdown menus unfold downward from their top edge on open, and roll back
+   up (bottom→top) on close, rather than fading in/out. transform-origin
+   (top) is set on .import-menu so scaleY pivots on the top edge. */
+.menu-expand-enter-active {
+  transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.16s ease;
+}
+.menu-expand-leave-active {
+  transition: transform 0.26s cubic-bezier(0.4, 0, 1, 1), opacity 0.18s ease;
+}
+.menu-expand-enter-from,
+.menu-expand-leave-to {
+  opacity: 0;
+  transform: scaleY(0);
 }
 
 @keyframes spin {

@@ -35,6 +35,7 @@ const PdfViewer = defineAsyncComponent(() => import('../components/PdfViewer.vue
 const EbookViewer = defineAsyncComponent(() => import('../components/EbookViewer.vue'))
 const CanvasPanel = defineAsyncComponent(() => import('../components/CanvasPanel.vue'))
 const SettingsModal = defineAsyncComponent(() => import('../components/SettingsModal.vue'))
+const WelcomeOnboarding = defineAsyncComponent(() => import('../components/WelcomeOnboarding.vue'))
 const SnippetLibraryView = defineAsyncComponent(() => import('../components/SnippetLibraryView.vue'))
 
 const { t } = useI18n()
@@ -357,6 +358,38 @@ function openSettingsSection(section?: 'rag') {
   showSettings.value = true
 }
 
+// ── First-run onboarding ────────────────────────────────────────────────────────
+// Guides the user through configuring the two things needed for full
+// functionality: a default AI model and a Semantic Scholar key. Shown on every
+// launch while setup is still incomplete, until the user opts out via the
+// "don't remind me again" checkbox (which sets the flag below).
+const ONBOARDING_DISMISSED_KEY = 'argus:onboarding:dismissed'
+const showOnboarding = ref(false)
+
+function onboardingNeeded(): boolean {
+  const modelDone = !!aiStore.findModel(aiStore.defaultSelection)
+  return !modelDone || !settingsStore.semanticScholarConfigured
+}
+
+// Call after the per-library stores have loaded. Show every launch while setup
+// is incomplete, unless the user has permanently dismissed the guide.
+function maybeShowOnboarding() {
+  if (localStorage.getItem(ONBOARDING_DISMISSED_KEY)) return
+  if (onboardingNeeded()) showOnboarding.value = true
+}
+
+// `permanent` is true when the user ticked "don't remind me again" (or finished
+// once everything is configured) — only then do we stop showing it on launch.
+function dismissOnboarding(permanent: boolean) {
+  showOnboarding.value = false
+  if (permanent) {
+    try { localStorage.setItem(ONBOARDING_DISMISSED_KEY, '1') } catch {}
+  }
+}
+
+// Manual re-trigger hook (e.g. a "review setup guide" entry): ignores the flag.
+function onShowOnboardingEvent() { showOnboarding.value = true }
+
 // Open the settings modal to a given section from anywhere (window event).
 function onOpenSettingsEvent(event: Event) {
   const { section } = (event as CustomEvent<{ section?: string }>).detail ?? {}
@@ -484,6 +517,7 @@ onMounted(async () => {
   document.addEventListener('argus-paper-drag-end', onPaperDragEnd)
   window.addEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)
   window.addEventListener('argus-open-settings', onOpenSettingsEvent)
+  window.addEventListener('argus-show-onboarding', onShowOnboardingEvent)
   activityStore.startHeartbeat()
   await syncActivityLibrary(libraryStore.currentPath)
   restoreWindowSize()
@@ -513,6 +547,7 @@ onMounted(async () => {
     await readerStore.loadTabs(libraryStore.currentPath)
     await loadMainLayout(libraryStore.currentPath)
     initSnippetStore()
+    maybeShowOnboarding()
   }
 
   // Tauri 2 file drag-drop
@@ -562,6 +597,7 @@ onUnmounted(() => {
   document.removeEventListener('argus-paper-drag-end', onPaperDragEnd)
   window.removeEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)
   window.removeEventListener('argus-open-settings', onOpenSettingsEvent)
+  window.removeEventListener('argus-show-onboarding', onShowOnboardingEvent)
   unlistenOpenPaper?.()
   unlistenDragDrop?.()
   unlistenLibraryPaperAdded?.()
@@ -614,6 +650,7 @@ async function onLibraryOpened() {
   await readerStore.loadTabs(libraryStore.currentPath!)
   await loadMainLayout(libraryStore.currentPath!)
   initSnippetStore()
+  maybeShowOnboarding()
 }
 
 // Reload per-library stores whenever the library path changes — both the
@@ -906,6 +943,9 @@ watch(
         </div>
       </div>
     </Transition>
+
+    <!-- First-run onboarding (guides default-model + Semantic Scholar setup) -->
+    <WelcomeOnboarding v-if="showOnboarding" @close="dismissOnboarding" />
 
     <!-- Unified settings modal -->
     <SettingsModal

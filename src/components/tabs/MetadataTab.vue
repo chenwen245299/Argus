@@ -8,6 +8,7 @@ import { useSettingsStore } from '../../stores/settings'
 import { useReaderStore } from '../../stores/reader'
 import { useSelectionStore } from '../../stores/selection'
 import { useRanksStore } from '../../stores/ranks'
+import { usePaperTasksStore } from '../../stores/paperTasks'
 import { badgesFromRank, isWithdrawnVenue, type DisplayBadge } from '../../utils/rankBadges'
 
 const props = defineProps<{
@@ -26,6 +27,7 @@ const settings = useSettingsStore()
 const reader = useReaderStore()
 const selection = useSelectionStore()
 const ranks = useRanksStore()
+const paperTasks = usePaperTasksStore()
 
 // ── References (Semantic Scholar citation list) ─────────────────────────────────
 const references = ref<CitationRef[]>([])
@@ -210,7 +212,6 @@ async function saveEdit() {
 watch(() => props.slug, () => {
   editing.value = false
   draft.value = null
-  refetchOk.value = false
   renameOk.value = false
   copiedKind.value = null
   sourceEditing.value = false
@@ -421,28 +422,10 @@ function onTagInputBlur() {
   window.setTimeout(() => { tagInputFocused.value = false }, 150)
 }
 
-// ── Re-fetch & rename ─────────────────────────────────────────────────────────
+// ── Rename ────────────────────────────────────────────────────────────────────
 const saving = ref(false)
-const refetching = ref(false)
 const renaming = ref(false)
-const refetchOk = ref(false)
 const renameOk = ref(false)
-
-async function refetch() {
-  if (!props.slug) return
-  refetching.value = true
-  refetchOk.value = false
-  try {
-    const updated = await invoke<PaperMeta>('fetch_metadata', { slug: props.slug })
-    emit('saved', updated)
-    refetchOk.value = true
-    setTimeout(() => { refetchOk.value = false }, 2500)
-  } catch (e) {
-    console.error('Refetch failed:', e)
-  } finally {
-    refetching.value = false
-  }
-}
 
 async function renameFolder() {
   if (!props.slug) return
@@ -457,6 +440,27 @@ async function renameFolder() {
     console.error('Rename failed:', e)
   } finally {
     renaming.value = false
+  }
+}
+
+// ── AI metadata re-fetch ──────────────────────────────────────────────────────
+// Re-runs the AI extraction pipeline. The backend broadcasts ai-meta-* events,
+// so we switch the sidebar to the AI tab to let the user watch it stream.
+const aiMetaRunning = computed(() => !!props.slug && paperTasks.aiMetaSlug === props.slug)
+
+async function refetchMetaAi() {
+  if (!props.slug || aiMetaRunning.value) return
+  const slug = props.slug
+  paperTasks.setAiMetaTask(slug)
+  window.dispatchEvent(new CustomEvent('argus-switch-sidebar-tab', { detail: { tab: 'ai' } }))
+  try {
+    const updated = await invoke<PaperMeta>('extract_metadata_ai', { slug })
+    emit('saved', updated)
+    window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug, meta: updated } }))
+  } catch (e) {
+    console.error('AI metadata extraction failed:', e)
+  } finally {
+    paperTasks.clearAiMetaTask()
   }
 }
 
@@ -525,12 +529,23 @@ function onFulltextUpdated(e: Event) {
   if (slug && slug === props.slug) loadFulltext(slug)
 }
 
+// The background import pipeline fetches references after the paper is already
+// selected/shown here, so refresh the list from cache when they land.
+function onReferencesUpdated(e: Event) {
+  const slug = (e as CustomEvent<{ slug?: string }>).detail?.slug
+  if (slug && slug === props.slug) loadCachedReferences()
+}
+
 onMounted(() => {
   window.addEventListener('argus-paper-fulltext-updated', onFulltextUpdated)
+  window.addEventListener('argus-references-updated', onReferencesUpdated)
   loadCachedReferences()
   if (!settings.loaded) settings.load()   // so the "no key" hint can show
 })
-onBeforeUnmount(() => { window.removeEventListener('argus-paper-fulltext-updated', onFulltextUpdated) })
+onBeforeUnmount(() => {
+  window.removeEventListener('argus-paper-fulltext-updated', onFulltextUpdated)
+  window.removeEventListener('argus-references-updated', onReferencesUpdated)
+})
 
 async function copyText(kind: 'abstract' | 'fulltext' | 'bibtex', text: string) {
   const val = text.trim()
@@ -575,10 +590,8 @@ async function extractAbstract() {
       <div class="action-bar">
         <template v-if="!editing">
           <button class="act-btn primary" @click="startEdit">{{ t('metaEdit.edit') }}</button>
-          <button class="act-btn" :disabled="refetching" @click="refetch">
-            <template v-if="refetching">{{ t('metaEdit.refetching') }}</template>
-            <template v-else-if="refetchOk">✓ {{ t('metaEdit.refetchOk') }}</template>
-            <template v-else>{{ t('metaEdit.refetch') }}</template>
+          <button class="act-btn" :disabled="aiMetaRunning" @click="refetchMetaAi">
+            {{ aiMetaRunning ? t('metaEdit.refetchMetaIng') : t('metaEdit.refetchMeta') }}
           </button>
           <button class="act-btn" :disabled="renaming" @click="renameFolder">
             <template v-if="renaming">{{ t('metaEdit.renaming') }}</template>

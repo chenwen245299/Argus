@@ -76,7 +76,14 @@ function refKey(r: CitationRef): string {
   if (r.doi) return 'doi:' + r.doi.trim().toLowerCase()
   return 'ti:' + r.title.toLowerCase().replace(/[^a-z0-9]+/g, '')
 }
-const byCiteDesc = (a: CitationRef, b: CitationRef) => (b.cite_count ?? -1) - (a.cite_count ?? -1)
+// In-library papers rank first (so they're never dropped when the node count is
+// capped), then by citation count within each group.
+const byLibThenCite = (a: CitationRef, b: CitationRef) => {
+  const la = a.library_slug ? 1 : 0
+  const lb = b.library_slug ? 1 : 0
+  if (la !== lb) return lb - la
+  return (b.cite_count ?? -1) - (a.cite_count ?? -1)
+}
 const sourceColor = (id: string) => sources.value.find(s => s.id === id)?.color ?? '#94a3b8'
 
 function diamOf(c?: number | null) {
@@ -103,7 +110,7 @@ function rebuildBase() {
   buildGen++     // abort any in-flight staggered expansion from a previous state
   resetSim()
   sources.value = [{ id: ROOT_ID, title: props.centerTitle, color: ROOT_COLOR, hubKey: CENTER_KEY }]
-  const sorted = [...props.refs].sort(byCiteDesc).slice(0, rootLimit.value)
+  const sorted = [...props.refs].sort(byLibThenCite).slice(0, rootLimit.value)
   sorted.forEach((r, i) => {
     const ang = i * GOLDEN_ANGLE
     const rad = 150 + 16 * Math.sqrt(i)
@@ -137,7 +144,7 @@ async function expand(node: GNode) {
 function addSource(id: string, title: string, hub: GNode, refs: CitationRef[]) {
   const color = SOURCE_COLORS[(sources.value.length - 1) % SOURCE_COLORS.length]
   sources.value = [...sources.value, { id, title, color, hubKey: hub.key }]
-  const sorted = [...refs].sort(byCiteDesc).slice(0, expandLimit.value)
+  const sorted = [...refs].sort(byLibThenCite).slice(0, expandLimit.value)
   const gen = buildGen
   let i = 0
   // Add nodes one at a time so the user watches them cascade out of the clicked
@@ -318,7 +325,6 @@ async function copySelected() {
     setTimeout(() => { copied.value = false }, 1500)
   } catch { /* text is still selectable */ }
 }
-function shortTitle(s: string) { return s.length > 22 ? s.slice(0, 21) + '…' : s }
 
 // ── Node drag + click ────────────────────────────────────────────────────────
 let dragNode: GNode | null = null
@@ -452,6 +458,17 @@ const nodesTransform = computed(() => `translate(${CX.value + view.x}px, ${CY.va
       @mousedown="onBgDown"
       @wheel="onWheel"
     >
+      <!-- Legend — pinned to the top-left corner. Every row is the same width;
+           longer source titles truncate with an ellipsis. -->
+      <div class="cg-legend-overlay">
+        <span class="cg-leg"><i class="dot lib-dot" /><span class="cg-leg-text">{{ t('citeGraph.legendInLib') }}</span></span>
+        <span class="cg-leg"><i class="dot pale-dot" /><span class="cg-leg-text">{{ t('citeGraph.legendNotInLib') }}</span></span>
+        <span v-for="s in sources" :key="s.id" class="cg-leg">
+          <i class="dot" :style="{ background: s.color }" />
+          <span class="cg-leg-text">{{ s.id === '__root__' ? t('citeGraph.legendThis') : s.title }}</span>
+        </span>
+      </div>
+
       <svg class="cg-edges" :width="W" :height="H" :viewBox="`0 0 ${W} ${H}`">
         <g :transform="edgeTransform">
           <line
@@ -495,12 +512,6 @@ const nodesTransform = computed(() => `translate(${CX.value + view.x}px, ${CY.va
 
     <div class="cg-footer">
       <div class="cg-legend">
-        <span class="cg-leg"><i class="dot lib-dot" /> {{ t('citeGraph.legendInLib') }}</span>
-        <span class="cg-leg"><i class="dot pale-dot" /> {{ t('citeGraph.legendNotInLib') }}</span>
-        <span v-for="s in sources" :key="s.id" class="cg-leg">
-          <i class="dot" :style="{ background: s.color }" />
-          {{ s.id === '__root__' ? t('citeGraph.legendThis') : shortTitle(s.title) }}
-        </span>
         <span class="cg-leg cg-size-hint">{{ t('citeGraph.legendSize') }}</span>
         <span class="cg-leg cg-size-hint">{{ t('citeGraph.legendExpand') }}</span>
         <span v-if="hiddenCount" class="cg-leg cg-more">{{ t('citeGraph.moreHidden', { n: hiddenCount }) }}</span>
@@ -642,8 +653,40 @@ const nodesTransform = computed(() => `translate(${CX.value + view.x}px, ${CY.va
 .cg-leg .pale-dot { background: color-mix(in srgb, var(--accent) 22%, var(--bg-primary)); border: 1.5px solid var(--border-default); }
 .cg-more { color: var(--text-secondary); }
 
+/* Legend overlay pinned to the viewport's top-left corner. Non-interactive so
+   it never blocks panning; every row shares one width and truncates overflow. */
+.cg-legend-overlay {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-primary) 82%, transparent);
+  border: 1px solid var(--border-subtle);
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
+.cg-legend-overlay .cg-leg {
+  display: flex;
+  width: 168px;
+  gap: 6px;
+  color: var(--text-secondary);
+  min-width: 0;
+}
+.cg-legend-overlay .cg-leg-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.cg-legend-overlay .dot { flex-shrink: 0; }
+
 .cg-foot-right { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; justify-content: flex-end; }
-.cg-sel { min-width: 0; max-width: 480px; text-align: right; user-select: text; }
+.cg-sel { min-width: 0; max-width: 720px; text-align: right; user-select: text; }
 .cg-sel-title {
   font-size: var(--font-size-sm);
   color: var(--text-primary);

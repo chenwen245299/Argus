@@ -183,7 +183,18 @@ export interface LibraryConfig {
   created_at: string
 }
 
-export type ImportStatus = 'importing' | 'fetching_meta' | 'renaming' | 'downloading' | 'done' | 'error'
+export type ImportStatus =
+  | 'importing'
+  | 'downloading'
+  | 'queued'
+  | 'extracting'
+  | 'ai_meta'
+  | 'renaming'
+  | 'fetching_meta'
+  | 'fetching_refs'
+  | 'ranking'
+  | 'done'
+  | 'error'
 
 export interface ImportJob {
   id: string

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
@@ -18,6 +19,7 @@ import { useRagStore } from '../stores/rag'
 import { useActivityStore } from '../stores/activity'
 import { switchToTranslationsTab, askAiText } from '../stores/translationHistory'
 import { pendingSnippet, initSnippetStore, libraries as snippetLibraries } from '../stores/snippetLibrary'
+import { lists as writingLists, activeListId as writingActiveListId } from '../stores/writing'
 import { isEbookFileType } from '../types'
 import Toolbar from '../components/Toolbar.vue'
 import LeftSidebar from '../components/LeftSidebar.vue'
@@ -37,6 +39,7 @@ const CanvasPanel = defineAsyncComponent(() => import('../components/CanvasPanel
 const SettingsModal = defineAsyncComponent(() => import('../components/SettingsModal.vue'))
 const WelcomeOnboarding = defineAsyncComponent(() => import('../components/WelcomeOnboarding.vue'))
 const SnippetLibraryView = defineAsyncComponent(() => import('../components/SnippetLibraryView.vue'))
+const WritingView = defineAsyncComponent(() => import('../components/WritingView.vue'))
 
 const { t } = useI18n()
 const libraryStore = useLibraryStore()
@@ -241,8 +244,34 @@ const liveEbookSlugs = computed(() => liveViewerSlugs.value.filter(s => isEbookF
 
 const showCanvas = ref(false)
 const showSnippetLibrary = ref(false)
+const showWriting = ref(false)
+// Open writing tabs (one per reference list; null = the "Library"/all-papers
+// view). Each stays open for quick switching until its tab is closed, mirroring
+// the snippet-library tabs. Names are derived reactively from the writing store.
+const openWritingIds = ref<(string | null)[]>([])
+const openWritingTabs = computed(() => {
+  const out: { id: string; name: string }[] = []
+  for (const id of openWritingIds.value) {
+    if (id === null) continue   // the all-papers ("Library") view has no tab
+    const list = writingLists.value.find(l => l.id === id)
+    if (list) out.push({ id, name: list.name })
+  }
+  return out
+})
 const activeSnippetLibraryId = ref<string | null>(null)
 const openSnippetLibraryIds = ref<string[]>([])
+type WorkspaceMode = 'library' | 'canvas' | 'snippets' | 'writing'
+
+// The workspace the center is currently showing. Drives the left sidebar so it
+// always matches the active tab (open a paper → library, writing tab → writing…).
+const activeWorkspace = computed<WorkspaceMode>(() => {
+  if (readerStore.activeSlug) return 'library'   // a paper tab is open
+  if (showWriting.value) return 'writing'
+  if (showCanvas.value) return 'canvas'
+  if (showSnippetLibrary.value) return 'snippets'
+  return 'library'
+})
+
 const openSnippetLibraryTabs = computed(() =>
   openSnippetLibraryIds.value
     .map(id => snippetLibraries.value.find(lib => lib.id === id))
@@ -252,15 +281,115 @@ const openSnippetLibraryTabs = computed(() =>
 // Sync showCanvas with canvasStore.isShown so TabBar close button works
 watch(() => canvasStore.isShown, (v) => { showCanvas.value = v })
 
+let autoOpeningCanvasId: string | null = null
+async function ensureCanvasSelection() {
+  if (!showCanvas.value || canvasStore.loading) return
+  const currentId = canvasStore.currentCanvas?.id
+  if (currentId && canvasStore.canvasList.some(canvas => canvas.id === currentId)) return
+  const first = canvasStore.canvasList[0]
+  if (!first || autoOpeningCanvasId === first.id) return
+  autoOpeningCanvasId = first.id
+  try {
+    await canvasStore.openCanvas(first.id)
+  } catch (e) {
+    console.error('Auto-open canvas:', e)
+  } finally {
+    autoOpeningCanvasId = null
+  }
+}
+
+watch(
+  [() => showCanvas.value, () => canvasStore.canvasList.map(canvas => canvas.id).join('|')],
+  () => { void ensureCanvasSelection() }
+)
+
+watch(
+  [() => showSnippetLibrary.value, () => snippetLibraries.value.map(lib => lib.id).join('|')],
+  ([visible]) => {
+    if (!visible) return
+    const currentId = activeSnippetLibraryId.value
+    const nextId = currentId && snippetLibraries.value.some(lib => lib.id === currentId)
+      ? currentId
+      : (snippetLibraries.value[0]?.id ?? null)
+    activeSnippetLibraryId.value = nextId
+    if (nextId) rememberSnippetLibraryTab(nextId)
+  }
+)
+
 const showLibraryLoading = computed(() =>
   libraryStore.isRestoringLibrary || (!libraryStore.currentPath && libraryStore.isLoading)
 )
+
+function rememberWritingTab(id: string | null) {
+  if (id === null) return   // the all-papers ("Library") view is tab-less
+  if (!openWritingIds.value.some(x => x === id)) {
+    openWritingIds.value = [...openWritingIds.value, id]
+  }
+}
+
+// Show one writing view (a specific list, or null = all papers) and give it a tab.
+function activateWriting(id: string | null) {
+  readerStore.showList()   // clear activeSlug so the reference table shows
+  showCanvas.value = false
+  canvasStore.isShown = false
+  showSnippetLibrary.value = false
+  writingActiveListId.value = id
+  rememberWritingTab(id)
+  showWriting.value = true
+}
+
+// Entering the writing workspace from the dropdown re-opens the last-active view
+// (or the all-papers view the first time).
+function onOpenWriting() {
+  activateWriting(writingActiveListId.value ?? null)
+}
+
+// Opening a specific folder/list from the sidebar (payload carries its id; null
+// = the "Library" all-papers view).
+function onOpenWritingList(id: string | null) {
+  activateWriting(id)
+}
+
+function closeWritingTab(id: string | null) {
+  const idx = openWritingIds.value.findIndex(x => x === id)
+  if (idx === -1) return
+  const next = openWritingIds.value.filter(x => x !== id)
+  openWritingIds.value = next
+
+  if (writingActiveListId.value === id && showWriting.value) {
+    const fallback = next[Math.min(idx, next.length - 1)]
+    if (fallback !== undefined) activateWriting(fallback)
+    else showWriting.value = false
+  }
+}
+
+// Prune tabs for lists deleted elsewhere; fall back to all-papers if the active
+// list is gone.
+watch(
+  () => writingLists.value.map(l => l.id).join('|'),
+  () => {
+    const valid = new Set(writingLists.value.map(l => l.id))
+    openWritingIds.value = openWritingIds.value.filter(id => id === null || valid.has(id))
+    if (showWriting.value && writingActiveListId.value !== null && !valid.has(writingActiveListId.value)) {
+      activateWriting(null)
+    }
+  }
+)
+
+function onOpenLibrary() {
+  readerStore.showList()
+  showCanvas.value = false
+  canvasStore.isShown = false
+  showSnippetLibrary.value = false
+  showWriting.value = false
+}
 
 function onOpenCanvas() {
   readerStore.showList()   // clear activeSlug so PdfViewer v-if yields to CanvasPanel
   showCanvas.value = true
   canvasStore.isShown = true
   showSnippetLibrary.value = false
+  showWriting.value = false
   // Land on the drawing panel (and leave the PDF-only tabs behind).
   if (!CANVAS_TABS.includes(sidebarTab.value)) sidebarTab.value = 'draw'
 }
@@ -282,9 +411,38 @@ function activateSnippetLibrary(libraryId: string) {
   readerStore.showList()
   showCanvas.value = false
   canvasStore.isShown = false
+  showWriting.value = false
   rememberSnippetLibraryTab(libraryId)
   activeSnippetLibraryId.value = libraryId
   showSnippetLibrary.value = true
+}
+
+function onOpenSnippetWorkspace() {
+  readerStore.showList()
+  showCanvas.value = false
+  canvasStore.isShown = false
+  showWriting.value = false
+  showSnippetLibrary.value = true
+
+  const currentId = activeSnippetLibraryId.value
+  const nextId = currentId && snippetLibraries.value.some(lib => lib.id === currentId)
+    ? currentId
+    : (snippetLibraries.value[0]?.id ?? null)
+  activeSnippetLibraryId.value = nextId
+  if (nextId) rememberSnippetLibraryTab(nextId)
+}
+
+function onSwitchWorkspace(mode: WorkspaceMode) {
+  if (mode === 'library') {
+    onOpenLibrary()
+  } else if (mode === 'canvas') {
+    onOpenCanvas()
+    void ensureCanvasSelection()
+  } else if (mode === 'snippets') {
+    onOpenSnippetWorkspace()
+  } else {
+    onOpenWriting()
+  }
 }
 
 function onOpenSnippetLibrary(libraryId: string) {
@@ -293,6 +451,8 @@ function onOpenSnippetLibrary(libraryId: string) {
 
 function hideSnippetLibrary() {
   showSnippetLibrary.value = false
+  // Clicking the home/canvas tab should also leave the writing view.
+  showWriting.value = false
 }
 
 function closeSnippetLibraryTab(libraryId: string) {
@@ -316,6 +476,13 @@ function onSnippetOpenPaper(slug: string, page: number, title: string) {
   showSnippetLibrary.value = false
   readerStore.openPaper(slug, title, libraryStore.papers.find(p => p.slug === slug)?.file_type)
   readerStore.pendingPageJump = page
+}
+
+function onWritingSelectPaper(slug: string) {
+  selectionStore.selectPaper(slug)
+  rightSidebarVisible.value = true
+  // Land on a paper tab so the right sidebar shows notes/metadata for the pick.
+  if (!PAPER_TABS.includes(sidebarTab.value)) sidebarTab.value = 'notes'
 }
 
 function onCanvasSelectPaper(slug: string) {
@@ -522,8 +689,13 @@ onMounted(async () => {
   await syncActivityLibrary(libraryStore.currentPath)
   restoreWindowSize()
 
-  unlistenLibraryPaperAdded = await listen('library-paper-added', () => {
-    Promise.all([libraryStore.refresh(), collectionsStore.load()])
+  unlistenLibraryPaperAdded = await listen<{ slug?: string; title?: string }>('library-paper-added', async (event) => {
+    await Promise.all([libraryStore.refresh(), collectionsStore.load()])
+    // arXiv-added papers arrive with only their arXiv source metadata; run the
+    // same full AI-metadata + Semantic Scholar / easyScholar pipeline as a local
+    // import so they end up with equivalent metadata coverage.
+    const slug = event.payload?.slug
+    if (slug) importStore.processAddedPaper(slug, event.payload?.title)
   })
 
   unlistenOpenPaper = await listen<{ slug: string; title?: string }>('argus-open-paper', (event) => {
@@ -756,7 +928,10 @@ watch(
 watch(
   () => readerStore.activeSlug,
   (slug) => {
-    if (slug) showSnippetLibrary.value = false
+    if (slug) {
+      showSnippetLibrary.value = false
+      showWriting.value = false
+    }
   }
 )
 
@@ -774,6 +949,9 @@ watch(
     }
     if (showSnippetLibrary.value) {
       showSnippetLibrary.value = false
+    }
+    if (showWriting.value) {
+      showWriting.value = false
     }
   }
 )
@@ -805,10 +983,7 @@ watch(
     <div class="welcome-drag" data-tauri-drag-region />
     <div class="welcome-card">
       <div class="welcome-icon">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-        </svg>
+        <Icon icon="fluent:book-24-regular" width="48" height="48" />
       </div>
       <h1>Argus</h1>
       <p>{{ t('welcome.tagline') }}</p>
@@ -827,11 +1002,16 @@ watch(
       :snippet-library-tabs="openSnippetLibraryTabs"
       :snippet-library-visible="showSnippetLibrary"
       :active-snippet-library-id="activeSnippetLibraryId"
+      :writing-tabs="openWritingTabs"
+      :writing-visible="showWriting"
+      :active-writing-id="writingActiveListId"
       @toggle-right-sidebar="rightSidebarVisible = !rightSidebarVisible"
       @show-home="hideSnippetLibrary"
       @show-canvas="hideSnippetLibrary"
       @switch-snippet-library="activateSnippetLibrary"
       @close-snippet-library-tab="closeSnippetLibraryTab"
+      @switch-writing="onOpenWritingList"
+      @close-writing-tab="closeWritingTab"
     />
 
     <Toolbar
@@ -849,9 +1029,12 @@ watch(
         v-model:show-settings="showSettings"
         :snippet-library-visible="showSnippetLibrary"
         :active-snippet-library-id="activeSnippetLibraryId"
+        :active-workspace="activeWorkspace"
         :style="{ width: leftWidth + 'px', minWidth: leftWidth + 'px' }"
+        @switch-workspace="onSwitchWorkspace"
         @open-canvas="onOpenCanvas"
         @open-snippet-library="onOpenSnippetLibrary"
+        @open-writing="onOpenWritingList"
       />
 
       <div
@@ -900,6 +1083,15 @@ watch(
             @open-paper="onSnippetOpenPaper"
             @open-settings="openSettingsSection"
           />
+          <div v-else-if="showSnippetLibrary" class="center-fill workspace-empty">
+            <Icon icon="fluent:folder-24-regular" width="44" height="44" />
+            <p>{{ t('snippets.noLibraries') }}</p>
+          </div>
+          <WritingView
+            v-else-if="showWriting"
+            class="center-fill"
+            @select-paper="onWritingSelectPaper"
+          />
           <div v-else class="center-fill">
             <PaperList />
           </div>
@@ -933,11 +1125,7 @@ watch(
     <Transition name="fade">
       <div v-if="isDragging" class="drag-overlay">
         <div class="drag-card">
-          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="17 8 12 3 7 8"/>
-            <line x1="12" y1="3" x2="12" y2="15"/>
-          </svg>
+          <Icon icon="fluent:arrow-upload-24-regular" width="40" height="40" />
           <p>{{ dragDropTitle }}</p>
           <span>{{ dragDropSubtitle }}</span>
         </div>
@@ -1145,6 +1333,17 @@ watch(
   flex: 1;
   min-height: 0;
 }
+
+.workspace-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--text-tertiary);
+  background: var(--bg-primary);
+}
+.workspace-empty p { margin: 0; font-size: var(--font-size-sm); }
 
 .right-panel-wrap {
   display: flex;

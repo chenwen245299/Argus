@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, shallowRef, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { runTranslation, triggerAskAi } from '../stores/translationHistory'
@@ -11,6 +12,7 @@ import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import { computeSections } from '../utils/sections'
+import { fluentIconFor, fluentReady } from '../utils/fluentEmoji'
 import type { Highlight, Rect, PaperSections } from '../types'
 // The legacy build includes its own Promise.withResolvers polyfill, so the worker
 // runs correctly on Ventura (WebKit < 17.4) without a custom wrapper.
@@ -36,6 +38,10 @@ const isActiveTab = computed(() => reader.activeSlug === props.slug)
 // ── Related papers (manual links) ───────────────────────────────────────────
 const relatedCount = computed(() =>
   library.papers.find(p => p.slug === props.slug)?.related_ids?.length ?? 0)
+const citationEmoji = '🕸️'
+const relatedEmoji = '🔗'
+const citationEmojiIcon = computed(() => fluentReady.value ? fluentIconFor(citationEmoji) : null)
+const relatedEmojiIcon = computed(() => fluentReady.value ? fluentIconFor(relatedEmoji) : null)
 function openRelatedFromToolbar(e: MouseEvent) {
   const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
   library.openRelatedPopover(props.slug, { x: r.right, y: r.bottom + 4 })
@@ -1863,12 +1869,18 @@ function triggerInitialRender() {
       <div class="toolbar-spacer" />
 
       <button class="related-btn" :title="t('citeGraph.buttonTitle')" @click="openCitationGraph">
-        <span class="related-btn-icon">🕸️</span>
+        <span class="related-btn-icon" aria-hidden="true">
+          <Icon v-if="citationEmojiIcon" :icon="citationEmojiIcon" width="15" height="15" />
+          <template v-else>{{ citationEmoji }}</template>
+        </span>
         <span class="related-btn-label">{{ t('citeGraph.buttonLabel') }}</span>
       </button>
 
       <button class="related-btn" :title="t('related.buttonTitle')" @click="openRelatedFromToolbar">
-        <span class="related-btn-icon">🔗</span>
+        <span class="related-btn-icon" aria-hidden="true">
+          <Icon v-if="relatedEmojiIcon" :icon="relatedEmojiIcon" width="15" height="15" />
+          <template v-else>{{ relatedEmoji }}</template>
+        </span>
         <span class="related-btn-label">{{ t('related.buttonLabel') }}</span>
         <span v-if="relatedCount" class="related-btn-count">{{ relatedCount }}</span>
       </button>
@@ -1908,11 +1920,7 @@ function triggerInitialRender() {
 
     <!-- Error -->
     <div v-if="error" class="pdf-error">
-      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <circle cx="12" cy="12" r="10"/>
-        <line x1="12" y1="8" x2="12" y2="12"/>
-        <line x1="12" y1="16" x2="12.01" y2="16"/>
-      </svg>
+      <Icon icon="fluent:error-circle-24-regular" width="32" height="32" />
       <p>{{ error }}</p>
     </div>
 
@@ -1995,41 +2003,22 @@ function triggerInitialRender() {
         :title="highlightStyle === 'highlight' ? t('pdf.switchUnderline') : t('pdf.switchHighlight')"
         @click="toggleHighlightStyle"
       >
-        <svg v-if="highlightStyle === 'highlight'" width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-          <rect x="1.5" y="1.5" width="13" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
-          <text x="8" y="12" text-anchor="middle" font-size="10" font-weight="bold" font-family="serif">A</text>
-        </svg>
-        <svg v-else width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-          <text x="8" y="11" text-anchor="middle" font-size="11" font-weight="bold" font-family="serif">A</text>
-          <rect x="1" y="13" width="14" height="1.5" rx="0.75"/>
-        </svg>
+        <Icon v-if="highlightStyle === 'highlight'" icon="fluent:highlight-24-regular" width="16" height="16" />
+        <Icon v-else icon="fluent:text-underline-24-regular" width="16" height="16" />
       </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="addToSnippetLibrary" :title="t('snippets.addToLibrary')">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
-        </svg>
+        <Icon icon="fluent:bookmark-24-regular" width="13" height="13" />
         <span class="sel-translate-label">{{ t('pdf.snippet') }}</span>
       </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="translateSelection">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M5 8l6 6"/>
-          <path d="M4 14l6-6 2-3"/>
-          <path d="M2 5h12"/>
-          <path d="M7 2h1"/>
-          <path d="M22 22l-5-10-5 10"/>
-          <path d="M14 18h6"/>
-        </svg>
+        <Icon icon="argus:translate" width="13" height="13" />
         <span class="sel-translate-label">{{ t('pdf.translate') }}</span>
       </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="askAiWithSelection" :title="t('pdf.askAi')">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M12 2l2.09 6.26L20 10l-5.91 1.74L12 18l-2.09-6.26L4 10l5.91-1.74L12 2z"/>
-          <path d="M19 14l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z"/>
-          <path d="M4 18l.6 1.8 1.8.6-1.8.6-.6 1.8-.6-1.8-1.8-.6 1.8-.6.6-1.8z"/>
-        </svg>
+        <Icon icon="fluent:sparkle-24-regular" width="13" height="13" />
         <span class="sel-translate-label">{{ t('pdf.askAi') }}</span>
       </button>
     </div>
@@ -2086,16 +2075,14 @@ function triggerInitialRender() {
 
     <!-- OCR progress overlay -->
     <div v-if="ocrProgress" class="ocr-status">
-      <svg class="ocr-spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-        <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-      </svg>
+      <Icon class="ocr-spin" icon="fluent:spinner-ios-20-filled" width="13" height="13" />
       <span>{{ t('extraction.stageOcrPage', { page: ocrProgress.page, total: ocrProgress.total }) }}</span>
     </div>
 
     <!-- Search bar (Cmd+F) -->
     <div v-if="searchOpen" class="search-bar" @click.stop>
       <div class="search-input-row">
-        <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <Icon class="search-icon" icon="fluent:search-24-regular" width="14" height="14" />
         <input
           ref="searchInputRef"
           v-model="searchQuery"
@@ -2109,14 +2096,14 @@ function triggerInitialRender() {
           {{ searchCountText }}
         </span>
         <button class="search-nav-btn" :disabled="searchMatches.length === 0" @click="navigateToSearchMatch(searchMatchIndex - 1)" title="上一个 (Shift+Enter)">
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"/></svg>
+          <Icon icon="fluent:chevron-up-24-regular" width="11" height="11" />
         </button>
         <button class="search-nav-btn" :disabled="searchMatches.length === 0" @click="navigateToSearchMatch(searchMatchIndex + 1)" title="下一个 (Enter)">
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+          <Icon icon="fluent:chevron-down-24-regular" width="11" height="11" />
         </button>
         <div class="search-divider" />
         <button class="search-close-btn" @click="closeSearch" title="关闭 (Esc)">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
         </button>
       </div>
       <div class="search-options-row">
@@ -2194,7 +2181,16 @@ function triggerInitialRender() {
   transition: background 0.1s;
 }
 .related-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
-.related-btn-icon { font-size: 12px; }
+.related-btn-icon {
+  width: 15px;
+  height: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 12px;
+  line-height: 1;
+}
 .related-btn-count {
   min-width: 16px;
   height: 16px;

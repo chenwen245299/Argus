@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted, computed, watch } from 'vue'
+import { Icon } from '@iconify/vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
@@ -303,12 +304,14 @@ async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
   if (nextId) selectedId.value = nextId
 
   try {
-    await store.addToLibrary(paper.arxiv_id, collectionId)
+    const slug = await store.addToLibrary(paper.arxiv_id, collectionId)
     const colName = collectionId
       ? (collectionsStore.file.collections.find(c => c.id === collectionId)?.name ?? '')
       : ''
     setAddMessage(colName ? `已添加到「${colName}」` : '已添加到文库', 3000)
-    emitTo('main', 'library-paper-added').catch(() => {})
+    // Pass the slug so the main window can run the full AI-metadata + enrichment
+    // pipeline on the freshly-added paper (it only has arXiv source metadata so far).
+    emitTo('main', 'library-paper-added', { slug, title: paper.title }).catch(() => {})
   } catch (e) {
     setAddMessage(String(e))
   } finally {
@@ -715,11 +718,7 @@ function jumpToDate(dateStr: string) {
     <div class="arxiv-topbar" :class="{ 'win-titlebar': isWindows }" data-tauri-drag-region>
       <div class="tl-space" data-tauri-drag-region />
       <div class="topbar-left" data-tauri-drag-region>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="topbar-icon" data-tauri-drag-region>
-          <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-          <path d="M2 17l10 5 10-5"/>
-          <path d="M2 12l10 5 10-5"/>
-        </svg>
+        <Icon icon="fluent:layer-24-regular" class="topbar-icon" width="16" height="16" data-tauri-drag-region />
         <span class="topbar-title" data-tauri-drag-region>arXiv 推荐</span>
         <span v-if="store.loaded" class="paper-count-pill" data-tauri-drag-region>{{ store.papers.length }} 篇</span>
         <div v-if="store.analyzing" class="topbar-analysis-status" data-tauri-drag-region>
@@ -744,23 +743,15 @@ function jumpToDate(dateStr: string) {
           class="tb-btn"
           @click="store.startAnalysis()"
         >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
-          </svg>
+          <Icon icon="fluent:weather-sunny-24-regular" width="14" height="14" />
           AI 分析全部
         </button>
         <button class="tb-btn topbar-fetch-btn" :disabled="store.fetching" @click="doFetch">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" :class="{ spin: store.fetching }">
-            <polyline points="23 4 23 10 17 10"/>
-            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-          </svg>
+          <Icon icon="fluent:arrow-sync-24-regular" width="14" height="14" :class="{ spin: store.fetching }" />
           {{ store.fetching ? '触发中...' : '手动触发抓取' }}
         </button>
         <button class="tb-btn" @click="showSettings = !showSettings">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-          </svg>
+          <Icon icon="fluent:settings-24-regular" width="14" height="14" />
           设置
         </button>
       </div>
@@ -785,10 +776,7 @@ function jumpToDate(dateStr: string) {
           aria-label="关闭提示"
           @click="dismissStatusBar"
         >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
-            <path d="M18 6L6 18"/>
-            <path d="M6 6l12 12"/>
-          </svg>
+          <Icon icon="fluent:dismiss-24-regular" width="13" height="13" />
         </button>
       </div>
     </Transition>
@@ -801,9 +789,7 @@ function jumpToDate(dateStr: string) {
         <div class="list-toolbar">
           <div class="search-row">
             <div class="search-wrap">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="search-icon">
-                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-              </svg>
+              <Icon class="search-icon" icon="fluent:search-24-regular" width="12" height="12" />
               <input v-model="categoryFilter" class="search-input" placeholder="按分类/标题过滤..." />
             </div>
             <!-- Unread filter toggle -->
@@ -813,10 +799,7 @@ function jumpToDate(dateStr: string) {
               title="只显示未读"
               @click="store.filterMode = store.filterMode === 'unread' ? 'all' : 'unread'"
             >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                <circle cx="12" cy="12" r="9"/>
-                <circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/>
-              </svg>
+              <Icon icon="fluent:record-24-regular" width="15" height="15" />
             </button>
             <!-- Tag (topic) filter -->
             <button
@@ -826,10 +809,7 @@ function jumpToDate(dateStr: string) {
               title="按标签筛选"
               @click="toggleTopicMenu"
             >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round">
-                <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/>
-                <line x1="7" y1="7" x2="7.01" y2="7"/>
-              </svg>
+              <Icon icon="fluent:tag-24-regular" width="14" height="14" />
               <span v-if="selectedTopics.size > 0" class="tool-badge">{{ selectedTopics.size }}</span>
             </button>
             <!-- Calendar toggle button -->
@@ -840,12 +820,7 @@ function jumpToDate(dateStr: string) {
               title="日历视图"
               @click="toggleCalendar"
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
-                <line x1="16" y1="2" x2="16" y2="6"/>
-                <line x1="8" y1="2" x2="8" y2="6"/>
-                <line x1="3" y1="10" x2="21" y2="10"/>
-              </svg>
+              <Icon icon="fluent:calendar-24-regular" width="14" height="14" />
             </button>
             <button
               ref="sortBtnRef"
@@ -854,18 +829,8 @@ function jumpToDate(dateStr: string) {
               title="排序"
               @click="toggleSortMenu"
             >
-              <svg v-if="store.sortOrder === 'desc'" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                <path d="M8 18V6"/>
-                <path d="M5 9l3-3 3 3"/>
-                <path d="M16 6v12"/>
-                <path d="M13 15l3 3 3-3"/>
-              </svg>
-              <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                <path d="M8 6v12"/>
-                <path d="M5 15l3 3 3-3"/>
-                <path d="M16 18V6"/>
-                <path d="M13 9l3-3 3 3"/>
-              </svg>
+              <Icon v-if="store.sortOrder === 'desc'" icon="fluent:arrow-sort-down-24-regular" width="14" height="14" />
+              <Icon v-else icon="fluent:arrow-sort-up-24-regular" width="14" height="14" />
             </button>
             <button
               class="list-tool-btn"
@@ -874,12 +839,7 @@ function jumpToDate(dateStr: string) {
               title="刷新列表并删除低于阈值的论文"
               @click="refreshPapers"
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" :class="{ spin: store.refreshing }">
-                <path d="M21 12a9 9 0 0 1-15.2 6.5"/>
-                <path d="M3 12A9 9 0 0 1 18.2 5.5"/>
-                <path d="M18 2v4h-4"/>
-                <path d="M6 22v-4h4"/>
-              </svg>
+              <Icon icon="fluent:arrow-sync-24-regular" width="14" height="14" :class="{ spin: store.refreshing }" />
             </button>
           </div>
         </div>
@@ -949,15 +909,11 @@ function jumpToDate(dateStr: string) {
             <div v-if="showCalendar" class="calendar-popover" :style="calPopoverStyle">
               <div class="cal-header">
                 <button class="cal-nav" @click="calPrevMonth">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                    <polyline points="15 18 9 12 15 6"/>
-                  </svg>
+                  <Icon icon="fluent:chevron-left-24-regular" width="12" height="12" />
                 </button>
                 <span class="cal-month-label">{{ calMonthLabel }}</span>
                 <button class="cal-nav" @click="calNextMonth">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                    <polyline points="9 18 15 12 9 6"/>
-                  </svg>
+                  <Icon icon="fluent:chevron-right-24-regular" width="12" height="12" />
                 </button>
               </div>
               <div class="cal-weekdays">
@@ -998,11 +954,7 @@ function jumpToDate(dateStr: string) {
             <span class="spinner" />
           </div>
           <div v-else-if="filteredPapers.length === 0" class="list-empty">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color: var(--text-tertiary)">
-              <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-              <path d="M2 17l10 5 10-5"/>
-              <path d="M2 12l10 5 10-5"/>
-            </svg>
+            <Icon icon="fluent:layer-24-regular" width="24" height="24" style="color: var(--text-tertiary)" />
             <p>{{ store.papers.length === 0 ? '暂无论文，点击「抓取」获取最新论文' : '无匹配结果' }}</p>
             <button v-if="store.papers.length === 0" class="fetch-btn sm" @click="doFetch">抓取</button>
           </div>
@@ -1017,9 +969,7 @@ function jumpToDate(dateStr: string) {
               }"
               @click="collapsedDates.has(group.date) ? collapsedDates.delete(group.date) : collapsedDates.add(group.date)"
             >
-              <svg class="date-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <polyline points="6 9 12 15 18 9"/>
-              </svg>
+              <Icon class="date-chevron" icon="fluent:chevron-down-24-regular" width="12" height="12" />
               <span class="date-text">{{ formatDateLabel(group.date) }}</span>
               <span class="date-count">{{ group.papers.length }}</span>
 
@@ -1030,10 +980,7 @@ function jumpToDate(dateStr: string) {
                   :title="group.selectionActive ? '收起本日选择' : '选择本日论文'"
                   @click="toggleDateSelection(group)"
                 >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M9 11l3 3L22 4"/>
-                    <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
-                  </svg>
+                  <Icon icon="fluent:checkbox-checked-24-regular" width="14" height="14" />
                 </button>
               </span>
             </div>
@@ -1047,9 +994,7 @@ function jumpToDate(dateStr: string) {
                       indeterminate: group.checkState === 'some'
                     }"
                   >
-                    <svg v-if="group.checkState === 'all'" width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-                      <polyline points="2 6 5 9 10 3"/>
-                    </svg>
+                    <Icon v-if="group.checkState === 'all'" icon="fluent:checkmark-24-regular" width="11" height="11" />
                     <span v-else-if="group.checkState === 'some'" class="indeterminate-bar"/>
                   </span>
                   <span>本日全选</span>
@@ -1062,12 +1007,7 @@ function jumpToDate(dateStr: string) {
                   :title="hasSelection ? '删除已选论文' : '请先选择论文'"
                   @click="deletingSelectedConfirm = true"
                 >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <polyline points="3 6 5 6 21 6"/>
-                    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-                    <path d="M10 11v6M14 11v6"/>
-                    <path d="M9 6V4h6v2"/>
-                  </svg>
+                  <Icon icon="fluent:delete-24-regular" width="13" height="13" />
                   删除所选
                 </button>
               </div>
@@ -1116,9 +1056,7 @@ function jumpToDate(dateStr: string) {
                     title="选择论文"
                     @click.stop="toggleCheck(paper.arxiv_id, $event)"
                   >
-                    <svg v-if="selectedPaperIds.has(paper.arxiv_id)" width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-                      <polyline points="2 6 5 9 10 3"/>
-                    </svg>
+                    <Icon v-if="selectedPaperIds.has(paper.arxiv_id)" icon="fluent:checkmark-24-regular" width="11" height="11" />
                   </button>
                 </div>
               </div>
@@ -1130,11 +1068,7 @@ function jumpToDate(dateStr: string) {
       <!-- Right: paper detail panel -->
       <div class="detail-panel">
         <div v-if="!selectedPaper" class="detail-empty">
-          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" style="color: var(--text-tertiary)">
-            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-            <path d="M2 17l10 5 10-5"/>
-            <path d="M2 12l10 5 10-5"/>
-          </svg>
+          <Icon icon="fluent:layer-24-regular" width="32" height="32" style="color: var(--text-tertiary)" />
           <p>选择一篇论文查看详情</p>
         </div>
 
@@ -1192,9 +1126,7 @@ function jumpToDate(dateStr: string) {
                 :disabled="!!addingId"
                 @click="openColPicker"
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                  <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-                </svg>
+                <Icon icon="fluent:add-24-regular" width="14" height="14" />
                 {{ addingId === selectedPaper.arxiv_id ? '添加中...' : '添加到文库' }}
               </button>
 
@@ -1224,9 +1156,7 @@ function jumpToDate(dateStr: string) {
                         >
                           <span class="col-emoji">{{ col.emoji ?? '📁' }}</span>
                           <span class="col-name">{{ col.name }}</span>
-                          <svg v-if="colHasChildren(col.id)" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="col-chevron-right">
-                            <polyline points="9 18 15 12 9 6"/>
-                          </svg>
+                          <Icon v-if="colHasChildren(col.id)" class="col-chevron-right" icon="fluent:chevron-right-24-regular" width="10" height="10" />
                         </button>
                       </div>
                     </div>
@@ -1252,9 +1182,7 @@ function jumpToDate(dateStr: string) {
                         >
                         <span class="col-emoji">{{ col.emoji ?? '📁' }}</span>
                         <span class="col-name">{{ col.name }}</span>
-                        <svg v-if="colHasChildren(col.id)" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="col-chevron-right">
-                          <polyline points="9 18 15 12 9 6"/>
-                        </svg>
+                        <Icon v-if="colHasChildren(col.id)" class="col-chevron-right" icon="fluent:chevron-right-24-regular" width="10" height="10" />
                       </button>
                     </div>
                   </div>
@@ -1263,9 +1191,7 @@ function jumpToDate(dateStr: string) {
             </template>
 
             <span v-else class="in-lib-tag">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <polyline points="20 6 9 17 4 12"/>
-              </svg>
+              <Icon icon="fluent:checkmark-24-regular" width="12" height="12" />
               已在文库
             </span>
             <div class="analysis-trigger">
@@ -1275,10 +1201,7 @@ function jumpToDate(dateStr: string) {
                 :disabled="!!analyzingId || selectedPaper.analysis_status === 'done'"
                 @click="analyzeSingle(selectedPaper)"
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" :class="{ spin: analyzingId === selectedPaper.arxiv_id }">
-                  <circle cx="12" cy="12" r="3"/>
-                  <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
-                </svg>
+                <Icon icon="fluent:weather-sunny-24-regular" width="13" height="13" :class="{ spin: analyzingId === selectedPaper.arxiv_id }" />
                 {{ analyzingId === selectedPaper.arxiv_id ? 'AI 分析中...' : selectedPaper.analysis_status === 'done' ? '已分析' : 'AI 分析' }}
               </button>
               <span v-if="selectedPaper.analysis_status === 'failed'" class="analysis-status-tag failed">分析失败</span>
@@ -1286,27 +1209,14 @@ function jumpToDate(dateStr: string) {
             </div>
             <button class="btn-arxiv" :class="{ 'btn-biorxiv-link': selectedPaper.source === 'biorxiv' }" @click="openUrl(selectedPaper.abs_url)">
               {{ selectedPaper.source === 'biorxiv' ? 'bioRxiv' : 'arXiv' }}
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-                <polyline points="15 3 21 3 21 9"/>
-                <line x1="10" y1="14" x2="21" y2="3"/>
-              </svg>
+              <Icon icon="fluent:open-24-regular" width="11" height="11" />
             </button>
             <button class="btn-pdf" @click="openUrl(selectedPaper.pdf_url)">
               PDF
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                <polyline points="14 2 14 8 20 8"/>
-                <line x1="16" y1="13" x2="8" y2="13"/>
-                <line x1="16" y1="17" x2="8" y2="17"/>
-                <polyline points="10 9 9 9 8 9"/>
-              </svg>
+              <Icon icon="fluent:document-text-24-regular" width="11" height="11" />
             </button>
             <button class="btn-dismiss" title="从推荐中移除这篇文章" @click="dismissPaper(selectedPaper.arxiv_id)">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="3 6 5 6 21 6"/>
-                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-              </svg>
+              <Icon icon="fluent:delete-24-regular" width="12" height="12" />
               移除
             </button>
           </div>
@@ -1360,10 +1270,7 @@ function jumpToDate(dateStr: string) {
         @click.stop
       >
         <button class="arxiv-ctx-item danger" @click="dismissPaper(arxivCtxMenu.arxivId)">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="3 6 5 6 21 6"/>
-            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-          </svg>
+          <Icon icon="fluent:delete-24-regular" width="13" height="13" />
           移除
         </button>
       </div>
@@ -1588,7 +1495,7 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   display: flex; flex-direction: column; gap: 6px;
   flex-shrink: 0;
 }
-.search-row { display: flex; align-items: center; gap: 2px; }
+.search-row { display: flex; align-items: center; gap: 0; }
 .search-wrap + .list-tool-btn { margin-left: 5px; }
 .search-wrap {
   position: relative; display: flex; align-items: center; flex: 1;
@@ -1608,7 +1515,7 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 /* Calendar toggle button */
 .cal-toggle-btn {
   display: flex; align-items: center; justify-content: center;
-  width: 28px; height: 28px; border-radius: var(--radius-md);
+  width: 22px; height: 26px; border-radius: var(--radius-md);
   color: var(--text-tertiary); flex-shrink: 0;
   transition: background 0.12s, color 0.12s;
 }
@@ -2461,8 +2368,8 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 }
 
 .cal-toggle-btn {
-  width: 28px;
-  height: 28px;
+  width: 22px;
+  height: 26px;
   border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
@@ -2816,7 +2723,7 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 }
 
 .list-tool-btn {
-  width: 26px;
+  width: 22px;
   height: 26px;
   display: inline-flex;
   align-items: center;

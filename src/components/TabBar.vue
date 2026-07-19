@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { Icon } from '@iconify/vue'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { useReaderStore } from '../stores/reader'
@@ -21,11 +22,19 @@ type SnippetLibraryTab = {
   emoji?: string
 }
 
+type WritingTab = {
+  id: string | null   // null = the "Library"/all-papers view
+  name: string
+}
+
 const props = defineProps<{
   rightSidebarOpen?: boolean
   snippetLibraryTabs?: SnippetLibraryTab[]
   snippetLibraryVisible?: boolean
   activeSnippetLibraryId?: string | null
+  writingTabs?: WritingTab[]
+  writingVisible?: boolean
+  activeWritingId?: string | null
 }>()
 const emit = defineEmits<{
   'toggle-right-sidebar': []
@@ -33,6 +42,8 @@ const emit = defineEmits<{
   'show-canvas': []
   'switch-snippet-library': [libraryId: string]
   'close-snippet-library-tab': [libraryId: string]
+  'switch-writing': [id: string | null]
+  'close-writing-tab': [id: string | null]
 }>()
 
 const isFullscreenLayout = ref(false)
@@ -119,6 +130,12 @@ function switchSnippetLibrary(libraryId: string) {
   emit('switch-snippet-library', libraryId)
 }
 
+function switchWriting(id: string | null) {
+  canvasStore.isShown = false
+  reader.showList()
+  emit('switch-writing', id)
+}
+
 function startDrag(e: MouseEvent) {
   if (e.button === 0) appWindow.startDragging()
 }
@@ -194,16 +211,11 @@ async function closeWindow() {
       <!-- Permanent home tab (current collection, cannot be closed) -->
       <div
         class="tab tab-home"
-        :class="{ active: !reader.activeSlug && !canvasStore.isShown && !props.snippetLibraryVisible }"
+        :class="{ active: !reader.activeSlug && !canvasStore.isShown && !props.snippetLibraryVisible && !props.writingVisible }"
         :title="homeTitle"
         @click="showHome()"
       >
-        <svg class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <rect x="3" y="3" width="8" height="8" rx="1"/>
-          <rect x="13" y="3" width="8" height="8" rx="1"/>
-          <rect x="3" y="13" width="8" height="8" rx="1"/>
-          <rect x="13" y="13" width="8" height="8" rx="1"/>
-        </svg>
+        <Icon icon="fluent:grid-24-regular" class="tab-icon" width="13" height="13" />
         <span class="tab-title">{{ homeTitle }}</span>
       </div>
 
@@ -215,18 +227,10 @@ async function closeWindow() {
         :title="canvasStore.currentCanvas.name"
         @click="showCanvas()"
       >
-        <svg class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <circle cx="8" cy="8" r="2.5"/><circle cx="16" cy="16" r="2.5"/>
-          <line x1="10" y1="8" x2="14" y2="16"/>
-          <circle cx="16" cy="8" r="2.5"/>
-          <line x1="10" y1="9" x2="14" y2="15"/>
-        </svg>
+        <Icon icon="fluent:share-android-24-regular" class="tab-icon" width="13" height="13" />
         <span class="tab-title">{{ canvasStore.currentCanvas.name }}</span>
         <button class="tab-close" @click.stop="closeCanvasTab">
-          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8">
-            <line x1="18" y1="6" x2="6" y2="18"/>
-            <line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
+          <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
         </button>
       </div>
 
@@ -240,15 +244,26 @@ async function closeWindow() {
         @click="switchSnippetLibrary(tab.id)"
       >
         <span v-if="tab.emoji" class="snippet-tab-emoji">{{ tab.emoji }}</span>
-        <svg v-else class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-        </svg>
+        <Icon v-else icon="fluent:folder-24-regular" class="tab-icon" width="13" height="13" />
         <span class="tab-title">{{ tab.name }}</span>
         <button class="tab-close" @click.stop="emit('close-snippet-library-tab', tab.id)">
-          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8">
-            <line x1="18" y1="6" x2="6" y2="18"/>
-            <line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
+          <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
+        </button>
+      </div>
+
+      <!-- Writing workspace tabs (one per open reference list; null = Library) -->
+      <div
+        v-for="tab in props.writingTabs ?? []"
+        :key="`writing:${tab.id ?? '__all__'}`"
+        class="tab tab-writing"
+        :class="{ active: props.writingVisible && props.activeWritingId === tab.id && !reader.activeSlug && !canvasStore.isShown }"
+        :title="tab.name"
+        @click="switchWriting(tab.id)"
+      >
+        <Icon :icon="tab.id === null ? 'fluent:grid-24-regular' : 'fluent:document-text-24-regular'" class="tab-icon" width="13" height="13" />
+        <span class="tab-title">{{ tab.name }}</span>
+        <button class="tab-close" @click.stop="emit('close-writing-tab', tab.id)">
+          <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
         </button>
       </div>
 
@@ -267,16 +282,10 @@ async function closeWindow() {
         @click="switchTab(tab.slug)"
         @mousedown="onTabMouseDown($event, idx)"
       >
-        <svg class="tab-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/>
-        </svg>
+        <Icon icon="fluent:document-24-regular" class="tab-icon" width="13" height="13" />
         <span class="tab-title">{{ titleInitialCaps(tab.title) }}</span>
         <button class="tab-close" @click.stop="reader.closeTab(tab.slug)">
-          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8">
-            <line x1="18" y1="6" x2="6" y2="18"/>
-            <line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
+          <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
         </button>
       </div>
     </div>
@@ -290,12 +299,7 @@ async function closeWindow() {
         @mousedown.stop
         @click="emit('toggle-right-sidebar')"
       >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <rect x="3.5" y="4" width="17" height="16" rx="4" />
-          <path d="M14.5 4v16" />
-          <path d="M17.5 9h.01" />
-          <path d="M17.5 12h.01" />
-        </svg>
+        <Icon icon="fluent:panel-right-24-regular" width="19" height="19" />
       </button>
 
       <div v-if="isWindows" class="window-controls" @mousedown.stop>

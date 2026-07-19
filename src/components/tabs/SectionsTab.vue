@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { useReaderStore } from '../../stores/reader'
@@ -126,10 +127,7 @@ function sourceLabel(source: string): string {
   <div class="sections-tab">
     <!-- No paper -->
     <div v-if="!props.slug" class="empty">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" />
-        <line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" />
-      </svg>
+      <Icon icon="fluent:text-bullet-list-24-regular" width="28" height="28" />
       <p>{{ t('sectionsTab.selectPaper') }}</p>
     </div>
 
@@ -140,16 +138,12 @@ function sourceLabel(source: string): string {
         <div class="header-actions">
           <button class="ai-split-btn" :disabled="detecting" :title="t('sectionsTab.detectHint')" @click="runDetect">
             <span v-if="detecting" class="spinner" />
-            <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M23 4v6h-6" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
-            </svg>
+            <Icon v-else icon="fluent:arrow-sync-24-regular" width="13" height="13" />
             {{ detecting ? t('sectionsTab.detecting') : t('sectionsTab.reDetect') }}
           </button>
           <button class="ai-split-btn" :disabled="splitting" @click="runAiSplit">
             <span v-if="splitting" class="spinner" />
-            <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 3 13.7 8.3 19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z" /><path d="M19 15v4" /><path d="M17 17h4" />
-            </svg>
+            <Icon v-else icon="fluent:sparkle-24-regular" width="13" height="13" />
             {{ splitting ? t('sectionsTab.aiSplitting') : t('sectionsTab.aiReSplit') }}
           </button>
         </div>
@@ -172,26 +166,19 @@ function sourceLabel(source: string): string {
 
     <!-- No structure detected -->
     <div v-else-if="!loading" class="empty">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" />
-        <line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" />
-      </svg>
+      <Icon icon="fluent:text-bullet-list-24-regular" width="28" height="28" />
       <p>{{ t('sectionsTab.noSections') }}</p>
       <span>{{ t('sectionsTab.noSectionsHint') }}</span>
       <p v-if="error" class="error-text">{{ error }}</p>
       <div class="empty-actions">
         <button class="ai-split-btn primary" :disabled="detecting" @click="runDetect">
           <span v-if="detecting" class="spinner" />
-          <svg v-else width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M23 4v6h-6" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
-          </svg>
+          <Icon v-else icon="fluent:arrow-sync-24-regular" width="14" height="14" />
           {{ detecting ? t('sectionsTab.detecting') : t('sectionsTab.detect') }}
         </button>
         <button class="ai-split-btn" :disabled="splitting" @click="runAiSplit">
           <span v-if="splitting" class="spinner" />
-          <svg v-else width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 3 13.7 8.3 19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z" /><path d="M19 15v4" /><path d="M17 17h4" />
-          </svg>
+          <Icon v-else icon="fluent:sparkle-24-regular" width="14" height="14" />
           {{ splitting ? t('sectionsTab.aiSplitting') : t('sectionsTab.aiSplit') }}
         </button>
       </div>

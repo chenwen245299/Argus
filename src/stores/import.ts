@@ -142,17 +142,14 @@ export const useImportStore = defineStore('import', () => {
   // Papers are processed one at a time (a shared FIFO queue) so we never fire a
   // burst of Semantic Scholar / easyScholar requests in parallel and trip their
   // rate limits, even when many files are imported at once.
-  // `extract` = run fulltext + AI-metadata extraction + rename (the steps that
-  // derive metadata from the file itself). URL imports already arrive with
-  // source metadata and a canonical folder name, so they only need the online
-  // enrichment (Semantic Scholar venue/references + easyScholar rank).
-  interface MetaOpts { extract: boolean }
-  interface MetaJob { slug: string; opts: MetaOpts }
-  const metaQueue: MetaJob[] = []
+  // Every import path (local PDF, URL/link, arXiv recommendation) runs the same
+  // full pipeline: fulltext + AI-metadata extraction + rename, followed by the
+  // online enrichment (Semantic Scholar venue/references + easyScholar rank).
+  const metaQueue: string[] = []
   let metaRunning = false
 
-  function enqueueMetadata(slug: string, opts: Partial<MetaOpts> = {}) {
-    metaQueue.push({ slug, opts: { extract: true, ...opts } })
+  function enqueueMetadata(slug: string) {
+    metaQueue.push(slug)
     if (!metaRunning) void runMetaWorker()
   }
 
@@ -160,8 +157,7 @@ export const useImportStore = defineStore('import', () => {
     metaRunning = true
     try {
       while (metaQueue.length) {
-        const job = metaQueue.shift()!
-        await runMetadataPipeline(job.slug, job.opts)
+        await runMetadataPipeline(metaQueue.shift()!)
       }
     } finally {
       metaRunning = false
@@ -171,7 +167,7 @@ export const useImportStore = defineStore('import', () => {
   // Order (per the paper's lifecycle): fulltext → AI metadata → rename →
   // Semantic Scholar (venue + references) → easyScholar (venue rank, cache-aware).
   // Every step is best-effort; a failure never aborts the rest.
-  async function runMetadataPipeline(slug: string, opts: MetaOpts) {
+  async function runMetadataPipeline(slug: string) {
     const library = useLibraryStore()
     const readerStore = useReaderStore()
     const selection = useSelectionStore()
@@ -180,44 +176,42 @@ export const useImportStore = defineStore('import', () => {
 
     let cur = slug
 
-    if (opts.extract) {
-      // 0. Fulltext + search index (prerequisite for AI metadata extraction).
-      _setStatus(cur, 'extracting')
-      try {
-        await invoke('extract_fulltext', { slug: cur })
-        await invoke('index_paper_search', { slug: cur })
-        window.dispatchEvent(new CustomEvent('argus-paper-fulltext-updated', { detail: { slug: cur } }))
-      } catch { /* non-fatal */ }
+    // 0. Fulltext + search index (prerequisite for AI metadata extraction).
+    _setStatus(cur, 'extracting')
+    try {
+      await invoke('extract_fulltext', { slug: cur })
+      await invoke('index_paper_search', { slug: cur })
+      window.dispatchEvent(new CustomEvent('argus-paper-fulltext-updated', { detail: { slug: cur } }))
+    } catch { /* non-fatal */ }
 
-      // 1. AI metadata (title/authors/year/venue from the PDF). When AI is not
-      //    configured or fails, fall back to the id/title-based online lookup so
-      //    non-AI setups still get metadata.
-      _setStatus(cur, 'ai_meta')
-      let aiOk = false
+    // 1. AI metadata (title/authors/year/venue from the PDF). When AI is not
+    //    configured or fails, fall back to the id/title-based online lookup so
+    //    non-AI setups still get metadata.
+    _setStatus(cur, 'ai_meta')
+    let aiOk = false
+    try {
+      const meta = await invoke<PaperMeta>('extract_metadata_ai', { slug: cur })
+      window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug: cur, meta } }))
+      aiOk = true
+    } catch { /* AI unavailable / no fulltext / error */ }
+    if (!aiOk) {
       try {
-        const meta = await invoke<PaperMeta>('extract_metadata_ai', { slug: cur })
+        const meta = await invoke<PaperMeta>('fetch_metadata', { slug: cur })
         window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug: cur, meta } }))
-        aiOk = true
-      } catch { /* AI unavailable / no fulltext / error */ }
-      if (!aiOk) {
-        try {
-          const meta = await invoke<PaperMeta>('fetch_metadata', { slug: cur })
-          window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug: cur, meta } }))
-        } catch { /* non-fatal */ }
-      }
-
-      // 2. Rename the folder to the canonical title-based slug.
-      _setStatus(cur, 'renaming')
-      try {
-        const newSlug = await invoke<string>('rename_paper_folder', { slug: cur })
-        if (newSlug !== cur) {
-          readerStore.replacePaperSlug(cur, newSlug)
-          if (selection.selectedSlug === cur) selection.selectPaper(newSlug)
-          _updateSlug(cur, newSlug)
-          cur = newSlug
-        }
       } catch { /* non-fatal */ }
     }
+
+    // 2. Rename the folder to the canonical title-based slug.
+    _setStatus(cur, 'renaming')
+    try {
+      const newSlug = await invoke<string>('rename_paper_folder', { slug: cur })
+      if (newSlug !== cur) {
+        readerStore.replacePaperSlug(cur, newSlug)
+        if (selection.selectedSlug === cur) selection.selectPaper(newSlug)
+        _updateSlug(cur, newSlug)
+        cur = newSlug
+      }
+    } catch { /* non-fatal */ }
 
     // 3. Semantic Scholar — backfill venue/DOI/citation count, then references.
     _setStatus(cur, 'fetching_meta')
@@ -312,10 +306,10 @@ export const useImportStore = defineStore('import', () => {
       await library.refresh()
       selection.selectPaper(finalSlug)
 
-      // Backfill online enrichment (Semantic Scholar venue/references +
-      // easyScholar rank) in the background. The URL import already produced
-      // source metadata and a canonical folder, so skip the file-extraction steps.
-      enqueueMetadata(finalSlug, { extract: false })
+      // Run the full metadata pipeline in the background — the same AI-metadata
+      // extraction plus Semantic Scholar / easyScholar enrichment as a local PDF
+      // import, so link imports end up with identical metadata coverage.
+      enqueueMetadata(finalSlug)
     } catch (e) {
       const j = jobs.value.find(j => j.id === jobId)
       if (j) {
@@ -326,6 +320,19 @@ export const useImportStore = defineStore('import', () => {
     } finally {
       unlisten.forEach(u => u())
     }
+  }
+
+  /**
+   * Run the full metadata pipeline for a paper that was added to the library
+   * out-of-band (e.g. from the arXiv recommendations window). Registers a job so
+   * the toolbar shows live progress, then runs the same extract + enrich pipeline
+   * as a local PDF import. Idempotent: a slug already being processed is ignored.
+   */
+  function processAddedPaper(slug: string, filename?: string) {
+    if (jobs.value.some(j => j.slug === slug)) return
+    _addJob(slug, filename ?? slug)
+    _setStatus(slug, 'queued')
+    enqueueMetadata(slug)
   }
 
   /** Import multiple files, one at a time (to avoid API rate limiting). */
@@ -347,5 +354,5 @@ export const useImportStore = defineStore('import', () => {
 
   function clearUrlError() { lastUrlError.value = null }
 
-  return { jobs, importFile, importFiles, importPaperUrl, clearDone, activeCount, lastUrlError, clearUrlError }
+  return { jobs, importFile, importFiles, importPaperUrl, processAddedPaper, clearDone, activeCount, lastUrlError, clearUrlError }
 })

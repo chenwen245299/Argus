@@ -120,10 +120,8 @@ function onCollectionMouseDown(e: MouseEvent) {
         class="expand-btn"
         @click.stop="$emit('toggleExpand', collection.id)"
       >
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-          :style="{ transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s' }">
-          <polyline points="9 18 15 12 9 6"/>
-        </svg>
+        <Icon icon="fluent:chevron-right-24-regular" width="11" height="11"
+          :style="{ transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s' }" />
       </button>
       <span v-else class="expand-placeholder" />
 

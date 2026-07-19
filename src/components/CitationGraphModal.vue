@@ -41,6 +41,10 @@ const refs = ref<CitationRef[]>([])
 const loading = ref(false)
 const error = ref('')
 
+// 'references' = papers this one cites (outgoing). 'citedBy' = papers in the
+// library that cite this one (incoming) — derived locally, no network.
+const mode = ref<'references' | 'citedBy'>('references')
+
 // How many reference nodes to display — user-configurable, remembered.
 const NODE_LIMIT_KEY = 'argus:citegraph-nodes'
 function loadNodeLimit(): number {
@@ -53,29 +57,46 @@ function onLimitChange() {
   localStorage.setItem(NODE_LIMIT_KEY, String(nodeLimit.value))
 }
 
-// On open: show cached references instantly; only hit the network when there's
-// no cache yet (Semantic Scholar rate-limits aggressively).
-watch(slug, async (s) => {
+// Load the graph data for the current slug + mode. References mode shows cached
+// references instantly and only hits the network when nothing is cached (S2
+// rate-limits hard). Cited-by mode is always local: it scans the library for
+// papers whose cached references point at this one.
+async function load() {
+  const s = slug.value
   refs.value = []
   error.value = ''
   if (!s) return
   loading.value = true
   try {
-    const cached = await invoke<CitationRef[]>('get_cached_references', { slug: s })
-    if (cached.length) {
-      refs.value = cached
+    if (mode.value === 'citedBy') {
+      refs.value = await invoke<CitationRef[]>('get_library_citers', { slug: s })
     } else {
-      refs.value = await invoke<CitationRef[]>('fetch_references', { slug: s })
+      const cached = await invoke<CitationRef[]>('get_cached_references', { slug: s })
+      refs.value = cached.length
+        ? cached
+        : await invoke<CitationRef[]>('fetch_references', { slug: s })
     }
   } catch (e) {
     error.value = String(e)
   } finally {
     loading.value = false
   }
-}, { immediate: true })
+}
 
+// Reset to the outgoing-citations view whenever a different paper opens.
+watch(slug, () => { mode.value = 'references'; load() }, { immediate: true })
+
+function setMode(m: 'references' | 'citedBy') {
+  if (mode.value === m || loading.value) return
+  mode.value = m
+  load()
+}
+
+// In references mode, refresh re-fetches from Semantic Scholar. In cited-by mode
+// there's no network to refresh from — just re-scan the library locally.
 async function refresh() {
   if (!slug.value || loading.value) return
+  if (mode.value === 'citedBy') { load(); return }
   loading.value = true
   error.value = ''
   try {
@@ -110,9 +131,21 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
     <div class="cgm-panel" @click.stop>
       <div class="cgm-header">
         <span class="cgm-title">
-          {{ t('citeGraph.title') }}
+          {{ mode === 'citedBy' ? t('citeGraph.titleCitedBy') : t('citeGraph.title') }}
           <span v-if="refs.length" class="cgm-count">{{ refs.length }}</span>
         </span>
+        <div class="cgm-mode" role="tablist">
+          <button
+            class="cgm-mode-btn"
+            :class="{ active: mode === 'references' }"
+            @click="setMode('references')"
+          >{{ t('citeGraph.tabRefs') }}</button>
+          <button
+            class="cgm-mode-btn"
+            :class="{ active: mode === 'citedBy' }"
+            @click="setMode('citedBy')"
+          >{{ t('citeGraph.tabCitedBy') }}</button>
+        </div>
         <span class="cgm-center-title" :title="center?.title">{{ center?.title }}</span>
         <label class="cgm-limit" :title="t('citeGraph.nodeCountHint')">
           {{ t('citeGraph.nodeCount') }}
@@ -135,13 +168,16 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           {{ error }}
           <button class="cgm-retry" @click="refresh">{{ t('citeGraph.retry') }}</button>
         </div>
-        <div v-else-if="!refs.length" class="cgm-status">{{ t('citeGraph.empty') }}</div>
+        <div v-else-if="!refs.length" class="cgm-status">
+          {{ mode === 'citedBy' ? t('citeGraph.emptyCitedBy') : t('citeGraph.empty') }}
+        </div>
         <CitationGraph
           v-else
           :center-title="center?.title ?? ''"
           :center-cite-count="center?.cite_count ?? null"
           :refs="refs"
           :max-nodes="nodeLimit"
+          :mode="mode"
           @open="onOpen"
         />
       </div>
@@ -212,6 +248,31 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   color: var(--accent);
   font-size: var(--font-size-xs);
   font-weight: 600;
+}
+.cgm-mode {
+  flex-shrink: 0;
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+}
+.cgm-mode-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  padding: 3px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.cgm-mode-btn:hover:not(.active) { color: var(--text-primary); }
+.cgm-mode-btn.active {
+  background: var(--bg-primary);
+  color: var(--accent);
+  box-shadow: var(--shadow-sm);
 }
 .cgm-center-title {
   flex: 1;

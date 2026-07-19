@@ -13,6 +13,8 @@
     "core:window:allow-destroy",
     "dialog:default",
     "dialog:allow-open",
+    "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
     "store:default",
     "store:allow-get",
     "store:allow-set",

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { useActivityStore, type ActivityRange, type ActivitySession } from '../stores/activity'
 
@@ -365,12 +366,7 @@ function fileTypeLabel(fileType?: string) {
       <div class="activity-header">
         <div class="title-wrap">
           <span class="title-icon">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 3v18h18"/>
-              <path d="M7 14l3-3 3 2 5-7"/>
-              <path d="M18 6h-4"/>
-              <path d="M18 6v4"/>
-            </svg>
+            <Icon icon="fluent:data-trending-24-regular" width="18" height="18" />
           </span>
           <span class="activity-title">{{ t('activityLog.title') }}</span>
         </div>
@@ -387,10 +383,7 @@ function fileTypeLabel(fileType?: string) {
             </button>
           </div>
           <button class="btn-close" @click="emit('close')">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="18" y1="6" x2="6" y2="18"/>
-              <line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
+            <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
           </button>
         </div>
       </div>
@@ -573,18 +566,22 @@ function fileTypeLabel(fileType?: string) {
 }
 
 .activity-modal {
-  --activity-bg: #f7faff;
-  --activity-panel: #ffffff;
-  --activity-soft: #f2f6fc;
-  --activity-border: #e1e8f2;
-  --activity-border-strong: #d3deeb;
-  --activity-text: #1f2937;
-  --activity-muted: #64748b;
-  --activity-faint: #94a3b8;
-  --activity-blue: #4f8df7;
+  --activity-bg: var(--bg-secondary);
+  --activity-panel: var(--bg-primary);
+  --activity-soft: color-mix(in srgb, var(--bg-secondary) 78%, var(--bg-primary));
+  --activity-border: var(--border-subtle);
+  --activity-border-strong: var(--border-default);
+  --activity-text: var(--text-primary);
+  --activity-muted: var(--text-secondary);
+  --activity-faint: var(--text-tertiary);
+  --activity-blue: var(--accent);
+  --activity-blue-soft: var(--accent-light);
   --activity-green: #48b884;
+  --activity-green-soft: color-mix(in srgb, var(--activity-green) 11%, var(--activity-panel));
   --activity-violet: #8b7cf6;
+  --activity-violet-soft: color-mix(in srgb, var(--activity-violet) 10%, var(--activity-panel));
   --activity-amber: #f2b44b;
+  --activity-amber-soft: color-mix(in srgb, var(--activity-amber) 11%, var(--activity-panel));
   width: 860px;
   max-width: 96vw;
   max-height: 86vh;
@@ -592,9 +589,9 @@ function fileTypeLabel(fileType?: string) {
   flex-direction: column;
   color: var(--activity-text);
   background: var(--activity-bg);
-  border: 1px solid rgba(226, 232, 240, 0.92);
+  border: 1px solid var(--border-default);
   border-radius: 16px;
-  box-shadow: 0 28px 72px rgba(15, 23, 42, 0.18);
+  box-shadow: var(--shadow-lg);
   overflow: hidden;
 }
 
@@ -604,7 +601,7 @@ function fileTypeLabel(fileType?: string) {
   justify-content: space-between;
   gap: 12px;
   padding: 16px 18px 16px 22px;
-  background: #fff;
+  background: var(--activity-panel);
   border-bottom: 1px solid var(--activity-border);
   flex-shrink: 0;
 }
@@ -624,8 +621,8 @@ function fileTypeLabel(fileType?: string) {
   align-items: center;
   justify-content: center;
   color: var(--activity-blue);
-  background: #edf4ff;
-  border: 1px solid #dce9ff;
+  background: var(--activity-blue-soft);
+  border: 1px solid var(--activity-border);
   flex-shrink: 0;
 }
 
@@ -640,8 +637,8 @@ function fileTypeLabel(fileType?: string) {
   gap: 1px;
   padding: 3px;
   border-radius: 999px;
-  border: 1px solid #e4ebf5;
-  background: #f0f4fa;
+  border: 1px solid var(--activity-border);
+  background: var(--activity-soft);
 }
 
 .range-tab {
@@ -657,9 +654,9 @@ function fileTypeLabel(fileType?: string) {
 }
 
 .range-tab.active {
-  color: #2563eb;
-  background: #fff;
-  box-shadow: 0 1px 5px rgba(30, 64, 175, 0.12);
+  color: var(--activity-blue);
+  background: var(--activity-panel);
+  box-shadow: var(--shadow-sm);
 }
 
 .btn-close {
@@ -674,7 +671,7 @@ function fileTypeLabel(fileType?: string) {
 
 .btn-close:hover {
   color: var(--activity-text);
-  background: #eef3fa;
+  background: var(--bg-hover);
 }
 
 .activity-body {
@@ -698,16 +695,16 @@ function fileTypeLabel(fileType?: string) {
   border-radius: 12px;
   border: 1px solid var(--activity-border);
   background: var(--activity-panel);
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+  box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
   gap: 5px;
 }
 
-.card-reading { background: #f2f7ff; }
-.card-opened { background: #f3fbf7; }
-.card-completed { background: #fff8eb; }
-.card-ai { background: #f6f3ff; }
+.card-reading { background: color-mix(in srgb, var(--activity-blue) 7%, var(--activity-panel)); }
+.card-opened { background: var(--activity-green-soft); }
+.card-completed { background: var(--activity-amber-soft); }
+.card-ai { background: var(--activity-violet-soft); }
 
 .card-label {
   font-size: 12px;
@@ -739,8 +736,8 @@ function fileTypeLabel(fileType?: string) {
 .panel-card {
   border: 1px solid var(--activity-border);
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.84);
-  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.045);
+  background: var(--activity-panel);
+  box-shadow: var(--shadow-sm);
 }
 
 .chart-card {
@@ -776,9 +773,9 @@ function fileTypeLabel(fileType?: string) {
   border-radius: 999px;
   font-size: 12px;
   font-weight: 650;
-  color: #2876d8;
-  background: #edf6ff;
-  border: 1px solid #d8ebff;
+  color: var(--activity-blue);
+  background: var(--activity-blue-soft);
+  border: 1px solid color-mix(in srgb, var(--activity-blue) 22%, transparent);
   white-space: nowrap;
 }
 
@@ -814,7 +811,7 @@ function fileTypeLabel(fileType?: string) {
   gap: 7px;
   overflow-x: auto;
   border-radius: 10px;
-  background: #fff;
+  background: var(--activity-panel);
 }
 
 .bars-area::-webkit-scrollbar { height: 3px; }
@@ -838,8 +835,8 @@ function fileTypeLabel(fileType?: string) {
   font-size: 10px;
   font-weight: 650;
   color: var(--activity-muted);
-  background: rgba(255, 255, 255, 0.78);
-  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06);
+  background: var(--activity-soft);
+  box-shadow: var(--shadow-sm);
   white-space: nowrap;
 }
 
@@ -851,7 +848,7 @@ function fileTypeLabel(fileType?: string) {
   display: flex;
   align-items: flex-end;
   border-radius: 7px;
-  background: #edf2f9;
+  background: var(--bg-tertiary);
   overflow: hidden;
 }
 
@@ -954,13 +951,13 @@ function fileTypeLabel(fileType?: string) {
   margin-top: 16px;
   border-radius: 50%;
   background: var(--activity-blue);
-  border: 2px solid #fff;
-  box-shadow: 0 0 0 2px #d9e8ff;
+  border: 2px solid var(--activity-panel);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--activity-blue) 28%, transparent);
 }
 
 .timeline-dot.live {
   background: var(--activity-green);
-  box-shadow: 0 0 0 2px #d8f2e4;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--activity-green) 28%, transparent);
 }
 
 .timeline-line {
@@ -969,7 +966,7 @@ function fileTypeLabel(fileType?: string) {
   bottom: -8px;
   width: 2px;
   border-radius: 999px;
-  background: #dbe6f3;
+  background: var(--bg-tertiary);
 }
 
 .timeline-row:last-child .timeline-line {
@@ -1007,8 +1004,8 @@ function fileTypeLabel(fileType?: string) {
   gap: 12px;
   padding: 9px 10px;
   border-radius: 10px;
-  background: #fff;
-  border: 1px solid #edf2f7;
+  background: var(--activity-panel);
+  border: 1px solid var(--activity-border);
 }
 
 .timeline-card {
@@ -1044,8 +1041,8 @@ function fileTypeLabel(fileType?: string) {
   margin-top: 8px;
   padding: 10px 10px 8px;
   border-radius: 12px;
-  border: 1px solid #e8eef7;
-  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  border: 1px solid var(--activity-border);
+  background: var(--activity-soft);
 }
 
 .session-card .session-timeline {
@@ -1071,7 +1068,7 @@ function fileTypeLabel(fileType?: string) {
   flex: 1 1 0;
   min-width: 0;
   border-radius: 3px;
-  background: #e6ecf5;
+  background: var(--bg-tertiary);
   transition: transform 0.1s ease, filter 0.1s ease;
 }
 .day-bar:not(.empty) {
@@ -1115,7 +1112,7 @@ function fileTypeLabel(fileType?: string) {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.8);
+  box-shadow: 0 0 0 1px var(--activity-border);
 }
 
 /* Mirror the reading timeline's .day-map exactly so both panels are symmetric. */
@@ -1123,8 +1120,8 @@ function fileTypeLabel(fileType?: string) {
   margin-top: 8px;
   padding: 10px 10px 8px;
   border-radius: 12px;
-  border: 1px solid #e8eef7;
-  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  border: 1px solid var(--activity-border);
+  background: var(--activity-soft);
 }
 
 .paper-reading-card .paper-time-list {
@@ -1141,7 +1138,7 @@ function fileTypeLabel(fileType?: string) {
   width: 100%;
   height: 5px;
   border-radius: 999px;
-  background: #eef3fa;
+  background: var(--bg-tertiary);
   overflow: hidden;
   margin-top: 4px;
 }
@@ -1175,18 +1172,18 @@ function fileTypeLabel(fileType?: string) {
 
 .type-pill {
   color: var(--activity-muted);
-  background: #f0f4fa;
+  background: var(--activity-soft);
 }
 
 .duration-pill,
 .paper-duration {
-  color: #2876d8;
-  background: #edf6ff;
+  color: var(--activity-blue);
+  background: var(--activity-blue-soft);
 }
 
 .duration-pill.live {
-  color: #2c8b65;
-  background: #ecf9f2;
+  color: var(--activity-green);
+  background: var(--activity-green-soft);
 }
 
 .paper-duration {

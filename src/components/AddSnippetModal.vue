@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import {
   libraries,
@@ -154,9 +155,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
         <div class="modal-header">
           <span class="modal-title">{{ t('snippets.addToLibrary') }}</span>
           <button class="close-btn" @click="cancel">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
+            <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
           </button>
         </div>
 
@@ -189,9 +188,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             @click="selectLibrary(lib.id)"
           >
             <span v-if="lib.emoji" class="lib-emoji">{{ lib.emoji }}</span>
-            <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-            </svg>
+            <Icon v-else icon="fluent:folder-24-regular" width="13" height="13" />
             {{ lib.name }}
           </button>
 
@@ -207,9 +204,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             />
           </template>
           <button v-else class="lib-btn new-lib-btn" @click="startNewLib">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
+            <Icon icon="fluent:add-24-regular" width="13" height="13" />
             {{ t('snippets.newLibrary') }}
           </button>
         </div>

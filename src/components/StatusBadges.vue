@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { useI18n } from 'vue-i18n'
+import { Icon } from '@iconify/vue'
 import type { PaperStatus } from '../types'
 
-defineProps<{ status: PaperStatus }>()
+defineProps<{ status: PaperStatus; hasBibtex?: boolean | null }>()
 const { t } = useI18n()
 </script>
 
@@ -13,13 +14,7 @@ const { t } = useI18n()
       :class="status.metadata_fetched ? 'badge--meta-ok' : 'badge--meta-missing'"
       :title="status.metadata_fetched ? t('badge.metaTitle') : t('badge.metaMissingTitle')"
     >
-      <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-        <polyline v-if="status.metadata_fetched" points="20 6 9 17 4 12"/>
-        <template v-else>
-          <line x1="18" y1="6" x2="6" y2="18"/>
-          <line x1="6" y1="6" x2="18" y2="18"/>
-        </template>
-      </svg>
+      <Icon :icon="status.metadata_fetched ? 'fluent:checkmark-24-regular' : 'fluent:dismiss-24-regular'" width="11" height="11" />
       {{ t('badge.meta') }}
     </span>
     <span
@@ -27,9 +22,7 @@ const { t } = useI18n()
       class="badge badge--text-ok"
       :title="t('badge.textTitle')"
     >
-      <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-        <polyline points="20 6 9 17 4 12"/>
-      </svg>
+      <Icon icon="fluent:checkmark-24-regular" width="11" height="11" />
       {{ t('badge.text') }}
     </span>
     <span
@@ -37,10 +30,16 @@ const { t } = useI18n()
       class="badge badge--ai-ok"
       :title="t('badge.summaryTitle')"
     >
-      <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-        <polyline points="20 6 9 17 4 12"/>
-      </svg>
+      <Icon icon="fluent:checkmark-24-regular" width="11" height="11" />
       AI
+    </span>
+    <span
+      v-if="hasBibtex"
+      class="badge badge--bibtex-ok"
+      :title="t('badge.bibtexTitle')"
+    >
+      <Icon icon="fluent:checkmark-24-regular" width="11" height="11" />
+      BibTeX
     </span>
   </div>
 </template>
@@ -75,5 +74,9 @@ const { t } = useI18n()
   background: color-mix(in srgb, #8b5cf6 14%, transparent);
   color: #7c3aed;
   font-weight: 600;
+}
+.badge--bibtex-ok {
+  background: color-mix(in srgb, #0ea5e9 15%, transparent);
+  color: #0369a1;
 }
 </style>

@@ -2,6 +2,7 @@
 import {
   ref, computed, markRaw, onMounted, onUnmounted, nextTick, watch,
 } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emit as tauriEmit, listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -1379,9 +1380,7 @@ watch(() => library.papers, () => {
           :disabled="creatingCanvas"
         />
         <button class="new-canvas-btn" @click="handleCreateCanvas" :disabled="creatingCanvas" :title="t('canvas.newCanvas')">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
+          <Icon icon="fluent:add-24-regular" width="15" height="15" />
         </button>
       </div>
 
@@ -1412,13 +1411,7 @@ watch(() => library.papers, () => {
           </template>
           <template v-else>
             <div class="canvas-item-name">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="canvas-icon">
-                <circle cx="8" cy="8" r="3"/><circle cx="16" cy="8" r="3"/>
-                <circle cx="12" cy="16" r="3"/>
-                <line x1="11" y1="8" x2="13" y2="8"/>
-                <line x1="9.5" y1="10.5" x2="11" y2="13.5"/>
-                <line x1="14.5" y1="10.5" x2="13" y2="13.5"/>
-              </svg>
+              <Icon icon="fluent:share-android-24-regular" class="canvas-icon" width="12" height="12" />
               <span>{{ entry.name }}</span>
             </div>
             <div class="canvas-item-meta">{{ entry.node_count }} 节点</div>
@@ -1432,16 +1425,10 @@ watch(() => library.papers, () => {
           </div>
           <div v-else class="canvas-item-actions" @click.stop>
             <button class="icon-btn" :title="t('canvas.rename')" @click="startRename(entry.id, entry.name)">
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-              </svg>
+              <Icon icon="fluent:edit-24-regular" width="12" height="12" />
             </button>
             <button class="icon-btn icon-btn--danger" :title="t('canvas.delete')" @click="confirmDelete(entry.id)">
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/>
-                <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/>
-              </svg>
+              <Icon icon="fluent:delete-24-regular" width="12" height="12" />
             </button>
           </div>
         </div>
@@ -1462,10 +1449,7 @@ watch(() => library.papers, () => {
             @click="showSuggestPanel = !showSuggestPanel"
             title="建议连线"
           >
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M9.5 14.5 L14.5 9.5"/><circle cx="7" cy="17" r="2.5"/><circle cx="17" cy="7" r="2.5"/>
-              <circle cx="17" cy="17" r="2.5"/>
-            </svg>
+            <Icon icon="fluent:share-android-24-regular" width="13" height="13" />
             {{ t('canvas.suggestEdges') }}
           </button>
 
@@ -1476,13 +1460,7 @@ watch(() => library.papers, () => {
               @click="showLayoutMenu = !showLayoutMenu"
               :disabled="applyingLayout"
             >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="2" y="3" width="5" height="5" rx="1"/>
-                <rect x="17" y="3" width="5" height="5" rx="1"/>
-                <rect x="9.5" y="16" width="5" height="5" rx="1"/>
-                <line x1="4.5" y1="8" x2="12" y2="16"/>
-                <line x1="19.5" y1="8" x2="12" y2="16"/>
-              </svg>
+              <Icon icon="fluent:organization-24-regular" width="13" height="13" />
               {{ t('canvas.autoLayout') }}
             </button>
 
@@ -1508,11 +1486,7 @@ watch(() => library.papers, () => {
             @click="showExportDialog = true"
             title="导出图片"
           >
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="7 10 12 15 17 10"/>
-              <line x1="12" y1="15" x2="12" y2="3"/>
-            </svg>
+            <Icon icon="fluent:arrow-download-24-regular" width="13" height="13" />
             {{ t('canvas.exportImage') }}
           </button>
 
@@ -1522,9 +1496,7 @@ watch(() => library.papers, () => {
             class="tb-action-btn tb-action-btn--accent"
             @click="openPaperPicker"
           >
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
+            <Icon icon="fluent:add-24-regular" width="14" height="14" />
             {{ t('canvas.addPaper') }}
           </button>
         </div>
@@ -1584,13 +1556,7 @@ watch(() => library.papers, () => {
 
       <!-- No canvas selected -->
       <div v-if="!canvasStore.currentCanvas" class="no-canvas-selected">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" style="opacity:0.2">
-          <circle cx="8" cy="8" r="3"/><circle cx="16" cy="8" r="3"/>
-          <circle cx="12" cy="16" r="3"/>
-          <line x1="11" y1="8" x2="13" y2="8"/>
-          <line x1="9.5" y1="10.5" x2="11" y2="13.5"/>
-          <line x1="14.5" y1="10.5" x2="13" y2="13.5"/>
-        </svg>
+        <Icon icon="fluent:share-android-24-regular" width="48" height="48" style="opacity:0.2" />
         <p>{{ t('canvas.noCanvases') }}</p>
         <p class="hint">{{ t('canvas.noCanvasesHint') }}</p>
       </div>
@@ -1614,9 +1580,7 @@ watch(() => library.papers, () => {
           <div class="picker-header">
             <span class="picker-title">{{ t('canvas.addPaperTitle') }}</span>
             <button class="close-btn" @click="showPaperPicker = false">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
+              <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
             </button>
           </div>
           <input
@@ -1668,28 +1632,19 @@ watch(() => library.papers, () => {
                 @click="ctxSetNodeColor(c.value)"
               >
                 <template v-if="!c.value">
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                    <circle cx="8" cy="8" r="6" stroke="var(--accent)" stroke-width="1.5"/>
-                    <line x1="3" y1="3" x2="13" y2="13" stroke="var(--accent)" stroke-width="1.5"/>
-                  </svg>
+                  <Icon icon="fluent:prohibited-24-regular" width="12" height="12" style="color: var(--accent)" />
                 </template>
               </button>
             </div>
           </div>
           <div v-if="!ctxCurrentNodeIsImage" class="ctx-divider" />
           <button v-if="!ctxCurrentNodeIsImage" class="ctx-item" @click="ctxOpenInMain">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-              <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
-            </svg>
+            <Icon icon="fluent:open-24-regular" width="12" height="12" />
             {{ t('canvas.openInMain') }}
           </button>
           <div v-if="!ctxCurrentNodeIsImage" class="ctx-divider" />
           <button class="ctx-item ctx-item--danger" @click="ctxRemoveNode">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/>
-              <path d="M9 6V4h6v2"/>
-            </svg>
+            <Icon icon="fluent:delete-24-regular" width="12" height="12" />
             {{ ctxCurrentNodeIsImage ? '删除图片' : t('canvas.removePaper') }}
           </button>
         </template>
@@ -1709,10 +1664,7 @@ watch(() => library.papers, () => {
                 @click="ctxSetEdgeColor(c.value)"
               >
                 <template v-if="!c.value">
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                    <circle cx="8" cy="8" r="6" stroke="var(--accent)" stroke-width="1.5"/>
-                    <line x1="3" y1="3" x2="13" y2="13" stroke="var(--accent)" stroke-width="1.5"/>
-                  </svg>
+                  <Icon icon="fluent:prohibited-24-regular" width="12" height="12" style="color: var(--accent)" />
                 </template>
               </button>
             </div>
@@ -1732,17 +1684,12 @@ watch(() => library.papers, () => {
           </div>
           <div class="ctx-divider" />
           <button class="ctx-item" @click="ctxEditEdgeLabel">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-            </svg>
+            <Icon icon="fluent:edit-24-regular" width="12" height="12" />
             编辑标签
           </button>
           <div class="ctx-divider" />
           <button class="ctx-item ctx-item--danger" @click="ctxRemoveEdge">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
+            <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
             删除连线
           </button>
         </template>

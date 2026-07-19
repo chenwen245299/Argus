@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { useCanvasStore, type DrawNodeSnapshot } from '../../stores/canvas'
 
@@ -17,14 +18,14 @@ function action(type: string, payload?: unknown) {
   canvasStore.requestAction(type, payload)
 }
 
-// Object-alignment buttons: [dir, title, svg inner markup]
-const ALIGN_BTNS: { dir: string; title: string; inner: string }[] = [
-  { dir: 'left', title: t('drawTab.alignLeft'), inner: '<line x1="4" y1="4" x2="4" y2="20" stroke="currentColor" stroke-width="2"/><rect x="7" y="6" width="13" height="4" rx="1"/><rect x="7" y="14" width="9" height="4" rx="1"/>' },
-  { dir: 'hcenter', title: t('drawTab.alignHCenter'), inner: '<line x1="12" y1="3" x2="12" y2="21" stroke="currentColor" stroke-width="2"/><rect x="5" y="6" width="14" height="4" rx="1"/><rect x="8" y="14" width="8" height="4" rx="1"/>' },
-  { dir: 'right', title: t('drawTab.alignRight'), inner: '<line x1="20" y1="4" x2="20" y2="20" stroke="currentColor" stroke-width="2"/><rect x="4" y="6" width="13" height="4" rx="1"/><rect x="8" y="14" width="9" height="4" rx="1"/>' },
-  { dir: 'top', title: t('drawTab.alignTop'), inner: '<line x1="4" y1="4" x2="20" y2="4" stroke="currentColor" stroke-width="2"/><rect x="6" y="7" width="4" height="13" rx="1"/><rect x="14" y="7" width="4" height="9" rx="1"/>' },
-  { dir: 'vcenter', title: t('drawTab.alignVCenter'), inner: '<line x1="3" y1="12" x2="21" y2="12" stroke="currentColor" stroke-width="2"/><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="8" width="4" height="8" rx="1"/>' },
-  { dir: 'bottom', title: t('drawTab.alignBottom'), inner: '<line x1="4" y1="20" x2="20" y2="20" stroke="currentColor" stroke-width="2"/><rect x="6" y="4" width="4" height="13" rx="1"/><rect x="14" y="8" width="4" height="9" rx="1"/>' },
+// Object-alignment buttons: [dir, title, Fluent icon]
+const ALIGN_BTNS: { dir: string; title: string; icon: string }[] = [
+  { dir: 'left', title: t('drawTab.alignLeft'), icon: 'fluent:align-left-24-regular' },
+  { dir: 'hcenter', title: t('drawTab.alignHCenter'), icon: 'fluent:align-center-horizontal-24-regular' },
+  { dir: 'right', title: t('drawTab.alignRight'), icon: 'fluent:align-right-24-regular' },
+  { dir: 'top', title: t('drawTab.alignTop'), icon: 'fluent:align-top-24-regular' },
+  { dir: 'vcenter', title: t('drawTab.alignVCenter'), icon: 'fluent:align-center-vertical-24-regular' },
+  { dir: 'bottom', title: t('drawTab.alignBottom'), icon: 'fluent:align-bottom-24-regular' },
 ]
 
 // Curated system / built-in font families.
@@ -78,7 +79,7 @@ const opacityPct = computed({
         <h4 class="group-title">{{ t('drawTab.selected', { n: count }) }}</h4>
         <div class="seg-control">
           <button v-for="b in ALIGN_BTNS" :key="b.dir" class="seg-btn icon-btn-sq" :title="b.title" @click="action('align', b.dir)">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" v-html="b.inner" />
+            <Icon :icon="b.icon" width="15" height="15" />
           </button>
         </div>
         <div class="field-pair">
@@ -112,9 +113,7 @@ const opacityPct = computed({
 
     <!-- Empty state -->
     <div v-else-if="!node" class="draw-empty">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/>
-      </svg>
+      <Icon icon="fluent:edit-24-regular" width="28" height="28" />
       <p>{{ t('drawTab.empty') }}</p>
       <span>{{ t('drawTab.emptyHint') }}</span>
     </div>
@@ -239,13 +238,13 @@ const opacityPct = computed({
         <div class="field-pair">
           <div class="seg-control align-seg">
             <button class="seg-btn" :class="{ active: (node.textAlign ?? 'left') === 'left' }" :title="t('drawTab.alignLeft')" @click="patch({ textAlign: 'left' })">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 6H3"/><path d="M15 12H3"/><path d="M17 18H3"/></svg>
+              <Icon icon="fluent:text-align-left-24-regular" width="15" height="15" />
             </button>
             <button class="seg-btn" :class="{ active: node.textAlign === 'center' }" :title="t('drawTab.alignHCenter')" @click="patch({ textAlign: 'center' })">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 6H3"/><path d="M17 12H7"/><path d="M19 18H5"/></svg>
+              <Icon icon="fluent:text-align-center-24-regular" width="15" height="15" />
             </button>
             <button class="seg-btn" :class="{ active: node.textAlign === 'right' }" :title="t('drawTab.alignRight')" @click="patch({ textAlign: 'right' })">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 6H3"/><path d="M21 12H9"/><path d="M21 18H7"/></svg>
+              <Icon icon="fluent:text-align-right-24-regular" width="15" height="15" />
             </button>
           </div>
           <label class="mini-field color-field">

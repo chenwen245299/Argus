@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch, Teleport } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -299,9 +300,7 @@ async function commitTags(s: Snippet) {
     <div class="snippet-header">
       <div class="header-left">
         <span v-if="library?.emoji" class="lib-emoji">{{ library.emoji }}</span>
-        <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-        </svg>
+        <Icon v-else icon="fluent:folder-24-regular" width="16" height="16" />
         <span class="lib-name">{{ library?.name ?? t('snippets.title') }}</span>
         <span class="item-count">{{ items.length }}</span>
       </div>
@@ -314,7 +313,7 @@ async function commitTags(s: Snippet) {
           :title="t('snippetLibrary.embedConfigTip')"
           @click="emit('open-settings', 'rag')"
         >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          <Icon icon="fluent:database-24-regular" width="12" height="12" />
           {{ t('snippetLibrary.embedConfig') }}
         </button>
         <template v-else>
@@ -326,10 +325,10 @@ async function commitTags(s: Snippet) {
             :disabled="syncing"
             @click="loadEmbeddedCount"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+            <Icon icon="fluent:arrow-sync-24-regular" width="15" height="15" />
           </button>
           <div class="embed-counter" :title="t('snippetLibrary.embedCounterTip')">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+            <Icon icon="fluent:database-24-regular" width="11" height="11" />
             <span>{{ embeddedCount }}/{{ totalCount }}</span>
           </div>
           <button
@@ -339,28 +338,22 @@ async function commitTags(s: Snippet) {
             :disabled="syncing || unembeddedCount === 0"
             @click="syncEmbeddings"
           >
-            <svg v-if="unembeddedCount > 0" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
-            <svg v-else width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+            <Icon v-if="unembeddedCount > 0" icon="fluent:cloud-arrow-up-24-regular" width="11" height="11" />
+            <Icon v-else icon="fluent:checkmark-24-regular" width="11" height="11" />
             {{ syncing ? t('snippetLibrary.embedding') : unembeddedCount > 0 ? t('snippetLibrary.embedN', { n: unembeddedCount }) : (totalCount > 0 ? t('snippetLibrary.embedDone') : t('snippetLibrary.embedNone')) }}
           </button>
         </template>
       </div>
 
       <div class="search-wrap">
-        <svg class="search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-        </svg>
+        <Icon class="search-icon" icon="fluent:search-24-regular" width="13" height="13" />
         <input v-model="searchQuery" class="search-input" :placeholder="t('snippets.search')" />
       </div>
     </div>
 
     <!-- Empty state -->
     <div v-if="items.length === 0" class="empty-state">
-      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.35">
-        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-        <line x1="12" y1="11" x2="12" y2="17"/>
-        <line x1="9" y1="14" x2="15" y2="14"/>
-      </svg>
+      <Icon icon="fluent:folder-add-24-regular" width="40" height="40" style="opacity:0.35" />
       <p class="empty-title">{{ t('snippets.noSnippets') }}</p>
       <p class="empty-hint">{{ t('snippets.addHint') }}</p>
     </div>
@@ -452,12 +445,7 @@ async function commitTags(s: Snippet) {
               <!-- Delete -->
               <td class="col-action" @click.stop>
                 <button class="del-btn" :title="t('hl.delete')" @click="handleDelete(s)">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="3 6 5 6 21 6"/>
-                    <path d="M19 6l-1 14H6L5 6"/>
-                    <path d="M10 11v6"/><path d="M14 11v6"/>
-                    <path d="M9 6V4h6v2"/>
-                  </svg>
+                  <Icon icon="fluent:delete-24-regular" width="13" height="13" />
                 </button>
               </td>
             </tr>

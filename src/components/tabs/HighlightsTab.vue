@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { useReaderStore } from '../../stores/reader'
 import { useLibraryStore } from '../../stores/library'
@@ -66,19 +67,13 @@ function colorStyle(color: string, alpha = 0.35): string {
 <template>
   <div class="highlights-tab">
     <div v-if="!isReaderActive" class="empty">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M12 20h9"/>
-        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>
-      </svg>
+      <Icon icon="fluent:highlight-24-regular" width="28" height="28" />
       <p>{{ t('hl.openPdf') }}</p>
       <span>{{ t('hl.doubleClick') }}</span>
     </div>
 
     <div v-else-if="sortedHighlights.length === 0" class="empty">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M12 20h9"/>
-        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>
-      </svg>
+      <Icon icon="fluent:highlight-24-regular" width="28" height="28" />
       <p>{{ t('hl.noHighlights') }}</p>
       <span>{{ t('hl.selectToHighlight') }}</span>
     </div>
@@ -110,9 +105,7 @@ function colorStyle(color: string, alpha = 0.35): string {
 
           <div class="hl-actions" v-if="editingNoteId !== hl.id">
             <button class="act-btn" @click="jumpTo(hl.id)">
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M5 12h14M12 5l7 7-7 7"/>
-              </svg>
+              <Icon icon="fluent:arrow-right-24-regular" width="12" height="12" />
               {{ t('hl.go') }}
             </button>
             <button class="act-btn" @click="startEditNote(hl.id)">{{ t('hl.note') }}</button>

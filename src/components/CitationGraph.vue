@@ -15,6 +15,9 @@ const props = defineProps<{
   centerCiteCount?: number | null
   refs: CitationRef[]
   maxNodes?: number
+  // 'references' = papers this one cites (default). 'citedBy' = library papers
+  // that cite it; expansion then walks the cited-by direction, library-only.
+  mode?: 'references' | 'citedBy'
 }>()
 const emit = defineEmits<{ (e: 'open', slug: string): void }>()
 
@@ -131,8 +134,15 @@ async function expand(node: GNode) {
   if (!slug || sources.value.some(s => s.id === slug) || expandingId.value) return
   expandingId.value = slug
   try {
-    let refs = await invoke<CitationRef[]>('get_cached_references', { slug })
-    if (!refs.length) refs = await invoke<CitationRef[]>('fetch_references', { slug })
+    let refs: CitationRef[]
+    if (props.mode === 'citedBy') {
+      // Walk the cited-by direction too — who, in the library, cites this node.
+      // Purely local, never the network.
+      refs = await invoke<CitationRef[]>('get_library_citers', { slug })
+    } else {
+      refs = await invoke<CitationRef[]>('get_cached_references', { slug })
+      if (!refs.length) refs = await invoke<CitationRef[]>('fetch_references', { slug })
+    }
     addSource(slug, node.ref!.title, node, refs)
   } catch (e) {
     console.error('Failed to expand citations:', e)
@@ -513,7 +523,7 @@ const nodesTransform = computed(() => `translate(${CX.value + view.x}px, ${CY.va
     <div class="cg-footer">
       <div class="cg-legend">
         <span class="cg-leg cg-size-hint">{{ t('citeGraph.legendSize') }}</span>
-        <span class="cg-leg cg-size-hint">{{ t('citeGraph.legendExpand') }}</span>
+        <span class="cg-leg cg-size-hint">{{ mode === 'citedBy' ? t('citeGraph.legendExpandCitedBy') : t('citeGraph.legendExpand') }}</span>
         <span v-if="hiddenCount" class="cg-leg cg-more">{{ t('citeGraph.moreHidden', { n: hiddenCount }) }}</span>
       </div>
       <div class="cg-foot-right">

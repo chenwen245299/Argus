@@ -15,6 +15,7 @@
     "docs:preview": "vitepress preview docs"
   },
   "dependencies": {
+    "@iconify-json/fluent": "^1.2.53",
     "@iconify-json/fluent-emoji-flat": "^1.2.5",
     "@iconify/vue": "^5.0.1",
     "@milkdown/core": "^7.21.1",
@@ -24,6 +25,7 @@
     "@milkdown/preset-commonmark": "^7.21.1",
     "@milkdown/vue": "^7.21.1",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-http": "2.5.9",
     "@tauri-apps/plugin-process": "^2",

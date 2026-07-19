@@ -638,6 +638,7 @@ pub fn list_papers_in_collection(
         let status = crate::paper::read_status(&path);
         let import_source =
             normalize_import_source(meta.import_source.as_deref(), meta.arxiv_id.as_deref());
+        let has_bibtex = Some(meta.bibtex.as_deref().is_some_and(|b| !b.trim().is_empty()));
         entries.push(PaperIndexEntry {
             slug,
             id: meta.id,
@@ -654,6 +655,7 @@ pub fn list_papers_in_collection(
             cite_count: meta.cite_count,
             file_type: meta.file_type,
             related_ids: meta.related_ids,
+            has_bibtex,
         });
     }
 

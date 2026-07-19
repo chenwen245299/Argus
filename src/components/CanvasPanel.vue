@@ -2,6 +2,7 @@
 import {
   ref, computed, markRaw, onMounted, onUnmounted, nextTick, watch,
 } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import {
@@ -1930,9 +1931,7 @@ watch(() => library.papers, () => {
     <!-- Toolbar -->
     <div class="canvas-toolbar">
       <button class="back-btn" :title="t('canvas.backToList')" @click="emit('close')">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-          <polyline points="15 18 9 12 15 6"/>
-        </svg>
+        <Icon icon="fluent:chevron-left-24-regular" width="13" height="13" />
       </button>
       <span class="canvas-name">{{ canvasStore.currentCanvas?.name || t('canvas.noCanvases') }}</span>
       <div class="toolbar-actions">
@@ -1943,23 +1942,14 @@ watch(() => library.papers, () => {
           :class="{ 'tb-action-btn--active': showSuggestPanel }"
           @click="showSuggestPanel = !showSuggestPanel"
         >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M9.5 14.5 L14.5 9.5"/><circle cx="7" cy="17" r="2.5"/><circle cx="17" cy="7" r="2.5"/>
-            <circle cx="17" cy="17" r="2.5"/>
-          </svg>
+          <Icon icon="fluent:share-android-24-regular" width="13" height="13" />
           {{ t('canvas.suggestEdges') }}
         </button>
 
         <!-- Auto Layout dropdown -->
         <div v-if="canvasStore.currentCanvas" class="layout-wrap">
           <button class="tb-action-btn" @click="showLayoutMenu = !showLayoutMenu" :disabled="applyingLayout">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="2" y="3" width="5" height="5" rx="1"/>
-              <rect x="17" y="3" width="5" height="5" rx="1"/>
-              <rect x="9.5" y="16" width="5" height="5" rx="1"/>
-              <line x1="4.5" y1="8" x2="12" y2="16"/>
-              <line x1="19.5" y1="8" x2="12" y2="16"/>
-            </svg>
+            <Icon icon="fluent:organization-24-regular" width="13" height="13" />
             {{ t('canvas.autoLayout') }}
           </button>
           <div v-if="showLayoutMenu" class="layout-menu" @mouseleave="showLayoutMenu = false">
@@ -1983,11 +1973,7 @@ watch(() => library.papers, () => {
           class="tb-action-btn"
           @click="showExportDialog = true"
         >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="7 10 12 15 17 10"/>
-            <line x1="12" y1="15" x2="12" y2="3"/>
-          </svg>
+          <Icon icon="fluent:arrow-download-24-regular" width="13" height="13" />
           {{ t('canvas.exportImage') }}
         </button>
 
@@ -1997,9 +1983,7 @@ watch(() => library.papers, () => {
           class="tb-action-btn tb-action-btn--accent"
           @click="openPaperPicker"
         >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
+          <Icon icon="fluent:add-24-regular" width="13" height="13" />
           {{ t('canvas.addPaper') }}
         </button>
       </div>
@@ -2070,15 +2054,8 @@ watch(() => library.papers, () => {
             :title="pointerToolTitle"
             @click="selectPointerTool"
           >
-            <svg v-if="pointerDragMode === 'select'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M5 3l14 9-7 1-4 7z"/>
-            </svg>
-            <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M18 11V7a2 2 0 0 0-4 0v4"/>
-              <path d="M14 10V6a2 2 0 0 0-4 0v7"/>
-              <path d="M10 12V8a2 2 0 1 0-4 0v7"/>
-              <path d="M6 15c0 4 2.5 6 6.5 6H14c3 0 5-2 5-5v-5a2 2 0 0 0-4 0v1"/>
-            </svg>
+            <Icon v-if="pointerDragMode === 'select'" icon="fluent:cursor-24-regular" width="15" height="15" />
+            <Icon v-else icon="fluent:hand-right-24-regular" width="15" height="15" />
           </button>
           <div class="btb-sep" />
           <button
@@ -2087,10 +2064,7 @@ watch(() => library.papers, () => {
             title="文字 (T)"
             @click="selectTool('text')"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M4 7V4h16v3"/><line x1="12" y1="4" x2="12" y2="20"/>
-              <line x1="8" y1="20" x2="16" y2="20"/>
-            </svg>
+            <Icon icon="fluent:text-t-24-regular" width="15" height="15" />
           </button>
           <button
             class="btb-btn"
@@ -2098,9 +2072,7 @@ watch(() => library.papers, () => {
             title="矩形 (R)"
             @click="selectShape('rect')"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="3" y="5" width="18" height="14" rx="2"/>
-            </svg>
+            <Icon icon="fluent:rectangle-landscape-24-regular" width="15" height="15" />
           </button>
           <button
             class="btb-btn"
@@ -2108,9 +2080,7 @@ watch(() => library.papers, () => {
             title="椭圆"
             @click="selectShape('ellipse')"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <ellipse cx="12" cy="12" rx="9" ry="7"/>
-            </svg>
+            <Icon icon="fluent:oval-24-regular" width="15" height="15" />
           </button>
           <button
             class="btb-btn"
@@ -2118,9 +2088,7 @@ watch(() => library.papers, () => {
             title="菱形"
             @click="selectShape('diamond')"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
-              <path d="M12 3l9 9-9 9-9-9z"/>
-            </svg>
+            <Icon icon="fluent:diamond-24-regular" width="15" height="15" />
           </button>
           <div class="btb-sep" />
           <button
@@ -2129,9 +2097,7 @@ watch(() => library.papers, () => {
             title="直线"
             @click="selectLine('line')"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-              <line x1="5" y1="19" x2="19" y2="5"/>
-            </svg>
+            <Icon icon="fluent:line-24-regular" width="15" height="15" />
           </button>
           <button
             class="btb-btn"
@@ -2139,9 +2105,7 @@ watch(() => library.papers, () => {
             title="箭头"
             @click="selectLine('arrow')"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="5" y1="19" x2="19" y2="5"/><path d="M11 5h8v8"/>
-            </svg>
+            <Icon icon="fluent:arrow-up-right-24-regular" width="15" height="15" />
           </button>
         </div>
 
@@ -2161,13 +2125,7 @@ watch(() => library.papers, () => {
 
       <!-- No canvas selected -->
       <div v-if="!canvasStore.currentCanvas" class="no-canvas-selected">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" style="opacity:0.2">
-          <circle cx="8" cy="8" r="3"/><circle cx="16" cy="8" r="3"/>
-          <circle cx="12" cy="16" r="3"/>
-          <line x1="11" y1="8" x2="13" y2="8"/>
-          <line x1="9.5" y1="10.5" x2="11" y2="13.5"/>
-          <line x1="14.5" y1="10.5" x2="13" y2="13.5"/>
-        </svg>
+        <Icon icon="fluent:share-android-24-regular" width="48" height="48" style="opacity:0.2" />
         <p>{{ t('canvas.noCanvases') }}</p>
         <p class="hint">{{ t('canvas.noCanvasesHint') }}</p>
       </div>
@@ -2190,9 +2148,7 @@ watch(() => library.papers, () => {
           <div class="picker-header">
             <span class="picker-title">{{ t('canvas.addPaperTitle') }}</span>
             <button class="close-btn" @click="showPaperPicker = false">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
+              <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
             </button>
           </div>
           <input v-model="pickerSearch" class="picker-search" :placeholder="t('canvas.searchPapers')" autofocus />
@@ -2258,27 +2214,19 @@ watch(() => library.papers, () => {
                   :title="color.label" :style="color.value ? { background: color.value } : {}"
                   @click.stop="ctxSetNodeColor(color.value)">
                   <template v-if="!color.value">
-                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                      <circle cx="8" cy="8" r="6" stroke="var(--accent)" stroke-width="1.5"/>
-                      <line x1="3" y1="3" x2="13" y2="13" stroke="var(--accent)" stroke-width="1.5"/>
-                    </svg>
+                    <Icon icon="fluent:prohibited-24-regular" width="12" height="12" style="color: var(--accent)" />
                   </template>
                 </button>
               </div>
             </div>
             <div class="ctx-divider" />
             <button class="ctx-item" @click="openAnnotationEditor(ctxMenu.nodeId!); closeCtxMenu()">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-              </svg>
+              <Icon icon="fluent:edit-24-regular" width="12" height="12" />
               编辑内容
             </button>
             <div class="ctx-divider" />
             <button class="ctx-item ctx-item--danger" @click="ctxRemoveNode">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M9 6V4h6v2"/>
-              </svg>
+              <Icon icon="fluent:delete-24-regular" width="12" height="12" />
               删除
             </button>
           </template>
@@ -2294,27 +2242,19 @@ watch(() => library.papers, () => {
                   :title="color.label" :style="color.value ? { background: color.value } : {}"
                   @click.stop="ctxSetNodeColor(color.value)">
                   <template v-if="!color.value">
-                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                      <circle cx="8" cy="8" r="6" stroke="var(--accent)" stroke-width="1.5"/>
-                      <line x1="3" y1="3" x2="13" y2="13" stroke="var(--accent)" stroke-width="1.5"/>
-                    </svg>
+                    <Icon icon="fluent:prohibited-24-regular" width="12" height="12" style="color: var(--accent)" />
                   </template>
                 </button>
               </div>
             </div>
             <div class="ctx-divider" />
             <button class="ctx-item" @click="openAnnotationEditor(ctxMenu.nodeId!); closeCtxMenu()">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-              </svg>
+              <Icon icon="fluent:edit-24-regular" width="12" height="12" />
               编辑标签
             </button>
             <div class="ctx-divider" />
             <button class="ctx-item ctx-item--danger" @click="ctxRemoveNode">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M9 6V4h6v2"/>
-              </svg>
+              <Icon icon="fluent:delete-24-regular" width="12" height="12" />
               删除
             </button>
           </template>
@@ -2322,9 +2262,7 @@ watch(() => library.papers, () => {
           <!-- Image node -->
           <template v-else-if="ctxMenu.nodeType === 'image'">
             <button class="ctx-item ctx-item--danger" @click="ctxRemoveNode">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M9 6V4h6v2"/>
-              </svg>
+              <Icon icon="fluent:delete-24-regular" width="12" height="12" />
               删除图片
             </button>
           </template>
@@ -2340,28 +2278,20 @@ watch(() => library.papers, () => {
                   :title="color.label" :style="color.value ? { background: color.value } : {}"
                   @click.stop="ctxSetNodeColor(color.value)">
                   <template v-if="!color.value">
-                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                      <circle cx="8" cy="8" r="6" stroke="var(--accent)" stroke-width="1.5"/>
-                      <line x1="3" y1="3" x2="13" y2="13" stroke="var(--accent)" stroke-width="1.5"/>
-                    </svg>
+                    <Icon icon="fluent:prohibited-24-regular" width="12" height="12" style="color: var(--accent)" />
                   </template>
                 </button>
               </div>
             </div>
             <div class="ctx-divider" />
             <button class="ctx-item" @click="ctxSelectPaper">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-              </svg>
+              <Icon icon="fluent:book-24-regular" width="12" height="12" />
               {{ t('canvas.viewPaper') }}
             </button>
 
             <div class="ctx-divider" />
             <button class="ctx-item ctx-item--danger" @click="ctxRemoveNode">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M9 6V4h6v2"/>
-              </svg>
+              <Icon icon="fluent:delete-24-regular" width="12" height="12" />
               {{ t('canvas.removePaper') }}
             </button>
           </template>
@@ -2380,10 +2310,7 @@ watch(() => library.papers, () => {
                 @click.stop="ctxSetEdgeColor(color.value)"
               >
                 <template v-if="!color.value">
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                    <circle cx="8" cy="8" r="6" stroke="var(--accent)" stroke-width="1.5"/>
-                    <line x1="3" y1="3" x2="13" y2="13" stroke="var(--accent)" stroke-width="1.5"/>
-                  </svg>
+                  <Icon icon="fluent:prohibited-24-regular" width="12" height="12" style="color: var(--accent)" />
                 </template>
               </button>
             </div>
@@ -2404,17 +2331,12 @@ watch(() => library.papers, () => {
           </div>
           <div class="ctx-divider" />
           <button class="ctx-item" @click="ctxEditEdgeLabel">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-            </svg>
+            <Icon icon="fluent:edit-24-regular" width="12" height="12" />
             {{ t('canvas.edgeLabelEdit') }}
           </button>
           <div class="ctx-divider" />
           <button class="ctx-item ctx-item--danger" @click="ctxRemoveEdge">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
+            <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
             {{ t('canvas.removeEdge') }}
           </button>
         </template>

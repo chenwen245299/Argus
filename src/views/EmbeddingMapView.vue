@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, shallowRef, computed, onMounted, onUnmounted, watch } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emitTo } from '@tauri-apps/api/event'
@@ -858,14 +859,7 @@ onUnmounted(() => {
     <div class="em-titlebar" data-tauri-drag-region>
       <div class="tl-space" data-tauri-drag-region />
       <div class="em-avatar" data-tauri-drag-region>
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" data-tauri-drag-region>
-          <circle cx="5.5" cy="6" r="2.6"/>
-          <circle cx="18" cy="5" r="2.2"/>
-          <circle cx="12" cy="13.5" r="2.8"/>
-          <circle cx="6" cy="19" r="2"/>
-          <circle cx="19" cy="18" r="2.4"/>
-          <path d="M7.8 7.5 10 11.4M14.6 12.2 16.4 6.9M10 15.6 7.3 17.5M14.5 15 17 16.6"/>
-        </svg>
+        <Icon icon="fluent:data-scatter-24-regular" width="15" height="15" data-tauri-drag-region />
       </div>
       <div class="em-title-block" data-tauri-drag-region>
         <span class="em-title" data-tauri-drag-region>{{ t('embedMap.title') }}</span>
@@ -899,9 +893,7 @@ onUnmounted(() => {
               @keydown.escape.stop="searchQuery = ''"
             />
             <button v-if="searchQuery" class="em-search-clear" @click="searchQuery = ''">
-              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
+              <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
             </button>
           </div>
         </div>
@@ -934,21 +926,11 @@ onUnmounted(() => {
         </label>
         <div class="em-btn-row">
           <button class="em-mini-btn" @click="resetView">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M15 3h6v6"/>
-              <path d="M9 21H3v-6"/>
-              <path d="M21 3l-7 7"/>
-              <path d="M3 21l7-7"/>
-            </svg>
+            <Icon icon="fluent:arrow-maximize-24-regular" width="12" height="12" />
             {{ t('embedMap.resetView') }}
           </button>
           <button class="em-mini-btn" :disabled="loading" @click="load">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="m17 2 4 4-4 4"/>
-              <path d="M3 11v-1a4 4 0 0 1 4-4h14"/>
-              <path d="m7 22-4-4 4-4"/>
-              <path d="M21 13v1a4 4 0 0 1-4 4H3"/>
-            </svg>
+            <Icon icon="fluent:arrow-sync-24-regular" width="13" height="13" />
             {{ t('embedMap.refresh') }}
           </button>
         </div>
@@ -970,20 +952,14 @@ onUnmounted(() => {
           <span class="em-panel-dot" :style="{ background: paperColor(selectedIdx!, 1) }" />
           <span class="em-panel-title">{{ selectedPaper.title }}</span>
           <button class="em-icon-btn em-panel-close" @click="selectedIdx = null">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
+            <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
           </button>
         </div>
         <div class="em-panel-meta">
           {{ t('embedMap.degreeCount', { n: graphInfo?.degrees[selectedIdx!] ?? 0 }) }} · {{ t('embedMap.chunkCount', { n: selectedPaper.chunk_count }) }}
         </div>
         <button class="em-open-btn" @click="openInMain(selectedPaper)">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-            <polyline points="15 3 21 3 21 9"/>
-            <line x1="10" y1="14" x2="21" y2="3"/>
-          </svg>
+          <Icon icon="fluent:open-24-regular" width="12" height="12" />
           {{ t('embedMap.openInMain') }}
         </button>
         <div v-if="selectedNeighbors.length" class="em-neighbors">
@@ -1015,14 +991,7 @@ onUnmounted(() => {
 
       <!-- Empty -->
       <div v-else-if="data && !data.papers.length" class="em-center-state">
-        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" class="em-empty-icon">
-          <circle cx="5.5" cy="6" r="2.6"/>
-          <circle cx="18" cy="5" r="2.2"/>
-          <circle cx="12" cy="13.5" r="2.8"/>
-          <circle cx="6" cy="19" r="2"/>
-          <circle cx="19" cy="18" r="2.4"/>
-          <path d="M7.8 7.5 10 11.4M14.6 12.2 16.4 6.9M10 15.6 7.3 17.5M14.5 15 17 16.6"/>
-        </svg>
+        <Icon icon="fluent:data-scatter-24-regular" class="em-empty-icon" width="44" height="44" />
         <p class="em-empty-title">{{ t('embedMap.empty') }}</p>
         <p class="em-empty-hint">{{ t('embedMap.emptyHint') }}</p>
         <div class="em-empty-actions">

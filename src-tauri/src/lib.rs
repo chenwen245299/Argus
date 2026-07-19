@@ -27,6 +27,7 @@ mod settings;
 mod snippets;
 mod token_usage;
 mod url_import;
+mod writing;
 
 use std::sync::Mutex;
 use tauri::Manager;
@@ -39,6 +40,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(
             tauri_plugin_window_state::Builder::new()
@@ -149,6 +151,7 @@ pub fn run() {
             commands::fetch_journal_rank,
             commands::get_venue_ranks,
             commands::get_cached_references,
+            commands::get_library_citers,
             commands::fetch_references,
             commands::set_easyscholar_key,
             commands::easyscholar_key_status,
@@ -173,6 +176,14 @@ pub fn run() {
             commands::list_papers_in_collection,
             commands::get_papers_folder_path,
             commands::get_collection_folder_path,
+            // ── Writing reference lists ──
+            commands::list_writing_lists,
+            commands::create_writing_list,
+            commands::rename_writing_list,
+            commands::delete_writing_list,
+            commands::add_papers_to_writing_list,
+            commands::remove_paper_from_writing_list,
+            commands::get_writing_folder_path,
             // ── M4: Extraction ──
             commands::extract_fulltext,
             commands::get_fulltext,

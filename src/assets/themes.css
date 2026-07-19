@@ -1,0 +1,783 @@
+/* ── Theme definitions ─────────────────────────────────────────────
+   Applied via the data-theme attribute on <html> (see src/stores/settings.ts).
+   Base tokens (:root) and the system dark fallback media query live in
+   main.css. Each theme below defines the full token set so nothing leaks
+   through from the base. The marketplace registry (names + preview colors)
+   lives in src/utils/themes.ts — keep it in sync when editing a theme. */
+
+/* ── Dark — neutral graphite ── */
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg-primary:   #1c1c1e;
+  --bg-secondary: #2c2c2e;
+  --bg-tertiary:  #3a3a3c;
+  --bg-hover:     rgba(255, 255, 255, 0.06);
+  --bg-active:    rgba(114, 174, 247, 0.18);
+  --bg-selected:  rgba(114, 174, 247, 0.12);
+
+  --text-primary:   #f5f5f7;
+  --text-secondary: #aeaeb2;
+  --text-tertiary:  #636366;
+  --text-accent:    #72aef7;
+
+  --border-subtle:  rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.12);
+  --divider:        rgba(255, 255, 255, 0.07);
+
+  --accent:         #72aef7;
+  --accent-hover:   #8fc0f9;
+  --accent-light:   rgba(114, 174, 247, 0.16);
+
+  --input-bg: rgba(255, 255, 255, 0.09);
+
+  --shadow-btn-accent: 0 1px 4px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.16), inset 0 -1px 0 rgba(0,0,0,0.20);
+  --shadow-nav-active: 0 1px 4px rgba(0,0,0,0.40), inset 0 1px 0 rgba(255,255,255,0.14), inset 0 -1px 0 rgba(0,0,0,0.18);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.12) 0%, rgba(0,0,0,0.10) 100%);
+
+  --badge-extracted-bg: #1b3d22;
+  --badge-extracted-fg: #5dbf6e;
+  --badge-summary-bg:   #1a2a4a;
+  --badge-summary-fg:   #82b1ff;
+  --badge-vector-bg:    #2d1a38;
+  --badge-vector-fg:    #ce93d8;
+  --badge-meta-bg:      #00282e;
+  --badge-meta-fg:      #4dd0e1;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.30), 0 1px 2px rgba(0, 0, 0, 0.20);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.40), 0 2px 6px rgba(0, 0, 0, 0.25);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.60), 0 8px 24px rgba(0, 0, 0, 0.40);
+}
+
+/* ── Light — default macOS (forces light regardless of OS setting) ── */
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-primary:    #ffffff;
+  --bg-secondary:  #f2f2f7;
+  --bg-tertiary:   #e5e5ea;
+  --bg-hover:      rgba(0, 0, 0, 0.05);
+  --bg-active:     rgba(0, 122, 255, 0.10);
+  --bg-selected:   rgba(0, 122, 255, 0.07);
+
+  --text-primary:   #1c1c1e;
+  --text-secondary: #636366;
+  --text-tertiary:  #8e8e93;
+  --text-accent:    #007aff;
+
+  --border-subtle:  rgba(0, 0, 0, 0.06);
+  --border-default: rgba(0, 0, 0, 0.10);
+  --divider:        rgba(0, 0, 0, 0.08);
+
+  --accent:         #007aff;
+  --accent-hover:   #0063d1;
+  --accent-light:   rgba(0, 122, 255, 0.10);
+
+  --shadow-btn-accent: 0 1px 3px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.14);
+  --shadow-nav-active: 0 1px 3px rgba(0,0,0,0.15), inset 0 1px 0 rgba(255,255,255,0.12);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.10) 0%, rgba(0,0,0,0.06) 100%);
+
+  --badge-extracted-bg: #e6f4ea;
+  --badge-extracted-fg: #1e7e34;
+  --badge-summary-bg:   #e8f0fe;
+  --badge-summary-fg:   #1557b0;
+  --badge-vector-bg:    #f3e5f5;
+  --badge-vector-fg:    #7b1fa2;
+  --badge-meta-bg:      #e0f7fa;
+  --badge-meta-fg:      #00838f;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.10), 0 2px 6px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.18), 0 8px 24px rgba(0, 0, 0, 0.10);
+}
+
+/* ── Warm — parchment & amber ── */
+[data-theme="warm"] {
+  color-scheme: light;
+
+  --bg-primary:    #faf8f5;
+  --bg-secondary:  #f2ede5;
+  --bg-tertiary:   #e6ddd2;
+  --bg-hover:      rgba(180, 120, 50, 0.07);
+  --bg-active:     rgba(217, 119, 6, 0.10);
+  --bg-selected:   rgba(217, 119, 6, 0.07);
+
+  --text-primary:   #1c1a16;
+  --text-secondary: #7a6a58;
+  --text-tertiary:  #a89282;
+  --text-accent:    #c98a10;
+
+  --border-subtle:  rgba(160, 120, 70, 0.10);
+  --border-default: rgba(160, 120, 70, 0.18);
+  --divider:        rgba(160, 120, 70, 0.10);
+
+  --accent:         #e8991a;
+  --accent-hover:   #f0aa35;
+  --accent-light:   rgba(232, 153, 26, 0.13);
+
+  --shadow-btn-accent: none;
+  --shadow-nav-active: none;
+  --gradient-accent:   none;
+
+  --badge-extracted-bg: #fef9c3;
+  --badge-extracted-fg: #854d0e;
+  --badge-summary-bg:   #fdf2cd;
+  --badge-summary-fg:   #78350f;
+  --badge-vector-bg:    #f3e6d8;
+  --badge-vector-fg:    #7c2d12;
+  --badge-meta-bg:      #e8f5e9;
+  --badge-meta-fg:      #2e7d32;
+
+  --shadow-sm: 0 1px 3px rgba(100, 60, 20, 0.10), 0 1px 2px rgba(100, 60, 20, 0.06);
+  --shadow-md: 0 4px 16px rgba(100, 60, 20, 0.12), 0 2px 6px rgba(100, 60, 20, 0.07);
+  --shadow-lg: 0 20px 60px rgba(100, 60, 20, 0.20), 0 8px 24px rgba(100, 60, 20, 0.12);
+}
+
+/* ── Forest — sage & natural green ── */
+[data-theme="forest"] {
+  color-scheme: light;
+
+  --bg-primary:    #f6f9f4;
+  --bg-secondary:  #ecf2e8;
+  --bg-tertiary:   #dce9d6;
+  --bg-hover:      rgba(45, 122, 79, 0.07);
+  --bg-active:     rgba(45, 122, 79, 0.12);
+  --bg-selected:   rgba(45, 122, 79, 0.07);
+
+  --text-primary:   #182418;
+  --text-secondary: #3d5a40;
+  --text-tertiary:  #7a9e7b;
+  --text-accent:    #2d8c58;
+
+  --border-subtle:  rgba(60, 120, 70, 0.10);
+  --border-default: rgba(60, 120, 70, 0.18);
+  --divider:        rgba(60, 120, 70, 0.10);
+
+  --accent:         #3fa368;
+  --accent-hover:   #52b87c;
+  --accent-light:   rgba(63, 163, 104, 0.13);
+
+  --shadow-btn-accent: 0 1px 3px rgba(20, 80, 40, 0.22), inset 0 1px 0 rgba(255,255,255,0.18);
+  --shadow-nav-active: 0 1px 3px rgba(20, 80, 40, 0.18), inset 0 1px 0 rgba(255,255,255,0.15);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.14) 0%, rgba(0,0,0,0.08) 100%);
+
+  --badge-extracted-bg: #d1fae5;
+  --badge-extracted-fg: #065f46;
+  --badge-summary-bg:   #d4edda;
+  --badge-summary-fg:   #145523;
+  --badge-vector-bg:    #e6f4ea;
+  --badge-vector-fg:    #2e7d32;
+  --badge-meta-bg:      #ccfbf1;
+  --badge-meta-fg:      #065f46;
+
+  --shadow-sm: 0 1px 3px rgba(20, 80, 40, 0.08), 0 1px 2px rgba(20, 80, 40, 0.05);
+  --shadow-md: 0 4px 16px rgba(20, 80, 40, 0.10), 0 2px 6px rgba(20, 80, 40, 0.06);
+  --shadow-lg: 0 20px 60px rgba(20, 80, 40, 0.18), 0 8px 24px rgba(20, 80, 40, 0.10);
+}
+
+/* ── Rose — lavender & soft violet ── */
+[data-theme="rose"] {
+  color-scheme: light;
+
+  --bg-primary:    #fdf8fc;
+  --bg-secondary:  #f5eef5;
+  --bg-tertiary:   #ece0ed;
+  --bg-hover:      rgba(147, 51, 234, 0.06);
+  --bg-active:     rgba(147, 51, 234, 0.10);
+  --bg-selected:   rgba(147, 51, 234, 0.07);
+
+  --text-primary:   #1c1820;
+  --text-secondary: #6b5b72;
+  --text-tertiary:  #a890b0;
+  --text-accent:    #9b50da;
+
+  --border-subtle:  rgba(120, 60, 160, 0.10);
+  --border-default: rgba(120, 60, 160, 0.16);
+  --divider:        rgba(120, 60, 160, 0.08);
+
+  --accent:         #b06af7;
+  --accent-hover:   #c285f9;
+  --accent-light:   rgba(176, 106, 247, 0.12);
+
+  --shadow-btn-accent: 0 1px 3px rgba(80, 20, 120, 0.22), inset 0 1px 0 rgba(255,255,255,0.18);
+  --shadow-nav-active: 0 1px 3px rgba(80, 20, 120, 0.18), inset 0 1px 0 rgba(255,255,255,0.15);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.14) 0%, rgba(0,0,0,0.08) 100%);
+
+  --badge-extracted-bg: #f3e8ff;
+  --badge-extracted-fg: #6b21a8;
+  --badge-summary-bg:   #ede9fe;
+  --badge-summary-fg:   #4c1d95;
+  --badge-vector-bg:    #f5d0fe;
+  --badge-vector-fg:    #701a75;
+  --badge-meta-bg:      #e0e7ff;
+  --badge-meta-fg:      #3730a3;
+
+  --shadow-sm: 0 1px 3px rgba(80, 20, 120, 0.08), 0 1px 2px rgba(80, 20, 120, 0.05);
+  --shadow-md: 0 4px 16px rgba(80, 20, 120, 0.10), 0 2px 6px rgba(80, 20, 120, 0.06);
+  --shadow-lg: 0 20px 60px rgba(80, 20, 120, 0.18), 0 8px 24px rgba(80, 20, 120, 0.10);
+}
+
+/* ── Midnight — deep navy night ── */
+[data-theme="midnight"] {
+  color-scheme: dark;
+
+  --bg-primary:   #10141d;
+  --bg-secondary: #1a2029;
+  --bg-tertiary:  #242c3a;
+  --bg-hover:     rgba(255, 255, 255, 0.06);
+  --bg-active:    rgba(96, 165, 250, 0.18);
+  --bg-selected:  rgba(96, 165, 250, 0.12);
+
+  --text-primary:   #e9eef6;
+  --text-secondary: #9aa7bb;
+  --text-tertiary:  #5c6a80;
+  --text-accent:    #6aa9ff;
+
+  --border-subtle:  rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.12);
+  --divider:        rgba(255, 255, 255, 0.07);
+
+  --accent:         #60a5fa;
+  --accent-hover:   #83bbfb;
+  --accent-light:   rgba(96, 165, 250, 0.16);
+
+  --input-bg: rgba(255, 255, 255, 0.09);
+
+  --shadow-btn-accent: 0 1px 4px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.16), inset 0 -1px 0 rgba(0,0,0,0.20);
+  --shadow-nav-active: 0 1px 4px rgba(0,0,0,0.40), inset 0 1px 0 rgba(255,255,255,0.14), inset 0 -1px 0 rgba(0,0,0,0.18);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.12) 0%, rgba(0,0,0,0.10) 100%);
+
+  --badge-extracted-bg: #1b3d22;
+  --badge-extracted-fg: #5dbf6e;
+  --badge-summary-bg:   #1a2a4a;
+  --badge-summary-fg:   #82b1ff;
+  --badge-vector-bg:    #2d1a38;
+  --badge-vector-fg:    #ce93d8;
+  --badge-meta-bg:      #00282e;
+  --badge-meta-fg:      #4dd0e1;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.32), 0 1px 2px rgba(0, 0, 0, 0.22);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.42), 0 2px 6px rgba(0, 0, 0, 0.26);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.62), 0 8px 24px rgba(0, 0, 0, 0.42);
+}
+
+/* ── Aurora — Nord-inspired polar night & frost ── */
+[data-theme="aurora"] {
+  color-scheme: dark;
+
+  --bg-primary:   #23272f;
+  --bg-secondary: #2e3440;
+  --bg-tertiary:  #3b4252;
+  --bg-hover:     rgba(255, 255, 255, 0.05);
+  --bg-active:    rgba(136, 192, 208, 0.16);
+  --bg-selected:  rgba(136, 192, 208, 0.10);
+
+  --text-primary:   #eceff4;
+  --text-secondary: #a7b1c4;
+  --text-tertiary:  #67718a;
+  --text-accent:    #88c0d0;
+
+  --border-subtle:  rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.11);
+  --divider:        rgba(255, 255, 255, 0.07);
+
+  --accent:         #88c0d0;
+  --accent-hover:   #a3d2df;
+  --accent-light:   rgba(136, 192, 208, 0.15);
+
+  --input-bg: rgba(255, 255, 255, 0.08);
+
+  --shadow-btn-accent: 0 1px 4px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.16), inset 0 -1px 0 rgba(0,0,0,0.20);
+  --shadow-nav-active: 0 1px 4px rgba(0,0,0,0.40), inset 0 1px 0 rgba(255,255,255,0.14), inset 0 -1px 0 rgba(0,0,0,0.18);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.12) 0%, rgba(0,0,0,0.10) 100%);
+
+  --badge-extracted-bg: #1b3d22;
+  --badge-extracted-fg: #5dbf6e;
+  --badge-summary-bg:   #1a2a4a;
+  --badge-summary-fg:   #82b1ff;
+  --badge-vector-bg:    #2d1a38;
+  --badge-vector-fg:    #ce93d8;
+  --badge-meta-bg:      #00282e;
+  --badge-meta-fg:      #4dd0e1;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.30), 0 1px 2px rgba(0, 0, 0, 0.20);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.40), 0 2px 6px rgba(0, 0, 0, 0.25);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.60), 0 8px 24px rgba(0, 0, 0, 0.40);
+}
+
+/* ── Twilight — deep violet night ── */
+[data-theme="twilight"] {
+  color-scheme: dark;
+
+  --bg-primary:   #201a2f;
+  --bg-secondary: #2b2340;
+  --bg-tertiary:  #372e4f;
+  --bg-hover:     rgba(255, 255, 255, 0.05);
+  --bg-active:    rgba(167, 139, 250, 0.18);
+  --bg-selected:  rgba(167, 139, 250, 0.12);
+
+  --text-primary:   #f0ebf9;
+  --text-secondary: #a99ec6;
+  --text-tertiary:  #675d88;
+  --text-accent:    #b39dfa;
+
+  --border-subtle:  rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.11);
+  --divider:        rgba(255, 255, 255, 0.07);
+
+  --accent:         #a78bfa;
+  --accent-hover:   #bfa7fc;
+  --accent-light:   rgba(167, 139, 250, 0.16);
+
+  --input-bg: rgba(255, 255, 255, 0.08);
+
+  --shadow-btn-accent: 0 1px 4px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.16), inset 0 -1px 0 rgba(0,0,0,0.20);
+  --shadow-nav-active: 0 1px 4px rgba(0,0,0,0.40), inset 0 1px 0 rgba(255,255,255,0.14), inset 0 -1px 0 rgba(0,0,0,0.18);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.12) 0%, rgba(0,0,0,0.10) 100%);
+
+  --badge-extracted-bg: #1b3d22;
+  --badge-extracted-fg: #5dbf6e;
+  --badge-summary-bg:   #1a2a4a;
+  --badge-summary-fg:   #82b1ff;
+  --badge-vector-bg:    #2d1a38;
+  --badge-vector-fg:    #ce93d8;
+  --badge-meta-bg:      #00282e;
+  --badge-meta-fg:      #4dd0e1;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.32), 0 1px 2px rgba(0, 0, 0, 0.22);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.42), 0 2px 6px rgba(0, 0, 0, 0.26);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.62), 0 8px 24px rgba(0, 0, 0, 0.42);
+}
+
+/* ── Ocean — abyssal teal ── */
+[data-theme="ocean"] {
+  color-scheme: dark;
+
+  --bg-primary:   #16272b;
+  --bg-secondary: #20353a;
+  --bg-tertiary:  #2b444a;
+  --bg-hover:     rgba(255, 255, 255, 0.05);
+  --bg-active:    rgba(45, 212, 191, 0.16);
+  --bg-selected:  rgba(45, 212, 191, 0.10);
+
+  --text-primary:   #e5f2f0;
+  --text-secondary: #92aeab;
+  --text-tertiary:  #57726f;
+  --text-accent:    #3fd9c6;
+
+  --border-subtle:  rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.11);
+  --divider:        rgba(255, 255, 255, 0.07);
+
+  --accent:         #2dd4bf;
+  --accent-hover:   #58dfcd;
+  --accent-light:   rgba(45, 212, 191, 0.15);
+
+  --input-bg: rgba(255, 255, 255, 0.08);
+
+  --shadow-btn-accent: 0 1px 4px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.16), inset 0 -1px 0 rgba(0,0,0,0.20);
+  --shadow-nav-active: 0 1px 4px rgba(0,0,0,0.40), inset 0 1px 0 rgba(255,255,255,0.14), inset 0 -1px 0 rgba(0,0,0,0.18);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.12) 0%, rgba(0,0,0,0.10) 100%);
+
+  --badge-extracted-bg: #1b3d22;
+  --badge-extracted-fg: #5dbf6e;
+  --badge-summary-bg:   #1a2a4a;
+  --badge-summary-fg:   #82b1ff;
+  --badge-vector-bg:    #2d1a38;
+  --badge-vector-fg:    #ce93d8;
+  --badge-meta-bg:      #00282e;
+  --badge-meta-fg:      #4dd0e1;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.32), 0 1px 2px rgba(0, 0, 0, 0.22);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.42), 0 2px 6px rgba(0, 0, 0, 0.26);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.62), 0 8px 24px rgba(0, 0, 0, 0.42);
+}
+
+/* ── Sepia — soft cream paper, gentle against white PDF pages ── */
+[data-theme="sepia"] {
+  color-scheme: light;
+
+  --bg-primary:    #fbf8f0;
+  --bg-secondary:  #f5f0e3;
+  --bg-tertiary:   #ece4cf;
+  --bg-hover:      rgba(120, 85, 30, 0.06);
+  --bg-active:     rgba(180, 132, 46, 0.10);
+  --bg-selected:   rgba(180, 132, 46, 0.07);
+
+  --text-primary:   #2c2417;
+  --text-secondary: #71634a;
+  --text-tertiary:  #a49172;
+  --text-accent:    #9c6f22;
+
+  --border-subtle:  rgba(120, 90, 40, 0.08);
+  --border-default: rgba(120, 90, 40, 0.14);
+  --divider:        rgba(120, 90, 40, 0.08);
+
+  --accent:         #b4842e;
+  --accent-hover:   #c6984a;
+  --accent-light:   rgba(180, 132, 46, 0.11);
+
+  --shadow-btn-accent: 0 1px 3px rgba(90, 60, 15, 0.25), inset 0 1px 0 rgba(255,255,255,0.18);
+  --shadow-nav-active: 0 1px 3px rgba(90, 60, 15, 0.20), inset 0 1px 0 rgba(255,255,255,0.15);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.14) 0%, rgba(0,0,0,0.08) 100%);
+
+  --badge-extracted-bg: #efe3bd;
+  --badge-extracted-fg: #7a5b12;
+  --badge-summary-bg:   #f3e2c8;
+  --badge-summary-fg:   #83521c;
+  --badge-vector-bg:    #ecdfc9;
+  --badge-vector-fg:    #7c4a12;
+  --badge-meta-bg:      #e9efe0;
+  --badge-meta-fg:      #4d7a2f;
+
+  --shadow-sm: 0 1px 3px rgba(95, 65, 20, 0.10), 0 1px 2px rgba(95, 65, 20, 0.06);
+  --shadow-md: 0 4px 16px rgba(95, 65, 20, 0.12), 0 2px 6px rgba(95, 65, 20, 0.07);
+  --shadow-lg: 0 20px 60px rgba(95, 65, 20, 0.20), 0 8px 24px rgba(95, 65, 20, 0.12);
+}
+
+/* ── Mint — fresh emerald breeze ── */
+[data-theme="mint"] {
+  color-scheme: light;
+
+  --bg-primary:    #f5faf7;
+  --bg-secondary:  #ebf4ee;
+  --bg-tertiary:   #dcebe1;
+  --bg-hover:      rgba(16, 185, 129, 0.06);
+  --bg-active:     rgba(16, 185, 129, 0.10);
+  --bg-selected:   rgba(16, 185, 129, 0.06);
+
+  --text-primary:   #12281d;
+  --text-secondary: #43614f;
+  --text-tertiary:  #7ca48c;
+  --text-accent:    #0b9668;
+
+  --border-subtle:  rgba(20, 130, 85, 0.08);
+  --border-default: rgba(20, 130, 85, 0.14);
+  --divider:        rgba(20, 130, 85, 0.08);
+
+  --accent:         #10b981;
+  --accent-hover:   #35cd97;
+  --accent-light:   rgba(16, 185, 129, 0.11);
+
+  --shadow-btn-accent: 0 1px 3px rgba(8, 90, 55, 0.22), inset 0 1px 0 rgba(255,255,255,0.18);
+  --shadow-nav-active: 0 1px 3px rgba(8, 90, 55, 0.18), inset 0 1px 0 rgba(255,255,255,0.15);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.14) 0%, rgba(0,0,0,0.08) 100%);
+
+  --badge-extracted-bg: #c9f5df;
+  --badge-extracted-fg: #0a6b45;
+  --badge-summary-bg:   #d7ecfe;
+  --badge-summary-fg:   #1260a0;
+  --badge-vector-bg:    #e9e0fb;
+  --badge-vector-fg:    #6d28d9;
+  --badge-meta-bg:      #c8f3ea;
+  --badge-meta-fg:      #0d6e5f;
+
+  --shadow-sm: 0 1px 3px rgba(8, 90, 55, 0.08), 0 1px 2px rgba(8, 90, 55, 0.05);
+  --shadow-md: 0 4px 16px rgba(8, 90, 55, 0.10), 0 2px 6px rgba(8, 90, 55, 0.06);
+  --shadow-lg: 0 20px 60px rgba(8, 90, 55, 0.18), 0 8px 24px rgba(8, 90, 55, 0.10);
+}
+
+/* ── Sky — airy morning blue ── */
+[data-theme="sky"] {
+  color-scheme: light;
+
+  --bg-primary:    #f6fafc;
+  --bg-secondary:  #ecf3f8;
+  --bg-tertiary:   #deeaf1;
+  --bg-hover:      rgba(14, 165, 233, 0.06);
+  --bg-active:     rgba(14, 165, 233, 0.10);
+  --bg-selected:   rgba(14, 165, 233, 0.06);
+
+  --text-primary:   #13252f;
+  --text-secondary: #4c687a;
+  --text-tertiary:  #86a3b4;
+  --text-accent:    #0284c7;
+
+  --border-subtle:  rgba(25, 110, 160, 0.08);
+  --border-default: rgba(25, 110, 160, 0.14);
+  --divider:        rgba(25, 110, 160, 0.08);
+
+  --accent:         #0ea5e9;
+  --accent-hover:   #3cb8f0;
+  --accent-light:   rgba(14, 165, 233, 0.11);
+
+  --shadow-btn-accent: 0 1px 3px rgba(15, 85, 130, 0.22), inset 0 1px 0 rgba(255,255,255,0.18);
+  --shadow-nav-active: 0 1px 3px rgba(15, 85, 130, 0.18), inset 0 1px 0 rgba(255,255,255,0.15);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.14) 0%, rgba(0,0,0,0.08) 100%);
+
+  --badge-extracted-bg: #d3f3e0;
+  --badge-extracted-fg: #16703f;
+  --badge-summary-bg:   #d6ecfd;
+  --badge-summary-fg:   #0f62a6;
+  --badge-vector-bg:    #eadffd;
+  --badge-vector-fg:    #6d28d9;
+  --badge-meta-bg:      #c9f2fa;
+  --badge-meta-fg:      #0b7386;
+
+  --shadow-sm: 0 1px 3px rgba(15, 85, 130, 0.08), 0 1px 2px rgba(15, 85, 130, 0.05);
+  --shadow-md: 0 4px 16px rgba(15, 85, 130, 0.10), 0 2px 6px rgba(15, 85, 130, 0.06);
+  --shadow-lg: 0 20px 60px rgba(15, 85, 130, 0.18), 0 8px 24px rgba(15, 85, 130, 0.10);
+}
+
+/* ── Sakura — soft cherry blossom pink ── */
+[data-theme="sakura"] {
+  color-scheme: light;
+
+  --bg-primary:    #fdf7fa;
+  --bg-secondary:  #f9eff4;
+  --bg-tertiary:   #f2e3eb;
+  --bg-hover:      rgba(236, 72, 153, 0.05);
+  --bg-active:     rgba(236, 72, 153, 0.09);
+  --bg-selected:   rgba(236, 72, 153, 0.06);
+
+  --text-primary:   #2b1823;
+  --text-secondary: #7c5669;
+  --text-tertiary:  #b38ba0;
+  --text-accent:    #d12f7b;
+
+  --border-subtle:  rgba(180, 60, 120, 0.07);
+  --border-default: rgba(180, 60, 120, 0.12);
+  --divider:        rgba(180, 60, 120, 0.07);
+
+  --accent:         #ec4899;
+  --accent-hover:   #f16fae;
+  --accent-light:   rgba(236, 72, 153, 0.10);
+
+  --shadow-btn-accent: 0 1px 3px rgba(130, 25, 75, 0.22), inset 0 1px 0 rgba(255,255,255,0.18);
+  --shadow-nav-active: 0 1px 3px rgba(130, 25, 75, 0.18), inset 0 1px 0 rgba(255,255,255,0.15);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.14) 0%, rgba(0,0,0,0.08) 100%);
+
+  --badge-extracted-bg: #fbe0ee;
+  --badge-extracted-fg: #b91c6b;
+  --badge-summary-bg:   #fbd9e8;
+  --badge-summary-fg:   #a91e63;
+  --badge-vector-bg:    #f6e0f7;
+  --badge-vector-fg:    #9333a8;
+  --badge-meta-bg:      #e3e4fb;
+  --badge-meta-fg:      #4f46a5;
+
+  --shadow-sm: 0 1px 3px rgba(130, 25, 75, 0.08), 0 1px 2px rgba(130, 25, 75, 0.05);
+  --shadow-md: 0 4px 16px rgba(130, 25, 75, 0.10), 0 2px 6px rgba(130, 25, 75, 0.06);
+  --shadow-lg: 0 20px 60px rgba(130, 25, 75, 0.18), 0 8px 24px rgba(130, 25, 75, 0.10);
+}
+
+/* ── Mist — quiet slate-grey morning fog ── */
+[data-theme="mist"] {
+  color-scheme: light;
+
+  --bg-primary:    #f7f9fa;
+  --bg-secondary:  #eef2f4;
+  --bg-tertiary:   #e0e7eb;
+  --bg-hover:      rgba(100, 116, 139, 0.06);
+  --bg-active:     rgba(100, 116, 139, 0.10);
+  --bg-selected:   rgba(100, 116, 139, 0.07);
+
+  --text-primary:   #1e293b;
+  --text-secondary: #5b6b7c;
+  --text-tertiary:  #94a3b3;
+  --text-accent:    #4a6f94;
+
+  --border-subtle:  rgba(80, 100, 120, 0.08);
+  --border-default: rgba(80, 100, 120, 0.13);
+  --divider:        rgba(80, 100, 120, 0.07);
+
+  --accent:         #6284a8;
+  --accent-hover:   #7a9abb;
+  --accent-light:   rgba(98, 132, 168, 0.12);
+
+  --shadow-btn-accent: 0 1px 3px rgba(50, 70, 95, 0.22), inset 0 1px 0 rgba(255,255,255,0.18);
+  --shadow-nav-active: 0 1px 3px rgba(50, 70, 95, 0.18), inset 0 1px 0 rgba(255,255,255,0.15);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.14) 0%, rgba(0,0,0,0.08) 100%);
+
+  --badge-extracted-bg: #e3efe6;
+  --badge-extracted-fg: #3a6b4a;
+  --badge-summary-bg:   #e2eaf4;
+  --badge-summary-fg:   #3c5a82;
+  --badge-vector-bg:    #e8e4f2;
+  --badge-vector-fg:    #6a5a94;
+  --badge-meta-bg:      #e0eef2;
+  --badge-meta-fg:      #3d6e7a;
+
+  --shadow-sm: 0 1px 3px rgba(50, 70, 95, 0.08), 0 1px 2px rgba(50, 70, 95, 0.05);
+  --shadow-md: 0 4px 16px rgba(50, 70, 95, 0.10), 0 2px 6px rgba(50, 70, 95, 0.06);
+  --shadow-lg: 0 20px 60px rgba(50, 70, 95, 0.18), 0 8px 24px rgba(50, 70, 95, 0.10);
+}
+
+/* ── Peach — soft coral sunrise ── */
+[data-theme="peach"] {
+  color-scheme: light;
+
+  --bg-primary:    #fdf8f5;
+  --bg-secondary:  #f9efe9;
+  --bg-tertiary:   #f3e2d8;
+  --bg-hover:      rgba(249, 112, 102, 0.06);
+  --bg-active:     rgba(249, 112, 102, 0.10);
+  --bg-selected:   rgba(249, 112, 102, 0.06);
+
+  --text-primary:   #2b1d18;
+  --text-secondary: #7d5f55;
+  --text-tertiary:  #b39388;
+  --text-accent:    #d6533f;
+
+  --border-subtle:  rgba(190, 90, 70, 0.08);
+  --border-default: rgba(190, 90, 70, 0.13);
+  --divider:        rgba(190, 90, 70, 0.07);
+
+  --accent:         #f97066;
+  --accent-hover:   #fb8a81;
+  --accent-light:   rgba(249, 112, 102, 0.11);
+
+  --shadow-btn-accent: 0 1px 3px rgba(150, 70, 50, 0.22), inset 0 1px 0 rgba(255,255,255,0.18);
+  --shadow-nav-active: 0 1px 3px rgba(150, 70, 50, 0.18), inset 0 1px 0 rgba(255,255,255,0.15);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.14) 0%, rgba(0,0,0,0.08) 100%);
+
+  --badge-extracted-bg: #fdeeee;
+  --badge-extracted-fg: #c0483a;
+  --badge-summary-bg:   #fce8dd;
+  --badge-summary-fg:   #b04a28;
+  --badge-vector-bg:    #f6e8f0;
+  --badge-vector-fg:    #a04a76;
+  --badge-meta-bg:      #e8f2ee;
+  --badge-meta-fg:      #3a7a62;
+
+  --shadow-sm: 0 1px 3px rgba(150, 70, 50, 0.08), 0 1px 2px rgba(150, 70, 50, 0.05);
+  --shadow-md: 0 4px 16px rgba(150, 70, 50, 0.10), 0 2px 6px rgba(150, 70, 50, 0.06);
+  --shadow-lg: 0 20px 60px rgba(150, 70, 50, 0.18), 0 8px 24px rgba(150, 70, 50, 0.10);
+}
+
+/* ── Mocha — warm coffee dark, Gruvbox-inspired ── */
+[data-theme="mocha"] {
+  color-scheme: dark;
+
+  --bg-primary:   #201a17;
+  --bg-secondary: #2b241f;
+  --bg-tertiary:  #38302a;
+  --bg-hover:     rgba(255, 255, 255, 0.05);
+  --bg-active:    rgba(212, 163, 115, 0.16);
+  --bg-selected:  rgba(212, 163, 115, 0.10);
+
+  --text-primary:   #f0e8dd;
+  --text-secondary: #b3a391;
+  --text-tertiary:  #6f6355;
+  --text-accent:    #d4a373;
+
+  --border-subtle:  rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.11);
+  --divider:        rgba(255, 255, 255, 0.06);
+
+  --accent:         #d4a373;
+  --accent-hover:   #e0b98e;
+  --accent-light:   rgba(212, 163, 115, 0.15);
+
+  --input-bg: rgba(255, 255, 255, 0.08);
+
+  --shadow-btn-accent: 0 1px 4px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.16), inset 0 -1px 0 rgba(0,0,0,0.20);
+  --shadow-nav-active: 0 1px 4px rgba(0,0,0,0.40), inset 0 1px 0 rgba(255,255,255,0.14), inset 0 -1px 0 rgba(0,0,0,0.18);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.12) 0%, rgba(0,0,0,0.10) 100%);
+
+  --badge-extracted-bg: #1b3d22;
+  --badge-extracted-fg: #5dbf6e;
+  --badge-summary-bg:   #1a2a4a;
+  --badge-summary-fg:   #82b1ff;
+  --badge-vector-bg:    #2d1a38;
+  --badge-vector-fg:    #ce93d8;
+  --badge-meta-bg:      #00282e;
+  --badge-meta-fg:      #4dd0e1;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.32), 0 1px 2px rgba(0, 0, 0, 0.22);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.42), 0 2px 6px rgba(0, 0, 0, 0.26);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.62), 0 8px 24px rgba(0, 0, 0, 0.42);
+}
+
+/* ── Pine — deep pine-forest dark ── */
+[data-theme="pine"] {
+  color-scheme: dark;
+
+  --bg-primary:   #131f1a;
+  --bg-secondary: #1c2d25;
+  --bg-tertiary:  #263b31;
+  --bg-hover:     rgba(255, 255, 255, 0.05);
+  --bg-active:    rgba(74, 222, 128, 0.15);
+  --bg-selected:  rgba(74, 222, 128, 0.10);
+
+  --text-primary:   #e4f0e8;
+  --text-secondary: #97b3a2;
+  --text-tertiary:  #54705f;
+  --text-accent:    #5fd08c;
+
+  --border-subtle:  rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.11);
+  --divider:        rgba(255, 255, 255, 0.06);
+
+  --accent:         #4ade80;
+  --accent-hover:   #6fe79a;
+  --accent-light:   rgba(74, 222, 128, 0.14);
+
+  --input-bg: rgba(255, 255, 255, 0.08);
+
+  --shadow-btn-accent: 0 1px 4px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.16), inset 0 -1px 0 rgba(0,0,0,0.20);
+  --shadow-nav-active: 0 1px 4px rgba(0,0,0,0.40), inset 0 1px 0 rgba(255,255,255,0.14), inset 0 -1px 0 rgba(0,0,0,0.18);
+  --gradient-accent: linear-gradient(to bottom, rgba(255,255,255,0.12) 0%, rgba(0,0,0,0.10) 100%);
+
+  --badge-extracted-bg: #1b3d22;
+  --badge-extracted-fg: #5dbf6e;
+  --badge-summary-bg:   #1a2a4a;
+  --badge-summary-fg:   #82b1ff;
+  --badge-vector-bg:    #2d1a38;
+  --badge-vector-fg:    #ce93d8;
+  --badge-meta-bg:      #00282e;
+  --badge-meta-fg:      #4dd0e1;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.32), 0 1px 2px rgba(0, 0, 0, 0.22);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.42), 0 2px 6px rgba(0, 0, 0, 0.26);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.62), 0 8px 24px rgba(0, 0, 0, 0.42);
+}
+
+/* ── Theme switch transition ───────────────────────────────────────
+   Added to <html> briefly while the theme changes so surfaces fade into
+   the new palette instead of snapping. Removed after ~300ms — never left
+   on permanently, so it can't interfere with per-component animations. */
+.theme-animating,
+.theme-animating *,
+.theme-animating *::before,
+.theme-animating *::after {
+  transition:
+    background-color .28s ease,
+    color .28s ease,
+    border-color .28s ease,
+    box-shadow .28s ease,
+    fill .28s ease,
+    stroke .28s ease !important;
+}
+
+/* ── hljs code-highlight overrides for all dark themes ─────────────
+   (Light themes use the default highlight.js github palette imported in
+   main.ts.) */
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs { color: #abb2bf; }
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-keyword,
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-selector-tag { color: #c678dd; }
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-string,
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-attr { color: #98c379; }
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-number,
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-literal { color: #d19a66; }
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-comment { color: #5c6370; font-style: italic; }
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-title,
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-name { color: #61afef; }
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-built_in,
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-type { color: #e5c07b; }
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-operator,
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .hljs-punctuation { color: #abb2bf; }
+
+/* ── PDF pages under dark themes ───────────────────────────────────
+   PDF pages are white by nature and glare against dark chrome. Invert the
+   page canvas Dark-Reader style — invert + hue-rotate keeps hues roughly
+   intact so figures stay recognizable — and darken the page backing to
+   match the inverted paper. Light themes keep the paper white.
+   (.pdf-pages ancestor bumps specificity above PdfViewer's scoped style.) */
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .pdf-canvas {
+  filter: invert(1) hue-rotate(180deg) contrast(0.9);
+}
+
+:is([data-theme="dark"], [data-theme="midnight"], [data-theme="aurora"], [data-theme="twilight"], [data-theme="ocean"], [data-theme="mocha"], [data-theme="pine"]) .pdf-pages .page-wrapper {
+  background: #0d0d0d;
+}

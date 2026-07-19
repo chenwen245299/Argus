@@ -1,11 +1,13 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import type { AppSettings, ThemeId } from '../types'
+import type { AppSettings } from '../types'
 
 export const useSettingsStore = defineStore('settings', () => {
   const settings = ref<AppSettings>({
     appearance: 'system',
+    appearance_light: 'light',
+    appearance_dark: 'dark',
     extraction_default: 'lopdf',
     usd_to_cny_rate: 7.2,
     metadata_ai_prompt: '',
@@ -24,7 +26,9 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       settings.value = await invoke<AppSettings>('get_settings')
       loaded.value = true
-      applyAppearance(settings.value.appearance)
+      ensureSchemeListener()
+      // No transition at startup — avoids a flash of animating colors on launch.
+      applyAppearance(false)
     } catch (e) {
       console.error('Failed to load settings:', e)
     }
@@ -63,22 +67,50 @@ export const useSettingsStore = defineStore('settings', () => {
     settings.value = { ...settings.value, ...patch }
     try {
       await invoke('save_settings', { settingsData: settings.value })
-      applyAppearance(settings.value.appearance)
+      applyAppearance()
     } catch (e) {
       // Roll back the optimistic update so UI reflects the persisted state.
       settings.value = previous
-      applyAppearance(settings.value.appearance)
+      applyAppearance()
       console.error('Failed to save settings:', e)
     }
   }
 
-  function applyAppearance(mode: ThemeId | string) {
+  // Briefly enables color transitions on <html> while a theme is applied so
+  // the UI fades into the new palette instead of snapping. The class is
+  // always removed again — it must never stay on permanently.
+  let themeAnimTimer: ReturnType<typeof setTimeout> | null = null
+  let schemeMedia: MediaQueryList | null = null
+
+  // Concrete palette that should be active right now. In 'system' mode this
+  // follows the OS light/dark setting using the user's per-mode preferences.
+  function resolveTheme(): string {
+    const s = settings.value
+    if (s.appearance && s.appearance !== 'system') return s.appearance
+    const osDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+    return osDark ? (s.appearance_dark || 'dark') : (s.appearance_light || 'light')
+  }
+
+  // Re-apply the theme when the OS flips light/dark while in 'system' mode.
+  function ensureSchemeListener() {
+    if (schemeMedia) return
+    schemeMedia = window.matchMedia('(prefers-color-scheme: dark)')
+    schemeMedia.addEventListener('change', () => {
+      if (settings.value.appearance === 'system') applyAppearance()
+    })
+  }
+
+  function applyAppearance(animate = true) {
     const root = document.documentElement
-    if (!mode || mode === 'system') {
-      root.removeAttribute('data-theme')
-    } else {
-      root.setAttribute('data-theme', mode)
+    if (animate) {
+      root.classList.add('theme-animating')
+      if (themeAnimTimer) clearTimeout(themeAnimTimer)
+      themeAnimTimer = setTimeout(() => {
+        root.classList.remove('theme-animating')
+        themeAnimTimer = null
+      }, 320)
     }
+    root.setAttribute('data-theme', resolveTheme())
   }
 
   return {

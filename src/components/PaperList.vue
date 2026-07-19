@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { Icon } from '@iconify/vue'
 import { listen } from '@tauri-apps/api/event'
 import { useI18n } from 'vue-i18n'
 import { storeToRefs } from 'pinia'
@@ -874,19 +875,19 @@ const STATUS_COLORS: Record<string, string> = {
 const PAPER_CATEGORIES = [
   {
     tag: '理论',
-    icon: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>',
+    icon: 'fluent:lightbulb-24-regular',
     color: '#7c3aed',
     bg: '#f3e8ff',
   },
   {
     tag: '方法',
-    icon: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
+    icon: 'fluent:key-24-regular',
     color: '#2563eb',
     bg: '#dbeafe',
   },
   {
     tag: '数据集',
-    icon: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>',
+    icon: 'fluent:database-24-regular',
     color: '#059669',
     bg: '#d1fae5',
   },
@@ -1429,9 +1430,7 @@ async function deleteBatch() {
     <!-- ── Action error toast ─────────────────────────────────────────────── -->
     <Transition name="err-toast">
       <div v-if="actionError" class="action-error-toast" @click.self="actionError = null">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0">
-          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-        </svg>
+        <Icon icon="fluent:error-circle-24-regular" width="14" height="14" style="flex-shrink:0" />
         <span>{{ actionError }}</span>
       </div>
     </Transition>
@@ -1500,17 +1499,9 @@ async function deleteBatch() {
           :title="exportDone ? t('list.exportListDone') : t('list.exportList')"
           @click.stop="exportToPdf"
         >
-          <svg v-if="exportBusy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="spin">
-            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
-          </svg>
-          <svg v-else-if="exportDone" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <polyline points="20 6 9 17 4 12"/>
-          </svg>
-          <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/>
-            <polyline points="16 6 12 2 8 6"/>
-            <line x1="12" y1="2" x2="12" y2="15"/>
-          </svg>
+          <Icon v-if="exportBusy" icon="fluent:spinner-ios-20-filled" width="14" height="14" class="spin" />
+          <Icon v-else-if="exportDone" icon="fluent:checkmark-24-regular" width="14" height="14" />
+          <Icon v-else icon="fluent:arrow-download-24-regular" width="14" height="14" />
         </button>
         <button
           class="col-picker-btn"
@@ -1518,24 +1509,16 @@ async function deleteBatch() {
           :title="t('list.colPicker')"
           @click.stop="showColPicker = !showColPicker"
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M4 6h8"/>
-            <path d="M16 6h4"/>
-            <circle cx="14" cy="6" r="2"/>
-            <path d="M4 12h3"/>
-            <path d="M11 12h9"/>
-            <circle cx="9" cy="12" r="2"/>
-            <path d="M4 18h10"/>
-            <path d="M18 18h2"/>
-            <circle cx="16" cy="18" r="2"/>
-          </svg>
+          <Icon icon="fluent:options-24-regular" width="14" height="14" />
         </button>
         <div v-if="showColPicker" class="col-picker-menu" @click.stop>
           <div class="col-picker-title">{{ t('list.colPicker') }}</div>
           <button v-for="id in ALL_COL_IDS" :key="id" class="col-picker-item" @click="toggleCol(id)">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <polyline v-if="visibleCols.has(id)" points="20 6 9 17 4 12"/>
-            </svg>
+            <Icon
+              icon="fluent:checkmark-24-regular"
+              width="13" height="13"
+              :style="{ visibility: visibleCols.has(id) ? 'visible' : 'hidden' }"
+            />
             {{ t(COL_META[id].labelKey) }}
           </button>
         </div>
@@ -1549,9 +1532,7 @@ async function deleteBatch() {
         <span class="search-count">{{ t('search.hits').replace('{n}', String(selection.searchResults.length)) }}</span>
       </div>
       <div v-if="selection.searchResults.length === 0" class="empty-state">
-        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-        </svg>
+        <Icon icon="fluent:search-24-regular" width="32" height="32" />
         <p>{{ t('search.noResults') }}</p>
       </div>
       <div v-else class="search-results">
@@ -1572,29 +1553,20 @@ async function deleteBatch() {
 
     <!-- ── Inbox placeholder ─────────────────────────────────────────────── -->
     <div v-else-if="selection.activeNav === 'inbox'" class="empty-state">
-      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/>
-        <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>
-      </svg>
+      <Icon icon="fluent:mail-inbox-24-regular" width="32" height="32" />
       <p>{{ t('list.inboxEmpty') }}</p>
       <span>{{ t('list.inboxHint') }}</span>
     </div>
 
     <!-- ── Recently read (empty) ─────────────────────────────────────────── -->
     <div v-else-if="selection.activeNav === 'recent' && sorted.length === 0 && !library.isLoading" class="empty-state">
-      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <circle cx="12" cy="12" r="9"/>
-        <polyline points="12 7 12 12 15 14"/>
-      </svg>
+      <Icon icon="fluent:clock-24-regular" width="32" height="32" />
       <p>{{ t('sidebar.recentEmpty') }}</p>
     </div>
 
     <!-- ── Empty state ───────────────────────────────────────────────────── -->
     <div v-else-if="sorted.length === 0 && !library.isLoading" class="empty-state">
-      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-      </svg>
+      <Icon icon="fluent:book-24-regular" width="32" height="32" />
       <p>{{ selection.activeNav.startsWith('collection:') ? t('collections.empty') : t('list.noPapers') }}</p>
       <span>{{ importHint }}</span>
       <button
@@ -1603,12 +1575,7 @@ async function deleteBatch() {
         :title="importButtonTitle"
         @click="pickAndImport"
       >
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/>
-          <line x1="12" y1="18" x2="12" y2="12"/>
-          <polyline points="9 15 12 18 15 15"/>
-        </svg>
+        <Icon icon="fluent:document-arrow-down-24-regular" width="13" height="13" />
         {{ t('import.btn') }}
       </button>
     </div>
@@ -1676,7 +1643,7 @@ async function deleteBatch() {
                 </div>
                 <div v-else-if="col.id === 'year'" class="row-cell row-year">{{ item.year ?? '—' }}</div>
                 <div v-else-if="col.id === 'added_at'" class="row-cell row-date">{{ formatDate(item.added_at) }}</div>
-                <div v-else-if="col.id === 'status'" class="row-right"><StatusBadges :status="item.status" /></div>
+                <div v-else-if="col.id === 'status'" class="row-right"><StatusBadges :status="item.status" :has-bibtex="item.has_bibtex" /></div>
                 <div v-else-if="col.id === 'tags'" class="row-cell row-tags">
                   <template v-if="item.tags && item.tags.length > 0">
                     <span
@@ -1685,10 +1652,11 @@ async function deleteBatch() {
                       class="tag-chip"
                       :style="categoryStyleFor(tag)"
                     >
-                      <span
+                      <Icon
                         v-if="categoryIconFor(tag)"
                         class="tag-icon"
-                        v-html="categoryIconFor(tag)"
+                        :icon="categoryIconFor(tag)!"
+                        width="13" height="13"
                       />
                       <span class="tag-text" @click="clickTag($event, tag)">{{ tag }}</span>
                       <button
@@ -1742,9 +1710,7 @@ async function deleteBatch() {
           <div class="ctx-item-group" @mouseenter="ctxMenu!.showColls = true" @mouseleave="ctxMenu!.showColls = false">
             <button class="ctx-item has-sub">
               {{ t('collections.addToColl') }}
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-left:auto">
-                <polyline points="9 18 15 12 9 6"/>
-              </svg>
+              <Icon icon="fluent:chevron-right-24-regular" width="12" height="12" style="margin-left:auto" />
             </button>
             <div v-if="ctxMenu.showColls && collectionsStore.file.collections.length === 0" class="ctx-submenu">
               <div class="ctx-item disabled">{{ t('collections.noCollections') }}</div>
@@ -1784,7 +1750,7 @@ async function deleteBatch() {
               }"
               @click="toggleCategoryBatch(cat.tag)"
             >
-              <span class="ctx-category-icon" v-html="cat.icon" />
+              <Icon class="ctx-category-icon" :icon="cat.icon" width="13" height="13" />
               {{ cat.tag }}
             </button>
           </div>
@@ -1806,9 +1772,7 @@ async function deleteBatch() {
         <div class="ctx-item-group" @mouseenter="ctxMenu!.showColls = true" @mouseleave="ctxMenu!.showColls = false">
           <button class="ctx-item has-sub">
             {{ t('collections.addToColl') }}
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-left:auto">
-              <polyline points="9 18 15 12 9 6"/>
-            </svg>
+            <Icon icon="fluent:chevron-right-24-regular" width="12" height="12" style="margin-left:auto" />
           </button>
           <div v-if="ctxMenu.showColls && collectionsStore.file.collections.length === 0" class="ctx-submenu">
             <div v-if="collectionsStore.file.collections.length === 0" class="ctx-item disabled">
@@ -1846,10 +1810,11 @@ async function deleteBatch() {
               :style="categoryStyleFor(tag)"
               @click="removeTagFromContext(tag)"
             >
-              <span
+              <Icon
                 v-if="categoryIconFor(tag)"
                 class="ctx-tag-icon"
-                v-html="categoryIconFor(tag)"
+                :icon="categoryIconFor(tag)!"
+                width="13" height="13"
               />
               <span>{{ tag }}</span>
               <span class="ctx-tag-remove">×</span>
@@ -1882,10 +1847,11 @@ async function deleteBatch() {
                 class="ctx-tag-suggestion"
                 @click="addSuggestedTag(tag)"
               >
-                <span
+                <Icon
                   v-if="categoryIconFor(tag)"
                   class="ctx-tag-icon"
-                  v-html="categoryIconFor(tag)"
+                  :icon="categoryIconFor(tag)!"
+                  width="13" height="13"
                 />
                 <span>{{ tag }}</span>
               </button>
@@ -1918,7 +1884,7 @@ async function deleteBatch() {
             }"
             @click="toggleCategoryTag(ctxMenu!.item, cat.tag)"
           >
-            <span class="ctx-category-icon" v-html="cat.icon" />
+            <Icon class="ctx-category-icon" :icon="cat.icon" width="13" height="13" />
             {{ cat.tag }}
           </button>
         </div>

@@ -11,7 +11,7 @@ use crate::LibraryRoot;
 use crate::{
     ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas,
     canvas_enhance, collections, copilot, ebook, extraction, library, llm, metadata, paper, rag,
-    search, sections, security_bookmark, settings, snippets, url_import,
+    search, sections, security_bookmark, settings, snippets, url_import, writing,
 };
 // ── Library management ────────────────────────────────────────────────────────
 
@@ -977,6 +977,7 @@ pub async fn delete_paper(slug: String, state: State<'_, LibraryRoot>) -> Result
         let deleted_id = meta.id.clone();
         let _ = rag::delete_paper_chunks(&root, &deleted_id).await;
         let _ = collections::purge_paper(&root, &deleted_id);
+        let _ = writing::purge_paper(&root, &deleted_id);
         // Drop this paper's id from every other paper's related_ids so no
         // dangling manual "related paper" links point at a paper that's gone.
         if let Ok(dirs) = paper::list_paper_dirs(&root) {
@@ -1099,6 +1100,18 @@ pub async fn get_cached_references(
     let mut refs = metadata::read_cached_references(&root, &slug);
     metadata::match_references_to_library(&root, &mut refs);
     Ok(refs)
+}
+
+/// Return the papers already in the library that cite this one, derived purely
+/// from cached references (no network). Shaped as `CitationRef`s so the citation
+/// graph can render the "cited-by" view with the same node component.
+#[tauri::command]
+pub async fn get_library_citers(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<Vec<crate::models::CitationRef>, String> {
+    let root = get_root(&state)?;
+    Ok(metadata::library_citers(&root, &slug))
 }
 
 /// Fetch the reference list from Semantic Scholar (and cache it), then annotate
@@ -1344,6 +1357,68 @@ pub async fn get_collection_folder_path(
 ) -> Result<String, String> {
     let root = get_root(&state)?;
     let path = collections::collection_folder_path_for(&root, &collection_id)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+// ── Writing reference lists ─────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_writing_lists(
+    state: State<'_, LibraryRoot>,
+) -> Result<writing::WritingListsFile, String> {
+    let root = get_root(&state)?;
+    Ok(writing::list_writing_lists(&root))
+}
+
+#[tauri::command]
+pub async fn create_writing_list(
+    name: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<writing::WritingList, String> {
+    let root = get_root(&state)?;
+    writing::create_writing_list(&root, name)
+}
+
+#[tauri::command]
+pub async fn rename_writing_list(
+    id: String,
+    name: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    writing::rename_writing_list(&root, &id, name)
+}
+
+#[tauri::command]
+pub async fn delete_writing_list(id: String, state: State<'_, LibraryRoot>) -> Result<(), String> {
+    let root = get_root(&state)?;
+    writing::delete_writing_list(&root, &id)
+}
+
+#[tauri::command]
+pub async fn add_papers_to_writing_list(
+    id: String,
+    paper_ids: Vec<String>,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    writing::add_papers_to_writing_list(&root, &id, paper_ids)
+}
+
+#[tauri::command]
+pub async fn remove_paper_from_writing_list(
+    id: String,
+    paper_id: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    writing::remove_paper_from_writing_list(&root, &id, &paper_id)
+}
+
+#[tauri::command]
+pub async fn get_writing_folder_path(state: State<'_, LibraryRoot>) -> Result<String, String> {
+    let root = get_root(&state)?;
+    let path = writing::writing_folder_path(&root)?;
     Ok(path.to_string_lossy().to_string())
 }
 

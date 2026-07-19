@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Icon } from '@iconify/vue'
 import { useCollectionsStore } from '../stores/collections'
 import type { Collection } from '../types'
 
@@ -40,18 +41,13 @@ function childCollections(col: Collection): Collection[] {
       >
         <span class="ctx-collection-icon" aria-hidden="true">{{ collectionEmoji(col) }}</span>
         <span class="ctx-collection-name">{{ col.name }}</span>
-        <svg
+        <Icon
           v-if="childCollections(col).length"
           class="ctx-folder-chevron"
-          width="10"
-          height="10"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2.5"
-        >
-          <polyline points="9 18 15 12 9 6"/>
-        </svg>
+          icon="fluent:chevron-right-24-regular"
+          width="11"
+          height="11"
+        />
       </button>
 
       <CollectionCascadeMenu

@@ -16,6 +16,7 @@ import { updateStore } from '../stores/update'
 import { filterRecentlyRead, recentPapersVersion } from '../utils/recentPapers'
 import { ensureFluentIcons, fluentReady, fluentEmojiList, type FluentEmojiEntry } from '../utils/fluentEmoji'
 import { libraries as snippetLibraries, snippets as allSnippets, createLibrary as createSnippetLibrary, deleteLibrary as deleteSnippetLibrary, renameLibrary as renameSnippetLibrary, loadAll as reloadSnippets } from '../stores/snippetLibrary'
+import { lists as writingLists, activeListId as writingActiveListId, loadLists as loadWritingLists, createList as createWritingList, renameList as renameWritingList, deleteList as deleteWritingList } from '../stores/writing'
 
 const { t } = useI18n()
 const library = useLibraryStore()
@@ -31,11 +32,16 @@ const recentCount = computed(() => {
   return filterRecentlyRead(library.papers).length
 })
 
-const showSettings = defineModel<boolean>('showSettings', { default: false })
-const props = defineProps<{ snippetLibraryVisible?: boolean; activeSnippetLibraryId?: string | null }>()
-const emit = defineEmits<{ 'open-canvas': [canvasId: string]; 'open-snippet-library': [libraryId: string] }>()
+type SidebarMode = 'library' | 'canvas' | 'snippets' | 'writing'
 
-type SidebarMode = 'library' | 'canvas' | 'snippets'
+const showSettings = defineModel<boolean>('showSettings', { default: false })
+const props = defineProps<{ snippetLibraryVisible?: boolean; activeSnippetLibraryId?: string | null; activeWorkspace?: SidebarMode }>()
+const emit = defineEmits<{
+  'switch-workspace': [mode: SidebarMode]
+  'open-canvas': [canvasId: string]
+  'open-snippet-library': [libraryId: string]
+  'open-writing': [listId: string | null]
+}>()
 
 const expanded = ref<Set<string>>(new Set())
 const libraryCollapsed = ref(false)
@@ -56,7 +62,7 @@ const collectionScrollRef = ref<HTMLElement | null>(null)
 function loadSidebarMode(): SidebarMode {
   try {
     const raw = localStorage.getItem(SIDEBAR_MODE_KEY)
-    if (raw === 'canvas' || raw === 'snippets' || raw === 'library') return raw
+    if (raw === 'canvas' || raw === 'snippets' || raw === 'library' || raw === 'writing') return raw
   } catch {}
   return 'library'
 }
@@ -70,22 +76,43 @@ function saveSidebarMode(mode: SidebarMode) {
 function sidebarModeLabel(mode: SidebarMode): string {
   if (mode === 'canvas') return t('sidebar.canvas')
   if (mode === 'snippets') return t('snippets.title')
+  if (mode === 'writing') return t('writing.title')
   return t('sidebar.library')
 }
 
 const activeSidebarModeLabel = computed(() => sidebarModeLabel(sidebarMode.value))
 
-function setSidebarMode(mode: SidebarMode) {
+// Set the sidebar panel mode + load that mode's data, WITHOUT opening a center
+// view. Used both by the workspace dropdown and by the reactive sync below.
+function applySidebarMode(mode: SidebarMode) {
   sidebarMode.value = mode
   saveSidebarMode(mode)
-  showWorkspaceMenu.value = false
-  closeCtx()
   if (mode === 'canvas') {
     void canvasStore.loadList()
   } else if (mode === 'snippets') {
     void reloadSnippets()
+  } else if (mode === 'writing') {
+    void loadWritingLists()
   }
 }
+
+function setSidebarMode(mode: SidebarMode) {
+  applySidebarMode(mode)
+  showWorkspaceMenu.value = false
+  closeCtx()
+  emit('switch-workspace', mode)
+}
+
+// Keep the sidebar workspace in step with whichever tab/view is active in the
+// center (open a paper → library, click the writing tab → writing, …). Only
+// reacts to real center changes — using the dropdown already sets the mode
+// locally, so this is a no-op in that path.
+watch(
+  () => props.activeWorkspace,
+  (ws) => {
+    if (ws && ws !== sidebarMode.value) applySidebarMode(ws)
+  }
+)
 
 function loadCanvasPanelHeight() {
   try {
@@ -134,12 +161,13 @@ onMounted(async () => {
   if (library.currentPath) {
     expanded.value = loadExpandedCollections(library.currentPath)
     await Promise.all([collectionsStore.load(), canvasStore.loadList()])
+    if (sidebarMode.value === 'writing') void loadWritingLists()
   }
   window.addEventListener('mousedown', onGlobalMousedown)
 })
 
 function onGlobalMousedown(e: MouseEvent) {
-  const anyMenuOpen = showWorkspaceMenu.value || ctxMenu.value || canvasCtxMenu.value || libCtxMenu.value || snippetCtxMenu.value
+  const anyMenuOpen = showWorkspaceMenu.value || ctxMenu.value || canvasCtxMenu.value || libCtxMenu.value || snippetCtxMenu.value || writingCtxMenu.value
   if (!anyMenuOpen) return
   const target = e.target as Element | null
   if (target?.closest('.workspace-switcher')) return
@@ -157,9 +185,9 @@ function toggleTag(tag: string) {
 }
 
 const CATEGORY_ICONS: Record<string, string> = {
-  '理论': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>',
-  '方法': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
-  '数据集': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>',
+  '理论': 'fluent:lightbulb-24-regular',
+  '方法': 'fluent:key-24-regular',
+  '数据集': 'fluent:database-24-regular',
 }
 
 const CATEGORY_STYLES: Record<string, { color: string; background: string }> = {
@@ -220,13 +248,18 @@ async function scrollToCollection(collectionId: string | null) {
   })
 }
 
-async function syncSidebarToPaper(slug: string | null) {
+async function syncSidebarToPaper(slug: string | null, opts: { fromReaderTab?: boolean } = {}) {
   if (!slug) return
   const paper = library.papers.find(p => p.slug === slug)
   if (!paper) return
 
+  // Single-click select in the writing workspace only previews notes in the
+  // right sidebar — stay put. Actually opening a paper (a reader tab) is a real
+  // navigation into the library, so fall through and reveal it there.
+  if (sidebarMode.value === 'writing' && !opts.fromReaderTab) return
+
   if (sidebarMode.value !== 'library') {
-    setSidebarMode('library')
+    applySidebarMode('library')
   }
   libraryCollapsed.value = false
 
@@ -255,7 +288,7 @@ async function syncSidebarToPaper(slug: string | null) {
 watch(
   () => readerStore.activeSlug,
   (slug) => {
-    void syncSidebarToPaper(slug)
+    void syncSidebarToPaper(slug, { fromReaderTab: true })
   }
 )
 
@@ -683,6 +716,94 @@ function stopResizeSnippet() {
   window.removeEventListener('mousemove', onResizeSnippetMove)
 }
 
+// ── Writing reference lists ───────────────────────────────────────────────────
+const showNewWritingInput = ref(false)
+const newWritingName = ref('')
+const writingRenamingId = ref<string | null>(null)
+const writingRenameValue = ref('')
+const writingCtxMenu = ref<{ x: number; y: number; id: string; name: string } | null>(null)
+const writingRefreshSpinning = ref(false)
+
+async function handleWritingRefresh() {
+  if (writingRefreshSpinning.value) return
+  writingRefreshSpinning.value = true
+  const t0 = Date.now()
+  try {
+    await loadWritingLists()
+  } finally {
+    const remaining = 700 - (Date.now() - t0)
+    if (remaining > 0) await new Promise(r => setTimeout(r, remaining))
+    writingRefreshSpinning.value = false
+  }
+}
+
+function startNewWritingList() {
+  setSidebarMode('writing')
+  newWritingName.value = ''
+  showNewWritingInput.value = true
+  setTimeout(() => (document.getElementById('new-writing-input') as HTMLInputElement)?.focus(), 50)
+}
+
+async function submitNewWritingList() {
+  const name = newWritingName.value.trim()
+  showNewWritingInput.value = false
+  if (!name) return
+  const list = await createWritingList(name)
+  if (list) selectWritingList(list.id)
+}
+
+function selectWritingList(id: string | null) {
+  writingActiveListId.value = id
+  closeCtx()
+  emit('open-writing', id)
+}
+
+function startRenameWritingList(id: string, name: string) {
+  closeWritingCtx()
+  writingRenamingId.value = id
+  writingRenameValue.value = name
+  nextTick(() => {
+    const el = document.getElementById(`writing-rename-${id}`) as HTMLInputElement | null
+    el?.focus()
+    el?.select()
+  })
+}
+
+async function submitRenameWritingList(id: string) {
+  const name = writingRenameValue.value.trim()
+  if (name) await renameWritingList(id, name)
+  writingRenamingId.value = null
+  writingRenameValue.value = ''
+}
+
+async function handleDeleteWritingList(id: string, name: string) {
+  closeWritingCtx()
+  if (!window.confirm(t('writing.deleteListConfirm').replace('{name}', name))) return
+  await deleteWritingList(id)
+}
+
+function openWritingCtx(e: MouseEvent, id: string, name: string) {
+  e.preventDefault()
+  ctxMenu.value = null
+  libCtxMenu.value = null
+  canvasCtxMenu.value = null
+  snippetCtxMenu.value = null
+  writingCtxMenu.value = { x: e.clientX, y: e.clientY, id, name }
+}
+
+function closeWritingCtx() {
+  writingCtxMenu.value = null
+}
+
+async function openWritingFolderInFinder() {
+  try {
+    const path = await invoke<string>('get_writing_folder_path')
+    await invoke('open_in_finder', { path })
+  } catch (e) {
+    console.error('Open writing folder in finder failed:', e)
+  }
+}
+
 // ── Context menu (collections) ────────────────────────────────────────────────
 const ctxMenu = ref<{ x: number; y: number; col: Collection } | null>(null)
 const canvasCtxMenu = ref<{ x: number; y: number; entry: CanvasIndexEntry } | null>(null)
@@ -735,6 +856,7 @@ function closeCtx() {
   libCtxMenu.value = null
   canvasCtxMenu.value = null
   snippetCtxMenu.value = null
+  writingCtxMenu.value = null
 }
 
 // ── Drag-drop targets (driven by pointer-based drag in PaperList) ─────────────
@@ -920,26 +1042,18 @@ onUnmounted(() => {
         <div class="workspace-switcher">
           <button class="workspace-switcher-btn" @click.stop="showWorkspaceMenu = !showWorkspaceMenu">
             <span class="workspace-icon" aria-hidden="true">
-              <svg v-if="sidebarMode === 'library'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-              </svg>
-              <svg v-else-if="sidebarMode === 'canvas'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="8" cy="8" r="2"/><circle cx="16" cy="8" r="2"/><circle cx="12" cy="17" r="2"/>
-                <line x1="9.8" y1="8.8" x2="13.2" y2="15.4"/><line x1="14.2" y1="8.8" x2="10.8" y2="15.4"/><line x1="10" y1="8" x2="14" y2="8"/>
-              </svg>
-              <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-              </svg>
+              <Icon v-if="sidebarMode === 'library'" icon="fluent:book-24-regular" width="14" height="14" />
+              <Icon v-else-if="sidebarMode === 'canvas'" icon="fluent:share-android-24-regular" width="14" height="14" />
+              <Icon v-else-if="sidebarMode === 'writing'" icon="fluent:edit-24-regular" width="14" height="14" />
+              <Icon v-else icon="fluent:folder-24-regular" width="14" height="14" />
             </span>
             <span class="workspace-title">{{ activeSidebarModeLabel }}</span>
-            <svg
-              width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+            <Icon
+              icon="fluent:chevron-down-24-regular"
+              width="13" height="13"
               class="workspace-caret"
               :class="{ 'is-open': showWorkspaceMenu }"
-            >
-              <polyline points="6 9 12 15 18 9"/>
-            </svg>
+            />
           </button>
 
           <Transition name="workspace-menu">
@@ -949,10 +1063,7 @@ onUnmounted(() => {
                 :class="{ active: sidebarMode === 'library' }"
                 @click="setSidebarMode('library')"
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-                  <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-                </svg>
+                <Icon icon="fluent:book-24-regular" width="14" height="14" />
                 {{ t('sidebar.library') }}
               </button>
               <button
@@ -960,10 +1071,7 @@ onUnmounted(() => {
                 :class="{ active: sidebarMode === 'canvas' }"
                 @click="setSidebarMode('canvas')"
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <circle cx="8" cy="8" r="2"/><circle cx="16" cy="8" r="2"/><circle cx="12" cy="17" r="2"/>
-                  <line x1="9.8" y1="8.8" x2="13.2" y2="15.4"/><line x1="14.2" y1="8.8" x2="10.8" y2="15.4"/><line x1="10" y1="8" x2="14" y2="8"/>
-                </svg>
+                <Icon icon="fluent:share-android-24-regular" width="14" height="14" />
                 {{ t('sidebar.canvas') }}
               </button>
               <button
@@ -971,10 +1079,16 @@ onUnmounted(() => {
                 :class="{ active: sidebarMode === 'snippets' }"
                 @click="setSidebarMode('snippets')"
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-                </svg>
+                <Icon icon="fluent:folder-24-regular" width="14" height="14" />
                 {{ t('snippets.title') }}
+              </button>
+              <button
+                class="workspace-menu-item"
+                :class="{ active: sidebarMode === 'writing' }"
+                @click="setSidebarMode('writing')"
+              >
+                <Icon icon="fluent:edit-24-regular" width="14" height="14" />
+                {{ t('writing.title') }}
               </button>
             </div>
           </Transition>
@@ -988,13 +1102,7 @@ onUnmounted(() => {
             :disabled="refreshSpinning"
             @click.stop="handleLibraryRefresh()"
           >
-            <svg
-              width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-              :class="{ spin: refreshSpinning }"
-            >
-              <polyline points="23 4 23 10 17 10"/>
-              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-            </svg>
+            <Icon icon="fluent:arrow-sync-24-regular" width="14" height="14" :class="{ spin: refreshSpinning }" />
           </button>
           <button
             v-else-if="sidebarMode === 'canvas'"
@@ -1003,24 +1111,25 @@ onUnmounted(() => {
             :disabled="canvasRefreshSpinning"
             @click.stop="handleCanvasRefresh()"
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-              :class="{ spin: canvasRefreshSpinning }">
-              <polyline points="23 4 23 10 17 10"/>
-              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-            </svg>
+            <Icon icon="fluent:arrow-sync-24-regular" width="14" height="14" :class="{ spin: canvasRefreshSpinning }" />
           </button>
           <button
-            v-else
+            v-else-if="sidebarMode === 'snippets'"
             class="icon-action"
             :title="t('toolbar.refreshTitle')"
             :disabled="snippetRefreshSpinning"
             @click.stop="handleSnippetRefresh()"
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-              :class="{ spin: snippetRefreshSpinning }">
-              <polyline points="23 4 23 10 17 10"/>
-              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-            </svg>
+            <Icon icon="fluent:arrow-sync-24-regular" width="14" height="14" :class="{ spin: snippetRefreshSpinning }" />
+          </button>
+          <button
+            v-else
+            class="icon-action"
+            :title="t('toolbar.refreshTitle')"
+            :disabled="writingRefreshSpinning"
+            @click.stop="handleWritingRefresh()"
+          >
+            <Icon icon="fluent:arrow-sync-24-regular" width="14" height="14" :class="{ spin: writingRefreshSpinning }" />
           </button>
 
           <button
@@ -1029,10 +1138,7 @@ onUnmounted(() => {
             :title="t('collections.new')"
             @click.stop="startNew()"
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="12" y1="5" x2="12" y2="19"/>
-              <line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
+            <Icon icon="fluent:add-24-regular" width="15" height="15" />
           </button>
           <button
             v-else-if="sidebarMode === 'canvas'"
@@ -1040,21 +1146,23 @@ onUnmounted(() => {
             :title="t('canvas.newCanvas')"
             @click.stop="startNewCanvas()"
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="12" y1="5" x2="12" y2="19"/>
-              <line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
+            <Icon icon="fluent:add-24-regular" width="15" height="15" />
           </button>
           <button
-            v-else
+            v-else-if="sidebarMode === 'snippets'"
             class="icon-action"
             :title="t('snippets.newLibrary')"
             @click.stop="startNewSnippetLib()"
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="12" y1="5" x2="12" y2="19"/>
-              <line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
+            <Icon icon="fluent:add-24-regular" width="15" height="15" />
+          </button>
+          <button
+            v-else
+            class="icon-action"
+            :title="t('writing.newList')"
+            @click.stop="startNewWritingList()"
+          >
+            <Icon icon="fluent:add-24-regular" width="15" height="15" />
           </button>
         </div>
       </div>
@@ -1073,12 +1181,7 @@ onUnmounted(() => {
                 @click="select('all')"
                 @contextmenu.prevent="openLibCtx($event)"
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <rect x="3" y="3" width="7" height="7"/>
-                  <rect x="14" y="3" width="7" height="7"/>
-                  <rect x="14" y="14" width="7" height="7"/>
-                  <rect x="3" y="14" width="7" height="7"/>
-                </svg>
+                <Icon icon="fluent:grid-24-regular" width="14" height="14" />
                 {{ t('sidebar.allPapers') }}
                 <span class="badge">{{ library.papers.length }}</span>
               </button>
@@ -1090,10 +1193,7 @@ onUnmounted(() => {
               :class="{ active: selection.activeNav === 'recent' && !selection.highlightedCollectionId }"
                 @click="select('recent')"
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="12" cy="12" r="9"/>
-                  <polyline points="12 7 12 12 15 14"/>
-                </svg>
+                <Icon icon="fluent:clock-24-regular" width="14" height="14" />
                 {{ t('sidebar.recentPapers') }}
                 <span class="badge">{{ recentCount }}</span>
               </button>
@@ -1173,20 +1273,19 @@ onUnmounted(() => {
                 :style="selection.tagFilter === tag ? {} : categoryStyleFor(tag)"
                 @click="toggleTag(tag)"
               >
-                <span
+                <Icon
                   v-if="CATEGORY_ICONS[tag]"
+                  :icon="CATEGORY_ICONS[tag]"
                   class="tag-chip-icon"
-                  v-html="CATEGORY_ICONS[tag]"
+                  width="11" height="11"
                 />
                 <span class="tag-chip-text">{{ tag }}</span>
                 <button
                   class="tag-chip-delete"
-                  :title="t('common.delete')"
+                  :title="t('collections.delete')"
                   @click.stop="deleteTag(tag)"
                 >
-                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-                    <path d="M18 6L6 18M6 6l12 12" />
-                  </svg>
+                  <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
                 </button>
               </div>
             </div>
@@ -1236,13 +1335,7 @@ onUnmounted(() => {
               />
             </template>
             <template v-else>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="8" cy="8" r="2"/><circle cx="16" cy="8" r="2"/>
-                <circle cx="12" cy="17" r="2"/>
-                <line x1="9.8" y1="8.8" x2="13.2" y2="15.4"/>
-                <line x1="14.2" y1="8.8" x2="10.8" y2="15.4"/>
-                <line x1="10" y1="8" x2="14" y2="8"/>
-              </svg>
+              <Icon icon="fluent:share-android-24-regular" width="13" height="13" />
               <span class="canvas-name-text">{{ cv.name }}</span>
               <span v-if="cv.node_count > 0" class="badge">{{ cv.node_count }}</span>
             </template>
@@ -1251,7 +1344,7 @@ onUnmounted(() => {
         </div>
       </template>
 
-      <template v-else>
+      <template v-else-if="sidebarMode === 'snippets'">
         <div class="workspace-panel">
           <div class="canvas-list mode-list">
           <div v-if="showNewSnippetLibInput" class="new-coll-row">
@@ -1298,9 +1391,7 @@ onUnmounted(() => {
             </template>
             <template v-else>
               <span v-if="lib.emoji" style="font-size:12px">{{ lib.emoji }}</span>
-              <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-              </svg>
+              <Icon v-else icon="fluent:folder-24-regular" width="13" height="13" />
               <span class="canvas-name-text">{{ lib.name }}</span>
               <span
                 v-if="snippetEmbedJobs[lib.id]"
@@ -1317,15 +1408,78 @@ onUnmounted(() => {
         </div>
         </div>
       </template>
+
+      <template v-else>
+        <div class="workspace-panel">
+          <div class="canvas-list mode-list">
+            <div class="writing-pinned-nav">
+              <div
+                class="nav-item"
+                :class="{ active: writingActiveListId === null }"
+                role="button"
+                tabindex="0"
+                @click="selectWritingList(null)"
+                @keydown.enter.prevent="selectWritingList(null)"
+              >
+                <Icon icon="fluent:grid-24-regular" width="13" height="13" />
+                <span class="canvas-name-text">{{ t('writing.allPapers') }}</span>
+                <span class="badge">{{ library.papers.length }}</span>
+              </div>
+            </div>
+
+            <div v-if="showNewWritingInput" class="new-coll-row">
+              <input
+                id="new-writing-input"
+                v-model="newWritingName"
+                class="coll-name-input"
+                :placeholder="t('writing.listNamePlaceholder')"
+                @keydown.enter="submitNewWritingList"
+                @keydown.escape="showNewWritingInput = false"
+                @blur="submitNewWritingList"
+              />
+            </div>
+
+            <div v-if="writingLists.length === 0 && !showNewWritingInput" class="no-collections">
+              {{ t('writing.noLists') }}
+            </div>
+
+            <div
+              v-for="list in writingLists"
+              :key="list.id"
+              class="nav-item"
+              :class="{ active: writingActiveListId === list.id }"
+              role="button"
+              tabindex="0"
+              @click="selectWritingList(list.id)"
+              @keydown.enter.prevent="selectWritingList(list.id)"
+              @contextmenu.prevent.stop="openWritingCtx($event, list.id, list.name)"
+            >
+              <template v-if="writingRenamingId === list.id">
+                <input
+                  :id="`writing-rename-${list.id}`"
+                  v-model="writingRenameValue"
+                  class="coll-name-input canvas-rename-input"
+                  @click.stop
+                  @keydown.enter.stop.prevent="submitRenameWritingList(list.id)"
+                  @keydown.escape.stop.prevent="writingRenamingId = null"
+                  @blur="submitRenameWritingList(list.id)"
+                />
+              </template>
+              <template v-else>
+                <Icon icon="fluent:document-text-24-regular" width="13" height="13" />
+                <span class="canvas-name-text">{{ list.name }}</span>
+                <span v-if="list.paper_ids.length > 0" class="badge">{{ list.paper_ids.length }}</span>
+              </template>
+            </div>
+          </div>
+        </div>
+      </template>
     </div>
 
     <div class="sidebar-footer">
       <button class="settings-nav-btn" @click.stop="showSettings = true">
         <span class="settings-icon-wrap">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-          </svg>
+          <Icon icon="fluent:settings-24-regular" width="16" height="16" />
           <span v-if="updateStore.hasUpdate" class="update-dot" title="有新版本可用" />
         </span>
         <span>{{ t('settings.title') }}</span>
@@ -1419,10 +1573,7 @@ onUnmounted(() => {
               <div class="emoji-picker-subtitle">{{ emojiPicker.col.name }}</div>
             </div>
             <button class="emoji-picker-close" @click="closeEmojiPicker">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
-                <line x1="18" y1="6" x2="6" y2="18"/>
-                <line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
+              <Icon icon="fluent:dismiss-24-regular" width="15" height="15" />
             </button>
           </div>
 
@@ -1523,6 +1674,26 @@ onUnmounted(() => {
         <div class="ctx-sep" />
         <button class="ctx-item danger" @click="handleDeleteSnippetLib(snippetCtxMenu!.id, snippetCtxMenu!.name)">
           删除
+        </button>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div
+        v-if="writingCtxMenu"
+        class="ctx-menu"
+        :style="{ left: writingCtxMenu.x + 'px', top: writingCtxMenu.y + 'px' }"
+        @click.stop
+      >
+        <button class="ctx-item" @click="startRenameWritingList(writingCtxMenu!.id, writingCtxMenu!.name)">
+          {{ t('collections.rename') }}
+        </button>
+        <button class="ctx-item" @click="openWritingFolderInFinder(); closeWritingCtx()">
+          {{ t('collections.openInFinder') }}
+        </button>
+        <div class="ctx-sep" />
+        <button class="ctx-item danger" @click="handleDeleteWritingList(writingCtxMenu!.id, writingCtxMenu!.name)">
+          {{ t('collections.delete') }}
         </button>
       </div>
     </Teleport>
@@ -1960,6 +2131,14 @@ onUnmounted(() => {
   min-height: auto;
   overflow: visible;
   padding: 2px 0 8px;
+}
+
+/* Separate the pinned "Library" entry from the reference lists below, mirroring
+   the library sidebar's pinned-nav divider. */
+.writing-pinned-nav {
+  padding-bottom: 4px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .canvas-name-text {

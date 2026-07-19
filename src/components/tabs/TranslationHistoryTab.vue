@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
+import { Icon } from '@iconify/vue'
 import {
   currentTranslation,
   translationHistory,
@@ -130,12 +131,7 @@ const modelIcon = computed(() =>
         title="清空记录"
         @click="clearTranslationHistory"
       >
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="3 6 5 6 21 6"/>
-          <path d="M19 6l-1 14H6L5 6"/>
-          <path d="M10 11v6M14 11v6"/>
-          <path d="M9 6V4h6v2"/>
-        </svg>
+        <Icon icon="fluent:delete-24-regular" width="13" height="13" />
       </button>
       <button
         v-if="view === 'history'"
@@ -143,9 +139,7 @@ const modelIcon = computed(() =>
         title="返回当前翻译"
         @click="view = 'current'"
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M18 6 6 18M6 6l12 12"/>
-        </svg>
+        <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
       </button>
       <button
         v-else
@@ -153,21 +147,14 @@ const modelIcon = computed(() =>
         title="翻译记录"
         @click="view = 'history'"
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M12 8v4l3 3"/>
-          <circle cx="12" cy="12" r="9"/>
-        </svg>
+        <Icon icon="fluent:clock-24-regular" width="14" height="14" />
       </button>
     </div>
 
     <!-- Current translation view -->
     <div v-if="view === 'current'" class="current-view">
       <div v-if="!currentTranslation.sourceText" class="empty">
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/>
-          <path d="M2 5h12"/><path d="M7 2h1"/>
-          <path d="m22 22-5-10-5 10"/><path d="M14 18h6"/>
-        </svg>
+        <Icon icon="argus:translate" width="28" height="28" />
         <p>暂无翻译</p>
         <span>在 PDF 中选中文字后点击翻译</span>
       </div>
@@ -181,8 +168,8 @@ const modelIcon = computed(() =>
             class="source-toggle-btn"
             @click="sourceExpanded = !sourceExpanded"
           >
-            <svg v-if="!sourceExpanded" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
-            <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"/></svg>
+            <Icon v-if="!sourceExpanded" icon="fluent:chevron-down-24-regular" width="11" height="11" />
+            <Icon v-else icon="fluent:chevron-up-24-regular" width="11" height="11" />
             {{ sourceExpanded ? '折叠原文' : '展开原文' }}
           </button>
         </div>
@@ -212,19 +199,11 @@ const modelIcon = computed(() =>
         <div v-if="currentTranslation.result || currentTranslation.error" class="msg-footer">
           <div class="msg-actions">
             <button class="action-btn" :class="{ done: copied }" title="复制译文" :disabled="!currentTranslation.result" @click="copyResult">
-              <svg v-if="copied" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <polyline points="20 6 9 17 4 12"/>
-              </svg>
-              <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>
-                <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
-              </svg>
+              <Icon v-if="copied" icon="fluent:checkmark-24-regular" width="12" height="12" />
+              <Icon v-else icon="fluent:copy-24-regular" width="12" height="12" />
             </button>
             <button class="action-btn" title="重新生成" :disabled="currentTranslation.loading" @click="regenerateTranslation">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
-                <path d="M21 3v6h-6"/>
-              </svg>
+              <Icon icon="fluent:arrow-sync-24-regular" width="12" height="12" />
             </button>
           </div>
           <div v-if="modelLabel || hasUsage || currentTranslation.error" class="msg-usage">
@@ -243,9 +222,7 @@ const modelIcon = computed(() =>
     <!-- History view -->
     <template v-else>
       <div v-if="translationHistory.entries.length === 0" class="empty">
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="9"/>
-        </svg>
+        <Icon icon="fluent:clock-24-regular" width="28" height="28" />
         <p>暂无翻译记录</p>
       </div>
 
@@ -254,9 +231,7 @@ const modelIcon = computed(() =>
           <div class="entry-header">
             <span class="entry-time">{{ fmtTime(entry.createdAt) }}</span>
             <button class="entry-delete-btn" title="删除" @click="deleteTranslationEntry(entry.id)">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
+              <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
             </button>
           </div>
           <div class="entry-source selectable-text">{{ entry.sourceText }}</div>

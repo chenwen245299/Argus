@@ -1,11 +1,10 @@
 <script setup lang="ts">
-import { computed, ref, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { useLibraryStore } from '../../stores/library'
 import { useSettingsStore } from '../../stores/settings'
 import { setLocale, type Locale } from '../../i18n'
-import type { ThemeId } from '../../types'
 
 const { t, locale } = useI18n()
 const library = useLibraryStore()
@@ -81,53 +80,10 @@ async function saveBillingSettings() {
   setTimeout(() => { billingSaveStatus.value = '' }, 2000)
 }
 
-interface ThemeOption {
-  id: ThemeId
-  label: string
-  preview: { bg: string; sidebar: string; accent: string; text: string }
-}
-
 const languageOptions: { id: Locale; label: string }[] = [
   { id: 'zh', label: '中文' },
   { id: 'en', label: 'English' },
 ]
-
-const themes = computed<ThemeOption[]>(() => [
-  {
-    id: 'system',
-    label: t('settings.themeSystem'),
-    preview: { bg: 'linear-gradient(135deg, #ffffff 50%, #1c1c1e 50%)', sidebar: 'rgba(0,0,0,0.08)', accent: '#007aff', text: '#888888' },
-  },
-  {
-    id: 'light',
-    label: t('settings.themeLight'),
-    preview: { bg: '#ffffff', sidebar: '#f2f2f7', accent: '#007aff', text: '#1c1c1e' },
-  },
-  {
-    id: 'dark',
-    label: t('settings.themeDark'),
-    preview: { bg: '#1c1c1e', sidebar: '#2c2c2e', accent: '#0a84ff', text: '#f5f5f7' },
-  },
-  {
-    id: 'warm',
-    label: t('settings.themeWarm'),
-    preview: { bg: '#faf8f5', sidebar: '#f2ede5', accent: '#d97706', text: '#1c1a16' },
-  },
-  {
-    id: 'forest',
-    label: t('settings.themeForest'),
-    preview: { bg: '#f6f9f4', sidebar: '#ecf2e8', accent: '#2d7a4f', text: '#182418' },
-  },
-  {
-    id: 'rose',
-    label: t('settings.themeRose'),
-    preview: { bg: '#fdf8fc', sidebar: '#f5eef5', accent: '#9333ea', text: '#1c1820' },
-  },
-])
-
-async function setTheme(id: ThemeId) {
-  await settingsStore.save({ appearance: id })
-}
 
 function selectLanguage(id: Locale) {
   setLocale(id)
@@ -264,38 +220,6 @@ function shortPath(p: string): string {
         </div>
       </div>
     </div>
-
-    <div class="setting-group">
-      <div class="setting-label">{{ t('settings.appearance') }}</div>
-      <div class="theme-grid">
-        <button
-          v-for="theme in themes"
-          :key="theme.id"
-          class="theme-card"
-          :class="{ active: settingsStore.settings.appearance === theme.id }"
-          @click="setTheme(theme.id)"
-        >
-          <!-- Mini app preview -->
-          <div class="theme-preview" :style="{ background: theme.preview.bg }">
-            <div class="preview-sidebar" :style="{ background: theme.preview.sidebar }" />
-            <div class="preview-body">
-              <div class="preview-bar" :style="{ background: theme.preview.accent, opacity: '0.85' }" />
-              <div class="preview-line" :style="{ background: theme.preview.text, opacity: '0.18' }" />
-              <div class="preview-line short" :style="{ background: theme.preview.text, opacity: '0.12' }" />
-            </div>
-          </div>
-          <!-- Label + active check -->
-          <div class="theme-footer">
-            <span class="theme-name">{{ theme.label }}</span>
-            <svg v-if="settingsStore.settings.appearance === theme.id"
-              class="check-icon" width="12" height="12" viewBox="0 0 24 24"
-              fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round">
-              <polyline points="20 6 9 17 4 12"/>
-            </svg>
-          </div>
-        </button>
-      </div>
-    </div>
   </div>
 </template>
 
@@ -398,92 +322,6 @@ h2 { font-size: 18px; font-weight: 600; margin-bottom: 24px; color: var(--text-p
   background: var(--bg-primary);
   color: var(--text-primary);
   box-shadow: var(--shadow-sm);
-}
-
-/* ── Theme grid ── */
-.theme-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
-}
-
-.theme-card {
-  display: flex;
-  flex-direction: column;
-  border: 2px solid var(--border-default);
-  border-radius: var(--radius-lg);
-  overflow: hidden;
-  cursor: pointer;
-  transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s;
-  background: var(--bg-secondary);
-  text-align: left;
-}
-.theme-card:hover {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-light);
-  transform: translateY(-1px);
-}
-.theme-card.active {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-light);
-}
-
-/* Mini preview area */
-.theme-preview {
-  height: 64px;
-  display: flex;
-  flex-shrink: 0;
-  overflow: hidden;
-  background-size: cover;
-}
-
-.preview-sidebar {
-  width: 28%;
-  flex-shrink: 0;
-  border-right: 1px solid rgba(0,0,0,0.08);
-}
-
-.preview-body {
-  flex: 1;
-  padding: 8px 8px 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.preview-bar {
-  height: 6px;
-  border-radius: 3px;
-  width: 55%;
-}
-
-.preview-line {
-  height: 4px;
-  border-radius: 2px;
-  width: 90%;
-  background: #000;
-}
-.preview-line.short { width: 65%; }
-
-/* Footer */
-.theme-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 7px 10px;
-  gap: 4px;
-}
-
-.theme-name {
-  font-size: var(--font-size-xs);
-  font-weight: 500;
-  color: var(--text-secondary);
-}
-.theme-card.active .theme-name { color: var(--accent); font-weight: 600; }
-
-.check-icon {
-  color: var(--accent);
-  flex-shrink: 0;
 }
 
 .billing-row {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { useAiStore } from '../../stores/ai'
@@ -111,9 +112,7 @@ function rejectAll() {
     <div class="suggest-header">
       <span class="suggest-title">{{ t('canvas.suggestEdges') }}</span>
       <button class="close-btn" @click="emit('close')">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
+        <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
       </button>
     </div>
 
@@ -175,10 +174,7 @@ function rejectAll() {
             <template v-if="!dismissed.has(suggKey(s))">
               <div class="sugg-flow">
                 <span class="sugg-paper">{{ shortTitle(s.from_paper_id) }}</span>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2">
-                  <line x1="5" y1="12" x2="19" y2="12"/>
-                  <polyline points="12 5 19 12 12 19"/>
-                </svg>
+                <Icon icon="fluent:arrow-right-24-regular" width="14" height="14" style="color: var(--accent)" />
                 <span class="sugg-paper">{{ shortTitle(s.to_paper_id) }}</span>
               </div>
               <div class="sugg-meta">

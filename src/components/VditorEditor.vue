@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, ref, nextTick, watch } from 'vue'
+import { Icon } from '@iconify/vue'
 import type VditorType from 'vditor'
 
 const props = defineProps<{ initialContent: string }>()
@@ -235,13 +236,13 @@ function onFindKeydown(e: KeyboardEvent) {
           {{ findQuery ? (matchCount === 0 ? '无结果' : `${matchIndex} / ${matchCount}`) : '' }}
         </span>
         <button class="find-nav" :disabled="matchCount === 0" title="上一个 (Shift+Enter)" @mousedown.prevent @click="findPrev">
-          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"/></svg>
+          <Icon icon="fluent:chevron-up-24-regular" width="10" height="10" />
         </button>
         <button class="find-nav" :disabled="matchCount === 0" title="下一个 (Enter)" @mousedown.prevent @click="findNext">
-          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+          <Icon icon="fluent:chevron-down-24-regular" width="10" height="10" />
         </button>
         <button class="find-close" title="关闭 (Esc)" @mousedown.prevent @click="closeFind">
-          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <Icon icon="fluent:dismiss-24-regular" width="10" height="10" />
         </button>
       </div>
     </Transition>

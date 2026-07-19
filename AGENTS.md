@@ -26,7 +26,7 @@ Argus/
 ├── src/                    # Vue/TypeScript frontend
 │   ├── App.vue             # Root view selector (uses Tauri window label)
 │   ├── main.ts             # Frontend entry point
-│   ├── assets/             # Icons, provider/model logos, CSS design tokens
+│   ├── assets/             # Icons, provider/model logos, CSS design tokens (main.css) + theme palettes (themes.css)
 │   ├── components/         # Vue SFCs (feature folders: tabs/, canvas/, settings/)
 │   ├── i18n/               # vue-i18n messages (zh + en)
 │   ├── stores/             # Pinia stores + a few reactive helper modules
@@ -273,7 +273,7 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
 ### Styling
 
 - Use the CSS design tokens in `src/assets/main.css` instead of hard-coded colors.
-- Themes are applied via `data-theme` (`system`, `light`, `dark`, `warm`, `forest`, `rose`). When no `data-theme` is set, the dark palette follows `prefers-color-scheme: dark`.
+- Themes are applied via `data-theme` (`system`, `light`, `dark`, `warm`, `forest`, `rose`, `midnight`, `aurora`, `twilight`, `ocean`, `mocha`, `pine`, `sepia`, `mint`, `sky`, `sakura`, `mist`, `peach`). When no `data-theme` is set, the dark palette follows `prefers-color-scheme: dark`. Palettes live in `src/assets/themes.css`; the marketplace metadata (names, preview colors, light/dark kind) lives in `src/utils/themes.ts` — keep the two in sync. Dark themes additionally invert PDF page colors via CSS `filter` rules in `themes.css`.
 - Common tokens: `--bg-primary`, `--bg-secondary`, `--text-primary`, `--text-secondary`, `--accent`, `--accent-hover`, `--border-subtle`, `--divider`, `--shadow-sm/md/lg`, `--radius-sm/md/lg`.
 - The design is intentionally flat: no gradients or inner shadows on accent elements.
 
@@ -380,7 +380,7 @@ xattr -cr /Applications/Argus.app
 | Change AI chat | `src-tauri/src/copilot.rs`, `src-tauri/src/llm.rs`, `src/components/tabs/AiTab.vue` |
 | Change canvas | `src/views/CanvasView.vue`, `src/components/canvas/`, `src-tauri/src/canvas*.rs` |
 | Change import pipeline | `src/stores/import.ts`, `src-tauri/src/metadata.rs`, `src-tauri/src/url_import.rs` |
-| Change themes | `src/assets/main.css`, `src/stores/settings.ts` |
+| Change themes | `src/assets/themes.css` (palettes), `src/utils/themes.ts` (registry), `src/components/settings/ThemeSettings.vue` (marketplace tab), `src/stores/settings.ts` (apply/preview) |
 | Change arXiv inbox | `src/views/ArxivView.vue`, `src/stores/arxiv.ts`, `src-tauri/src/arxiv*.rs` |
 | Change embedding map | `src/views/EmbeddingMapView.vue`, `src-tauri/src/rag.rs` |
 

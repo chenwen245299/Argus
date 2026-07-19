@@ -1,32 +1,17 @@
 <script setup lang="ts">
 import { onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { Icon } from '@iconify/vue'
 import { useCanvasStore } from '../../stores/canvas'
 
 const { t } = useI18n()
 const canvasStore = useCanvasStore()
 
 const hoverOptions = [
-  {
-    value: 'notes',
-    labelKey: 'canvasSettings.sourceNotes',
-    paths: ['M4 4.5A2.5 2.5 0 0 1 6.5 2H18a2 2 0 0 1 2 2v17H6.5A2.5 2.5 0 0 0 4 18.5z', 'M8 6h8', 'M8 10h7'],
-  },
-  {
-    value: 'summary',
-    labelKey: 'canvasSettings.sourceSummary',
-    paths: ['M12 3 13.7 8.3 19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z', 'M19 15v4', 'M17 17h4'],
-  },
-  {
-    value: 'abstract',
-    labelKey: 'canvasSettings.sourceAbstract',
-    paths: ['M4 5h16', 'M4 10h16', 'M4 15h10', 'M4 20h7'],
-  },
-  {
-    value: 'none',
-    labelKey: 'canvasSettings.sourceNone',
-    paths: ['M18 6 6 18', 'M6 6l12 12', 'M4 4h16v16H4z'],
-  },
+  { value: 'notes', labelKey: 'canvasSettings.sourceNotes', icon: 'fluent:notebook-24-regular' },
+  { value: 'summary', labelKey: 'canvasSettings.sourceSummary', icon: 'fluent:sparkle-24-regular' },
+  { value: 'abstract', labelKey: 'canvasSettings.sourceAbstract', icon: 'fluent:text-align-left-24-regular' },
+  { value: 'none', labelKey: 'canvasSettings.sourceNone', icon: 'fluent:prohibited-24-regular' },
 ] as const
 
 onMounted(async () => {
@@ -66,15 +51,11 @@ watch(() => canvasStore.settings.hover_content_source, () => {
             v-model="canvasStore.settings.hover_content_source"
           />
           <span class="option-icon">
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-              <path v-for="p in option.paths" :key="p" :d="p" />
-            </svg>
+            <Icon :icon="option.icon" width="19" height="19" />
           </span>
           <span class="option-label">{{ t(option.labelKey) }}</span>
           <span class="option-check">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
+            <Icon icon="fluent:checkmark-24-filled" width="14" height="14" />
           </span>
         </label>
       </div>
@@ -86,10 +67,7 @@ watch(() => canvasStore.settings.hover_content_source, () => {
           :disabled="canvasStore.settingsSaving"
           @click="canvasStore.saveSettings()"
         >
-          <svg v-if="canvasStore.settingsSaving" class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="23 4 23 10 17 10" />
-            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
-          </svg>
+          <Icon v-if="canvasStore.settingsSaving" icon="fluent:arrow-clockwise-24-regular" class="spin" width="14" height="14" />
           <span>{{ canvasStore.settingsSaving ? t('canvasSettings.saving') : t('canvasSettings.save') }}</span>
         </button>
       </div>

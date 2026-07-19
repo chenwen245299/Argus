@@ -134,6 +134,9 @@ export interface PaperIndexEntry {
   file_type?: string
   /** Mirrors PaperMeta.related_ids (paper ids) for badge/count without a fetch. */
   related_ids?: string[]
+  /** Whether the paper has a non-empty BibTeX entry, for the list status badge.
+   *  null on legacy index entries written before this field existed. */
+  has_bibtex?: boolean | null
 }
 
 /** True when a paper's main document is an ebook rather than a PDF. */
@@ -231,10 +234,21 @@ export interface CollectionsFile {
 
 // ── M4: App Settings ──────────────────────────────────────────────────────────
 
-export type ThemeId = 'system' | 'light' | 'dark' | 'warm' | 'forest' | 'rose'
+export type ThemeId =
+  | 'system'
+  | 'light' | 'dark' | 'warm' | 'forest' | 'rose'
+  | 'midnight' | 'aurora' | 'twilight' | 'ocean' | 'mocha' | 'pine'
+  | 'sepia' | 'mint' | 'sky' | 'sakura' | 'mist' | 'peach'
+
+/** Theme ids that name an actual palette (everything except the 'system' mode). */
+export type ConcreteThemeId = Exclude<ThemeId, 'system'>
 
 export interface AppSettings {
   appearance: ThemeId
+  /** Palette applied in 'system' mode while the OS is light. */
+  appearance_light?: ConcreteThemeId
+  /** Palette applied in 'system' mode while the OS is dark. */
+  appearance_dark?: ConcreteThemeId
   extraction_default: string
   usd_to_cny_rate?: number
   metadata_ai_provider_id?: string

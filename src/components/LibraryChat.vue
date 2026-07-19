@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -1641,10 +1642,7 @@ onUnmounted(() => {
       <div class="tl-space" data-tauri-drag-region />
       <template v-if="ai.loaded && ai.isConfigured">
         <div class="header-avatar" data-tauri-drag-region>
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" data-tauri-drag-region>
-            <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
-            <path d="M8 9h8"/><path d="M8 13h5"/>
-          </svg>
+          <Icon icon="fluent:chat-24-regular" width="15" height="15" data-tauri-drag-region />
         </div>
         <div class="header-title-block" data-tauri-drag-region>
           <span class="header-conv-title" data-tauri-drag-region>{{ activeConv?.title || t('libraryChat.untitled') }}</span>
@@ -1654,7 +1652,7 @@ onUnmounted(() => {
         <div class="lc-titlebar-actions">
           <!-- RAG not configured -->
           <button v-if="knowledgeSource !== 'papers' && !ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+            <Icon icon="fluent:database-24-regular" width="11" height="11" />
             RAG
           </button>
           <template v-else-if="knowledgeSource === 'papers'">
@@ -1662,19 +1660,17 @@ onUnmounted(() => {
               {{ selectedPapers.length }} 篇
             </div>
             <button class="rag-refresh-btn" title="添加文献" @click="openPaperPicker">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
-                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
+              <Icon icon="fluent:add-24-regular" width="15" height="15" />
             </button>
           </template>
           <template v-else-if="knowledgeSource === 'snippets'">
             <!-- Snippet RAG controls -->
             <span v-if="snippetSyncing" class="rag-sync-progress">{{ snippetSyncProgress.done }}/{{ snippetSyncProgress.total }}</span>
             <button class="rag-refresh-btn" :class="{ refreshing: snippetSyncing }" title="刷新素材库嵌入状态" :disabled="snippetSyncing" @click="loadSnippetStoreCounts">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10"/><path d="M3.51 15a9 9 0 0 0 14.85 3.36L23 14"/></svg>
+              <Icon icon="fluent:arrow-sync-24-regular" width="15" height="15" />
             </button>
             <div class="rag-counter" title="素材库：已嵌入素材 / 总素材数">
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+              <Icon icon="fluent:database-24-regular" width="11" height="11" />
               <span class="rag-counter-text">{{ snippetEmbeddedCount }}/{{ snippetTotalCount }}</span>
             </div>
             <button
@@ -1684,8 +1680,8 @@ onUnmounted(() => {
               :disabled="snippetSyncing || (snippetEmbeddedCount >= snippetTotalCount && snippetTotalCount > 0)"
               @click="syncSnippets"
             >
-              <svg v-if="snippetEmbeddedCount < snippetTotalCount" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
-              <svg v-else width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              <Icon v-if="snippetEmbeddedCount < snippetTotalCount" icon="fluent:cloud-arrow-up-24-regular" width="11" height="11" />
+              <Icon v-else icon="fluent:checkmark-24-regular" width="11" height="11" />
               {{ snippetSyncing ? '嵌入中…' : snippetEmbeddedCount < snippetTotalCount ? `嵌入 ${snippetTotalCount - snippetEmbeddedCount} 条` : '已全部嵌入' }}
             </button>
           </template>
@@ -1693,18 +1689,18 @@ onUnmounted(() => {
           <template v-else-if="knowledgeSource === 'paper-rag'">
             <span v-if="syncingMissing" class="rag-sync-progress">{{ syncProgress.done }}/{{ syncProgress.total }}</span>
             <button class="rag-refresh-btn" :class="{ refreshing: refreshingCounts || syncingMissing }" title="刷新嵌入状态" :disabled="refreshingCounts || syncingMissing" @click="refreshCounts">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10"/><path d="M3.51 15a9 9 0 0 0 14.85 3.36L23 14"/></svg>
+              <Icon icon="fluent:arrow-sync-24-regular" width="15" height="15" />
             </button>
             <div class="rag-counter" title="向量库：已嵌入论文 / 总论文数">
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+              <Icon icon="fluent:database-24-regular" width="11" height="11" />
               <span class="rag-counter-text">{{ vectorizedCount }}/{{ allPapers.length }}</span>
             </div>
             <template v-if="syncingMissing">
-              <button class="rag-sync-cancel" @click="syncCancelRequested = true" title="取消同步"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+              <button class="rag-sync-cancel" @click="syncCancelRequested = true" title="取消同步"><Icon icon="fluent:dismiss-24-regular" width="11" height="11" /></button>
             </template>
             <button v-else class="rag-sync-btn" :class="{ 'all-done': unvectorizedPapers.length === 0 }" :title="unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇未向量化的论文` : '所有论文已嵌入'" :disabled="unvectorizedPapers.length === 0" @click="syncMissing">
-              <svg v-if="unvectorizedPapers.length > 0" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
-              <svg v-else width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              <Icon v-if="unvectorizedPapers.length > 0" icon="fluent:cloud-arrow-up-24-regular" width="11" height="11" />
+              <Icon v-else icon="fluent:checkmark-24-regular" width="11" height="11" />
               {{ unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇` : '已全部嵌入' }}
             </button>
           </template>
@@ -1715,7 +1711,7 @@ onUnmounted(() => {
                 <span v-else>{{ selectedModelLabel().charAt(0).toUpperCase() }}</span>
               </span>
               <span class="lc-model-label">{{ selectedModelLabel() }}</span>
-              <svg class="chevron" :class="{ open: modelMenuOpen }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"/></svg>
+              <Icon class="chevron" :class="{ open: modelMenuOpen }" icon="fluent:chevron-down-24-regular" width="12" height="12" />
             </button>
             <div v-if="modelMenuOpen" class="lc-model-menu">
               <div v-for="group in ai.groupedModels" :key="group.id" class="lc-model-group">
@@ -1745,9 +1741,7 @@ onUnmounted(() => {
     <!-- ── No AI provider ────────────────────────────────────────────────────── -->
     <div v-if="ai.loaded && !ai.isConfigured" class="center-hint">
       <div class="hint-icon">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/>
-        </svg>
+        <Icon icon="fluent:info-24-regular" width="24" height="24" />
       </div>
       <p class="hint-title">{{ t('copilot.noProviderTitle') }}</p>
       <p class="hint-desc">{{ t('copilot.noProviderDesc') }}</p>
@@ -1765,9 +1759,7 @@ onUnmounted(() => {
             <span class="sidebar-count">{{ conversations.length }}</span>
           </div>
           <button class="new-chat-btn" :title="t('libraryChat.newChat')" @click="startNewConversation">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
+            <Icon icon="fluent:add-24-regular" width="14" height="14" />
             <span>{{ t('libraryChat.newChat') }}</span>
           </button>
         </div>
@@ -1794,9 +1786,7 @@ onUnmounted(() => {
               :title="t('libraryChat.deleteConv')"
               @click.stop="deleteConversation(conv.id)"
             >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
+              <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
             </button>
           </div>
         </div>
@@ -1813,16 +1803,10 @@ onUnmounted(() => {
           <div class="tl-space" data-tauri-drag-region />
           <div class="header-left">
             <button class="sidebar-toggle-btn" @click="sidebarOpen = !sidebarOpen" :title="sidebarOpen ? '收起' : '展开'">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="3" y="3" width="18" height="18" rx="2"/>
-                <line x1="9" y1="3" x2="9" y2="21"/>
-              </svg>
+              <Icon icon="fluent:panel-left-24-regular" width="15" height="15" />
             </button>
             <div class="header-avatar">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
-                <path d="M8 9h8"/><path d="M8 13h5"/>
-              </svg>
+              <Icon icon="fluent:chat-24-regular" width="16" height="16" />
             </div>
             <div class="header-title-block">
               <span class="header-conv-title">{{ activeConv?.title || t('libraryChat.untitled') }}</span>
@@ -1837,11 +1821,7 @@ onUnmounted(() => {
               title="点击配置 RAG"
               @click="emit('open-settings', 'rag')"
             >
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                <ellipse cx="12" cy="5" rx="9" ry="3"/>
-                <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
-                <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
-              </svg>
+              <Icon icon="fluent:database-24-regular" width="11" height="11" />
               RAG
             </button>
 
@@ -1860,27 +1840,18 @@ onUnmounted(() => {
                 :disabled="refreshingCounts || syncingMissing"
                 @click="refreshCounts"
               >
-                <svg width="15" height="15" viewBox="-2 -2 28 28" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                  <polyline points="23 4 23 10 17 10"/>
-                  <path d="M20.49 15A9 9 0 1 1 23 10"/>
-                </svg>
+                <Icon icon="fluent:arrow-sync-24-regular" width="15" height="15" />
               </button>
 
               <div class="rag-counter" title="向量库：已嵌入论文 / 总论文数">
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                  <ellipse cx="12" cy="5" rx="9" ry="3"/>
-                  <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
-                  <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
-                </svg>
+                <Icon icon="fluent:database-24-regular" width="11" height="11" />
                 <span class="rag-counter-text">{{ vectorizedCount }}/{{ allPapers.length }}</span>
               </div>
 
               <!-- Syncing: cancel button -->
               <template v-if="syncingMissing">
                 <button class="rag-sync-cancel" @click="syncCancelRequested = true" title="取消同步">
-                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-                  </svg>
+                  <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
                 </button>
               </template>
 
@@ -1893,14 +1864,8 @@ onUnmounted(() => {
                 :disabled="unvectorizedPapers.length === 0"
                 @click="syncMissing"
               >
-                <svg v-if="unvectorizedPapers.length > 0" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                  <polyline points="16 16 12 12 8 16"/>
-                  <line x1="12" y1="12" x2="12" y2="21"/>
-                  <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
-                </svg>
-                <svg v-else width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                  <polyline points="20 6 9 17 4 12"/>
-                </svg>
+                <Icon v-if="unvectorizedPapers.length > 0" icon="fluent:cloud-arrow-up-24-regular" width="11" height="11" />
+                <Icon v-else icon="fluent:checkmark-24-regular" width="11" height="11" />
                 {{ unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇` : '已全部嵌入' }}
               </button>
             </template>
@@ -1916,9 +1881,7 @@ onUnmounted(() => {
                   <span v-else>{{ selectedModelLabel().charAt(0).toUpperCase() }}</span>
                 </span>
                 <span class="lc-model-label">{{ selectedModelLabel() }}</span>
-                <svg class="chevron" :class="{ open: modelMenuOpen }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
-                  <path d="m6 9 6 6 6-6"/>
-                </svg>
+                <Icon class="chevron" :class="{ open: modelMenuOpen }" icon="fluent:chevron-down-24-regular" width="12" height="12" />
               </button>
 
               <div v-if="modelMenuOpen" class="lc-model-menu">
@@ -1950,9 +1913,7 @@ onUnmounted(() => {
         <!-- RAG hint banner -->
         <div v-if="ragStore.loaded && !ragStore.isConfigured" class="rag-hint-bar">
           <div class="rag-hint-icon">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/>
-            </svg>
+            <Icon icon="fluent:info-24-regular" width="13" height="13" />
           </div>
           <span class="rag-hint-text">{{ t('libraryChat.ragHint') }}</span>
           <button class="rag-hint-action" @click="emit('open-settings', 'rag')">{{ t('libraryChat.ragHintAction') }}</button>
@@ -1990,10 +1951,7 @@ onUnmounted(() => {
           <div v-if="activeMessages.length === 0" class="empty-chat">
             <div class="empty-panel">
               <div class="empty-icon">
-                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
-                  <path d="M8 9h8"/><path d="M8 13h5"/>
-                </svg>
+                <Icon icon="fluent:chat-24-regular" width="28" height="28" />
               </div>
               <p class="empty-title">{{ t('libraryChat.title') }}</p>
               <p class="empty-hint">{{ t('libraryChat.placeholder') }}</p>
@@ -2044,9 +2002,7 @@ onUnmounted(() => {
                         class="ctx-pill ctx-paper"
                         :title="label"
                       >{{ label }}</span>
-                      <svg class="ctx-chevron" :class="{ open: expandedContextId === msg.id }" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                        <path d="m6 9 6 6 6-6"/>
-                      </svg>
+                      <Icon class="ctx-chevron" :class="{ open: expandedContextId === msg.id }" icon="fluent:chevron-down-24-regular" width="11" height="11" />
                     </button>
                     <div v-if="expandedContextId === msg.id" class="ctx-preview">
                       <div
@@ -2070,24 +2026,17 @@ onUnmounted(() => {
                       @click="previewAttachment(att)"
                     >
                       <img v-if="att.type === 'image'" :src="att.dataUrl" class="user-attachment-thumb" alt="" />
-                      <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                        <polyline points="14 2 14 8 20 8"/>
-                      </svg>
+                      <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
                       <span class="user-attachment-name">{{ att.name }}</span>
                     </button>
                   </div>
                   <div class="user-bubble">{{ msg.content }}</div>
                   <div class="message-actions user-actions">
                     <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                      </svg>
+                      <Icon icon="fluent:copy-24-regular" width="13" height="13" />
                     </button>
                     <button title="编辑并重发" :disabled="loading" @click="startEditUser(msg)">
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>
-                      </svg>
+                      <Icon icon="fluent:edit-24-regular" width="13" height="13" />
                     </button>
                   </div>
                 </div>
@@ -2108,13 +2057,12 @@ onUnmounted(() => {
                       class="reasoning-summary"
                       @click="toggleReasoning(activeAnswer(msg).id)"
                     >
-                      <svg
-                        width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                      <Icon
+                        width="11" height="11"
                         class="reasoning-chevron"
                         :class="{ collapsed: isReasoningCollapsed(activeAnswer(msg).id) }"
-                      >
-                        <path d="m6 9 6 6 6-6"/>
-                      </svg>
+                        icon="fluent:chevron-down-24-regular"
+                      />
                       思考过程
                       <span v-if="activeAnswer(msg).streaming && !activeAnswer(msg).content" class="reasoning-live-dot" />
                       <span class="reasoning-count">{{ reasoningStats(activeAnswer(msg).reasoningContent || '') }}</span>
@@ -2150,16 +2098,10 @@ onUnmounted(() => {
                   <div v-if="!activeAnswer(msg).streaming || hasUsage(activeAnswer(msg))" class="assistant-action-row">
                     <div v-if="!activeAnswer(msg).streaming" class="message-actions assistant-actions">
                       <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                          <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                        </svg>
+                        <Icon icon="fluent:copy-24-regular" width="13" height="13" />
                       </button>
                       <button title="重新生成" :disabled="loading" @click="regenerateAssistant(msg)">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                          <path d="M1 4v6h6"/><path d="M23 20v-6h-6"/>
-                          <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10"/>
-                          <path d="M3.51 15a9 9 0 0 0 14.85 3.36L23 14"/>
-                        </svg>
+                        <Icon icon="fluent:arrow-sync-24-regular" width="13" height="13" />
                       </button>
                       <!-- @ button: pick another model and add as a variant -->
                       <div class="msg-model-picker" @click.stop>
@@ -2170,9 +2112,7 @@ onUnmounted(() => {
                           :class="{ active: modelPickerMsgId === msg.id }"
                           @click.stop="openModelPicker(msg.id, $event)"
                         >
-                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/>
-                          </svg>
+                          <Icon icon="fluent:mention-24-regular" width="13" height="13" />
                         </button>
                       </div>
                     </div>
@@ -2209,15 +2149,9 @@ onUnmounted(() => {
                         class="sources-toggle"
                         @click="toggleSources(msg.id)"
                       >
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                          <ellipse cx="12" cy="5" rx="9" ry="3"/>
-                          <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
-                          <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
-                        </svg>
+                        <Icon icon="fluent:database-24-regular" width="11" height="11" />
                         <span>{{ isSourcesExpanded(msg.id) ? t('libraryChat.hideSources') : t('libraryChat.sources', { n: groupedSources(answerSources(msg)).length }) }}</span>
-                        <svg class="chevron" :class="{ open: isSourcesExpanded(msg.id) }" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                          <polyline points="6 9 12 15 18 9"/>
-                        </svg>
+                        <Icon class="chevron" :class="{ open: isSourcesExpanded(msg.id) }" icon="fluent:chevron-down-24-regular" width="10" height="10" />
                       </button>
                       <!-- Model variant tabs to the RIGHT of sources -->
                       <div v-if="answerVariants(msg).length > 1" class="answer-tabs">
@@ -2244,10 +2178,7 @@ onUnmounted(() => {
                   <div v-if="isSourcesExpanded(msg.id) && answerSources(msg).length > 0" class="sources-list">
                     <div v-for="group in groupedSources(answerSources(msg))" :key="group.paper_id" class="source-group">
                       <button class="source-paper-name" @click="openSourcePaper(group)">
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                          <polyline points="14 2 14 8 20 8"/>
-                        </svg>
+                        <Icon icon="fluent:document-24-regular" width="11" height="11" />
                         <span>{{ group.paper_title }}</span>
                       </button>
                       <div class="source-chips">
@@ -2283,15 +2214,10 @@ onUnmounted(() => {
                 :title="att.name"
               >
                 <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
-                <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                  <polyline points="14 2 14 8 20 8"/>
-                </svg>
+                <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
                 <span class="attachment-name">{{ att.name }}</span>
                 <button class="attachment-remove" title="移除" @click="removeAttachment(att.id)">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-                  </svg>
+                  <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
                 </button>
               </div>
             </div>
@@ -2316,10 +2242,7 @@ onUnmounted(() => {
             <div class="composer-footer">
               <div class="footer-left">
                 <button class="toolbar-btn" title="新建对话" @click="startNewConversation">
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                    <path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"/>
-                  </svg>
+                  <Icon icon="fluent:compose-24-regular" width="15" height="15" />
                 </button>
                 <button
                   class="attach-btn"
@@ -2327,9 +2250,7 @@ onUnmounted(() => {
                   :disabled="loading"
                   @click="openFilePicker"
                 >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                    <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-                  </svg>
+                  <Icon icon="fluent:attach-24-regular" width="14" height="14" />
                 </button>
                 <!-- Reasoning / thinking mode picker -->
                 <div class="reasoning-picker" @click.stop>
@@ -2339,11 +2260,7 @@ onUnmounted(() => {
                     title="思考模式"
                     @click="reasoningOpen = !reasoningOpen"
                   >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
-                      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
-                      <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
-                      <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
-                    </svg>
+                    <Icon icon="fluent:brain-circuit-24-regular" width="15" height="15" />
                     <span v-if="useReasoning" class="reasoning-badge">
                       {{ isDeepSeekSelected
                           ? (reasoningLevel === 'high' ? 'max' : 'high')
@@ -2397,9 +2314,7 @@ onUnmounted(() => {
                   >
                     <span class="ks-dot" />
                     {{ knowledgeSourceLabel }}
-                    <svg class="ks-chevron" :class="{ open: sourcePickerOpen }" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                      <path d="m6 9 6 6 6-6"/>
-                    </svg>
+                    <Icon class="ks-chevron" :class="{ open: sourcePickerOpen }" icon="fluent:chevron-down-24-regular" width="10" height="10" />
                   </button>
                   <div v-if="sourcePickerOpen" class="ks-menu">
                     <button
@@ -2407,36 +2322,30 @@ onUnmounted(() => {
                       :class="{ selected: knowledgeSource === 'paper-rag' }"
                       @click="setKnowledgeSource('paper-rag')"
                     >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-                      </svg>
+                      <Icon icon="fluent:book-24-regular" width="12" height="12" />
                       <span class="ks-option-text">
                         文献库RAG
                         <span v-if="!ragStore.isConfigured" class="ks-option-hint">（RAG 未配置）</span>
                       </span>
-                      <svg v-if="knowledgeSource === 'paper-rag'" class="ks-check" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                      <Icon v-if="knowledgeSource === 'paper-rag'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
                     </button>
                     <button
                       class="ks-option"
                       :class="{ selected: knowledgeSource === 'papers' }"
                       @click="setKnowledgeSource('papers')"
                     >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M12 7v6"/><path d="M9 10h6"/>
-                      </svg>
+                      <Icon icon="fluent:book-24-regular" width="12" height="12" />
                       <span class="ks-option-text">文献库</span>
-                      <svg v-if="knowledgeSource === 'papers'" class="ks-check" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                      <Icon v-if="knowledgeSource === 'papers'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
                     </button>
                     <button
                       class="ks-option"
                       :class="{ selected: knowledgeSource === 'snippets' }"
                       @click="setKnowledgeSource('snippets')"
                     >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>
-                      </svg>
+                      <Icon icon="fluent:document-text-24-regular" width="12" height="12" />
                       <span class="ks-option-text">素材库</span>
-                      <svg v-if="knowledgeSource === 'snippets'" class="ks-check" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                      <Icon v-if="knowledgeSource === 'snippets'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
                     </button>
                   </div>
                 </div>
@@ -2447,24 +2356,18 @@ onUnmounted(() => {
                   :title="selectedPapers.length > 0 ? `已选 ${selectedPapers.length} 篇文献` : '添加文献'"
                   @click="openPaperPicker"
                 >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-                    <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-                  </svg>
+                  <Icon icon="fluent:add-24-regular" width="13" height="13" />
                   <span v-if="selectedPapers.length > 0" class="paper-count">{{ selectedPapers.length }}</span>
                 </button>
               </div>
               <div class="footer-right">
                 <span class="enter-hint">{{ t('libraryChat.enterHint') }}</span>
                 <button v-if="loading" class="send-btn stop-btn" title="停止生成" @click="stopStreaming">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-                    <rect width="14" height="14" x="5" y="5" rx="2"/>
-                  </svg>
+                  <Icon icon="fluent:stop-24-filled" width="13" height="13" />
                   停止
                 </button>
                 <button v-else class="send-btn" :disabled="!canSend" @click="sendMessage">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                    <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                  </svg>
+                  <Icon icon="fluent:send-24-regular" width="13" height="13" />
                   {{ t('copilot.send') }}
                 </button>
               </div>
@@ -2503,9 +2406,7 @@ onUnmounted(() => {
         <div class="paper-picker-header">
           <span class="paper-picker-title">添加文献</span>
           <button class="paper-picker-close" @click="paperPickerOpen = false">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
+            <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
           </button>
         </div>
         <input v-model="paperPickerSearch" class="paper-picker-search" placeholder="搜索标题、作者、年份..." autofocus />
@@ -2535,17 +2436,13 @@ onUnmounted(() => {
     <div v-if="previewImage" class="attachment-lightbox" @click.self="closePreview">
       <img :src="previewImage" class="lightbox-image" alt="" />
       <button class="lightbox-close" @click="closePreview">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
+        <Icon icon="fluent:dismiss-24-regular" width="18" height="18" />
       </button>
     </div>
     <div v-if="previewPdf" class="attachment-lightbox pdf-lightbox" @click.self="closePreview">
       <iframe :src="previewPdf" class="lightbox-pdf" frameborder="0"></iframe>
       <button class="lightbox-close" @click="closePreview">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
+        <Icon icon="fluent:dismiss-24-regular" width="18" height="18" />
       </button>
     </div>
   </Teleport>

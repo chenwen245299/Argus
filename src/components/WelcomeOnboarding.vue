@@ -60,10 +60,7 @@ onMounted(() => { ensureFluentIcons() })
             <!-- 1. Default AI model (required) -->
             <div class="ob-item" :class="{ done: modelDone }">
               <div class="ob-check">
-                <svg v-if="modelDone" width="14" height="14" viewBox="0 0 14 14" fill="none"
-                     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M2.5 7.5 L5.5 10.5 L11.5 3.5" />
-                </svg>
+                <Icon v-if="modelDone" icon="fluent:checkmark-24-regular" width="14" height="14" />
                 <span v-else>1</span>
               </div>
               <div class="ob-body">
@@ -82,10 +79,7 @@ onMounted(() => { ensureFluentIcons() })
             <!-- 2. Semantic Scholar API key (recommended) -->
             <div class="ob-item" :class="{ done: ssDone }">
               <div class="ob-check">
-                <svg v-if="ssDone" width="14" height="14" viewBox="0 0 14 14" fill="none"
-                     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M2.5 7.5 L5.5 10.5 L11.5 3.5" />
-                </svg>
+                <Icon v-if="ssDone" icon="fluent:checkmark-24-regular" width="14" height="14" />
                 <span v-else>2</span>
               </div>
               <div class="ob-body">

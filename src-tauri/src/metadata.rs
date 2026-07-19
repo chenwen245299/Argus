@@ -1489,6 +1489,89 @@ pub fn match_references_to_library(root: &str, refs: &mut [CitationRef]) {
     }
 }
 
+/// Find papers already in the library that cite the given paper. Purely local:
+/// scans each library paper's cached references for one that resolves to the
+/// target (by arXiv id, DOI, or normalized title) and never touches the network.
+/// Returned as `CitationRef`s (with `library_slug`/`library_id` set) so the
+/// citation graph can render them like any other node, sized by citation count.
+pub fn library_citers(root: &str, target_slug: &str) -> Vec<CitationRef> {
+    let Ok(target) = paper::read_meta(root, target_slug) else {
+        return vec![];
+    };
+    let t_arxiv = target
+        .arxiv_id
+        .as_deref()
+        .map(normalize_arxiv)
+        .filter(|s| !s.is_empty());
+    let t_doi = target
+        .doi
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+    let t_title = Some(normalize_title(&target.title)).filter(|s| !s.is_empty());
+
+    // A reference resolves to the target when any stable id (or the normalized
+    // title) matches — the same precedence match_references_to_library uses.
+    let matches_target = |r: &CitationRef| -> bool {
+        if let Some(ta) = &t_arxiv {
+            if r.arxiv_id
+                .as_deref()
+                .map(normalize_arxiv)
+                .filter(|s| !s.is_empty())
+                .is_some_and(|ra| &ra == ta)
+            {
+                return true;
+            }
+        }
+        if let Some(td) = &t_doi {
+            if r.doi
+                .as_deref()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .is_some_and(|rd| &rd == td)
+            {
+                return true;
+            }
+        }
+        if let Some(tt) = &t_title {
+            let rn = normalize_title(&r.title);
+            if !rn.is_empty() && &rn == tt {
+                return true;
+            }
+        }
+        false
+    };
+
+    let mut out: Vec<CitationRef> = Vec::new();
+    for (slug, _path) in paper::list_paper_dirs(root).unwrap_or_default() {
+        if slug == target_slug {
+            continue;
+        }
+        let refs = read_cached_references(root, &slug);
+        if refs.is_empty() || !refs.iter().any(matches_target) {
+            continue;
+        }
+        let Ok(m) = paper::read_meta(root, &slug) else {
+            continue;
+        };
+        out.push(CitationRef {
+            paper_id: Some(m.id.clone()),
+            title: m.title,
+            authors: m.authors,
+            year: m.year,
+            venue: m.venue,
+            doi: m.doi,
+            arxiv_id: m.arxiv_id,
+            cite_count: m.cite_count,
+            library_slug: Some(slug),
+            library_id: Some(m.id),
+        });
+    }
+    // Biggest citers first, so they survive when the graph caps the node count.
+    out.sort_by(|a, b| b.cite_count.unwrap_or(0).cmp(&a.cite_count.unwrap_or(0)));
+    out
+}
+
 /// Extract metadata using AI only (manual trigger from context menu).
 /// Requires fulltext to already be cached; sends the first 512 words to the AI model.
 /// Emits:

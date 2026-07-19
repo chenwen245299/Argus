@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { useSelectionStore } from '../stores/selection'
@@ -112,10 +113,7 @@ async function onSlugChanged(newSlug: string) {
     <template v-else-if="!activePaperSlug">
       <!-- No paper selected -->
       <div class="no-selection">
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-        </svg>
+        <Icon icon="fluent:book-24-regular" width="28" height="28" />
         <p>{{ t('sidebar.selectPaper') }}</p>
       </div>
     </template>

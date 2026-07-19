@@ -225,6 +225,13 @@ pub struct PaperIndexEntry {
     /// count/list straight from the index without an extra fetch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_ids: Vec<String>,
+    /// Whether the paper carries a non-empty BibTeX entry in its metadata, so the
+    /// list status column can badge it without loading the full meta per row.
+    /// `None` marks an index entry written before this field existed; the scan
+    /// treats that as a cache miss and re-reads meta once, so the badge appears
+    /// for papers that already had BibTeX before this feature shipped.
+    #[serde(default)]
+    pub has_bibtex: Option<bool>,
 }
 
 fn default_reading_status_entry() -> String {
@@ -290,6 +297,12 @@ impl Default for CollectionsFile {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppSettings {
     pub appearance: String,
+    /// Palette applied in 'system' appearance mode while the OS is light.
+    #[serde(default = "default_appearance_light")]
+    pub appearance_light: String,
+    /// Palette applied in 'system' appearance mode while the OS is dark.
+    #[serde(default = "default_appearance_dark")]
+    pub appearance_dark: String,
     pub extraction_default: String,
     /// USD to CNY exchange rate used for displaying provider-reported AI costs.
     #[serde(default = "default_usd_to_cny_rate")]
@@ -509,10 +522,20 @@ pub fn is_legacy_ai_summary_prompt(prompt: &str) -> bool {
         || prompt == legacy_ai_summary_prompt_plain_detail().trim()
 }
 
+fn default_appearance_light() -> String {
+    "light".to_string()
+}
+
+fn default_appearance_dark() -> String {
+    "dark".to_string()
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             appearance: "system".to_string(),
+            appearance_light: default_appearance_light(),
+            appearance_dark: default_appearance_dark(),
             extraction_default: "lopdf".to_string(),
             usd_to_cny_rate: default_usd_to_cny_rate(),
             metadata_ai_provider_id: None,

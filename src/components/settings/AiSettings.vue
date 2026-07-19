@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { Icon } from '@iconify/vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useAiStore } from '../../stores/ai'
 import { useSettingsStore } from '../../stores/settings'
@@ -680,9 +681,7 @@ function toggleCapability(form: ModelForm, cap: string) {
         <div class="list-header">
           <span class="list-title">{{ t('aiService.title') }}</span>
           <button class="add-btn" @click="startAdd" :title="t('aiService.addProvider')">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
+            <Icon icon="fluent:add-24-regular" width="14" height="14" />
           </button>
         </div>
 
@@ -864,16 +863,12 @@ function toggleCapability(form: ModelForm, cap: string) {
                   <div class="fetch-dialog-sub">{{ t('aiService.fetchDialogSub') }}</div>
                 </div>
                 <button class="fetch-dialog-close" @click="showFetchDialog = false">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-                  </svg>
+                  <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
                 </button>
               </div>
               <div class="fetch-dialog-filter">
                 <div class="fetch-search">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/>
-                  </svg>
+                  <Icon icon="fluent:search-24-regular" width="15" height="15" />
                   <input v-model="fetchSearch" :placeholder="t('aiService.searchModelPlaceholder')" />
                 </div>
                 <div class="fetch-cap-tabs">
@@ -1060,10 +1055,10 @@ function toggleCapability(form: ModelForm, cap: string) {
                     </div>
                     <div class="model-btns">
                       <button class="icon-btn success" @click="saveEditModel" :title="t('aiService.save')">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                        <Icon icon="fluent:checkmark-24-regular" width="15" height="15" />
                       </button>
                       <button class="icon-btn" @click="editModelIdx = null" :title="t('aiService.cancel')">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                        <Icon icon="fluent:dismiss-24-regular" width="15" height="15" />
                       </button>
                     </div>
                   </div>
@@ -1231,13 +1226,13 @@ function toggleCapability(form: ModelForm, cap: string) {
                       @click="setDefaultModel(selectedId!, m.id)"
                       :title="t('aiService.setDefault')"
                     >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                      <Icon icon="fluent:star-24-filled" width="14" height="14" />
                     </button>
                     <button class="icon-btn" @click="startEditModel(idx)" :title="t('aiService.editModel')">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                      <Icon icon="fluent:edit-24-regular" width="14" height="14" />
                     </button>
                     <button class="icon-btn danger" @click="removeModel(idx); saveProvider()" :title="t('aiService.deleteModel')">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                      <Icon icon="fluent:delete-24-regular" width="14" height="14" />
                     </button>
                   </div>
                 </div>
@@ -1438,8 +1433,8 @@ function toggleCapability(form: ModelForm, cap: string) {
 }
 .provider-switch.on,
 .toggle-switch.on {
-  background: #2e7d32;
-  box-shadow: inset 0 0 0 1px #2e7d32;
+  background: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 .provider-switch.disabled,
 .toggle-switch.disabled {

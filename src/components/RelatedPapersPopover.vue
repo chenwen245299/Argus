@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick, onBeforeUnmount } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { save as dialogSave } from '@tauri-apps/plugin-dialog'
@@ -222,18 +223,8 @@ async function exportList() {
           :title="enlarged ? t('related.shrink') : t('related.enlarge')"
           @click="toggleEnlarge"
         >
-          <svg v-if="!enlarged" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="15 3 21 3 21 9" />
-            <polyline points="9 21 3 21 3 15" />
-            <line x1="21" y1="3" x2="14" y2="10" />
-            <line x1="3" y1="21" x2="10" y2="14" />
-          </svg>
-          <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="4 14 10 14 10 20" />
-            <polyline points="20 10 14 10 14 4" />
-            <line x1="14" y1="10" x2="21" y2="3" />
-            <line x1="10" y1="14" x2="3" y2="21" />
-          </svg>
+          <Icon v-if="!enlarged" icon="fluent:arrow-maximize-24-regular" width="15" height="15" />
+          <Icon v-else icon="fluent:arrow-minimize-24-regular" width="15" height="15" />
         </button>
         <button class="rp-close" :title="t('related.close')" @click="close">×</button>
       </div>
@@ -267,11 +258,7 @@ async function exportList() {
             :title="t('related.exportTitle')"
             @click="exportList"
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
-            </svg>
+            <Icon icon="fluent:arrow-download-24-regular" width="15" height="15" />
           </button>
         </div>
       </template>

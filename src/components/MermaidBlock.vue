@@ -4,7 +4,7 @@
     <div v-else-if="status === 'done'" class="mermaid-svg-wrap">
       <div class="mermaid-inner" v-html="svgHtml" />
       <button class="mermaid-copy-btn" :title="t('mermaid.copyImage')" @click="copyAsImage">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+        <Icon icon="fluent:copy-24-regular" width="14" height="14" />
       </button>
     </div>
     <pre v-else class="mermaid-error">{{ src }}</pre>
@@ -16,6 +16,7 @@
 
 <script setup lang="ts">
 import { ref, watch, onMounted } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import DOMPurify from 'dompurify'
 import { svgStringToPngBlob } from '../utils/svgToPng'

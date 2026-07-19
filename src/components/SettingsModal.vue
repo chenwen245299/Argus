@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { updateStore } from '../stores/update'
 import GeneralSettings from './settings/GeneralSettings.vue'
+import ThemeSettings from './settings/ThemeSettings.vue'
 import AiSettings from './settings/AiSettings.vue'
 import ExtractionSettings from './settings/ExtractionSettings.vue'
 import AboutSettings from './settings/AboutSettings.vue'
@@ -16,12 +17,13 @@ const emit = defineEmits<{ close: [] }>()
 
 const tlHover = ref(false)
 
-type Section = 'general' | 'ai' | 'extraction' | 'about' | 'arxiv' | 'rag' | 'canvas'
+type Section = 'general' | 'themes' | 'ai' | 'extraction' | 'about' | 'arxiv' | 'rag' | 'canvas'
 
 const activeSection = ref<Section>((props.initialSection as Section) ?? 'general')
 
 const sections: { id: Section; label: string; placeholder?: boolean }[] = [
   { id: 'general', label: 'settings.general' },
+  { id: 'themes', label: 'settings.themes' },
   { id: 'ai', label: 'settings.ai' },
   { id: 'extraction', label: 'settings.extraction' },
   { id: 'arxiv', label: 'settings.arxiv' },
@@ -94,6 +96,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <!-- Right content -->
             <div class="settings-content">
               <GeneralSettings v-if="activeSection === 'general'" />
+              <ThemeSettings v-else-if="activeSection === 'themes'" />
               <AiSettings v-else-if="activeSection === 'ai'" />
               <RagSettings v-else-if="activeSection === 'rag'" />
               <ArxivSettings v-else-if="activeSection === 'arxiv'" />

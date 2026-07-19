@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -1780,10 +1781,7 @@ function toggleContextPanel(nodeId: string) {
 
     <template v-else-if="!ai.isConfigured && ai.loaded">
       <div class="center-hint">
-        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
-          <path d="M12 3 13.8 8.2 19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>
-          <path d="M19 15v4"/><path d="M17 17h4"/>
-        </svg>
+        <Icon icon="fluent:sparkle-24-regular" width="34" height="34" />
         <h3>{{ t('copilot.noProviderTitle') }}</h3>
         <p>{{ t('copilot.noProviderDesc') }}</p>
         <button class="primary-btn" @click="emit('open-settings')">{{ t('copilot.goToSettings') }}</button>
@@ -1798,9 +1796,7 @@ function toggleContextPanel(nodeId: string) {
         </div>
 
         <button class="new-chat-btn sidebar-new-chat" @click="startNewConversation(false)">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 5v14"/><path d="M5 12h14"/>
-          </svg>
+          <Icon icon="fluent:add-24-regular" width="15" height="15" />
           新对话
         </button>
 
@@ -1815,9 +1811,7 @@ function toggleContextPanel(nodeId: string) {
             <span class="history-title">{{ conv.title }}</span>
             <span class="history-meta">{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
             <button class="history-delete" title="删除" @click="deleteConversation(conv.id, $event)">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>
-              </svg>
+              <Icon icon="fluent:delete-24-regular" width="13" height="13" />
             </button>
           </div>
           <div v-if="conversations.length === 0" class="history-empty">暂无历史对话</div>
@@ -1828,30 +1822,20 @@ function toggleContextPanel(nodeId: string) {
         <header class="ai-header" :data-tauri-drag-region="props.standalone ? '' : undefined">
           <div class="header-main" :data-tauri-drag-region="props.standalone ? '' : undefined">
             <span class="spark-icon">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 3 13.8 8.2 19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>
-                <path d="M19 15v4"/><path d="M17 17h4"/>
-              </svg>
+              <Icon icon="fluent:sparkle-24-regular" width="15" height="15" />
             </span>
             <span class="header-title">{{ activeTitle }}</span>
           </div>
 
           <div class="header-actions">
             <button class="icon-btn" title="新建对话" @click="startNewConversation(true)">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 5v14"/><path d="M5 12h14"/>
-              </svg>
+              <Icon icon="fluent:add-24-regular" width="15" height="15" />
             </button>
             <button v-if="!props.standalone" class="icon-btn" title="在独立窗口打开" @click="openPopupWindow">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-              </svg>
+              <Icon icon="fluent:open-24-regular" width="14" height="14" />
             </button>
             <button v-if="!props.standalone" class="icon-btn" title="对话历史" @click="showHistory = true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
-                <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
-                <path d="M8 8h8"/><path d="M8 12h5"/>
-              </svg>
+              <Icon icon="fluent:chat-24-regular" width="16" height="16" />
             </button>
           </div>
         </header>
@@ -1865,9 +1849,7 @@ function toggleContextPanel(nodeId: string) {
               </template>
             </span>
             <span class="model-trigger-label">{{ selectedModelLabel() }}</span>
-            <svg class="chevron" :class="{ open: showModelMenu }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
-              <path d="m6 9 6 6 6-6"/>
-            </svg>
+            <Icon class="chevron" :class="{ open: showModelMenu }" icon="fluent:chevron-down-24-regular" width="12" height="12" />
           </button>
 
           <div v-if="showModelMenu" class="model-menu">
@@ -1927,10 +1909,7 @@ function toggleContextPanel(nodeId: string) {
         >
         <div v-if="!activeConversation?.nodes.length" class="empty-chat">
           <div class="empty-orb">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-              <path d="M12 3 13.8 8.2 19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>
-              <path d="M19 15v4"/><path d="M17 17h4"/>
-            </svg>
+            <Icon icon="fluent:sparkle-24-regular" width="22" height="22" />
           </div>
           <p>基于这篇论文开始新对话</p>
           <span>选择模型，开始与这篇论文对话。</span>
@@ -1966,9 +1945,7 @@ function toggleContextPanel(nodeId: string) {
                     <span v-if="newlyAddedContext(node.id).sections" class="ctx-pill ctx-sections">章节</span>
                     <span v-if="newlyAddedContext(node.id).fulltext" class="ctx-pill ctx-fulltext">全文</span>
                     <span v-if="newlyAddedContext(node.id).pdf" class="ctx-pill ctx-pdf">PDF</span>
-                    <svg class="ctx-chevron" :class="{ open: expandedContextId === node.id }" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                      <polyline points="6 9 12 15 18 9"/>
-                    </svg>
+                    <Icon class="ctx-chevron" :class="{ open: expandedContextId === node.id }" icon="fluent:chevron-down-24-regular" width="11" height="11" />
                   </button>
                   <div v-if="expandedContextId === node.id" class="ctx-preview">
                     <template v-if="getFirstAnswer(node.id)?.contextContent">
@@ -2005,10 +1982,7 @@ function toggleContextPanel(nodeId: string) {
                     @click="previewAttachment(att)"
                   >
                     <img v-if="att.type === 'image'" :src="att.dataUrl" class="user-attachment-thumb" alt="" />
-                    <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                      <polyline points="14 2 14 8 20 8"/>
-                    </svg>
+                    <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
                     <span class="user-attachment-name">{{ att.name }}</span>
                   </button>
                 </div>
@@ -2016,27 +1990,14 @@ function toggleContextPanel(nodeId: string) {
                 <div class="msg-footer user-footer">
                   <div class="msg-actions">
                     <button class="action-btn" :class="{ done: copiedIds.has(node.id) }" title="复制" @click="copyText(node.id, node.content)">
-                      <svg v-if="copiedIds.has(node.id)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                        <polyline points="20 6 9 17 4 12"/>
-                      </svg>
-                      <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>
-                        <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
-                      </svg>
+                      <Icon v-if="copiedIds.has(node.id)" icon="fluent:checkmark-24-regular" width="12" height="12" />
+                      <Icon v-else icon="fluent:copy-24-regular" width="12" height="12" />
                     </button>
                     <button class="action-btn" title="编辑" :disabled="hasStreaming" @click="startEdit(node)">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-                      </svg>
+                      <Icon icon="fluent:edit-24-regular" width="12" height="12" />
                     </button>
                     <button class="action-btn danger" title="删除该对话" :disabled="hasStreaming" @click="deleteExchange(node.id)">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <polyline points="3 6 5 6 21 6"/>
-                        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-                        <path d="M10 11v6M14 11v6"/>
-                        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                      </svg>
+                      <Icon icon="fluent:delete-24-regular" width="12" height="12" />
                     </button>
                   </div>
                 </div>
@@ -2077,9 +2038,7 @@ function toggleContextPanel(nodeId: string) {
                 <!-- Thinking / reasoning content (collapsible) -->
                 <details v-if="answer.reasoningContent" class="reasoning-section">
                   <summary class="reasoning-summary">
-                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="reasoning-chevron">
-                      <path d="m9 18 6-6-6-6"/>
-                    </svg>
+                    <Icon class="reasoning-chevron" icon="fluent:chevron-right-24-regular" width="11" height="11" />
                     思考过程
                     <span v-if="answer.streaming && !answer.content" class="reasoning-live-dot" />
                   </summary>
@@ -2106,35 +2065,19 @@ function toggleContextPanel(nodeId: string) {
               <div class="msg-footer answer-foot">
                 <div class="msg-actions">
                   <button class="action-btn" :class="{ done: copiedIds.has(answer.id) }" title="复制回答" @click="copyText(answer.id, answer.content)">
-                    <svg v-if="copiedIds.has(answer.id)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                      <polyline points="20 6 9 17 4 12"/>
-                    </svg>
-                    <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>
-                      <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
-                    </svg>
+                    <Icon v-if="copiedIds.has(answer.id)" icon="fluent:checkmark-24-regular" width="12" height="12" />
+                    <Icon v-else icon="fluent:copy-24-regular" width="12" height="12" />
                   </button>
                   <button class="action-btn" :disabled="answer.streaming || hasStreaming" title="重新生成" @click="regenerate(node, answer)">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
-                      <path d="M21 3v6h-6"/>
-                    </svg>
+                    <Icon icon="fluent:arrow-sync-24-regular" width="12" height="12" />
                   </button>
                   <button class="action-btn danger" :disabled="answer.streaming || hasStreaming" title="删除该回答" @click="deleteAnswer(node, answer)">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <polyline points="3 6 5 6 21 6"/>
-                      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-                      <path d="M10 11v6M14 11v6"/>
-                      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                    </svg>
+                    <Icon icon="fluent:delete-24-regular" width="12" height="12" />
                   </button>
                 </div>
                 <div v-if="hasUsage(answer) || answer.error" class="msg-usage">
                   <span v-if="currentTurnInputTokens(answer) > 0" class="usage-tokens usage-turn-input" title="本轮你输入的内容（估算 tokens，不含历史与全文）">
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M12 20h9"/>
-                      <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>
-                    </svg>
+                    <Icon icon="fluent:edit-24-regular" width="10" height="10" />
                     {{ formatTokenCount(currentTurnInputTokens(answer)) }}
                   </span>
                   <span v-if="typeof answer.inputTokens === 'number'" class="usage-tokens" title="上下文输入 tokens（含历史与全文）">↑{{ formatTokenCount(answer.inputTokens) }}</span>
@@ -2202,9 +2145,7 @@ function toggleContextPanel(nodeId: string) {
             >
               <span class="context-btn-label">章节</span>
               <span v-if="sectionsActive" class="context-count">{{ selectedSectionTitles.length }}</span>
-              <svg class="context-caret" :class="{ open: showSectionMenu }" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="6 9 12 15 18 9" />
-              </svg>
+              <Icon class="context-caret" :class="{ open: showSectionMenu }" icon="fluent:chevron-down-24-regular" width="9" height="9" />
             </button>
             <Transition name="section-menu">
               <div v-if="showSectionMenu" class="section-menu">
@@ -2261,15 +2202,10 @@ function toggleContextPanel(nodeId: string) {
               :title="att.name"
             >
               <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
-              <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                <polyline points="14 2 14 8 20 8"/>
-              </svg>
+              <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
               <span class="attachment-name">{{ att.name }}</span>
               <button class="attachment-remove" title="移除" @click="removeAttachment(att.id)">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-                </svg>
+                <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
               </button>
             </div>
           </div>
@@ -2292,15 +2228,10 @@ function toggleContextPanel(nodeId: string) {
           />
           <div class="composer-toolbar">
             <button class="toolbar-btn" title="新建对话" @click="startNewConversation(true)">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                <path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"/>
-              </svg>
+              <Icon icon="fluent:compose-24-regular" width="15" height="15" />
             </button>
             <button class="toolbar-btn" title="上传图片或 PDF" @click="openFilePicker">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-              </svg>
+              <Icon icon="fluent:attach-24-regular" width="15" height="15" />
             </button>
 
             <!-- Reasoning / thinking mode picker -->
@@ -2311,11 +2242,7 @@ function toggleContextPanel(nodeId: string) {
                 title="思考模式"
                 @click="reasoningOpen = !reasoningOpen"
               >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
-                  <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
-                  <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
-                  <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
-                </svg>
+                <Icon icon="fluent:brain-circuit-24-regular" width="15" height="15" />
                 <span v-if="useReasoning" class="reasoning-badge">
                   {{ isDeepSeekSelected
                       ? (reasoningLevel === 'high' ? 'max' : 'high')
@@ -2361,15 +2288,10 @@ function toggleContextPanel(nodeId: string) {
             <span class="toolbar-spacer" />
 
             <button v-if="hasStreaming" class="send-btn stop-btn" title="停止生成" @click="stopAllStreaming">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
-                <rect width="14" height="14" x="5" y="5" rx="2"/>
-              </svg>
+              <Icon icon="fluent:stop-24-filled" width="15" height="15" />
             </button>
             <button v-else class="send-btn" :class="{ active: canSend }" :disabled="!canSend" @click="sendMessage">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
-                <path d="m22 2-7 20-4-9-9-4Z"/>
-                <path d="M22 2 11 13"/>
-              </svg>
+              <Icon icon="fluent:send-24-regular" width="15" height="15" />
             </button>
           </div>
         </div>
@@ -2383,16 +2305,12 @@ function toggleContextPanel(nodeId: string) {
                 <p>{{ conversations.length }} 个历史对话</p>
               </div>
               <button class="icon-btn" @click="showHistory = false">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
-                </svg>
+                <Icon icon="fluent:dismiss-24-regular" width="15" height="15" />
               </button>
             </div>
 
             <button class="new-chat-btn" @click="startNewConversation(true)">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 5v14"/><path d="M5 12h14"/>
-              </svg>
+              <Icon icon="fluent:add-24-regular" width="15" height="15" />
               新对话
             </button>
 
@@ -2407,9 +2325,7 @@ function toggleContextPanel(nodeId: string) {
                 <span class="history-title">{{ conv.title }}</span>
                 <span class="history-meta">{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
                 <button class="history-delete" title="删除" @click="deleteConversation(conv.id, $event)">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>
-                  </svg>
+                  <Icon icon="fluent:delete-24-regular" width="13" height="13" />
                 </button>
               </div>
               <div v-if="conversations.length === 0" class="history-empty">暂无历史对话</div>
@@ -2424,17 +2340,13 @@ function toggleContextPanel(nodeId: string) {
       <div v-if="previewImage" class="attachment-lightbox" @click.self="closePreview">
         <img :src="previewImage" class="lightbox-image" alt="" />
         <button class="lightbox-close" @click="closePreview">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
+          <Icon icon="fluent:dismiss-24-regular" width="18" height="18" />
         </button>
       </div>
       <div v-if="previewPdf" class="attachment-lightbox pdf-lightbox" @click.self="closePreview">
         <iframe :src="previewPdf" class="lightbox-pdf" frameborder="0"></iframe>
         <button class="lightbox-close" @click="closePreview">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
+          <Icon icon="fluent:dismiss-24-regular" width="18" height="18" />
         </button>
       </div>
     </Teleport>

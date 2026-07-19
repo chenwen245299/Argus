@@ -46,6 +46,7 @@ pub fn open_library(root: &str) -> Result<LibraryConfig, String> {
     mkdir_if_missing(&root_path.join("papers"))?;
     mkdir_if_missing(&root_path.join("canvases"))?;
     mkdir_if_missing(&root_path.join("inbox"))?;
+    mkdir_if_missing(&root_path.join("writing"))?;
 
     if config_path.exists() {
         let content = std::fs::read_to_string(&config_path)
@@ -120,6 +121,7 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
             if cached.meta_mtime > 0
                 && cached.meta_mtime == current_mtime
                 && cached_source_valid
+                && cached.has_bibtex.is_some()
             {
                 let mut entry = cached.clone();
                 entry.status = synced_status(root, &slug, &path);
@@ -155,6 +157,7 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
         }
 
         let status = synced_status(root, &slug, &path);
+        let has_bibtex = Some(meta.bibtex.as_deref().is_some_and(|b| !b.trim().is_empty()));
         entries.push(PaperIndexEntry {
             slug,
             id: meta.id,
@@ -171,6 +174,7 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
             cite_count: meta.cite_count,
             file_type: meta.file_type,
             related_ids: meta.related_ids,
+            has_bibtex,
         });
     }
 

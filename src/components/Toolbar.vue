@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { Icon } from '@iconify/vue'
 import { storeToRefs } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -83,13 +84,15 @@ const emit = defineEmits<{
   'update:sidebarTab': [tab: string]
 }>()
 
-type SidebarTabDef = { id: string; paths: string[]; label: string }
+// The translations tab keeps its original hand-drawn "translate" glyph
+// (`argus:translate`, registered in main.ts) rather than a Fluent icon, which
+// would show Japanese kana.
+type SidebarTabDef = { id: string; icon: string; label: string }
 
 const drawTabDef = computed((): SidebarTabDef => ({
   id: 'draw',
   label: t('toolbarTabs.draw'),
-  // pen / edit icon
-  paths: ['M12 19l7-7 3 3-7 7-3-3z', 'M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z', 'M2 2l7.586 7.586', 'M11 11a2 2 0 1 0 4 0 2 2 0 0 0-4 0z'],
+  icon: 'fluent:edit-24-regular',
 }))
 
 const sidebarTabs = computed((): SidebarTabDef[] => {
@@ -107,43 +110,12 @@ const sidebarTabs = computed((): SidebarTabDef[] => {
 })
 
 const baseSidebarTabs = computed((): SidebarTabDef[] => [
-  {
-    id: 'translations',
-    label: t('toolbarTabs.translations'),
-    paths: ['m5 8 6 6', 'm4 14 6-6 2-3', 'M2 5h12', 'M7 2h1', 'm22 22-5-10-5 10', 'M14 18h6'],
-  },
-  {
-    id: 'notes',
-    label: t('toolbarTabs.notes'),
-    paths: [
-      'M4 4.5A2.5 2.5 0 0 1 6.5 2H18a2 2 0 0 1 2 2v17H6.5A2.5 2.5 0 0 0 4 18.5z',
-      'M8 6h8', 'M8 10h7',
-    ],
-  },
-  {
-    id: 'highlights',
-    label: t('toolbarTabs.highlights'),
-    paths: ['m15 5 4 4-8.5 8.5H6.5l-.5-4z', 'm13 7 4 4', 'M4 21h12'],
-  },
-  {
-    id: 'ai',
-    label: t('toolbarTabs.ai'),
-    paths: [
-      'M12 3 13.7 8.3 19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z',
-      'M19 15v4', 'M17 17h4',
-    ],
-  },
-  {
-    id: 'sections',
-    label: t('toolbarTabs.sections'),
-    // Table-of-contents / list icon
-    paths: ['M8 6h13', 'M8 12h13', 'M8 18h13', 'M3 6h.01', 'M3 12h.01', 'M3 18h.01'],
-  },
-  {
-    id: 'metadata',
-    label: t('toolbarTabs.metadata'),
-    paths: ['M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z', 'M12 16v-4', 'M12 8h.01'],
-  },
+  { id: 'translations', label: t('toolbarTabs.translations'), icon: 'argus:translate' },
+  { id: 'notes', label: t('toolbarTabs.notes'), icon: 'fluent:notebook-24-regular' },
+  { id: 'highlights', label: t('toolbarTabs.highlights'), icon: 'fluent:highlight-24-regular' },
+  { id: 'ai', label: t('toolbarTabs.ai'), icon: 'fluent:sparkle-24-regular' },
+  { id: 'sections', label: t('toolbarTabs.sections'), icon: 'fluent:text-bullet-list-24-regular' },
+  { id: 'metadata', label: t('toolbarTabs.metadata'), icon: 'fluent:info-24-regular' },
 ])
 
 const searchQuery = ref('')
@@ -390,14 +362,57 @@ function clearSearch() {
 // ── Batch AI analysis ────────────────────────────────────────────────────────
 const batchRunning = ref(false)
 const batchStopping = ref(false) // queue cleared, waiting for in-flight to finish
-const batchDone = ref(0)
-const batchTotal = ref(0)
+// Papers the batch queued at kickoff (stable — never shrinks mid-run so the
+// denominator doesn't drop for still-queued papers on a >concurrency batch).
+const batchBaseline = ref<Set<string>>(new Set())
+// Papers that reached a terminal stage and were then pruned from aiSummaryJobs.
+// Recorded so they keep counting toward the tally after they disappear from the
+// live map (jobs are removed ~2s after finishing).
+const batchRetiredDone = ref<Set<string>>(new Set())
+
+// Denominator: every paper this batch touches — the kickoff queue, whatever is
+// live in aiSummaryJobs right now (this folds in single-paper analyses the user
+// starts manually while the batch runs), plus already-finished-and-pruned ones.
+// Derived straight from the reactive job map (same source the popover list uses)
+// so the count can never drift out of sync with the rows shown.
+const batchAllSlugs = computed(() => {
+  const s = new Set(batchBaseline.value)
+  for (const slug of Object.keys(aiSummaryJobs.value)) s.add(slug)
+  for (const slug of batchRetiredDone.value) s.add(slug)
+  return s
+})
+const batchTotal = computed(() => batchAllSlugs.value.size)
+const batchDone = computed(() => {
+  let n = 0
+  for (const slug of batchAllSlugs.value) {
+    if (batchRetiredDone.value.has(slug)) { n++; continue }
+    const stage = aiSummaryJobs.value[slug]?.stage
+    if (stage === 'done' || stage === 'error') n++
+  }
+  return n
+})
 const showBatchDetail = ref(false)
 let batchCancelled = false
 
 watch(batchRunning, (running) => {
   if (!running) showBatchDetail.value = false
 })
+
+// Record papers as they reach a terminal stage so they keep counting after the
+// job map prunes them ~2s later. Pure best-effort: even if this misses a beat,
+// the computeds above still keep the tally consistent with the live list.
+watch(aiSummaryJobs, (jobs) => {
+  if (!batchRunning.value) return
+  let changed = false
+  const retired = new Set(batchRetiredDone.value)
+  for (const [slug, job] of Object.entries(jobs)) {
+    if ((job.stage === 'done' || job.stage === 'error') && !retired.has(slug)) {
+      retired.add(slug)
+      changed = true
+    }
+  }
+  if (changed) batchRetiredDone.value = retired
+}, { deep: true })
 
 async function refreshSinglePaperStatus(slug: string) {
   try {
@@ -488,8 +503,8 @@ async function startBatchAnalysis() {
   batchRunning.value = true
   batchStopping.value = false
   batchCancelled = false
-  batchDone.value = 0
-  batchTotal.value = toAnalyze.length
+  batchBaseline.value = new Set(toAnalyze.map(p => p.slug))
+  batchRetiredDone.value = new Set()
 
   const CONCURRENCY = 5
   const queue = [...toAnalyze]
@@ -503,7 +518,6 @@ async function startBatchAnalysis() {
         active++
         analyzeOnePaper(paper.slug).finally(() => {
           active--
-          batchDone.value++
           drain()
         })
       }
@@ -793,17 +807,12 @@ onUnmounted(() => {
       <!-- Left: vault picker button -->
       <button class="lib-path-btn" @click="library.pickAndOpen()" :title="t('toolbar.switchTitle')">
         <!-- Home icon -->
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" class="vault-icon">
-          <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-          <polyline points="9 22 9 12 15 12 15 22"/>
-        </svg>
+        <Icon icon="fluent:home-24-regular" class="vault-icon" width="16" height="16" />
         <span class="path-text">
           {{ library.currentPath ? shortPath(library.currentPath) : t('toolbar.noLibrary') }}
         </span>
         <span v-if="library.isRefreshing" class="scan-dot" title="正在同步…" />
-        <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="chevron-icon">
-          <polyline points="6 9 12 15 18 9"/>
-        </svg>
+        <Icon v-else icon="fluent:chevron-down-24-regular" class="chevron-icon" width="12" height="12" />
       </button>
     </div>
 
@@ -813,10 +822,7 @@ onUnmounted(() => {
 
     <!-- Center: search -->
     <div v-if="library.currentPath" class="search-box">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="search-icon">
-        <circle cx="11" cy="11" r="8"/>
-        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-      </svg>
+      <Icon icon="fluent:search-24-regular" class="search-icon" width="14" height="14" />
       <input
         v-model="searchQuery"
         class="search-input"
@@ -825,10 +831,7 @@ onUnmounted(() => {
         @keydown.escape="clearSearch"
       />
       <button v-if="searchQuery" class="search-clear" @click="clearSearch">
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
-          <line x1="18" y1="6" x2="6" y2="18"/>
-          <line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
+        <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
       </button>
     </div>
     <div v-else class="search-placeholder" />
@@ -843,9 +846,7 @@ onUnmounted(() => {
       >
         <span class="paper-task-spinner" />
         <span class="paper-task-label">{{ batchStopping ? t('toolbar.batchStopping') : t('toolbar.batchAnalysisRunning') }} {{ batchDone }}/{{ batchTotal }}</span>
-        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
-          <polyline :points="showBatchDetail ? '18 15 12 9 6 15' : '6 9 12 15 18 9'"/>
-        </svg>
+        <Icon :icon="showBatchDetail ? 'fluent:chevron-up-24-regular' : 'fluent:chevron-down-24-regular'" width="11" height="11" />
       </span>
 
       <Transition name="batch-detail">
@@ -861,9 +862,7 @@ onUnmounted(() => {
               class="batch-detail-item"
             >
               <span v-if="item.active" class="paper-task-spinner batch-item-spinner" />
-              <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="20 6 9 17 4 12"/>
-              </svg>
+              <Icon v-else icon="fluent:checkmark-24-regular" width="13" height="13" />
               <span class="batch-item-name">{{ item.detail?.split('\n')[0] ?? item.id }}</span>
               <span class="batch-item-stage">{{ item.stage }}</span>
             </div>
@@ -884,9 +883,7 @@ onUnmounted(() => {
         :title="paperTaskItems[0].detail || paperTaskItems[0].label"
       >
         <span v-if="paperTaskItems[0].active" class="paper-task-spinner" />
-        <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="20 6 9 17 4 12"/>
-        </svg>
+        <Icon v-else icon="fluent:checkmark-24-regular" width="13" height="13" />
         <span class="paper-task-label">{{ paperTaskItems[0].label }}</span>
       </span>
 
@@ -898,13 +895,9 @@ onUnmounted(() => {
           @click.stop="showPaperTaskDetail = !showPaperTaskDetail"
         >
           <span v-if="paperTaskActiveCount > 0" class="paper-task-spinner" />
-          <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="20 6 9 17 4 12"/>
-          </svg>
+          <Icon v-else icon="fluent:checkmark-24-regular" width="13" height="13" />
           <span class="paper-task-label">{{ t('paper.summarizeAi') }} {{ paperTaskDoneCount }}/{{ paperTaskItems.length }}</span>
-          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
-            <polyline :points="showPaperTaskDetail ? '18 15 12 9 6 15' : '6 9 12 15 18 9'"/>
-          </svg>
+          <Icon :icon="showPaperTaskDetail ? 'fluent:chevron-up-24-regular' : 'fluent:chevron-down-24-regular'" width="11" height="11" />
         </span>
 
         <Transition name="batch-detail">
@@ -920,9 +913,7 @@ onUnmounted(() => {
                 class="batch-detail-item"
               >
                 <span v-if="item.active" class="paper-task-spinner batch-item-spinner" />
-                <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                  <polyline points="20 6 9 17 4 12"/>
-                </svg>
+                <Icon v-else icon="fluent:checkmark-24-regular" width="13" height="13" />
                 <span class="batch-item-name">{{ item.detail?.split('\n')[0] ?? item.id }}</span>
                 <span class="batch-item-stage">{{ item.stage }}</span>
               </div>
@@ -940,13 +931,9 @@ onUnmounted(() => {
         @click.stop="showBatchOpDetail = !showBatchOpDetail"
       >
         <span v-if="batchTasks.running" class="paper-task-spinner" />
-        <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="20 6 9 17 4 12"/>
-        </svg>
+        <Icon v-else icon="fluent:checkmark-24-regular" width="13" height="13" />
         <span class="paper-task-label">{{ batchTasks.label }} {{ batchTasks.doneCount }}/{{ batchTasks.total }}</span>
-        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
-          <polyline :points="showBatchOpDetail ? '18 15 12 9 6 15' : '6 9 12 15 18 9'"/>
-        </svg>
+        <Icon :icon="showBatchOpDetail ? 'fluent:chevron-up-24-regular' : 'fluent:chevron-down-24-regular'" width="11" height="11" />
       </span>
 
       <Transition name="batch-detail">
@@ -962,12 +949,8 @@ onUnmounted(() => {
               class="batch-detail-item"
             >
               <span v-if="item.status === 'running'" class="paper-task-spinner batch-item-spinner" />
-              <svg v-else-if="item.status === 'error'" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-              </svg>
-              <svg v-else-if="item.status === 'done'" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="20 6 9 17 4 12"/>
-              </svg>
+              <Icon v-else-if="item.status === 'error'" icon="fluent:error-circle-24-regular" width="13" height="13" style="color: #ef4444" />
+              <Icon v-else-if="item.status === 'done'" icon="fluent:checkmark-24-regular" width="13" height="13" />
               <span v-else class="batch-item-pending-dot" />
               <span class="batch-item-name">{{ titleInitialCaps(item.title) }}</span>
               <span class="batch-item-stage">{{ item.message ? t('batch.itemError') : t(`batch.status.${item.status}`) }}</span>
@@ -981,9 +964,7 @@ onUnmounted(() => {
     <div v-if="embedJobAgg" class="embed-progress-strip">
       <span class="paper-task-chip" :class="{ 'is-active': embedJobAgg.running }">
         <span v-if="embedJobAgg.running" class="paper-task-spinner" />
-        <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="20 6 9 17 4 12"/>
-        </svg>
+        <Icon v-else icon="fluent:checkmark-24-regular" width="13" height="13" />
         <span class="paper-task-label">{{ embedJobText }}</span>
       </span>
     </div>
@@ -1001,13 +982,9 @@ onUnmounted(() => {
       :title="importStore.lastUrlError"
       @click="importStore.clearUrlError()"
     >
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-        <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-      </svg>
+      <Icon icon="fluent:error-circle-24-regular" width="14" height="14" />
       <span class="import-error-text">导入失败：{{ importStore.lastUrlError }}</span>
-      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-      </svg>
+      <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
     </div>
 
     <!-- DeepSeek peak / off-peak price indicator -->
@@ -1022,14 +999,8 @@ onUnmounted(() => {
       <img :src="dpskIconUrl" class="dpsk-logo" alt="" />
       <span class="dpsk-provider">DeepSeek</span>
       <span class="dpsk-sep" />
-      <svg v-if="isPeakPriceNow" class="dpsk-trend" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-        <polyline points="3 17 9 11 13 15 21 7" />
-        <polyline points="15 7 21 7 21 13" />
-      </svg>
-      <svg v-else class="dpsk-trend" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-        <polyline points="3 7 9 13 13 9 21 17" />
-        <polyline points="15 17 21 17 21 11" />
-      </svg>
+      <Icon v-if="isPeakPriceNow" icon="fluent:arrow-trending-24-regular" class="dpsk-trend" width="14" height="14" />
+      <Icon v-else icon="fluent:arrow-trending-down-24-regular" class="dpsk-trend" width="14" height="14" />
       <span class="dpsk-price-label">{{ isPeakPriceNow ? '波峰' : '波谷' }}</span>
     </div>
 
@@ -1043,35 +1014,20 @@ onUnmounted(() => {
         :title="importTitle"
         @click="toggleImportMenu"
       >
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/>
-          <line x1="12" y1="18" x2="12" y2="12"/>
-          <polyline points="9 15 12 18 15 15"/>
-        </svg>
+        <Icon icon="fluent:document-arrow-down-24-regular" width="15" height="15" />
         {{ t('import.btn') }}
-        <svg class="import-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <polyline points="6 9 12 15 18 9"/>
-        </svg>
+        <Icon class="import-caret" :class="{ 'is-open': showImportMenu }" icon="fluent:chevron-down-24-regular" width="12" height="12" />
       </button>
 
       <!-- Dropdown: choose import method -->
-      <Transition name="menu-expand">
+      <Transition name="toolbar-dropdown">
         <div v-if="showImportMenu" class="import-menu">
           <button class="import-menu-item" :title="t('import.btnTitle')" @click="chooseFileImport">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-              <polyline points="14 2 14 8 20 8"/>
-              <line x1="12" y1="18" x2="12" y2="12"/>
-              <polyline points="9 15 12 18 15 15"/>
-            </svg>
+            <Icon icon="fluent:document-arrow-down-24-regular" width="15" height="15" />
             {{ t('import.fileImportBtn') }}
           </button>
           <button class="import-menu-item" :title="t('import.urlImportTitle')" @click="chooseUrlImport">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
-            </svg>
+            <Icon icon="fluent:link-24-regular" width="15" height="15" />
             {{ t('import.urlImportBtn') }}
           </button>
         </div>
@@ -1083,9 +1039,7 @@ onUnmounted(() => {
           <div class="popover-header">
             <span class="popover-title">{{ t('import.urlImportTitle') }}</span>
             <button class="popover-close" @click="closeUrlPopover">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
+              <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
             </button>
           </div>
           <input
@@ -1136,43 +1090,26 @@ onUnmounted(() => {
             {{ aiProgressText }}
           </span>
         </span>
-        <svg class="import-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <polyline points="6 9 12 15 18 9"/>
-        </svg>
+        <Icon class="import-caret" :class="{ 'is-open': showAiMenu }" icon="fluent:chevron-down-24-regular" width="12" height="12" />
         <span v-if="!arxivWindowOpen && arxivNewCount > 0" class="arxiv-badge">{{ arxivNewCount }}</span>
       </button>
 
       <!-- Dropdown: arXiv / library chat -->
-      <Transition name="menu-expand">
+      <Transition name="toolbar-dropdown">
         <div v-if="showAiMenu" class="import-menu ai-hub-menu">
           <button class="import-menu-item" :title="t('toolbar.arxivTitle')" @click="chooseArxiv">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-              <path d="M2 17l10 5 10-5"/>
-              <path d="M2 12l10 5 10-5"/>
-            </svg>
+            <Icon icon="fluent:layer-24-regular" width="15" height="15" />
             {{ t('toolbar.arxivMenuItem') }}
             <span v-if="!arxivWindowOpen && arxivNewCount > 0" class="menu-badge">{{ arxivNewCount }}</span>
             <span v-else-if="arxivAnalyzing && arxivProgress.total > 0" class="menu-meta">{{ arxivProgress.done }}/{{ arxivProgress.total }}</span>
           </button>
           <button class="import-menu-item" :title="t('toolbar.libraryChatTitle')" @click="chooseLibraryChat">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>
-              <path d="M8 9h8"/>
-              <path d="M8 13h5"/>
-            </svg>
+            <Icon icon="fluent:chat-24-regular" width="15" height="15" />
             {{ t('toolbar.libraryChat') }}
             <span v-if="ragEmbedSyncing && ragEmbedProgress.total > 0" class="menu-meta">{{ ragEmbedProgress.done }}/{{ ragEmbedProgress.total }}</span>
           </button>
           <button class="import-menu-item" :title="t('toolbar.embeddingMapTitle')" @click="chooseEmbeddingMap">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-              <circle cx="5.5" cy="6" r="2.6"/>
-              <circle cx="18" cy="5" r="2.2"/>
-              <circle cx="12" cy="13.5" r="2.8"/>
-              <circle cx="6" cy="19" r="2"/>
-              <circle cx="19" cy="18" r="2.4"/>
-              <path d="M7.8 7.5 10 11.4M14.6 12.2 16.4 6.9M10 15.6 7.3 17.5M14.5 15 17 16.6"/>
-            </svg>
+            <Icon icon="fluent:data-scatter-24-regular" width="15" height="15" />
             {{ t('toolbar.embeddingMap') }}
           </button>
           <div class="menu-divider" />
@@ -1183,15 +1120,9 @@ onUnmounted(() => {
             :title="batchStopping ? t('toolbar.batchStopping') : batchRunning ? t('toolbar.batchStopTitle') : t('toolbar.batchAnalysisTitle')"
             @click="chooseBatchAnalysis"
           >
-            <svg v-if="!batchRunning" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 3 13.7 8.3 19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z"/>
-              <path d="M19 15v4"/>
-              <path d="M17 17h4"/>
-            </svg>
+            <Icon v-if="!batchRunning" icon="fluent:sparkle-24-regular" width="15" height="15" />
             <span v-else-if="batchStopping" class="paper-task-spinner menu-item-spinner" />
-            <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-              <rect x="4" y="4" width="16" height="16" rx="2"/>
-            </svg>
+            <Icon v-else icon="fluent:stop-24-filled" width="13" height="13" />
             {{ batchStopping ? t('toolbar.batchStopping') : batchRunning ? t('toolbar.batchStop') : t('toolbar.batchAnalysis') }}
           </button>
         </div>
@@ -1207,37 +1138,19 @@ onUnmounted(() => {
         :title="t('toolbar.statsTitle')"
         @click="toggleStatsMenu"
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M3 3v18h18"/>
-          <rect x="7" y="11" width="3" height="6" rx="1"/>
-          <rect x="12" y="7" width="3" height="10" rx="1"/>
-          <rect x="17" y="5" width="3" height="12" rx="1"/>
-        </svg>
+        <Icon icon="fluent:data-bar-vertical-24-regular" width="15" height="15" />
         <span class="batch-btn-label">{{ t('toolbar.stats') }}</span>
-        <svg class="import-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <polyline points="6 9 12 15 18 9"/>
-        </svg>
+        <Icon class="import-caret" :class="{ 'is-open': showStatsMenu }" icon="fluent:chevron-down-24-regular" width="12" height="12" />
       </button>
 
-      <Transition name="menu-expand">
+      <Transition name="toolbar-dropdown">
         <div v-if="showStatsMenu" class="import-menu stats-menu">
           <button class="import-menu-item" :title="t('toolbar.activityLogTitle')" @click="chooseActivityLog">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 19V5"/>
-              <path d="M4 19h16"/>
-              <path d="M8 15l3-4 3 2 4-7"/>
-              <path d="M18 6h-4"/>
-              <path d="M18 6v4"/>
-            </svg>
+            <Icon icon="fluent:data-trending-24-regular" width="15" height="15" />
             {{ t('toolbar.activityLog') }}
           </button>
           <button class="import-menu-item" :title="t('toolbar.aiUsageTitle')" @click="chooseUsage">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <ellipse cx="12" cy="6" rx="7" ry="3"/>
-              <path d="M5 6v5c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/>
-              <path d="M5 11v5c0 1.7 3.1 3 7 3 1.3 0 2.5-.1 3.5-.4"/>
-              <path d="M18.5 14.5l.5 1.2 1.2.5-1.2.5-.5 1.2-.5-1.2-1.2-.5 1.2-.5.5-1.2z"/>
-            </svg>
+            <Icon icon="fluent:database-24-regular" width="15" height="15" />
             {{ t('toolbar.aiUsage') }}
           </button>
         </div>
@@ -1270,9 +1183,7 @@ onUnmounted(() => {
           :title="tab.label"
           @click="emit('update:sidebarTab', tab.id)"
         >
-          <svg class="sidebar-tab-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path v-for="p in tab.paths" :key="p" :d="p"/>
-          </svg>
+          <Icon :icon="tab.icon" class="sidebar-tab-icon" width="20" height="20" />
           <span class="sidebar-tab-label">{{ tab.label }}</span>
         </button>
       </div>
@@ -2034,15 +1945,17 @@ onUnmounted(() => {
   margin-left: -1px;
   opacity: 0.65;
   flex-shrink: 0;
+  transform-origin: center;
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
+.import-caret.is-open { transform: rotate(180deg); }
 
 /* Import method dropdown */
 .import-menu {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  /* Unfold downward from the top edge on open, roll back up on close. */
-  transform-origin: top center;
+  transform-origin: top right;
   min-width: 148px;
   background: var(--bg-primary);
   border: 1px solid var(--border-default);
@@ -2202,19 +2115,42 @@ onUnmounted(() => {
   transform: scale(0.8);
 }
 
-/* Dropdown menus unfold downward from their top edge on open, and roll back
-   up (bottom→top) on close, rather than fading in/out. transform-origin
-   (top) is set on .import-menu so scaleY pivots on the top edge. */
-.menu-expand-enter-active {
-  transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.16s ease;
+/* Toolbar dropdowns visibly unfold from their trigger and roll back into it. */
+.toolbar-dropdown-enter-active {
+  will-change: transform, opacity;
+  animation: toolbar-dropdown-in 0.36s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
-.menu-expand-leave-active {
-  transition: transform 0.26s cubic-bezier(0.4, 0, 1, 1), opacity 0.18s ease;
+.toolbar-dropdown-leave-active {
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: toolbar-dropdown-out 0.28s cubic-bezier(0.4, 0, 1, 1) both;
 }
-.menu-expand-enter-from,
-.menu-expand-leave-to {
-  opacity: 0;
-  transform: scaleY(0);
+
+@keyframes toolbar-dropdown-in {
+  from {
+    opacity: 0;
+    transform: translateY(-14px) scale(0.92, 0.76);
+    clip-path: inset(0 0 100% 0 round 8px);
+  }
+  65% { opacity: 1; }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    clip-path: inset(0 0 0 0 round 8px);
+  }
+}
+
+@keyframes toolbar-dropdown-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    clip-path: inset(0 0 0 0 round 8px);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.95, 0.8);
+    clip-path: inset(0 0 100% 0 round 8px);
+  }
 }
 
 @keyframes spin {

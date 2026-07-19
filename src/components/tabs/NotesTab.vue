@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import VditorEditor from '../VditorEditor.vue'
@@ -26,6 +27,28 @@ function togglePin(note: { id: string }, e: MouseEvent) {
     ? current.filter(id => id !== note.id)
     : [...current, note.id]
   emit('update:canvasNotes', next)
+}
+
+// ── First-run pin guide ───────────────────────────────────────────────────────
+// The first time the notes sidebar is opened for a paper, explain what pinning a
+// note buys you (list badge + relationship-graph hover thumbnail). Shown once,
+// gated by a localStorage flag.
+const PIN_GUIDE_KEY = 'argus:notes-pin-guide-seen'
+const showPinGuide = ref(false)
+function maybeShowPinGuide() {
+  if (!props.slug || showPinGuide.value) return
+  try {
+    if (localStorage.getItem(PIN_GUIDE_KEY)) return
+    // Mark seen as soon as it's shown, so it appears exactly once and never
+    // re-nags — even if the tab is switched away before it's dismissed.
+    localStorage.setItem(PIN_GUIDE_KEY, '1')
+  } catch {
+    return // storage disabled — skip the guide rather than nag every open
+  }
+  showPinGuide.value = true
+}
+function dismissPinGuide() {
+  showPinGuide.value = false
 }
 
 // ── View state ────────────────────────────────────────────────────────────────
@@ -273,7 +296,11 @@ async function handleNotesUpdated(event: Event) {
 
 onMounted(() => {
   window.addEventListener('argus-notes-updated', handleNotesUpdated)
+  maybeShowPinGuide()
 })
+
+// Also trigger when a paper gets selected while the notes tab is already open.
+watch(() => props.slug, (s) => { if (s) maybeShowPinGuide() })
 
 onBeforeUnmount(async () => {
   window.removeEventListener('argus-notes-updated', handleNotesUpdated)
@@ -306,6 +333,35 @@ function fmtDate(iso: string) {
 
 <template>
   <div class="notes-tab">
+    <!-- First-run guide: what pinning a note does -->
+    <Transition name="pin-guide-fade">
+      <div v-if="showPinGuide" class="pin-guide" @click.self="dismissPinGuide">
+        <div class="pin-guide-card">
+          <div class="pin-guide-head">
+            <span class="pin-guide-icon">
+              <Icon icon="fluent:pin-24-regular" width="14" height="14" />
+            </span>
+            <span class="pin-guide-title">{{ t('notes.pinGuideTitle') }}</span>
+          </div>
+          <p class="pin-guide-intro">{{ t('notes.pinGuideIntro') }}</p>
+          <ul class="pin-guide-points">
+            <li>
+              <span class="pin-guide-demo">
+                <i class="demo-badge" style="background:#e0e7ff;color:#4338ca">A</i>
+                <i class="demo-badge" style="background:#fce7f3;color:#be185d">B</i>
+              </span>
+              <span class="pin-guide-text">{{ t('notes.pinGuidePoint1') }}</span>
+            </li>
+            <li>
+              <span class="pin-guide-demo"><i class="demo-thumb" /></span>
+              <span class="pin-guide-text">{{ t('notes.pinGuidePoint2') }}</span>
+            </li>
+          </ul>
+          <button class="pin-guide-btn" @click="dismissPinGuide">{{ t('notes.pinGuideGotIt') }}</button>
+        </div>
+      </div>
+    </Transition>
+
     <!-- No paper selected -->
     <div v-if="!slug" class="empty">{{ t('notes.selectHint') }}</div>
 
@@ -314,9 +370,7 @@ function fmtDate(iso: string) {
       <div class="list-toolbar">
         <span class="list-heading">{{ t('tabs.notes') }}</span>
         <button class="new-btn" :title="t('notes.newNote')" @click="createNote">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
+          <Icon icon="fluent:add-24-regular" width="15" height="15" />
         </button>
       </div>
 
@@ -344,21 +398,14 @@ function fmtDate(iso: string) {
                 :title="isPinned(note.id) ? t('notes.unpinFromCanvas') : t('notes.pinToCanvas')"
                 @click="togglePin(note, $event)"
               >
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none">
-                  <path d="M16 1l-1.5 1.5L16 4l-6 6-2-1L6 11l3 3-5 5h2l4-4 3 3 2-2-1-2 6-6 1.5 1.5L23 8z"/>
-                </svg>
+                <Icon :icon="isPinned(note.id) ? 'fluent:pin-24-filled' : 'fluent:pin-24-regular'" width="11" height="11" />
               </button>
               <button
                 class="note-delete-btn"
                 :title="t('notes.deleteNote')"
                 @click="deleteNote(note, $event)"
               >
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="3 6 5 6 21 6"/>
-                  <path d="M19 6l-1 14H6L5 6"/>
-                  <path d="M10 11v6M14 11v6"/>
-                  <path d="M9 6V4h6v2"/>
-                </svg>
+                <Icon icon="fluent:delete-24-regular" width="13" height="13" />
               </button>
             </div>
           </div>
@@ -370,9 +417,7 @@ function fmtDate(iso: string) {
     <template v-else-if="view === 'editor' && activeNote">
       <div class="editor-toolbar">
         <button class="back-btn" type="button" :title="t('notes.back')" @click.stop="goBack">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <polyline points="15 18 9 12 15 6"/>
-          </svg>
+          <Icon icon="fluent:chevron-left-24-regular" width="15" height="15" />
         </button>
 
         <!-- Inline editable title -->
@@ -398,9 +443,7 @@ function fmtDate(iso: string) {
         <span v-else-if="saveError" class="status error">{{ saveError }}</span>
 
         <button class="popout-btn" :title="t('notes.openInWindow')" @click="openInWindow">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-          </svg>
+          <Icon icon="fluent:open-24-regular" width="14" height="14" />
         </button>
       </div>
 
@@ -421,7 +464,127 @@ function fmtDate(iso: string) {
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  position: relative;
 }
+
+/* ── First-run pin guide ── */
+.pin-guide {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: color-mix(in srgb, var(--bg-primary) 62%, transparent);
+  backdrop-filter: blur(3px);
+}
+.pin-guide-card {
+  width: 100%;
+  max-width: 280px;
+  padding: 16px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+}
+.pin-guide-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 8px;
+}
+.pin-guide-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-light);
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.pin-guide-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.pin-guide-intro {
+  margin: 0 0 10px;
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.pin-guide-points {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.pin-guide-points li {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+.pin-guide-demo {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 1px;
+  width: 34px;
+  justify-content: center;
+}
+.demo-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  font-style: normal;
+}
+.demo-thumb {
+  width: 30px;
+  height: 20px;
+  border-radius: 3px;
+  background: repeating-linear-gradient(
+    to bottom,
+    var(--text-tertiary) 0 1.5px,
+    transparent 1.5px 5px
+  );
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  opacity: 0.8;
+}
+.pin-guide-text {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+.pin-guide-btn {
+  width: 100%;
+  padding: 7px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #fff;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: filter 0.1s;
+}
+.pin-guide-btn:hover { filter: brightness(1.08); }
+
+.pin-guide-fade-enter-active,
+.pin-guide-fade-leave-active { transition: opacity 0.2s ease; }
+.pin-guide-fade-enter-from,
+.pin-guide-fade-leave-to { opacity: 0; }
 
 .empty {
   flex: 1;

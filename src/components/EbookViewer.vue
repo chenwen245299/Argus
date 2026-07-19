@@ -6,6 +6,7 @@
 // untouched. Highlights anchor to character offsets in each chapter's
 // sanitized DOM text, so they survive font-size changes and reflow.
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import DOMPurify from 'dompurify'
@@ -1298,9 +1299,7 @@ defineExpose({ closeToList: handleBack })
         <span class="position-group font-controls">
           <span class="control-label">{{ t('ebook.fontSize') }}</span>
           <button class="font-step-btn" @click="fontSmaller" :title="t('ebook.fontSmaller')" :disabled="fontSize <= FONT_MIN">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
-              <line x1="5" y1="12" x2="19" y2="12" />
-            </svg>
+            <Icon icon="fluent:subtract-24-regular" width="13" height="13" />
           </button>
           <input
             class="toolbar-number-input font-size-input"
@@ -1312,18 +1311,13 @@ defineExpose({ closeToList: handleBack })
             @keydown.enter="($event.target as HTMLInputElement).blur()"
           />
           <button class="font-step-btn" @click="fontLarger" :title="t('ebook.fontLarger')" :disabled="fontSize >= FONT_MAX">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
-              <line x1="12" y1="5" x2="12" y2="19" />
-              <line x1="5" y1="12" x2="19" y2="12" />
-            </svg>
+            <Icon icon="fluent:add-24-regular" width="13" height="13" />
           </button>
         </span>
       </div>
 
       <button class="ebook-search-btn" @click="openSearch" :title="t('ebook.search')">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-          <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
-        </svg>
+        <Icon icon="fluent:search-24-regular" width="15" height="15" />
       </button>
 
       <div class="color-picker">
@@ -1341,11 +1335,7 @@ defineExpose({ closeToList: handleBack })
 
     <!-- Error -->
     <div v-if="error" class="ebook-error">
-      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <circle cx="12" cy="12" r="10"/>
-        <line x1="12" y1="8" x2="12" y2="12"/>
-        <line x1="12" y1="16" x2="12.01" y2="16"/>
-      </svg>
+      <Icon icon="fluent:error-circle-24-regular" width="32" height="32" />
       <p>{{ error }}</p>
     </div>
 
@@ -1399,9 +1389,7 @@ defineExpose({ closeToList: handleBack })
 
     <!-- In-book search -->
     <div v-if="searchOpen" class="ebook-search-bar" @click.stop>
-      <svg class="ebook-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-        <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
-      </svg>
+      <Icon class="ebook-search-icon" icon="fluent:search-24-regular" width="14" height="14" />
       <input
         ref="searchInputRef"
         v-model="searchQuery"
@@ -1426,13 +1414,13 @@ defineExpose({ closeToList: handleBack })
         >{{ t('ebook.searchWholeBook') }}</button>
       </div>
       <button class="ebook-search-nav" :disabled="searchMatches.length === 0" @click="prevMatch" :title="t('ebook.searchPrev')">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15" /></svg>
+        <Icon icon="fluent:chevron-up-24-regular" width="11" height="11" />
       </button>
       <button class="ebook-search-nav" :disabled="searchMatches.length === 0" @click="nextMatch" :title="t('ebook.searchNext')">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9" /></svg>
+        <Icon icon="fluent:chevron-down-24-regular" width="11" height="11" />
       </button>
       <button class="ebook-search-close" @click="closeSearch" :title="t('ebook.searchClose')">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+        <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
       </button>
     </div>
 
@@ -1459,41 +1447,22 @@ defineExpose({ closeToList: handleBack })
         :title="highlightStyle === 'highlight' ? t('pdf.switchUnderline') : t('pdf.switchHighlight')"
         @click="toggleHighlightStyle"
       >
-        <svg v-if="highlightStyle === 'highlight'" width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-          <rect x="1.5" y="1.5" width="13" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
-          <text x="8" y="12" text-anchor="middle" font-size="10" font-weight="bold" font-family="serif">A</text>
-        </svg>
-        <svg v-else width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-          <text x="8" y="11" text-anchor="middle" font-size="11" font-weight="bold" font-family="serif">A</text>
-          <rect x="1" y="13" width="14" height="1.5" rx="0.75"/>
-        </svg>
+        <Icon v-if="highlightStyle === 'highlight'" icon="fluent:highlight-24-regular" width="16" height="16" />
+        <Icon v-else icon="fluent:text-underline-24-regular" width="16" height="16" />
       </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="addToSnippetLibrary" :title="t('snippets.addToLibrary')">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
-        </svg>
+        <Icon icon="fluent:bookmark-24-regular" width="13" height="13" />
         <span class="sel-translate-label">{{ t('pdf.snippet') }}</span>
       </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="translateSelection">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M5 8l6 6"/>
-          <path d="M4 14l6-6 2-3"/>
-          <path d="M2 5h12"/>
-          <path d="M7 2h1"/>
-          <path d="M22 22l-5-10-5 10"/>
-          <path d="M14 18h6"/>
-        </svg>
+        <Icon icon="argus:translate" width="13" height="13" />
         <span class="sel-translate-label">{{ t('pdf.translate') }}</span>
       </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="askAiWithSelection" :title="t('pdf.askAi')">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M12 2l2.09 6.26L20 10l-5.91 1.74L12 18l-2.09-6.26L4 10l5.91-1.74L12 2z"/>
-          <path d="M19 14l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z"/>
-          <path d="M4 18l.6 1.8 1.8.6-1.8.6-.6 1.8-.6-1.8-1.8-.6 1.8-.6.6-1.8z"/>
-        </svg>
+        <Icon icon="fluent:sparkle-24-regular" width="13" height="13" />
         <span class="sel-translate-label">{{ t('pdf.askAi') }}</span>
       </button>
     </div>

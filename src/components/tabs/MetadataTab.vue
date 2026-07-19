@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import type { CitationRef, PaperMeta } from '../../types'
@@ -742,13 +743,8 @@ async function extractAbstract() {
                 title="复制 BibTeX"
                 @click="copyText('bibtex', meta.bibtex ?? '')"
               >
-                <svg v-if="copiedKind === 'bibtex'" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                  <polyline points="20 6 9 17 4 12"/>
-                </svg>
-                <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                </svg>
+                <Icon v-if="copiedKind === 'bibtex'" icon="fluent:checkmark-24-regular" width="12" height="12" />
+                <Icon v-else icon="fluent:copy-24-regular" width="12" height="12" />
                 {{ copiedKind === 'bibtex' ? '已复制' : '复制' }}
               </button>
             </div>
@@ -780,7 +776,7 @@ async function extractAbstract() {
             <span>{{ t('meta.abstract') }}</span>
             <div class="section-actions">
               <button class="abstract-btn" :disabled="abstractExtracting" @click="extractAbstract">
-                <svg v-if="abstractExtracting" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="spin-xs"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                <Icon v-if="abstractExtracting" icon="fluent:arrow-sync-24-regular" width="10" height="10" class="spin-xs" />
                 {{ abstractExtracting ? t('meta.abstractExtracting') : abstractText ? t('meta.abstractReExtract') : t('meta.abstractExtract') }}
               </button>
               <button
@@ -790,13 +786,8 @@ async function extractAbstract() {
                 title="复制摘要"
                 @click="copyText('abstract', abstractText)"
               >
-                <svg v-if="copiedKind === 'abstract'" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                  <polyline points="20 6 9 17 4 12"/>
-                </svg>
-                <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                </svg>
+                <Icon v-if="copiedKind === 'abstract'" icon="fluent:checkmark-24-regular" width="12" height="12" />
+                <Icon v-else icon="fluent:copy-24-regular" width="12" height="12" />
                 {{ copiedKind === 'abstract' ? '已复制' : '复制' }}
               </button>
             </div>
@@ -826,13 +817,8 @@ async function extractAbstract() {
                 title="复制全文"
                 @click="copyText('fulltext', fulltext)"
               >
-                <svg v-if="copiedKind === 'fulltext'" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                  <polyline points="20 6 9 17 4 12"/>
-                </svg>
-                <svg v-else width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                </svg>
+                <Icon v-if="copiedKind === 'fulltext'" icon="fluent:checkmark-24-regular" width="12" height="12" />
+                <Icon v-else icon="fluent:copy-24-regular" width="12" height="12" />
                 {{ copiedKind === 'fulltext' ? '已复制' : '复制' }}
               </button>
             </div>

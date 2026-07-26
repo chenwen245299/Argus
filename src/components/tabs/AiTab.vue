@@ -1878,7 +1878,7 @@ function toggleContextPanel(nodeId: string) {
 
         <div class="messages-wrap">
         <nav
-          v-if="!activeConversationIsMetadataExtraction && messageNav.length > 1"
+          v-if="messageNav.length > 1"
           class="rail-nav"
           aria-label="消息导航"
           @mouseleave="clearNavHover"

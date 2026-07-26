@@ -1509,6 +1509,35 @@ async function submitUserEdit(msg: LibraryUiMessage) {
   await runAssistantRequest(conv, reactiveMsg, reactiveMsg, history, sel)
 }
 
+// Delete a whole Q&A turn (the user message + its assistant answer) so the
+// conversation stays strictly alternating — regenerate already covers "redo this
+// answer", so delete removes the exchange entirely.
+function deleteMessage(msg: LibraryUiMessage) {
+  if (loading.value || !activeConv.value) return
+  const conv = activeConv.value
+  const idx = conv.messages.findIndex(m => m.id === msg.id)
+  if (idx < 0) return
+  let start = idx
+  let count = 1
+  if (msg.role === 'assistant') {
+    // Include the preceding user question, if any.
+    if (idx > 0 && conv.messages[idx - 1].role === 'user') { start = idx - 1; count = 2 }
+  } else if (idx + 1 < conv.messages.length && conv.messages[idx + 1].role === 'assistant') {
+    // User message: include the following assistant answer.
+    count = 2
+  }
+  conv.messages.splice(start, count)
+  if (conv.messages.length === 0) {
+    // Emptied the conversation — drop it like an explicit conversation delete.
+    deleteConversation(conv.id)
+    return
+  }
+  // Keep the title in sync if the first (title-defining) user turn was removed.
+  const firstUser = conv.messages.find(m => m.role === 'user')
+  if (firstUser) conv.title = deriveTitleFromMsg(firstUser.content)
+  persistActive()
+}
+
 async function copyMessage(msg: LibraryUiMessage) {
   const text = msg.role === 'assistant' ? activeAnswer(msg).content : msg.content
   await navigator.clipboard.writeText(text).catch(() => {})
@@ -2038,6 +2067,9 @@ onUnmounted(() => {
                     <button title="编辑并重发" :disabled="loading" @click="startEditUser(msg)">
                       <Icon icon="fluent:edit-24-regular" width="13" height="13" />
                     </button>
+                    <button title="删除此轮对话" :disabled="loading" @click="deleteMessage(msg)">
+                      <Icon icon="fluent:delete-24-regular" width="13" height="13" />
+                    </button>
                   </div>
                 </div>
               </template>
@@ -2115,6 +2147,9 @@ onUnmounted(() => {
                           <Icon icon="fluent:mention-24-regular" width="13" height="13" />
                         </button>
                       </div>
+                      <button title="删除此轮对话" :disabled="loading" @click="deleteMessage(msg)">
+                        <Icon icon="fluent:delete-24-regular" width="13" height="13" />
+                      </button>
                     </div>
                     <div class="assistant-usage">
                       <span class="assistant-model-meta" :title="answerModelName(activeAnswer(msg))">

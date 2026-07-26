@@ -280,6 +280,7 @@ pub fn run() {
             commands::add_arxiv_to_library,
             commands::import_arxiv_url,
             commands::import_paper_url,
+            commands::find_duplicate_paper,
             // ── M9: Canvas window ──
             commands::open_canvas_window,
             commands::save_canvas_window_size,

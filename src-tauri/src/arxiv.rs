@@ -5,8 +5,8 @@ use std::sync::{Arc, OnceLock};
 use tauri::Emitter;
 
 use crate::models::{
-    ArxivConfig, ArxivInbox, ArxivPaper, ArxivScheduleStatus, ChatMessage, PaperMeta, PaperStatus,
-    DEFAULT_ARXIV_ANALYSIS_PROMPT,
+    ArxivConfig, ArxivInbox, ArxivPaper, ArxivScheduleStatus, ChatMessage, ImportResult, PaperMeta,
+    PaperStatus, DEFAULT_ARXIV_ANALYSIS_PROMPT,
 };
 use crate::{ai_manager, collections, extraction, llm, paper, search, settings};
 
@@ -493,16 +493,94 @@ fn lookup_contains_paper(lookup: &LibraryLookup, arxiv_id: &str, title: &str, au
         || lookup.title_without_author.contains(&target_title)
 }
 
-fn check_in_library(root: &str, title: &str, authors: &[String]) -> bool {
-    let lookup = build_library_lookup(root);
-    lookup_contains_paper(&lookup, "", title, authors)
-}
-
 pub fn mark_in_library_statuses(root: &str, papers: &mut Vec<ArxivPaper>) {
     let lookup = build_library_lookup(root);
     for p in papers.iter_mut() {
         p.in_library = lookup_contains_paper(&lookup, &p.arxiv_id, &p.title, &p.authors);
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateHit {
+    pub slug: String,
+    pub title: String,
+}
+
+/// Scan the library for a paper matching the given identity, returning the
+/// existing paper's slug + title if found. Match order: (1) arxiv_id
+/// (version-insensitive) or DOI equality, (2) normalized title + first-author
+/// lastname (matching also when either side has no first author). `exclude_slug`
+/// skips one folder — used when the candidate is itself already present as a
+/// freshly-imported temp folder (local PDF/ebook path).
+pub fn find_duplicate(
+    root: &str,
+    arxiv_id: Option<&str>,
+    doi: Option<&str>,
+    title: &str,
+    authors: &[String],
+    exclude_slug: Option<&str>,
+) -> Option<DuplicateHit> {
+    let cand_arxiv_base = arxiv_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split('v').next().unwrap_or(s));
+    let cand_doi = doi.map(str::trim).filter(|s| !s.is_empty());
+    let cand_title = normalize_title(title);
+    let cand_lastname = authors
+        .first()
+        .map(|a| normalize_lastname(a))
+        .unwrap_or_default();
+
+    let entries = crate::paper::list_paper_dirs(root).ok()?;
+    for (slug, path) in entries {
+        if exclude_slug == Some(slug.as_str()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path.join("meta.json")) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let stored_title_raw = meta.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let hit = || {
+            Some(DuplicateHit {
+                slug: slug.clone(),
+                title: stored_title_raw.to_string(),
+            })
+        };
+
+        // 1a. arXiv id (version-insensitive)
+        if let Some(base_input) = cand_arxiv_base {
+            let stored = meta.get("arxiv_id").and_then(|v| v.as_str()).unwrap_or("");
+            if !stored.is_empty() && stored.split('v').next().unwrap_or(stored) == base_input {
+                return hit();
+            }
+        }
+        // 1b. DOI
+        if let Some(cd) = cand_doi {
+            let stored = meta.get("doi").and_then(|v| v.as_str()).unwrap_or("");
+            if !stored.is_empty() && stored.eq_ignore_ascii_case(cd) {
+                return hit();
+            }
+        }
+        // 2. Normalized title + first-author lastname
+        if !cand_title.is_empty() && normalize_title(stored_title_raw) == cand_title {
+            let stored_lastname = meta
+                .get("authors")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(normalize_lastname)
+                .unwrap_or_default();
+            if cand_lastname.is_empty() || stored_lastname.is_empty() || stored_lastname == cand_lastname
+            {
+                return hit();
+            }
+        }
+    }
+    None
 }
 
 
@@ -1120,7 +1198,8 @@ pub async fn add_to_library(
     arxiv_id: &str,
     collection_id: Option<&str>,
     app: &tauri::AppHandle,
-) -> Result<String, String> {
+    force: bool,
+) -> Result<ImportResult, String> {
     if let Some(cid) = collection_id.filter(|s| !s.is_empty()) {
         crate::collections::ensure_collection_can_receive_papers(root, cid)?;
     }
@@ -1134,12 +1213,20 @@ pub async fn add_to_library(
         .cloned()
         .ok_or_else(|| format!("Paper {} not found in inbox.", arxiv_id))?;
 
-    // Check not already in library by title + first author
-    if check_in_library(root, &paper.title, &paper.authors) {
-        return Err(format!(
-            "「{}」already exists in your library.",
-            paper.title
-        ));
+    // Duplicate check by arxiv_id/DOI or title+first-author (unless forced). For
+    // bioRxiv recommendations the `arxiv_id` field actually carries the DOI.
+    if !force {
+        let is_biorxiv = paper.source.as_deref() == Some("biorxiv");
+        let (cand_arxiv, cand_doi) = if is_biorxiv {
+            (None, Some(arxiv_id))
+        } else {
+            (Some(arxiv_id), None)
+        };
+        if let Some(hit) =
+            find_duplicate(root, cand_arxiv, cand_doi, &paper.title, &paper.authors, None)
+        {
+            return Ok(ImportResult::duplicate(hit.slug, hit.title));
+        }
     }
 
     let _ = app.emit(
@@ -1285,7 +1372,7 @@ pub async fn add_to_library(
         }
     });
 
-    Ok(final_slug)
+    Ok(ImportResult::imported(final_slug))
 }
 
 // ── Window ────────────────────────────────────────────────────────────────────
@@ -1714,35 +1801,6 @@ pub(crate) fn unique_paper_dir(papers_root: &Path, slug: &str) -> PathBuf {
     papers_root.join(format!("{slug}-{}", uuid::Uuid::new_v4()))
 }
 
-/// Find the slug of a paper already in the library by its arXiv ID.
-fn find_paper_slug_by_arxiv_id(root: &str, arxiv_id: &str) -> Option<String> {
-    let papers_dir = Path::new(root).join("papers");
-    for entry in std::fs::read_dir(&papers_dir).ok()?.flatten() {
-        let meta_path = entry.path().join("meta.json");
-        if let Ok(text) = std::fs::read_to_string(&meta_path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) {
-                let stored = meta
-                    .get("arxiv_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                // Match both "2505.20278" and "2505.20278v1" style
-                if !stored.is_empty() {
-                    let base_stored = stored.split('v').next().unwrap_or(stored);
-                    let base_input = arxiv_id.split('v').next().unwrap_or(arxiv_id);
-                    if base_stored == base_input {
-                        let slug = entry
-                            .file_name()
-                            .to_string_lossy()
-                            .into_owned();
-                        return Some(slug);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Import an arXiv paper by URL or bare ID.
 /// Fetches metadata by scraping the abs page HTML (no API calls — they time out).
 /// Downloads the PDF from the link found in the page.
@@ -1751,7 +1809,8 @@ pub async fn import_by_url(
     url: &str,
     collection_id: &str,
     app: &tauri::AppHandle,
-) -> Result<String, String> {
+    force: bool,
+) -> Result<ImportResult, String> {
     if !collection_id.is_empty() {
         collections::ensure_collection_can_receive_papers(root, collection_id)?;
     }
@@ -1806,9 +1865,11 @@ pub async fn import_by_url(
     let (title, authors, abstract_text, pdf_url, year) =
         parse_arxiv_html_meta(&html, &arxiv_id)?;
 
-    // ── Already in library? Return existing slug so the frontend can navigate ──
-    if let Some(existing_slug) = find_paper_slug_by_arxiv_id(root, &arxiv_id) {
-        return Ok(existing_slug);
+    // ── Already in library? Report the duplicate so the frontend can confirm ──
+    if !force {
+        if let Some(hit) = find_duplicate(root, Some(&arxiv_id), None, &title, &authors, None) {
+            return Ok(ImportResult::duplicate(hit.slug, hit.title));
+        }
     }
 
     emit("downloading");
@@ -1920,5 +1981,5 @@ pub async fn import_by_url(
     let _ = app.emit("library-updated", serde_json::json!({ "slug": final_slug }));
     emit("done");
 
-    Ok(final_slug)
+    Ok(ImportResult::imported(final_slug))
 }

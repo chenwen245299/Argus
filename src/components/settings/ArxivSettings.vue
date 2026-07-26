@@ -125,6 +125,9 @@ function resetPrompt() {
 
 // Preset categories
 const PRESETS = ['cs.AI', 'cs.CL', 'cs.LG', 'cs.CV', 'cs.NE', 'cs.RO', 'stat.ML', 'cs.IR', 'cs.MA', 'eess.AS']
+
+// arXiv 需要至少一个分类，否则抓取会被跳过——提醒用户避免以为 arXiv 已在自动抓取。
+const arxivNeedsCategories = computed(() => form.value.fetch_arxiv && form.value.categories.length === 0)
 </script>
 
 <template>
@@ -202,6 +205,7 @@ const PRESETS = ['cs.AI', 'cs.CL', 'cs.LG', 'cs.CV', 'cs.NE', 'cs.RO', 'stat.ML'
     <!-- Categories (only relevant when arXiv is enabled) -->
     <div class="field-group" :class="{ 'section-dimmed': !form.fetch_arxiv }">
       <label class="field-label">{{ t('arxivSettings.categories') }}</label>
+      <p v-if="arxivNeedsCategories" class="field-hint warn">{{ t('arxivSettings.categoriesRequired') }}</p>
       <div class="cat-tags">
         <span v-for="cat in form.categories" :key="cat" class="cat-tag">
           {{ cat }}

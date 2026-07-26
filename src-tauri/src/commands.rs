@@ -3,8 +3,8 @@ use tauri::{Emitter, Manager, State};
 use crate::models::{
     AiModel, AiProviderInfo, AiProviderInput, AiSettingsInfo, AppSettings, ArxivConfig, ArxivInbox,
     ArxivPaper, ArxivScheduleStatus, Canvas, CanvasIndexEntry, CanvasSettings, ChatMessage,
-    Collection, CollectionsFile, Highlight, LibraryConfig, NodePosition, Note, PaperIndexEntry,
-    PaperMeta, PaperStatus,
+    Collection, CollectionsFile, Highlight, ImportResult, LibraryConfig, NodePosition, Note,
+    PaperIndexEntry, PaperMeta, PaperStatus,
     RagSettings, ReadingState, RetrievedChunk, SearchHit, SuggestedEdge, VectorStoreInfo,
 };
 use crate::LibraryRoot;
@@ -2675,14 +2675,15 @@ pub async fn cancel_arxiv_analysis() -> Result<(), String> {
 pub async fn add_arxiv_to_library(
     arxiv_id: String,
     collection_id: Option<String>,
+    force: Option<bool>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
-) -> Result<String, String> {
+) -> Result<ImportResult, String> {
     let root = get_root(&state)?;
     if let Some(cid) = collection_id.as_deref().filter(|c| !c.trim().is_empty()) {
         collections::ensure_collection_can_receive_papers(&root, cid)?;
     }
-    arxiv::add_to_library(&root, &arxiv_id, collection_id.as_deref(), &app).await
+    arxiv::add_to_library(&root, &arxiv_id, collection_id.as_deref(), &app, force.unwrap_or(false)).await
 }
 
 // ── URL-based arXiv import ────────────────────────────────────────────────────
@@ -2692,12 +2693,13 @@ pub async fn add_arxiv_to_library(
 pub async fn import_paper_url(
     url: String,
     collection_id: String,
+    force: Option<bool>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
-) -> Result<String, String> {
+) -> Result<ImportResult, String> {
     let root = get_root(&state)?;
     collections::ensure_collection_can_receive_papers(&root, &collection_id)?;
-    url_import::import_by_url(&root, &url, &collection_id, &app).await
+    url_import::import_by_url(&root, &url, &collection_id, &app, force.unwrap_or(false)).await
 }
 
 // Keep old command for backward compat
@@ -2705,12 +2707,33 @@ pub async fn import_paper_url(
 pub async fn import_arxiv_url(
     url: String,
     collection_id: String,
+    force: Option<bool>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
-) -> Result<String, String> {
+) -> Result<ImportResult, String> {
     let root = get_root(&state)?;
     collections::ensure_collection_can_receive_papers(&root, &collection_id)?;
-    arxiv::import_by_url(&root, &url, &collection_id, &app).await
+    arxiv::import_by_url(&root, &url, &collection_id, &app, force.unwrap_or(false)).await
+}
+
+/// Check whether an already-imported paper (given its slug) duplicates another
+/// paper already in the library. Used by the local-PDF/ebook import pipeline
+/// once metadata has been extracted, to prompt the user before finalizing.
+#[tauri::command]
+pub async fn find_duplicate_paper(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<Option<crate::arxiv::DuplicateHit>, String> {
+    let root = get_root(&state)?;
+    let meta = paper::read_meta(&root, &slug)?;
+    Ok(arxiv::find_duplicate(
+        &root,
+        meta.arxiv_id.as_deref(),
+        meta.doi.as_deref(),
+        &meta.title,
+        &meta.authors,
+        Some(&slug),
+    ))
 }
 
 // ── Shell / Finder ────────────────────────────────────────────────────────────

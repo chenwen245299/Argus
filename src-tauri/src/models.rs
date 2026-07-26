@@ -50,6 +50,40 @@ pub struct PaperMeta {
     pub journal_rank: Option<JournalRank>,
 }
 
+/// Outcome of an import command that performs duplicate detection. `status` is
+/// "imported" (a new paper was created — `slug` set) or "duplicate" (a matching
+/// paper already exists and nothing was written — `existing_slug` + `title` set).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportResult {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub existing_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl ImportResult {
+    pub fn imported(slug: impl Into<String>) -> Self {
+        ImportResult {
+            status: "imported".into(),
+            slug: Some(slug.into()),
+            existing_slug: None,
+            title: None,
+        }
+    }
+    pub fn duplicate(existing_slug: impl Into<String>, title: impl Into<String>) -> Self {
+        ImportResult {
+            status: "duplicate".into(),
+            slug: None,
+            existing_slug: Some(existing_slug.into()),
+            title: Some(title.into()),
+        }
+    }
+}
+
 /// Journal/venue ranking data cached from the easyScholar open API.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JournalRank {

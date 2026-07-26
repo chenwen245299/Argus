@@ -5,6 +5,10 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { ArxivConfig, ArxivPaper, ArxivScheduleStatus } from '../types'
 import { fetchArxivCategories } from '../utils/arxivFetch'
 import { fetchBiorxivAsArxivPapers } from '../utils/biorxivFetch'
+import { i18n } from '../i18n'
+
+/** Result of a duplicate-aware import command (add_arxiv_to_library). */
+interface ImportOutcome { status: 'imported' | 'duplicate'; slug?: string; existingSlug?: string; title?: string }
 
 export type SortMode = 'score' | 'date' | 'status' | 'rating'
 export type SortOrder = 'desc' | 'asc'
@@ -168,9 +172,13 @@ export const useArxivStore = defineStore('arxiv', () => {
       await loadConfig()
       if (!config.value.fetch_arxiv && !config.value.fetch_biorxiv)
         throw new Error('请至少开启一种爬取来源（arXiv 或 bioRxiv）')
+      const arxivReady = config.value.fetch_arxiv && config.value.categories.length > 0
+      // arXiv 需要至少一个分类才能抓取；若只开了 arXiv 却没选分类，直接报错而非静默无结果。
+      if (config.value.fetch_arxiv && !arxivReady && !config.value.fetch_biorxiv)
+        throw new Error('已开启 arXiv 抓取但未选择任何分类，请先在设置中至少选择一个 arXiv 分类')
       const today = new Date().toISOString().slice(0, 10)
       const from = new Date(Date.now() - config.value.days_back * 86400000).toISOString().slice(0, 10)
-      const arxivPapers = config.value.fetch_arxiv && config.value.categories.length > 0
+      const arxivPapers = arxivReady
         ? await fetchArxivCategories(config.value, from, today)
         : []
       const biorxivPapers = config.value.fetch_biorxiv
@@ -181,6 +189,9 @@ export const useArxivStore = defineStore('arxiv', () => {
       const knownRead = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
       papers.value = result.map(p => ({ ...p, read: p.read || knownRead.has(p.arxiv_id) }))
       await loadScheduleStatus()
+      // arXiv 开着但缺分类：bioRxiv 已正常抓取，仍要提示 arXiv 被跳过，避免用户误以为 arXiv 生效了。
+      if (config.value.fetch_arxiv && !arxivReady)
+        fetchMessage.value = '⚠ 已跳过 arXiv：未选择任何分类。请在设置中至少选择一个 arXiv 分类。'
     } catch (e) {
       fetchMessage.value = String(e)
     } finally {
@@ -205,7 +216,8 @@ export const useArxivStore = defineStore('arxiv', () => {
         if (next > today) return
         dateFrom = next
       }
-      const arxivPapers = config.value.fetch_arxiv && config.value.categories.length > 0
+      const arxivReady = config.value.fetch_arxiv && config.value.categories.length > 0
+      const arxivPapers = arxivReady
         ? await fetchArxivCategories(config.value, dateFrom, today)
         : []
       const biorxivPapers = config.value.fetch_biorxiv
@@ -216,6 +228,9 @@ export const useArxivStore = defineStore('arxiv', () => {
       const knownRead2 = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
       papers.value = result.map(p => ({ ...p, read: p.read || knownRead2.has(p.arxiv_id) }))
       await loadScheduleStatus()
+      // 自动抓取同样不静默跳过：arXiv 开着但没选分类时给出可见提示。
+      if (config.value.fetch_arxiv && !arxivReady)
+        fetchMessage.value = '⚠ 已跳过 arXiv 自动抓取：未选择任何分类。请在设置中至少选择一个 arXiv 分类。'
     } catch (e) {
       fetchMessage.value = String(e)
     } finally {
@@ -269,14 +284,23 @@ export const useArxivStore = defineStore('arxiv', () => {
     }
   }
 
-  async function addToLibrary(arxivId: string, collectionId?: string) {
-    const slug = await invoke<string>('add_arxiv_to_library', {
+  // Returns the imported paper's slug, or null when the user cancels a duplicate.
+  async function addToLibrary(arxivId: string, collectionId?: string): Promise<string | null> {
+    let res = await invoke<ImportOutcome>('add_arxiv_to_library', {
       arxivId,
       collectionId: collectionId ?? null,
     })
-    const p = papers.value.find(p => p.arxiv_id === arxivId)
-    if (p) papers.value = papers.value.filter(p => p.arxiv_id !== arxivId)
-    return slug
+    if (res.status === 'duplicate') {
+      const msg = i18n.global.t('import.duplicateConfirm').replace('{title}', res.title ?? arxivId)
+      if (!window.confirm(msg)) return null   // canceled — leave recommendation in place
+      res = await invoke<ImportOutcome>('add_arxiv_to_library', {
+        arxivId,
+        collectionId: collectionId ?? null,
+        force: true,
+      })
+    }
+    papers.value = papers.value.filter(p => p.arxiv_id !== arxivId)
+    return res.slug ?? null
   }
 
   async function subscribeEvents() {

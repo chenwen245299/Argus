@@ -305,6 +305,11 @@ async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
 
   try {
     const slug = await store.addToLibrary(paper.arxiv_id, collectionId)
+    if (!slug) {
+      // Duplicate, and the user canceled — the recommendation stays put.
+      if (nextId) selectedId.value = paper.arxiv_id
+      return
+    }
     const colName = collectionId
       ? (collectionsStore.file.collections.find(c => c.id === collectionId)?.name ?? '')
       : ''

@@ -29,27 +29,9 @@ function togglePin(note: { id: string }, e: MouseEvent) {
   emit('update:canvasNotes', next)
 }
 
-// ── First-run pin guide ───────────────────────────────────────────────────────
-// The first time the notes sidebar is opened for a paper, explain what pinning a
-// note buys you (list badge + relationship-graph hover thumbnail). Shown once,
-// gated by a localStorage flag.
-const PIN_GUIDE_KEY = 'argus:notes-pin-guide-seen'
-const showPinGuide = ref(false)
-function maybeShowPinGuide() {
-  if (!props.slug || showPinGuide.value) return
-  try {
-    if (localStorage.getItem(PIN_GUIDE_KEY)) return
-    // Mark seen as soon as it's shown, so it appears exactly once and never
-    // re-nags — even if the tab is switched away before it's dismissed.
-    localStorage.setItem(PIN_GUIDE_KEY, '1')
-  } catch {
-    return // storage disabled — skip the guide rather than nag every open
-  }
-  showPinGuide.value = true
-}
-function dismissPinGuide() {
-  showPinGuide.value = false
-}
+// The pin guide (what pinning a note buys you) is shown inline in the empty-list
+// state — whenever a paper has no notes there's free space to explain it, and it
+// disappears on its own once the first note exists. No popup, no dismissal.
 
 // ── View state ────────────────────────────────────────────────────────────────
 type View = 'list' | 'editor'
@@ -296,11 +278,7 @@ async function handleNotesUpdated(event: Event) {
 
 onMounted(() => {
   window.addEventListener('argus-notes-updated', handleNotesUpdated)
-  maybeShowPinGuide()
 })
-
-// Also trigger when a paper gets selected while the notes tab is already open.
-watch(() => props.slug, (s) => { if (s) maybeShowPinGuide() })
 
 onBeforeUnmount(async () => {
   window.removeEventListener('argus-notes-updated', handleNotesUpdated)
@@ -333,9 +311,25 @@ function fmtDate(iso: string) {
 
 <template>
   <div class="notes-tab">
-    <!-- First-run guide: what pinning a note does -->
-    <Transition name="pin-guide-fade">
-      <div v-if="showPinGuide" class="pin-guide" @click.self="dismissPinGuide">
+    <!-- No paper selected -->
+    <div v-if="!slug" class="empty">{{ t('notes.selectHint') }}</div>
+
+    <!-- Note list -->
+    <template v-else-if="view === 'list'">
+      <div class="list-toolbar">
+        <span class="list-heading">{{ t('tabs.notes') }}</span>
+        <button class="new-btn" :title="t('notes.newNote')" @click="createNote">
+          <Icon icon="fluent:add-24-regular" width="15" height="15" />
+        </button>
+      </div>
+
+      <div v-if="loadingList" class="empty">…</div>
+
+      <div v-else-if="notes.length === 0" class="empty-list">
+        <p>{{ t('notes.noNotes') }}</p>
+        <span>{{ t('notes.noNotesHint') }}</span>
+
+        <!-- Pin guide: shown here whenever the paper has no notes -->
         <div class="pin-guide-card">
           <div class="pin-guide-head">
             <span class="pin-guide-icon">
@@ -357,28 +351,7 @@ function fmtDate(iso: string) {
               <span class="pin-guide-text">{{ t('notes.pinGuidePoint2') }}</span>
             </li>
           </ul>
-          <button class="pin-guide-btn" @click="dismissPinGuide">{{ t('notes.pinGuideGotIt') }}</button>
         </div>
-      </div>
-    </Transition>
-
-    <!-- No paper selected -->
-    <div v-if="!slug" class="empty">{{ t('notes.selectHint') }}</div>
-
-    <!-- Note list -->
-    <template v-else-if="view === 'list'">
-      <div class="list-toolbar">
-        <span class="list-heading">{{ t('tabs.notes') }}</span>
-        <button class="new-btn" :title="t('notes.newNote')" @click="createNote">
-          <Icon icon="fluent:add-24-regular" width="15" height="15" />
-        </button>
-      </div>
-
-      <div v-if="loadingList" class="empty">…</div>
-
-      <div v-else-if="notes.length === 0" class="empty-list">
-        <p>{{ t('notes.noNotes') }}</p>
-        <span>{{ t('notes.noNotesHint') }}</span>
       </div>
 
       <ul v-else class="note-list">
@@ -468,25 +441,15 @@ function fmtDate(iso: string) {
 }
 
 /* ── First-run pin guide ── */
-.pin-guide {
-  position: absolute;
-  inset: 0;
-  z-index: 20;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-  background: color-mix(in srgb, var(--bg-primary) 62%, transparent);
-  backdrop-filter: blur(3px);
-}
 .pin-guide-card {
   width: 100%;
   max-width: 280px;
-  padding: 16px;
-  background: var(--bg-primary);
-  border: 1px solid var(--border-default);
+  margin-top: 18px;
+  padding: 14px;
+  text-align: left;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-md);
 }
 .pin-guide-head {
   display: flex;
@@ -518,7 +481,7 @@ function fmtDate(iso: string) {
 }
 .pin-guide-points {
   list-style: none;
-  margin: 0 0 14px;
+  margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
@@ -567,25 +530,6 @@ function fmtDate(iso: string) {
   color: var(--text-secondary);
   line-height: 1.45;
 }
-.pin-guide-btn {
-  width: 100%;
-  padding: 7px;
-  border: none;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
-  color: #fff;
-  font-size: var(--font-size-sm);
-  font-weight: 500;
-  cursor: pointer;
-  transition: filter 0.1s;
-}
-.pin-guide-btn:hover { filter: brightness(1.08); }
-
-.pin-guide-fade-enter-active,
-.pin-guide-fade-leave-active { transition: opacity 0.2s ease; }
-.pin-guide-fade-enter-from,
-.pin-guide-fade-leave-to { opacity: 0; }
-
 .empty {
   flex: 1;
   display: flex;
@@ -634,9 +578,10 @@ function fmtDate(iso: string) {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: safe center;
   gap: 6px;
   padding: 24px;
+  overflow-y: auto;
   color: var(--text-tertiary);
 }
 .empty-list p { font-size: var(--font-size-sm); font-weight: 500; color: var(--text-secondary); margin: 0; }

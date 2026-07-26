@@ -13,23 +13,24 @@ pub async fn import_by_url(
     url: &str,
     collection_id: &str,
     app: &tauri::AppHandle,
-) -> Result<String, String> {
+    force: bool,
+) -> Result<ImportResult, String> {
     let u = url.trim().to_ascii_lowercase();
 
     if u.ends_with(".pdf") || u.contains(".pdf?") {
         // Direct PDF link — download and add with filename-derived title
-        return pdf_url::import(root, url, collection_id, app).await;
+        return pdf_url::import(root, url, collection_id, app, force).await;
     }
 
     if u.contains("aclanthology.org") {
-        acl::import(root, url, collection_id, app).await
+        acl::import(root, url, collection_id, app, force).await
     } else if u.contains("openreview.net") {
-        openreview::import(root, url, collection_id, app).await
+        openreview::import(root, url, collection_id, app, force).await
     } else if u.contains("aaai.org") {
-        aaai::import(root, url, collection_id, app).await
+        aaai::import(root, url, collection_id, app, force).await
     } else {
         // Default: arXiv (handles arxiv.org URLs and bare IDs)
-        crate::arxiv::import_by_url(root, url, collection_id, app).await
+        crate::arxiv::import_by_url(root, url, collection_id, app, force).await
     }
 }
 
@@ -63,7 +64,8 @@ mod pdf_url {
         url: &str,
         collection_id: &str,
         app: &tauri::AppHandle,
-    ) -> Result<String, String> {
+        force: bool,
+    ) -> Result<ImportResult, String> {
         use tauri::Emitter;
 
         let emit = |s: &str| {
@@ -145,13 +147,21 @@ mod pdf_url {
             journal_rank: None,
         };
 
-        if let Err(e) =
-            super::finalize_paper(root, &final_dir, &final_slug, paper_meta, collection_id, app, "pdf").await
+        match super::finalize_paper(
+            root, &final_dir, &final_slug, paper_meta, collection_id, app, "pdf", force,
+        )
+        .await
         {
-            let _ = std::fs::remove_dir_all(&final_dir);
-            return Err(e);
+            Ok(None) => Ok(ImportResult::imported(final_slug)),
+            Ok(Some(hit)) => {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                Ok(ImportResult::duplicate(hit.slug, hit.title))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                Err(e)
+            }
         }
-        Ok(final_slug)
     }
 }
 
@@ -159,7 +169,7 @@ mod pdf_url {
 // Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::models::{PaperMeta, PaperStatus};
+use crate::models::{ImportResult, PaperMeta, PaperStatus};
 use crate::{collections, extraction, paper, search, settings};
 use std::path::Path;
 use tauri::Emitter;
@@ -218,7 +228,9 @@ fn build_slug(authors: &[String], year: Option<u32>, title: &str) -> String {
     sanitize(&format!("{last_name}-{year_str}-{title_words}-{short_id}"))
 }
 
-/// Write all paper files, index, and optionally assign to a collection.
+/// Write all paper files, index, and optionally assign to a collection. Returns
+/// `Ok(Some(hit))` when a duplicate is detected (nothing is written — the caller
+/// cleans up the download dir), or `Ok(None)` when the paper was written.
 async fn finalize_paper(
     root: &str,
     final_dir: &Path,
@@ -227,7 +239,23 @@ async fn finalize_paper(
     collection_id: &str,
     app: &tauri::AppHandle,
     source_tag: &str,
-) -> Result<(), String> {
+    force: bool,
+) -> Result<Option<crate::arxiv::DuplicateHit>, String> {
+    // Duplicate check before writing meta.json (the freshly-created download dir
+    // has no meta.json yet, so it is never matched against itself).
+    if !force {
+        if let Some(hit) = crate::arxiv::find_duplicate(
+            root,
+            meta.arxiv_id.as_deref(),
+            meta.doi.as_deref(),
+            &meta.title,
+            &meta.authors,
+            None,
+        ) {
+            return Ok(Some(hit));
+        }
+    }
+
     let paper_id = meta.id.clone();
     paper::write_meta(root, final_slug, &meta)?;
     paper::ensure_paper_files(root, final_slug);
@@ -266,7 +294,7 @@ async fn finalize_paper(
     );
 
     let _ = final_dir; // suppress unused warning
-    Ok(())
+    Ok(None)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -443,7 +471,8 @@ mod acl {
         url: &str,
         collection_id: &str,
         app: &tauri::AppHandle,
-    ) -> Result<String, String> {
+        force: bool,
+    ) -> Result<ImportResult, String> {
         let id = parse_id(url)
             .ok_or_else(|| format!("Could not find an ACL Anthology paper ID in: {url}"))?;
 
@@ -511,7 +540,7 @@ mod acl {
             journal_rank: None,
         };
 
-        if let Err(e) = super::finalize_paper(
+        match super::finalize_paper(
             root,
             &final_dir,
             &final_slug,
@@ -519,13 +548,20 @@ mod acl {
             collection_id,
             app,
             "acl",
+            force,
         )
         .await
         {
-            let _ = std::fs::remove_dir_all(&final_dir);
-            return Err(e);
+            Ok(None) => Ok(ImportResult::imported(final_slug)),
+            Ok(Some(hit)) => {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                Ok(ImportResult::duplicate(hit.slug, hit.title))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                Err(e)
+            }
         }
-        Ok(final_slug)
     }
 }
 
@@ -668,7 +704,8 @@ mod aaai {
         url: &str,
         collection_id: &str,
         app: &tauri::AppHandle,
-    ) -> Result<String, String> {
+        force: bool,
+    ) -> Result<ImportResult, String> {
         let id = parse_id(url)
             .ok_or_else(|| format!("Could not find an AAAI article ID in: {url}"))?;
 
@@ -745,15 +782,21 @@ mod aaai {
             journal_rank: None,
         };
 
-        if let Err(e) = super::finalize_paper(
-            root, &final_dir, &final_slug, paper_meta, collection_id, app, "aaai",
+        match super::finalize_paper(
+            root, &final_dir, &final_slug, paper_meta, collection_id, app, "aaai", force,
         )
         .await
         {
-            let _ = std::fs::remove_dir_all(&final_dir);
-            return Err(e);
+            Ok(None) => Ok(ImportResult::imported(final_slug)),
+            Ok(Some(hit)) => {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                Ok(ImportResult::duplicate(hit.slug, hit.title))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                Err(e)
+            }
         }
-        Ok(final_slug)
     }
 
     #[cfg(test)]
@@ -882,7 +925,8 @@ mod openreview {
         url: &str,
         collection_id: &str,
         app: &tauri::AppHandle,
-    ) -> Result<String, String> {
+        force: bool,
+    ) -> Result<ImportResult, String> {
         let id = parse_id(url)
             .ok_or_else(|| format!("Could not find an OpenReview paper ID in: {url}"))?;
 
@@ -955,14 +999,20 @@ mod openreview {
             journal_rank: None,
         };
 
-        if let Err(e) = super::finalize_paper(
-            root, &final_dir, &final_slug, paper_meta, collection_id, app, "openreview",
+        match super::finalize_paper(
+            root, &final_dir, &final_slug, paper_meta, collection_id, app, "openreview", force,
         )
         .await
         {
-            let _ = std::fs::remove_dir_all(&final_dir);
-            return Err(e);
+            Ok(None) => Ok(ImportResult::imported(final_slug)),
+            Ok(Some(hit)) => {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                Ok(ImportResult::duplicate(hit.slug, hit.title))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                Err(e)
+            }
         }
-        Ok(final_slug)
     }
 }

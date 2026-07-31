@@ -140,17 +140,22 @@ fn strip_xml_tags(text: &str) -> String {
 // ── Identifier extraction ─────────────────────────────────────────────────────
 
 pub fn find_arxiv_id(text: &str) -> Option<String> {
-    // New-style arXiv IDs: YYMM.NNNNN[vN]
-    let re = Regex::new(r"(?i)(?:arxiv[:\s./]*)?(\d{4}\.\d{4,5}(?:v\d+)?)").ok()?;
+    // Only accept an id that is explicitly tagged as an arXiv identifier
+    // ("arXiv:2501.01234", "arxiv.org/abs/2501.01234v2"). A bare "YYMM.NNNNN"
+    // token elsewhere on the page is far more likely to be a *cited* paper's id
+    // (or a figure/equation label) than THIS paper's own id, and mistaking one
+    // makes the entire metadata fetch resolve to the wrong paper. The paper's own
+    // stamp appears at the top, so the first tagged match wins.
+    //
+    // New-style arXiv IDs: YYMM.NNNNN[vN].
+    let re = Regex::new(r"(?i)arxiv[:\s.]*(?:org/abs/)?(\d{4}\.\d{4,5})(?:v\d+)?").ok()?;
     for cap in re.captures_iter(text) {
         if let Some(m) = cap.get(1) {
             let id = m.as_str().to_string();
             // Sanity: first 2 chars are month 01-12
             let month: u32 = id[2..4].parse().unwrap_or(0);
             if (1..=12).contains(&month) {
-                // Strip version suffix for API call
-                let clean = id.split('v').next().unwrap_or(&id).to_string();
-                return Some(clean);
+                return Some(id);
             }
         }
     }
@@ -490,37 +495,64 @@ fn parse_s2_json(json: &Value) -> Option<MetaUpdate> {
 
 // ── Semantic Scholar title search ─────────────────────────────────────────────
 
+/// Split a title into a set of significant lowercase alphanumeric tokens
+/// (length ≥ 2), for fuzzy title comparison. Punctuation, casing, and one-letter
+/// tokens are discarded so "Kimi K3: Open Frontier Intelligence" and
+/// "Kimi-K3 Open Frontier Intelligence" compare equal.
+fn title_token_set(title: &str) -> std::collections::HashSet<String> {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 2)
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+/// Decide whether two titles refer to the same paper. A search backend returns
+/// its best-effort ranked hits even for a query it has no true match for, so a
+/// blind "take the top result" mislabels a paper with a stranger's metadata
+/// (wrong authors / year / arXiv id / citation count). We instead require a real
+/// overlap: a high token Jaccard, or a clean subset match when the smaller title
+/// is specific enough to be unambiguous (handles a stored title that is missing
+/// its subtitle, or vice-versa).
+fn titles_match(a: &str, b: &str) -> bool {
+    let sa = title_token_set(a);
+    let sb = title_token_set(b);
+    if sa.is_empty() || sb.is_empty() {
+        return false;
+    }
+    let inter = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    if union > 0 && inter as f32 / union as f32 >= 0.6 {
+        return true;
+    }
+    // Subset match: every significant word of the shorter title appears in the
+    // longer one, and the shorter one carries ≥ 4 distinctive tokens (so a
+    // generic 1-3 word title can't latch onto an unrelated longer paper).
+    let smaller = sa.len().min(sb.len());
+    inter == smaller && smaller >= 4
+}
+
 pub async fn fetch_semantic_scholar_by_title(
     title: &str,
     api_key: Option<&str>,
 ) -> Option<MetaUpdate> {
     let json = s2_get_json(
         "https://api.semanticscholar.org/graph/v1/paper/search",
-        &[("query", title), ("fields", S2_META_FIELDS), ("limit", "3")],
+        &[("query", title), ("fields", S2_META_FIELDS), ("limit", "5")],
         api_key,
         MAX_META_BYTES,
     )
     .await
     .ok()?;
     let papers = json["data"].as_array()?;
-    // Pick the first result whose title roughly matches (case-insensitive substring)
-    let title_lower = title.to_lowercase();
-    // Char-safe prefix: byte-slicing `[..40]` panics when the cut lands mid-character,
-    // which is essentially guaranteed for CJK titles (3 bytes/char).
-    let title_prefix: String = title_lower.chars().take(40).collect();
+    // Return the first candidate whose title genuinely matches ours. No blind
+    // "top result" fallback: when S2 has no real match, returning None (leaving
+    // fields empty) is far better than backfilling a wrong paper's metadata.
     for paper in papers {
-        let candidate = paper["title"].as_str().unwrap_or("").to_lowercase();
-        let candidate_prefix: String = candidate.chars().take(40).collect();
-        // Accept if either title contains the other (handles truncated/subtitle variants)
-        if candidate.contains(title_prefix.as_str())
-            || title_lower.contains(candidate_prefix.as_str())
-        {
+        let candidate = paper["title"].as_str().unwrap_or("");
+        if titles_match(title, candidate) {
             return parse_s2_json(paper);
         }
-    }
-    // Fall back to first result if query is specific enough
-    if !papers.is_empty() && title.split_whitespace().count() >= 5 {
-        return parse_s2_json(&papers[0]);
     }
     None
 }
@@ -730,6 +762,30 @@ pub async fn fetch_and_apply(
     // Merge update into current meta
     let mut meta = crate::paper::read_meta(root, slug)?;
 
+    // Self-heal a stale, unconfirmed arXiv id. When this PDF carries no arXiv id of
+    // its own (find_arxiv_id = None) yet meta already has one, that id was
+    // auto-filled by an earlier lookup and may be a wrong title-search guess. Verify
+    // it still resolves to THIS paper; if it resolves to a *different* paper, drop
+    // it and the citation count derived from it so a re-fetch can self-heal instead
+    // of the wrong id sticking forever. Only a positive title mismatch clears — a
+    // transient fetch failure returns None and leaves the id untouched.
+    let mut self_healed = false;
+    if arxiv_id.is_none() && !meta.title.trim().is_empty() {
+        if let Some(stored) = meta.arxiv_id.clone().filter(|s| !s.trim().is_empty()) {
+            if let Some(resolved) = fetch_arxiv(&stored).await {
+                let still_ours = resolved
+                    .title
+                    .as_deref()
+                    .map_or(false, |t| titles_match(t, &meta.title));
+                if !still_ours {
+                    meta.arxiv_id = None;
+                    meta.cite_count = None;
+                    self_healed = true;
+                }
+            }
+        }
+    }
+
     if let Some(u) = update {
         if let Some(t) = u.title {
             meta.title = t;
@@ -770,8 +826,10 @@ pub async fn fetch_and_apply(
         status.last_updated = chrono::Utc::now().to_rfc3339();
         crate::paper::write_status(root, slug, &status)?;
     } else {
-        // Still store identifiers we found even if API calls failed
-        let mut changed = false;
+        // Still store identifiers we found even if API calls failed. `self_healed`
+        // seeds `changed` so a cleared stale id is persisted even when no update
+        // came back.
+        let mut changed = self_healed;
         if meta.arxiv_id.is_none() && arxiv_id.is_some() {
             meta.arxiv_id = arxiv_id;
             changed = true;
@@ -798,12 +856,25 @@ pub async fn fetch_semantic_scholar_meta(
     let meta = crate::paper::read_meta(root, slug)?;
     let s2_key = s2_api_key(root);
 
-    // Prefer stable identifiers from meta.
+    // Prefer stable identifiers from meta — but only trust the result if it
+    // actually describes THIS paper. A stored arXiv id / DOI can be a stale wrong
+    // guess left by an earlier title-search mismatch; blindly trusting it would
+    // keep pulling a stranger's citation count and authors (the exact failure that
+    // stamped a report with an unrelated paper's metadata). Verify the returned
+    // title matches ours; skip the check only when we have no title to compare.
     if let Some(update) =
         fetch_semantic_scholar(meta.arxiv_id.as_deref(), meta.doi.as_deref(), s2_key.as_deref())
             .await
     {
-        return Ok(Some(update));
+        let trustworthy = meta.title.trim().is_empty()
+            || update
+                .title
+                .as_deref()
+                .map_or(false, |t| titles_match(t, &meta.title));
+        if trustworthy {
+            return Ok(Some(update));
+        }
+        // Stored id resolves to a different paper — ignore it and try a title search.
     }
 
     // Fallback to title search if title is long enough to be specific.
@@ -1290,18 +1361,27 @@ async fn s2_resolve_paper_id(
     }
     let json = s2_get_json(
         "https://api.semanticscholar.org/graph/v1/paper/search",
-        &[("query", title), ("limit", "1"), ("fields", "title")],
+        &[("query", title), ("limit", "5"), ("fields", "title")],
         api_key,
         MAX_META_BYTES,
     )
     .await?;
-    json.get("data")
+    // Verify the hit's title actually matches before trusting its id — otherwise
+    // a paper S2 doesn't have would resolve to a stranger's id and we'd cache an
+    // unrelated paper's reference list against it.
+    let papers = json
+        .get("data")
         .and_then(Value::as_array)
-        .and_then(|d| d.first())
-        .and_then(|p| p.get("paperId"))
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
-        .ok_or_else(|| S2_NOT_FOUND.to_string())
+        .ok_or_else(|| S2_NOT_FOUND.to_string())?;
+    for p in papers {
+        let candidate = p.get("title").and_then(Value::as_str).unwrap_or("");
+        if titles_match(title, candidate) {
+            if let Some(id) = p.get("paperId").and_then(Value::as_str) {
+                return Ok(id.to_string());
+            }
+        }
+    }
+    Err(S2_NOT_FOUND.to_string())
 }
 
 /// Fetch the reference list (papers cited by this paper) from Semantic Scholar
@@ -1882,5 +1962,77 @@ mod journal_rank_tests {
         );
         assert!(has(&c, "International Conference on Machine Learning"));
         assert!(has(&c, "ICML"));
+    }
+}
+
+#[cfg(test)]
+mod identifier_tests {
+    use super::{find_arxiv_id, titles_match};
+
+    #[test]
+    fn arxiv_id_found_when_tagged() {
+        assert_eq!(
+            find_arxiv_id("arXiv:2501.01234v2 [cs.LG] 12 Jan 2025"),
+            Some("2501.01234".to_string())
+        );
+        assert_eq!(
+            find_arxiv_id("Available at https://arxiv.org/abs/2312.09876"),
+            Some("2312.09876".to_string())
+        );
+        assert_eq!(
+            find_arxiv_id("preprint arXiv: 2408.00001"),
+            Some("2408.00001".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_number_is_not_mistaken_for_own_arxiv_id() {
+        // A cited paper's bare id in the body must NOT be picked up as this
+        // paper's own id — this is the exact failure that mislabeled a report
+        // with a stranger's arXiv metadata.
+        assert_eq!(find_arxiv_id("Kimi K3 builds on Kimi K2 [58]. See 2306.02781"), None);
+        assert_eq!(find_arxiv_id("Model uses 1234.56789 tokens per second"), None);
+    }
+
+    #[test]
+    fn first_tagged_id_wins() {
+        // The paper's own stamp comes before any references.
+        assert_eq!(
+            find_arxiv_id("arXiv:2501.11111\n... references ... arXiv:2306.02781"),
+            Some("2501.11111".to_string())
+        );
+    }
+
+    #[test]
+    fn titles_match_accepts_same_paper_variants() {
+        assert!(titles_match(
+            "Attention Is All You Need",
+            "Attention is all you need."
+        ));
+        // Punctuation / separators ignored.
+        assert!(titles_match(
+            "Kimi K3: Open Frontier Intelligence",
+            "Kimi-K3 Open Frontier Intelligence"
+        ));
+        // Missing subtitle (subset with ≥4 distinctive tokens) still matches.
+        assert!(titles_match(
+            "Deep Residual Learning for Image Recognition",
+            "Deep Residual Learning for Image Recognition: A Study"
+        ));
+    }
+
+    #[test]
+    fn titles_match_rejects_unrelated_paper() {
+        // The reported bug: a new paper absent from S2 must not latch onto an
+        // unrelated top search hit.
+        assert!(!titles_match(
+            "Kimi K3: Open Frontier Intelligence",
+            "A Bayesian Approach to Gaussian Process Regression"
+        ));
+        // A generic short title can't latch onto an unrelated longer paper.
+        assert!(!titles_match(
+            "Open Intelligence",
+            "Open Intelligence for Autonomous Multi-Agent Robotics Systems"
+        ));
     }
 }

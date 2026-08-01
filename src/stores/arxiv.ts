@@ -208,13 +208,25 @@ export const useArxivStore = defineStore('arxiv', () => {
       if (!config.value.auto_fetch_enabled) return
       if (!config.value.fetch_arxiv && !config.value.fetch_biorxiv) return
       const today = new Date().toISOString().slice(0, 10)
+      // arXiv announces papers with a lag: a paper submitted on day D only becomes
+      // queryable via submittedDate:[D..] after that day's announcement cycle (next
+      // day, longer over weekends). So a window that starts at last_fetch_date+1
+      // collapses to "today", where arXiv has nothing yet — the fetch advances
+      // last_fetch_date to today anyway (bioRxiv/store side-effect), and the lagged
+      // papers fall permanently between windows. bioRxiv has no such lag, which is
+      // why only bioRxiv appeared to auto-fetch. Always overlap back by days_back so
+      // freshly-announced arXiv papers are caught; merge_into_inbox dedups by id so
+      // re-scanning recent days is harmless.
+      const lookbackStart = new Date(Date.now() - config.value.days_back * 86400000).toISOString().slice(0, 10)
       let dateFrom: string
       if (!config.value.last_fetch_date) {
-        dateFrom = new Date(Date.now() - config.value.days_back * 86400000).toISOString().slice(0, 10)
+        dateFrom = lookbackStart
       } else {
         const next = new Date(new Date(config.value.last_fetch_date).getTime() + 86400000).toISOString().slice(0, 10)
         if (next > today) return
-        dateFrom = next
+        // Widen to whichever start is earlier: the day after last fetch (to fill a
+        // long offline gap) or the days_back lookback (to absorb the announce lag).
+        dateFrom = next < lookbackStart ? next : lookbackStart
       }
       const arxivReady = config.value.fetch_arxiv && config.value.categories.length > 0
       const arxivPapers = arxivReady

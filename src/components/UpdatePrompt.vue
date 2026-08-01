@@ -27,13 +27,15 @@ const renderedNotes = computed(() => {
 
 <template>
   <Teleport to="body">
-    <div v-if="updateStore.showReleaseNotes" class="rn-overlay" @click.self="updateStore.showReleaseNotes = false">
+    <div v-if="updateStore.showReleaseNotes" class="rn-overlay" @click.self="updateStore.state !== 'downloading' && (updateStore.showReleaseNotes = false)">
       <div class="rn-modal">
         <div class="rn-header">
           <div class="rn-title-wrap">
             <span class="rn-badge">v{{ updateStore.newVersion }}</span>
             <h2 class="rn-title">{{ t('about.releaseNotesTitle') }}</h2>
           </div>
+          <!-- Kept during download as an escape hatch if it stalls; the overlay
+               click-outside is disabled so only a deliberate click dismisses it. -->
           <button class="rn-close" @click="updateStore.showReleaseNotes = false">
             <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
           </button>
@@ -59,8 +61,28 @@ const renderedNotes = computed(() => {
           </div>
         </div>
         <div class="rn-footer">
-          <button class="rn-dismiss" @click="updateStore.showReleaseNotes = false">{{ t('about.later') }}</button>
-          <button class="rn-install" @click="startUpdate(); updateStore.showReleaseNotes = false">{{ t('about.updateNow') }}</button>
+          <!-- Downloading: show live progress in place of the buttons. Clicking
+               "update now" used to close the dialog and download silently, which
+               looked like a freeze — now the dialog stays open and animates. -->
+          <div v-if="updateStore.state === 'downloading'" class="rn-progress-wrap">
+            <div class="rn-progress-bar">
+              <div class="rn-progress-fill" :style="{ width: updateStore.downloadProgress + '%' }" />
+            </div>
+            <span class="rn-progress-label">{{ t('about.downloading') }} {{ updateStore.downloadProgress }}%</span>
+          </div>
+
+          <!-- Download failed: surface the reason and allow a retry. -->
+          <template v-else-if="updateStore.state === 'error'">
+            <span class="rn-error">{{ updateStore.errorMsg }}</span>
+            <button class="rn-dismiss" @click="updateStore.showReleaseNotes = false">{{ t('about.later') }}</button>
+            <button class="rn-install" @click="startUpdate()">{{ t('about.updateNow') }}</button>
+          </template>
+
+          <!-- Default: "update now" starts the download and flips to the view above. -->
+          <template v-else>
+            <button class="rn-dismiss" @click="updateStore.showReleaseNotes = false">{{ t('about.later') }}</button>
+            <button class="rn-install" @click="startUpdate()">{{ t('about.updateNow') }}</button>
+          </template>
         </div>
       </div>
     </div>
@@ -233,6 +255,44 @@ const renderedNotes = computed(() => {
   transition: opacity 0.12s;
 }
 .rn-install:hover { opacity: 0.85; }
+
+/* Download progress (shown in the footer while installing) */
+.rn-progress-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.rn-progress-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.rn-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.rn-progress-label {
+  flex-shrink: 0;
+  min-width: 92px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.rn-error {
+  flex: 1;
+  font-size: var(--font-size-xs);
+  color: #e53e3e;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
 
 /* markdown content */
 .rn-body.markdown-body p { margin: 0 0 8px; }

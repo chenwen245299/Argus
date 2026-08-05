@@ -686,17 +686,47 @@ struct RawAnalysisResult {
     matched_topics: Option<Vec<String>>,
 }
 
-fn build_analysis_prompt(template: &str, topics: &str, paper: &ArxivPaper) -> String {
+const ANALYSIS_SYSTEM_PROMPT: &str =
+    "你是一名严谨的研究助理。请只输出用户要求的有效 JSON，不要添加 Markdown 或解释。";
+
+/// Builds the (system, user) pair for one paper.
+///
+/// The user's free-text requirements (`focus`) go into the system message rather
+/// than being appended to the template, because the template ends with "仅回复
+/// 符合此模式的有效 JSON" and anything tacked on after that weakens it. A template
+/// containing `{focus}` opts into inline placement instead — that is an explicit
+/// choice, so we honour it and leave the system message alone.
+fn build_analysis_messages(
+    template: &str,
+    topics: &str,
+    focus: &str,
+    paper: &ArxivPaper,
+) -> (String, String) {
     let base = if template.trim().is_empty() {
         DEFAULT_ARXIV_ANALYSIS_PROMPT
     } else {
         template
     };
-    let authors = paper.authors.join(", ");
-    base.replace("{topics}", topics)
+    let focus = focus.trim();
+    let inline = base.contains("{focus}");
+
+    let user = base
+        .replace("{focus}", focus)
+        .replace("{topics}", topics)
         .replace("{title}", &paper.title)
-        .replace("{authors}", &authors)
-        .replace("{abstract}", &paper.summary)
+        .replace("{authors}", &paper.authors.join(", "))
+        .replace("{abstract}", &paper.summary);
+
+    let system = if focus.is_empty() || inline {
+        ANALYSIS_SYSTEM_PROMPT.to_string()
+    } else {
+        format!(
+            "{}\n\n用户的额外要求（请在评分、匹配主题与总结时一并考虑）：\n{}",
+            ANALYSIS_SYSTEM_PROMPT, focus
+        )
+    };
+
+    (system, user)
 }
 
 fn parse_score(value: &serde_json::Value) -> Result<f32, String> {
@@ -747,20 +777,14 @@ async fn call_ai_single(
     api_key: &str,
     model: &str,
     topics: &str,
+    focus: &str,
     prompt_template: &str,
     paper: &ArxivPaper,
 ) -> Result<AnalysisResult, String> {
+    let (system, user) = build_analysis_messages(prompt_template, topics, focus, paper);
     let messages = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content:
-                "你是一名严谨的研究助理。请只输出用户要求的有效 JSON，不要添加 Markdown 或解释。"
-                    .into(),
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: build_analysis_prompt(prompt_template, topics, paper).into(),
-        },
+        ChatMessage { role: "system".to_string(), content: system.into() },
+        ChatMessage { role: "user".to_string(), content: user.into() },
     ];
 
     let content = llm::chat_completion(provider, api_key, model, &messages, "arxiv").await?;
@@ -825,6 +849,7 @@ pub async fn analyze_single(
         &api_key,
         &model,
         &keywords,
+        &config.ai_analysis_focus,
         &prompt_template,
         &paper,
     )
@@ -1001,6 +1026,7 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
     let api_key    = std::sync::Arc::new(api_key);
     let model      = std::sync::Arc::new(model);
     let keywords   = std::sync::Arc::new(keywords);
+    let focus      = std::sync::Arc::new(config.ai_analysis_focus.clone());
     let prompt_template = std::sync::Arc::new(prompt_template);
 
     let mut join_set: tokio::task::JoinSet<(String, Result<AnalysisResult, String>)> =
@@ -1017,6 +1043,7 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
         let key    = api_key.clone();
         let mdl    = model.clone();
         let kws    = keywords.clone();
+        let fcs    = focus.clone();
         let tmpl   = prompt_template.clone();
         let done_c = done_arc.clone();
         let id_c   = paper.arxiv_id.clone();
@@ -1041,7 +1068,7 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
             }));
 
             // The actual slow part — call the AI provider.
-            let result = call_ai_single(&prov, &key, &mdl, &kws, &tmpl, &paper).await;
+            let result = call_ai_single(&prov, &key, &mdl, &kws, &fcs, &tmpl, &paper).await;
             (id_c, result)
         });
     }
@@ -1982,4 +2009,82 @@ pub async fn import_by_url(
     emit("done");
 
     Ok(ImportResult::imported(final_slug))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paper() -> ArxivPaper {
+        ArxivPaper {
+            arxiv_id: "2401.00001".to_string(),
+            title: "A Study".to_string(),
+            authors: vec!["Ann".to_string(), "Bo".to_string()],
+            summary: "We show things.".to_string(),
+            categories: vec![],
+            published: String::new(),
+            updated: String::new(),
+            pdf_url: String::new(),
+            abs_url: String::new(),
+            relevance_score: None,
+            relevance_reason: None,
+            key_contributions: vec![],
+            analysis_summary: None,
+            matched_topics: vec![],
+            analysis_status: "pending".to_string(),
+            in_library: false,
+            fetched_at: String::new(),
+            read: false,
+            rating: 0,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn placeholders_are_filled() {
+        let (_, user) = build_analysis_messages(
+            "主题：{topics}\n标题：{title}\n作者：{authors}\n摘要：{abstract}",
+            "LLM, RL",
+            "",
+            &paper(),
+        );
+        assert_eq!(user, "主题：LLM, RL\n标题：A Study\n作者：Ann, Bo\n摘要：We show things.");
+    }
+
+    #[test]
+    fn empty_focus_leaves_system_prompt_alone() {
+        let (system, _) = build_analysis_messages(DEFAULT_ARXIV_ANALYSIS_PROMPT, "LLM", "   ", &paper());
+        assert_eq!(system, ANALYSIS_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn focus_goes_to_system_and_keeps_json_instruction_last() {
+        let (system, user) =
+            build_analysis_messages(DEFAULT_ARXIV_ANALYSIS_PROMPT, "LLM", "偏好开源代码", &paper());
+        assert!(system.contains("偏好开源代码"));
+        // The template's closing "reply with JSON only" must stay at the end of the
+        // user message — that is the whole reason focus lives in the system message.
+        assert!(!user.contains("偏好开源代码"));
+        assert!(user.trim_end().ends_with(
+            r#"{"relevance_score": 0, "relevance_reason": "", "key_contributions": [], "summary": "", "matched_topics": []}"#
+        ));
+    }
+
+    #[test]
+    fn focus_placeholder_opts_into_inline_placement() {
+        let (system, user) = build_analysis_messages(
+            "要求：{focus}\n标题：{title}",
+            "LLM",
+            "偏好开源代码",
+            &paper(),
+        );
+        assert_eq!(user, "要求：偏好开源代码\n标题：A Study");
+        assert_eq!(system, ANALYSIS_SYSTEM_PROMPT, "inline placement must not also duplicate into system");
+    }
+
+    #[test]
+    fn focus_placeholder_is_removed_when_focus_is_empty() {
+        let (_, user) = build_analysis_messages("要求：{focus}|结束", "LLM", "", &paper());
+        assert_eq!(user, "要求：|结束");
+    }
 }

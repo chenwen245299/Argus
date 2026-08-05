@@ -12,6 +12,8 @@ import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import { computeSections } from '../utils/sections'
+import { renderMarkdown } from '../utils/renderMarkdown'
+import { notePopupSize, notePopupStyle, clampNotePopupPos, observeNotePopupResize } from '../utils/notePopup'
 import { fluentIconFor, fluentReady } from '../utils/fluentEmoji'
 import type { Highlight, Rect, PaperSections } from '../types'
 // The legacy build includes its own Promise.withResolvers polyfill, so the worker
@@ -277,7 +279,30 @@ const hlNotePopup = ref<{ x: number; y: number; hlId: string } | null>(null)   /
 const hlNoteText = ref('')
 const hlNoteEditing = ref(false)   // false = view mode, true = edit mode
 const noteTextareaRef = ref<HTMLTextAreaElement | null>(null)
+const notePopupRef = ref<HTMLElement | null>(null)
 const hlColorPopup = ref<{ x: number; y: number; hlId: string } | null>(null)  // right-click: color + delete
+
+// Notes are authored as markdown + $TeX$ and rendered on the view side, so a
+// formula reads as a formula instead of raw source (same deal as the notes tab).
+const hlNoteHtml = computed(() => renderMarkdown(hlNoteText.value))
+
+// Position is already clamped at open time; only the size stays reactive here.
+const hlNotePopupStyle = computed(() => {
+  const p = hlNotePopup.value
+  return p ? notePopupStyle(p.x, p.y) : {}
+})
+
+function openNotePopup(x: number, y: number, hlId: string) {
+  hlNotePopup.value = { ...clampNotePopupPos(x, y), hlId }
+}
+
+// Track the popup element only while it exists; v-if tears it down between opens.
+let stopNoteResizeObserver: (() => void) | null = null
+watch(notePopupRef, (el) => {
+  stopNoteResizeObserver?.()
+  stopNoteResizeObserver = el ? observeNotePopupResize(el) : null
+})
+onUnmounted(() => stopNoteResizeObserver?.())
 
 const COLORS = computed(() => [
   { label: t('pdf.yellow'), value: '#FFEB3B' },
@@ -1067,7 +1092,7 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
           const bounding = div.getBoundingClientRect()
           hlNoteText.value = reader.highlightsFor(props.slug).find(h => h.id === hl.id)?.note ?? ''
           hlNoteEditing.value = false
-          hlNotePopup.value = { x: bounding.left, y: bounding.bottom + 4, hlId: hl.id }
+          openNotePopup(bounding.left, bounding.bottom + 4, hl.id)
           hlColorPopup.value = null
         })
         div.addEventListener('contextmenu', (e) => {
@@ -1104,7 +1129,7 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
           const bounding = r.getBoundingClientRect()
           hlNoteText.value = reader.highlightsFor(props.slug).find(h => h.id === hl.id)?.note ?? ''
           hlNoteEditing.value = false
-          hlNotePopup.value = { x: bounding.left, y: bounding.bottom + 4, hlId: hl.id }
+          openNotePopup(bounding.left, bounding.bottom + 4, hl.id)
           hlColorPopup.value = null
         })
         r.addEventListener('contextmenu', (e) => {
@@ -2026,13 +2051,14 @@ function triggerInitialRender() {
     <!-- Highlight note popup: left-click → view; double-click → edit; blur → auto-save -->
     <div
       v-if="hlNotePopup"
+      ref="notePopupRef"
       class="hl-note-popup"
-      :style="{ left: `${hlNotePopup.x}px`, top: `${hlNotePopup.y}px` }"
+      :style="hlNotePopupStyle"
       @click.stop
     >
       <!-- View mode -->
       <div v-if="!hlNoteEditing" class="hl-note-view" @dblclick="startNoteEdit">
-        <span v-if="hlNoteText" class="hl-note-text">{{ hlNoteText }}</span>
+        <div v-if="hlNoteText" class="hl-note-text" v-html="hlNoteHtml" />
         <span v-else class="hl-note-placeholder">{{ t('pdf.notePlaceholder') }}</span>
       </div>
       <!-- Edit mode -->
@@ -2041,7 +2067,6 @@ function triggerInitialRender() {
         ref="noteTextareaRef"
         v-model="hlNoteText"
         class="hl-note-textarea"
-        rows="3"
         :placeholder="t('pdf.notePlaceholder')"
         @blur="saveNote(); hlNoteEditing = false"
         @keydown.esc.stop="saveNote(); hlNoteEditing = false"
@@ -2568,6 +2593,9 @@ function triggerInitialRender() {
 }
 
 /* ── Highlight popups ── */
+/* The note popup is the resizable window: `resize: both` lives here rather than
+   on the textarea so dragging works in view mode too and the grabber sits on the
+   frame. Its size comes from the shared inline style; min/max keep it sane. */
 .hl-note-popup {
   position: fixed;
   z-index: 1001;
@@ -2576,11 +2604,21 @@ function triggerInitialRender() {
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
   padding: 8px;
-  width: 220px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  resize: both;
+  overflow: hidden;
+  min-width: 200px;
+  min-height: 90px;
+  max-width: 70vw;
+  max-height: 70vh;
 }
 
 .hl-note-view {
-  min-height: 48px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
   cursor: text;
   padding: 2px 0;
 }
@@ -2589,7 +2627,6 @@ function triggerInitialRender() {
   font-size: var(--font-size-sm);
   color: var(--text-primary);
   line-height: 1.55;
-  white-space: pre-wrap;
   word-break: break-word;
 }
 
@@ -2600,9 +2637,11 @@ function triggerInitialRender() {
 }
 
 .hl-note-textarea {
+  flex: 1;
   width: 100%;
-  min-height: 72px;
-  resize: vertical;
+  min-height: 0;
+  resize: none;
+  box-sizing: border-box;
   border: 1px solid var(--accent);
   border-radius: var(--radius-sm);
   background: var(--bg-secondary);
@@ -2613,6 +2652,42 @@ function triggerInitialRender() {
   font-family: inherit;
   outline: none;
 }
+
+/* Rendered note body. The popup is narrow, so everything that can overflow gets
+   its own scroller and block spacing is tightened — a stray margin reads as a
+   layout bug at this size. */
+.hl-note-text :deep(> *:first-child) { margin-top: 0; }
+.hl-note-text :deep(> *:last-child) { margin-bottom: 0; }
+.hl-note-text :deep(p) { margin: 0 0 6px; }
+.hl-note-text :deep(ul),
+.hl-note-text :deep(ol) { margin: 0 0 6px; padding-left: 18px; }
+.hl-note-text :deep(li) { margin: 1px 0; }
+.hl-note-text :deep(h1),
+.hl-note-text :deep(h2),
+.hl-note-text :deep(h3),
+.hl-note-text :deep(h4) { font-size: var(--font-size-sm); font-weight: 600; margin: 6px 0 4px; }
+.hl-note-text :deep(blockquote) {
+  margin: 0 0 6px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-default);
+  color: var(--text-secondary);
+}
+.hl-note-text :deep(hr) { margin: 6px 0; border: none; border-top: 1px solid var(--border-subtle); }
+.hl-note-text :deep(img) { max-width: 100%; height: auto; }
+.hl-note-text :deep(table) { display: block; overflow-x: auto; max-width: 100%; }
+.hl-note-text :deep(pre) { max-width: 100%; overflow-x: auto; }
+.hl-note-text :deep(.md-code-block) { margin: 6px 0; }
+
+/* KaTeX: display math is centred and scrolls on its own; keep it near body size
+   so a formula doesn't tower over the surrounding text in a small popup. */
+.hl-note-text :deep(.katex) { font-size: 1.02em; }
+.hl-note-text :deep(.katex-display) {
+  margin: 6px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+}
+.hl-note-text :deep(.katex-display > .katex) { font-size: 1.08em; }
 
 .hl-color-popup {
   position: fixed;

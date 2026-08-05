@@ -27,6 +27,7 @@ mod settings;
 mod snippets;
 mod token_usage;
 mod url_import;
+mod watcher;
 mod writing;
 
 use std::sync::Mutex;

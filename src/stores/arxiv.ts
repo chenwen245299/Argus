@@ -40,6 +40,7 @@ const DEFAULT_CONFIG: ArxivConfig = {
   max_fetch: 100,
   ai_analysis_enabled: false,
   ai_analysis_prompt: DEFAULT_ARXIV_ANALYSIS_PROMPT,
+  ai_analysis_focus: '',
   ai_filter_enabled: true,
   ai_filter_threshold: 6,
   ai_provider_id: null,

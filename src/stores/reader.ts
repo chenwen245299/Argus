@@ -248,6 +248,32 @@ export const useReaderStore = defineStore('reader', () => {
     scrollToHighlightId.value = id
   }
 
+  /**
+   * Re-read a paper's disk-backed state after it changed outside this app
+   * (typically synced in from another machine).
+   *
+   * Only papers with an open tab are refreshed — everything else is read fresh
+   * when its tab opens anyway. Highlights and reading state are both written
+   * whole-file, so the sync already resolved them last-writer-wins on disk;
+   * picking up the winner is strictly better than showing a version that no
+   * longer exists anywhere. Notes are deliberately NOT touched: they can be open
+   * in an editor with unsaved keystrokes, and clobbering those loses work that
+   * was never on disk to begin with.
+   */
+  async function reloadFromDisk(slug: string) {
+    if (!tabs.value.some(t => t.slug === slug)) return
+    try {
+      const [hl, rs] = await Promise.all([
+        invoke<Highlight[]>('get_highlights', { slug }),
+        invoke<ReadingState | null>('get_reading_state', { slug }),
+      ])
+      setHighlights(slug, hl)
+      setReadingState(slug, rs)
+    } catch (e) {
+      console.error(`[reader] reload ${slug} after external change failed:`, e)
+    }
+  }
+
   async function persistReadingState(rs: ReadingState) {
     const slug = activeSlug.value
     if (!slug) return
@@ -291,5 +317,6 @@ export const useReaderStore = defineStore('reader', () => {
     removeHighlight,
     jumpToHighlight,
     persistReadingState,
+    reloadFromDisk,
   }
 })

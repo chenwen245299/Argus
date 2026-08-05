@@ -7,9 +7,8 @@ import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useAiStore, type ModelOption } from '../stores/ai'
 import { useRagStore } from '../stores/rag'
 import { useSettingsStore } from '../stores/settings'
-import MermaidBlock from './MermaidBlock.vue'
+import MarkdownBody from './MarkdownBody.vue'
 import WindowControls from './WindowControls.vue'
-import { renderMarkdown, getSegments } from '../utils/renderMarkdown'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
 import { buildChunks } from '../utils/chunker'
@@ -366,12 +365,14 @@ function setKnowledgeSource(src: KnowledgeSource) {
   try { localStorage.setItem(KNOWLEDGE_SOURCE_KEY, src) } catch {}
 }
 
+// "文献库论文" rather than plain "文献库" — next to "文献库RAG" in the picker the
+// shorter name read like the category the other option belonged to.
 const knowledgeSourceLabel = computed(() =>
   knowledgeSource.value === 'snippets'
     ? '素材库'
     : knowledgeSource.value === 'paper-rag'
       ? '文献库RAG'
-      : '文献库'
+      : '文献库论文'
 )
 
 function setActiveSelectedPaperSlugs(slugs: string[]) {
@@ -550,32 +551,52 @@ const stoppedTargetIds = new Set<string>()
 const activeRequestIds = new Map<string, string>()
 
 // ── Throttled streaming render ────────────────────────────────────────────────
-// Re-rendering full markdown (markdown-it + KaTeX + highlight.js) on every
-// streamed token is O(n²) and freezes the UI on long answers. We refresh a
-// `displayContent` copy at most once per STREAM_RENDER_MS instead.
-const STREAM_RENDER_MS = 90
+// A streamed answer is re-parsed in full (marked + KaTeX + highlight.js) on every
+// refresh, so refreshing per token is O(n²) and freezes the UI. We refresh a
+// `displayContent` copy on an interval instead.
+//
+// The interval adapts: a flat one only holds for short answers, since a 25KB
+// answer costs ~150ms per parse and would need more CPU than there is wall-clock
+// time. We measure what a refresh actually costs here and keep re-parsing to
+// roughly a quarter of wall-clock time. Mirrors AiTab's throttle.
+const STREAM_RENDER_MIN_MS = 90
+const STREAM_RENDER_MAX_MS = 800
+const STREAM_RENDER_DUTY = 4        // interval = measured cost × this
 const streamRenderTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const streamRenderLast = new Map<string, number>()
+const streamRenderCost = new Map<string, number>()
 
 type StreamTarget = LibraryUiMessage | LibraryAnswerVariant
+
+function streamRenderInterval(id: string): number {
+  const cost = streamRenderCost.get(id) ?? 0
+  return Math.min(STREAM_RENDER_MAX_MS, Math.max(STREAM_RENDER_MIN_MS, Math.round(cost * STREAM_RENDER_DUTY)))
+}
+
+// nextTick fires after Vue has patched the DOM, so this times parse + patch.
+function applyStreamRender(target: StreamTarget) {
+  const startedAt = performance.now()
+  target.displayContent = target.content
+  nextTick(() => streamRenderCost.set(target.id, performance.now() - startedAt))
+  scrollToBottom()
+}
 
 function scheduleStreamRender(target: StreamTarget) {
   const now = Date.now()
   const last = streamRenderLast.get(target.id) ?? 0
   const elapsed = now - last
-  if (elapsed >= STREAM_RENDER_MS) {
+  const interval = streamRenderInterval(target.id)
+  if (elapsed >= interval) {
     streamRenderLast.set(target.id, now)
-    target.displayContent = target.content
-    scrollToBottom()
+    applyStreamRender(target)
     return
   }
   if (streamRenderTimers.has(target.id)) return
   const timer = setTimeout(() => {
     streamRenderTimers.delete(target.id)
     streamRenderLast.set(target.id, Date.now())
-    target.displayContent = target.content
-    scrollToBottom()
-  }, STREAM_RENDER_MS - elapsed)
+    applyStreamRender(target)
+  }, interval - elapsed)
   streamRenderTimers.set(target.id, timer)
 }
 
@@ -584,6 +605,7 @@ function flushStreamRender(target: StreamTarget) {
   const timer = streamRenderTimers.get(target.id)
   if (timer) { clearTimeout(timer); streamRenderTimers.delete(target.id) }
   streamRenderLast.delete(target.id)
+  streamRenderCost.delete(target.id)
   target.displayContent = target.content
 }
 
@@ -592,6 +614,7 @@ function clearAllStreamRenderTimers() {
   for (const timer of streamRenderTimers.values()) clearTimeout(timer)
   streamRenderTimers.clear()
   streamRenderLast.clear()
+  streamRenderCost.clear()
 }
 
 // ── Computed ──────────────────────────────────────────────────────────────────
@@ -2114,15 +2137,16 @@ onUnmounted(() => {
                          Before any content arrives we show just a blinking cursor —
                          no "思考中" placeholder (the 思考过程 box already covers thinking). -->
                     <template v-if="activeAnswer(msg).streaming">
-                      <div v-if="activeAnswer(msg).content" v-html="renderMarkdown(activeAnswer(msg).displayContent ?? activeAnswer(msg).content)" />
+                      <MarkdownBody
+                        v-if="activeAnswer(msg).content"
+                        :content="activeAnswer(msg).displayContent ?? activeAnswer(msg).content"
+                        :streaming="true"
+                      />
                       <span class="cursor-blink"/>
                     </template>
                     <!-- Done: Mermaid-aware segment rendering -->
                     <template v-else>
-                      <template v-for="(seg, si) in getSegments(activeAnswer(msg).content)" :key="si">
-                        <div v-if="seg.type === 'md'" v-html="seg.html" />
-                        <MermaidBlock v-else :src="seg.src" />
-                      </template>
+                      <MarkdownBody :content="activeAnswer(msg).content" />
                     </template>
                   </div>
 
@@ -2370,7 +2394,7 @@ onUnmounted(() => {
                       @click="setKnowledgeSource('papers')"
                     >
                       <Icon icon="fluent:book-24-regular" width="12" height="12" />
-                      <span class="ks-option-text">文献库</span>
+                      <span class="ks-option-text">文献库论文</span>
                       <Icon v-if="knowledgeSource === 'papers'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
                     </button>
                     <button

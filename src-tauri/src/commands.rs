@@ -11,7 +11,7 @@ use crate::LibraryRoot;
 use crate::{
     ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas,
     canvas_enhance, collections, copilot, ebook, extraction, library, llm, metadata, paper, rag,
-    search, sections, security_bookmark, settings, snippets, url_import, writing,
+    search, sections, security_bookmark, settings, snippets, url_import, watcher, writing,
 };
 // ── Library management ────────────────────────────────────────────────────────
 
@@ -71,6 +71,9 @@ pub async fn open_library(
     // Track current root for token usage recording.
     crate::token_usage::set_root(&root);
 
+    // Pick up edits synced in from another machine while this one sits open.
+    watcher::watch(&app, &root);
+
     // Update scheduler enabled state based on config.
     let arxiv_cfg = arxiv::get_arxiv_config(&root);
     arxiv_scheduler::on_auto_fetch_changed(arxiv_cfg.auto_fetch_enabled);
@@ -119,7 +122,12 @@ pub async fn load_library_cache(
 #[tauri::command]
 pub async fn scan_library(state: State<'_, LibraryRoot>) -> Result<Vec<PaperIndexEntry>, String> {
     let root = get_root(&state)?;
-    library::scan_library(&root)
+    // Blocking IO: a 5000-paper library takes ~0.5s even on the cached path, and
+    // running that inline would park one of the async runtime's workers — the same
+    // pool that carries in-flight AI streaming. Hand it to the blocking pool.
+    tokio::task::spawn_blocking(move || library::scan_library(&root))
+        .await
+        .map_err(|e| format!("scan_library task failed: {e}"))?
 }
 
 // ── Paper list ────────────────────────────────────────────────────────────────

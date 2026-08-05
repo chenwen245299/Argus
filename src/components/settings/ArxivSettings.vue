@@ -28,6 +28,7 @@ function normalizeConfig(config: ArxivConfig): ArxivConfig {
     ai_analysis_prompt: config.ai_analysis_prompt?.trim()
       ? config.ai_analysis_prompt
       : DEFAULT_ARXIV_ANALYSIS_PROMPT,
+    ai_analysis_focus: config.ai_analysis_focus ?? '',
     ai_filter_enabled: config.ai_filter_enabled ?? true,
     ai_filter_threshold: Number.isFinite(config.ai_filter_threshold)
       ? Math.min(10, Math.max(0, config.ai_filter_threshold))
@@ -244,6 +245,18 @@ const arxivNeedsCategories = computed(() => form.value.fetch_arxiv && form.value
         @blur="flushKeywordsDraft"
       />
       <p class="field-hint">{{ t('arxivSettings.keywordsHint') }}</p>
+    </div>
+
+    <!-- Extra requirements: free-text preferences that keywords can't express -->
+    <div class="field-group">
+      <label class="field-label">{{ t('arxivSettings.focus') }}</label>
+      <textarea
+        v-model="form.ai_analysis_focus"
+        class="field-textarea"
+        rows="4"
+        :placeholder="t('arxivSettings.focusPh')"
+      />
+      <p class="field-hint">{{ t('arxivSettings.focusHint') }}</p>
     </div>
 
     <!-- Fetch frequency -->

@@ -163,8 +163,14 @@ export function renderMarkdown(content: string): string {
     })
 
     return DOMPurify.sanitize(html, {
-      ADD_ATTR: ['data-action', 'data-md-action', 'target', 'rel', 'title', 'type'],
-      ADD_TAGS: ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'g', 'defs', 'use', 'symbol'],
+      ADD_ATTR: ['data-action', 'data-md-action', 'target', 'rel', 'title', 'type', 'encoding'],
+      // `semantics`/`annotation` carry KaTeX's original TeX source; without them
+      // DOMPurify drops the tags but leaves their text orphaned inside <math>,
+      // which both corrupts textContent and loses the source for copy-as-markdown.
+      // Note: only plain `annotation` — `annotation-xml` stays banned, since
+      // encoding="text/html" there is a known mXSS vector.
+      ADD_TAGS: ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'g', 'defs', 'use', 'symbol',
+                 'semantics', 'annotation'],
       FORCE_BODY: false,
     })
   } catch {

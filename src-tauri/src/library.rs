@@ -190,3 +190,62 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
 
     Ok(entries)
 }
+
+#[cfg(test)]
+mod scan_bench {
+    //! Opt-in timing harness (`cargo test --lib scan_bench -- --ignored --nocapture`).
+    //! Not a correctness test — it exists so the cost of reacting to an external
+    //! change can be checked against a realistic library size rather than guessed.
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn make_library(n: usize) -> PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("argus-scan-bench-{}", uuid::Uuid::new_v4().simple()));
+        // Without this the index.json write fails and the second scan silently
+        // re-reads every meta.json — i.e. it would not measure the cached path.
+        std::fs::create_dir_all(root.join(".argus")).unwrap();
+        for i in 0..n {
+            let dir = root.join("papers").join(format!("paper{i:05}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let meta = serde_json::json!({
+                "id": format!("id{i}"),
+                "title": format!("A Study of Things Number {i}"),
+                "authors": ["Ann Author", "Bo Buthor"],
+                "year": 2020,
+                "doi": null, "arxiv_id": null, "venue": "Some Venue",
+                "tags": ["ml", "nlp"],
+                "added_at": "2024-01-01T00:00:00Z",
+                "original_filename": null,
+                "reading_status": "unread",
+            });
+            std::fs::write(dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+            std::fs::write(dir.join(".status.json"), r#"{"has_text":true}"#).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    #[ignore]
+    fn time_scan_at_realistic_sizes() {
+        for n in [100usize, 500, 2000, 5000] {
+            let root = make_library(n);
+            let r = root.to_str().unwrap();
+
+            let t0 = Instant::now();
+            let cold = super::scan_library(r).unwrap();
+            let cold_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let t1 = Instant::now();
+            let warm = super::scan_library(r).unwrap();
+            let warm_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+            assert_eq!(cold.len(), n);
+            assert_eq!(warm.len(), n);
+            println!(
+                "{n:>5} papers | cold(first scan) {cold_ms:>8.1}ms | warm(mtime cache hit) {warm_ms:>8.1}ms",
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}

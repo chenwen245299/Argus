@@ -4,6 +4,7 @@ import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { useReaderStore } from '../../stores/reader'
 import { useLibraryStore } from '../../stores/library'
+import { renderMarkdown } from '../../utils/renderMarkdown'
 import { isEbookFileType } from '../../types'
 
 const { t } = useI18n()
@@ -55,6 +56,12 @@ function cancelNote() {
   editingNoteId.value = null
 }
 
+// Same markdown + $TeX$ rendering as the reader's note popup, so a formula reads
+// the same on both sides instead of showing raw source here.
+function noteHtml(note: string): string {
+  return renderMarkdown(note)
+}
+
 function colorStyle(color: string, alpha = 0.35): string {
   const h = color.replace('#', '')
   const r = parseInt(h.substring(0, 2), 16)
@@ -83,10 +90,10 @@ function colorStyle(color: string, alpha = 0.35): string {
         <div class="hl-color-bar" :style="{ background: hl.color }" />
         <div class="hl-body">
           <p class="hl-text" :style="{ background: colorStyle(hl.color) }">{{ hl.text }}</p>
-          <div class="hl-meta">
-            <span v-if="!isEbook" class="hl-page">p.{{ hl.page }}</span>
-            <span v-if="hl.note" class="hl-note">{{ hl.note }}</span>
+          <div v-if="!isEbook" class="hl-meta">
+            <span class="hl-page">p.{{ hl.page }}</span>
           </div>
+          <div v-if="hl.note" class="hl-note" v-html="noteHtml(hl.note)" />
 
           <div v-if="editingNoteId === hl.id" class="note-editor">
             <textarea
@@ -165,7 +172,33 @@ function colorStyle(color: string, alpha = 0.35): string {
 
 .hl-meta { display: flex; gap: 8px; font-size: var(--font-size-xs); color: var(--text-tertiary); margin-bottom: 4px; }
 .hl-page { flex-shrink: 0; }
-.hl-note { color: var(--text-secondary); font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Rendered note preview: markdown + KaTeX, kept tight so list rows stay compact. */
+.hl-note {
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  color: var(--text-secondary);
+  word-break: break-word;
+  margin-bottom: 6px;
+}
+.hl-note :deep(> *:first-child) { margin-top: 0; }
+.hl-note :deep(> *:last-child) { margin-bottom: 0; }
+.hl-note :deep(p) { margin: 0 0 4px; }
+.hl-note :deep(ul),
+.hl-note :deep(ol) { margin: 0 0 4px; padding-left: 16px; }
+.hl-note :deep(li) { margin: 1px 0; }
+.hl-note :deep(h1),
+.hl-note :deep(h2),
+.hl-note :deep(h3),
+.hl-note :deep(h4) { font-size: var(--font-size-xs); font-weight: 600; margin: 4px 0 2px; color: var(--text-primary); }
+.hl-note :deep(blockquote) { margin: 0 0 4px; padding-left: 6px; border-left: 2px solid var(--border-subtle); }
+.hl-note :deep(img) { max-width: 100%; height: auto; }
+.hl-note :deep(table) { display: block; overflow-x: auto; max-width: 100%; }
+.hl-note :deep(pre) { max-width: 100%; overflow-x: auto; }
+.hl-note :deep(.md-code-block) { margin: 4px 0; }
+.hl-note :deep(.katex) { font-size: 1.05em; }
+.hl-note :deep(.katex-display) { margin: 4px 0; overflow-x: auto; overflow-y: hidden; }
+.hl-note :deep(.katex-display > .katex) { font-size: 1.1em; }
 
 .hl-actions { display: flex; gap: 4px; flex-wrap: wrap; }
 
@@ -195,7 +228,10 @@ function colorStyle(color: string, alpha = 0.35): string {
   border-radius: var(--radius-sm);
   background: var(--bg-primary);
   color: var(--text-primary);
-  resize: none;
+  resize: vertical;
+  min-height: 44px;
+  font-family: inherit;
+  line-height: 1.5;
   box-sizing: border-box;
 }
 

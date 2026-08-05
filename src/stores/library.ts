@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { LibraryConfig, PaperIndexEntry } from '../types'
 import { useReaderStore } from './reader'
 import { useRanksStore } from './ranks'
@@ -77,10 +78,45 @@ export const useLibraryStore = defineStore('library', () => {
 
       // Phase 2: incremental background scan (always runs, updates any changes)
       _backgroundScan()
+
+      // Phase 3: keep up with edits synced in from other machines.
+      _watchExternalChanges()
     } catch (e) {
       error.value = String(e)
       isLoading.value = false
     }
+  }
+
+  // ── External changes (iCloud / Dropbox sync from another machine) ──────────
+  // The Rust watcher reports edits it did not make itself, already debounced to
+  // one event per sync burst. Re-scanning is incremental (meta.json mtimes are
+  // cached), so reacting is cheap even when a burst touches many papers.
+  let unlistenFileChanges: UnlistenFn | null = null
+  let externalRefreshQueued = false
+
+  async function _watchExternalChanges() {
+    if (unlistenFileChanges) return   // one listener for the app's lifetime
+    unlistenFileChanges = await listen<{ slugs: string[]; other: boolean }>(
+      'library-files-changed',
+      async (event) => {
+        // Collapse events that arrive while a scan is still running; refresh()
+        // already re-runs itself for requests that land mid-flight.
+        if (externalRefreshQueued) return
+        externalRefreshQueued = true
+        try {
+          await refresh()
+          // Only papers with an open tab need re-reading, and a sync burst can
+          // name thousands of slugs — intersect first so the work is bounded by
+          // the tab count, then run those few in parallel.
+          const reader = useReaderStore()
+          const open = new Set(reader.tabs.map(t => t.slug))
+          const affected = (event.payload.slugs ?? []).filter(s => open.has(s))
+          await Promise.all(affected.map(s => reader.reloadFromDisk(s)))
+        } finally {
+          externalRefreshQueued = false
+        }
+      },
+    )
   }
 
   async function _backgroundScan() {

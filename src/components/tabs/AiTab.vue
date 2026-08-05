@@ -7,8 +7,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useAiStore, type ModelOption } from '../../stores/ai'
 import { useSettingsStore } from '../../stores/settings'
-import MermaidBlock from '../MermaidBlock.vue'
-import { renderMarkdown, getSegments } from '../../utils/renderMarkdown'
+import MarkdownBody from '../MarkdownBody.vue'
 import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
 import type { ChatContentPart, ChatMessage, PaperMeta, PaperStatus, PaperSection } from '../../types'
@@ -1133,21 +1132,44 @@ function stopAllStreaming() {
 }
 
 // ── Throttled streaming render ────────────────────────────────────────────────
-// Re-rendering the full markdown (markdown-it + KaTeX + highlight.js) on every
-// streamed token is O(n²) and freezes the UI on long answers. We instead refresh
-// a `displayContent` copy at most once per STREAM_RENDER_MS.
-const STREAM_RENDER_MS = 90
+// A streamed answer is re-parsed in full (marked + KaTeX + highlight.js) on every
+// refresh, so refreshing per token is O(n²) and freezes the UI. We refresh a
+// `displayContent` copy on an interval instead.
+//
+// The interval adapts, because a fixed one only works for short answers: a 25KB
+// answer costs ~150ms per parse, so at a flat 90ms the renderer needs more than a
+// second of CPU per second of streaming and never catches up — the whole webview
+// (PDF reader included) locks up. We measure what a refresh actually costs on
+// this machine and keep re-parsing to roughly a quarter of wall-clock time.
+const STREAM_RENDER_MIN_MS = 90
+const STREAM_RENDER_MAX_MS = 800
+const STREAM_RENDER_DUTY = 4        // interval = measured cost × this
 const streamRenderTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const streamRenderLast = new Map<string, number>()
+const streamRenderCost = new Map<string, number>()
+
+function streamRenderInterval(ansId: string): number {
+  const cost = streamRenderCost.get(ansId) ?? 0
+  return Math.min(STREAM_RENDER_MAX_MS, Math.max(STREAM_RENDER_MIN_MS, Math.round(cost * STREAM_RENDER_DUTY)))
+}
+
+// Publish the new text and time the resulting render. nextTick runs after Vue has
+// patched the DOM, so this captures parse + patch — the real cost of a refresh.
+function applyStreamRender(ans: AssistantAnswer) {
+  const startedAt = performance.now()
+  ans.displayContent = ans.content
+  nextTick(() => streamRenderCost.set(ans.id, performance.now() - startedAt))
+  scrollToBottom()
+}
 
 function scheduleStreamRender(ans: AssistantAnswer) {
   const now = Date.now()
   const last = streamRenderLast.get(ans.id) ?? 0
   const elapsed = now - last
-  if (elapsed >= STREAM_RENDER_MS) {
+  const interval = streamRenderInterval(ans.id)
+  if (elapsed >= interval) {
     streamRenderLast.set(ans.id, now)
-    ans.displayContent = ans.content
-    scrollToBottom()
+    applyStreamRender(ans)
     return
   }
   if (streamRenderTimers.has(ans.id)) return
@@ -1155,8 +1177,8 @@ function scheduleStreamRender(ans: AssistantAnswer) {
     streamRenderTimers.delete(ans.id)
     streamRenderLast.set(ans.id, Date.now())
     const live = findReactiveAnswer(ans.id)
-    if (live) { live.displayContent = live.content; scrollToBottom() }
-  }, STREAM_RENDER_MS - elapsed)
+    if (live) applyStreamRender(live)
+  }, interval - elapsed)
   streamRenderTimers.set(ans.id, timer)
 }
 
@@ -1165,6 +1187,7 @@ function flushStreamRender(ans: AssistantAnswer) {
   const timer = streamRenderTimers.get(ans.id)
   if (timer) { clearTimeout(timer); streamRenderTimers.delete(ans.id) }
   streamRenderLast.delete(ans.id)
+  streamRenderCost.delete(ans.id)
   ans.displayContent = ans.content
 }
 
@@ -1174,6 +1197,7 @@ function clearAllStreamRenderTimers() {
   for (const timer of streamRenderTimers.values()) clearTimeout(timer)
   streamRenderTimers.clear()
   streamRenderLast.clear()
+  streamRenderCost.clear()
 }
 
 async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history: ChatMessage[]) {
@@ -2050,15 +2074,14 @@ function toggleContextPanel(nodeId: string) {
                   :class="{ pending: answer.streaming && !answer.content && !answer.reasoningContent }"
                 >
                   <template v-if="answer.streaming">
-                    <div v-if="answer.content" v-html="renderMarkdown(answer.displayContent ?? answer.content)" />
+                    <MarkdownBody
+                      v-if="answer.content"
+                      :content="answer.displayContent ?? answer.content"
+                      :streaming="true"
+                    />
                     <div v-else-if="!answer.reasoningContent" class="thinking-placeholder">{{ answer.withReasoning ? '正在思考…' : '生成中…' }}</div>
                   </template>
-                  <template v-else>
-                    <template v-for="(seg, si) in getSegments(answer.content)" :key="si">
-                      <div v-if="seg.type === 'md'" v-html="seg.html" />
-                      <MermaidBlock v-else :src="seg.src" />
-                    </template>
-                  </template>
+                  <MarkdownBody v-else :content="answer.content" />
                 </div>
               </article>
 

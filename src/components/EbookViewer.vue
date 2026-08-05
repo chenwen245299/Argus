@@ -15,6 +15,8 @@ import { openAddSnippetModal } from '../stores/snippetLibrary'
 import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
+import { renderMarkdown } from '../utils/renderMarkdown'
+import { notePopupSize, notePopupStyle, clampNotePopupPos, observeNotePopupResize } from '../utils/notePopup'
 import type { EbookManifest, Highlight } from '../types'
 
 // One instance per open ebook tab; `slug` never changes for an instance.
@@ -171,7 +173,30 @@ const hlNotePopup = ref<{ x: number; y: number; hlId: string } | null>(null)
 const hlNoteText = ref('')
 const hlNoteEditing = ref(false)
 const noteTextareaRef = ref<HTMLTextAreaElement | null>(null)
+const notePopupRef = ref<HTMLElement | null>(null)
 const hlColorPopup = ref<{ x: number; y: number; hlId: string } | null>(null)
+
+// Notes are authored as markdown + $TeX$ and rendered on the view side, matching
+// the PDF reader and the notes tab.
+const hlNoteHtml = computed(() => renderMarkdown(hlNoteText.value))
+
+// Position is already clamped at open time; only the size stays reactive here.
+const hlNotePopupStyle = computed(() => {
+  const p = hlNotePopup.value
+  return p ? notePopupStyle(p.x, p.y) : {}
+})
+
+function openNotePopup(x: number, y: number, hlId: string) {
+  hlNotePopup.value = { ...clampNotePopupPos(x, y), hlId }
+}
+
+// Track the popup element only while it exists; v-if tears it down between opens.
+let stopNoteResizeObserver: (() => void) | null = null
+watch(notePopupRef, (el) => {
+  stopNoteResizeObserver?.()
+  stopNoteResizeObserver = el ? observeNotePopupResize(el) : null
+})
+onUnmounted(() => stopNoteResizeObserver?.())
 
 // ── Lifecycle (global listeners follow the ACTIVE tab, not mount/unmount) ────
 function addGlobalListeners() {
@@ -770,7 +795,7 @@ function renderChapterHighlights(idx: number) {
       }
       div.addEventListener('click', (ev) => {
         ev.stopPropagation()
-        hlNotePopup.value = { x: ev.clientX, y: ev.clientY + 8, hlId: hl.id }
+        openNotePopup(ev.clientX, ev.clientY + 8, hl.id)
         hlNoteText.value = reader.highlightsFor(props.slug).find(h => h.id === hl.id)?.note ?? ''
         hlNoteEditing.value = false
         hlColorPopup.value = null
@@ -1470,12 +1495,13 @@ defineExpose({ closeToList: handleBack })
     <!-- Highlight note popup -->
     <div
       v-if="hlNotePopup"
+      ref="notePopupRef"
       class="hl-note-popup"
-      :style="{ left: `${hlNotePopup.x}px`, top: `${hlNotePopup.y}px` }"
+      :style="hlNotePopupStyle"
       @click.stop
     >
       <div v-if="!hlNoteEditing" class="hl-note-view" @dblclick="startNoteEdit">
-        <span v-if="hlNoteText" class="hl-note-text">{{ hlNoteText }}</span>
+        <div v-if="hlNoteText" class="hl-note-text" v-html="hlNoteHtml" />
         <span v-else class="hl-note-placeholder">{{ t('pdf.notePlaceholder') }}</span>
       </div>
       <textarea
@@ -1483,7 +1509,6 @@ defineExpose({ closeToList: handleBack })
         ref="noteTextareaRef"
         v-model="hlNoteText"
         class="hl-note-textarea"
-        rows="3"
         :placeholder="t('pdf.notePlaceholder')"
         @blur="saveNote(); hlNoteEditing = false"
         @keydown.esc.stop="saveNote(); hlNoteEditing = false"
@@ -2065,30 +2090,79 @@ defineExpose({ closeToList: handleBack })
 .sel-style-btn.active { color: var(--accent); }
 .sel-translate-label { white-space: nowrap; }
 
+/* Resizable note window — `resize: both` sits on the frame (not the textarea) so
+   dragging works in view mode too. Size comes from the shared inline style. */
 .hl-note-popup {
   position: fixed;
   z-index: 60;
-  width: 240px;
   background: var(--bg-primary);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
   padding: 8px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  resize: both;
+  overflow: hidden;
+  min-width: 200px;
+  min-height: 90px;
+  max-width: 70vw;
+  max-height: 70vh;
 }
-.hl-note-view { min-height: 40px; font-size: 12.5px; cursor: text; }
-.hl-note-text { color: var(--text-primary); white-space: pre-wrap; }
+.hl-note-view { flex: 1; min-height: 0; overflow: auto; font-size: 12.5px; cursor: text; }
+.hl-note-text { color: var(--text-primary); word-break: break-word; line-height: 1.55; }
 .hl-note-placeholder { color: var(--text-secondary); }
 .hl-note-textarea {
+  flex: 1;
   width: 100%;
-  resize: vertical;
+  min-height: 0;
+  resize: none;
   font-size: 12.5px;
   padding: 6px;
+  line-height: 1.5;
+  font-family: inherit;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: var(--bg-primary);
   color: var(--text-primary);
   box-sizing: border-box;
+  outline: none;
 }
+
+/* Rendered note body — tight block spacing and self-scrolling overflow, so
+   nothing blows out the narrow popup. */
+.hl-note-text :deep(> *:first-child) { margin-top: 0; }
+.hl-note-text :deep(> *:last-child) { margin-bottom: 0; }
+.hl-note-text :deep(p) { margin: 0 0 6px; }
+.hl-note-text :deep(ul),
+.hl-note-text :deep(ol) { margin: 0 0 6px; padding-left: 18px; }
+.hl-note-text :deep(li) { margin: 1px 0; }
+.hl-note-text :deep(h1),
+.hl-note-text :deep(h2),
+.hl-note-text :deep(h3),
+.hl-note-text :deep(h4) { font-size: 12.5px; font-weight: 600; margin: 6px 0 4px; }
+.hl-note-text :deep(blockquote) {
+  margin: 0 0 6px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-default);
+  color: var(--text-secondary);
+}
+.hl-note-text :deep(hr) { margin: 6px 0; border: none; border-top: 1px solid var(--border-subtle); }
+.hl-note-text :deep(img) { max-width: 100%; height: auto; }
+.hl-note-text :deep(table) { display: block; overflow-x: auto; max-width: 100%; }
+.hl-note-text :deep(pre) { max-width: 100%; overflow-x: auto; }
+.hl-note-text :deep(.md-code-block) { margin: 6px 0; }
+
+/* KaTeX: keep formulas close to body size and let display math scroll. */
+.hl-note-text :deep(.katex) { font-size: 1.02em; }
+.hl-note-text :deep(.katex-display) {
+  margin: 6px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+}
+.hl-note-text :deep(.katex-display > .katex) { font-size: 1.08em; }
 
 .hl-color-popup {
   position: fixed;

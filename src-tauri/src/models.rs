@@ -1002,6 +1002,12 @@ pub struct ArxivConfig {
     pub ai_analysis_enabled: bool,
     #[serde(default = "default_arxiv_analysis_prompt")]
     pub ai_analysis_prompt: String,
+    /// Free-text extra requirements the user wants applied on top of `keywords`
+    /// (e.g. "偏好有开源代码、在真实数据上验证的工作"). Injected into the analysis
+    /// prompt at `{focus}`, or appended as its own block when the template — such
+    /// as one saved before this field existed — has no placeholder.
+    #[serde(default)]
+    pub ai_analysis_focus: String,
     #[serde(default = "default_ai_filter_enabled")]
     pub ai_filter_enabled: bool,
     #[serde(default = "default_ai_filter_threshold")]
@@ -1059,6 +1065,7 @@ impl Default for ArxivConfig {
             max_fetch: 100,
             ai_analysis_enabled: false,
             ai_analysis_prompt: DEFAULT_ARXIV_ANALYSIS_PROMPT.to_string(),
+            ai_analysis_focus: String::new(),
             ai_filter_enabled: true,
             ai_filter_threshold: 6.0,
             ai_provider_id: None,

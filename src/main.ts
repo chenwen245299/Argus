@@ -17,10 +17,15 @@ import 'katex/dist/katex.min.css'
 import 'highlight.js/styles/github.css'
 import { addIcon } from '@iconify/vue'
 import { i18n } from './i18n'
+import { installMarkdownCopy } from './utils/copyAsMarkdown'
 import App from './App.vue'
 import './assets/main.css'
 // Theme palettes must load after main.css so [data-theme] rules win at equal specificity.
 import './assets/themes.css'
+
+// Selections inside rendered markdown copy out as markdown source, not as the
+// flattened glyphs the HTML happens to contain (see utils/copyAsMarkdown).
+installMarkdownCopy()
 
 // Suppress browser's native right-click menu everywhere except text inputs.
 document.addEventListener('contextmenu', (e) => {

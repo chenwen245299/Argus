@@ -449,6 +449,8 @@ export interface ArxivConfig {
   max_fetch: number
   ai_analysis_enabled: boolean
   ai_analysis_prompt: string
+  /** Free-text requirements layered on top of `keywords` during AI analysis. */
+  ai_analysis_focus: string
   ai_filter_enabled: boolean
   ai_filter_threshold: number
   ai_provider_id: string | null

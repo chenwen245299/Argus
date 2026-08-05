@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Icon } from '@iconify/vue'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import type { UnlistenFn } from '@tauri-apps/api/event'
-import { useReaderStore } from '../stores/reader'
+import { useReaderStore, TAB_GROUP_COLORS, type Tab, type TabGroup, type TabGroupColor } from '../stores/reader'
 import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
 import { useCanvasStore } from '../stores/canvas'
@@ -53,15 +53,62 @@ const isWindows = navigator.userAgent.toLowerCase().includes('windows')
 let unlistenResize: UnlistenFn | null = null
 let refreshTimers: number[] = []
 
+// ── Tab groups ────────────────────────────────────────────────────────────────
+// Paper tabs render as a flat list of segments: either a lone tab or a group
+// (chip + its members, which the store keeps contiguous). Every draggable slot
+// carries `data-drop-index` — its index in `reader.tabs` — so drop targets stay
+// correct even when a collapsed group hides its members from the DOM.
+
+type PaperSegment =
+  | { kind: 'tab'; key: string; tab: Tab; index: number }
+  | { kind: 'group'; key: string; group: TabGroup; index: number; items: { tab: Tab; index: number }[] }
+
+const paperSegments = computed<PaperSegment[]>(() => {
+  const out: PaperSegment[] = []
+  reader.tabs.forEach((tab, index) => {
+    const group = tab.groupId ? reader.groupById(tab.groupId) : null
+    if (!group) {
+      out.push({ kind: 'tab', key: tab.slug, tab, index })
+      return
+    }
+    const last = out[out.length - 1]
+    if (last?.kind === 'group' && last.group.id === group.id) {
+      last.items.push({ tab, index })
+      return
+    }
+    out.push({ kind: 'group', key: group.id, group, index, items: [{ tab, index }] })
+  })
+  return out
+})
+
+function groupHasActive(group: TabGroup) {
+  return reader.tabs.some(t => t.groupId === group.id && t.slug === reader.activeSlug) && !canvasStore.isShown
+}
+
 // ── Tab drag-and-drop (pointer-based, avoids macOS native DnD green +) ────────
 const dragFrom = ref<number | null>(null)
+const dragGroupId = ref<string | null>(null)
 const dropAt = ref<number | null>(null)
 const tabsScrollRef = ref<HTMLElement | null>(null)
 
-function onTabMouseDown(e: MouseEvent, idx: number) {
-  if (e.button !== 0) return
-  if ((e.target as HTMLElement).closest('.tab-close')) return
+/** Index in `reader.tabs` the pointer currently sits before. */
+function dropIndexAt(clientX: number): number {
+  const slots = tabsScrollRef.value?.querySelectorAll<HTMLElement>('[data-drop-index]')
+  let di = reader.tabs.length
+  slots?.forEach(el => {
+    const i = Number(el.dataset.dropIndex)
+    if (!Number.isFinite(i)) return
+    const { left, width } = el.getBoundingClientRect()
+    if (clientX < left + width / 2 && i < di) di = i
+  })
+  return di
+}
 
+/**
+ * Shared press-and-drag gesture. `onDrop` only fires once the pointer actually
+ * moved, so a plain click still falls through to the element's own handler.
+ */
+function beginDrag(e: MouseEvent, onStart: () => void, onDrop: (dropIdx: number) => void) {
   const startX = e.clientX
   let dragging = false
 
@@ -69,31 +116,113 @@ function onTabMouseDown(e: MouseEvent, idx: number) {
     if (!dragging) {
       if (Math.abs(ev.clientX - startX) < 5) return
       dragging = true
-      dragFrom.value = idx
+      onStart()
     }
-    // Find drop position from live tab positions
-    const tabs = tabsScrollRef.value?.querySelectorAll<HTMLElement>('.tab.tab-paper')
-    if (!tabs) return
-    let di = reader.tabs.length
-    tabs.forEach((el, i) => {
-      const { left, width } = el.getBoundingClientRect()
-      if (ev.clientX < left + width / 2 && i < di) di = i
-    })
-    dropAt.value = di
+    dropAt.value = dropIndexAt(ev.clientX)
   }
 
   const onUp = () => {
     document.removeEventListener('mousemove', onMove)
     document.removeEventListener('mouseup', onUp)
-    if (dragging && dragFrom.value !== null && dropAt.value !== null) {
-      reader.reorderTabs(dragFrom.value, dropAt.value)
-    }
+    if (dragging && dropAt.value !== null) onDrop(dropAt.value)
     dragFrom.value = null
+    dragGroupId.value = null
     dropAt.value = null
   }
 
   document.addEventListener('mousemove', onMove)
   document.addEventListener('mouseup', onUp)
+}
+
+function onTabMouseDown(e: MouseEvent, idx: number) {
+  if (e.button !== 0) return
+  if ((e.target as HTMLElement).closest('.tab-close')) return
+  beginDrag(e, () => { dragFrom.value = idx }, dropIdx => {
+    if (dragFrom.value !== null) reader.reorderTabs(dragFrom.value, dropIdx)
+  })
+}
+
+// `click` fires after `mouseup`, by which point the drag state is already torn
+// down — so a finished drag is remembered here to stop it toggling the group.
+let chipDragged = false
+
+function onGroupChipMouseDown(e: MouseEvent, segment: PaperSegment) {
+  if (e.button !== 0 || segment.kind !== 'group') return
+  beginDrag(e, () => { dragGroupId.value = segment.group.id }, dropIdx => {
+    if (dragGroupId.value) reader.reorderTabGroup(dragGroupId.value, dropIdx)
+    chipDragged = true
+  })
+}
+
+// ── Tab / group context menus ─────────────────────────────────────────────────
+const tabMenu = ref<{ x: number; y: number; slug: string } | null>(null)
+const groupMenu = ref<{ x: number; y: number; groupId: string } | null>(null)
+const groupNameInput = ref<HTMLInputElement | null>(null)
+
+const menuTab = computed(() => reader.tabs.find(t => t.slug === tabMenu.value?.slug) ?? null)
+const menuGroup = computed(() => reader.groupById(groupMenu.value?.groupId))
+/** Groups a tab can be moved into — everything except the one it's already in. */
+const otherGroups = computed(() =>
+  reader.tabGroups.filter(g => g.id !== menuTab.value?.groupId)
+)
+
+/** Keep a menu inside the window; both are ~210px wide. */
+function menuPosition(e: MouseEvent, height: number) {
+  return {
+    x: Math.min(e.clientX, Math.max(8, window.innerWidth - 218)),
+    y: Math.min(e.clientY, Math.max(8, window.innerHeight - height)),
+  }
+}
+
+function closeMenus() {
+  tabMenu.value = null
+  groupMenu.value = null
+}
+
+function openTabMenu(e: MouseEvent, slug: string) {
+  closeMenus()
+  tabMenu.value = { ...menuPosition(e, 260), slug }
+}
+
+function openGroupMenu(e: MouseEvent, groupId: string) {
+  closeMenus()
+  groupMenu.value = { ...menuPosition(e, 220), groupId }
+  nextTick(() => groupNameInput.value?.focus())
+}
+
+function groupTab(slug: string) {
+  const id = reader.createTabGroup([slug])
+  closeMenus()
+  if (!id) return
+  // Straight into renaming, like Chrome's "add to new group".
+  nextTick(() => {
+    const el = tabsScrollRef.value?.querySelector<HTMLElement>(`[data-group-chip="${id}"]`)
+    const rect = el?.getBoundingClientRect()
+    if (rect) {
+      groupMenu.value = { x: rect.left, y: rect.bottom + 4, groupId: id }
+      nextTick(() => groupNameInput.value?.select())
+    }
+  })
+}
+
+function moveTabToGroup(slug: string, groupId: string | null) {
+  reader.setTabGroup(slug, groupId)
+  closeMenus()
+}
+
+function onGroupChipClick(group: TabGroup) {
+  if (chipDragged) { chipDragged = false; return }
+  reader.toggleTabGroupCollapsed(group.id)
+}
+
+function applyGroupColor(color: TabGroupColor) {
+  if (menuGroup.value) reader.setTabGroupColor(menuGroup.value.id, color)
+}
+
+function onDocumentMouseDown(e: MouseEvent) {
+  if (!tabMenu.value && !groupMenu.value) return
+  if ((e.target as HTMLElement).closest('.tabbar-menu')) return
+  closeMenus()
 }
 
 const homeTitle = computed(() => {
@@ -175,12 +304,14 @@ onMounted(async () => {
   await refreshWindowLayout()
   unlistenResize = await appWindow.onResized(scheduleWindowLayoutRefresh)
   window.addEventListener('resize', scheduleWindowLayoutRefresh)
+  document.addEventListener('mousedown', onDocumentMouseDown)
 })
 
 onUnmounted(() => {
   clearRefreshTimers()
   unlistenResize?.()
   window.removeEventListener('resize', scheduleWindowLayoutRefresh)
+  document.removeEventListener('mousedown', onDocumentMouseDown)
 })
 
 async function minimizeWindow() {
@@ -267,27 +398,79 @@ async function closeWindow() {
         </button>
       </div>
 
-      <!-- PDF tabs -->
-      <div
-        v-for="(tab, idx) in reader.tabs"
-        :key="tab.slug"
-        class="tab tab-paper"
-        :class="{
-          active: tab.slug === reader.activeSlug && !canvasStore.isShown,
-          'tab-dragging': dragFrom === idx,
-          'drop-before': dropAt === idx && dragFrom !== idx,
-          'drop-after': dropAt === idx + 1 && dragFrom !== idx,
-        }"
-        :title="titleInitialCaps(tab.title)"
-        @click="switchTab(tab.slug)"
-        @mousedown="onTabMouseDown($event, idx)"
-      >
-        <Icon icon="fluent:document-24-regular" class="tab-icon" width="13" height="13" />
-        <span class="tab-title">{{ titleInitialCaps(tab.title) }}</span>
-        <button class="tab-close" @click.stop="reader.closeTab(tab.slug)">
-          <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
-        </button>
-      </div>
+      <!-- PDF tabs, grouped Chrome-style -->
+      <template v-for="segment in paperSegments" :key="segment.key">
+        <!-- Ungrouped tab -->
+        <div
+          v-if="segment.kind === 'tab'"
+          class="tab tab-paper"
+          :class="{
+            active: segment.tab.slug === reader.activeSlug && !canvasStore.isShown,
+            'tab-dragging': dragFrom === segment.index,
+            'drop-before': dropAt === segment.index && dragFrom !== segment.index,
+            'drop-after': dropAt === segment.index + 1 && dragFrom !== segment.index,
+          }"
+          :data-drop-index="segment.index"
+          :title="titleInitialCaps(segment.tab.title)"
+          @click="switchTab(segment.tab.slug)"
+          @mousedown="onTabMouseDown($event, segment.index)"
+          @contextmenu.prevent.stop="openTabMenu($event, segment.tab.slug)"
+        >
+          <Icon icon="fluent:document-24-regular" class="tab-icon" width="13" height="13" />
+          <span class="tab-title">{{ titleInitialCaps(segment.tab.title) }}</span>
+          <button class="tab-close" @click.stop="reader.closeTab(segment.tab.slug)">
+            <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
+          </button>
+        </div>
+
+        <!-- Group: colour sleeve wrapping a chip and its member tabs -->
+        <div
+          v-else
+          class="tab-group"
+          :class="[`group-${segment.group.color}`, { 'group-collapsed': segment.group.collapsed }]"
+        >
+          <button
+            class="group-chip"
+            :class="{ 'chip-dragging': dragGroupId === segment.group.id }"
+            :data-group-chip="segment.group.id"
+            :data-drop-index="segment.group.collapsed ? segment.index : undefined"
+            :title="segment.group.name || '未命名分组'"
+            @click="onGroupChipClick(segment.group)"
+            @mousedown="onGroupChipMouseDown($event, segment)"
+            @contextmenu.prevent.stop="openGroupMenu($event, segment.group.id)"
+          >
+            <span v-if="segment.group.name" class="group-chip-name">{{ segment.group.name }}</span>
+            <span v-else class="group-chip-dot" />
+            <span v-if="segment.group.collapsed" class="group-chip-count">{{ segment.items.length }}</span>
+          </button>
+
+          <div
+            v-for="item in (segment.group.collapsed ? [] : segment.items)"
+            :key="item.tab.slug"
+            class="tab tab-paper tab-in-group"
+            :class="{
+              active: item.tab.slug === reader.activeSlug && !canvasStore.isShown,
+              'tab-dragging': dragFrom === item.index,
+              'drop-before': dropAt === item.index && dragFrom !== item.index,
+              'drop-after': dropAt === item.index + 1 && dragFrom !== item.index,
+            }"
+            :data-drop-index="item.index"
+            :title="titleInitialCaps(item.tab.title)"
+            @click="switchTab(item.tab.slug)"
+            @mousedown="onTabMouseDown($event, item.index)"
+            @contextmenu.prevent.stop="openTabMenu($event, item.tab.slug)"
+          >
+            <Icon icon="fluent:document-24-regular" class="tab-icon" width="13" height="13" />
+            <span class="tab-title">{{ titleInitialCaps(item.tab.title) }}</span>
+            <button class="tab-close" @click.stop="reader.closeTab(item.tab.slug)">
+              <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
+            </button>
+          </div>
+
+          <!-- A collapsed group still shows which of its tabs is the live one -->
+          <span v-if="segment.group.collapsed && groupHasActive(segment.group)" class="group-active-dot" />
+        </div>
+      </template>
     </div>
 
     <!-- Right area — draggable filler + right-sidebar toggle -->
@@ -324,6 +507,86 @@ async function closeWindow() {
         </button>
       </div>
     </div>
+
+    <!-- ── Tab context menu ──────────────────────────────────────────────── -->
+    <Teleport to="body">
+      <div
+        v-if="tabMenu && menuTab"
+        class="tabbar-menu"
+        :style="{ left: `${tabMenu.x}px`, top: `${tabMenu.y}px` }"
+      >
+        <button class="tabbar-menu-item" @click="groupTab(menuTab.slug)">
+          <Icon icon="fluent:tab-group-24-regular" width="14" height="14" />
+          添加到新分组
+        </button>
+        <template v-if="otherGroups.length">
+          <div class="tabbar-menu-label">添加到已有分组</div>
+          <button
+            v-for="g in otherGroups"
+            :key="g.id"
+            class="tabbar-menu-item"
+            @click="moveTabToGroup(menuTab.slug, g.id)"
+          >
+            <span class="menu-color-dot" :class="`group-${g.color}`" />
+            {{ g.name || '未命名分组' }}
+          </button>
+        </template>
+        <button v-if="menuTab.groupId" class="tabbar-menu-item" @click="moveTabToGroup(menuTab.slug, null)">
+          <Icon icon="fluent:arrow-exit-20-regular" width="14" height="14" />
+          从分组中移出
+        </button>
+        <div class="tabbar-menu-sep" />
+        <button class="tabbar-menu-item" @click="reader.closeTab(menuTab.slug); closeMenus()">
+          <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
+          关闭标签页
+        </button>
+      </div>
+
+      <!-- ── Group context menu ─────────────────────────────────────────── -->
+      <div
+        v-if="groupMenu && menuGroup"
+        class="tabbar-menu"
+        :style="{ left: `${groupMenu.x}px`, top: `${groupMenu.y}px` }"
+      >
+        <input
+          ref="groupNameInput"
+          class="group-name-input"
+          :value="menuGroup.name"
+          placeholder="为分组命名"
+          maxlength="40"
+          @input="reader.renameTabGroup(menuGroup.id, ($event.target as HTMLInputElement).value)"
+          @keydown.enter="closeMenus()"
+          @keydown.escape="closeMenus()"
+        />
+        <div class="group-color-row">
+          <button
+            v-for="c in TAB_GROUP_COLORS"
+            :key="c"
+            class="group-color-swatch"
+            :class="[`group-${c}`, { selected: menuGroup.color === c }]"
+            :title="c"
+            @click="applyGroupColor(c)"
+          />
+        </div>
+        <div class="tabbar-menu-sep" />
+        <button class="tabbar-menu-item" @click="reader.toggleTabGroupCollapsed(menuGroup.id); closeMenus()">
+          <Icon
+            :icon="menuGroup.collapsed ? 'fluent:chevron-right-24-regular' : 'fluent:chevron-down-24-regular'"
+            width="14"
+            height="14"
+          />
+          {{ menuGroup.collapsed ? '展开分组' : '折叠分组' }}
+        </button>
+        <button class="tabbar-menu-item" @click="reader.ungroupTabs(menuGroup.id); closeMenus()">
+          <Icon icon="fluent:group-dismiss-24-regular" width="14" height="14" />
+          取消分组
+        </button>
+        <button class="tabbar-menu-item danger" @click="reader.closeTabGroup(menuGroup.id); closeMenus()">
+          <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
+          关闭分组
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -443,7 +706,11 @@ async function closeWindow() {
   max-width: 180px;
   flex-shrink: 0;
   cursor: pointer;
-  color: var(--text-tertiary);
+  /* Inactive tabs used to be --text-tertiary on no fill, which reads as
+     "disabled" rather than "not focused". Chrome keeps inactive tab labels
+     nearly as dark as the active one and separates them with a soft fill. */
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-primary) 4%, transparent);
   font-size: 12px;
   border-radius: 7px 7px 0 0;
   border: 1px solid transparent;
@@ -451,15 +718,19 @@ async function closeWindow() {
   transition: background 0.1s, color 0.1s;
   position: relative;
 }
-.tab:hover { background: var(--bg-hover); color: var(--text-primary); }
+.tab:hover {
+  background: color-mix(in srgb, var(--text-primary) 9%, transparent);
+  color: var(--text-primary);
+}
 
 .tab.active {
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-weight: 500;
+  font-weight: 600;
   border-color: var(--border-subtle);
   margin-bottom: -1px;
   padding-bottom: 1px;
+  box-shadow: 0 -1px 5px rgba(0, 0, 0, 0.07);
 }
 
 .tab-home {
@@ -469,9 +740,168 @@ async function closeWindow() {
 
 .tab-icon {
   flex-shrink: 0;
-  opacity: 0.55;
+  opacity: 0.75;
 }
 .tab.active .tab-icon { opacity: 1; color: var(--accent); }
+
+/* ── Tab groups ─────────────────────────────────────────────────────────────
+   Chrome's palette. Hues are mid-tone so they hold up on light and dark
+   backgrounds, and every derived shade is a color-mix against the current
+   theme's tokens rather than a hard-coded tint — so the group reads correctly
+   under all 18 themes without per-theme overrides. */
+.group-grey   { --group-color: #7a8290; }
+.group-blue   { --group-color: #2b7de9; }
+.group-red    { --group-color: #e0402f; }
+.group-yellow { --group-color: #e0a112; }
+.group-green  { --group-color: #1ea44b; }
+.group-pink   { --group-color: #dc2b83; }
+.group-purple { --group-color: #9a45e8; }
+.group-cyan   { --group-color: #0e9aa7; }
+.group-orange { --group-color: #f2802e; }
+
+.tab-group {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 3px;
+  margin: 0 1px;
+  border-radius: 9px 9px 0 0;
+  background: color-mix(in srgb, var(--group-color) 11%, transparent);
+  flex-shrink: 0;
+  position: relative;
+}
+.tab-group.group-collapsed { padding: 0 2px; }
+
+.group-chip {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: 5px;
+  height: 21px;
+  max-width: 140px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  font-weight: 650;
+  cursor: pointer;
+  flex-shrink: 0;
+  color: color-mix(in srgb, var(--group-color) 68%, var(--text-primary));
+  background: color-mix(in srgb, var(--group-color) 22%, transparent);
+  transition: background 0.1s;
+}
+.group-chip:hover { background: color-mix(in srgb, var(--group-color) 38%, transparent); }
+.group-chip.chip-dragging { opacity: 0.4; }
+.group-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A nameless group is just its colour dot, so the chip shrinks to fit it. */
+.group-chip:has(.group-chip-dot) { padding: 0 5px; }
+.group-chip-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--group-color);
+}
+.group-chip-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  padding: 0 4px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--group-color) 34%, transparent);
+}
+/* Marks a collapsed group whose hidden tab is the one on screen. */
+.group-active-dot {
+  align-self: center;
+  width: 5px;
+  height: 5px;
+  margin-left: 1px;
+  border-radius: 50%;
+  background: var(--group-color);
+}
+
+/* Inside a sleeve the tint comes from the group, so members drop their own
+   fill and pick up the group colour on hover and when active. */
+.tab-in-group { background: transparent; }
+.tab-in-group:hover { background: color-mix(in srgb, var(--group-color) 20%, transparent); }
+.tab-group .tab.active .tab-icon { color: var(--group-color); }
+
+/* ── Tab / group context menus ─────────────────────────────────────────────── */
+.tabbar-menu {
+  position: fixed;
+  z-index: 3000;
+  min-width: 210px;
+  padding: 5px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  font-size: 12.5px;
+  user-select: none;
+  -webkit-app-region: no-drag;
+}
+.tabbar-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 9px;
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.08s, color 0.08s;
+}
+.tabbar-menu-item:hover { background: var(--accent); color: #fff; }
+.tabbar-menu-item.danger { color: #e53e3e; }
+.tabbar-menu-item.danger:hover { background: #e53e3e; color: #fff; }
+.tabbar-menu-label {
+  padding: 7px 9px 3px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.tabbar-menu-sep {
+  height: 1px;
+  background: var(--border-subtle);
+  margin: 4px 0;
+}
+.menu-color-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--group-color);
+  flex-shrink: 0;
+}
+.group-name-input {
+  width: 100%;
+  height: 28px;
+  padding: 0 9px;
+  margin-bottom: 7px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  user-select: text;
+}
+.group-name-input:focus { border-color: var(--accent); }
+.group-color-row {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 5px;
+  padding: 1px 2px 3px;
+}
+.group-color-swatch {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--group-color);
+  cursor: pointer;
+}
+.group-color-swatch.selected {
+  box-shadow: 0 0 0 2px var(--bg-primary), 0 0 0 3.5px var(--group-color);
+}
 
 .snippet-tab-emoji {
   flex-shrink: 0;

@@ -913,9 +913,9 @@ watch(askAiText, (val) => {
   if (!rightSidebarVisible.value) rightSidebarVisible.value = true
 })
 
-// Auto-save tabs whenever they change (length, order, or active)
+// Auto-save tabs whenever they change (length, order, active, or grouping)
 watch(
-  [() => [...readerStore.tabs], () => readerStore.activeSlug],
+  [() => [...readerStore.tabs], () => readerStore.activeSlug, () => [...readerStore.tabGroups]],
   () => {
     if (libraryStore.currentPath) {
       readerStore.saveTabs(libraryStore.currentPath)

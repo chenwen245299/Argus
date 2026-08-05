@@ -12,11 +12,34 @@ export interface Tab {
    *  Tabs persisted before this field existed lack it — MainView falls back
    *  to the library index when routing to a viewer. */
   fileType?: string
+  /** Chrome-style tab group this tab belongs to. Absent = ungrouped. */
+  groupId?: string
+}
+
+/** Chrome's tab-group palette. */
+export const TAB_GROUP_COLORS = [
+  'grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange',
+] as const
+export type TabGroupColor = (typeof TAB_GROUP_COLORS)[number]
+
+export interface TabGroup {
+  id: string
+  /** Empty name renders as a bare colour dot, like Chrome. */
+  name: string
+  color: TabGroupColor
+  collapsed: boolean
+}
+
+interface PersistedTabs {
+  tabs: Tab[]
+  activeSlug: string | null
+  groups: TabGroup[]
 }
 
 export const useReaderStore = defineStore('reader', () => {
   const tabs      = ref<Tab[]>([])
   const activeSlug = ref<string | null>(null)
+  const tabGroups = ref<TabGroup[]>([])
 
   // Backward-compat computed props (PdfViewer uses these)
   const openSlug  = computed(() => activeSlug.value)
@@ -60,6 +83,130 @@ export const useReaderStore = defineStore('reader', () => {
     }
   }
 
+  // ── Tab groups ──────────────────────────────────────────────────────────────
+  // Two invariants, both borrowed from Chrome, are maintained by
+  // `normalizeGroups()` after every mutation:
+  //   1. a group's members are contiguous in `tabs`, anchored where its first
+  //      member sits — so a group can be drawn as one continuous sleeve;
+  //   2. a group with no members ceases to exist.
+
+  function groupById(id: string | null | undefined): TabGroup | null {
+    return id ? tabGroups.value.find(g => g.id === id) ?? null : null
+  }
+
+  function tabsInGroup(id: string): Tab[] {
+    return tabs.value.filter(t => t.groupId === id)
+  }
+
+  function normalizeGroups() {
+    const known = new Set(tabGroups.value.map(g => g.id))
+    // A groupId with no group behind it (stale persisted state) means ungrouped.
+    for (const tab of tabs.value) {
+      if (tab.groupId && !known.has(tab.groupId)) delete tab.groupId
+    }
+    const emitted = new Set<string>()
+    const ordered: Tab[] = []
+    for (const tab of tabs.value) {
+      if (!tab.groupId) { ordered.push(tab); continue }
+      if (emitted.has(tab.groupId)) continue  // already pulled in with its group
+      emitted.add(tab.groupId)
+      ordered.push(...tabs.value.filter(t => t.groupId === tab.groupId))
+    }
+    if (ordered.some((t, i) => t !== tabs.value[i])) tabs.value = ordered
+    if (tabGroups.value.some(g => !emitted.has(g.id))) {
+      tabGroups.value = tabGroups.value.filter(g => emitted.has(g.id))
+    }
+  }
+
+  /** Cycle the palette so consecutive new groups don't land on the same colour. */
+  function nextGroupColor(): TabGroupColor {
+    const used = new Set(tabGroups.value.map(g => g.color))
+    return TAB_GROUP_COLORS.find(c => !used.has(c)) ?? TAB_GROUP_COLORS[tabGroups.value.length % TAB_GROUP_COLORS.length]
+  }
+
+  function createTabGroup(slugs: string[], name = '', color?: TabGroupColor): string | null {
+    const members = slugs.filter(s => tabs.value.some(t => t.slug === s))
+    if (!members.length) return null
+    const group: TabGroup = {
+      id: `tg_${crypto.randomUUID()}`,
+      name,
+      color: color ?? nextGroupColor(),
+      collapsed: false,
+    }
+    tabGroups.value = [...tabGroups.value, group]
+    for (const tab of tabs.value) {
+      if (members.includes(tab.slug)) tab.groupId = group.id
+    }
+    normalizeGroups()
+    return group.id
+  }
+
+  function setTabGroup(slug: string, groupId: string | null) {
+    const tab = tabs.value.find(t => t.slug === slug)
+    if (!tab) return
+    if (groupId && !groupById(groupId)) return
+    if (groupId) {
+      tab.groupId = groupId
+      // Joining a collapsed group would make the tab vanish; open it instead.
+      const group = groupById(groupId)
+      if (group?.collapsed && activeSlug.value === slug) group.collapsed = false
+    } else {
+      delete tab.groupId
+    }
+    normalizeGroups()
+  }
+
+  function renameTabGroup(id: string, name: string) {
+    const group = groupById(id)
+    if (group) group.name = name
+  }
+
+  function setTabGroupColor(id: string, color: TabGroupColor) {
+    const group = groupById(id)
+    if (group) group.color = color
+  }
+
+  function setTabGroupCollapsed(id: string, collapsed: boolean) {
+    const group = groupById(id)
+    if (!group || group.collapsed === collapsed) return
+    group.collapsed = collapsed
+    // Collapsing the group holding the active tab would hide what's on screen,
+    // so hand activation to the nearest tab outside it (Chrome does the same).
+    if (collapsed && activeSlug.value) {
+      const active = tabs.value.find(t => t.slug === activeSlug.value)
+      if (active?.groupId === id) {
+        const idx = tabs.value.indexOf(active)
+        const outside = [...tabs.value.slice(idx + 1), ...tabs.value.slice(0, idx).reverse()]
+          .find(t => t.groupId !== id)
+        activeSlug.value = outside?.slug ?? null
+      }
+    }
+  }
+
+  function toggleTabGroupCollapsed(id: string) {
+    setTabGroupCollapsed(id, !groupById(id)?.collapsed)
+  }
+
+  /** Dissolve the group, keeping its tabs open and in place. */
+  function ungroupTabs(id: string) {
+    for (const tab of tabs.value) {
+      if (tab.groupId === id) delete tab.groupId
+    }
+    tabGroups.value = tabGroups.value.filter(g => g.id !== id)
+    normalizeGroups()
+  }
+
+  function closeTabGroup(id: string) {
+    for (const tab of tabsInGroup(id)) closeTab(tab.slug)
+    normalizeGroups()
+  }
+
+  /** A tab becoming active must be visible, so open its group if collapsed. */
+  function revealTab(slug: string) {
+    const group = groupById(tabs.value.find(t => t.slug === slug)?.groupId)
+    if (group?.collapsed) group.collapsed = false
+  }
+
   function openPaper(slug: string, title: string, fileType?: string) {
     recordPaperAccess(slug)
     const existing = tabs.value.find(t => t.slug === slug)
@@ -70,6 +217,7 @@ export const useReaderStore = defineStore('reader', () => {
       if (fileType && !existing.fileType) existing.fileType = fileType
     }
     activeSlug.value = slug
+    revealTab(slug)
   }
 
   function replacePaperSlug(oldSlug: string, newSlug: string, title?: string) {
@@ -89,6 +237,7 @@ export const useReaderStore = defineStore('reader', () => {
     // Note: switching to an already-open tab is NOT a new "open" — recency is
     // recorded only in openPaper, so "最近阅读" stays ordered by open order.
     activeSlug.value = slug
+    revealTab(slug)
   }
 
   function closeTab(slug: string) {
@@ -98,7 +247,10 @@ export const useReaderStore = defineStore('reader', () => {
     if (activeSlug.value === slug) {
       const next = tabs.value[Math.min(idx, tabs.value.length - 1)]
       activeSlug.value = next?.slug ?? null
+      if (activeSlug.value) revealTab(activeSlug.value)
     }
+    // Closing the last member retires the group.
+    normalizeGroups()
     // Note: per-slug state is freed when the viewer instance is actually
     // destroyed (see PdfViewer's discardTabState on unmount), NOT here — the
     // KeepAlive'd instance may linger in cache and be reused if reopened.
@@ -118,7 +270,34 @@ export const useReaderStore = defineStore('reader', () => {
     const [item] = arr.splice(fromIdx, 1)
     const adjusted = fromIdx < insertBefore ? insertBefore - 1 : insertBefore
     arr.splice(adjusted, 0, item)
+    // Where a tab lands decides its group, as in Chrome: dropped between two
+    // members of the same group it joins them; dropped anywhere else it comes
+    // out — except when nudged around inside the group it already belongs to.
+    const prev = arr[adjusted - 1]
+    const next = arr[adjusted + 1]
+    const between = prev?.groupId && prev.groupId === next?.groupId ? prev.groupId : undefined
+    const stayingHome = item.groupId && (prev?.groupId === item.groupId || next?.groupId === item.groupId)
+      ? item.groupId
+      : undefined
+    const target = between ?? stayingHome
+    if (target) item.groupId = target
+    else delete item.groupId
     tabs.value = arr
+    normalizeGroups()
+  }
+
+  /** Move a whole group (chip + members) so it starts at `insertBefore`. */
+  function reorderTabGroup(groupId: string, insertBefore: number) {
+    const members = tabsInGroup(groupId)
+    if (!members.length) return
+    const rest = tabs.value.filter(t => t.groupId !== groupId)
+    // `insertBefore` indexes the full list; translate it to the list without
+    // the group by discounting the members that sit before it.
+    const removedBefore = tabs.value.slice(0, insertBefore).filter(t => t.groupId === groupId).length
+    const at = Math.max(0, Math.min(rest.length, insertBefore - removedBefore))
+    rest.splice(at, 0, ...members)
+    tabs.value = rest
+    normalizeGroups()
   }
 
   /** Remove any tabs whose slugs are no longer in the library paper list. */
@@ -130,6 +309,7 @@ export const useReaderStore = defineStore('reader', () => {
     if (tabs.value.length !== before && activeSlug.value && !validSlugs.has(activeSlug.value)) {
       activeSlug.value = tabs.value[0]?.slug ?? null
     }
+    normalizeGroups()
   }
 
   function _tabKey(libraryPath: string) {
@@ -141,7 +321,8 @@ export const useReaderStore = defineStore('reader', () => {
       const snapshot = JSON.parse(JSON.stringify({
         tabs: tabs.value,
         activeSlug: activeSlug.value,
-      })) as { tabs: Tab[]; activeSlug: string | null }
+        groups: tabGroups.value,
+      })) as PersistedTabs
       localStorage.setItem(_tabKey(libraryPath), JSON.stringify(snapshot))
       tabSaveChain = tabSaveChain
         .catch(() => undefined)
@@ -153,43 +334,69 @@ export const useReaderStore = defineStore('reader', () => {
     } catch {}
   }
 
+  /** `groups` is absent in state written before tab groups existed. */
+  function normalizePersistedGroups(value: unknown): TabGroup[] {
+    if (!Array.isArray(value)) return []
+    return value
+      .filter((g): g is TabGroup => !!g && typeof g === 'object' && typeof (g as TabGroup).id === 'string')
+      .map(g => ({
+        id: g.id,
+        name: typeof g.name === 'string' ? g.name : '',
+        color: TAB_GROUP_COLORS.includes(g.color) ? g.color : 'grey',
+        collapsed: !!g.collapsed,
+      }))
+  }
+
+  function applyPersisted(state: PersistedTabs) {
+    tabs.value = state.tabs
+    activeSlug.value = state.activeSlug
+    tabGroups.value = state.groups
+    // Drops dangling groupIds and restores contiguity, so hand-edited or
+    // pre-groups state still lands in a consistent shape.
+    normalizeGroups()
+    if (activeSlug.value) revealTab(activeSlug.value)
+  }
+
   async function loadTabs(libraryPath: string) {
-    let legacyState: { tabs: Tab[]; activeSlug: string | null } | null = null
+    let legacyState: PersistedTabs | null = null
     try {
       const raw = localStorage.getItem(_tabKey(libraryPath))
       if (raw) {
-        const state = JSON.parse(raw) as { tabs: Tab[]; activeSlug: string | null }
+        const state = JSON.parse(raw) as Partial<PersistedTabs>
         legacyState = {
           tabs: Array.isArray(state.tabs) ? state.tabs : [],
           activeSlug: typeof state.activeSlug === 'string' ? state.activeSlug : null,
+          groups: normalizePersistedGroups(state.groups),
         }
       }
     } catch {}
 
     try {
       const uiState = await invoke<Record<string, unknown>>('get_library_ui_state', { root: libraryPath })
-      const state = uiState.tabs as { tabs?: unknown; activeSlug?: unknown } | undefined
+      const state = uiState.tabs as Partial<PersistedTabs> | undefined
       if (state && Array.isArray(state.tabs)) {
-        tabs.value = state.tabs as Tab[]
-        activeSlug.value = typeof state.activeSlug === 'string' ? state.activeSlug : null
+        applyPersisted({
+          tabs: state.tabs,
+          activeSlug: typeof state.activeSlug === 'string' ? state.activeSlug : null,
+          groups: normalizePersistedGroups(state.groups),
+        })
         return
       }
       if (legacyState) {
-        tabs.value = legacyState.tabs
-        activeSlug.value = legacyState.activeSlug
+        applyPersisted(legacyState)
         saveTabs(libraryPath)
         return
       }
     } catch (e) {
       console.error('[reader] load ui_state tabs failed:', e)
       if (legacyState) {
-        tabs.value = legacyState.tabs
-        activeSlug.value = legacyState.activeSlug
+        applyPersisted(legacyState)
         return
       }
     }
     tabs.value = []
     activeSlug.value = null
+    tabGroups.value = []
   }
 
   function setPdfDoc(doc: PDFDocumentProxy, slug?: string) {
@@ -288,6 +495,18 @@ export const useReaderStore = defineStore('reader', () => {
   return {
     tabs,
     activeSlug,
+    tabGroups,
+    groupById,
+    tabsInGroup,
+    createTabGroup,
+    setTabGroup,
+    renameTabGroup,
+    setTabGroupColor,
+    setTabGroupCollapsed,
+    toggleTabGroupCollapsed,
+    ungroupTabs,
+    closeTabGroup,
+    reorderTabGroup,
     openSlug,
     openTitle,
     pdfDoc,

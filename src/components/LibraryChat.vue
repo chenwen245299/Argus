@@ -2280,13 +2280,15 @@ onUnmounted(() => {
                 </button>
               </div>
             </div>
+            <!-- Never disabled while generating: the next question can be typed
+                 (and pasted into) right away — only sending waits. `sendMessage`
+                 and `canSend` are what actually hold the message back. -->
             <textarea
               ref="textareaEl"
               v-model="input"
               class="chat-input"
-              :placeholder="t('libraryChat.inputPlaceholder')"
+              :placeholder="loading ? t('libraryChat.inputPlaceholderBusy') : t('libraryChat.inputPlaceholder')"
               rows="1"
-              :disabled="loading"
               @keydown="handleKeydown"
               @paste="onPaste"
             />

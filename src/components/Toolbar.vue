@@ -29,6 +29,13 @@ const collectionsStore = useCollectionsStore()
 const ragStore = useRagStore()
 const ai = useAiStore()
 
+/** Jump to the library paper that a rejected import duplicated. */
+function viewDuplicatePaper() {
+  const slug = importStore.lastDuplicate?.existingSlug
+  if (slug) selection.selectPaper(slug)
+  importStore.clearDuplicateNotice()
+}
+
 // ── DeepSeek-style peak/off-peak price indicator ────────────────────────────
 // Peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00; else off-peak.
 const priceClockTs = ref(Date.now())
@@ -987,6 +994,28 @@ onUnmounted(() => {
       <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
     </div>
 
+    <!-- Duplicate stopped an import -->
+    <div
+      v-if="importStore.lastDuplicate"
+      class="import-dup-toast"
+      :title="t('import.duplicateStopped', { title: importStore.lastDuplicate.title })"
+    >
+      <Icon icon="fluent:copy-24-regular" width="14" height="14" />
+      <span class="import-dup-text">
+        {{ t('import.duplicateStopped', { title: importStore.lastDuplicate.title }) }}
+      </span>
+      <button
+        v-if="importStore.lastDuplicate.existingSlug"
+        class="import-dup-view"
+        @click="viewDuplicatePaper"
+      >
+        {{ t('import.duplicateView') }}
+      </button>
+      <button class="import-dup-close" @click="importStore.clearDuplicateNotice()">
+        <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
+      </button>
+    </div>
+
     <!-- DeepSeek peak / off-peak price indicator -->
     <div
       v-if="library.currentPath && hasPeakModel"
@@ -1414,6 +1443,51 @@ onUnmounted(() => {
   white-space: nowrap;
   max-width: 260px;
 }
+
+/* A stopped duplicate is not a failure — amber, not red, and it carries a way
+   to go look at the paper it matched. */
+.import-dup-toast {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 420px;
+  padding: 4px 5px 4px 8px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, #b8860b 12%, var(--bg-primary));
+  border: 1px solid color-mix(in srgb, #b8860b 32%, transparent);
+  color: #a1740a;
+  font-size: var(--font-size-xs);
+  flex-shrink: 0;
+}
+.import-dup-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 300px;
+}
+.import-dup-view {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, #b8860b 20%, transparent);
+  color: inherit;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+.import-dup-view:hover { background: color-mix(in srgb, #b8860b 32%, transparent); }
+.import-dup-close {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  cursor: pointer;
+}
+.import-dup-close:hover { background: color-mix(in srgb, #b8860b 22%, transparent); }
 
 .spinner {
   display: inline-block;

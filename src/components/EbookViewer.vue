@@ -16,7 +16,7 @@ import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import { renderMarkdown } from '../utils/renderMarkdown'
-import { notePopupSize, notePopupStyle, clampNotePopupPos, observeNotePopupResize } from '../utils/notePopup'
+import { notePopupStyle, clampNotePopupPos, observeNotePopupResize, forgetNotePopupSize } from '../utils/notePopup'
 import type { EbookManifest, Highlight } from '../types'
 
 // One instance per open ebook tab; `slug` never changes for an instance.
@@ -183,18 +183,22 @@ const hlNoteHtml = computed(() => renderMarkdown(hlNoteText.value))
 // Position is already clamped at open time; only the size stays reactive here.
 const hlNotePopupStyle = computed(() => {
   const p = hlNotePopup.value
-  return p ? notePopupStyle(p.x, p.y) : {}
+  return p ? notePopupStyle(p.x, p.y, p.hlId) : {}
 })
 
 function openNotePopup(x: number, y: number, hlId: string) {
-  hlNotePopup.value = { ...clampNotePopupPos(x, y), hlId }
+  hlNotePopup.value = { ...clampNotePopupPos(x, y, hlId), hlId }
 }
 
 // Track the popup element only while it exists; v-if tears it down between opens.
 let stopNoteResizeObserver: (() => void) | null = null
-watch(notePopupRef, (el) => {
+// Sizes are per-highlight, so the observer is rebound whenever EITHER the
+// element or the highlight changes: clicking straight from one highlight's note
+// to another reuses the same element, and a stale binding would write the new
+// popup's size onto the previous highlight.
+watch([notePopupRef, () => hlNotePopup.value?.hlId], ([el, hlId]) => {
   stopNoteResizeObserver?.()
-  stopNoteResizeObserver = el ? observeNotePopupResize(el) : null
+  stopNoteResizeObserver = el && hlId ? observeNotePopupResize(el, hlId) : null
 })
 onUnmounted(() => stopNoteResizeObserver?.())
 
@@ -1073,6 +1077,7 @@ function addHighlightToSnippetLibrary(hlId: string) {
 }
 function deleteHighlight(id: string) {
   reader.removeHighlight(id)
+  forgetNotePopupSize(id)
   hlColorPopup.value = null
   hlNotePopup.value = null
 }

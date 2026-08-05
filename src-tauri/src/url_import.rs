@@ -893,6 +893,23 @@ mod openreview {
         out
     }
 
+    /// OpenReview gates its endpoints (forum page, `/pdf`, and both API hosts)
+    /// behind a browser-verification challenge that answers with an HTML page
+    /// instead of the requested content. Recognising it turns a baffling
+    /// "could not find title" into something the user can act on.
+    fn is_challenge_page(body: &str) -> bool {
+        body.contains("Verifying your browser")
+            || body.contains("ChallengeRequiredError")
+            || body.contains("/challenge?redirect=")
+    }
+
+    fn challenge_error(id: &str) -> String {
+        format!(
+            "OpenReview 要求浏览器验证，无法自动抓取。请在浏览器中打开 \
+             https://openreview.net/forum?id={id} 下载 PDF，再用「导入 → 本地 PDF」添加。"
+        )
+    }
+
     async fn fetch_meta(client: &reqwest::Client, id: &str) -> Result<Meta, String> {
         let forum_url = format!("https://openreview.net/forum?id={id}");
         let html = client
@@ -903,6 +920,10 @@ mod openreview {
             .text()
             .await
             .map_err(|e| format!("Read page: {e}"))?;
+
+        if is_challenge_page(&html) {
+            return Err(challenge_error(id));
+        }
 
         let title = meta_content(&html, "citation_title")
             .ok_or_else(|| format!("OpenReview: could not find title for '{id}'"))?;
@@ -957,8 +978,25 @@ mod openreview {
             .send()
             .await
             .map_err(|e| format!("Download PDF: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("PDF unavailable: HTTP {}", resp.status()));
+        // The verification gate answers `/pdf?id=…` with an HTML page (HTTP 403)
+        // instead of the file, so an HTML body here means the same thing — but
+        // only say so when the body really is the challenge: a genuinely
+        // restricted PDF fails with 403 too.
+        let status = resp.status();
+        let looks_html = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("text/html"));
+        if !status.is_success() || looks_html {
+            let body = crate::net::fetch_text_capped(resp, 64 * 1024)
+                .await
+                .unwrap_or_default();
+            return Err(if is_challenge_page(&body) {
+                challenge_error(&id)
+            } else {
+                format!("PDF unavailable: HTTP {status}")
+            });
         }
         let pdf_bytes = super::read_bytes_capped(resp).await?;
 

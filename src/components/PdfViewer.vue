@@ -13,7 +13,7 @@ import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import { computeSections } from '../utils/sections'
 import { renderMarkdown } from '../utils/renderMarkdown'
-import { notePopupSize, notePopupStyle, clampNotePopupPos, observeNotePopupResize } from '../utils/notePopup'
+import { notePopupStyle, clampNotePopupPos, observeNotePopupResize, forgetNotePopupSize } from '../utils/notePopup'
 import { fluentIconFor, fluentReady } from '../utils/fluentEmoji'
 import type { Highlight, Rect, PaperSections } from '../types'
 // The legacy build includes its own Promise.withResolvers polyfill, so the worker
@@ -289,18 +289,22 @@ const hlNoteHtml = computed(() => renderMarkdown(hlNoteText.value))
 // Position is already clamped at open time; only the size stays reactive here.
 const hlNotePopupStyle = computed(() => {
   const p = hlNotePopup.value
-  return p ? notePopupStyle(p.x, p.y) : {}
+  return p ? notePopupStyle(p.x, p.y, p.hlId) : {}
 })
 
 function openNotePopup(x: number, y: number, hlId: string) {
-  hlNotePopup.value = { ...clampNotePopupPos(x, y), hlId }
+  hlNotePopup.value = { ...clampNotePopupPos(x, y, hlId), hlId }
 }
 
 // Track the popup element only while it exists; v-if tears it down between opens.
 let stopNoteResizeObserver: (() => void) | null = null
-watch(notePopupRef, (el) => {
+// Sizes are per-highlight, so the observer is rebound whenever EITHER the
+// element or the highlight changes: clicking straight from one highlight's note
+// to another reuses the same element, and a stale binding would write the new
+// popup's size onto the previous highlight.
+watch([notePopupRef, () => hlNotePopup.value?.hlId], ([el, hlId]) => {
   stopNoteResizeObserver?.()
-  stopNoteResizeObserver = el ? observeNotePopupResize(el) : null
+  stopNoteResizeObserver = el && hlId ? observeNotePopupResize(el, hlId) : null
 })
 onUnmounted(() => stopNoteResizeObserver?.())
 
@@ -319,6 +323,105 @@ let progressDebounce: ReturnType<typeof setTimeout> | null = null
 // IntersectionObserver for lazy rendering
 let observer: IntersectionObserver | null = null
 
+// ── In-document jump history ──────────────────────────────────────────────────
+// Following a cross-reference ("see Wu et al., 2021") throws away where you were
+// reading, which is the whole reason you followed it. So every link jump records
+// the spot it left, and ⌘[ / ⌘] (plus the mouse's side buttons) walk that history
+// exactly like a browser's back/forward: back pushes the current spot onto the
+// forward stack, and a fresh jump discards the forward stack.
+
+interface JumpPos {
+  scrollTop: number
+  scrollLeft: number
+  /** Zoom at capture time — the position is rescaled if the user zoomed since. */
+  scale: number
+}
+
+const JUMP_HISTORY_LIMIT = 50
+const jumpBack = ref<JumpPos[]>([])
+const jumpForward = ref<JumpPos[]>([])
+
+function currentJumpPos(): JumpPos | null {
+  const el = containerRef.value
+  if (!el) return null
+  return { scrollTop: el.scrollTop, scrollLeft: el.scrollLeft, scale: scale.value }
+}
+
+function restoreJumpPos(pos: JumpPos) {
+  const el = containerRef.value
+  if (!el) return
+  // Page wrappers keep their box even when not rendered, so scrollTop stays
+  // meaningful; only zoom changes it, and that's a plain ratio.
+  const ratio = scale.value / (pos.scale || scale.value)
+  el.scrollTop = pos.scrollTop * ratio
+  el.scrollLeft = pos.scrollLeft * ratio
+}
+
+/** Records the spot a link is leaving. Called right as the jump commits. */
+function pushJumpOrigin(pos: JumpPos) {
+  jumpBack.value.push(pos)
+  if (jumpBack.value.length > JUMP_HISTORY_LIMIT) jumpBack.value.shift()
+  jumpForward.value = []
+  showJumpHint()
+}
+
+function jumpHistoryBack() {
+  const target = jumpBack.value.pop()
+  if (!target) return
+  const here = currentJumpPos()
+  if (here) jumpForward.value.push(here)
+  restoreJumpPos(target)
+}
+
+function jumpHistoryForward() {
+  const target = jumpForward.value.pop()
+  if (!target) return
+  const here = currentJumpPos()
+  if (here) jumpBack.value.push(here)
+  restoreJumpPos(target)
+}
+
+// ── Jump hint toast ───────────────────────────────────────────────────────────
+const JUMP_HINT_DISMISSED_KEY = 'argus:pdf-jump-hint-dismissed'
+const jumpHintVisible = ref(false)
+let jumpHintTimer: ReturnType<typeof setTimeout> | null = null
+
+const isMacPlatform = navigator.userAgent.toLowerCase().includes('mac')
+const jumpModLabel = computed(() => (isMacPlatform ? '⌘' : 'Ctrl+'))
+
+function jumpHintSuppressed(): boolean {
+  try {
+    return localStorage.getItem(JUMP_HINT_DISMISSED_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function clearJumpHintTimer() {
+  if (jumpHintTimer) { clearTimeout(jumpHintTimer); jumpHintTimer = null }
+}
+
+function showJumpHint() {
+  if (jumpHintSuppressed() || !isActiveTab.value) return
+  jumpHintVisible.value = true
+  clearJumpHintTimer()
+  jumpHintTimer = setTimeout(() => { jumpHintVisible.value = false }, 5000)
+}
+
+function hideJumpHint() {
+  clearJumpHintTimer()
+  jumpHintVisible.value = false
+}
+
+function dismissJumpHintForever() {
+  try {
+    localStorage.setItem(JUMP_HINT_DISMISSED_KEY, '1')
+  } catch {
+    // a non-persistent dismissal is still better than ignoring the click
+  }
+  hideJumpHint()
+}
+
 // PDF.js link/annotation handling.
 //
 // `SimpleLinkService` is a navigation no-op — its `setDocument`/`goToDestination`
@@ -332,6 +435,9 @@ class ArgusLinkService extends PDFLinkService {
   async goToDestination(dest: string | any[]) {
     const doc = pdfDoc.value
     if (!doc) return
+    // Captured before the awaits below — none of them move the viewport, so
+    // this is still the spot the reader is leaving.
+    const origin = currentJumpPos()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let explicitDest: any[] | null
     try {
@@ -366,6 +472,7 @@ class ArgusLinkService extends PDFLinkService {
     }
 
     await ensurePageRendered(pageIndex)
+    if (origin) pushJumpOrigin(origin)
     scrollToPageIndex(pageIndex, offsetY)
   }
 
@@ -374,7 +481,11 @@ class ArgusLinkService extends PDFLinkService {
     if (!doc) return
     const pageNumber = typeof val === 'number' ? val : parseInt(val, 10)
     if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > doc.numPages) return
-    void ensurePageRendered(pageNumber - 1).then(() => scrollToPageIndex(pageNumber - 1, 0))
+    const origin = currentJumpPos()
+    void ensurePageRendered(pageNumber - 1).then(() => {
+      if (origin) pushJumpOrigin(origin)
+      scrollToPageIndex(pageNumber - 1, 0)
+    })
   }
 
   executeNamedAction(action: string) {
@@ -416,6 +527,7 @@ function addGlobalListeners() {
   installSelectionListeners()
   window.addEventListener('mouseup', onWindowMouseUp)
   window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('mousedown', onMouseNavButton)
   window.addEventListener('argus-snippet-highlight', onSnippetHighlight)
   window.addEventListener('resize', updateScrollThumbs)
 }
@@ -424,8 +536,17 @@ function removeGlobalListeners() {
   teardownSelectionListeners()
   window.removeEventListener('mouseup', onWindowMouseUp)
   window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('mousedown', onMouseNavButton)
   window.removeEventListener('argus-snippet-highlight', onSnippetHighlight)
   window.removeEventListener('resize', updateScrollThumbs)
+}
+
+/** Mouse side buttons: 3 = back, 4 = forward. */
+function onMouseNavButton(e: MouseEvent) {
+  if (e.button !== 3 && e.button !== 4) return
+  e.preventDefault()
+  if (e.button === 3) jumpHistoryBack()
+  else jumpHistoryForward()
 }
 
 onMounted(async () => {
@@ -449,6 +570,7 @@ watch(isActiveTab, (active) => {
   } else {
     if (containerRef.value) _savedScrollTop = containerRef.value.scrollTop
     removeGlobalListeners()
+    hideJumpHint() // don't let it reappear when this tab comes back
     flushReadingState() // persist scroll position before this tab goes to the background
   }
 }, { immediate: true })
@@ -461,6 +583,7 @@ onUnmounted(() => {
   if (progressDebounce) clearTimeout(progressDebounce)
   if (scrollThumbHideTimer) clearTimeout(scrollThumbHideTimer)
   if (searchDebounce) clearTimeout(searchDebounce)
+  clearJumpHintTimer()
   pageTextCache.clear()
   pdfDoc.value?.destroy()
   // This viewer is gone for good (tab closed or evicted from cache) — drop its
@@ -1634,8 +1757,22 @@ const searchCountText = computed(() => {
 })
 
 // ── Keyboard navigation ───────────────────────────────────────────────────────
+function isTypingTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null
+  if (!el?.tagName) return false
+  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable
+}
+
 function onKeyDown(e: KeyboardEvent) {
   const mod = e.metaKey || e.ctrlKey
+  // ⌘[ / ⌘] walk the in-document jump history — but not while typing, where the
+  // same chord means something else (outdent, bracket entry).
+  if (mod && (e.key === '[' || e.key === ']') && !isTypingTarget(e.target)) {
+    e.preventDefault()
+    if (e.key === '[') jumpHistoryBack()
+    else jumpHistoryForward()
+    return
+  }
   if (mod && e.key === 'f') { e.preventDefault(); openSearch(); return }
   if (mod && e.key === 'g' && searchOpen.value) {
     e.preventDefault()
@@ -1840,6 +1977,7 @@ async function translateHighlight(hlId: string) {
 
 function deleteHighlight(id: string) {
   reader.removeHighlight(id)
+  forgetNotePopupSize(id)
   hlColorPopup.value = null
   hlNotePopup.value = null
 }
@@ -2003,6 +2141,29 @@ function triggerInitialRender() {
         }"
         @pointerdown="onThumbPointerDown('h', $event)"
       />
+
+      <!-- Shortcut hint, shown the first times a link jump happens -->
+      <Transition name="jump-hint">
+        <div v-if="jumpHintVisible" class="jump-hint">
+          <Icon icon="fluent:arrow-hook-up-left-24-regular" width="15" height="15" class="jump-hint-icon" />
+          <div class="jump-hint-text">
+            <span class="jump-hint-title">{{ t('pdf.jumpHintTitle') }}</span>
+            <span class="jump-hint-keys">
+              <kbd>{{ jumpModLabel }}[</kbd> {{ t('pdf.jumpHintBack') }}
+              <span class="jump-hint-dot">·</span>
+              <kbd>{{ jumpModLabel }}]</kbd> {{ t('pdf.jumpHintForward') }}
+              <span class="jump-hint-dot">·</span>
+              {{ t('pdf.jumpHintMouse') }}
+            </span>
+          </div>
+          <button class="jump-hint-never" @click="dismissJumpHintForever">
+            {{ t('pdf.jumpHintNever') }}
+          </button>
+          <button class="jump-hint-close" :title="t('pdf.jumpHintClose')" @click="hideJumpHint">
+            <Icon icon="fluent:dismiss-24-regular" width="13" height="13" />
+          </button>
+        </div>
+      </Transition>
     </div>
 
     <!-- Selection popup: click a color to immediately highlight -->
@@ -2337,6 +2498,108 @@ function triggerInitialRender() {
   min-height: 0;
   overflow: hidden;
   background: var(--bg-secondary);
+}
+
+/* ── Jump-history hint ─────────────────────────────────────────────────────── */
+.jump-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(560px, calc(100% - 32px));
+  padding: 9px 10px 9px 14px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--text-primary) 12%, transparent);
+  /* Frosted glass: a translucent pane over the page, not a solid bar. */
+  background: color-mix(in srgb, var(--bg-primary) 72%, transparent);
+  backdrop-filter: blur(18px) saturate(180%);
+  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  box-shadow: var(--shadow-md);
+  font-size: 12px;
+  color: var(--text-primary);
+  user-select: none;
+}
+.jump-hint-icon {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+.jump-hint-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.jump-hint-title {
+  font-weight: 600;
+  white-space: nowrap;
+}
+.jump-hint-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+.jump-hint-keys kbd {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text-primary) 10%, transparent);
+  color: var(--text-primary);
+}
+.jump-hint-dot { color: var(--text-tertiary); }
+.jump-hint-never {
+  flex-shrink: 0;
+  margin-left: 2px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-primary) 7%, transparent);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.jump-hint-never:hover {
+  background: color-mix(in srgb, var(--text-primary) 13%, transparent);
+  color: var(--text-primary);
+}
+.jump-hint-close {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.jump-hint-close:hover {
+  background: color-mix(in srgb, var(--text-primary) 10%, transparent);
+  color: var(--text-primary);
+}
+
+.jump-hint-enter-active,
+.jump-hint-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.jump-hint-enter-from,
+.jump-hint-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(8px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jump-hint-enter-active,
+  .jump-hint-leave-active { transition: none; }
 }
 
 .pdf-container {

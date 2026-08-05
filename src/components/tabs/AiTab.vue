@@ -121,6 +121,19 @@ const unlisteners = new Map<string, UnlistenFn>()
 // Maps answer.id -> backend request_id, so stopAllStreaming can tell the backend
 // to truly cancel the in-flight HTTP request (stop the provider generating/billing).
 const activeRequestIds = new Map<string, string>()
+// Answers that are streaming right now, mapped to the paper + conversation that
+// owns them. Holding the conversation here keeps it alive and reactive after the
+// user switches to another paper, so a generation started on paper A keeps
+// streaming into A's conversation in the background instead of being dropped.
+const streamOwners = new Map<string, { slug: string; conv: Conversation }>()
+// Per-paper view state, snapshotted when leaving a paper and restored when
+// coming back, so switching tabs doesn't drop the user back into a blank chat.
+interface PaperSession {
+  conv: Conversation | null
+  tabs: Record<string, string>
+  input: string
+}
+const sessions = new Map<string, PaperSession>()
 const fulltextReady = ref(false)
 const fulltextChecking = ref(false)
 const abstractAvailable = ref(false)
@@ -295,14 +308,35 @@ const isDeepSeekSelected = computed(() => {
   return !!provider?.base_url.toLowerCase().includes('deepseek')
 })
 
-// Access an answer through Vue's reactive proxy chain (fixes reactivity bug)
+// Access an answer through Vue's reactive proxy chain (fixes reactivity bug).
+// A streaming answer is looked up in its own conversation first, so a background
+// generation still lands in the right place after the user switched papers.
 function findReactiveAnswer(answerId: string): AssistantAnswer | null {
-  if (!activeConversation.value) return null
-  for (const node of activeConversation.value.nodes) {
-    if (node.role === 'assistantGroup') {
-      const ans = node.answers.find(a => a.id === answerId)
-      if (ans) return ans
+  const owner = streamOwners.get(answerId)?.conv
+  const scopes = [owner, activeConversation.value].filter((c): c is Conversation => !!c)
+  for (const conv of scopes) {
+    for (const node of conv.nodes) {
+      if (node.role === 'assistantGroup') {
+        const ans = node.answers.find(a => a.id === answerId)
+        if (ans) return ans
+      }
     }
+  }
+  return null
+}
+
+// Whether an answer belongs to the conversation currently on screen. Background
+// answers must not scroll (or otherwise disturb) the paper the user is reading.
+function isAnswerVisible(answerId: string): boolean {
+  const conv = activeConversation.value
+  if (!conv) return false
+  return conv.nodes.some(n => n.role === 'assistantGroup' && n.answers.some(a => a.id === answerId))
+}
+
+// The conversation object behind a still-streaming conversation id, if any.
+function liveConversationById(id: string): Conversation | null {
+  for (const { conv } of streamOwners.values()) {
+    if (conv.id === id) return conv
   }
   return null
 }
@@ -444,16 +478,63 @@ async function importLegacyHistory(slug: string) {
 }
 
 async function loadConversations(slug: string) {
+  // A background generation for this paper may still be flushing to disk; read
+  // after it lands so the history list isn't one answer behind.
+  await (backgroundSaves.get(slug) ?? Promise.resolve()).catch(() => {})
+  let list: Conversation[] = []
   try {
-    conversations.value = normalizeConversations(
-      await invoke<unknown>('get_paper_ai_conversations', { slug }),
-      slug
-    )
+    list = normalizeConversations(await invoke<unknown>('get_paper_ai_conversations', { slug }), slug)
   } catch {
-    conversations.value = []
+    list = []
   }
+  // The user may have switched papers again while this was loading.
+  if (props.slug !== slug) return
+  conversations.value = list
   await importLegacyHistory(slug)
-  startNewConversation(false)
+  if (props.slug !== slug) return
+  restoreSession(slug)
+}
+
+// Papers whose view state is kept in memory. Old entries are dropped, but never
+// one whose answer is still generating: that object is the live target.
+const MAX_CACHED_SESSIONS = 30
+
+function hasLiveStreamFor(slug: string): boolean {
+  for (const owner of streamOwners.values()) {
+    if (owner.slug === slug) return true
+  }
+  return false
+}
+
+function rememberSession(slug: string) {
+  // Re-insert so the Map's iteration order stays least-recently-used first.
+  sessions.delete(slug)
+  sessions.set(slug, {
+    conv: activeConversation.value,
+    tabs: { ...activeAnswerTabs.value },
+    input: input.value,
+  })
+  while (sessions.size > MAX_CACHED_SESSIONS) {
+    const evictable = [...sessions.keys()].find(k => !hasLiveStreamFor(k))
+    if (!evictable) break
+    sessions.delete(evictable)
+  }
+}
+
+// Bring back the conversation the user was last looking at for this paper —
+// including one that is still generating — instead of opening a blank chat.
+function restoreSession(slug: string) {
+  const session = sessions.get(slug)
+  sessions.delete(slug)
+  if (!session?.conv) {
+    startNewConversation(false)
+    return
+  }
+  activeConversation.value = session.conv
+  activeAnswerTabs.value = session.tabs
+  input.value = session.input
+  showHistory.value = false
+  nextTick(() => scrollToBottom(true))
 }
 
 function applyFulltextReady(ready: boolean, resetMode = false) {
@@ -677,7 +758,9 @@ watch(askAiText, (text) => {
 function openConversation(id: string) {
   const conv = conversations.value.find(c => c.id === id)
   if (!conv) return
-  activeConversation.value = cloneConversation(conv)
+  // If this conversation still has a live generation, reopen the streaming
+  // object itself — a snapshot would stop updating.
+  activeConversation.value = liveConversationById(id) ?? cloneConversation(conv)
   // Restore the badge selection this conversation was last used with.
   restoreContextFromConversation(conv)
   activeAnswerTabs.value = {}
@@ -698,23 +781,69 @@ function deleteConversation(id: string, event?: MouseEvent) {
 
 function persistActiveConversation() {
   const conv = activeConversation.value
-  if (!props.slug || !conv || conv.nodes.length === 0) return
+  if (!props.slug || !conv) return
+  persistConversationFor(props.slug, conv)
+}
+
+// Persist `conv` under `slug`, which is not necessarily the paper on screen: a
+// background generation can finish long after the user switched away.
+function persistConversationFor(slug: string, conv: Conversation) {
+  if (conv.nodes.length === 0) return
   conv.updatedAt = nowIso()
   conv.title = isMetadataExtractionConversation(conv)
     ? 'AI 元数据提取'
     : firstUserTitle(conv.nodes) || conv.title || '新对话'
+  if (slug !== props.slug) {
+    queueBackgroundSave(slug, conv)
+    return
+  }
   const idx = conversations.value.findIndex(c => c.id === conv.id)
   if (idx >= 0) conversations.value[idx] = cloneConversation(conv)
   else conversations.value.unshift(cloneConversation(conv))
   conversations.value.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-  saveConversationsToPaper(props.slug).catch(() => {})
-  saveLegacyActiveHistory(conv).catch(() => {})
+  saveConversationsToPaper(slug).catch(() => {})
+  saveLegacyActiveHistory(slug, conv).catch(() => {})
 }
 
-async function saveLegacyActiveHistory(conv: Conversation) {
-  if (!props.slug) return
+// Saving for a paper this view doesn't have loaded is a read-modify-write on its
+// conversation file, so writes are chained per paper — two models finishing at
+// almost the same time would otherwise clobber each other.
+const backgroundSaves = new Map<string, Promise<void>>()
+
+function queueBackgroundSave(slug: string, conv: Conversation) {
+  // Snapshot now: the live conversation keeps mutating while the write awaits.
+  const snapshot = cloneConversation(conv)
+  const prev = backgroundSaves.get(slug) ?? Promise.resolve()
+  const next: Promise<void> = prev
+    .catch(() => {})
+    .then(() => saveConversationForOtherPaper(slug, snapshot))
+    .catch(() => {})
+    .finally(() => {
+      if (backgroundSaves.get(slug) === next) backgroundSaves.delete(slug)
+    })
+  backgroundSaves.set(slug, next)
+}
+
+async function saveConversationForOtherPaper(slug: string, snapshot: Conversation) {
+  let list: Conversation[] = []
+  try {
+    list = normalizeConversations(await invoke<unknown>('get_paper_ai_conversations', { slug }), slug)
+  } catch {
+    list = []
+  }
+  const idx = list.findIndex(c => c.id === snapshot.id)
+  if (idx >= 0) list[idx] = snapshot
+  else list.unshift(snapshot)
+  const persisted = list
+    .filter(c => c.nodes.length > 0)
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+  await invoke('save_paper_ai_conversations', { slug, conversations: persisted })
+  await invoke('save_chat_history', { slug, messages: flattenConversation(snapshot) })
+}
+
+async function saveLegacyActiveHistory(slug: string, conv: Conversation) {
   const messages = flattenConversation(conv)
-  await invoke('save_chat_history', { slug: props.slug, messages })
+  await invoke('save_chat_history', { slug, messages })
 }
 
 // Persist after an in-place edit to the active conversation's nodes. If the
@@ -985,9 +1114,14 @@ function flattenConversation(conv: Conversation): ChatMessage[] {
 
 async function sendMessage() {
   if (!canSend.value || !props.slug) return
+  // Pin the paper up front: the user can switch tabs while this turn is being
+  // set up, and the answer must still belong to the paper they asked about.
+  const slug = props.slug
   const text = input.value.trim()
-  const conv = activeConversation.value ?? createBlankConversation(props.slug)
-  activeConversation.value = conv
+  activeConversation.value = activeConversation.value ?? createBlankConversation(slug)
+  // Read it back so `conv` is the reactive proxy, not the raw object: streaming
+  // mutations (possibly from the background) must be tracked by Vue.
+  const conv = activeConversation.value
   const contextPlan = contextPlanForConversation()
 
   const userNode: ChatNode = {
@@ -1009,13 +1143,13 @@ async function sendMessage() {
   conv.title = firstUserTitle(conv.nodes) || conv.title
   input.value = ''
   attachments.value = []
-  persistActiveConversation()
+  persistConversationFor(slug, conv)
   await nextTick()
   resizeTextarea()
   scrollToBottom(true)
 
   const history = buildHistoryUntil(conv, group.id)
-  await Promise.all(group.answers.map(answer => streamAnswer(conv, answer, history)))
+  await Promise.all(group.answers.map(answer => streamAnswer(slug, conv, answer, history)))
 }
 
 function modelToAnswer(
@@ -1041,6 +1175,8 @@ function modelToAnswer(
 
 async function regenerate(group: ChatNode, answer: AssistantAnswer) {
   if (group.role !== 'assistantGroup' || !activeConversation.value || !props.slug || answer.streaming) return
+  const slug = props.slug
+  const conv = activeConversation.value
   const ra = findReactiveAnswer(answer.id)
   if (ra) {
     ra.content = ''
@@ -1054,9 +1190,9 @@ async function regenerate(group: ChatNode, answer: AssistantAnswer) {
     ra.costUsd = undefined
     ra.createdAt = nowIso()
   }
-  persistActiveConversation()
-  const history = buildHistoryUntil(activeConversation.value, group.id)
-  await streamAnswer(activeConversation.value, answer, history)
+  persistConversationFor(slug, conv)
+  const history = buildHistoryUntil(conv, group.id)
+  await streamAnswer(slug, conv, answer, history)
 }
 
 type UserNode = Extract<ChatNode, { role: 'user' }>
@@ -1075,6 +1211,7 @@ function cancelEdit() {
 async function submitEdit(node: UserNode) {
   const conv = activeConversation.value
   if (!conv || !props.slug || hasStreaming.value) return
+  const slug = props.slug
   const newText = editingText.value.trim()
   if (!newText) return
 
@@ -1097,12 +1234,12 @@ async function submitEdit(node: UserNode) {
   if (group.answers[0]) setActiveAnswer(group.id, group.answers[0].id)
   conv.nodes.push(group)
   conv.title = firstUserTitle(conv.nodes) || conv.title
-  persistActiveConversation()
+  persistConversationFor(slug, conv)
   await nextTick()
   scrollToBottom(true)
 
   const history = buildHistoryUntil(conv, group.id)
-  await Promise.all(group.answers.map(answer => streamAnswer(conv, answer, history)))
+  await Promise.all(group.answers.map(answer => streamAnswer(slug, conv, answer, history)))
 }
 
 function onEditKeydown(e: KeyboardEvent, node: UserNode) {
@@ -1110,23 +1247,33 @@ function onEditKeydown(e: KeyboardEvent, node: UserNode) {
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submitEdit(node) }
 }
 
+// Stop only the answers of the conversation on screen — a generation running in
+// the background for another paper is not what this button refers to.
 function stopAllStreaming() {
-  // Tell the backend to truly cancel each in-flight request (closes the HTTP
-  // stream so the provider stops generating / billing).
-  for (const requestId of [...activeRequestIds.values()]) {
-    invoke('cancel_ai_request', { requestId }).catch(() => {})
-  }
-  activeRequestIds.clear()
-  for (const [key, off] of unlisteners.entries()) {
-    off()
-    unlisteners.delete(key)
-    const answerId = key.replace(/-(reasoning|context|usage)$/, '')
+  const conv = activeConversation.value
+  if (!conv) return
+  const answerIds = conv.nodes.flatMap(n =>
+    n.role === 'assistantGroup' ? n.answers.filter(a => a.streaming).map(a => a.id) : []
+  )
+  for (const answerId of answerIds) {
+    // Tell the backend to truly cancel the in-flight request (closes the HTTP
+    // stream so the provider stops generating / billing).
+    const requestId = activeRequestIds.get(answerId)
+    if (requestId) invoke('cancel_ai_request', { requestId }).catch(() => {})
+    activeRequestIds.delete(answerId)
+    for (const suffix of ['', '-reasoning', '-context', '-usage']) {
+      const key = `${answerId}${suffix}`
+      const off = unlisteners.get(key)
+      if (off) off()
+      unlisteners.delete(key)
+    }
     const ra = findReactiveAnswer(answerId)
     if (ra?.streaming) {
       ra.streaming = false
       ra.endedAt = performance.now()
       flushStreamRender(ra)
     }
+    streamOwners.delete(answerId)
   }
   persistActiveConversation()
 }
@@ -1159,7 +1306,8 @@ function applyStreamRender(ans: AssistantAnswer) {
   const startedAt = performance.now()
   ans.displayContent = ans.content
   nextTick(() => streamRenderCost.set(ans.id, performance.now() - startedAt))
-  scrollToBottom()
+  // An answer streaming in the background must not scroll the paper on screen.
+  if (isAnswerVisible(ans.id)) scrollToBottom()
 }
 
 function scheduleStreamRender(ans: AssistantAnswer) {
@@ -1200,8 +1348,19 @@ function clearAllStreamRenderTimers() {
   streamRenderCost.clear()
 }
 
-async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history: ChatMessage[]) {
-  if (!props.slug) return
+// `slug` is the paper the turn was started on — deliberately a parameter, not
+// `props.slug`: the user can switch papers mid-generation and everything below
+// must keep targeting that paper and conversation, not what is on screen when
+// the tokens arrive.
+async function streamAnswer(
+  slug: string,
+  conv: Conversation,
+  answer: AssistantAnswer,
+  history: ChatMessage[],
+) {
+  // Pin the conversation object that owns this answer.
+  const owner = activeConversation.value?.id === conv.id ? activeConversation.value : conv
+  streamOwners.set(answer.id, { slug, conv: owner })
   const eventName = `paper-ai-chat-${answer.id}`
   const reasoningEventName = `${eventName}-reasoning`
   // Backend cancellation id: sent to `chat_with_paper_event`, used by
@@ -1276,7 +1435,7 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
 
   try {
     const finalText = await invoke<string>('chat_with_paper_event', {
-      slug: props.slug,
+      slug,
       messages: history,
       providerId: answer.providerId || null,
       modelId: answer.modelId || null,
@@ -1319,8 +1478,12 @@ async function streamAnswer(conv: Conversation, answer: AssistantAnswer, history
     if (offUsage) offUsage()
     unlisteners.delete(`${answer.id}-usage`)
     activeRequestIds.delete(answer.id)
-    persistActiveConversation()
-    scrollToBottom()
+    const visible = isAnswerVisible(answer.id)
+    streamOwners.delete(answer.id)
+    // Save to the paper this answer was started on, even if another one is now
+    // on screen.
+    persistConversationFor(slug, owner)
+    if (visible) scrollToBottom()
   }
 }
 
@@ -1528,8 +1691,12 @@ function finaliseMetaAnswer(answerId: string) {
   const offUsage = unlisteners.get(`${answerId}-usage`)
   offUsage?.()
   unlisteners.delete(`${answerId}-usage`)
-  persistActiveConversation()
-  scrollToBottom()
+  const visible = isAnswerVisible(answerId)
+  const owner = streamOwners.get(answerId)
+  streamOwners.delete(answerId)
+  if (owner) persistConversationFor(owner.slug, owner.conv)
+  else persistActiveConversation()
+  if (visible) scrollToBottom()
 }
 
 function closeFloating(e: MouseEvent) {
@@ -1544,15 +1711,28 @@ function closeFloating(e: MouseEvent) {
   }
 }
 
+// The paper this view is currently showing, tracked separately from `props.slug`
+// so the watcher knows which paper it is leaving.
+let sessionSlug: string | null = null
+// Increments on every switch; a slow, superseded run must not clear the guard
+// (or write state) belonging to a newer one.
+let slugRunToken = 0
+
 watch(() => props.slug, async (slug) => {
+  // Snapshot the paper being left so switching back restores the same
+  // conversation. Answers still generating keep streaming into that object —
+  // `streamOwners` holds it, so clearing the refs below doesn't interrupt them.
+  if (sessionSlug && sessionSlug !== slug) rememberSession(sessionSlug)
+  sessionSlug = slug
+  const token = ++slugRunToken
   // Guard the whole (re)initialization: every contextMode/usePdf/section change
   // below is programmatic, so it must not be persisted (and thus not broadcast
   // to the other window). The `savedSel` we read here is the source of truth.
   restoringContext = true
   try {
-    for (const off of unlisteners.values()) off()
-    unlisteners.clear()
-    clearAllStreamRenderTimers()
+    // Stream listeners are deliberately NOT torn down here: an answer that is
+    // still generating must keep running in the background. Each stream removes
+    // its own listeners when it finishes.
     showHistory.value = false
     showModelMenu.value = false
     activeConversation.value = null
@@ -1570,13 +1750,15 @@ watch(() => props.slug, async (slug) => {
         refreshAbstractAvailability(slug),
         refreshSummaryAvailability(slug),
       ])
+      if (props.slug !== slug) return
       await loadConversations(slug)
+      if (props.slug !== slug) return
       // Restore the last badge selection for this paper (shared across windows
       // via localStorage) so the sidebar tab and the standalone popup open in sync.
       if (savedSel) applyContextSelection(savedSel)
     }
   } finally {
-    restoringContext = false
+    if (token === slugRunToken) restoringContext = false
   }
 }, { immediate: true })
 
@@ -1656,6 +1838,8 @@ onMounted(async () => {
     }
     conversations.value.unshift(conv)
     activeConversation.value = conv
+    // Pin the extraction to this paper so it survives a paper switch too.
+    streamOwners.set(answer_id, { slug: ev.payload.slug, conv: activeConversation.value! })
 
     // Wire up stream listener using the same event pattern as copilot
     const unlisten = await listen<StreamPayload>(`paper-ai-chat-${answer_id}`, (event) => {

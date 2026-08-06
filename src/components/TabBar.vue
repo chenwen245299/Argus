@@ -441,34 +441,42 @@ async function closeWindow() {
           >
             <span v-if="segment.group.name" class="group-chip-name">{{ segment.group.name }}</span>
             <span v-else class="group-chip-dot" />
-            <span v-if="segment.group.collapsed" class="group-chip-count">{{ segment.items.length }}</span>
+            <Transition name="chipcount">
+              <span v-if="segment.group.collapsed" class="group-chip-count">{{ segment.items.length }}</span>
+            </Transition>
           </button>
 
-          <div
-            v-for="item in (segment.group.collapsed ? [] : segment.items)"
-            :key="item.tab.slug"
-            class="tab tab-paper tab-in-group"
-            :class="{
-              active: item.tab.slug === reader.activeSlug && !canvasStore.isShown,
-              'tab-dragging': dragFrom === item.index,
-              'drop-before': dropAt === item.index && dragFrom !== item.index,
-              'drop-after': dropAt === item.index + 1 && dragFrom !== item.index,
-            }"
-            :data-drop-index="item.index"
-            :title="titleInitialCaps(item.tab.title)"
-            @click="switchTab(item.tab.slug)"
-            @mousedown="onTabMouseDown($event, item.index)"
-            @contextmenu.prevent.stop="openTabMenu($event, item.tab.slug)"
-          >
-            <Icon icon="fluent:document-24-regular" class="tab-icon" width="13" height="13" />
-            <span class="tab-title">{{ titleInitialCaps(item.tab.title) }}</span>
-            <button class="tab-close" @click.stop="reader.closeTab(item.tab.slug)">
-              <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
-            </button>
-          </div>
+          <!-- Members fold in and out rather than blinking: each tab animates its
+               own width, and the tabs to the right slide along with it. -->
+          <TransitionGroup name="tabfold">
+            <div
+              v-for="item in (segment.group.collapsed ? [] : segment.items)"
+              :key="item.tab.slug"
+              class="tab tab-paper tab-in-group"
+              :class="{
+                active: item.tab.slug === reader.activeSlug && !canvasStore.isShown,
+                'tab-dragging': dragFrom === item.index,
+                'drop-before': dropAt === item.index && dragFrom !== item.index,
+                'drop-after': dropAt === item.index + 1 && dragFrom !== item.index,
+              }"
+              :data-drop-index="item.index"
+              :title="titleInitialCaps(item.tab.title)"
+              @click="switchTab(item.tab.slug)"
+              @mousedown="onTabMouseDown($event, item.index)"
+              @contextmenu.prevent.stop="openTabMenu($event, item.tab.slug)"
+            >
+              <Icon icon="fluent:document-24-regular" class="tab-icon" width="13" height="13" />
+              <span class="tab-title">{{ titleInitialCaps(item.tab.title) }}</span>
+              <button class="tab-close" @click.stop="reader.closeTab(item.tab.slug)">
+                <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
+              </button>
+            </div>
+          </TransitionGroup>
 
           <!-- A collapsed group still shows which of its tabs is the live one -->
-          <span v-if="segment.group.collapsed && groupHasActive(segment.group)" class="group-active-dot" />
+          <Transition name="chipcount">
+            <span v-if="segment.group.collapsed && groupHasActive(segment.group)" class="group-active-dot" />
+          </Transition>
         </div>
       </template>
     </div>
@@ -762,14 +770,18 @@ async function closeWindow() {
 .tab-group {
   display: flex;
   align-items: stretch;
-  gap: 2px;
   padding: 0 3px;
   margin: 0 1px;
   border-radius: 9px 9px 0 0;
   background: color-mix(in srgb, var(--group-color) 11%, transparent);
   flex-shrink: 0;
   position: relative;
+  transition: padding 0.22s cubic-bezier(0.32, 0.72, 0, 1);
 }
+/* Spacing is a margin rather than `gap` so it can collapse with the tab it
+   belongs to — a gap would stay at full width until the element is removed,
+   leaving a visible jump at the end of the fold. */
+.tab-group > * + * { margin-left: 2px; }
 .tab-group.group-collapsed { padding: 0 2px; }
 
 .group-chip {
@@ -819,6 +831,57 @@ async function closeWindow() {
   margin-left: 1px;
   border-radius: 50%;
   background: var(--group-color);
+}
+
+/* ── Collapse / expand animation ────────────────────────────────────────────
+   A tab has no explicit width — it sizes to its title, clamped between
+   min-width and max-width — and `width: auto` can't be transitioned. Driving
+   both clamps from 0 instead makes the used width follow them, so the tab
+   folds from and unfolds to its natural size without measuring anything. */
+.tabfold-enter-active,
+.tabfold-leave-active {
+  transition:
+    min-width 0.22s cubic-bezier(0.32, 0.72, 0, 1),
+    max-width 0.22s cubic-bezier(0.32, 0.72, 0, 1),
+    padding 0.22s cubic-bezier(0.32, 0.72, 0, 1),
+    margin-left 0.22s cubic-bezier(0.32, 0.72, 0, 1),
+    opacity 0.16s ease;
+  overflow: hidden;
+  pointer-events: none;
+}
+.tabfold-enter-from,
+.tabfold-leave-to {
+  min-width: 0;
+  max-width: 0;
+  padding-left: 0;
+  padding-right: 0;
+  margin-left: 0;
+  opacity: 0;
+}
+/* A tab leaving is taken out of the flow's control by `position: absolute` in
+   the default TransitionGroup recipe — we deliberately do NOT do that here:
+   the leaving tab must keep occupying (shrinking) space so the tabs after it
+   slide left instead of snapping. */
+
+/* The count badge and the active dot only exist while collapsed, so they fade
+   in on the same beat as the fold. */
+.chipcount-enter-active,
+.chipcount-leave-active {
+  transition: opacity 0.16s ease, max-width 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+  overflow: hidden;
+}
+.chipcount-enter-from,
+.chipcount-leave-to {
+  opacity: 0;
+  max-width: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tab-group,
+  .tabfold-enter-active,
+  .tabfold-leave-active,
+  .chipcount-enter-active,
+  .chipcount-leave-active { transition: none; }
 }
 
 /* Inside a sleeve the tint comes from the group, so members drop their own

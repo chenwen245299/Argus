@@ -119,6 +119,7 @@ pub async fn generate_summary(
         None,
         "summary",
         None,
+        false,
     )
     .await?;
 

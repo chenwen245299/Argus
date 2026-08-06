@@ -169,6 +169,7 @@ pub async fn chat_with_paper(
         false,
         &[],
         None,
+        false,
     )
     .await
 }
@@ -187,6 +188,7 @@ pub async fn chat_with_paper_on_event(
     use_pdf: bool,
     section_titles: &[String],
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    web_search: bool,
 ) -> Result<String, String> {
     let (provider, api_key, model) =
         ai_manager::resolve_provider_model(root, provider_id, model_id)?;
@@ -337,6 +339,7 @@ pub async fn chat_with_paper_on_event(
         reasoning_effort,
         "copilot",
         cancel,
+        web_search,
     )
     .await
 }
@@ -376,6 +379,7 @@ pub async fn chat_with_library(
     reasoning_effort: Option<&str>,
     app: &tauri::AppHandle,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    web_search: bool,
 ) -> Result<String, String> {
     use tauri::Emitter;
 
@@ -384,6 +388,10 @@ pub async fn chat_with_library(
 
     let use_snippets = knowledge_source.map_or(false, |s| s == "snippets");
     let use_selected_papers = knowledge_source.map_or(false, |s| s == "papers");
+    // "none" = plain conversation: no retrieval, no library context, no source
+    // citations demanded of the model. Anything unrecognised still falls through
+    // to the RAG default, so older callers behave as before.
+    let use_no_source = knowledge_source.map_or(false, |s| s == "none");
 
     let system;
 
@@ -426,6 +434,10 @@ pub async fn chat_with_library(
             },
         );
         system = selected_system;
+    } else if use_no_source {
+        // Clear any sources the previous turn left on screen.
+        let _ = app.emit(sources_event_name, Vec::<crate::models::RetrievedChunk>::new());
+        system = build_plain_system_prompt();
     } else if use_snippets {
         let query_text = messages
             .iter()
@@ -537,6 +549,7 @@ pub async fn chat_with_library(
         reasoning_effort,
         "library_chat",
         cancel,
+        web_search,
     )
     .await
 }
@@ -868,6 +881,19 @@ fn get_fulltext_context(
     let truncated = total > max_chars;
     let context: String = fulltext.chars().take(max_chars).collect();
     (context, truncated)
+}
+
+/// System prompt for "no knowledge base": a general assistant with none of the
+/// library-specific citation rules, which would otherwise make the model
+/// apologise for having no sources to cite.
+fn build_plain_system_prompt() -> String {
+    String::from(
+        "You are a helpful, knowledgeable assistant.\n\
+         Respond in the same language the user uses (Chinese if asked in Chinese).\n\
+         Answer from your own knowledge. No documents from the user's library are \
+         attached to this conversation, so do not claim to be citing them; if a \
+         question needs a specific paper the user has not provided, say so.",
+    )
 }
 
 fn build_library_system_prompt(chunks: Option<&[RetrievedChunk]>) -> String {

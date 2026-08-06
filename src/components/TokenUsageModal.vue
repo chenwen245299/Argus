@@ -3,7 +3,8 @@ import { ref, computed, onMounted } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
-import type { AiSettingsInfo, AppSettings } from '../types'
+import type { AiModel, AiSettingsInfo, AppSettings } from '../types'
+import { estimateCostCny, hasConfiguredPrice, DEFAULT_USD_TO_CNY_RATE } from '../utils/modelPricing'
 
 const { t } = useI18n()
 
@@ -37,36 +38,18 @@ const RANGES: { key: Range }[] = [
 ]
 
 const BAR_STACK_HEIGHT = 96
-const DEFAULT_USD_TO_CNY_RATE = 7.2
 
 // ── Price lookup ───────────────────────────────────────────────────────────────
 
+// Keyed `providerId::modelId`; holds the model itself so pricing stays in one
+// place (src/utils/modelPricing.ts) instead of a flattened copy of its fields.
 const priceMap = computed(() => {
-  const map = new Map<string, { inputCny?: number; outputCny?: number; inputUsd?: number; outputUsd?: number; peakPricing?: boolean; peakInputCny?: number; peakOutputCny?: number }>()
+  const map = new Map<string, AiModel>()
   for (const p of (aiSettings.value?.providers ?? [])) {
-    for (const m of p.models) {
-      map.set(`${p.id}::${m.id}`, {
-        inputCny: m.input_price_per_million,
-        outputCny: m.output_price_per_million,
-        inputUsd: m.input_price_usd_per_million,
-        outputUsd: m.output_price_usd_per_million,
-        peakPricing: m.peak_pricing,
-        peakInputCny: m.peak_input_price_per_million,
-        peakOutputCny: m.peak_output_price_per_million,
-      })
-    }
+    for (const m of p.models) map.set(`${p.id}::${m.id}`, m)
   }
   return map
 })
-
-// DeepSeek-style peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00.
-// Everything else is off-peak. Uses UTC so it's correct regardless of the user's
-// local timezone.
-function isPeakHour(date: Date): boolean {
-  const minutes = ((date.getUTCHours() + 8) % 24) * 60 + date.getUTCMinutes()
-  const h = minutes / 60
-  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
-}
 
 const usdToCnyRate = computed(() => {
   const rate = Number(appSettings.value?.usd_to_cny_rate)
@@ -127,32 +110,24 @@ function recordCost(r: UsageRecord) {
   if (r.cost_usd != null && Number.isFinite(r.cost_usd) && r.cost_usd >= 0) {
     return r.cost_usd * usdToCnyRate.value
   }
-  const key = `${r.provider}::${r.model}`
-  const prices = priceMap.value.get(key)
-  if (!prices) return 0
-  let c = 0
-  if (prices.inputUsd != null || prices.outputUsd != null) {
-    if (prices.inputUsd != null)  c += (r.input_tokens  / 1_000_000) * prices.inputUsd * usdToCnyRate.value
-    if (prices.outputUsd != null) c += (r.output_tokens / 1_000_000) * prices.outputUsd * usdToCnyRate.value
-    return c
-  }
-  // Peak/off-peak: price each record by whether its own timestamp falls in the
-  // peak window (falls back to the standard price if the peak price isn't set).
-  const peak = prices.peakPricing && isPeakHour(new Date(r.ts))
-  const inputCny = peak && prices.peakInputCny != null ? prices.peakInputCny : prices.inputCny
-  const outputCny = peak && prices.peakOutputCny != null ? prices.peakOutputCny : prices.outputCny
-  if (inputCny != null)  c += (r.input_tokens  / 1_000_000) * inputCny
-  if (outputCny != null) c += (r.output_tokens / 1_000_000) * outputCny
-  return c
+  // Each record is priced by its OWN timestamp (peak vs off-peak) and its own
+  // measured cache-hit count, so a historical total stays accurate no matter
+  // when it is viewed.
+  return estimateCostCny(
+    priceMap.value.get(`${r.provider}::${r.model}`),
+    {
+      inputTokens: r.input_tokens,
+      outputTokens: r.output_tokens,
+      cacheHitTokens: r.cache_hit_tokens,
+      at: new Date(r.ts),
+    },
+    usdToCnyRate.value,
+  ) ?? 0
 }
 
 function recordHasCostData(r: UsageRecord) {
   if (r.cost_usd != null && Number.isFinite(r.cost_usd) && r.cost_usd >= 0) return true
-  const prices = priceMap.value.get(`${r.provider}::${r.model}`)
-  return !!prices && (
-    prices.inputUsd != null || prices.outputUsd != null ||
-    prices.inputCny != null || prices.outputCny != null
-  )
+  return hasConfiguredPrice(priceMap.value.get(`${r.provider}::${r.model}`))
 }
 
 const hasCostData = computed(() => filteredRecords.value.some(recordHasCostData))

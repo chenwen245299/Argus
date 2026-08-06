@@ -13,6 +13,7 @@ import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
 import { buildChunks } from '../utils/chunker'
 import { sortPapersByRecentAccess } from '../utils/recentPapers'
+import { estimateCostCny } from '../utils/modelPricing'
 import type { ChatContentPart, ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
 
 const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag'] }>()
@@ -117,6 +118,8 @@ interface LibraryAnswerVariant {
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
+  /** Input tokens the provider served from its context cache (measured, not estimated). */
+  cacheHitTokens?: number
   costUsd?: number | null
   startedAt?: number
   endedAt?: number
@@ -142,6 +145,8 @@ interface LibraryUiMessage {
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
+  /** Input tokens the provider served from its context cache (measured, not estimated). */
+  cacheHitTokens?: number
   costUsd?: number | null
   startedAt?: number
   endedAt?: number
@@ -185,6 +190,7 @@ interface StreamUsagePayload {
   input_tokens?: number
   output_tokens?: number
   total_tokens?: number
+  cache_hit_tokens?: number
   cost_usd?: number | null
 }
 
@@ -310,16 +316,30 @@ const modelPickerMsg = computed(() =>
 )
 
 // ── Knowledge source picker ───────────────────────────────────────────────────
-type KnowledgeSource = 'paper-rag' | 'papers' | 'snippets'
+/** 'none' = plain conversation, no library context at all. */
+type KnowledgeSource = 'paper-rag' | 'papers' | 'snippets' | 'none'
 
 function loadKnowledgeSource(): KnowledgeSource {
   const saved = localStorage.getItem(KNOWLEDGE_SOURCE_KEY)
-  if (saved === 'papers' || saved === 'paper-rag' || saved === 'snippets') return saved
+  if (saved === 'papers' || saved === 'paper-rag' || saved === 'snippets' || saved === 'none') return saved
   return 'paper-rag'
 }
 
 const knowledgeSource = ref<KnowledgeSource>(loadKnowledgeSource())
 const sourcePickerOpen = ref(false)
+
+// Server-side web search is a DeepSeek Responses-API feature, so the toggle only
+// shows for a DeepSeek model (mirrors AiTab).
+const useWebSearch = ref(false)
+const webSearchAvailable = computed(() => {
+  const sel = selectedModel.value ?? ai.defaultSelection ?? null
+  if (!sel) return false
+  const provider = ai.settings.providers.find(p => p.id === sel.providerId)
+  return !!provider?.base_url.toLowerCase().includes('deepseek')
+})
+watch(webSearchAvailable, (ok) => { if (!ok) useWebSearch.value = false })
+/** Live server-side search phase while a turn is running. */
+const webSearchPhase = ref<string | null>(null)
 
 // Reasoning / thinking-mode state (mirrors AiTab). DeepSeek exposes high/max;
 // everyone else low/medium/high — the backend maps DeepSeek's levels.
@@ -367,13 +387,14 @@ function setKnowledgeSource(src: KnowledgeSource) {
 
 // "文献库论文" rather than plain "文献库" — next to "文献库RAG" in the picker the
 // shorter name read like the category the other option belonged to.
-const knowledgeSourceLabel = computed(() =>
-  knowledgeSource.value === 'snippets'
-    ? '素材库'
-    : knowledgeSource.value === 'paper-rag'
-      ? '文献库RAG'
-      : '文献库论文'
-)
+const knowledgeSourceLabel = computed(() => {
+  switch (knowledgeSource.value) {
+    case 'snippets': return '素材库'
+    case 'paper-rag': return '文献库RAG'
+    case 'none': return '不使用知识库'
+    default: return '文献库论文'
+  }
+})
 
 function setActiveSelectedPaperSlugs(slugs: string[]) {
   const conv = conversations.value.find(c => c.id === activeConvId.value)
@@ -911,6 +932,7 @@ function activeAnswer(msg: LibraryUiMessage): LibraryAnswerVariant {
     inputTokens: msg.inputTokens,
     outputTokens: msg.outputTokens,
     totalTokens: msg.totalTokens,
+    cacheHitTokens: msg.cacheHitTokens,
     costUsd: msg.costUsd,
     startedAt: msg.startedAt,
     endedAt: msg.endedAt,
@@ -940,6 +962,7 @@ function ensureAnswerVariants(msg: LibraryUiMessage) {
       inputTokens: msg.inputTokens,
       outputTokens: msg.outputTokens,
       totalTokens: msg.totalTokens,
+      cacheHitTokens: msg.cacheHitTokens,
       costUsd: msg.costUsd,
       startedAt: msg.startedAt,
       endedAt: msg.endedAt,
@@ -1015,8 +1038,55 @@ const usdToCnyRate = computed(() => {
 function formatTokenCount(value: number | undefined) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return ''
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M`
-  if (value >= 10_000) return `${(value / 1_000).toFixed(1)}k`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`
   return String(value)
+}
+
+/**
+ * DeepSeek reports no cost, so the library chat used to show none at all while
+ * the paper chat estimated one from the configured prices. Same helper now, so
+ * the two agree — including the cache-hit split.
+ */
+function answerCostCny(answer: LibraryAnswerVariant | LibraryUiMessage): number | null {
+  if (typeof answer.inputTokens !== 'number' || typeof answer.outputTokens !== 'number') return null
+  const provider = ai.settings.providers.find(p => p.id === answer.model?.providerId)
+  const model = provider?.models.find(x => x.id === answer.model?.modelId)
+  const cost = estimateCostCny(
+    model,
+    {
+      inputTokens: answer.inputTokens,
+      outputTokens: answer.outputTokens,
+      cacheHitTokens: answer.cacheHitTokens,
+      // Priced by when the answer was produced, so peak/off-peak stays right.
+      at: answer.createdAt ? new Date(answer.createdAt) : new Date(),
+    },
+    usdToCnyRate.value,
+  )
+  return cost != null && cost > 0 ? cost : null
+}
+
+/**
+ * Share of input tokens served from the provider's context cache. Null unless
+ * the provider actually reported a count (DeepSeek does; most don't), since a
+ * missing number is not the same as a genuine 0%.
+ */
+function cacheHitPercent(answer: LibraryAnswerVariant | LibraryUiMessage): number | null {
+  if (typeof answer.cacheHitTokens !== 'number') return null
+  if (typeof answer.inputTokens !== 'number' || answer.inputTokens <= 0) return null
+  // The backend always emits a count, 0 included, so showing it unconditionally
+  // would paint a meaningless 0% on providers with no cache at all. DeepSeek
+  // always shows (0% there means the cache genuinely missed); others only when
+  // something actually hit.
+  const provider = ai.settings.providers.find(p => p.id === answer.model?.providerId)
+  const cachingProvider = !!provider?.base_url.toLowerCase().includes('deepseek')
+  if (!cachingProvider && answer.cacheHitTokens <= 0) return null
+  const pct = (answer.cacheHitTokens / answer.inputTokens) * 100
+  return Number.isFinite(pct) ? Math.round(pct) : null
+}
+
+function fmtCny(cny: number): string {
+  if (cny < 0.01) return '<0.01'
+  return cny.toFixed(cny < 1 ? 3 : 2)
 }
 
 function formatCostCny(costUsd: number | null | undefined) {
@@ -1310,11 +1380,22 @@ async function runAssistantRequest(
     }))
   }
 
+  // Search happens server-side before any text arrives, so without this the UI
+  // would sit blank for the whole retrieval.
+  if (useWebSearch.value && webSearchAvailable.value) {
+    webSearchPhase.value = 'in_progress'
+    offs.push(await listen<{ status?: string }>(`${eventName}-websearch`, (e) => {
+      const status = e.payload?.status
+      webSearchPhase.value = status === 'done' || status === 'completed' ? null : status ?? null
+    }))
+  }
+
   offs.push(await listen<StreamUsagePayload>(usageEventName, (e) => {
     const usage = e.payload
     if (typeof usage.input_tokens === 'number') target.inputTokens = usage.input_tokens
     if (typeof usage.output_tokens === 'number') target.outputTokens = usage.output_tokens
     if (typeof usage.total_tokens === 'number') target.totalTokens = usage.total_tokens
+    if (typeof usage.cache_hit_tokens === 'number') target.cacheHitTokens = usage.cache_hit_tokens
     if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) target.costUsd = usage.cost_usd
     persistActive()
   }))
@@ -1351,6 +1432,7 @@ async function runAssistantRequest(
       useReasoning: useReasoning.value,
       reasoningEffort: useReasoning.value ? effortToSend : null,
       requestId,
+      webSearch: useWebSearch.value && webSearchAvailable.value,
     })
     // If the user pressed stop, don't refill content the backend produced anyway.
     if (!stoppedTargetIds.has(target.id)) {
@@ -1358,6 +1440,7 @@ async function runAssistantRequest(
       if (pendingSources.length > 0) target.sources = [...pendingSources]
     }
     target.streaming = false
+    webSearchPhase.value = null
     target.endedAt = performance.now()
     assistantMsg.streaming = false
     flushStreamRender(target)
@@ -1372,6 +1455,7 @@ async function runAssistantRequest(
       target.error = true
     }
     target.streaming = false
+    webSearchPhase.value = null
     target.endedAt = performance.now()
     assistantMsg.streaming = false
     flushStreamRender(target)
@@ -1427,6 +1511,7 @@ function stopStreaming() {
       for (const target of targets) {
         if (target.streaming) {
           target.streaming = false
+          webSearchPhase.value = null
           target.endedAt = performance.now()
           flushStreamRender(target)
         }
@@ -1703,7 +1788,7 @@ onUnmounted(() => {
         <div class="lc-titlebar-fill" data-tauri-drag-region />
         <div class="lc-titlebar-actions">
           <!-- RAG not configured -->
-          <button v-if="knowledgeSource !== 'papers' && !ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
+          <button v-if="knowledgeSource !== 'papers' && knowledgeSource !== 'none' && !ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
             <Icon icon="fluent:database-24-regular" width="11" height="11" />
             RAG
           </button>
@@ -2106,6 +2191,11 @@ onUnmounted(() => {
                   <span v-else>{{ modelFallbackInitial(activeAnswer(msg)) }}</span>
                 </div>
                 <div class="assistant-content">
+                  <!-- Server-side search runs before any text arrives -->
+                  <div v-if="webSearchPhase && activeAnswer(msg).streaming" class="websearch-status">
+                    <Icon icon="fluent:globe-search-24-regular" width="13" height="13" />
+                    {{ webSearchPhase === 'in_progress' ? '正在发起联网搜索…' : '正在检索网页…' }}
+                  </div>
                   <!-- Thinking / reasoning content (collapsible) -->
                   <div v-if="activeAnswer(msg).reasoningContent" class="reasoning-section">
                     <button
@@ -2190,8 +2280,17 @@ onUnmounted(() => {
                       </span>
                       <span v-if="typeof activeAnswer(msg).inputTokens === 'number'" title="上下文输入 tokens">↑{{ formatTokenCount(activeAnswer(msg).inputTokens) }}</span>
                       <span v-if="typeof activeAnswer(msg).outputTokens === 'number'" title="本次输出 tokens">↓{{ formatTokenCount(activeAnswer(msg).outputTokens) }}</span>
+                      <span
+                        v-if="cacheHitPercent(activeAnswer(msg)) !== null"
+                        class="usage-cache"
+                        :title="`命中上下文缓存 ${activeAnswer(msg).cacheHitTokens} / ${activeAnswer(msg).inputTokens} 输入 tokens，按缓存价计费`"
+                      >
+                        <Icon icon="fluent:database-24-regular" width="10" height="10" />
+                        {{ cacheHitPercent(activeAnswer(msg)) }}%
+                      </span>
                       <span v-if="answerSpeed(activeAnswer(msg))" class="msg-speed">{{ answerSpeed(activeAnswer(msg)) }}</span>
                       <span v-if="activeAnswer(msg).costUsd != null && formatCostCny(activeAnswer(msg).costUsd)" class="usage-cost" :title="`约 ¥${formatCostCny(activeAnswer(msg).costUsd)} / $${activeAnswer(msg).costUsd!.toFixed(6)}`">¥{{ formatCostCny(activeAnswer(msg).costUsd) }}</span>
+                      <span v-else-if="answerCostCny(activeAnswer(msg))" class="usage-cost" title="按已配置的价格估算（缓存命中按缓存价计）">≈¥{{ fmtCny(answerCostCny(activeAnswer(msg))!) }}</span>
                     </div>
                   </div>
 
@@ -2313,6 +2412,16 @@ onUnmounted(() => {
                 >
                   <Icon icon="fluent:attach-24-regular" width="14" height="14" />
                 </button>
+                <!-- Server-side web search (DeepSeek only) -->
+                <button
+                  v-if="webSearchAvailable"
+                  class="toolbar-btn"
+                  :class="{ 'toolbar-btn-active': useWebSearch }"
+                  :title="useWebSearch ? '联网搜索：已开启' : '联网搜索：让模型在回答前检索网页'"
+                  @click="useWebSearch = !useWebSearch"
+                >
+                  <Icon icon="fluent:globe-search-24-regular" width="15" height="15" />
+                </button>
                 <!-- Reasoning / thinking mode picker -->
                 <div class="reasoning-picker" @click.stop>
                   <button
@@ -2368,7 +2477,7 @@ onUnmounted(() => {
                   <button
                     class="ks-trigger"
                     :class="{
-                      on: knowledgeSource === 'paper-rag' ? ragStore.isConfigured : true,
+                      on: knowledgeSource === 'paper-rag' ? ragStore.isConfigured : knowledgeSource !== 'none',
                       active: sourcePickerOpen,
                     }"
                     @click="sourcePickerOpen = !sourcePickerOpen"
@@ -2407,6 +2516,16 @@ onUnmounted(() => {
                       <Icon icon="fluent:document-text-24-regular" width="12" height="12" />
                       <span class="ks-option-text">素材库</span>
                       <Icon v-if="knowledgeSource === 'snippets'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
+                    </button>
+                    <div class="ks-sep" />
+                    <button
+                      class="ks-option"
+                      :class="{ selected: knowledgeSource === 'none' }"
+                      @click="setKnowledgeSource('none')"
+                    >
+                      <Icon icon="fluent:chat-24-regular" width="12" height="12" />
+                      <span class="ks-option-text">不使用知识库</span>
+                      <Icon v-if="knowledgeSource === 'none'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
                     </button>
                   </div>
                 </div>
@@ -3377,6 +3496,22 @@ onUnmounted(() => {
 }
 
 /* ── Thinking / reasoning box (思考过程) ───────────────────────────────────── */
+.websearch-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+.websearch-status svg { animation: websearch-pulse 1.4s ease-in-out infinite; }
+@keyframes websearch-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .websearch-status svg { animation: none; }
+}
 .reasoning-section {
   margin-bottom: 6px;
   border: 1px solid var(--border-subtle);
@@ -3571,7 +3706,15 @@ onUnmounted(() => {
   color: color-mix(in srgb, var(--accent) 74%, var(--text-tertiary));
 }
 
-.assistant-usage .usage-cost {
+.assistant-usage .usage-cache {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.usage-cost {
   color: var(--text-secondary);
   font-weight: 500;
   margin-left: 2px;
@@ -4040,12 +4183,14 @@ onUnmounted(() => {
   margin-top: 6px;
 }
 
-.footer-left { display: flex; align-items: center; gap: 8px; }
+/* Most of the space between these icons is the buttons' own padding, not the
+   gap — see the note on .toolbar-btn below. Kept in step with AiTab's composer. */
+.footer-left { display: flex; align-items: center; gap: 2px; }
 .footer-right { display: flex; align-items: center; gap: 8px; }
 
 .attach-btn {
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -4232,6 +4377,7 @@ onUnmounted(() => {
 
 /* Knowledge source picker */
 .ks-picker {
+  margin-left: 6px;
   position: relative;
 }
 
@@ -4270,10 +4416,12 @@ onUnmounted(() => {
 .ks-trigger.on .ks-dot { background: var(--accent); }
 
 /* ── Reasoning / thinking-mode picker (flat toolbar button + popover) ──────── */
+/* A 15px glyph in a 28px box carries 6.5px of air per side, which dominated the
+   spacing however small the gap got. 24px trims that while staying clickable. */
 .toolbar-btn {
   position: relative;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   border: none;
   background: transparent;
   border-radius: 8px;
@@ -4398,6 +4546,11 @@ onUnmounted(() => {
   z-index: 200;
 }
 
+.ks-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border-subtle);
+}
 .ks-option {
   display: flex;
   align-items: center;

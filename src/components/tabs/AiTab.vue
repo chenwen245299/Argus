@@ -12,6 +12,7 @@ import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
 import type { ChatContentPart, ChatMessage, PaperMeta, PaperStatus, PaperSection } from '../../types'
 import { askAiText } from '../../stores/translationHistory'
+import { estimateCostCny } from '../../utils/modelPricing'
 
 const props = withDefaults(defineProps<{ slug: string | null; standalone?: boolean }>(), {
   standalone: false,
@@ -60,6 +61,8 @@ interface AssistantAnswer {
   costUsd?: number | null
   contextMode?: string
   usedPdf?: boolean
+  /** Whether this turn ran with DeepSeek's server-side web search. */
+  usedWebSearch?: boolean
   // Titles of the paper sections selected as context for this turn.
   sectionTitles?: string[]
   source?: 'chat' | 'metadataExtraction'
@@ -142,6 +145,27 @@ let unlistenExtractionProgress: UnlistenFn | null = null
 let unlistenMetaStart: UnlistenFn | null = null
 let unlistenMetaDone: UnlistenFn | null = null
 let unlistenMetaError: UnlistenFn | null = null
+
+// ── Panel width ───────────────────────────────────────────────────────────────
+// Docked in the right sidebar this panel can be narrow, and the usage row
+// (turn tokens, context tokens, output tokens, cache hit, throughput, cost)
+// then wraps onto a second line. Throughput is the least load-bearing of those
+// numbers, so it is the one that drops out when there isn't room. The popup
+// window is always wide enough, so it never hides.
+const rootRef = ref<HTMLElement | null>(null)
+const panelWidth = ref(0)
+let panelResizeObserver: ResizeObserver | null = null
+
+/**
+ * Below this the usage row no longer fits on one line. Measured: the row wraps
+ * at roughly 330px of card width, and the card is the panel minus `.messages`'
+ * 2×12px padding — so the sidebar's 350px minimum lands just inside the wrap,
+ * which is what put the cost on its own line. 380 clears it with enough headroom
+ * for the longer numbers (↑158.2k, ~120 tok/s, ≈¥12.34). The sidebar can be
+ * dragged from 350 to 560, so this stays reachable.
+ */
+const SPEED_MIN_WIDTH = 380
+const showAnswerSpeed = computed(() => props.standalone || panelWidth.value >= SPEED_MIN_WIDTH)
 
 // Copy state for message actions
 const copiedIds = ref(new Set<string>())
@@ -307,6 +331,28 @@ const isDeepSeekSelected = computed(() => {
   const provider = ai.settings.providers.find(p => p.id === primary.providerId)
   return !!provider?.base_url.toLowerCase().includes('deepseek')
 })
+
+// Server-side web search is a DeepSeek Responses-API feature, so the toggle only
+// appears when every selected model can actually honour it — a mixed multi-model
+// turn would otherwise silently search on some answers and not others.
+const useWebSearch = ref(false)
+const webSearchAvailable = computed(() =>
+  selectedModels.value.length > 0 &&
+  selectedModels.value.every(m => {
+    const provider = ai.settings.providers.find(p => p.id === m.providerId)
+    return !!provider?.base_url.toLowerCase().includes('deepseek')
+  })
+)
+watch(webSearchAvailable, (ok) => { if (!ok) useWebSearch.value = false })
+
+/** Live "searching the web…" state, keyed by answer id. */
+const webSearchStatus = ref<Record<string, string>>({})
+function setWebSearchStatus(answerId: string, status: string | null) {
+  const next = { ...webSearchStatus.value }
+  if (status) next[answerId] = status
+  else delete next[answerId]
+  webSearchStatus.value = next
+}
 
 // Access an answer through Vue's reactive proxy chain (fixes reactivity bug).
 // A streaming answer is looked up in its own conversation first, so a background
@@ -1169,6 +1215,7 @@ function modelToAnswer(
     createdAt: nowIso(),
     contextMode: contextModeToSend,
     usedPdf: usePdfToSend,
+    usedWebSearch: useWebSearch.value && webSearchAvailable.value,
     sectionTitles: sectionTitlesToSend,
   }
 }
@@ -1412,6 +1459,19 @@ async function streamAnswer(
   )
   unlisteners.set(`${answer.id}-context`, unlistenCtx)
 
+  // Web-search progress: DeepSeek runs the search server-side and reports
+  // in_progress / searching / completed before the answer starts streaming.
+  if (answer.usedWebSearch) {
+    const unlistenSearch = await listen<{ status: string }>(
+      `${eventName}-websearch`,
+      (event) => {
+        const status = event.payload.status
+        setWebSearchStatus(answer.id, status === 'done' || status === 'completed' ? null : status)
+      },
+    )
+    unlisteners.set(`${answer.id}-websearch`, unlistenSearch)
+  }
+
   // Only listen to reasoning events when the user explicitly enabled the toggle.
   // Some models (e.g. DeepSeek) emit reasoning_content by default; suppress it here
   // so "思考过程" never appears unless the user opted in.
@@ -1446,6 +1506,7 @@ async function streamAnswer(
       usePdf: !!answer.usedPdf,
       sectionTitles: answer.sectionTitles ?? [],
       requestId,
+      webSearch: !!answer.usedWebSearch,
     })
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) {
@@ -1477,6 +1538,10 @@ async function streamAnswer(
     const offUsage = unlisteners.get(`${answer.id}-usage`)
     if (offUsage) offUsage()
     unlisteners.delete(`${answer.id}-usage`)
+    const offSearch = unlisteners.get(`${answer.id}-websearch`)
+    if (offSearch) offSearch()
+    unlisteners.delete(`${answer.id}-websearch`)
+    setWebSearchStatus(answer.id, null)
     activeRequestIds.delete(answer.id)
     const visible = isAnswerVisible(answer.id)
     streamOwners.delete(answer.id)
@@ -1516,34 +1581,49 @@ function applyUsage(answer: AssistantAnswer, usage: StreamUsagePayload) {
   if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) answer.costUsd = usage.cost_usd
 }
 
-// DeepSeek-style peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00.
-function isPeakHour(date: Date): boolean {
-  const minutes = ((date.getUTCHours() + 8) % 24) * 60 + date.getUTCMinutes()
-  const h = minutes / 60
-  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
-}
-
-// Estimated CNY cost for models whose provider doesn't return a cost (e.g.
-// DeepSeek), using the configured prices: cache-hit vs miss input + output, and
-// peak/off-peak by the current time. Returns null when no CNY prices are set.
+// Estimated CNY cost for models whose provider doesn't return one (e.g.
+// DeepSeek), from the configured prices. The cache-hit split and peak/off-peak
+// rules live in utils/modelPricing so this agrees with the usage dashboard.
 function estimatedCostCny(answer: AssistantAnswer): number | null {
   if (typeof answer.inputTokens !== 'number' || typeof answer.outputTokens !== 'number') return null
   const provider = ai.settings.providers.find(p => p.id === answer.providerId)
-  const m = provider?.models.find(x => x.id === answer.modelId)
-  if (!m || (m.input_price_per_million == null && m.output_price_per_million == null)) return null
-  const peak = !!m.peak_pricing && isPeakHour(new Date())
-  const inPrice = (peak && m.peak_input_price_per_million != null ? m.peak_input_price_per_million : m.input_price_per_million) ?? 0
-  const outPrice = (peak && m.peak_output_price_per_million != null ? m.peak_output_price_per_million : m.output_price_per_million) ?? 0
-  const cacheHit = answer.cacheHitTokens ?? 0
-  const cacheMiss = Math.max(0, answer.inputTokens - cacheHit)
-  const cacheHitPrice = m.cache_hit_input_price_per_million != null ? m.cache_hit_input_price_per_million : inPrice
-  const cost = (cacheMiss / 1e6) * inPrice + (cacheHit / 1e6) * cacheHitPrice + (answer.outputTokens / 1e6) * outPrice
-  return Number.isFinite(cost) && cost > 0 ? cost : null
+  const model = provider?.models.find(x => x.id === answer.modelId)
+  const cost = estimateCostCny(
+    model,
+    {
+      inputTokens: answer.inputTokens,
+      outputTokens: answer.outputTokens,
+      cacheHitTokens: answer.cacheHitTokens,
+      // Priced when the answer was produced, not when it is re-rendered.
+      at: answer.createdAt ? new Date(answer.createdAt) : new Date(),
+    },
+    usdToCnyRate.value,
+  )
+  return cost != null && cost > 0 ? cost : null
 }
 
 function fmtCny(cny: number): string {
   if (cny < 0.01) return '<0.01'
   return cny.toFixed(cny < 1 ? 3 : 2)
+}
+
+/**
+ * Share of input tokens the provider served from its context cache. Only shown
+ * where the number is real: DeepSeek reports it, most providers don't, and a
+ * missing count is indistinguishable from a genuine 0% miss.
+ */
+function cacheHitPercent(answer: AssistantAnswer): number | null {
+  if (typeof answer.cacheHitTokens !== 'number') return null
+  if (typeof answer.inputTokens !== 'number' || answer.inputTokens <= 0) return null
+  // The backend always emits a count, 0 included, so a plain "is it a number"
+  // check would paint a meaningless 0% on every provider that has no cache at
+  // all. Show it for DeepSeek always (0% there is real information — the cache
+  // missed), and elsewhere only when something actually hit.
+  const provider = ai.settings.providers.find(p => p.id === answer.providerId)
+  const cachingProvider = !!provider?.base_url.toLowerCase().includes('deepseek')
+  if (!cachingProvider && answer.cacheHitTokens <= 0) return null
+  const pct = (answer.cacheHitTokens / answer.inputTokens) * 100
+  return Number.isFinite(pct) ? Math.round(pct) : null
 }
 
 function hasUsage(answer: AssistantAnswer) {
@@ -1558,7 +1638,7 @@ const usdToCnyRate = computed(() => {
 function formatTokenCount(value: number | undefined) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return ''
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M`
-  if (value >= 10_000) return `${(value / 1_000).toFixed(1)}k`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`
   return String(value)
 }
 
@@ -1780,6 +1860,13 @@ onMounted(async () => {
   await settingsStore.load()
   if (!ai.loaded) await ai.load()
   ensureDefaultModels()
+  if (typeof ResizeObserver !== 'undefined' && rootRef.value) {
+    panelWidth.value = rootRef.value.offsetWidth
+    panelResizeObserver = new ResizeObserver(entries => {
+      panelWidth.value = entries[0]?.contentRect.width ?? 0
+    })
+    panelResizeObserver.observe(rootRef.value)
+  }
   document.addEventListener('mousedown', closeFloating)
   window.addEventListener('focus', onWindowFocus)
   window.addEventListener('argus-paper-fulltext-updated', onPaperFulltextUpdated)
@@ -1883,6 +1970,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  panelResizeObserver?.disconnect()
+  panelResizeObserver = null
   document.removeEventListener('mousedown', closeFloating)
   window.removeEventListener('focus', onWindowFocus)
   window.removeEventListener('argus-paper-fulltext-updated', onPaperFulltextUpdated)
@@ -1982,7 +2071,7 @@ function toggleContextPanel(nodeId: string) {
 </script>
 
 <template>
-  <div class="paper-ai" :class="{ standalone: props.standalone }">
+  <div ref="rootRef" class="paper-ai" :class="{ standalone: props.standalone }">
     <div v-if="!slug" class="center-hint">
       <p>{{ t('sidebar.selectPaper') }}</p>
     </div>
@@ -2239,8 +2328,23 @@ function toggleContextPanel(nodeId: string) {
                       class="pdf-badge"
                       title="已将 PDF 直接发送给模型"
                     >PDF</span>
+                    <span
+                      v-if="answer.usedWebSearch"
+                      class="websearch-badge"
+                      title="本轮启用了 DeepSeek 联网搜索"
+                    >
+                      <Icon icon="fluent:globe-search-24-regular" width="11" height="11" />
+                      联网
+                    </span>
                     <span v-if="answer.streaming" class="live-dot" />
                   </div>
+                </div>
+
+                <!-- Search runs server-side before any text arrives, so this is
+                     the only sign the turn is doing anything at all. -->
+                <div v-if="webSearchStatus[answer.id]" class="websearch-status">
+                  <Icon icon="fluent:globe-search-24-regular" width="13" height="13" />
+                  {{ webSearchStatus[answer.id] === 'in_progress' ? '正在发起联网搜索…' : '正在检索网页…' }}
                 </div>
 
                 <!-- Thinking / reasoning content (collapsible) -->
@@ -2289,7 +2393,15 @@ function toggleContextPanel(nodeId: string) {
                   </span>
                   <span v-if="typeof answer.inputTokens === 'number'" class="usage-tokens" title="上下文输入 tokens（含历史与全文）">↑{{ formatTokenCount(answer.inputTokens) }}</span>
                   <span v-if="typeof answer.outputTokens === 'number'" class="usage-tokens" title="本次输出 tokens">↓{{ formatTokenCount(answer.outputTokens) }}</span>
-                  <span v-if="answerSpeed(answer)" class="msg-speed">{{ answerSpeed(answer) }}</span>
+                  <span
+                    v-if="cacheHitPercent(answer) !== null"
+                    class="usage-cache"
+                    :title="`命中上下文缓存 ${answer.cacheHitTokens} / ${answer.inputTokens} 输入 tokens，按缓存价计费`"
+                  >
+                    <Icon icon="fluent:database-24-regular" width="10" height="10" />
+                    {{ cacheHitPercent(answer) }}%
+                  </span>
+                  <span v-if="showAnswerSpeed && answerSpeed(answer)" class="msg-speed">{{ answerSpeed(answer) }}</span>
                   <span v-if="answer.costUsd != null && formatCostCny(answer.costUsd)" class="usage-cost" :title="`约 ¥${formatCostCny(answer.costUsd)} / $${answer.costUsd.toFixed(6)}`">¥{{ formatCostCny(answer.costUsd) }}</span>
                   <span v-else-if="answer.costUsd == null && estimatedCostCny(answer) != null" class="usage-cost usage-cost-est" :title="`按配置单价估算（含缓存命中/峰谷），约 ¥${estimatedCostCny(answer)!.toFixed(6)}`">≈¥{{ fmtCny(estimatedCostCny(answer)!) }}</span>
                   <span v-if="answer.error" class="error-badge">出错</span>
@@ -2439,6 +2551,17 @@ function toggleContextPanel(nodeId: string) {
             </button>
             <button class="toolbar-btn" title="上传图片或 PDF" @click="openFilePicker">
               <Icon icon="fluent:attach-24-regular" width="15" height="15" />
+            </button>
+
+            <!-- Server-side web search (DeepSeek only) -->
+            <button
+              v-if="webSearchAvailable"
+              class="toolbar-btn"
+              :class="{ 'toolbar-btn-active': useWebSearch }"
+              :title="useWebSearch ? '联网搜索：已开启' : '联网搜索：让模型在回答前检索网页'"
+              @click="useWebSearch = !useWebSearch"
+            >
+              <Icon icon="fluent:globe-search-24-regular" width="15" height="15" />
             </button>
 
             <!-- Reasoning / thinking mode picker -->
@@ -3109,6 +3232,36 @@ function toggleContextPanel(nodeId: string) {
   align-items: center;
   gap: 7px;
 }
+.websearch-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.websearch-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  /* Same horizontal inset as .answer-body — without it the icon sat flush
+     against the card border while the text below it was indented. */
+  padding: 9px 11px 0;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+.websearch-status svg { animation: websearch-pulse 1.4s ease-in-out infinite; }
+@keyframes websearch-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .websearch-status svg { animation: none; }
+}
 .pdf-badge {
   display: inline-flex;
   align-items: center;
@@ -3324,6 +3477,14 @@ function toggleContextPanel(nodeId: string) {
 .usage-tokens { color: var(--text-tertiary); }
 .usage-turn-input { display: inline-flex; align-items: center; gap: 2px; }
 .msg-speed { color: color-mix(in srgb, var(--accent) 74%, var(--text-tertiary)); }
+.usage-cache {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
 .usage-cost {
   color: var(--text-secondary);
   font-weight: 500;
@@ -3633,14 +3794,19 @@ function toggleContextPanel(nodeId: string) {
 .composer-toolbar {
   display: flex;
   align-items: center;
-  gap: 1px;
+  gap: 2px;
   padding: 5px 7px 7px;
 }
 .toolbar-spacer { flex: 1; }
+/* Most of the space between these icons was the buttons' own padding, not the
+   gap: a 15px glyph in a 30px box carries 7.5px of air on each side, so even at
+   gap:1 the glyphs sat ~16px apart. Shrinking the box is what actually tightens
+   the run — 24px keeps a comfortable click target and lands the glyphs ~11px
+   apart. Keep this in step with LibraryChat's composer. */
 .toolbar-btn {
   position: relative;
-  width: 30px;
-  height: 30px;
+  width: 24px;
+  height: 24px;
   border: none;
   background: transparent;
   border-radius: 8px;

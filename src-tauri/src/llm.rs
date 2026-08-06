@@ -24,6 +24,16 @@ fn is_ollama(provider: &AiProvider) -> bool {
     provider.kind == "ollama"
 }
 
+pub fn is_deepseek(provider: &AiProvider) -> bool {
+    provider.base_url.to_lowercase().contains("deepseek")
+}
+
+/// Server-side web search is a DeepSeek Responses-API feature; no other provider
+/// wired up here exposes one, so the toggle is only offered for DeepSeek.
+pub fn supports_web_search(provider: &AiProvider) -> bool {
+    is_deepseek(provider)
+}
+
 /// Ollama's native endpoints live at `/api/*` off the server root. Accept a
 /// base URL configured either as the bare root (`http://localhost:11434`) or
 /// with a trailing OpenAI-compat `/v1` segment, and reduce it to the root so
@@ -67,7 +77,26 @@ pub async fn chat_completion_stream(
     reasoning_effort: Option<&str>,
     source: &str,
     cancel: Option<Arc<AtomicBool>>,
+    web_search: bool,
 ) -> Result<String, String> {
+    // Web search lives on a different protocol (DeepSeek's Responses API), so it
+    // takes its own path rather than adding a `tools` field to a request the
+    // /chat/completions endpoint would ignore.
+    if web_search && supports_web_search(provider) {
+        return stream_deepseek_responses(
+            provider,
+            api_key,
+            model,
+            messages,
+            event_name,
+            app,
+            use_reasoning,
+            reasoning_effort,
+            source,
+            cancel,
+        )
+        .await;
+    }
     if is_ollama(provider) {
         stream_ollama(
             provider,
@@ -1163,6 +1192,227 @@ async fn stream_openai_compat(
             cache_hit_tokens,
         );
     }
+    let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
+    Ok(accumulated)
+}
+
+// ── DeepSeek Responses API (server-side web search) ───────────────────────────
+//
+// DeepSeek exposes its built-in web search only through the Responses API
+// (`POST {base}/responses`), not through /chat/completions — so enabling the
+// toggle switches protocol, not just a request field. Differences that matter:
+//   * system messages become the top-level `instructions` string;
+//   * the remaining turns go in `input` as `{role, content}` items;
+//   * image/PDF parts are NOT supported here, so content is flattened to text;
+//   * the SSE stream carries typed events, not `choices[].delta`.
+// Unsupported request fields are documented as silently ignored, so sending the
+// OpenAI-shaped `reasoning.effort` is safe even where DeepSeek's own naming
+// differs.
+
+/// Flatten a message to plain text: the Responses API rejects nothing here, but
+/// DeepSeek ignores image/file input, so only the text parts carry meaning.
+fn responses_input_text(m: &ChatMessage) -> String {
+    match &m.content {
+        ChatContent::Text(s) => s.clone(),
+        ChatContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ChatContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_deepseek_responses(
+    provider: &AiProvider,
+    api_key: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    event_name: &str,
+    app: &tauri::AppHandle,
+    use_reasoning: bool,
+    reasoning_effort: Option<&str>,
+    source: &str,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<String, String> {
+    let client = build_client()?;
+    let url = format!("{}/responses", provider.base_url.trim_end_matches('/'));
+
+    let mut instructions = String::new();
+    let mut input: Vec<serde_json::Value> = Vec::new();
+    for m in messages {
+        let text = responses_input_text(m);
+        if m.role == "system" {
+            if text.trim().is_empty() {
+                continue;
+            }
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
+            }
+            instructions.push_str(&text);
+        } else {
+            input.push(serde_json::json!({ "role": m.role, "content": text }));
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "tools": [{ "type": "web_search" }],
+        "stream": true,
+    });
+    if !instructions.is_empty() {
+        body["instructions"] = serde_json::json!(instructions);
+    }
+    if use_reasoning {
+        body["reasoning"] = serde_json::json!({ "effort": reasoning_effort.unwrap_or("high") });
+    }
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(friendly_error(status, &text));
+    }
+
+    let reasoning_event = format!("{event_name}-reasoning");
+    // Search progress drives a "searching the web…" indicator in the composer.
+    let search_event = format!("{event_name}-websearch");
+    let mut stream = resp.bytes_stream();
+    let mut byte_buf: Vec<u8> = Vec::new();
+    let mut buf = String::new();
+    let mut accumulated = String::new();
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut cache_hit_tokens: u64 = 0;
+    let mut usage_emitted = false;
+
+    while let Some(chunk) = stream.next().await {
+        if let Some(flag) = &cancel {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        byte_buf.extend_from_slice(&bytes);
+        let valid_up_to = match std::str::from_utf8(&byte_buf) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_up_to > 0 {
+            buf.push_str(unsafe { std::str::from_utf8_unchecked(&byte_buf[..valid_up_to]) });
+            byte_buf.drain(..valid_up_to);
+        }
+
+        loop {
+            let Some(pos) = buf.find('\n') else { break };
+            let line = buf[..pos].trim_end_matches('\r').to_string();
+            buf.drain(..pos + 1);
+
+            // `event:` lines are ignored: the type is repeated inside the JSON,
+            // which is the one place it is guaranteed to be.
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim_start();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+
+            match json["type"].as_str().unwrap_or("") {
+                "response.output_text.delta" => {
+                    if let Some(delta) = json["delta"].as_str().filter(|s| !s.is_empty()) {
+                        accumulated.push_str(delta);
+                        let _ = app
+                            .emit(event_name, serde_json::json!({"delta": delta, "done": false}));
+                    }
+                }
+                "response.reasoning_text.delta" => {
+                    if let Some(delta) = json["delta"].as_str().filter(|s| !s.is_empty()) {
+                        let _ = app.emit(
+                            &reasoning_event,
+                            serde_json::json!({"delta": delta, "done": false}),
+                        );
+                    }
+                }
+                t @ ("response.web_search_call.in_progress"
+                | "response.web_search_call.searching"
+                | "response.web_search_call.completed") => {
+                    let phase = t.rsplit('.').next().unwrap_or("searching");
+                    let _ = app.emit(&search_event, serde_json::json!({ "status": phase }));
+                }
+                "response.failed" | "response.incomplete" => {
+                    let msg = json["response"]["error"]["message"]
+                        .as_str()
+                        .or_else(|| json["response"]["incomplete_details"]["reason"].as_str())
+                        .unwrap_or("response did not complete");
+                    // Partial text is worth keeping, so a late failure is only an
+                    // error when nothing was produced at all.
+                    if accumulated.is_empty() {
+                        return Err(format!("DeepSeek: {msg}"));
+                    }
+                }
+                "response.completed" => {
+                    let usage = &json["response"]["usage"];
+                    input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+                    output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
+                    cache_hit_tokens = usage["input_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    let total = usage["total_tokens"]
+                        .as_u64()
+                        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+                    emit_stream_usage(
+                        app,
+                        event_name,
+                        input_tokens,
+                        output_tokens,
+                        total,
+                        None,
+                        cache_hit_tokens,
+                    );
+                    usage_emitted = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    crate::token_usage::record_full(
+        source,
+        &provider.id,
+        model,
+        input_tokens,
+        output_tokens,
+        None,
+        cache_hit_tokens,
+    );
+    if !usage_emitted {
+        emit_stream_usage(
+            app,
+            event_name,
+            input_tokens,
+            output_tokens,
+            input_tokens.saturating_add(output_tokens),
+            None,
+            cache_hit_tokens,
+        );
+    }
+    let _ = app.emit(&search_event, serde_json::json!({ "status": "done" }));
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
 }

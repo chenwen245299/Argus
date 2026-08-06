@@ -1749,6 +1749,7 @@ pub async fn fetch_metadata_with_ai(
         None,
         "metadata",
         None,
+        false,
     )
     .await
     {

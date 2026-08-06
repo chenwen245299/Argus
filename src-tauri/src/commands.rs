@@ -581,7 +581,7 @@ pub async fn translate_text_stream(
     tauri::async_runtime::spawn(async move {
         let _ = crate::llm::chat_completion_stream(
             &provider, &api_key, &model, &messages,
-            &event_name, &app, false, None, "translate", None,
+            &event_name, &app, false, None, "translate", None, false,
         )
         .await;
     });
@@ -1808,6 +1808,7 @@ pub async fn chat_with_paper_event(
     use_pdf: Option<bool>,
     section_titles: Option<Vec<String>>,
     request_id: Option<String>,
+    web_search: Option<bool>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -1829,6 +1830,7 @@ pub async fn chat_with_paper_event(
         use_pdf.unwrap_or(false),
         &section_titles,
         cancel,
+        web_search.unwrap_or(false),
     )
     .await
 }
@@ -2056,6 +2058,7 @@ pub async fn chat_with_library(
     use_reasoning: Option<bool>,
     reasoning_effort: Option<String>,
     request_id: Option<String>,
+    web_search: Option<bool>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -2079,6 +2082,7 @@ pub async fn chat_with_library(
         reasoning_effort.as_deref(),
         &app,
         cancel,
+        web_search.unwrap_or(false),
     )
     .await
 }

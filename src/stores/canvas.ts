@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { Canvas, CanvasIndexEntry, CanvasSettings } from '../types'
 
@@ -33,8 +33,34 @@ export interface DrawNodeSnapshot {
 
 export const useCanvasStore = defineStore('canvas', () => {
   const canvasList = ref<CanvasIndexEntry[]>([])
-  const currentCanvas = ref<Canvas | null>(null)
-  const isShown = ref(false)      // whether canvas panel is currently in the center pane
+
+  // Several canvases can be open as tabs at once, each with its own live
+  // document, so loaded canvases are kept by id rather than one at a time. Every
+  // CanvasPanel instance reads ITS canvas by id; the store just holds the data.
+  const canvasesById = ref<Record<string, Canvas>>({})
+  const activeCanvasId = ref<string | null>(null)
+  const isShown = ref(false)      // whether a canvas panel is currently in the center pane
+
+  function canvasById(id: string | null | undefined): Canvas | null {
+    return id ? canvasesById.value[id] ?? null : null
+  }
+
+  function setCanvas(id: string, canvas: Canvas) {
+    canvasesById.value = { ...canvasesById.value, [id]: canvas }
+  }
+
+  /** The active canvas. Writable so the single-canvas callers (CanvasView, and
+   *  CanvasPanel's own doc updates) keep working unchanged. */
+  const currentCanvas = computed<Canvas | null>({
+    get: () => canvasById(activeCanvasId.value),
+    set: (value) => {
+      const id = activeCanvasId.value
+      if (!id) return
+      if (value) setCanvas(id, value)
+      else dropCanvas(id)
+    },
+  })
+
   const settings = ref<CanvasSettings>({ hover_content_source: 'notes' })
   const loading = ref(false)
   const settingsSaving = ref(false)
@@ -74,10 +100,27 @@ export const useCanvasStore = defineStore('canvas', () => {
     pendingAction.value = { type, payload, seq: ++actionSeq }
   }
 
-  // Debounce timer for auto-save
-  let saveTimer: ReturnType<typeof setTimeout> | null = null
+  // Auto-save debounce, one timer per open canvas — a shared timer would let a
+  // keystroke in one canvas postpone another canvas's pending save.
+  const saveTimers = new Map<string, ReturnType<typeof setTimeout>>()
   // Timer that resets the "saved" flash indicator.
   let settingsSavedTimer: ReturnType<typeof setTimeout> | null = null
+
+  function cancelSave(id: string) {
+    const timer = saveTimers.get(id)
+    if (timer) { clearTimeout(timer); saveTimers.delete(id) }
+  }
+
+  /** Forget a canvas's loaded document, cancelling any save still pending. */
+  function dropCanvas(id: string) {
+    cancelSave(id)
+    if (id in canvasesById.value) {
+      const next = { ...canvasesById.value }
+      delete next[id]
+      canvasesById.value = next
+    }
+    if (activeCanvasId.value === id) activeCanvasId.value = null
+  }
 
   async function loadList() {
     try {
@@ -93,10 +136,13 @@ export const useCanvasStore = defineStore('canvas', () => {
     return canvas
   }
 
+  /** Load a canvas (if not already loaded) and make it the active one. */
   async function openCanvas(id: string) {
+    activeCanvasId.value = id
+    if (canvasesById.value[id]) return   // already open in another tab
     loading.value = true
     try {
-      currentCanvas.value = await invoke<Canvas>('get_canvas', { id })
+      setCanvas(id, await invoke<Canvas>('get_canvas', { id }))
     } finally {
       loading.value = false
     }
@@ -105,36 +151,41 @@ export const useCanvasStore = defineStore('canvas', () => {
   async function renameCanvas(id: string, newName: string) {
     await invoke('rename_canvas', { id, newName })
     await loadList()
-    if (currentCanvas.value?.id === id) {
-      currentCanvas.value = { ...currentCanvas.value, name: newName }
-    }
+    const open = canvasById(id)
+    if (open) setCanvas(id, { ...open, name: newName })
   }
 
   async function deleteCanvas(id: string) {
     await invoke('delete_canvas', { id })
-    if (currentCanvas.value?.id === id) {
-      currentCanvas.value = null
-      isShown.value = false
-    }
+    dropCanvas(id)
+    if (!activeCanvasId.value) isShown.value = false
     await loadList()
   }
 
-  function scheduleSave() {
-    if (saveTimer) clearTimeout(saveTimer)
-    saveTimer = setTimeout(() => persistCanvas(), 800)
+  /** `id` defaults to the active canvas, for the single-canvas callers. */
+  function scheduleSave(id?: string) {
+    const key = id ?? activeCanvasId.value
+    if (!key) return
+    cancelSave(key)
+    saveTimers.set(key, setTimeout(() => {
+      saveTimers.delete(key)
+      void persistCanvas(key)
+    }, 800))
   }
 
-  async function persistCanvas() {
-    if (!currentCanvas.value) return
+  async function persistCanvas(id?: string) {
+    const key = id ?? activeCanvasId.value
+    const canvas = canvasById(key)
+    if (!key || !canvas) return
     try {
-      await invoke('save_canvas', { canvasData: currentCanvas.value })
+      await invoke('save_canvas', { canvasData: canvas })
       // Refresh the index entry
-      const idx = canvasList.value.findIndex(e => e.id === currentCanvas.value!.id)
+      const idx = canvasList.value.findIndex(e => e.id === key)
       if (idx >= 0) {
         canvasList.value[idx] = {
           ...canvasList.value[idx],
-          node_count: currentCanvas.value.nodes.length,
-          updated_at: currentCanvas.value.updated_at,
+          node_count: canvas.nodes.length,
+          updated_at: canvas.updated_at,
         }
       }
     } catch (e) {
@@ -142,14 +193,16 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  /** Flush a canvas's pending edits and unload it (its tab is closing). */
+  async function closeCanvas(id: string) {
+    cancelSave(id)
+    await persistCanvas(id)
+    dropCanvas(id)
+    if (!activeCanvasId.value) isShown.value = false
+  }
+
   async function closeCurrentCanvas() {
-    if (saveTimer) {
-      clearTimeout(saveTimer)
-      saveTimer = null
-    }
-    await persistCanvas()
-    currentCanvas.value = null
-    isShown.value = false
+    if (activeCanvasId.value) await closeCanvas(activeCanvasId.value)
   }
 
   async function getNodeDisplayContent(paperId: string, source: string): Promise<string> {
@@ -187,6 +240,10 @@ export const useCanvasStore = defineStore('canvas', () => {
 
   return {
     canvasList,
+    canvasesById,
+    activeCanvasId,
+    canvasById,
+    setCanvas,
     currentCanvas,
     isShown,
     settings,
@@ -208,6 +265,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     deleteCanvas,
     scheduleSave,
     persistCanvas,
+    closeCanvas,
     closeCurrentCanvas,
     getNodeDisplayContent,
     loadSettings,

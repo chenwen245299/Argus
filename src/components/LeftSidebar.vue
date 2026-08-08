@@ -486,16 +486,13 @@ async function submitNewCanvas() {
   }
 }
 
-async function openSpecificCanvas(canvasId?: string) {
+function openSpecificCanvas(canvasId?: string) {
   if (!canvasId) return
   sidebarMode.value = 'canvas'
   saveSidebarMode('canvas')
-  try {
-    await canvasStore.openCanvas(canvasId)
-    emit('open-canvas', canvasId)
-  } catch (e) {
-    console.error('Open canvas:', e)
-  }
+  // MainView owns opening: it creates/focuses the tab, and the tab is what
+  // loads the document. Loading here directly would show a canvas with no tab.
+  emit('open-canvas', canvasId)
 }
 
 const canvasRenamingId = ref<string | null>(null)

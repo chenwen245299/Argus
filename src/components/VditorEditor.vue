@@ -3,7 +3,12 @@ import { onMounted, onBeforeUnmount, ref, nextTick, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import type VditorType from 'vditor'
 
-const props = defineProps<{ initialContent: string }>()
+const props = defineProps<{
+  initialContent: string
+  /** Persist a pasted image and return the URL to render it by. Without this,
+   *  Vditor falls back to inlining the file as a base64 `data:` URI. */
+  imageUploader?: (file: File) => Promise<string | null>
+}>()
 const emit = defineEmits<{ change: [markdown: string] }>()
 
 const containerEl = ref<HTMLDivElement | null>(null)
@@ -38,6 +43,40 @@ function normalizeDisplayMathDelimiters(markdown: string) {
   return text
 }
 
+const uploadError = ref('')
+
+/**
+ * Vditor hands the handler whatever the event carried: a `FileList` for a paste,
+ * a `DataTransferItemList` for a drop. Neither is an array, and the drop entries
+ * are `DataTransferItem`s that still need `getAsFile()`.
+ */
+type PastedItem = File | DataTransferItem
+function toFiles(input: ArrayLike<PastedItem>): File[] {
+  return Array.from(input)
+    .map(item => (item instanceof File ? item : item.getAsFile()))
+    .filter((f): f is File => !!f)
+}
+
+/** Save each pasted image, then insert a link to it at the cursor. */
+async function handlePastedFiles(input: ArrayLike<PastedItem>) {
+  const images = toFiles(input).filter(f => f.type.startsWith('image/'))
+  if (!images.length || !props.imageUploader) return
+  uploadError.value = ''
+  for (const file of images) {
+    try {
+      const url = await props.imageUploader(file)
+      if (!url) {
+        uploadError.value = `不支持的图片格式：${file.type || '未知'}`
+        continue
+      }
+      // insertValue emits `input`, so the note autosaves like any other edit.
+      vd?.insertValue(`![](${url})\n`)
+    } catch (e) {
+      uploadError.value = String(e)
+    }
+  }
+}
+
 onMounted(async () => {
   // Vditor (JS + CSS) is heavyweight — load it when an editor actually mounts
   // instead of in every window's startup bundle.
@@ -66,6 +105,17 @@ onMounted(async () => {
     counter: { enable: false },
     resize: { enable: false },
     cache: { enable: false },
+    // Vditor's own paste path, when neither `upload.url` nor `upload.handler` is
+    // set, does `readAsDataURL` and drops the whole image into the document as
+    // base64. A screenshot is megabytes of text on one line, re-parsed on every
+    // keystroke and rewritten to disk on every autosave — that is what froze the
+    // editor. Claiming `handler` takes that branch out of play entirely.
+    upload: {
+      handler: (files: File[]) => {
+        void handlePastedFiles(files as unknown as ArrayLike<PastedItem>)
+        return null
+      },
+    },
     after() {
       requestAnimationFrame(() => {
         if (content && vd?.getValue().trim() === '') {
@@ -183,6 +233,21 @@ function openFind() {
   })
 }
 
+/**
+ * Replace the editor's content from outside (a save that happened in another
+ * window). `clearStack=true` suppresses the `input` event, so adopting a remote
+ * change doesn't look like a local edit and bounce straight back out as a save.
+ */
+function setContent(markdown: string): boolean {
+  // Vditor initialises asynchronously; report failure so the caller can remount
+  // us with the new content instead of silently dropping it.
+  if (!vd) return false
+  if (vd.getValue() !== markdown) vd.setValue(markdown, true)
+  return true
+}
+
+defineExpose({ setContent })
+
 function closeFind() {
   clearHighlights()
   allRanges = []
@@ -247,6 +312,10 @@ function onFindKeydown(e: KeyboardEvent) {
       </div>
     </Transition>
 
+    <Transition name="find-bar">
+      <div v-if="uploadError" class="upload-error" @click="uploadError = ''">{{ uploadError }}</div>
+    </Transition>
+
     <div ref="containerEl" class="vditor-host" />
   </div>
 </template>
@@ -265,6 +334,24 @@ function onFindKeydown(e: KeyboardEvent) {
 }
 
 /* Find bar */
+/* Image-paste failure, dismissed by clicking it. Sits below the find bar so the
+   two never overlap when both are up. */
+.upload-error {
+  position: absolute;
+  top: 44px;
+  right: 12px;
+  z-index: 100;
+  max-width: 70%;
+  background: var(--bg-secondary);
+  border: 1px solid var(--danger, #dc2626);
+  color: var(--danger, #dc2626);
+  border-radius: var(--radius-sm);
+  padding: 5px 9px;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
 .find-bar {
   position: absolute;
   top: 8px;

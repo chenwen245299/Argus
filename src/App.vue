@@ -97,7 +97,8 @@ select,
 .argus-md-editor *,
 .textLayer,
 .textLayer *,
-.selectable-text {
+.selectable-text,
+.selectable-text * {
   user-select: text;
   -webkit-user-select: text;
 }

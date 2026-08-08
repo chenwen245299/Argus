@@ -1669,10 +1669,44 @@ function onMsgContainerClick(e: MouseEvent) {
   }
 }
 
+// ── Composer height ───────────────────────────────────────────────────────────
+// The box auto-grows with the text up to 6 lines, but the user can also drag its
+// top edge to pick a height outright. The popup window and the sidebar tab are
+// very different shapes, so each remembers its own.
+const COMPOSER_MIN_H = 44
+const COMPOSER_H_KEY = `argus:ai-composer-height${props.standalone ? '-popup' : ''}`
+
+/** Never let the composer eat more than this much of the window. */
+function composerMaxH() {
+  return Math.max(COMPOSER_MIN_H, Math.round(window.innerHeight * 0.6))
+}
+
+const composerHeight = ref<number | null>((() => {
+  const n = Number(localStorage.getItem(COMPOSER_H_KEY))
+  return Number.isFinite(n) && n >= COMPOSER_MIN_H ? n : null
+})())
+
+function persistComposerHeight() {
+  try {
+    if (composerHeight.value) localStorage.setItem(COMPOSER_H_KEY, String(composerHeight.value))
+    else localStorage.removeItem(COMPOSER_H_KEY)
+  } catch { /* private mode / quota — the height still applies for this session */ }
+}
+
 function resizeTextarea() {
   nextTick(() => {
     const el = textareaEl.value
     if (!el) return
+    // A dragged height wins outright: the box stays where the user put it and
+    // long input scrolls inside, instead of auto-grow yanking it back. maxHeight
+    // has to move with it, or the CSS cap would clip a box dragged taller.
+    if (composerHeight.value) {
+      const h = Math.min(composerHeight.value, composerMaxH())
+      el.style.maxHeight = `${h}px`
+      el.style.height = `${h}px`
+      return
+    }
+    el.style.maxHeight = ''
     const lineH = parseFloat(getComputedStyle(el).lineHeight) || 19
     const padTop = parseFloat(getComputedStyle(el).paddingTop) || 10
     el.style.height = 'auto'
@@ -1681,6 +1715,43 @@ function resizeTextarea() {
     const snapped = Math.min(maxLines, lines) * lineH + padTop
     el.style.height = `${snapped}px`
   })
+}
+
+watch(composerHeight, resizeTextarea)
+
+function onComposerResizeStart(e: PointerEvent) {
+  const el = textareaEl.value
+  if (!el) return
+  const handle = e.currentTarget as HTMLElement
+  const startY = e.clientY
+  const startH = el.offsetHeight
+  handle.setPointerCapture?.(e.pointerId)
+
+  const onMove = (ev: PointerEvent) => {
+    // The composer is pinned to the bottom, so dragging UP grows it — hence the
+    // inverted delta.
+    composerHeight.value = Math.min(
+      composerMaxH(),
+      Math.max(COMPOSER_MIN_H, startH + startY - ev.clientY),
+    )
+  }
+  const onUp = (ev: PointerEvent) => {
+    handle.releasePointerCapture?.(ev.pointerId)
+    handle.removeEventListener('pointermove', onMove)
+    handle.removeEventListener('pointerup', onUp)
+    handle.removeEventListener('pointercancel', onUp)
+    persistComposerHeight()
+  }
+  handle.addEventListener('pointermove', onMove)
+  handle.addEventListener('pointerup', onUp)
+  handle.addEventListener('pointercancel', onUp)
+}
+
+/** Double-click the grabber to hand the height back to auto-grow. */
+function resetComposerHeight() {
+  composerHeight.value = null
+  persistComposerHeight()
+  resizeTextarea()
 }
 
 function handleKeydown(e: KeyboardEvent) {
@@ -1857,6 +1928,9 @@ watch(activeConversationIsMetadataExtraction, (isMetadataExtraction) => {
 })
 
 onMounted(async () => {
+  // Apply a remembered composer height right away — otherwise it wouldn't take
+  // effect until the first keystroke re-ran the sizing.
+  if (composerHeight.value) resizeTextarea()
   await settingsStore.load()
   if (!ai.loaded) await ai.load()
   ensureDefaultModels()
@@ -2441,6 +2515,12 @@ function toggleContextPanel(nodeId: string) {
         </div>
 
         <footer class="composer">
+        <div
+          class="composer-resizer"
+          title="拖动调整输入框高度（双击恢复自适应）"
+          @pointerdown="onComposerResizeStart"
+          @dblclick="resetComposerHeight"
+        />
         <div class="context-bar">
           <button
             class="context-btn"
@@ -3508,6 +3588,34 @@ function toggleContextPanel(nodeId: string) {
   border-top: none;
   background: #ffffff;
 }
+/* Drag the composer's top edge to set its height; the grip only shows on hover
+   so it stays out of the way. Sits above the context bar's buttons. */
+.composer-resizer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 8px;
+  z-index: 3;
+  cursor: ns-resize;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.composer-resizer::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 38px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border-default);
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+.composer-resizer:hover::after { opacity: 1; }
 .standalone .composer-box {
   padding: 12px 12px 8px 14px;
   background: #f5f5f7;
@@ -3517,12 +3625,15 @@ function toggleContextPanel(nodeId: string) {
   border-color: rgba(34, 63, 121, 0.35);
   background: #fafafa;
 }
+/* Matches the sidebar's resting height (~3 lines). This used to be 24px — one
+   line — which read as cramped in a window this size. Line spacing is kept in
+   step with the sidebar too; 1.55 was noticeably airier at the same font size. */
 .standalone .composer-input {
-  min-height: 24px;
-  max-height: 180px;
+  min-height: 68px;
+  max-height: 240px;
   padding: 0;
   font-size: 14px;
-  line-height: 1.55;
+  line-height: 1.45;
 }
 .standalone .composer-toolbar {
   margin-top: 8px;

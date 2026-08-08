@@ -8,7 +8,7 @@ import { Window as TauriWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalSize } from '@tauri-apps/api/dpi'
 import { useLibraryStore } from '../stores/library'
-import { useReaderStore } from '../stores/reader'
+import { useReaderStore, featureTabKey } from '../stores/reader'
 import { useImportStore } from '../stores/import'
 import { useSettingsStore } from '../stores/settings'
 import { useCollectionsStore } from '../stores/collections'
@@ -242,24 +242,37 @@ function activePaperInfo() {
 const livePdfSlugs = computed(() => liveViewerSlugs.value.filter(s => !isEbookFileType(fileTypeFor(s))))
 const liveEbookSlugs = computed(() => liveViewerSlugs.value.filter(s => isEbookFileType(fileTypeFor(s))))
 
-const showCanvas = ref(false)
-const showSnippetLibrary = ref(false)
-const showWriting = ref(false)
-// Open writing tabs (one per reference list; null = the "Library"/all-papers
-// view). Each stays open for quick switching until its tab is closed, mirroring
-// the snippet-library tabs. Names are derived reactively from the writing store.
-const openWritingIds = ref<(string | null)[]>([])
-const openWritingTabs = computed(() => {
-  const out: { id: string; name: string }[] = []
-  for (const id of openWritingIds.value) {
-    if (id === null) continue   // the all-papers ("Library") view has no tab
-    const list = writingLists.value.find(l => l.id === id)
-    if (list) out.push({ id, name: list.name })
-  }
-  return out
+// Which workspace the centre shows is decided entirely by the active tab, so
+// these are derived, never assigned. They used to be independent refs that every
+// navigation path had to reset in concert; one active tab makes them mutually
+// exclusive by construction.
+const activeTabKind = computed(() => {
+  const tab = readerStore.activeTab
+  return tab ? (tab.kind ?? 'paper') : null
 })
-const activeSnippetLibraryId = ref<string | null>(null)
-const openSnippetLibraryIds = ref<string[]>([])
+const showCanvas = computed(() => activeTabKind.value === 'canvas')
+const showSnippetLibrary = computed(() => activeTabKind.value === 'snippets')
+const showWriting = computed(() => activeTabKind.value === 'writing')
+
+/** The open canvas ids, in tab order. */
+const openCanvasIds = computed(() =>
+  readerStore.featureTabs('canvas')
+    .map(t => t.refId)
+    .filter((id): id is string => !!id))
+
+// Canvas panels are instantiated on first visit and then kept alive, mirroring
+// `materializedSlugs` for papers: a restored-but-unvisited canvas tab doesn't
+// load its document on startup, and a closed one unmounts.
+const materializedCanvasIds = ref<Set<string>>(new Set())
+const liveCanvasIds = computed(() =>
+  openCanvasIds.value.filter(id => materializedCanvasIds.value.has(id)))
+const activeCanvasId = computed(() =>
+  showCanvas.value ? readerStore.activeTab?.refId ?? null : null)
+const activeSnippetLibraryId = computed(() =>
+  showSnippetLibrary.value ? readerStore.activeTab?.refId ?? null : null)
+const activeWritingId = computed(() =>
+  showWriting.value ? readerStore.activeTab?.refId ?? null : null)
+
 type WorkspaceMode = 'library' | 'canvas' | 'snippets' | 'writing'
 
 // The workspace the center is currently showing. Drives the left sidebar so it
@@ -272,70 +285,55 @@ const activeWorkspace = computed<WorkspaceMode>(() => {
   return 'library'
 })
 
-const openSnippetLibraryTabs = computed(() =>
-  openSnippetLibraryIds.value
-    .map(id => snippetLibraries.value.find(lib => lib.id === id))
-    .filter((lib): lib is NonNullable<typeof lib> => Boolean(lib))
-)
+// The writing workspace's all-papers ("Library") view has no list id, but every
+// workspace on screen now needs a tab to be reachable — so it gets a reserved one.
+const WRITING_ALL = '__all__'
 
-// Sync showCanvas with canvasStore.isShown so TabBar close button works
-watch(() => canvasStore.isShown, (v) => { showCanvas.value = v })
-
-let autoOpeningCanvasId: string | null = null
-async function ensureCanvasSelection() {
-  if (!showCanvas.value || canvasStore.loading) return
-  const currentId = canvasStore.currentCanvas?.id
-  if (currentId && canvasStore.canvasList.some(canvas => canvas.id === currentId)) return
-  const first = canvasStore.canvasList[0]
-  if (!first || autoOpeningCanvasId === first.id) return
-  autoOpeningCanvasId = first.id
-  try {
-    await canvasStore.openCanvas(first.id)
-  } catch (e) {
-    console.error('Auto-open canvas:', e)
-  } finally {
-    autoOpeningCanvasId = null
+// The active tab is the source of truth; these keep the stores that still track
+// their own "current" pointer (canvas documents, the writing list) in step.
+watch(activeCanvasId, (id) => {
+  canvasStore.isShown = !!id
+  if (!id) return
+  if (!materializedCanvasIds.value.has(id)) {
+    materializedCanvasIds.value = new Set(materializedCanvasIds.value).add(id)
   }
-}
+  canvasStore.openCanvas(id).catch(e => console.error('Open canvas:', e))
+}, { immediate: true })
 
+// Free the document of a canvas whose tab was closed (flushing pending edits).
 watch(
-  [() => showCanvas.value, () => canvasStore.canvasList.map(canvas => canvas.id).join('|')],
-  () => { void ensureCanvasSelection() }
-)
-
-watch(
-  [() => showSnippetLibrary.value, () => snippetLibraries.value.map(lib => lib.id).join('|')],
-  ([visible]) => {
-    if (!visible) return
-    const currentId = activeSnippetLibraryId.value
-    const nextId = currentId && snippetLibraries.value.some(lib => lib.id === currentId)
-      ? currentId
-      : (snippetLibraries.value[0]?.id ?? null)
-    activeSnippetLibraryId.value = nextId
-    if (nextId) rememberSnippetLibraryTab(nextId)
+  () => openCanvasIds.value.join('|'),
+  () => {
+    const open = new Set(openCanvasIds.value)
+    const closed = [...materializedCanvasIds.value].filter(id => !open.has(id))
+    if (!closed.length) return
+    materializedCanvasIds.value = new Set(
+      [...materializedCanvasIds.value].filter(id => open.has(id)))
+    for (const id of closed) void canvasStore.closeCanvas(id)
   }
 )
+
+watch(activeWritingId, (id) => {
+  if (id !== null) writingActiveListId.value = id === WRITING_ALL ? null : id
+}, { immediate: true })
 
 const showLibraryLoading = computed(() =>
   libraryStore.isRestoringLibrary || (!libraryStore.currentPath && libraryStore.isLoading)
 )
 
-function rememberWritingTab(id: string | null) {
-  if (id === null) return   // the all-papers ("Library") view is tab-less
-  if (!openWritingIds.value.some(x => x === id)) {
-    openWritingIds.value = [...openWritingIds.value, id]
-  }
+/** Open (or focus) a canvas tab. Several canvases can be open at once. */
+function activateCanvas(id: string) {
+  const name = canvasStore.canvasList.find(c => c.id === id)?.name ?? t('canvas.untitled')
+  readerStore.openFeatureTab('canvas', id, name)
 }
 
 // Show one writing view (a specific list, or null = all papers) and give it a tab.
 function activateWriting(id: string | null) {
-  readerStore.showList()   // clear activeSlug so the reference table shows
-  showCanvas.value = false
-  canvasStore.isShown = false
-  showSnippetLibrary.value = false
-  writingActiveListId.value = id
-  rememberWritingTab(id)
-  showWriting.value = true
+  const refId = id ?? WRITING_ALL
+  const name = id === null
+    ? t('writing.allPapers')
+    : writingLists.value.find(l => l.id === id)?.name ?? t('writing.title')
+  readerStore.openFeatureTab('writing', refId, name)
 }
 
 // Entering the writing workspace from the dropdown re-opens the last-active view
@@ -350,86 +348,77 @@ function onOpenWritingList(id: string | null) {
   activateWriting(id)
 }
 
-function closeWritingTab(id: string | null) {
-  const idx = openWritingIds.value.findIndex(x => x === id)
-  if (idx === -1) return
-  const next = openWritingIds.value.filter(x => x !== id)
-  openWritingIds.value = next
-
-  if (writingActiveListId.value === id && showWriting.value) {
-    const fallback = next[Math.min(idx, next.length - 1)]
-    if (fallback !== undefined) activateWriting(fallback)
-    else showWriting.value = false
-  }
+/**
+ * Keep one kind of feature tab in step with the things it points at: drop tabs
+ * whose target is gone, and refresh titles so a rename shows on the tab.
+ *
+ * Pruning is skipped while `entries` is empty, on purpose. These lists load
+ * lazily (the sidebar only fetches canvases/writing lists when you open that
+ * section) and reset to `[]` when their IPC call fails — so "empty" usually
+ * means "not loaded yet", not "you deleted everything". Treating it as
+ * authoritative would silently wipe restored tabs on a transient error. The cost
+ * of the guard is a tab that lingers after you delete the last item of a kind;
+ * clicking it just shows that workspace's empty state.
+ */
+function syncFeatureTabs(
+  kind: 'canvas' | 'snippets' | 'writing',
+  entries: () => { id: string; name: string }[],
+  extraValidIds: string[] = [],
+) {
+  watch(
+    () => entries().map(e => `${e.id}:${e.name}`).join('|'),
+    () => {
+      const list = entries()
+      if (!list.length) return
+      readerStore.pruneFeatureTabs(kind, new Set([...extraValidIds, ...list.map(e => e.id)]))
+      for (const tab of readerStore.featureTabs(kind)) {
+        const entry = list.find(e => e.id === tab.refId)
+        if (entry) tab.title = entry.name
+      }
+    }
+  )
 }
 
-// Prune tabs for lists deleted elsewhere; fall back to all-papers if the active
-// list is gone.
-watch(
-  () => writingLists.value.map(l => l.id).join('|'),
-  () => {
-    const valid = new Set(writingLists.value.map(l => l.id))
-    openWritingIds.value = openWritingIds.value.filter(id => id === null || valid.has(id))
-    if (showWriting.value && writingActiveListId.value !== null && !valid.has(writingActiveListId.value)) {
-      activateWriting(null)
-    }
-  }
-)
+syncFeatureTabs('writing', () => writingLists.value, [WRITING_ALL])
+syncFeatureTabs('canvas', () => canvasStore.canvasList)
+syncFeatureTabs('snippets', () => snippetLibraries.value)
 
 function onOpenLibrary() {
   readerStore.showList()
-  showCanvas.value = false
-  canvasStore.isShown = false
-  showSnippetLibrary.value = false
-  showWriting.value = false
 }
 
-function onOpenCanvas() {
-  readerStore.showList()   // clear activeSlug so PdfViewer v-if yields to CanvasPanel
-  showCanvas.value = true
-  canvasStore.isShown = true
-  showSnippetLibrary.value = false
-  showWriting.value = false
+// Entering the canvas workspace. With an explicit id (clicking a canvas in the
+// sidebar) that canvas gets a tab; without one, re-focus an already-open canvas
+// tab, else fall back to the first canvas in the library.
+function onOpenCanvas(canvasId?: string) {
+  const target = canvasId
+    ?? activeCanvasId.value
+    ?? openCanvasIds.value[0]
+    ?? canvasStore.canvasList[0]?.id
+  if (target) activateCanvas(target)
+  else readerStore.showList()
   // Land on the drawing panel (and leave the PDF-only tabs behind).
   if (!CANVAS_TABS.includes(sidebarTab.value)) sidebarTab.value = 'draw'
 }
 
 function closeCanvas() {
-  showCanvas.value = false
-  canvasStore.isShown = false
+  const id = activeCanvasId.value
+  if (id) readerStore.closeTab(featureTabKey('canvas', id))
   // 'draw' only exists in canvas mode — fall back to a paper tab.
   if (!PAPER_TABS.includes(sidebarTab.value)) sidebarTab.value = 'metadata'
 }
 
-function rememberSnippetLibraryTab(libraryId: string) {
-  if (!openSnippetLibraryIds.value.includes(libraryId)) {
-    openSnippetLibraryIds.value = [...openSnippetLibraryIds.value, libraryId]
-  }
-}
-
 function activateSnippetLibrary(libraryId: string) {
-  readerStore.showList()
-  showCanvas.value = false
-  canvasStore.isShown = false
-  showWriting.value = false
-  rememberSnippetLibraryTab(libraryId)
-  activeSnippetLibraryId.value = libraryId
-  showSnippetLibrary.value = true
+  const name = snippetLibraries.value.find(lib => lib.id === libraryId)?.name ?? t('snippets.title')
+  readerStore.openFeatureTab('snippets', libraryId, name)
 }
 
 function onOpenSnippetWorkspace() {
-  readerStore.showList()
-  showCanvas.value = false
-  canvasStore.isShown = false
-  showWriting.value = false
-  showSnippetLibrary.value = true
-
-  const currentId = activeSnippetLibraryId.value
-  const nextId = currentId && snippetLibraries.value.some(lib => lib.id === currentId)
-    ? currentId
-    : (snippetLibraries.value[0]?.id ?? null)
-  activeSnippetLibraryId.value = nextId
-  if (nextId) rememberSnippetLibraryTab(nextId)
+  const target = activeSnippetLibraryId.value
+    ?? readerStore.featureTabs('snippets')[0]?.refId
+    ?? snippetLibraries.value[0]?.id
+  if (target) activateSnippetLibrary(target)
+  else readerStore.showList()
 }
 
 function onSwitchWorkspace(mode: WorkspaceMode) {
@@ -437,7 +426,6 @@ function onSwitchWorkspace(mode: WorkspaceMode) {
     onOpenLibrary()
   } else if (mode === 'canvas') {
     onOpenCanvas()
-    void ensureCanvasSelection()
   } else if (mode === 'snippets') {
     onOpenSnippetWorkspace()
   } else {
@@ -449,31 +437,9 @@ function onOpenSnippetLibrary(libraryId: string) {
   activateSnippetLibrary(libraryId)
 }
 
-function hideSnippetLibrary() {
-  showSnippetLibrary.value = false
-  // Clicking the home/canvas tab should also leave the writing view.
-  showWriting.value = false
-}
-
-function closeSnippetLibraryTab(libraryId: string) {
-  const idx = openSnippetLibraryIds.value.indexOf(libraryId)
-  if (idx === -1) return
-  const nextIds = openSnippetLibraryIds.value.filter(id => id !== libraryId)
-  openSnippetLibraryIds.value = nextIds
-
-  if (activeSnippetLibraryId.value !== libraryId) return
-
-  const nextId = nextIds[Math.min(idx, nextIds.length - 1)]
-  if (nextId) {
-    activateSnippetLibrary(nextId)
-  } else {
-    showSnippetLibrary.value = false
-    activeSnippetLibraryId.value = null
-  }
-}
-
 function onSnippetOpenPaper(slug: string, page: number, title: string) {
-  showSnippetLibrary.value = false
+  // openPaper makes the paper the active tab, which is all it takes to leave
+  // the snippet workspace now that the centre pane follows the active tab.
   readerStore.openPaper(slug, title, libraryStore.papers.find(p => p.slug === slug)?.file_type)
   readerStore.pendingPageJump = page
 }
@@ -703,8 +669,6 @@ onMounted(async () => {
     if (!slug) return
     const paper = libraryStore.papers.find(p => p.slug === slug)
     selectionStore.selectPaper(slug)
-    showCanvas.value = false
-    canvasStore.isShown = false
     readerStore.openPaper(slug, event.payload.title || paper?.title || slug, paper?.file_type)
     rightSidebarVisible.value = true
     if (!PAPER_TABS.includes(sidebarTab.value)) {
@@ -924,36 +888,13 @@ watch(
   { deep: true }
 )
 
-// Switching to a paper tab should close the snippet library panel
-watch(
-  () => readerStore.activeSlug,
-  (slug) => {
-    if (slug) {
-      showSnippetLibrary.value = false
-      showWriting.value = false
-    }
-  }
-)
-
 // Sidebar navigation should always bring the main area back to the library list
-// tab. The opened PDF tab stays open; it just stops being the active tab.
+// tab. Open tabs stay open; they just stop being the active tab. (Leaving the
+// canvas/snippet/writing workspaces falls out of the same call, since the centre
+// pane follows the active tab.)
 watch(
   () => selectionStore.navSelectionSeq,
-  () => {
-    if (readerStore.activeSlug) {
-      readerStore.showList()
-    }
-    if (showCanvas.value) {
-      showCanvas.value = false
-      canvasStore.isShown = false
-    }
-    if (showSnippetLibrary.value) {
-      showSnippetLibrary.value = false
-    }
-    if (showWriting.value) {
-      showWriting.value = false
-    }
-  }
+  () => { readerStore.showList() }
 )
 </script>
 
@@ -997,21 +938,11 @@ watch(
   <!-- Library loaded → 3-column layout -->
   <div v-else class="main-layout">
     <!-- Title bar: sits above everything, drag region + tabs next to traffic lights -->
+    <!-- The tab bar reads the whole tab list off the reader store now, so it
+         needs no per-workspace props: every tab kind lives in `reader.tabs`. -->
     <TabBar
       :right-sidebar-open="rightSidebarVisible"
-      :snippet-library-tabs="openSnippetLibraryTabs"
-      :snippet-library-visible="showSnippetLibrary"
-      :active-snippet-library-id="activeSnippetLibraryId"
-      :writing-tabs="openWritingTabs"
-      :writing-visible="showWriting"
-      :active-writing-id="writingActiveListId"
       @toggle-right-sidebar="rightSidebarVisible = !rightSidebarVisible"
-      @show-home="hideSnippetLibrary"
-      @show-canvas="hideSnippetLibrary"
-      @switch-snippet-library="activateSnippetLibrary"
-      @close-snippet-library-tab="closeSnippetLibraryTab"
-      @switch-writing="onOpenWritingList"
-      @close-writing-tab="closeWritingTab"
     />
 
     <Toolbar
@@ -1070,14 +1001,20 @@ watch(
         />
         <!-- Non-PDF center views (shown only when no PDF tab is active) -->
         <template v-if="!readerStore.activeSlug">
+          <!-- One panel per open canvas tab, kept mounted and toggled with
+               v-show — same shape as the per-slug PdfViewer instances above, so
+               switching canvas tabs doesn't reload or lose in-canvas state. -->
           <CanvasPanel
-            v-if="showCanvas"
+            v-for="id in liveCanvasIds"
+            v-show="id === activeCanvasId"
+            :key="`canvas:${id}`"
+            :canvas-id="id"
             class="center-fill"
             @select-paper="onCanvasSelectPaper"
             @close="closeCanvas()"
           />
           <SnippetLibraryView
-            v-else-if="showSnippetLibrary && activeSnippetLibraryId"
+            v-if="showSnippetLibrary && activeSnippetLibraryId"
             :library-id="activeSnippetLibraryId"
             class="center-fill"
             @open-paper="onSnippetOpenPaper"
@@ -1092,7 +1029,9 @@ watch(
             class="center-fill"
             @select-paper="onWritingSelectPaper"
           />
-          <div v-else class="center-fill">
+          <!-- The canvas panels above are a separate v-for, so the fallback has
+               to exclude canvas mode explicitly rather than ride the chain. -->
+          <div v-else-if="!showCanvas" class="center-fill">
             <PaperList />
           </div>
         </template>

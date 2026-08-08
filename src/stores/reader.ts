@@ -5,15 +5,35 @@ import type { Highlight, ReadingState } from '../types'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { recordPaperAccess } from '../utils/recentPapers'
 
+/** What a tab shows. Absent on persisted tabs written before feature tabs were
+ *  folded in here, which were all papers — hence `paper` as the implied default. */
+export type TabKind = 'paper' | 'canvas' | 'snippets' | 'writing'
+
 export interface Tab {
+  /** Unique tab key. Papers use the bare paper slug — unchanged, so state
+   *  persisted before feature tabs existed still loads — and feature tabs use
+   *  `${kind}:${refId}`, which can't collide with a slug. */
   slug: string
   title: string
+  /** Absent = 'paper'. See TabKind. */
+  kind?: TabKind
+  /** Canvas id / snippet-library id / writing-list id. Papers: absent. */
+  refId?: string
   /** Main document format (see PaperMeta.file_type). Absent = pdf.
    *  Tabs persisted before this field existed lack it — MainView falls back
    *  to the library index when routing to a viewer. */
   fileType?: string
   /** Chrome-style tab group this tab belongs to. Absent = ungrouped. */
   groupId?: string
+}
+
+export function tabKind(tab: Tab): TabKind {
+  return tab.kind ?? 'paper'
+}
+
+/** The `slug` a feature tab is filed under. */
+export function featureTabKey(kind: Exclude<TabKind, 'paper'>, refId: string): string {
+  return `${kind}:${refId}`
 }
 
 /** Chrome's tab-group palette. */
@@ -32,18 +52,31 @@ export interface TabGroup {
 
 interface PersistedTabs {
   tabs: Tab[]
+  /** Persisted under the old name; holds the active tab's key, whatever its kind. */
   activeSlug: string | null
   groups: TabGroup[]
 }
 
 export const useReaderStore = defineStore('reader', () => {
   const tabs      = ref<Tab[]>([])
-  const activeSlug = ref<string | null>(null)
   const tabGroups = ref<TabGroup[]>([])
+
+  // The active tab's key, of any kind — null means the permanent home tab.
+  const activeKey = ref<string | null>(null)
+  const activeTab = computed<Tab | null>(() =>
+    tabs.value.find(t => t.slug === activeKey.value) ?? null)
+
+  // The active PAPER's slug, or null when a feature tab (or home) is active.
+  // Everything that asks "is a paper open?" reads this, so feature tabs joining
+  // the same list stayed invisible to those checks.
+  const activeSlug = computed<string | null>(() => {
+    const tab = activeTab.value
+    return tab && tabKind(tab) === 'paper' ? tab.slug : null
+  })
 
   // Backward-compat computed props (PdfViewer uses these)
   const openSlug  = computed(() => activeSlug.value)
-  const openTitle = computed(() => tabs.value.find(t => t.slug === activeSlug.value)?.title ?? '')
+  const openTitle = computed(() => activeTab.value?.title ?? '')
 
   // Per-slug state, keyed by slug and kept across tab switches. This lets each
   // tab's PdfViewer be preserved (via <KeepAlive>) and switched to instantly:
@@ -149,7 +182,7 @@ export const useReaderStore = defineStore('reader', () => {
       tab.groupId = groupId
       // Joining a collapsed group would make the tab vanish; open it instead.
       const group = groupById(groupId)
-      if (group?.collapsed && activeSlug.value === slug) group.collapsed = false
+      if (group?.collapsed && activeKey.value === slug) group.collapsed = false
     } else {
       delete tab.groupId
     }
@@ -172,13 +205,13 @@ export const useReaderStore = defineStore('reader', () => {
     group.collapsed = collapsed
     // Collapsing the group holding the active tab would hide what's on screen,
     // so hand activation to the nearest tab outside it (Chrome does the same).
-    if (collapsed && activeSlug.value) {
-      const active = tabs.value.find(t => t.slug === activeSlug.value)
-      if (active?.groupId === id) {
+    if (collapsed && activeTab.value) {
+      const active = activeTab.value
+      if (active.groupId === id) {
         const idx = tabs.value.indexOf(active)
         const outside = [...tabs.value.slice(idx + 1), ...tabs.value.slice(0, idx).reverse()]
           .find(t => t.groupId !== id)
-        activeSlug.value = outside?.slug ?? null
+        activeKey.value = outside?.slug ?? null
       }
     }
   }
@@ -216,8 +249,27 @@ export const useReaderStore = defineStore('reader', () => {
       existing.title = title  // update title in case it changed
       if (fileType && !existing.fileType) existing.fileType = fileType
     }
-    activeSlug.value = slug
+    activeKey.value = slug
     revealTab(slug)
+  }
+
+  /**
+   * Open (or re-focus) a canvas / snippet-library / writing tab. These live in
+   * the same list as paper tabs so they inherit ordering, grouping and
+   * persistence — the whole point of keying them into `tabs`.
+   */
+  function openFeatureTab(kind: Exclude<TabKind, 'paper'>, refId: string, title: string) {
+    const key = featureTabKey(kind, refId)
+    const existing = tabs.value.find(t => t.slug === key)
+    if (!existing) tabs.value.push({ slug: key, title, kind, refId })
+    else existing.title = title   // the canvas/list may have been renamed
+    activeKey.value = key
+    revealTab(key)
+  }
+
+  /** Tabs of one feature kind, in tab-bar order. */
+  function featureTabs(kind: Exclude<TabKind, 'paper'>): Tab[] {
+    return tabs.value.filter(t => t.kind === kind)
   }
 
   function replacePaperSlug(oldSlug: string, newSlug: string, title?: string) {
@@ -226,17 +278,17 @@ export const useReaderStore = defineStore('reader', () => {
       existing.slug = newSlug
       if (title) existing.title = title
     }
-    if (activeSlug.value === oldSlug) {
-      activeSlug.value = newSlug
+    if (activeKey.value === oldSlug) {
+      activeKey.value = newSlug
     }
   }
 
   function switchTab(slug: string) {
-    if (activeSlug.value === slug) return
+    if (activeKey.value === slug) return
     if (!tabs.value.find(t => t.slug === slug)) return
     // Note: switching to an already-open tab is NOT a new "open" — recency is
     // recorded only in openPaper, so "最近阅读" stays ordered by open order.
-    activeSlug.value = slug
+    activeKey.value = slug
     revealTab(slug)
   }
 
@@ -244,10 +296,12 @@ export const useReaderStore = defineStore('reader', () => {
     const idx = tabs.value.findIndex(t => t.slug === slug)
     if (idx === -1) return
     tabs.value.splice(idx, 1)
-    if (activeSlug.value === slug) {
+    if (activeKey.value === slug) {
+      // The neighbour taking over may be a feature tab; MainView follows
+      // `activeTab`, so the centre pane switches workspace along with it.
       const next = tabs.value[Math.min(idx, tabs.value.length - 1)]
-      activeSlug.value = next?.slug ?? null
-      if (activeSlug.value) revealTab(activeSlug.value)
+      activeKey.value = next?.slug ?? null
+      if (activeKey.value) revealTab(activeKey.value)
     }
     // Closing the last member retires the group.
     normalizeGroups()
@@ -260,8 +314,9 @@ export const useReaderStore = defineStore('reader', () => {
     if (activeSlug.value) closeTab(activeSlug.value)
   }
 
+  /** Hand activation back to the permanent home tab. */
   function showList() {
-    activeSlug.value = null
+    activeKey.value = null
   }
 
   function reorderTabs(fromIdx: number, insertBefore: number) {
@@ -300,14 +355,30 @@ export const useReaderStore = defineStore('reader', () => {
     normalizeGroups()
   }
 
-  /** Remove any tabs whose slugs are no longer in the library paper list. */
+  /** Remove any PAPER tabs whose slugs are no longer in the library paper list.
+   *  Feature tabs are deliberately untouched — they aren't papers, and this runs
+   *  on every library load, so including them would wipe them all. They get
+   *  pruned against their own targets by `pruneFeatureTabs`. */
   function pruneStaleTabs(validSlugs: Set<string>) {
-    const before = tabs.value.length
-    const removed = tabs.value.filter(t => !validSlugs.has(t.slug))
-    tabs.value = tabs.value.filter(t => validSlugs.has(t.slug))
+    const isStale = (t: Tab) => tabKind(t) === 'paper' && !validSlugs.has(t.slug)
+    const removed = tabs.value.filter(isStale)
+    if (!removed.length) return
+    tabs.value = tabs.value.filter(t => !isStale(t))
     removed.forEach(t => discardTabState(t.slug))
-    if (tabs.value.length !== before && activeSlug.value && !validSlugs.has(activeSlug.value)) {
-      activeSlug.value = tabs.value[0]?.slug ?? null
+    if (removed.some(t => t.slug === activeKey.value)) {
+      activeKey.value = tabs.value[0]?.slug ?? null
+    }
+    normalizeGroups()
+  }
+
+  /** Drop feature tabs whose target is gone (canvas / library / list deleted). */
+  function pruneFeatureTabs(kind: Exclude<TabKind, 'paper'>, validIds: Set<string>) {
+    const isStale = (t: Tab) => t.kind === kind && !validIds.has(t.refId ?? '')
+    const removed = tabs.value.filter(isStale)
+    if (!removed.length) return
+    tabs.value = tabs.value.filter(t => !isStale(t))
+    if (removed.some(t => t.slug === activeKey.value)) {
+      activeKey.value = tabs.value[0]?.slug ?? null
     }
     normalizeGroups()
   }
@@ -320,7 +391,7 @@ export const useReaderStore = defineStore('reader', () => {
     try {
       const snapshot = JSON.parse(JSON.stringify({
         tabs: tabs.value,
-        activeSlug: activeSlug.value,
+        activeSlug: activeKey.value,
         groups: tabGroups.value,
       })) as PersistedTabs
       localStorage.setItem(_tabKey(libraryPath), JSON.stringify(snapshot))
@@ -347,14 +418,30 @@ export const useReaderStore = defineStore('reader', () => {
       }))
   }
 
+  /** A `kind` we don't recognise (hand-edited or newer state) would render as a
+   *  tab nothing can show, so it falls back to a paper tab. */
+  function normalizePersistedTabs(value: unknown): Tab[] {
+    if (!Array.isArray(value)) return []
+    const kinds: TabKind[] = ['paper', 'canvas', 'snippets', 'writing']
+    return value
+      .filter((t): t is Tab => !!t && typeof t === 'object' && typeof (t as Tab).slug === 'string')
+      .map(t => {
+        const kind = t.kind && kinds.includes(t.kind) ? t.kind : 'paper'
+        // A feature tab with no target can't be routed anywhere — demote it too.
+        return kind === 'paper' || !t.refId
+          ? { ...t, kind: undefined, refId: undefined }
+          : { ...t, kind }
+      })
+  }
+
   function applyPersisted(state: PersistedTabs) {
     tabs.value = state.tabs
-    activeSlug.value = state.activeSlug
+    activeKey.value = state.activeSlug
     tabGroups.value = state.groups
     // Drops dangling groupIds and restores contiguity, so hand-edited or
     // pre-groups state still lands in a consistent shape.
     normalizeGroups()
-    if (activeSlug.value) revealTab(activeSlug.value)
+    if (activeKey.value) revealTab(activeKey.value)
   }
 
   async function loadTabs(libraryPath: string) {
@@ -364,7 +451,7 @@ export const useReaderStore = defineStore('reader', () => {
       if (raw) {
         const state = JSON.parse(raw) as Partial<PersistedTabs>
         legacyState = {
-          tabs: Array.isArray(state.tabs) ? state.tabs : [],
+          tabs: normalizePersistedTabs(state.tabs),
           activeSlug: typeof state.activeSlug === 'string' ? state.activeSlug : null,
           groups: normalizePersistedGroups(state.groups),
         }
@@ -376,7 +463,7 @@ export const useReaderStore = defineStore('reader', () => {
       const state = uiState.tabs as Partial<PersistedTabs> | undefined
       if (state && Array.isArray(state.tabs)) {
         applyPersisted({
-          tabs: state.tabs,
+          tabs: normalizePersistedTabs(state.tabs),
           activeSlug: typeof state.activeSlug === 'string' ? state.activeSlug : null,
           groups: normalizePersistedGroups(state.groups),
         })
@@ -395,7 +482,7 @@ export const useReaderStore = defineStore('reader', () => {
       }
     }
     tabs.value = []
-    activeSlug.value = null
+    activeKey.value = null
     tabGroups.value = []
   }
 
@@ -495,6 +582,8 @@ export const useReaderStore = defineStore('reader', () => {
   return {
     tabs,
     activeSlug,
+    activeKey,
+    activeTab,
     tabGroups,
     groupById,
     tabsInGroup,
@@ -518,8 +607,11 @@ export const useReaderStore = defineStore('reader', () => {
     scrollToHighlightId,
     pendingPageJump,
     openPaper,
+    openFeatureTab,
+    featureTabs,
     replacePaperSlug,
     pruneStaleTabs,
+    pruneFeatureTabs,
     switchTab,
     closeTab,
     closePaper,

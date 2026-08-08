@@ -5,7 +5,10 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import VditorEditor from '../VditorEditor.vue'
 import { useLibraryStore } from '../../stores/library'
+import { broadcastNoteSaved, onNoteSavedElsewhere } from '../../utils/noteSync'
+import { toDisplayMarkdown, toStoredMarkdown, savePastedImage } from '../../utils/noteAssets'
 import type { Note } from '../../types'
+import type { UnlistenFn } from '@tauri-apps/api/event'
 
 const library = useLibraryStore()
 
@@ -53,8 +56,10 @@ const editorKey = ref(0)
 const currentContent = ref('')
 const saving = ref(false)
 const saveError = ref('')
+const editorRef = ref<InstanceType<typeof VditorEditor> | null>(null)
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let openNoteSeq = 0
+let unlistenNoteSaved: UnlistenFn | null = null
 
 function createNoteWindowLabel() {
   const suffix = Math.random().toString(36).slice(2, 10)
@@ -106,7 +111,9 @@ async function openNote(note: Note) {
 
   let md = ''
   try {
-    md = await invoke<string>('get_note', { slug: props.slug, noteId: note.id })
+    const stored = await invoke<string>('get_note', { slug: props.slug, noteId: note.id })
+    // Swap `assets/…` for renderable blob URLs; `flushSave` swaps them back.
+    md = props.slug ? await toDisplayMarkdown(props.slug, stored) : stored
   } catch {
     md = ''
   }
@@ -222,13 +229,23 @@ async function flushSave(slug: string, noteId: string, content: string) {
   saving.value = true
   saveError.value = ''
   try {
-    await invoke('save_note', { slug, noteId, content })
+    // Only relative asset paths go to disk — and to the other window, whose blob
+    // URLs are its own and would be meaningless there.
+    const stored = toStoredMarkdown(content)
+    await invoke('save_note', { slug, noteId, content: stored })
     loadedContent.value = content
+    broadcastNoteSaved(slug, noteId, stored)
   } catch (e) {
     saveError.value = String(e)
   } finally {
     saving.value = false
   }
+}
+
+/** Cmd+V of an image: store it under notes/assets and render it from there. */
+async function uploadNoteImage(file: File): Promise<string | null> {
+  if (!props.slug) return null
+  return savePastedImage(props.slug, file)
 }
 
 function onContentChange(markdown: string) {
@@ -276,12 +293,41 @@ async function handleNotesUpdated(event: Event) {
   }
 }
 
-onMounted(() => {
+// A note edited in its standalone window autosaves there; without this the
+// sidebar would keep showing the stale copy AND overwrite the window's work on
+// its next flush (tab switch, unmount, opening another note).
+async function handleNoteSavedElsewhere(payload: { slug: string; noteId: string; content: string }) {
+  if (payload.slug !== props.slug) return
+  // Only worth re-reading while the list is on screen; the editor view refreshes
+  // it on the way back out, and this fires on every autosave over there.
+  if (view.value === 'list') void loadList(payload.slug)
+  if (activeNote.value?.id !== payload.noteId) return
+  // Unsaved local edits win: replacing text mid-typing is worse than letting the
+  // two copies diverge until whoever saves next.
+  if (currentContent.value !== loadedContent.value) return
+  // The payload holds relative asset paths; resolve them for this webview.
+  const display = await toDisplayMarkdown(payload.slug, payload.content)
+  if (activeNote.value?.id !== payload.noteId) return
+  loadedContent.value = display
+  currentContent.value = display
+  // A remount is the fallback when the editor hasn't finished initialising.
+  if (!editorRef.value?.setContent(display)) editorKey.value++
+}
+
+let noteSyncDisposed = false
+
+onMounted(async () => {
   window.addEventListener('argus-notes-updated', handleNotesUpdated)
+  const unlisten = await onNoteSavedElsewhere(handleNoteSavedElsewhere)
+  // The subscription can resolve after a fast unmount — drop it right away.
+  if (noteSyncDisposed) unlisten()
+  else unlistenNoteSaved = unlisten
 })
 
 onBeforeUnmount(async () => {
+  noteSyncDisposed = true
   window.removeEventListener('argus-notes-updated', handleNotesUpdated)
+  unlistenNoteSaved?.()
   await maybeSave()
 })
 
@@ -422,8 +468,10 @@ function fmtDate(iso: string) {
 
       <div class="editor-wrap">
         <VditorEditor
+          ref="editorRef"
           :key="editorKey"
           :initial-content="loadedContent"
+          :image-uploader="uploadNoteImage"
           @change="onContentChange"
         />
       </div>

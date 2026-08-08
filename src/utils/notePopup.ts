@@ -93,13 +93,43 @@ export function forgetNotePopupSize(hlId: string) {
   persistSizes()
 }
 
-// Width/height are pinned by the inline style below, so the box can only change
-// when the user drags the CSS resize grabber — no need to filter content resizes.
-export function observeNotePopupResize(el: HTMLElement, hlId: string): () => void {
-  if (typeof ResizeObserver === 'undefined') return () => {}
-  const ro = new ResizeObserver(() => setNotePopupSize(hlId, el.offsetWidth, el.offsetHeight))
-  ro.observe(el)
-  return () => ro.disconnect()
+// Resizing is driven by an explicit grabber rather than CSS `resize: both`.
+// Two reasons the native one didn't work here: its hit area is a ~10px corner
+// that the note body's own scroller wins on hit-test, so the grab mostly missed;
+// and it resizes by mutating inline width/height, which is exactly what the
+// reactive style binding below writes — a ResizeObserver reading the result back
+// into the store made the two fight each other every frame.
+//
+// Sizing off the pointer delta instead keeps the store the single source of
+// truth: nothing reads the DOM, so there is no loop to settle.
+export function startNotePopupResize(e: PointerEvent, hlId: string, origin: { x: number; y: number }) {
+  const handle = e.currentTarget as HTMLElement
+  const start = notePopupSizeFor(hlId)
+  const startX = e.clientX
+  const startY = e.clientY
+  // Capture so the drag survives the pointer outrunning the (still-growing) box.
+  handle.setPointerCapture?.(e.pointerId)
+
+  const onMove = (ev: PointerEvent) => {
+    // The popup is fixed-positioned at `origin`, so its own offset — not a flat
+    // vw/vh cap — is what decides how far it can grow before leaving the screen.
+    const maxW = Math.max(NOTE_POPUP_MIN_W, window.innerWidth - origin.x - 8)
+    const maxH = Math.max(NOTE_POPUP_MIN_H, window.innerHeight - origin.y - 8)
+    setNotePopupSize(
+      hlId,
+      Math.min(maxW, Math.max(NOTE_POPUP_MIN_W, start.w + ev.clientX - startX)),
+      Math.min(maxH, Math.max(NOTE_POPUP_MIN_H, start.h + ev.clientY - startY)),
+    )
+  }
+  const onUp = (ev: PointerEvent) => {
+    handle.releasePointerCapture?.(ev.pointerId)
+    handle.removeEventListener('pointermove', onMove)
+    handle.removeEventListener('pointerup', onUp)
+    handle.removeEventListener('pointercancel', onUp)
+  }
+  handle.addEventListener('pointermove', onMove)
+  handle.addEventListener('pointerup', onUp)
+  handle.addEventListener('pointercancel', onUp)
 }
 
 // Anchor the popup at the click point, pulled back inside the viewport — a window

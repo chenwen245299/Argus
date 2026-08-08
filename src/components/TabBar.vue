@@ -4,47 +4,51 @@ import { useI18n } from 'vue-i18n'
 import { Icon } from '@iconify/vue'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import type { UnlistenFn } from '@tauri-apps/api/event'
-import { useReaderStore, TAB_GROUP_COLORS, type Tab, type TabGroup, type TabGroupColor } from '../stores/reader'
+import { useReaderStore, TAB_GROUP_COLORS, tabKind, type Tab, type TabGroup, type TabGroupColor } from '../stores/reader'
 import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
-import { useCanvasStore } from '../stores/canvas'
+import { libraries as snippetLibraries } from '../stores/snippetLibrary'
 import { titleInitialCaps } from '../utils/text'
 
 const { t } = useI18n()
 const reader = useReaderStore()
 const selection = useSelectionStore()
 const collections = useCollectionsStore()
-const canvasStore = useCanvasStore()
-
-type SnippetLibraryTab = {
-  id: string
-  name: string
-  emoji?: string
-}
-
-type WritingTab = {
-  id: string | null   // null = the "Library"/all-papers view
-  name: string
-}
 
 const props = defineProps<{
   rightSidebarOpen?: boolean
-  snippetLibraryTabs?: SnippetLibraryTab[]
-  snippetLibraryVisible?: boolean
-  activeSnippetLibraryId?: string | null
-  writingTabs?: WritingTab[]
-  writingVisible?: boolean
-  activeWritingId?: string | null
 }>()
 const emit = defineEmits<{
   'toggle-right-sidebar': []
-  'show-home': []
-  'show-canvas': []
-  'switch-snippet-library': [libraryId: string]
-  'close-snippet-library-tab': [libraryId: string]
-  'switch-writing': [id: string | null]
-  'close-writing-tab': [id: string | null]
 }>()
+
+/** Per-kind tab chrome. Feature tabs used to be three hand-written blocks; they
+ *  now render through the same path as paper tabs, so this is the only place
+ *  their appearance differs. */
+const TAB_ICONS: Record<string, string> = {
+  paper: 'fluent:document-24-regular',
+  canvas: 'fluent:share-android-24-regular',
+  snippets: 'fluent:folder-24-regular',
+  writing: 'fluent:document-text-24-regular',
+}
+
+function iconFor(tab: Tab) {
+  return TAB_ICONS[tabKind(tab)] ?? TAB_ICONS.paper
+}
+
+/** A snippet library with a custom emoji shows it in place of the folder icon. */
+function emojiFor(tab: Tab): string | null {
+  if (tabKind(tab) !== 'snippets') return null
+  return snippetLibraries.value.find(lib => lib.id === tab.refId)?.emoji ?? null
+}
+
+function labelFor(tab: Tab) {
+  return tabKind(tab) === 'paper' ? titleInitialCaps(tab.title) : tab.title
+}
+
+function isActive(tab: Tab) {
+  return tab.slug === reader.activeKey
+}
 
 const isFullscreenLayout = ref(false)
 const isMaximized = ref(false)
@@ -54,17 +58,19 @@ let unlistenResize: UnlistenFn | null = null
 let refreshTimers: number[] = []
 
 // ── Tab groups ────────────────────────────────────────────────────────────────
-// Paper tabs render as a flat list of segments: either a lone tab or a group
-// (chip + its members, which the store keeps contiguous). Every draggable slot
-// carries `data-drop-index` — its index in `reader.tabs` — so drop targets stay
-// correct even when a collapsed group hides its members from the DOM.
+// Every tab — paper, canvas, snippet library, writing — renders as a flat list of
+// segments: either a lone tab or a group (chip + its members, which the store
+// keeps contiguous). Every draggable slot carries `data-drop-index` — its index
+// in `reader.tabs` — so drop targets stay correct even when a collapsed group
+// hides its members from the DOM. None of this cares what a tab shows, which is
+// why feature tabs get dragging and grouping just by living in `reader.tabs`.
 
-type PaperSegment =
+type TabSegment =
   | { kind: 'tab'; key: string; tab: Tab; index: number }
   | { kind: 'group'; key: string; group: TabGroup; index: number; items: { tab: Tab; index: number }[] }
 
-const paperSegments = computed<PaperSegment[]>(() => {
-  const out: PaperSegment[] = []
+const tabSegments = computed<TabSegment[]>(() => {
+  const out: TabSegment[] = []
   reader.tabs.forEach((tab, index) => {
     const group = tab.groupId ? reader.groupById(tab.groupId) : null
     if (!group) {
@@ -82,7 +88,7 @@ const paperSegments = computed<PaperSegment[]>(() => {
 })
 
 function groupHasActive(group: TabGroup) {
-  return reader.tabs.some(t => t.groupId === group.id && t.slug === reader.activeSlug) && !canvasStore.isShown
+  return reader.tabs.some(t => t.groupId === group.id && isActive(t))
 }
 
 // ── Tab drag-and-drop (pointer-based, avoids macOS native DnD green +) ────────
@@ -146,7 +152,7 @@ function onTabMouseDown(e: MouseEvent, idx: number) {
 // down — so a finished drag is remembered here to stop it toggling the group.
 let chipDragged = false
 
-function onGroupChipMouseDown(e: MouseEvent, segment: PaperSegment) {
+function onGroupChipMouseDown(e: MouseEvent, segment: TabSegment) {
   if (e.button !== 0 || segment.kind !== 'group') return
   beginDrag(e, () => { dragGroupId.value = segment.group.id }, dropIdx => {
     if (dragGroupId.value) reader.reorderTabGroup(dragGroupId.value, dropIdx)
@@ -232,37 +238,13 @@ const homeTitle = computed(() => {
 })
 
 function showHome() {
-  canvasStore.isShown = false
-  reader.showList()
-  emit('show-home')
-}
-
-function showCanvas() {
-  canvasStore.isShown = true
-  reader.showList()
-  emit('show-canvas')
-}
-
-function closeCanvasTab() {
-  void canvasStore.closeCurrentCanvas()
   reader.showList()
 }
 
+// One activation path for every tab kind — MainView follows `reader.activeTab`
+// and swaps the centre pane accordingly.
 function switchTab(slug: string) {
-  canvasStore.isShown = false
   reader.switchTab(slug)
-}
-
-function switchSnippetLibrary(libraryId: string) {
-  canvasStore.isShown = false
-  reader.showList()
-  emit('switch-snippet-library', libraryId)
-}
-
-function switchWriting(id: string | null) {
-  canvasStore.isShown = false
-  reader.showList()
-  emit('switch-writing', id)
 }
 
 function startDrag(e: MouseEvent) {
@@ -339,10 +321,11 @@ async function closeWindow() {
 
     <!-- Tabs -->
     <div ref="tabsScrollRef" class="tabs-scroll">
-      <!-- Permanent home tab (current collection, cannot be closed) -->
+      <!-- Permanent home tab: always first, never dragged, never closed. It is
+           the ONLY fixed tab — everything after it is reorderable. -->
       <div
         class="tab tab-home"
-        :class="{ active: !reader.activeSlug && !canvasStore.isShown && !props.snippetLibraryVisible && !props.writingVisible }"
+        :class="{ active: !reader.activeTab }"
         :title="homeTitle"
         @click="showHome()"
       >
@@ -350,74 +333,27 @@ async function closeWindow() {
         <span class="tab-title">{{ homeTitle }}</span>
       </div>
 
-      <!-- Canvas tab (always shown while a canvas is loaded, regardless of active state) -->
-      <div
-        v-if="canvasStore.currentCanvas"
-        class="tab tab-canvas"
-        :class="{ active: canvasStore.isShown }"
-        :title="canvasStore.currentCanvas.name"
-        @click="showCanvas()"
-      >
-        <Icon icon="fluent:share-android-24-regular" class="tab-icon" width="13" height="13" />
-        <span class="tab-title">{{ canvasStore.currentCanvas.name }}</span>
-        <button class="tab-close" @click.stop="closeCanvasTab">
-          <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
-        </button>
-      </div>
-
-      <!-- Snippet library tabs -->
-      <div
-        v-for="tab in props.snippetLibraryTabs ?? []"
-        :key="`snippet:${tab.id}`"
-        class="tab tab-snippet"
-        :class="{ active: props.snippetLibraryVisible && props.activeSnippetLibraryId === tab.id && !reader.activeSlug && !canvasStore.isShown }"
-        :title="tab.name"
-        @click="switchSnippetLibrary(tab.id)"
-      >
-        <span v-if="tab.emoji" class="snippet-tab-emoji">{{ tab.emoji }}</span>
-        <Icon v-else icon="fluent:folder-24-regular" class="tab-icon" width="13" height="13" />
-        <span class="tab-title">{{ tab.name }}</span>
-        <button class="tab-close" @click.stop="emit('close-snippet-library-tab', tab.id)">
-          <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
-        </button>
-      </div>
-
-      <!-- Writing workspace tabs (one per open reference list; null = Library) -->
-      <div
-        v-for="tab in props.writingTabs ?? []"
-        :key="`writing:${tab.id ?? '__all__'}`"
-        class="tab tab-writing"
-        :class="{ active: props.writingVisible && props.activeWritingId === tab.id && !reader.activeSlug && !canvasStore.isShown }"
-        :title="tab.name"
-        @click="switchWriting(tab.id)"
-      >
-        <Icon :icon="tab.id === null ? 'fluent:grid-24-regular' : 'fluent:document-text-24-regular'" class="tab-icon" width="13" height="13" />
-        <span class="tab-title">{{ tab.name }}</span>
-        <button class="tab-close" @click.stop="emit('close-writing-tab', tab.id)">
-          <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
-        </button>
-      </div>
-
-      <!-- PDF tabs, grouped Chrome-style -->
-      <template v-for="segment in paperSegments" :key="segment.key">
+      <!-- Every tab kind, grouped Chrome-style -->
+      <template v-for="segment in tabSegments" :key="segment.key">
         <!-- Ungrouped tab -->
         <div
           v-if="segment.kind === 'tab'"
           class="tab tab-paper"
           :class="{
-            active: segment.tab.slug === reader.activeSlug && !canvasStore.isShown,
+            active: isActive(segment.tab),
             'tab-dragging': dragFrom === segment.index,
             'drop-before': dropAt === segment.index && dragFrom !== segment.index,
             'drop-after': dropAt === segment.index + 1 && dragFrom !== segment.index,
           }"
           :data-drop-index="segment.index"
-          :title="titleInitialCaps(segment.tab.title)"
+          :title="labelFor(segment.tab)"
           @click="switchTab(segment.tab.slug)"
           @mousedown="onTabMouseDown($event, segment.index)"
           @contextmenu.prevent.stop="openTabMenu($event, segment.tab.slug)"
         >
-          <Icon icon="fluent:document-24-regular" class="tab-icon" width="13" height="13" />
-          <span class="tab-title">{{ titleInitialCaps(segment.tab.title) }}</span>
+          <span v-if="emojiFor(segment.tab)" class="snippet-tab-emoji">{{ emojiFor(segment.tab) }}</span>
+          <Icon v-else :icon="iconFor(segment.tab)" class="tab-icon" width="13" height="13" />
+          <span class="tab-title">{{ labelFor(segment.tab) }}</span>
           <button class="tab-close" @click.stop="reader.closeTab(segment.tab.slug)">
             <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
           </button>
@@ -454,19 +390,20 @@ async function closeWindow() {
               :key="item.tab.slug"
               class="tab tab-paper tab-in-group"
               :class="{
-                active: item.tab.slug === reader.activeSlug && !canvasStore.isShown,
+                active: isActive(item.tab),
                 'tab-dragging': dragFrom === item.index,
                 'drop-before': dropAt === item.index && dragFrom !== item.index,
                 'drop-after': dropAt === item.index + 1 && dragFrom !== item.index,
               }"
               :data-drop-index="item.index"
-              :title="titleInitialCaps(item.tab.title)"
+              :title="labelFor(item.tab)"
               @click="switchTab(item.tab.slug)"
               @mousedown="onTabMouseDown($event, item.index)"
               @contextmenu.prevent.stop="openTabMenu($event, item.tab.slug)"
             >
-              <Icon icon="fluent:document-24-regular" class="tab-icon" width="13" height="13" />
-              <span class="tab-title">{{ titleInitialCaps(item.tab.title) }}</span>
+              <span v-if="emojiFor(item.tab)" class="snippet-tab-emoji">{{ emojiFor(item.tab) }}</span>
+              <Icon v-else :icon="iconFor(item.tab)" class="tab-icon" width="13" height="13" />
+              <span class="tab-title">{{ labelFor(item.tab) }}</span>
               <button class="tab-close" @click.stop="reader.closeTab(item.tab.slug)">
                 <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
               </button>

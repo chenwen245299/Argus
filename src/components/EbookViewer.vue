@@ -16,7 +16,7 @@ import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import { renderMarkdown } from '../utils/renderMarkdown'
-import { notePopupStyle, clampNotePopupPos, observeNotePopupResize, forgetNotePopupSize } from '../utils/notePopup'
+import { notePopupStyle, clampNotePopupPos, startNotePopupResize, forgetNotePopupSize } from '../utils/notePopup'
 import type { EbookManifest, Highlight } from '../types'
 
 // One instance per open ebook tab; `slug` never changes for an instance.
@@ -173,7 +173,6 @@ const hlNotePopup = ref<{ x: number; y: number; hlId: string } | null>(null)
 const hlNoteText = ref('')
 const hlNoteEditing = ref(false)
 const noteTextareaRef = ref<HTMLTextAreaElement | null>(null)
-const notePopupRef = ref<HTMLElement | null>(null)
 const hlColorPopup = ref<{ x: number; y: number; hlId: string } | null>(null)
 
 // Notes are authored as markdown + $TeX$ and rendered on the view side, matching
@@ -190,27 +189,26 @@ function openNotePopup(x: number, y: number, hlId: string) {
   hlNotePopup.value = { ...clampNotePopupPos(x, y, hlId), hlId }
 }
 
-// Track the popup element only while it exists; v-if tears it down between opens.
-let stopNoteResizeObserver: (() => void) | null = null
-// Sizes are per-highlight, so the observer is rebound whenever EITHER the
-// element or the highlight changes: clicking straight from one highlight's note
-// to another reuses the same element, and a stale binding would write the new
-// popup's size onto the previous highlight.
-watch([notePopupRef, () => hlNotePopup.value?.hlId], ([el, hlId]) => {
-  stopNoteResizeObserver?.()
-  stopNoteResizeObserver = el && hlId ? observeNotePopupResize(el, hlId) : null
-})
-onUnmounted(() => stopNoteResizeObserver?.())
+// Sizes are stored per-highlight, so the drag always names the highlight the
+// popup is currently showing rather than whatever it was bound to at mount.
+function onNoteResizeStart(e: PointerEvent) {
+  const p = hlNotePopup.value
+  if (!p) return
+  e.stopPropagation()
+  startNotePopupResize(e, p.hlId, { x: p.x, y: p.y })
+}
 
 // ── Lifecycle (global listeners follow the ACTIVE tab, not mount/unmount) ────
 function addGlobalListeners() {
   window.addEventListener('mouseup', onWindowMouseUp)
+  window.addEventListener('mousedown', onWindowMouseDown)
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('resize', onWindowResize)
   document.addEventListener('selectionchange', onSelectionChange)
 }
 function removeGlobalListeners() {
   window.removeEventListener('mouseup', onWindowMouseUp)
+  window.removeEventListener('mousedown', onWindowMouseDown)
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('resize', onWindowResize)
   document.removeEventListener('selectionchange', onSelectionChange)
@@ -642,7 +640,18 @@ function rangeFromOffsets(root: HTMLElement, start: number, end: number): Range 
 }
 
 // ── Selection popup ───────────────────────────────────────────────────────────
+/** True while a drag that began inside the note popup is in flight. */
+let noteDragOrigin = false
+
+function onWindowMouseDown(e: MouseEvent) {
+  noteDragOrigin = !!(e.target as HTMLElement).closest?.('.hl-note-popup')
+}
+
 function onWindowMouseUp(e: MouseEvent) {
+  // A drag that STARTED in the note popup is a text selection inside it — the
+  // release often lands outside, and dismissing there would tear down the very
+  // text the user is selecting (and with it the selection they meant to copy).
+  if (noteDragOrigin) { noteDragOrigin = false; return }
   if ((e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup')) return
   hlNotePopup.value = null
   if (e.button !== 2) hlColorPopup.value = null
@@ -1500,12 +1509,11 @@ defineExpose({ closeToList: handleBack })
     <!-- Highlight note popup -->
     <div
       v-if="hlNotePopup"
-      ref="notePopupRef"
       class="hl-note-popup"
       :style="hlNotePopupStyle"
       @click.stop
     >
-      <div v-if="!hlNoteEditing" class="hl-note-view" @dblclick="startNoteEdit">
+      <div v-if="!hlNoteEditing" class="hl-note-view selectable-text" @dblclick="startNoteEdit">
         <div v-if="hlNoteText" class="hl-note-text" v-html="hlNoteHtml" />
         <span v-else class="hl-note-placeholder">{{ t('pdf.notePlaceholder') }}</span>
       </div>
@@ -1519,6 +1527,7 @@ defineExpose({ closeToList: handleBack })
         @keydown.esc.stop="saveNote(); hlNoteEditing = false"
         @keydown.meta.enter.stop="saveNote(); hlNoteEditing = false"
       />
+      <div class="hl-note-resizer" :title="t('pdf.noteResize')" @pointerdown="onNoteResizeStart" />
     </div>
 
     <!-- Highlight context popup -->
@@ -2095,8 +2104,11 @@ defineExpose({ closeToList: handleBack })
 .sel-style-btn.active { color: var(--accent); }
 .sel-translate-label { white-space: nowrap; }
 
-/* Resizable note window — `resize: both` sits on the frame (not the textarea) so
-   dragging works in view mode too. Size comes from the shared inline style. */
+/* Resizable note window — dragging is driven by the .hl-note-resizer grabber
+   below rather than CSS `resize` (see utils/notePopup.ts). Size comes from the
+   shared inline style, which clamps it, so no max-* here: a CSS cap the drag
+   doesn't know about would stop the box while the stored size kept growing.
+   Sizing sits on the frame, not the textarea, so view mode resizes too. */
 .hl-note-popup {
   position: fixed;
   z-index: 60;
@@ -2108,13 +2120,38 @@ defineExpose({ closeToList: handleBack })
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
-  resize: both;
   overflow: hidden;
   min-width: 200px;
   min-height: 90px;
-  max-width: 70vw;
-  max-height: 70vh;
 }
+
+/* Deliberately bigger than the ~10px native resizer, and stacked above the note
+   body so its scroller can't win the hit-test on the corner. */
+.hl-note-resizer {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  z-index: 2;
+  cursor: nwse-resize;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.hl-note-resizer::after {
+  content: '';
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid var(--text-tertiary);
+  border-bottom: 2px solid var(--text-tertiary);
+  opacity: 0.5;
+  transition: opacity 0.1s;
+}
+.hl-note-popup:hover .hl-note-resizer::after { opacity: 0.9; }
 .hl-note-view { flex: 1; min-height: 0; overflow: auto; font-size: 12.5px; cursor: text; }
 .hl-note-text { color: var(--text-primary); word-break: break-word; line-height: 1.55; }
 .hl-note-placeholder { color: var(--text-secondary); }

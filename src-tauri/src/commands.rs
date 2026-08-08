@@ -352,6 +352,38 @@ pub async fn save_note(
     Ok(())
 }
 
+/// Store an image pasted into a note. `data` is base64 (the clipboard bytes go
+/// over IPC, and base64 keeps that a compact string rather than a JSON array).
+/// Returns the note-relative path to put in the markdown, e.g. `assets/x.png`.
+#[tauri::command]
+pub async fn save_note_asset(
+    slug: String,
+    ext: String,
+    data: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<String, String> {
+    use base64::Engine;
+    let root = get_root(&state)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| format!("Invalid image data: {e}"))?;
+    paper::write_note_asset(&root, &slug, &ext, &bytes)
+}
+
+/// Read a note image back for display, as base64. The bytes are turned into a
+/// blob URL in the webview — they are never written into the markdown.
+#[tauri::command]
+pub async fn read_note_asset(
+    slug: String,
+    name: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<String, String> {
+    use base64::Engine;
+    let root = get_root(&state)?;
+    let bytes = paper::read_note_asset(&root, &slug, &name)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 #[tauri::command]
 pub async fn rename_note(
     slug: String,

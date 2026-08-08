@@ -117,6 +117,8 @@ pub fn run() {
             commands::get_note,
             commands::create_note,
             commands::save_note,
+            commands::save_note_asset,
+            commands::read_note_asset,
             commands::rename_note,
             commands::delete_note,
             commands::get_highlights,

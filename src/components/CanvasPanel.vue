@@ -46,10 +46,20 @@ const library = useLibraryStore()
 const reader = useReaderStore()
 const selectionStore = useSelectionStore()
 
+// Several canvases can be open as tabs, each with its own live CanvasPanel kept
+// mounted in the background (same shape as PdfViewer's per-slug instances). So
+// this instance works off ITS canvas id, never the store's "current" one.
+const props = defineProps<{ canvasId: string }>()
+
 const emit = defineEmits<{
   'select-paper': [slug: string]
   'close': []
 }>()
+
+const canvas = computed(() => canvasStore.canvasById(props.canvasId))
+/** Only the visible panel may act on global channels (keyboard, selection). */
+const isActiveCanvas = computed(() =>
+  canvasStore.isShown && canvasStore.activeCanvasId === props.canvasId)
 
 // ── Vue Flow setup ────────────────────────────────────────────────────────────
 
@@ -782,7 +792,7 @@ function extractCanvasEdges(): CEdge[] {
 // ── Render current canvas from store ─────────────────────────────────────────
 
 async function renderCanvas() {
-  const cv = canvasStore.currentCanvas
+  const cv = canvas.value
   if (!cv) return
   noteTitlesMap.value = new Map()
   nodes.value = buildVfNodes(cv.nodes)
@@ -802,11 +812,13 @@ async function renderCanvas() {
   history.reset()
 }
 
-// Watch for canvas switches (LeftSidebar calls canvasStore.openCanvas)
+// Render once this instance's canvas document arrives (it loads asynchronously
+// after the tab is opened). The id is stable for the life of the instance —
+// switching canvas tabs mounts a different instance, it doesn't reuse this one.
 watch(
-  () => canvasStore.currentCanvas?.id,
+  () => canvas.value?.id,
   async (id) => {
-    canvasStore.setSelectedNode(null)
+    if (isActiveCanvas.value) canvasStore.setSelectedNode(null)
     if (id) await renderCanvas()
     else { nodes.value = []; edges.value = [] }
   },
@@ -816,16 +828,16 @@ watch(
 // ── Persist canvas (debounced) ────────────────────────────────────────────────
 
 function triggerSave() {
-  const cv = canvasStore.currentCanvas
+  const cv = canvas.value
   if (!cv) return
   const vp = getViewport()
-  canvasStore.currentCanvas = {
+  canvasStore.setCanvas(props.canvasId, {
     ...cv,
     nodes: extractCanvasNodes(),
     edges: extractCanvasEdges(),
     viewport: { offset_x: vp.x, offset_y: vp.y, zoom: vp.zoom },
-  }
-  canvasStore.scheduleSave()
+  })
+  canvasStore.scheduleSave(props.canvasId)
 }
 
 // ── Undo / redo history (snapshot based) ──────────────────────────────────────
@@ -966,8 +978,8 @@ function openPaperById(paperId: string) {
   const paper = library.papers.find(p => p.id === paperId)
   if (!paper?.slug) return
   selectionStore.selectPaper(paper.slug)
+  // Making the paper the active tab is what leaves the canvas workspace.
   reader.openPaper(paper.slug, paper.title)
-  canvasStore.isShown = false
   emit('select-paper', paper.slug)
 }
 
@@ -1088,10 +1100,12 @@ function applyNodePatch(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
   recordHistory()
 }
 
+// The properties panel publishes patches on one shared channel, so a
+// backgrounded canvas must ignore them — its node ids could even collide.
 watch(
   () => canvasStore.pendingPatch,
   (p) => {
-    if (!p) return
+    if (!p || !isActiveCanvas.value) return
     applyNodePatch(p.nodeId, p.patch)
   }
 )
@@ -1317,7 +1331,7 @@ async function addImageFileToCanvas(file: File) {
 }
 
 async function onCanvasPaste(e: ClipboardEvent) {
-  if (!canvasStore.isShown || !canvasStore.currentCanvas || isEditableTarget(e.target)) return
+  if (!isActiveCanvas.value || !canvas.value || isEditableTarget(e.target)) return
   const items = Array.from(e.clipboardData?.items ?? [])
   const imageItem = items.find(item => item.kind === 'file' && item.type.startsWith('image/'))
   if (imageItem) {
@@ -1346,7 +1360,7 @@ function deleteSelection() {
 watch(
   () => canvasStore.pendingAction,
   (a) => {
-    if (!a) return
+    if (!a || !isActiveCanvas.value) return
     switch (a.type) {
       case 'align': alignNodes(a.payload as AlignDir); break
       case 'distribute': distributeNodes(a.payload as 'h' | 'v'); break
@@ -1362,7 +1376,9 @@ watch(
 
 // ── Keyboard shortcuts (canvas only) ──────────────────────────────────────────
 function onCanvasKeydown(e: KeyboardEvent) {
-  if (!canvasStore.isShown) return
+  // Backgrounded canvas tabs stay mounted, so every one of them would otherwise
+  // answer the same keypress — only the visible one may act.
+  if (!isActiveCanvas.value) return
   if (isEditableTarget(e.target)) return
   const meta = e.metaKey || e.ctrlKey
   const lower = e.key.toLowerCase()
@@ -1454,7 +1470,7 @@ function findBlankViewportPosition(): { x: number; y: number } {
 
 function addPaperToCanvas(paper: PaperIndexEntry) {
   // Adding a paper to the canvas isn't "reading" — don't touch recency.
-  const cv = canvasStore.currentCanvas
+  const cv = canvas.value
   if (!cv) return
   const exists = nodes.value.some(n => n.data.paperId === paper.id)
   if (exists) {
@@ -1780,7 +1796,7 @@ function acceptAllSuggestions(suggestions: SuggestedEdge[]) {
 
 // ── M10: Auto layout ──────────────────────────────────────────────────────────
 async function applyLayout(layout: 'timeline' | 'topological', direction: 'horizontal' | 'vertical') {
-  if (!canvasStore.currentCanvas) return
+  if (!canvas.value) return
   if (!window.confirm(t('canvas.layoutConfirm'))) return
   layoutHistory.value = (nodes.value as any[]).map(n => ({
     node_id: n.id, x: n.position.x, y: n.position.y,
@@ -1789,7 +1805,7 @@ async function applyLayout(layout: 'timeline' | 'topological', direction: 'horiz
   showLayoutMenu.value = false
   try {
     const positions = await invoke<NodePosition[]>('compute_canvas_layout', {
-      canvasId: canvasStore.currentCanvas.id,
+      canvasId: props.canvasId,
       layout,
       direction,
     })
@@ -1921,7 +1937,7 @@ watch(() => library.papers, () => {
       },
     }
   })
-  const cv = canvasStore.currentCanvas
+  const cv = canvas.value
   if (cv) loadNoteTitles(cv.nodes)
 })
 </script>
@@ -1933,11 +1949,11 @@ watch(() => library.papers, () => {
       <button class="back-btn" :title="t('canvas.backToList')" @click="emit('close')">
         <Icon icon="fluent:chevron-left-24-regular" width="13" height="13" />
       </button>
-      <span class="canvas-name">{{ canvasStore.currentCanvas?.name || t('canvas.noCanvases') }}</span>
+      <span class="canvas-name">{{ canvas?.name || t('canvas.noCanvases') }}</span>
       <div class="toolbar-actions">
         <!-- Suggest Edges -->
         <button
-          v-if="canvasStore.currentCanvas"
+          v-if="canvas"
           class="tb-action-btn"
           :class="{ 'tb-action-btn--active': showSuggestPanel }"
           @click="showSuggestPanel = !showSuggestPanel"
@@ -1947,7 +1963,7 @@ watch(() => library.papers, () => {
         </button>
 
         <!-- Auto Layout dropdown -->
-        <div v-if="canvasStore.currentCanvas" class="layout-wrap">
+        <div v-if="canvas" class="layout-wrap">
           <button class="tb-action-btn" @click="showLayoutMenu = !showLayoutMenu" :disabled="applyingLayout">
             <Icon icon="fluent:organization-24-regular" width="13" height="13" />
             {{ t('canvas.autoLayout') }}
@@ -1969,7 +1985,7 @@ watch(() => library.papers, () => {
 
         <!-- Export -->
         <button
-          v-if="canvasStore.currentCanvas"
+          v-if="canvas"
           class="tb-action-btn"
           @click="showExportDialog = true"
         >
@@ -1979,7 +1995,7 @@ watch(() => library.papers, () => {
 
         <!-- Add Paper -->
         <button
-          v-if="canvasStore.currentCanvas"
+          v-if="canvas"
           class="tb-action-btn tb-action-btn--accent"
           @click="openPaperPicker"
         >
@@ -1992,7 +2008,7 @@ watch(() => library.papers, () => {
     <!-- Canvas area -->
     <div class="canvas-content">
       <div
-        v-if="canvasStore.currentCanvas"
+        v-if="canvas"
         class="flow-wrap"
         ref="flowContainerRef"
         @pointermove="lastCanvasPointer = { x: $event.clientX, y: $event.clientY }"
@@ -2006,6 +2022,8 @@ watch(() => library.papers, () => {
           :connection-mode="ConnectionMode.Loose"
           :default-edge-options="{ type: 'adjustable', markerEnd: MarkerType.ArrowClosed }"
           :snap-to-grid="false"
+          :min-zoom="0.05"
+          :max-zoom="4"
           :pan-on-drag="pointerPanOnDrag"
           :selection-key-code="pointerSelectionKeyCode"
           :elements-selectable="activeTool === 'pointer'"
@@ -2124,7 +2142,7 @@ watch(() => library.papers, () => {
       </div>
 
       <!-- No canvas selected -->
-      <div v-if="!canvasStore.currentCanvas" class="no-canvas-selected">
+      <div v-if="!canvas" class="no-canvas-selected">
         <Icon icon="fluent:share-android-24-regular" width="48" height="48" style="opacity:0.2" />
         <p>{{ t('canvas.noCanvases') }}</p>
         <p class="hint">{{ t('canvas.noCanvasesHint') }}</p>
@@ -2132,8 +2150,8 @@ watch(() => library.papers, () => {
 
       <!-- Suggest Panel -->
       <SuggestPanel
-        v-if="showSuggestPanel && canvasStore.currentCanvas"
-        :canvas-id="canvasStore.currentCanvas.id"
+        v-if="showSuggestPanel && canvas"
+        :canvas-id="canvas.id"
         :paper-names="paperNames"
         @accept="acceptSuggestion"
         @accept-all="acceptAllSuggestions"
@@ -2367,7 +2385,7 @@ watch(() => library.papers, () => {
     <!-- Export Dialog -->
     <ExportDialog
       v-if="showExportDialog"
-      :canvas-name="canvasStore.currentCanvas?.name ?? 'canvas'"
+      :canvas-name="canvas?.name ?? 'canvas'"
       :flow-el="flowContainerRef"
       @close="showExportDialog = false"
     />

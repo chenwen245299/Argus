@@ -314,6 +314,83 @@ pub fn delete_note(root: &str, slug: &str, note_id: &str) -> Result<(), String> 
     Ok(())
 }
 
+// ── Note assets (pasted images) ───────────────────────────────────────────────
+// Images pasted into a note are written next to it, under `notes/assets/`, and
+// referenced from the markdown by the relative path `assets/<name>`. Keeping the
+// link relative is what makes a paper folder self-contained: copy it elsewhere
+// and the notes still resolve. Absolute paths (or an inlined data: URI) would
+// not survive the move.
+
+/// Extensions we're willing to write and hand back to a webview `<img>`. SVG is
+/// deliberately absent — it can carry script, and these bytes come from whatever
+/// happened to be on the clipboard.
+const NOTE_ASSET_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+/// Cap on a single pasted image. Large enough for a retina screenshot, small
+/// enough that a stray paste can't wedge the editor or bloat the library.
+const NOTE_ASSET_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+fn note_assets_dir(root: &str, slug: &str) -> PathBuf {
+    notes_dir(root, slug).join("assets")
+}
+
+fn note_asset_path(root: &str, slug: &str, name: &str) -> Result<PathBuf, String> {
+    validate_slug(slug)?;
+    crate::path_guard::validate_segment("asset name", name)?;
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !NOTE_ASSET_EXTS.contains(&ext.as_str()) {
+        return Err(format!("Unsupported image type: {ext}"));
+    }
+    Ok(note_assets_dir(root, slug).join(name))
+}
+
+/// Write a pasted image and return its note-relative path (`assets/<name>`).
+pub fn write_note_asset(root: &str, slug: &str, ext: &str, bytes: &[u8]) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("Image is empty".to_string());
+    }
+    if bytes.len() > NOTE_ASSET_MAX_BYTES {
+        return Err(format!(
+            "Image is too large ({} MB); the limit is {} MB",
+            bytes.len() / (1024 * 1024),
+            NOTE_ASSET_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    if !NOTE_ASSET_EXTS.contains(&ext.as_str()) {
+        return Err(format!("Unsupported image type: {ext}"));
+    }
+    // A random name sidesteps collisions entirely — pasted images have no
+    // meaningful filename to preserve anyway.
+    let name = format!("{}.{ext}", uuid::Uuid::new_v4());
+    let path = note_asset_path(root, slug, &name)?;
+    let dir = note_assets_dir(root, slug);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create assets dir: {e}"))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("Failed to write image: {e}"))?;
+    Ok(format!("assets/{name}"))
+}
+
+/// Read a note asset back for display. Returns the raw bytes; the caller turns
+/// them into a blob URL rather than embedding them in the markdown.
+pub fn read_note_asset(root: &str, slug: &str, name: &str) -> Result<Vec<u8>, String> {
+    let path = note_asset_path(root, slug, name)?;
+    // `note_asset_path` already rejects separators and `..`, so the join cannot
+    // escape the assets dir; this is belt-and-braces against symlinked entries.
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|e| format!("Failed to read image: {e}"))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err("Not a regular file".to_string());
+    }
+    if meta.len() as usize > NOTE_ASSET_MAX_BYTES {
+        return Err("Image is too large".to_string());
+    }
+    std::fs::read(&path).map_err(|e| format!("Failed to read image: {e}"))
+}
+
 // ── Highlights ────────────────────────────────────────────────────────────────
 
 pub fn read_highlights(root: &str, slug: &str) -> Vec<Highlight> {

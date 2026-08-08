@@ -4,6 +4,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import VditorEditor from '../components/VditorEditor.vue'
+import { broadcastNoteSaved, onNoteSavedElsewhere } from '../utils/noteSync'
+import { toDisplayMarkdown, toStoredMarkdown, savePastedImage } from '../utils/noteAssets'
 
 interface NoteWindowData { slug: string; noteId: string; title: string }
 
@@ -26,12 +28,20 @@ const saveError = ref('')
 const loaded = ref(false)
 const isMac = navigator.userAgent.toLowerCase().includes('macintosh')
 
+const editorRef = ref<InstanceType<typeof VditorEditor> | null>(null)
+
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let unlisten: UnlistenFn | null = null
 let unlistenClose: UnlistenFn | null = null
+let unlistenNoteSaved: UnlistenFn | null = null
 // Latest markdown seen on input; flushed on close so a debounce that hasn't
 // fired yet doesn't drop the user's last edits when the window is destroyed.
 const latestContent = ref<string | null>(null)
+// What's actually on disk, so "has unsaved edits" is a real comparison rather
+// than "has ever typed" — `latestContent` outlives the save that persisted it.
+const savedContent = ref<string | null>(null)
+const hasUnsavedEdits = () =>
+  latestContent.value !== null && latestContent.value !== savedContent.value
 
 function noteWindowStorageKey() {
   return `argus:note-window:${windowLabel}`
@@ -48,11 +58,15 @@ async function setWindowTitle(title: string) {
 
 async function loadNote(data: NoteWindowData) {
   try {
-    const md = await invoke<string>('get_note', { slug: data.slug, noteId: data.noteId })
+    const stored = await invoke<string>('get_note', { slug: data.slug, noteId: data.noteId })
+    // Swap `assets/…` for renderable blob URLs; `flushSave` swaps them back.
+    const md = await toDisplayMarkdown(data.slug, stored)
     slug.value = data.slug
     noteId.value = data.noteId
     noteTitle.value = data.title || '笔记'
     content.value = md
+    savedContent.value = md
+    latestContent.value = null
     editorKey.value++
     loaded.value = true
     await setWindowTitle(noteTitle.value)
@@ -66,12 +80,23 @@ async function flushSave(markdown: string) {
   saving.value = true
   saveError.value = ''
   try {
-    await invoke('save_note', { slug: slug.value, noteId: noteId.value, content: markdown })
+    // Only relative asset paths go to disk — and to the sidebar, whose blob URLs
+    // are its own and would be meaningless there.
+    const stored = toStoredMarkdown(markdown)
+    await invoke('save_note', { slug: slug.value, noteId: noteId.value, content: stored })
+    savedContent.value = markdown
+    broadcastNoteSaved(slug.value, noteId.value, stored)
   } catch (e) {
     saveError.value = String(e)
   } finally {
     saving.value = false
   }
+}
+
+/** Cmd+V of an image: store it under notes/assets and render it from there. */
+async function uploadNoteImage(file: File): Promise<string | null> {
+  if (!slug.value) return null
+  return savePastedImage(slug.value, file)
 }
 
 function onContentChange(markdown: string) {
@@ -98,6 +123,23 @@ onMounted(async () => {
     await loadNote(event.payload)
   })
 
+  // Mirror saves made in the sidebar, so this window doesn't sit on a stale copy
+  // and overwrite them on its next autosave.
+  unlistenNoteSaved = await onNoteSavedElsewhere(async (payload) => {
+    if (payload.slug !== slug.value || payload.noteId !== noteId.value) return
+    // Local unsaved edits win — silently replacing what someone is typing is
+    // worse than the two copies diverging until the next explicit save.
+    if (hasUnsavedEdits()) return
+    // The payload holds relative asset paths; resolve them for this webview.
+    const display = await toDisplayMarkdown(payload.slug, payload.content)
+    if (payload.noteId !== noteId.value || hasUnsavedEdits()) return
+    content.value = display
+    savedContent.value = display
+    latestContent.value = null
+    // A remount is the fallback when the editor hasn't finished initialising.
+    if (!editorRef.value?.setContent(display)) editorKey.value++
+  })
+
   // The main window writes per-window initial data before calling open_note_window.
   try {
     const stored = localStorage.getItem(noteWindowStorageKey())
@@ -121,6 +163,7 @@ window.addEventListener('beforeunload', () => { void flushPendingSave() })
 onBeforeUnmount(async () => {
   unlisten?.()
   unlistenClose?.()
+  unlistenNoteSaved?.()
   clearTimeout(debounceTimer!)
   await flushPendingSave()
 })
@@ -135,8 +178,10 @@ onBeforeUnmount(async () => {
 
     <div class="nw-editor" v-if="loaded">
       <VditorEditor
+        ref="editorRef"
         :key="editorKey"
         :initial-content="content"
+        :image-uploader="uploadNoteImage"
         @change="onContentChange"
       />
     </div>

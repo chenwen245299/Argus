@@ -364,12 +364,25 @@ pub fn write_note_asset(root: &str, slug: &str, ext: &str, bytes: &[u8]) -> Resu
     if !NOTE_ASSET_EXTS.contains(&ext.as_str()) {
         return Err(format!("Unsupported image type: {ext}"));
     }
-    // A random name sidesteps collisions entirely — pasted images have no
-    // meaningful filename to preserve anyway.
-    let name = format!("{}.{ext}", uuid::Uuid::new_v4());
-    let path = note_asset_path(root, slug, &name)?;
     let dir = note_assets_dir(root, slug);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create assets dir: {e}"))?;
+
+    // Named by local wall-clock time so the folder reads chronologically and a
+    // file can be matched to when it was pasted. Two pastes inside one second
+    // are entirely possible, hence the `-2`, `-3` … fallback.
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let (name, path) = (1..=999)
+        .find_map(|n| {
+            let name = if n == 1 {
+                format!("{stamp}.{ext}")
+            } else {
+                format!("{stamp}-{n}.{ext}")
+            };
+            let path = note_asset_path(root, slug, &name).ok()?;
+            (!path.exists()).then_some((name, path))
+        })
+        .ok_or_else(|| "Could not find a free filename for the image".to_string())?;
+
     std::fs::write(&path, bytes).map_err(|e| format!("Failed to write image: {e}"))?;
     Ok(format!("assets/{name}"))
 }

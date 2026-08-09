@@ -3,6 +3,17 @@ import hljs from 'highlight.js/lib/common'
 import DOMPurify from 'dompurify'
 import katex from 'katex'
 
+// DOMPurify's default URI policy blocks `blob:`, which is how a note's pasted
+// images are rendered (see utils/noteAssets.ts) — without this they'd be
+// stripped and show as broken. This is the stock pattern plus `blob`.
+//
+// Safe to allow: a blob URL is an opaque handle to a Blob this app created in
+// its own origin. Markdown from anywhere else — AI output, paper text — cannot
+// mint one, so the worst an injected `blob:` can do is dangle. `data:` stays
+// blocked precisely because it CAN carry an arbitrary inline payload.
+const ALLOWED_URI_REGEXP =
+  /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|blob):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
+
 // common build covers: js/ts/python/java/go/rust/cpp/c/csharp/bash/shell/json/xml/css/sql/yaml/etc.
 // Register a few convenient aliases not in the common map.
 hljs.registerAliases(['js'], { languageName: 'javascript' })
@@ -171,6 +182,7 @@ export function renderMarkdown(content: string): string {
       // encoding="text/html" there is a known mXSS vector.
       ADD_TAGS: ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'g', 'defs', 'use', 'symbol',
                  'semantics', 'annotation'],
+      ALLOWED_URI_REGEXP,
       FORCE_BODY: false,
     })
   } catch {

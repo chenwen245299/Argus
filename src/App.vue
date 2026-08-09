@@ -102,4 +102,13 @@ select,
   user-select: text;
   -webkit-user-select: text;
 }
+
+/* While a resize grabber is being dragged, nothing is selectable — otherwise the
+   drag anchors a text selection in whatever opted back in above (see
+   utils/dragSelectionGuard.ts). Needs !important to beat those opt-ins. */
+body.argus-dragging,
+body.argus-dragging * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
 </style>

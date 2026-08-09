@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { beginDragSelectionGuard, endDragSelectionGuard } from './dragSelectionGuard'
 
 // Shared geometry for the highlight-note ("批注") popup used by both readers.
 // The popup is a resizable window: the user drags its bottom-right grabber in
@@ -109,6 +110,8 @@ export function startNotePopupResize(e: PointerEvent, hlId: string, origin: { x:
   const startY = e.clientY
   // Capture so the drag survives the pointer outrunning the (still-growing) box.
   handle.setPointerCapture?.(e.pointerId)
+  // The note body is selectable, and it's right under the pointer.
+  beginDragSelectionGuard()
 
   const onMove = (ev: PointerEvent) => {
     // The popup is fixed-positioned at `origin`, so its own offset — not a flat
@@ -122,6 +125,7 @@ export function startNotePopupResize(e: PointerEvent, hlId: string, origin: { x:
     )
   }
   const onUp = (ev: PointerEvent) => {
+    endDragSelectionGuard()
     handle.releasePointerCapture?.(ev.pointerId)
     handle.removeEventListener('pointermove', onMove)
     handle.removeEventListener('pointerup', onUp)

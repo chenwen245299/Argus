@@ -30,6 +30,7 @@ import { useCanvasStore } from '../stores/canvas'
 import { useLibraryStore } from '../stores/library'
 import { useCanvasHistory, type CanvasSnapshot } from '../composables/useCanvasHistory'
 import { sortPapersByRecentAccess } from '../utils/recentPapers'
+import { toDisplayMarkdown } from '../utils/noteAssets'
 import PaperNode from '../components/canvas/PaperNode.vue'
 import AdjustableEdge from '../components/canvas/AdjustableEdge.vue'
 import TextNode from '../components/canvas/TextNode.vue'
@@ -910,7 +911,10 @@ function onNodeMouseEnter(event: NodeMouseEvent) {
     hoverContent.value = ''
     try {
       const raw = await canvasStore.getNodeDisplayContent(nd.data.paperId, source)
-      hoverContent.value = raw
+      // Notes reference pasted images by the relative `assets/…` path, which a
+      // webview can't load — resolve them the same way the note editor does.
+      const slug = library.papers.find(p => p.id === nd.data.paperId)?.slug
+      hoverContent.value = slug ? await toDisplayMarkdown(slug, raw) : raw
     } finally {
       hoverLoading.value = false
     }
@@ -2093,6 +2097,15 @@ watch(() => library.papers, () => {
 :deep(.hover-content h2) { font-size: 13px; margin: 6px 0 3px; }
 :deep(.hover-content h3) { font-size: 12px; margin: 4px 0 2px; }
 :deep(.hover-content p) { margin: 4px 0; }
+/* A pasted screenshot is far wider than this card — scale it down rather than
+   letting it force a horizontal scrollbar. */
+:deep(.hover-content img) {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  margin: 6px 0;
+}
 :deep(.hover-content ul, .hover-content ol) { padding-left: 16px; margin: 4px 0; }
 :deep(.hover-content code) {
   background: var(--bg-secondary, #f3f4f6);

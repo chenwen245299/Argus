@@ -30,6 +30,7 @@ import { useReaderStore } from '../stores/reader'
 import { useSelectionStore } from '../stores/selection'
 import { useCanvasHistory, type CanvasSnapshot } from '../composables/useCanvasHistory'
 import { sortPapersByRecentAccess } from '../utils/recentPapers'
+import { toDisplayMarkdown } from '../utils/noteAssets'
 import PaperNode from './canvas/PaperNode.vue'
 import AdjustableEdge from './canvas/AdjustableEdge.vue'
 import TextNode from './canvas/TextNode.vue'
@@ -428,6 +429,7 @@ const hoverContent = ref('')
 const hoverLoading = ref(false)
 const hoverPos = ref({ x: 0, y: 0 })
 let hoverTimer: ReturnType<typeof setTimeout> | null = null
+let hoverCloseTimer: ReturnType<typeof setTimeout> | null = null
 
 // ── Context menu ──────────────────────────────────────────────────────────────
 
@@ -1504,12 +1506,29 @@ function addPaperToCanvas(paper: PaperIndexEntry) {
 
 function clearHoverTooltip() {
   if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null }
+  cancelHoverClose()
   hoverNodeId.value = null
   hoverContent.value = ''
   hoverLoading.value = false
 }
 
+// Leaving the node doesn't close the card immediately: the pointer has to cross
+// a gap to reach it, and the card is scrollable, so it has to survive the trip.
+// Moving onto the card cancels the close; leaving the card starts it again.
+function cancelHoverClose() {
+  if (hoverCloseTimer) { clearTimeout(hoverCloseTimer); hoverCloseTimer = null }
+}
+
+function scheduleHoverClose() {
+  cancelHoverClose()
+  hoverCloseTimer = setTimeout(() => {
+    hoverCloseTimer = null
+    clearHoverTooltip()
+  }, 240)
+}
+
 function onNodeMouseEnter(event: NodeMouseEvent) {
+  cancelHoverClose()
   if (ctxMenu.value.show || isDraggingNode) {
     clearHoverTooltip()
     return
@@ -1527,8 +1546,12 @@ function onNodeMouseEnter(event: NodeMouseEvent) {
     hoverContent.value = ''
     try {
       const raw = await canvasStore.getNodeDisplayContent(nd.data.paperId, 'notes')
+      // Notes reference pasted images by the relative `assets/…` path, which a
+      // webview can't load — resolve them the same way the note editor does.
+      const slug = library.papers.find(p => p.id === nd.data.paperId)?.slug
+      const display = slug ? await toDisplayMarkdown(slug, raw) : raw
       if (!ctxMenu.value.show && hoverNodeId.value === nd.id) {
-        hoverContent.value = raw
+        hoverContent.value = display
       }
     } finally {
       if (hoverNodeId.value === nd.id) hoverLoading.value = false
@@ -1537,7 +1560,11 @@ function onNodeMouseEnter(event: NodeMouseEvent) {
 }
 
 function onNodeMouseLeave() {
-  clearHoverTooltip()
+  // Cancel a preview that hasn't opened yet, but give an open one its grace
+  // period so the pointer can reach it.
+  if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null }
+  if (hoverNodeId.value) scheduleHoverClose()
+  else clearHoverTooltip()
 }
 
 const renderedHoverContent = computed(() => {
@@ -1908,6 +1935,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  // Both hover timers, so neither fires against a torn-down instance.
+  clearHoverTooltip()
   document.removeEventListener('keydown', onKeydown)
   document.removeEventListener('keydown', onCanvasKeydown)
   document.removeEventListener('paste', onCanvasPaste)
@@ -2133,6 +2162,8 @@ watch(() => library.papers, () => {
             v-if="hoverNodeId && (hoverLoading || hoverContent)"
             class="hover-tooltip"
             :style="{ left: `${hoverPos.x}px`, top: `${hoverPos.y}px` }"
+            @mouseenter="cancelHoverClose"
+            @mouseleave="scheduleHoverClose"
           >
             <div v-if="hoverLoading" class="hover-loading">{{ t('canvas.hoverLoading') }}</div>
             <div v-else-if="hoverContent" class="hover-content" v-html="renderedHoverContent" />
@@ -2589,7 +2620,10 @@ watch(() => library.papers, () => {
 :deep(.vue-flow__minimap) { border-radius: 8px; overflow: hidden; }
 .canvas-minimap { bottom: 12px; right: 12px; }
 
-/* Hover tooltip */
+/* Hover tooltip. Interactive on purpose — a long note has to be scrollable, and
+   `pointer-events: none` made the card unreachable: the pointer passed straight
+   through it to the canvas, so it could never be hovered or scrolled. It closes
+   on its own mouseleave instead (see scheduleHoverClose). */
 .hover-tooltip {
   position: fixed;
   z-index: 9999;
@@ -2600,8 +2634,10 @@ watch(() => library.papers, () => {
   border-radius: 10px;
   box-shadow: 0 4px 20px rgba(0,0,0,0.15);
   overflow-y: auto;
+  /* Contain the wheel so scrolling past either end doesn't start zooming the
+     canvas underneath. */
+  overscroll-behavior: contain;
   padding: 14px 16px;
-  pointer-events: none;
   transform: translate(16px, -50%);
 }
 .hover-loading { color: var(--text-tertiary); font-size: 12px; }
@@ -2610,6 +2646,15 @@ watch(() => library.papers, () => {
 :deep(.hover-content h1) { font-size: 15px; margin: 8px 0 4px; }
 :deep(.hover-content h2) { font-size: 13px; margin: 6px 0 3px; }
 :deep(.hover-content p) { margin: 4px 0; }
+/* A pasted screenshot is far wider than this card — scale it down rather than
+   letting it force a horizontal scrollbar. */
+:deep(.hover-content img) {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  margin: 6px 0;
+}
 :deep(.hover-content ul, .hover-content ol) { padding-left: 16px; margin: 4px 0; }
 :deep(.hover-content code) {
   background: var(--bg-secondary);

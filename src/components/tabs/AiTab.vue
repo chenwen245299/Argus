@@ -10,6 +10,7 @@ import { useSettingsStore } from '../../stores/settings'
 import MarkdownBody from '../MarkdownBody.vue'
 import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
+import { beginDragSelectionGuard, endDragSelectionGuard } from '../../utils/dragSelectionGuard'
 import type { ChatContentPart, ChatMessage, PaperMeta, PaperStatus, PaperSection } from '../../types'
 import { askAiText } from '../../stores/translationHistory'
 import { estimateCostCny } from '../../utils/modelPricing'
@@ -1726,6 +1727,8 @@ function onComposerResizeStart(e: PointerEvent) {
   const startY = e.clientY
   const startH = el.offsetHeight
   handle.setPointerCapture?.(e.pointerId)
+  // Dragging upward sweeps over the message list, which is selectable text.
+  beginDragSelectionGuard()
 
   const onMove = (ev: PointerEvent) => {
     // The composer is pinned to the bottom, so dragging UP grows it — hence the
@@ -1736,6 +1739,7 @@ function onComposerResizeStart(e: PointerEvent) {
     )
   }
   const onUp = (ev: PointerEvent) => {
+    endDragSelectionGuard()
     handle.releasePointerCapture?.(ev.pointerId)
     handle.removeEventListener('pointermove', onMove)
     handle.removeEventListener('pointerup', onUp)

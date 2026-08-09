@@ -199,6 +199,11 @@ function teardownSelectionListeners() {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const pageRenderTasks = new Map<number, any>() // pdfjs RenderTask per page
 const inflightRenders = new Map<number, Promise<void>>()
+// The scale each page's DOM was actually built at. A zoom leaves the old content
+// on screen (CSS-scaled) rather than blanking it, so "rendered" is no longer the
+// same question as "rendered at the current scale" — this is what tells them
+// apart and makes a stale page re-render.
+const pageRenderScales = new Map<number, number>()
 
 /** Track a render so the scale watcher can await/cancel in-flight work. */
 function requestRenderPage(idx: number): Promise<void> {
@@ -1018,7 +1023,9 @@ function observePage(el: HTMLDivElement | null, idx: number) {
 // ── Render / Unrender pages ────────────────────────────────────────────────────
 async function renderPage(idx: number) {
   if (!pdfDoc.value) return
-  if (renderedPages.value.has(idx)) return
+  // Already up to date? Content rendered at a different scale is still on screen
+  // but stale, so it has to fall through and re-render.
+  if (renderedPages.value.has(idx) && pageRenderScales.get(idx) === scale.value) return
   if (renderingPages.has(idx)) return
   renderingPages.add(idx)
 
@@ -1027,10 +1034,21 @@ async function renderPage(idx: number) {
 
   const myGen = renderGeneration
   const scenScale = scale.value
+  // Content from a previous scale. It stays on screen until the new canvas is
+  // painted — swapping only at that point is what removes the white flash.
+  const stale = Array.from(el.children) as HTMLElement[]
   // Track every node this render appends so we can tear down a half-built page
   // if a newer generation supersedes us at any await point (avoids ghost layers).
   const appended: HTMLElement[] = []
-  const cleanupAppended = () => { appended.forEach(n => n.remove()) }
+  // Once the canvas has replaced the previous content it must survive being
+  // superseded — tearing it down too would leave a genuinely blank page, which
+  // is the very thing this rework exists to prevent. It stays, gets resized to
+  // whatever scale is now current, and the next render replaces it properly.
+  let committedCanvas: HTMLCanvasElement | null = null
+  const cleanupAppended = () => {
+    appended.forEach(n => { if (n !== committedCanvas) n.remove() })
+    if (committedCanvas) rescalePageDom(idx, scale.value)
+  }
   try {
     const page: PDFPageProxy = await pdfDoc.value.getPage(idx + 1)
     // Scale changed while we were fetching the page — abandon.
@@ -1041,24 +1059,31 @@ async function renderPage(idx: number) {
     // Physical viewport for crisp canvas rendering on HiDPI screens
     const physicalVp = page.getViewport({ scale: scenScale * dpr })
 
-    // Canvas — pdfjs v5 takes the canvas element directly and owns the context
+    // Canvas — pdfjs v5 takes the canvas element directly and owns the context.
+    // Rendered DETACHED: an empty canvas in the page would cover the old content
+    // with a white rectangle for the whole render, which is the flash we're
+    // avoiding. It only joins the DOM once it actually has the page on it.
     const canvas = document.createElement('canvas')
     canvas.className = 'pdf-canvas'
     canvas.width = Math.round(physicalVp.width)
     canvas.height = Math.round(physicalVp.height)
     canvas.style.width = `${Math.round(logicalVp.width)}px`
     canvas.style.height = `${Math.round(logicalVp.height)}px`
-    el.appendChild(canvas)
-    appended.push(canvas)
 
     const task = page.render({ canvas, viewport: physicalVp })
     pageRenderTasks.set(idx, task)
     await task.promise
     pageRenderTasks.delete(idx)
 
-    // Scale changed during render — the watcher cleared `el`; bail without
-    // marking the page rendered so it re-renders cleanly at the new scale.
+    // Scale changed during render — a newer generation owns the page now, so
+    // bail without touching what's on screen.
     if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
+
+    // The swap: new canvas in, previous scale's content out, same frame.
+    el.appendChild(canvas)
+    appended.push(canvas)
+    committedCanvas = canvas
+    stale.forEach(n => n.remove())
 
     // Text layer at logical scale so CSS positions match layout
     const textLayerDiv = document.createElement('div')
@@ -1133,6 +1158,7 @@ async function renderPage(idx: number) {
     linkifyDiv.style.width = `${Math.round(logicalVp.width)}px`
     linkifyDiv.style.height = `${Math.round(logicalVp.height)}px`
     el.appendChild(linkifyDiv)
+    appended.push(linkifyDiv)
     try {
       linkifyTextLayer(textLayerDiv, linkifyDiv)
     } catch (e) {
@@ -1140,6 +1166,7 @@ async function renderPage(idx: number) {
     }
 
     renderedPages.value = new Set(renderedPages.value).add(idx)
+    pageRenderScales.set(idx, scenScale)
     page.cleanup()
   } catch (e) {
     // RenderingCancelledException is expected when a zoom cancels in-flight work.
@@ -1157,32 +1184,65 @@ function unrenderPage(idx: number) {
   if (!el) return
   // Keep the placeholder size — only remove rendered children
   while (el.firstChild) el.removeChild(el.firstChild)
+  pageRenderScales.delete(idx)
   const next = new Set(renderedPages.value)
   next.delete(idx)
   renderedPages.value = next
 }
 
+/**
+ * Make a page's already-rendered content match a new scale immediately, without
+ * re-rendering: the canvas bitmap is stretched by the browser (soft for a
+ * moment) and the pdfjs layers are re-sized through the CSS variable they are
+ * built around. The crisp re-render then swaps in underneath the user's notice.
+ */
+function rescalePageDom(idx: number, newScale: number) {
+  const el = pageRefs.value[idx]
+  const base = pageSizes.value[idx]
+  if (!el || !base) return
+  const w = Math.round(base.width * newScale)
+  const h = Math.round(base.height * newScale)
+
+  el.querySelectorAll<HTMLElement>('.pdf-canvas, .highlight-overlay, .linkify-overlay')
+    .forEach((n) => { n.style.width = `${w}px`; n.style.height = `${h}px` })
+  // pdfjs sizes and positions these layers off this variable, which is exactly
+  // what it exists for — zooming without re-running the layer.
+  el.querySelectorAll<HTMLElement>('.textLayer, .annotationLayer')
+    .forEach((n) => { n.style.setProperty('--total-scale-factor', String(newScale)) })
+
+  // Highlight boxes are absolute px at the old scale, so they need redrawing.
+  const overlay = el.querySelector('.highlight-overlay') as HTMLDivElement | null
+  if (overlay) renderHighlightsOnPage(overlay, idx)
+}
+
 // ── Re-render on scale change ─────────────────────────────────────────────────
-watch(scale, async () => {
+watch(scale, async (newScale) => {
   saveZoom()
   // Mark every in-flight render stale and cancel the running pdfjs tasks so
   // none of them lands a canvas sized for the previous scale.
   renderGeneration++
   pageRenderTasks.forEach((task) => { try { task.cancel() } catch { /* already done */ } })
   pageRenderTasks.clear()
+
+  // Resize what's already on screen RIGHT NOW. The page wrappers resize
+  // reactively with `scale`, so without this their content would sit at the old
+  // size inside a differently-sized box. This used to wipe every page instead
+  // and re-render from scratch — that blank gap, across a full re-render of
+  // canvas + text + annotation layers, was the white screen.
+  pageRefs.value.forEach((_, idx) => rescalePageDom(idx, newScale))
+
   // Wait for the cancelled/stale renders to unwind so their page locks free up
   // before we re-render — otherwise a re-render could be blocked or doubled.
   await Promise.allSettled([...inflightRenders.values()])
-
-  // Drop ALL rendered/partial content (not just `renderedPages`, which misses
-  // pages that were mid-render) and reset state.
-  pageRefs.value.forEach((el) => { if (el) while (el.firstChild) el.removeChild(el.firstChild) })
+  // Cancelled renders leave nothing behind; anything mid-flight bailed on the
+  // generation check without touching the DOM.
   renderingPages.clear()
-  renderedPages.value = new Set()
 
   await nextTick()
   updateScrollThumbs()
-  // Re-render the currently visible pages at the new scale.
+  // Re-render the currently visible pages at the new scale. `pageRenderScales`
+  // is deliberately left alone: it still records the OLD scale, which is what
+  // makes renderPage treat these pages as stale and rebuild them.
   if (observer && containerRef.value) {
     observer.disconnect()
     pageRefs.value.forEach((el) => { if (el) observer!.observe(el) })

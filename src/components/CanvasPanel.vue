@@ -31,6 +31,7 @@ import { useSelectionStore } from '../stores/selection'
 import { useCanvasHistory, type CanvasSnapshot } from '../composables/useCanvasHistory'
 import { sortPapersByRecentAccess } from '../utils/recentPapers'
 import { toDisplayMarkdown } from '../utils/noteAssets'
+import { requestAddPapersToChat } from '../utils/chatPapers'
 import PaperNode from './canvas/PaperNode.vue'
 import AdjustableEdge from './canvas/AdjustableEdge.vue'
 import TextNode from './canvas/TextNode.vue'
@@ -437,7 +438,12 @@ const ctxMenu = ref<{
   show: boolean; x: number; y: number
   nodeId: string | null; edgeId: string | null
   paperId: string | null; nodeType: string | null
-}>({ show: false, x: 0, y: 0, nodeId: null, edgeId: null, paperId: null, nodeType: null })
+  /** Node ids captured when the menu opened. Right-clicking a box-selection
+   *  fires Vue Flow's `selectionContextMenu` with the nodes it covers, and
+   *  snapshotting them here keeps the menu acting on what was selected at
+   *  open time rather than on whatever the selection is by the time it's used. */
+  selectionIds: string[]
+}>({ show: false, x: 0, y: 0, nodeId: null, edgeId: null, paperId: null, nodeType: null, selectionIds: [] })
 
 // ── Edge label editor ─────────────────────────────────────────────────────────
 
@@ -1578,6 +1584,10 @@ function onNodeContextMenu(event: NodeMouseEvent) {
   event.event.preventDefault()
   clearHoverTooltip()
   const paperId = (event.node.data?.paperId as string) ?? null
+  // Right-clicking a node that's part of a box-selection should act on the whole
+  // selection; right-clicking outside it acts on that node alone.
+  const selected = canvasStore.selectedNodeIds
+  const inSelection = selected.length > 1 && selected.includes(event.node.id)
 
   ctxMenu.value = {
     show: true,
@@ -1587,6 +1597,25 @@ function onNodeContextMenu(event: NodeMouseEvent) {
     edgeId: null,
     paperId,
     nodeType: event.node.type ?? 'paper',
+    selectionIds: inSelection ? [...selected] : [event.node.id],
+  }
+}
+
+/** Right-click on the box-selection itself (the rectangle, not a node). Vue Flow
+ *  fires this instead of `nodeContextMenu`, which is why dragging a box around
+ *  papers and right-clicking it used to do nothing at all. */
+function onSelectionContextMenu({ event, nodes }: { event: MouseEvent; nodes: VfNode[] }) {
+  event.preventDefault()
+  clearHoverTooltip()
+  ctxMenu.value = {
+    show: true,
+    x: event.clientX,
+    y: event.clientY,
+    nodeId: null,
+    edgeId: null,
+    paperId: null,
+    nodeType: null,
+    selectionIds: nodes.map(n => n.id),
   }
 }
 
@@ -1601,17 +1630,84 @@ function onEdgeContextMenu(event: EdgeMouseEvent) {
     edgeId: event.edge.id,
     paperId: null,
     nodeType: null,
+    selectionIds: [],
   }
 }
 
 function closeCtxMenu() {
-  ctxMenu.value = { show: false, x: 0, y: 0, nodeId: null, edgeId: null, paperId: null, nodeType: null }
+  ctxMenu.value = {
+    show: false, x: 0, y: 0, nodeId: null, edgeId: null, paperId: null, nodeType: null, selectionIds: [],
+  }
 }
 
 function ctxSelectPaper() {
   const paperId = ctxMenu.value.paperId
   closeCtxMenu()
   if (paperId) openPaperById(paperId)
+}
+
+// ── Send papers to the library chat ───────────────────────────────────────────
+// A transient message for the outcomes the user has to act on (the chat isn't
+// open, or is open on the wrong knowledge source) — the canvas has no other
+// notification surface.
+const chatNotice = ref('')
+let chatNoticeTimer: ReturnType<typeof setTimeout> | null = null
+
+function showChatNotice(text: string) {
+  chatNotice.value = text
+  if (chatNoticeTimer) clearTimeout(chatNoticeTimer)
+  chatNoticeTimer = setTimeout(() => { chatNotice.value = ''; chatNoticeTimer = null }, 5000)
+}
+
+/** Paper nodes the menu's actions apply to, from the ids snapshotted at open. */
+function ctxTargetPaperNodes(): { paperId: string }[] {
+  const ids = ctxMenu.value.selectionIds
+  if (!ids.length) return []
+  return (nodes.value as VfNode[])
+    .filter(n => ids.includes(n.id) && n.type === 'paper' && n.data?.paperId)
+    .map(n => ({ paperId: n.data.paperId as string }))
+}
+
+const ctxPaperTargetCount = computed(() => {
+  if (!ctxMenu.value.show) return 0
+  return ctxTargetPaperNodes().length
+})
+
+function ctxRemoveSelection() {
+  const ids = ctxMenu.value.selectionIds
+  closeCtxMenu()
+  if (!ids.length) return
+  removeNodes(ids)
+  removeEdges((edges.value as VfEdge[])
+    .filter(e => ids.includes(e.source) || ids.includes(e.target))
+    .map(e => e.id))
+  triggerSave()
+  recordHistory()
+}
+
+async function ctxAddPapersToChat() {
+  const targets = ctxTargetPaperNodes()
+  closeCtxMenu()
+  const slugs = targets
+    .map(t => library.papers.find(p => p.id === t.paperId)?.slug)
+    .filter((s): s is string => !!s)
+  if (!slugs.length) return
+
+  const outcome = await requestAddPapersToChat(slugs)
+  if (outcome.status === 'unavailable') {
+    showChatNotice('请先打开「智能问答」窗口，并把知识来源切换到「文献库论文」')
+    return
+  }
+  if (outcome.status === 'declined') {
+    showChatNotice('「智能问答」当前的知识来源不是「文献库论文」，请先切换后再添加')
+    return
+  }
+  const skipped = outcome.alreadyPresent
+  showChatNotice(
+    outcome.added > 0
+      ? `已添加 ${outcome.added} 篇到智能问答${skipped ? `（${skipped} 篇已在其中）` : ''}`
+      : '选中的论文都已经在智能问答里了'
+  )
 }
 
 function ctxRemoveNode() {
@@ -1937,6 +2033,7 @@ onMounted(async () => {
 onUnmounted(() => {
   // Both hover timers, so neither fires against a torn-down instance.
   clearHoverTooltip()
+  if (chatNoticeTimer) clearTimeout(chatNoticeTimer)
   document.removeEventListener('keydown', onKeydown)
   document.removeEventListener('keydown', onCanvasKeydown)
   document.removeEventListener('paste', onCanvasPaste)
@@ -2066,6 +2163,7 @@ watch(() => library.papers, () => {
           @node-mouse-enter="onNodeMouseEnter"
           @node-mouse-leave="onNodeMouseLeave"
           @node-context-menu="onNodeContextMenu"
+          @selection-context-menu="onSelectionContextMenu"
           @edge-context-menu="onEdgeContextMenu"
           @nodes-change="triggerSave"
           @edges-change="triggerSave"
@@ -2155,6 +2253,11 @@ watch(() => library.papers, () => {
             <Icon icon="fluent:arrow-up-right-24-regular" width="15" height="15" />
           </button>
         </div>
+
+        <!-- Result of "添加到智能问答" -->
+        <Transition name="chat-notice">
+          <div v-if="chatNotice" class="chat-notice" @click="chatNotice = ''">{{ chatNotice }}</div>
+        </Transition>
 
         <!-- Hover tooltip -->
         <Teleport to="body">
@@ -2337,6 +2440,10 @@ watch(() => library.papers, () => {
               <Icon icon="fluent:book-24-regular" width="12" height="12" />
               {{ t('canvas.viewPaper') }}
             </button>
+            <button class="ctx-item" @click="ctxAddPapersToChat">
+              <Icon icon="fluent:chat-24-regular" width="12" height="12" />
+              添加到智能问答<template v-if="ctxPaperTargetCount > 1">（{{ ctxPaperTargetCount }} 篇）</template>
+            </button>
 
             <div class="ctx-divider" />
             <button class="ctx-item ctx-item--danger" @click="ctxRemoveNode">
@@ -2345,6 +2452,23 @@ watch(() => library.papers, () => {
             </button>
           </template>
         </template>
+        <!-- Right-click on a box-selection (no single node under the cursor) -->
+        <template v-if="!ctxMenu.nodeId && !ctxMenu.edgeId && ctxMenu.selectionIds.length">
+          <button
+            class="ctx-item"
+            :disabled="ctxPaperTargetCount === 0"
+            @click="ctxAddPapersToChat"
+          >
+            <Icon icon="fluent:chat-24-regular" width="12" height="12" />
+            添加到智能问答<template v-if="ctxPaperTargetCount"> （{{ ctxPaperTargetCount }} 篇）</template>
+          </button>
+          <div class="ctx-divider" />
+          <button class="ctx-item ctx-item--danger" @click="ctxRemoveSelection">
+            <Icon icon="fluent:delete-24-regular" width="12" height="12" />
+            删除选中（{{ ctxMenu.selectionIds.length }}）
+          </button>
+        </template>
+
         <template v-if="ctxMenu.edgeId">
           <div class="ctx-style-section">
             <span class="ctx-style-label">颜色</span>
@@ -2620,6 +2744,30 @@ watch(() => library.papers, () => {
 :deep(.vue-flow__minimap) { border-radius: 8px; overflow: hidden; }
 .canvas-minimap { bottom: 12px; right: 12px; }
 
+/* Outcome of sending papers to the library chat. Click to dismiss; it also
+   times itself out. */
+.chat-notice {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  max-width: 80%;
+  padding: 9px 15px;
+  border-radius: 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.16);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.chat-notice-enter-active,
+.chat-notice-leave-active { transition: opacity .18s ease, transform .18s ease; }
+.chat-notice-enter-from,
+.chat-notice-leave-to { opacity: 0; transform: translate(-50%, 6px); }
+
 /* Hover tooltip. Interactive on purpose — a long note has to be scrollable, and
    `pointer-events: none` made the card unreachable: the pointer passed straight
    through it to the canvas, so it could never be hovered or scrolled. It closes
@@ -2749,6 +2897,12 @@ watch(() => library.papers, () => {
   transition: background 0.1s;
 }
 .ctx-item:hover { background: var(--bg-hover); }
+/* Shown when a selection holds no paper nodes — e.g. only shapes were boxed. */
+.ctx-item:disabled {
+  color: var(--text-tertiary);
+  cursor: default;
+}
+.ctx-item:disabled:hover { background: none; }
 .ctx-item--danger { color: #ef4444; }
 .ctx-item--danger:hover { background: #fee2e2; }
 .ctx-style-section {

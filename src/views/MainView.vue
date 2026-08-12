@@ -454,24 +454,31 @@ function onWritingSelectPaper(slug: string) {
 function onCanvasSelectPaper(slug: string) {
   selectionStore.selectPaper(slug)
   rightSidebarVisible.value = true
-  // In canvas mode, clicking any element jumps to the drawing properties tab.
-  if (showCanvas.value) {
-    sidebarTab.value = 'draw'
-    return
-  }
-  if (!PAPER_TABS.includes(sidebarTab.value)) {
-    sidebarTab.value = 'metadata'
+  // Stay on whatever tab is already open. Clicking through the graph with 笔记
+  // showing should show each paper's notes — bouncing to the drawing properties
+  // every time made the sidebar useless for reading as you navigate. Only a tab
+  // that can't render the current context falls back.
+  // (`select-paper` also fires when a node is OPENED as a reader tab, by which
+  // point this is no longer canvas mode — hence the two tab sets.)
+  const allowed = showCanvas.value ? CANVAS_TABS : PAPER_TABS
+  if (!allowed.includes(sidebarTab.value)) {
+    sidebarTab.value = showCanvas.value ? 'draw' : 'metadata'
   }
 }
 
-// Selecting any element on the canvas (node / text / shape / line) jumps the
-// sidebar to the drawing properties tab so its properties are visible.
-watch(() => canvasStore.selectedNodeIds.length, (n) => {
-  if (showCanvas.value && n > 0) {
-    sidebarTab.value = 'draw'
+// Selecting a canvas element reveals the sidebar. A paper node keeps the current
+// tab (see above); text/shape/line and multi-selections only have drawing
+// properties, so those do jump to 绘图.
+watch(
+  () => (canvasStore.selectedNodeIds.length ? (canvasStore.selectedNode?.type ?? 'multi') : null),
+  (kind) => {
+    if (!showCanvas.value || !kind) return
     rightSidebarVisible.value = true
+    if (kind !== 'paper' || !CANVAS_TABS.includes(sidebarTab.value)) {
+      sidebarTab.value = 'draw'
+    }
   }
-})
+)
 
 function onSwitchSidebarTab(event: Event) {
   const { tab } = (event as CustomEvent<{ tab: string }>).detail ?? {}

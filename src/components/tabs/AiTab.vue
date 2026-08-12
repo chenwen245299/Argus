@@ -1767,12 +1767,35 @@ function handleKeydown(e: KeyboardEvent) {
   }
 }
 
+// ── Follow-the-stream scrolling ───────────────────────────────────────────────
+// Whether new streamed text should pull the view down. This is tracked from the
+// user's own scrolling rather than re-measured at render time: an answer that is
+// still streaming changes the container's height constantly, so a distance-from-
+// bottom check taken right after a DOM patch can read a height that is about to
+// change again and yank the user back down. Once they scroll up they stay put
+// until they come back to the bottom themselves.
+const stickToBottom = ref(true)
+const STICK_THRESHOLD_PX = 120
+
+function onMessagesScroll() {
+  const el = messagesEl.value
+  if (!el) return
+  stickToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < STICK_THRESHOLD_PX
+}
+
+/** Scrolling up is an explicit "let me read" — release immediately, don't wait
+ *  for the scroll event, which a mid-stream height change could contradict. */
+function onMessagesWheel(e: WheelEvent) {
+  if (e.deltaY < 0) stickToBottom.value = false
+}
+
 function scrollToBottom(force = false) {
+  if (force) stickToBottom.value = true
   nextTick(() => {
     const el = messagesEl.value
     if (!el) return
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
-    if (force || nearBottom) el.scrollTop = el.scrollHeight
+    if (!stickToBottom.value) return
+    el.scrollTop = el.scrollHeight
   })
 }
 
@@ -2281,6 +2304,8 @@ function toggleContextPanel(nodeId: string) {
           class="messages"
           :class="{ 'messages--no-floating-model': activeConversationIsMetadataExtraction }"
           @click="onMsgContainerClick"
+          @scroll.passive="onMessagesScroll"
+          @wheel.passive="onMessagesWheel"
         >
         <div v-if="!activeConversation?.nodes.length" class="empty-chat">
           <div class="empty-orb">
@@ -3493,12 +3518,30 @@ function toggleContextPanel(nodeId: string) {
   border-color: color-mix(in srgb, #ff3b30 55%, transparent);
 }
 .variant-btn.streaming {
-  animation: variant-pulse 1.2s ease-out infinite;
+  /* Breathing, not a one-shot ripple: a model can still be answering while a
+     different variant is on screen, so this has to read as "ongoing" at a
+     glance. Halo and icon share the timing so they pulse as one. */
+  animation: variant-halo 1.6s ease-in-out infinite;
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
-@keyframes variant-pulse {
-  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 34%, transparent); }
-  70% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
-  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+.variant-btn.streaming .variant-logo,
+.variant-btn.streaming .variant-letter {
+  animation: variant-breathe 1.6s ease-in-out infinite;
+}
+@keyframes variant-halo {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 38%, transparent); }
+  50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 0%, transparent); }
+}
+@keyframes variant-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .variant-btn.streaming,
+  .variant-btn.streaming .variant-logo,
+  .variant-btn.streaming .variant-letter {
+    animation: none;
+  }
 }
 .variant-logo {
   width: 20px;

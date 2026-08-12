@@ -13,6 +13,7 @@ import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
 import { buildChunks } from '../utils/chunker'
 import { sortPapersByRecentAccess } from '../utils/recentPapers'
+import { serveAddPapersToChat } from '../utils/chatPapers'
 import { estimateCostCny } from '../utils/modelPricing'
 import type { ChatContentPart, ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
 
@@ -421,6 +422,8 @@ const pickerPapers = computed(() => {
 
 function openPaperPicker() {
   paperPickerSearch.value = ''
+  // The dialog is "添加文献", so it opens on the list you add from.
+  pickerTab.value = 'available'
   paperPickerOpen.value = true
 }
 
@@ -448,6 +451,35 @@ function toggleSelectedPaper(paper: PaperIndexEntry) {
 function clearSelectedPapers() {
   setActiveSelectedPaperSlugs([])
 }
+
+/**
+ * Papers sent over from the relation graph's context menu. Declined (null) when
+ * the chat isn't on the 文献库论文 source — adding them to a context that isn't
+ * being used would look like it silently did nothing.
+ */
+function applyPapersFromGraph(slugs: string[]) {
+  if (knowledgeSource.value !== 'papers') return null
+  const known = new Set(allPapers.value.map(p => p.slug))
+  const current = new Set(selectedPaperSlugs.value)
+  const incoming = slugs.filter(s => known.has(s))
+  const fresh = incoming.filter(s => !current.has(s))
+  if (fresh.length) setActiveSelectedPaperSlugs([...selectedPaperSlugs.value, ...fresh])
+  return { added: fresh.length, alreadyPresent: incoming.length - fresh.length }
+}
+
+// The picker used to interleave chosen and unchosen papers, so finding what was
+// already in the context meant scanning the whole list for badges. They're two
+// tabs now — with hundreds of papers, stacked sections still meant scrolling
+// past the whole library to reach the other group.
+type PickerTab = 'available' | 'added'
+const pickerTab = ref<PickerTab>('available')
+
+const pickerSelectedPapers = computed(() =>
+  pickerPapers.value.filter(p => selectedPaperSlugs.value.includes(p.slug)))
+const pickerUnselectedPapers = computed(() =>
+  pickerPapers.value.filter(p => !selectedPaperSlugs.value.includes(p.slug)))
+const pickerVisiblePapers = computed(() =>
+  pickerTab.value === 'added' ? pickerSelectedPapers.value : pickerUnselectedPapers.value)
 
 // ── Snippet store state ───────────────────────────────────────────────────────
 const snippetEmbeddedCount  = ref(0)
@@ -1726,6 +1758,7 @@ async function refreshConversations() {
 }
 
 let unlistenLibraryChanged: UnlistenFn | null = null
+let unlistenAddPapers: UnlistenFn | null = null
 
 onMounted(async () => {
   await settingsStore.load()
@@ -1757,6 +1790,8 @@ onMounted(async () => {
     await refreshConversations()
   })
 
+  unlistenAddPapers = await serveAddPapersToChat(applyPapersFromGraph)
+
   // Window size is persisted by the Tauri window event handler.
 })
 
@@ -1768,6 +1803,7 @@ onUnmounted(() => {
   for (const id of [...activeUnlisteners.keys()]) detachListeners(id)
   clearAllStreamRenderTimers()
   unlistenLibraryChanged?.()
+  unlistenAddPapers?.()
 })
 </script>
 
@@ -2590,13 +2626,38 @@ onUnmounted(() => {
           </button>
         </div>
         <input v-model="paperPickerSearch" class="paper-picker-search" placeholder="搜索标题、作者、年份..." autofocus />
-        <div class="paper-picker-list">
-          <div v-if="pickerPapers.length === 0" class="paper-picker-empty">暂无匹配文献</div>
+        <div class="paper-picker-tabs">
           <button
-            v-for="paper in pickerPapers"
+            class="paper-picker-tab"
+            :class="{ active: pickerTab === 'available' }"
+            @click="pickerTab = 'available'"
+          >
+            未添加
+            <span class="paper-picker-tab-count">{{ pickerUnselectedPapers.length }}</span>
+          </button>
+          <button
+            class="paper-picker-tab"
+            :class="{ active: pickerTab === 'added' }"
+            @click="pickerTab = 'added'"
+          >
+            已添加
+            <span class="paper-picker-tab-count">{{ pickerSelectedPapers.length }}</span>
+          </button>
+          <button
+            v-if="pickerTab === 'added' && pickerSelectedPapers.length"
+            class="paper-picker-clear"
+            @click="clearSelectedPapers"
+          >全部移除</button>
+        </div>
+
+        <div class="paper-picker-list">
+          <div v-if="pickerVisiblePapers.length === 0" class="paper-picker-empty">
+            {{ pickerTab === 'added' ? '还没有添加任何文献' : '暂无匹配文献' }}
+          </div>
+          <button
+            v-for="paper in pickerVisiblePapers"
             :key="paper.slug"
             class="paper-picker-item"
-            :class="{ selected: selectedPaperSlugs.includes(paper.slug) }"
             @click="toggleSelectedPaper(paper)"
           >
             <span class="paper-picker-item-title">{{ paper.title }}</span>
@@ -2604,7 +2665,7 @@ onUnmounted(() => {
               {{ paper.authors.slice(0, 2).join(', ') }}{{ paper.authors.length > 2 ? ' 等' : '' }}
               <template v-if="paper.year"> · {{ paper.year }}</template>
             </span>
-            <span v-if="selectedPaperSlugs.includes(paper.slug)" class="paper-picker-badge">点击移除</span>
+            <span v-if="pickerTab === 'added'" class="paper-picker-badge">点击移除</span>
           </button>
         </div>
       </div>
@@ -4634,7 +4695,10 @@ onUnmounted(() => {
 }
 .paper-picker-dialog {
   width: min(520px, calc(100vw - 40px));
-  max-height: min(620px, calc(100vh - 80px));
+  /* Fixed, not max-height: with max-height the box sizes to its content, so
+     switching from 未添加 (hundreds) to 已添加 (a handful) collapsed the whole
+     dialog. The list inside scrolls, so the frame has no reason to move. */
+  height: min(620px, calc(100vh - 80px));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -4679,6 +4743,9 @@ onUnmounted(() => {
   background: var(--bg-primary);
 }
 .paper-picker-list {
+  /* flex:1 so a short list still fills the fixed-height dialog instead of
+     leaving the scroll area collapsed at the top. */
+  flex: 1;
   min-height: 0;
   overflow-y: auto;
   padding: 0 8px 12px;
@@ -4689,6 +4756,54 @@ onUnmounted(() => {
   font-size: 13px;
   text-align: center;
 }
+/* Chosen vs. unchosen as tabs — one list on screen at a time. */
+.paper-picker-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 16px 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.paper-picker-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.paper-picker-tab:hover { background: var(--bg-hover); }
+.paper-picker-tab.active {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+.paper-picker-tab-count {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-primary) 8%, transparent);
+  font-size: 11px;
+  font-weight: 500;
+}
+.paper-picker-tab.active .paper-picker-tab-count {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.paper-picker-clear {
+  margin-left: auto;
+  border: none;
+  background: none;
+  padding: 4px 6px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.paper-picker-clear:hover { color: #dc2626; }
 .paper-picker-item {
   position: relative;
   display: flex;
@@ -4701,10 +4816,8 @@ onUnmounted(() => {
   color: var(--text-primary);
 }
 .paper-picker-item:hover { background: var(--bg-hover); }
-.paper-picker-item.selected {
-  opacity: 0.62;
-  cursor: default;
-}
+/* No dimmed "already added" state any more — the 已添加 tab is what says so, and
+   greying a whole tab's worth of rows only made them hard to read. */
 .paper-picker-item-title {
   font-size: 13px;
   font-weight: 600;

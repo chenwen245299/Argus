@@ -2,6 +2,7 @@ import { marked, type Tokens } from 'marked'
 import hljs from 'highlight.js/lib/common'
 import DOMPurify from 'dompurify'
 import katex from 'katex'
+import { invoke } from '@tauri-apps/api/core'
 
 // DOMPurify's default URI policy blocks `blob:`, which is how a note's pasted
 // images are rendered (see utils/noteAssets.ts) — without this they'd be
@@ -36,6 +37,21 @@ function installMarkdownHandlers() {
 
   document.addEventListener('click', (event) => {
     const target = event.target as HTMLElement | null
+
+    // Links rendered inside markdown (AI answers, notes, chat) must go to the
+    // OS browser: the webview has no tabs, so `target="_blank"` is a no-op and
+    // a plain navigation would replace the app itself. Only http(s) is routed —
+    // in-page `#anchor` jumps and mailto: keep their default behaviour.
+    const link = target?.closest<HTMLAnchorElement>('a.md-link')
+    if (link) {
+      const href = link.getAttribute('href') ?? ''
+      if (/^https?:\/\//i.test(href)) {
+        event.preventDefault()
+        invoke('open_url', { url: href }).catch(console.error)
+      }
+      return
+    }
+
     const button = target?.closest<HTMLButtonElement>('[data-md-action]')
     if (!button) return
 

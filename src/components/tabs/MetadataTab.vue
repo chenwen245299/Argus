@@ -175,7 +175,7 @@ function importSource(value?: string | null, arxivId?: string | null): ImportSou
 // ── Edit state ────────────────────────────────────────────────────────────────
 const editing = ref(false)
 const draft = ref<PaperMeta | null>(null)
-const copiedKind = ref<'abstract' | 'fulltext' | 'bibtex' | null>(null)
+const copiedKind = ref<'abstract' | 'fulltext' | 'bibtex' | 'citekey' | null>(null)
 const sourceEditing = ref(false)
 const sourceDraft = ref<ImportSource>('file')
 const sourceSaving = ref(false)
@@ -290,6 +290,24 @@ async function saveBibtex() {
     bibtexSaving.value = false
   }
 }
+
+// ── Citation key ──────────────────────────────────────────────────────────────
+// The key is what actually gets typed in a manuscript (`\cite{wu2021reascan}`),
+// so it gets its own copy button instead of making you select it out of the
+// BibTeX block by hand. `@string`/`@comment`/`@preamble` are not entries, so
+// skip them and take the first real one — a paper's BibTeX may carry a @string
+// preamble ahead of the entry.
+const CITE_KEY_RE = /@\s*([A-Za-z]+)\s*\{\s*([^,\s{}]+)\s*,/g
+
+const citeKey = computed(() => {
+  const src = props.meta?.bibtex ?? ''
+  for (const m of src.matchAll(CITE_KEY_RE)) {
+    const type = m[1].toLowerCase()
+    if (type === 'string' || type === 'comment' || type === 'preamble') continue
+    return m[2]
+  }
+  return ''
+})
 
 // ── Citation count inline edit ────────────────────────────────────────────────
 const citeCountEditing = ref(false)
@@ -548,7 +566,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('argus-references-updated', onReferencesUpdated)
 })
 
-async function copyText(kind: 'abstract' | 'fulltext' | 'bibtex', text: string) {
+async function copyText(kind: 'abstract' | 'fulltext' | 'bibtex' | 'citekey', text: string) {
   const val = text.trim()
   if (!val) return
   await navigator.clipboard.writeText(val).catch(() => {})
@@ -735,6 +753,17 @@ async function extractAbstract() {
             <div class="section-actions">
               <button class="copy-section-btn" @click="startBibtexEdit">
                 {{ meta.bibtex ? '编辑' : '导入' }}
+              </button>
+              <button
+                class="copy-section-btn"
+                :class="{ done: copiedKind === 'citekey' }"
+                :disabled="!citeKey"
+                :title="citeKey ? `复制引用键：${citeKey}` : '未能从 BibTeX 中解析出引用键'"
+                @click="copyText('citekey', citeKey)"
+              >
+                <Icon v-if="copiedKind === 'citekey'" icon="fluent:checkmark-24-regular" width="12" height="12" />
+                <Icon v-else icon="fluent:tag-24-regular" width="12" height="12" />
+                {{ copiedKind === 'citekey' ? '已复制' : '引用键' }}
               </button>
               <button
                 class="copy-section-btn"

@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use tauri::Emitter;
 
-use crate::models::{ChatContent, ChatContentPart, ChatMessage, FileData, PaperMeta, RetrievedChunk};
+use crate::models::{
+    AiProvider, ChatContent, ChatContentPart, ChatMessage, FileData, PaperMeta, RetrievedChunk,
+};
 use crate::{ai_manager, ai_summary, extraction, llm, paper, rag};
 
 // ── Chat history persistence ──────────────────────────────────────────────────
@@ -103,42 +105,410 @@ pub fn clear_library_chat_history(root: &str) -> Result<(), String> {
     }
 }
 
-// Library-wide "智能问答" conversations (multi-conversation model with titles,
-// selected papers, timestamps). Stored per-library under `.argus/` so switching
-// libraries never bleeds conversation data between them. The frontend owns the
-// shape, so we persist it as an opaque JSON array (same pattern as
-// `ai_conversations.json` for per-paper chat).
-fn library_conversations_path(root: &str) -> PathBuf {
+// Library-wide "智能问答" conversations.
+//
+// # One file per conversation, beside `papers/`
+//
+// These used to be a single `.argus/library_chats.json` holding every
+// conversation in one JSON array. That has a cost that is easy to miss: JSON
+// arrays cannot be edited in place, so touching one conversation meant
+// re-serializing and rewriting *all* of them — and the chat window saves several
+// times per answer. The old code capped the file at 50 conversations to keep
+// that bounded, which silently deleted the 51st.
+//
+// One file each removes both problems: a save rewrites only what changed, and
+// there is no reason left to cap how many are kept.
+//
+// They live in `<library>/chats/` rather than `.argus/` because they are the
+// user's own writing, not a rebuildable cache — the same reason `papers/` is not
+// hidden either. `.argus/` is for things the app can regenerate.
+//
+// The frontend owns the shape; each file is stored as an opaque JSON object.
+
+fn conversations_dir(root: &str) -> PathBuf {
+    Path::new(root).join("chats")
+}
+
+/// Where every conversation used to live, in one array.
+fn legacy_conversations_path(root: &str) -> PathBuf {
     Path::new(root).join(".argus").join("library_chats.json")
 }
 
-pub fn read_library_conversations(root: &str) -> serde_json::Value {
-    let path = library_conversations_path(root);
-    if !path.exists() {
-        return serde_json::json!([]);
+/// Filename for a conversation id.
+///
+/// Ids are generated as base36 and are already safe, but a file name is a real
+/// path segment and anything arriving from an older version or a hand-edited
+/// file has to be neutralised. Unsafe ids map to a stable hash rather than being
+/// rejected, so an odd id costs its readable filename and nothing else.
+fn conversation_file_stem(id: &str) -> String {
+    let safe = id.len() <= 64
+        && !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if safe {
+        return id.to_string();
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .filter(|v: &serde_json::Value| v.is_array())
-        .unwrap_or_else(|| serde_json::json!([]))
+    // FNV-1a: stable across runs and platforms, which `DefaultHasher` is not.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("id-{hash:016x}")
 }
 
-pub fn write_library_conversations(
-    root: &str,
-    conversations: &serde_json::Value,
-) -> Result<(), String> {
-    if !conversations.is_array() {
-        return Err("Library conversations must be an array.".to_string());
+fn conversation_path(root: &str, id: &str) -> Result<PathBuf, String> {
+    let name = format!("{}.json", conversation_file_stem(id));
+    crate::path_guard::validate_segment("conversation id", &name)?;
+    Ok(conversations_dir(root).join(name))
+}
+
+/// Every conversation, newest first. Reads only — never migrates.
+///
+/// Split from [`load_library_conversations`] so the MCP tools can use it. They
+/// are annotated `readOnlyHint: true`, and a client is entitled to take that at
+/// its word: several auto-approve read-only calls. Migration creates a
+/// directory, writes a file per conversation and renames the original, which is
+/// not something a tool making that claim may do.
+///
+/// Anything the migration has not moved yet is still read, straight out of the
+/// legacy file, so switching this path off does not hide conversations from the
+/// agent — or from the user, if a migration ever stops half way.
+pub fn read_library_conversations(root: &str) -> serde_json::Value {
+    let mut convs: Vec<serde_json::Value> = std::fs::read_dir(conversations_dir(root))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|v| v["id"].is_string() && v["messages"].is_array())
+        .collect();
+
+    // Whatever is still only in the old single-file store. The per-file copy
+    // wins: it is the one the app has been writing to since the migration.
+    let migrated: std::collections::HashSet<String> = convs
+        .iter()
+        .filter_map(|v| v["id"].as_str().map(str::to_string))
+        .collect();
+    convs.extend(
+        legacy_conversations(root)
+            .into_iter()
+            .filter(|v| v["id"].as_str().is_some_and(|id| !migrated.contains(id))),
+    );
+
+    // Order lived in the array's sequence before; now it is derived, so a file
+    // written by hand or restored from a backup still lands in the right place.
+    convs.sort_by(|a, b| {
+        let key = |v: &serde_json::Value| {
+            v["updatedAt"]
+                .as_str()
+                .or_else(|| v["createdAt"].as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        key(b).cmp(&key(a))
+    });
+    serde_json::Value::Array(convs)
+}
+
+/// What the app itself calls: migrate first, then read.
+pub fn load_library_conversations(root: &str) -> serde_json::Value {
+    migrate_legacy_conversations(root);
+    read_library_conversations(root)
+}
+
+/// The conversations still sitting in the pre-split file, if it is there.
+fn legacy_conversations(root: &str) -> Vec<serde_json::Value> {
+    let Ok(text) = std::fs::read_to_string(legacy_conversations_path(root)) else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Array(convs)) => convs
+            .into_iter()
+            .filter(|v| v["id"].is_string() && v["messages"].is_array())
+            .collect(),
+        _ => Vec::new(),
     }
-    let path = library_conversations_path(root);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("Create .argus dir: {e}"))?;
-    }
-    let content = serde_json::to_string_pretty(conversations)
-        .map_err(|e| format!("Serialize library conversations: {e}"))?;
+}
+
+pub fn write_library_conversation(root: &str, conversation: &serde_json::Value) -> Result<(), String> {
+    let id = conversation["id"]
+        .as_str()
+        .ok_or("Conversation is missing an id.")?;
+    let path = conversation_path(root, id)?;
+    std::fs::create_dir_all(conversations_dir(root))
+        .map_err(|e| format!("Create chats dir: {e}"))?;
+    let content = serde_json::to_string_pretty(conversation)
+        .map_err(|e| format!("Serialize conversation: {e}"))?;
     crate::fsutil::atomic_write_str(&path, &content)
-        .map_err(|e| format!("Write library_chats.json: {e}"))
+        .map_err(|e| format!("Write conversation: {e}"))
+}
+
+pub fn delete_library_conversation(root: &str, id: &str) -> Result<(), String> {
+    let path = conversation_path(root, id)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        // Already gone is the desired end state, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Delete conversation: {e}")),
+    }
+}
+
+/// Split the old single-file store into one file per conversation.
+///
+/// Runs at most once: the legacy file is renamed aside only after every
+/// conversation has been written out, so an interrupted migration leaves the
+/// original untouched and is simply retried next time. The backup is kept rather
+/// than deleted — this moves the user's own writing, and a rename is cheap
+/// insurance against a bug here.
+fn migrate_legacy_conversations(root: &str) {
+    let legacy = legacy_conversations_path(root);
+    if !legacy.exists() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&legacy) else {
+        return;
+    };
+    let Ok(serde_json::Value::Array(convs)) = serde_json::from_str::<serde_json::Value>(&text)
+    else {
+        return;
+    };
+
+    for conv in &convs {
+        let Some(id) = conv["id"].as_str() else {
+            continue;
+        };
+        // If a per-file copy already exists, a previous run moved this one and
+        // the user may have edited it since. Copying the legacy row over it
+        // would silently undo that. Only what is still missing gets written,
+        // which is what makes retrying an interrupted migration safe.
+        if conversation_path(root, id).is_ok_and(|p| p.exists()) {
+            continue;
+        }
+        if let Err(e) = write_library_conversation(root, conv) {
+            eprintln!("[chats] migration aborted, leaving the original in place: {e}");
+            return;
+        }
+    }
+
+    let backup = legacy.with_extension("json.pre-split-backup");
+    if let Err(e) = std::fs::rename(&legacy, &backup) {
+        eprintln!("[chats] could not set the old file aside: {e}");
+    }
+}
+
+#[cfg(test)]
+mod conversation_store_tests {
+    use super::*;
+
+    struct TempRoot(PathBuf);
+    impl TempRoot {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("argus-chats-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".argus")).unwrap();
+            TempRoot(dir)
+        }
+        fn path(&self) -> String {
+            self.0.to_string_lossy().to_string()
+        }
+    }
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn conv(id: &str, updated: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "title": id, "messages": [],
+            "createdAt": updated, "updatedAt": updated,
+        })
+    }
+
+    #[test]
+    fn a_conversation_round_trips_through_its_own_file() {
+        let root = TempRoot::new("roundtrip");
+        write_library_conversation(&root.path(), &conv("abc123", "2026-01-01T00:00:00Z")).unwrap();
+        let all = read_library_conversations(&root.path());
+        assert_eq!(all.as_array().unwrap().len(), 1);
+        assert_eq!(all[0]["id"], "abc123");
+        assert!(
+            root.0.join("chats").join("abc123.json").exists(),
+            "not stored beside papers/ under its own id"
+        );
+    }
+
+    /// Order used to be the array's sequence. It is derived now, so a file
+    /// restored from a backup still lands where it belongs.
+    #[test]
+    fn conversations_come_back_newest_first() {
+        let root = TempRoot::new("order");
+        write_library_conversation(&root.path(), &conv("old", "2026-01-01T00:00:00Z")).unwrap();
+        write_library_conversation(&root.path(), &conv("new", "2026-06-01T00:00:00Z")).unwrap();
+        let all = read_library_conversations(&root.path());
+        assert_eq!(all[0]["id"], "new");
+        assert_eq!(all[1]["id"], "old");
+    }
+
+    #[test]
+    fn saving_one_conversation_leaves_the_others_untouched() {
+        let root = TempRoot::new("isolation");
+        write_library_conversation(&root.path(), &conv("a", "2026-01-01T00:00:00Z")).unwrap();
+        write_library_conversation(&root.path(), &conv("b", "2026-01-02T00:00:00Z")).unwrap();
+
+        let a_file = root.0.join("chats").join("a.json");
+        let before = std::fs::metadata(&a_file).unwrap().len();
+        let mut updated = conv("b", "2026-02-02T00:00:00Z");
+        updated["title"] = serde_json::json!("much longer title than before");
+        write_library_conversation(&root.path(), &updated).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&a_file).unwrap().len(),
+            before,
+            "writing b rewrote a"
+        );
+    }
+
+    #[test]
+    fn deleting_removes_only_that_file() {
+        let root = TempRoot::new("delete");
+        write_library_conversation(&root.path(), &conv("a", "2026-01-01T00:00:00Z")).unwrap();
+        write_library_conversation(&root.path(), &conv("b", "2026-01-02T00:00:00Z")).unwrap();
+        delete_library_conversation(&root.path(), "a").unwrap();
+        let all = read_library_conversations(&root.path());
+        assert_eq!(all.as_array().unwrap().len(), 1);
+        assert_eq!(all[0]["id"], "b");
+        // Deleting what is already gone is the desired end state.
+        delete_library_conversation(&root.path(), "a").unwrap();
+    }
+
+    /// The migration moves the user's own writing. Nothing may be lost, and the
+    /// original has to survive as a backup.
+    #[test]
+    fn the_legacy_file_is_split_without_losing_anything() {
+        let root = TempRoot::new("migrate");
+        let legacy = serde_json::json!([
+            conv("one", "2026-01-01T00:00:00Z"),
+            conv("two", "2026-02-01T00:00:00Z"),
+            conv("three", "2026-03-01T00:00:00Z"),
+        ]);
+        std::fs::write(
+            legacy_conversations_path(&root.path()),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let all = load_library_conversations(&root.path());
+        let ids: Vec<&str> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["three", "two", "one"], "{all}");
+
+        assert!(
+            !legacy_conversations_path(&root.path()).exists(),
+            "the old file would be migrated again on every read"
+        );
+        assert!(
+            root.0.join(".argus").join("library_chats.json.pre-split-backup").exists(),
+            "the original was deleted rather than set aside"
+        );
+
+        // And a second read must not resurrect or duplicate anything.
+        let again = load_library_conversations(&root.path());
+        assert_eq!(again.as_array().unwrap().len(), 3);
+    }
+
+    /// The MCP tools that list conversations are annotated `readOnlyHint: true`,
+    /// and clients auto-approve on that basis. Reading must therefore not be
+    /// what triggers the migration — and must still show everything, or the
+    /// agent would be told the un-migrated conversations do not exist.
+    #[test]
+    fn reading_never_migrates_but_still_sees_the_legacy_file() {
+        let root = TempRoot::new("readonly");
+        let legacy = serde_json::json!([
+            conv("one", "2026-01-01T00:00:00Z"),
+            conv("two", "2026-02-01T00:00:00Z"),
+        ]);
+        std::fs::write(
+            legacy_conversations_path(&root.path()),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let all = read_library_conversations(&root.path());
+        assert_eq!(all.as_array().unwrap().len(), 2, "legacy rows were hidden");
+        assert_eq!(all[0]["id"], "two", "newest first still applies");
+
+        assert!(
+            legacy_conversations_path(&root.path()).exists(),
+            "a read-only call moved the user's file"
+        );
+        assert!(
+            !root.0.join("chats").exists(),
+            "a read-only call created the chats folder"
+        );
+    }
+
+    /// With both stores present the per-file copy is the live one; the legacy
+    /// row is a stale snapshot from before the migration.
+    #[test]
+    fn the_migrated_copy_wins_over_the_legacy_row() {
+        let root = TempRoot::new("both");
+        std::fs::write(
+            legacy_conversations_path(&root.path()),
+            serde_json::to_string(&serde_json::json!([conv("dup", "2026-01-01T00:00:00Z")])).unwrap(),
+        )
+        .unwrap();
+        let mut newer = conv("dup", "2026-05-05T00:00:00Z");
+        newer["title"] = serde_json::json!("edited since the migration");
+        write_library_conversation(&root.path(), &newer).unwrap();
+
+        let all = read_library_conversations(&root.path());
+        assert_eq!(all.as_array().unwrap().len(), 1, "the id was listed twice");
+        assert_eq!(all[0]["title"], "edited since the migration");
+    }
+
+    /// An id that is not a safe filename must not escape the chats folder.
+    #[test]
+    fn a_hostile_id_cannot_write_outside_the_folder() {
+        let root = TempRoot::new("traversal");
+        for id in ["../../escape", "a/b", "..", ""] {
+            let stem = conversation_file_stem(id);
+            assert!(
+                !stem.contains('/') && !stem.contains('\\') && stem != "..",
+                "id {id:?} produced the file stem {stem:?}"
+            );
+        }
+        // And the mapping is stable, or a conversation would be unreachable
+        // after the write that created it.
+        assert_eq!(conversation_file_stem("a/b"), conversation_file_stem("a/b"));
+        assert_ne!(conversation_file_stem("a/b"), conversation_file_stem("a/c"));
+
+        write_library_conversation(&root.path(), &conv("../../escape", "2026-01-01T00:00:00Z"))
+            .unwrap();
+        assert_eq!(read_library_conversations(&root.path())[0]["id"], "../../escape");
+    }
+
+    /// A stray or half-written file in the folder must not take the list down.
+    #[test]
+    fn unreadable_files_are_skipped_not_fatal() {
+        let root = TempRoot::new("junk");
+        write_library_conversation(&root.path(), &conv("good", "2026-01-01T00:00:00Z")).unwrap();
+        let dir = root.0.join("chats");
+        std::fs::write(dir.join("broken.json"), "{ not json").unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
+        std::fs::write(dir.join("wrong-shape.json"), "{\"id\": 5}").unwrap();
+
+        let all = read_library_conversations(&root.path());
+        assert_eq!(all.as_array().unwrap().len(), 1);
+        assert_eq!(all[0]["id"], "good");
+    }
 }
 
 // ── Copilot chat ──────────────────────────────────────────────────────────────
@@ -783,8 +1153,12 @@ pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
             }
         };
         match event {
-            WindowEvent::Resized(_) | WindowEvent::CloseRequested { .. } => {
+            WindowEvent::Resized(_) => save(&win_ref),
+            WindowEvent::CloseRequested { .. } => {
                 save(&win_ref);
+                // The user has left agent mode by leaving entirely; stop paying
+                // to hold their conversation's cache open.
+                crate::cache_keepalive::disarm();  // the window is going; no one to tell
             }
             _ => {}
         }
@@ -1253,4 +1627,946 @@ fn build_system_prompt(
     }
 
     prompt
+}
+
+// ── Agent mode ───────────────────────────────────────────────────────────────
+//
+// Instead of retrieving context up front and hoping it contains the answer, the
+// model is handed the same tools the MCP server exposes and decides for itself
+// what to look at: list, search, open a paper's sections, read the part it
+// needs, check the user's own notes. That turns "answer from these five RAG
+// chunks" into "go find out", which is what the user actually asked for.
+//
+// Shape of one turn:
+//
+//   1. Ask the model with `tools` available (non-streaming).
+//   2. If it requested tools, run them, append the results, and go back to 1.
+//   3. When it stops asking for tools, stream the final answer.
+//
+// Each tool call is announced on `{event_name}-agent` so the UI can show what
+// the model is doing rather than a blank pause.
+
+/// Default tool rounds per answer when the caller does not say.
+pub const DEFAULT_AGENT_ROUNDS: usize = 10;
+/// Lower bound — one round is still a useful "look something up, then answer".
+pub const MIN_AGENT_ROUNDS: usize = 1;
+/// Hard ceiling, whatever the user configures.
+///
+/// The budget is theirs to set, but a model stuck re-reading the same paper
+/// must still terminate. Five hundred rounds is enough for a genuine survey
+/// across a large library, and still a bound rather than an open tab.
+pub const MAX_AGENT_ROUNDS: usize = 500;
+
+/// Clamp a user-supplied round budget into the range the loop will honour.
+pub fn clamp_agent_rounds(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_AGENT_ROUNDS)
+        .clamp(MIN_AGENT_ROUNDS, MAX_AGENT_ROUNDS)
+}
+
+// ── Context budgeting ────────────────────────────────────────────────────────
+//
+// What actually limits how much a tool may return is the model's context
+// window, and it varies by two orders of magnitude across the models this app
+// can be pointed at — a million tokens for DeepSeek V4, 131k for a local
+// gpt-oss. A single constant is wrong for both: it starves the large model and
+// still overruns the small one.
+//
+// The hazard is also not the single result. The agent loop keeps every tool
+// result in the transcript for every later round, so round twenty carries
+// rounds one through nineteen. Unbounded results do not merely produce one
+// oversized message; they walk the whole conversation off the end of the window
+// and the provider rejects the request outright, mid-answer. So there are two
+// budgets: what one result may be, and what all of them together may be.
+
+/// Roughly how many tokens a string costs.
+///
+/// A fixed characters-per-token ratio cannot be right for both scripts at once:
+/// English runs about four characters to the token, CJK about one. Anything in
+/// between is optimistic for one of them, and being optimistic here means
+/// overrunning the window this budget exists to protect. So the two are counted
+/// separately and the estimate follows the actual content — which matters most
+/// for a tool result, where JSON structure is ASCII and the values may not be.
+///
+/// Deliberately an over-estimate for non-Latin scripts: a tokenizer usually does
+/// better than one token per character, and the cost of guessing high is a
+/// slightly smaller result rather than a rejected request.
+fn estimate_tokens(s: &str) -> usize {
+    let mut ascii = 0usize;
+    let mut wide = 0usize;
+    for c in s.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            wide += 1;
+        }
+    }
+    wide + ascii.div_ceil(4)
+}
+
+/// Assumed window when a model's `context_length` is not configured.
+///
+/// Small enough to be safe on anything current, which is the right way to be
+/// wrong when the answer is unknown.
+const ASSUMED_CONTEXT_TOKENS: u64 = 128_000;
+
+/// Floor under both budgets, for a model declared with an implausibly tiny
+/// window — a tool result has to be able to say something.
+const MIN_RESULT_TOKENS: usize = 2_000;
+
+#[derive(Debug, Clone, Copy)]
+struct ContextBudget {
+    /// The most one tool result may contribute, in tokens.
+    single_result: usize,
+    /// The most all tool results together may occupy, in tokens, before the
+    /// oldest are evicted.
+    transcript: usize,
+}
+
+impl ContextBudget {
+    /// Derive both budgets from the model's declared window.
+    ///
+    /// A quarter of the window for one result, half for all of them: the
+    /// remainder is the system prompt, the tool schemas, the conversation, and
+    /// the answer being generated.
+    fn for_model(provider: &AiProvider, model_id: &str) -> Self {
+        let tokens = provider
+            .models
+            .iter()
+            .find(|m| m.id == model_id)
+            .and_then(|m| m.context_length)
+            .filter(|&n| n > 0)
+            .unwrap_or(ASSUMED_CONTEXT_TOKENS) as usize;
+        ContextBudget {
+            single_result: (tokens / 4).max(MIN_RESULT_TOKENS),
+            transcript: (tokens / 2).max(MIN_RESULT_TOKENS * 2),
+        }
+    }
+}
+
+/// The prompt used when the user has not written their own.
+///
+/// The collection-first instruction is the substantive part. A model left to
+/// itself reaches for a keyword `list_papers` across the whole library, which
+/// matches on titles and misses the structure the user built by hand — their
+/// grouping encodes intent that a keyword cannot recover.
+pub const DEFAULT_AGENT_SYSTEM_PROMPT: &str = r#"You are a research assistant with direct read access to the user's literature library through MCP tools.
+
+Answer by looking things up. Anything you say about what is or is not in this library must come from a tool call, never from memory.
+
+## Find papers by walking the user's own structure
+
+The library is organised into collections, and the user has already done that work. Papers filed together are related in the way the user thinks about them, which is information no keyword search contains. So navigate down rather than searching across:
+
+1. `list_collections` — see the structure, with each collection's readable path and paper count.
+2. `list_papers` with the `collection_id` of the branch that fits the question.
+3. Only then narrow, with `query`, `tag`, `year_from` / `year_to`, `venue`, `min_citations`, or by sorting on `citations` or `year`.
+
+Descend one level at a time when a collection has children; the leaf the user filed something under is usually more specific than the question implies.
+
+Use `search_papers` when the question is about something *inside* the papers — a method, a phrase, a finding. That searches full text, not titles.
+
+A bare keyword `list_papers` across the whole library is the last resort, not the first move. It matches titles the user never grouped that way, and misses the ones they did.
+
+## Reading
+
+- `get_library_stats` when you need the shape of the library before anything else.
+- `list_papers` and `search_papers` return an abstract with each paper. The default is a preview; pass `abstract_detail: "full"` when you intend to reason over the abstracts themselves rather than just pick papers from them, and `"none"` when you only need identifiers. Read those before opening anything, and open only what the question actually needs.
+- `get_paper_sections`, then `get_paper_fulltext` with a `section`, to read the relevant part instead of paging through a whole paper.
+- `get_note` and `get_highlights` for what the user wrote or marked themselves. Often the best answer to "what did I think about this".
+
+## Answering
+
+Cite the papers you used by title. If the library does not contain the answer, say so plainly instead of filling the gap from memory. Keep tool calls purposeful: each one costs the user time and money.
+
+Reply in the language the user wrote in."#;
+
+/// The prompt in force: the user's, or the default when they have not set one.
+///
+/// Shared by the agent loop and the cache keepalive — they must send byte-identical
+/// system messages or the warmed prefix is not the one the next question asks for.
+fn agent_system_prompt(app: &tauri::AppHandle) -> String {
+    resolve_system_prompt(crate::mcp::client::read_settings(app).system_prompt)
+}
+
+/// A blank or whitespace-only prompt means the default, not silence.
+///
+/// Split out from the settings read so the one thing that can go wrong here —
+/// clearing the box and leaving the model with no instructions at all — is
+/// testable without a running Tauri app.
+fn resolve_system_prompt(configured: String) -> String {
+    if configured.trim().is_empty() {
+        DEFAULT_AGENT_SYSTEM_PROMPT.to_string()
+    } else {
+        configured
+    }
+}
+
+/// Trim a tool result to what one message may contribute.
+///
+/// Returns the text and whether anything was dropped — reported rather than
+/// re-derived by the caller, so nothing has to sniff for a marker string.
+fn truncate_tool_result(value: &serde_json::Value, cap_tokens: usize) -> (String, bool) {
+    let rendered = serde_json::to_string(value).unwrap_or_else(|_| "null".into());
+    if estimate_tokens(&rendered) <= cap_tokens {
+        return (rendered, false);
+    }
+    // Accumulated as we go rather than re-estimating a growing prefix, which
+    // would be quadratic on a result of half a million characters.
+    let mut kept = String::new();
+    let mut ascii = 0usize;
+    let mut wide = 0usize;
+    for c in rendered.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            wide += 1;
+        }
+        if wide + ascii.div_ceil(4) > cap_tokens {
+            break;
+        }
+        kept.push(c);
+    }
+    // Tell the model the result was cut, so it pages rather than assuming it
+    // has seen everything.
+    (
+        format!("{kept}\n…[result truncated; narrow the query or use offset/limit]"),
+        true,
+    )
+}
+
+/// What an evicted tool result is replaced with.
+///
+/// A stub rather than a deletion: removing the message would orphan the
+/// `tool_calls` entry that referenced it, and providers reject that outright.
+const EVICTED_NOTE: &str =
+    r#"{"note":"this earlier result was dropped to stay inside the context window; call the tool again if you still need it"}"#;
+
+/// Keep the accumulated tool output under `budget` by blanking the oldest results.
+///
+/// Called after each tool message is appended. Newest results are the ones the
+/// model is reasoning about, so the oldest go first.
+///
+/// This does invalidate the prompt cache from the first evicted message onward —
+/// the prefix changed. That is a real cost, and the right one to pay: the
+/// alternative is the provider rejecting the request for exceeding its window,
+/// which loses the whole answer rather than one cache hit. It only happens on
+/// runs that would otherwise have failed.
+/// `protect_from` is the index where the round in progress begins. Its results
+/// count towards the total but are never blanked: the model has not seen them
+/// yet, and replacing one with "call the tool again if you still need it" makes
+/// it do exactly that, whereupon the re-fetched copy evicts another result from
+/// the same round. That oscillates instead of converging, and every turn of it
+/// is a billed round. Better to run slightly over budget for one round than to
+/// take back what was just fetched.
+fn evict_old_tool_results(
+    convo: &mut [serde_json::Value],
+    budget: usize,
+    protect_from: usize,
+) -> usize {
+    let size = |m: &serde_json::Value| m["content"].as_str().map_or(0, estimate_tokens);
+    let stub_size = estimate_tokens(EVICTED_NOTE);
+
+    let mut total: usize = convo
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(size)
+        .sum();
+    if total <= budget {
+        return 0;
+    }
+
+    let mut evicted = 0usize;
+    for msg in convo.iter_mut().take(protect_from) {
+        if total <= budget {
+            break;
+        }
+        if msg["role"] != "tool" {
+            continue;
+        }
+        let was = size(msg);
+        if was <= stub_size {
+            continue; // already a stub
+        }
+        msg["content"] = serde_json::json!(EVICTED_NOTE);
+        total = total.saturating_sub(was).saturating_add(stub_size);
+        evicted += 1;
+    }
+    evicted
+}
+
+/// Library Q&A where the model drives its own retrieval through the MCP tools.
+///
+/// Connects any external MCP servers the user configured, runs the loop, and
+/// tears the connections down on every exit path — including cancellation, which
+/// is why the loop lives in its own function.
+#[allow(clippy::too_many_arguments)]
+pub async fn chat_with_library_agent(
+    root: &str,
+    messages: Vec<ChatMessage>,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    event_name: &str,
+    use_reasoning: bool,
+    reasoning_effort: Option<&str>,
+    max_rounds: Option<usize>,
+    // Opaque label for the conversation this answer belongs to, echoed back in
+    // the cache-keepalive status so the chat window can put the indicator on
+    // the right conversation.
+    conversation_id: Option<&str>,
+    app: &tauri::AppHandle,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<String, String> {
+    use tauri::Emitter;
+
+    let settings = crate::mcp::client::read_settings(app);
+    // The caller may override, but the round budget lives in settings so both
+    // windows agree on it without having to pass it around.
+    let max_rounds = clamp_agent_rounds(max_rounds.or(Some(settings.max_rounds)));
+
+    let bridge = crate::mcp::client::ToolBridge::connect(&settings.servers).await;
+    if !bridge.is_empty() || !bridge.failures().is_empty() {
+        let _ = app.emit(
+            format!("{event_name}-agent").as_str(),
+            serde_json::json!({
+                "phase": "servers",
+                "extraTools": bridge.tools().len(),
+                "failed": bridge.failures(),
+            }),
+        );
+    }
+
+    let warm_from = messages.clone();
+    let outcome = run_agent_loop(
+        root,
+        messages,
+        provider_id,
+        model_id,
+        event_name,
+        use_reasoning,
+        reasoning_effort,
+        max_rounds,
+        &bridge,
+        app,
+        cancel,
+    )
+    .await;
+
+    // Snapshot before shutting the servers down: the external tool declarations
+    // are part of the prefix that has to stay warm, and a keepalive sending a
+    // different tools block would refresh a cache entry nothing will ask for.
+    let tool_defs = agent_tool_defs(&bridge);
+    bridge.shutdown().await;
+
+    // Keep the prefix this answer just built warm, so the user can think for
+    // ten minutes and still ask their follow-up at the cache-hit price.
+    if let Ok(answer) = &outcome {
+        arm_cache_keepalive(
+            root,
+            provider_id,
+            model_id,
+            conversation_id,
+            &warm_from,
+            answer,
+            tool_defs,
+            app,
+        );
+    }
+    outcome
+}
+
+/// Ask the keepalive to hold this conversation's prefix, if that is worth doing.
+///
+/// Nothing here is allowed to fail loudly: a keepalive that cannot start is a
+/// missed saving, not a broken answer.
+#[allow(clippy::too_many_arguments)]
+fn arm_cache_keepalive(
+    root: &str,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    conversation_id: Option<&str>,
+    messages: &[ChatMessage],
+    answer: &str,
+    tool_defs: Vec<serde_json::Value>,
+    app: &tauri::AppHandle,
+) {
+    if !crate::mcp::client::read_settings(app).keep_cache_warm {
+        crate::cache_keepalive::disarm_and_announce(app);
+        return;
+    }
+    let Ok((provider, api_key, model)) =
+        ai_manager::resolve_provider_model(root, provider_id, model_id)
+    else {
+        return;
+    };
+    let hits = LAST_AGENT_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    if !crate::cache_keepalive::is_worthwhile(&provider, hits) {
+        crate::cache_keepalive::disarm_and_announce(app);
+        return;
+    }
+
+    // The prefix the *next* question will send: system prompt, the turns so
+    // far, and the answer just given. Not the loop's internal transcript, which
+    // carries `tool` messages the next request will not repeat.
+    let mut warm = vec![serde_json::json!({
+        "role": "system",
+        "content": agent_system_prompt(app),
+    })];
+    warm.extend(
+        messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": &m.content})),
+    );
+    warm.push(serde_json::json!({ "role": "assistant", "content": answer }));
+
+    crate::cache_keepalive::arm(
+        app,
+        crate::cache_keepalive::Warm {
+            conversation_id: conversation_id.map(str::to_string),
+            provider,
+            api_key,
+            model,
+            messages: warm,
+            tools: tool_defs,
+        },
+    );
+}
+
+/// Cache-hit tokens reported by the most recent agent turn.
+///
+/// Used to decide whether pinging this provider actually lands as a hit. A
+/// static rather than a return value because the decision is made after the
+/// loop has already handed back its answer.
+static LAST_AGENT_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The tool array an agent turn sends: the library's own, then the external
+/// servers'. Built in one place so the keepalive cannot drift from the real
+/// request — a differing tools block is a different cached prefix.
+fn agent_tool_defs(bridge: &crate::mcp::client::ToolBridge) -> Vec<serde_json::Value> {
+    crate::mcp::agent::tools()
+        .into_iter()
+        .chain(bridge.tools().iter().cloned())
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                }
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_loop(
+    root: &str,
+    messages: Vec<ChatMessage>,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    event_name: &str,
+    use_reasoning: bool,
+    reasoning_effort: Option<&str>,
+    max_rounds: usize,
+    bridge: &crate::mcp::client::ToolBridge,
+    app: &tauri::AppHandle,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<String, String> {
+    use tauri::Emitter;
+
+    let (provider, api_key, model) =
+        ai_manager::resolve_provider_model(root, provider_id, model_id)?;
+
+    if !llm::supports_tool_calling(&provider) {
+        return Err(format!(
+            "「{}」暂不支持工具调用，无法使用 Agent 模式。请改用 DeepSeek、OpenRouter \
+             等 OpenAI 兼容的供应商。",
+            provider.name
+        ));
+    }
+
+    let budget = ContextBudget::for_model(&provider, &model);
+    let agent_event = format!("{event_name}-agent");
+    let cancelled = || {
+        cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
+
+    // Tool declarations in OpenAI-compatible form, built once per answer: the
+    // library's own tools first, then whatever the configured servers offer.
+    let tool_defs = agent_tool_defs(bridge);
+
+    let mut convo: Vec<serde_json::Value> = vec![serde_json::json!({
+        "role": "system",
+        "content": agent_system_prompt(app),
+    })];
+    convo.extend(
+        messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": &m.content})),
+    );
+
+    let mut rounds = 0usize;
+    // Rounds whose tool calls were actually run — which is what the user's
+    // "tool call limit" means. Counted separately from `rounds` because the
+    // loop has to make one more provider call than that to discover the model
+    // is finished, and billing the user's budget for that call would mean a
+    // limit of N only ever ran N-1 rounds (and a limit of 1 ran none at all).
+    let mut tool_rounds = 0usize;
+    // Everything the model said across all rounds, in order. Kept so the
+    // persisted answer matches what the user watched appear.
+    let mut streamed = String::new();
+    // Summed across rounds and emitted once at the end. Per round would show
+    // the user a cost strip while the agent is still working, reporting only
+    // the most recent call rather than what the answer actually cost.
+    let mut usage = llm::TurnUsage::default();
+
+    // A labelled block rather than `?` and early returns: every way out of the
+    // loop has to pass through the `emit_usage` below it. A run the user stopped
+    // at round thirteen still spent thirteen rounds of tokens, and dropping the
+    // total meant the cost strip showed nothing at all for it.
+    let outcome: Result<(), String> = 'rounds: {
+    loop {
+        if cancelled() {
+            break 'rounds Err("cancelled".to_string());
+        }
+
+        let _ = app.emit(
+            agent_event.as_str(),
+            serde_json::json!({ "phase": "thinking", "round": rounds + 1 }),
+        );
+
+        // Streamed: the model's prose reaches the user as it is generated, both
+        // for the running commentary before a tool call and for the final
+        // answer. `done` is withheld until the loop finishes.
+        let turn = llm::stream_with_tools(
+            &provider,
+            &api_key,
+            &model,
+            &convo,
+            &tool_defs,
+            event_name,
+            app,
+            use_reasoning,
+            reasoning_effort,
+            "library-agent",
+            cancel.clone(),
+        )
+        .await;
+        let turn = match turn {
+            Ok(t) => t,
+            Err(e) => break 'rounds Err(e),
+        };
+        rounds += 1;
+        usage.add(&turn.usage);
+        if !turn.content.is_empty() {
+            if !streamed.is_empty() {
+                streamed.push_str("\n\n");
+            }
+            streamed.push_str(&turn.content);
+        }
+
+        // No tool calls means the model is done looking and this is the answer.
+        if turn.tool_calls.is_empty() {
+            break 'rounds Ok(());
+        }
+
+        if tool_rounds >= max_rounds {
+            // Stop calling tools, but give the model one turn to answer with
+            // what it already gathered rather than returning nothing.
+            let _ = app.emit(
+                agent_event.as_str(),
+                serde_json::json!({ "phase": "limit", "rounds": tool_rounds, "max": max_rounds }),
+            );
+            convo.push(serde_json::json!({
+                "role": "user",
+                "content": "Tool budget reached. Answer now with what you have gathered, \
+                            and say which parts you could not verify.",
+            }));
+            let final_turn = llm::stream_with_tools(
+                &provider,
+                &api_key,
+                &model,
+                &convo,
+                // No tools on this call: the budget is spent, and offering them
+                // again invites another round the loop would have to ignore.
+                &[],
+                event_name,
+                app,
+                use_reasoning,
+                reasoning_effort,
+                "library-agent",
+                cancel.clone(),
+            )
+            .await;
+            let final_turn = match final_turn {
+                Ok(t) => t,
+                Err(e) => break 'rounds Err(e),
+            };
+            usage.add(&final_turn.usage);
+            if !final_turn.content.is_empty() {
+                if !streamed.is_empty() {
+                    streamed.push_str("\n\n");
+                }
+                streamed.push_str(&final_turn.content);
+            }
+            break 'rounds Ok(());
+        }
+
+        // Record the model's own turn verbatim; providers reject a `tool`
+        // message whose id has no matching `tool_calls` entry before it.
+        convo.push(serde_json::json!({
+            "role": "assistant",
+            "content": turn.content,
+            "tool_calls": turn.tool_calls.iter().map(|c| serde_json::json!({
+                "id": c.id,
+                "type": "function",
+                "function": { "name": c.name, "arguments": c.arguments.to_string() }
+            })).collect::<Vec<_>>(),
+        }));
+
+        tool_rounds += 1;
+        // Where this round's results begin, so eviction can leave them alone.
+        let round_start = convo.len();
+        for call in &turn.tool_calls {
+            if cancelled() {
+                break 'rounds Err("cancelled".to_string());
+            }
+            let _ = app.emit(
+                agent_event.as_str(),
+                serde_json::json!({
+                    "phase": "tool",
+                    "round": rounds,
+                    "tool": call.name,
+                    // Absent for the library's own tools; the UI shows it as a
+                    // chip so the user can see when a third party was consulted.
+                    "server": bridge.server_of(&call.name),
+                    "arguments": call.arguments,
+                }),
+            );
+
+            let outcome = if bridge.handles(&call.name) {
+                // An external server is another process on the far end of a
+                // pipe — already async, and nothing to move off this thread.
+                bridge.call(&call.name, &call.arguments).await
+            } else {
+                let root_owned = root.to_string();
+                let name = call.name.clone();
+                let args = call.arguments.clone();
+                // Library tools do blocking file and SQLite work; keep it off
+                // the async runtime that is also carrying this provider's HTTP
+                // request.
+                match tokio::task::spawn_blocking(move || {
+                    crate::mcp::agent::call(&root_owned, &name, &args)
+                })
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => break 'rounds Err(format!("tool task failed: {e}")),
+                }
+            };
+
+            // A failed tool is fed back as text rather than aborting: the model
+            // can read the message and correct itself (wrong slug, bad section
+            // name) on the next round.
+            let (content, ok, cut) = match &outcome {
+                Ok(value) => {
+                    let (text, cut) = truncate_tool_result(value, budget.single_result);
+                    (text, true, cut)
+                }
+                Err(e) => (format!("{{\"error\":{}}}", serde_json::json!(e)), false, false),
+            };
+
+            // Send exactly what the model got. There used to be a display cap
+            // here, which meant the panel showed less than the model read — the
+            // opposite of what an inspector is for. It costs nothing to send it
+            // all: the detail box is rendered only when that step is expanded,
+            // and `stripTransientContext` drops these payloads before the
+            // conversation is written to disk.
+            //
+            // `truncated` now means the *model's* copy was cut to fit the
+            // context budget, which is the only truncation worth reporting.
+            let _ = app.emit(
+                agent_event.as_str(),
+                serde_json::json!({
+                    "phase": "result",
+                    "round": rounds,
+                    "tool": call.name,
+                    "server": bridge.server_of(&call.name),
+                    "ok": ok,
+                    "chars": content.chars().count(),
+                    "preview": content,
+                    "truncated": cut,
+                }),
+            );
+
+            convo.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": content,
+            }));
+
+            // The loop retains every result for every later round, so this is
+            // where a long run would otherwise walk off the end of the window.
+            let dropped = evict_old_tool_results(&mut convo, budget.transcript, round_start);
+            if dropped > 0 {
+                let _ = app.emit(
+                    agent_event.as_str(),
+                    serde_json::json!({
+                        "phase": "evicted",
+                        "round": rounds,
+                        "dropped": dropped,
+                    }),
+                );
+            }
+        }
+    }
+    };
+
+    // What the answer cost, on every path out of the loop — finished, cancelled
+    // or failed. Skipped only when nothing was spent, so a run that died before
+    // its first response does not put an empty cost strip on screen.
+    if usage.input_tokens > 0 || usage.output_tokens > 0 || usage.cost_usd.is_some() {
+        llm::emit_usage(app, event_name, &usage);
+    }
+    LAST_AGENT_CACHE_HITS.store(usage.cache_hit_tokens, std::sync::atomic::Ordering::Relaxed);
+    outcome?;
+
+    if cancelled() {
+        return Err("cancelled".to_string());
+    }
+
+    let _ = app.emit(
+        agent_event.as_str(),
+        serde_json::json!({ "phase": "answering", "rounds": rounds }),
+    );
+    // The text already reached the UI as it streamed; close the stream so the
+    // frontend stops showing a caret.
+    let _ = app.emit(event_name, serde_json::json!({ "delta": "", "done": true }));
+    Ok(streamed)
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+
+    fn model(id: &str, context_length: Option<u64>) -> AiProvider {
+        AiProvider {
+            id: "p".into(),
+            name: "P".into(),
+            kind: "openai_compatible".into(),
+            base_url: "https://example.com/v1".into(),
+            enabled: true,
+            created_at: String::new(),
+            models: vec![serde_json::from_value(serde_json::json!({
+                "id": id,
+                "display_name": id,
+                "context_length": context_length,
+            }))
+            .expect("AiModel fixture")],
+        }
+    }
+
+    #[test]
+    fn oversized_tool_results_are_cut_and_flagged() {
+        let cap = 24_000; // tokens
+        let big = serde_json::json!({ "text": "x".repeat(cap * 8) });
+        let (out, cut) = truncate_tool_result(&big, cap);
+        assert!(cut, "the caller was not told it was cut");
+        assert!(out.contains("truncated"), "the model must be told it was cut");
+        assert!(estimate_tokens(&out) < cap + 60, "{}", estimate_tokens(&out));
+    }
+
+    /// The estimate has to follow the script, not a single ratio. A budget that
+    /// assumes four characters per token hands a Chinese transcript four times
+    /// the tokens it thinks it is handing over, and the request is rejected
+    /// mid-answer by the provider.
+    #[test]
+    fn chinese_text_is_not_costed_as_though_it_were_english() {
+        let english = "the quick brown fox jumps over the lazy dog. ".repeat(40);
+        let chinese = "这是一段中文文本，用来检查预算估计是否按字符计费。".repeat(40);
+
+        // Per character, not per string — the two are different lengths. The
+        // point is the *rate*: the same number of characters costs about four
+        // times as much in Chinese.
+        let rate = |s: &str| estimate_tokens(s) as f64 / s.chars().count() as f64;
+        assert!(
+            rate(&chinese) > rate(&english) * 3.5,
+            "{:.2} tokens/char for Chinese vs {:.2} for English",
+            rate(&chinese),
+            rate(&english)
+        );
+        // Roughly one token per character, and never fewer.
+        assert!(estimate_tokens(&chinese) >= chinese.chars().count());
+    }
+
+    /// Truncating a Chinese result must respect the token budget and must not
+    /// split a character.
+    #[test]
+    fn truncation_of_chinese_stays_within_budget_and_on_boundaries() {
+        let value = serde_json::json!({ "text": "文献综述与实验结果".repeat(500) });
+        let (out, cut) = truncate_tool_result(&value, 400);
+        assert!(cut);
+        assert!(estimate_tokens(&out) < 460, "{}", estimate_tokens(&out));
+        // Reconstructing it proves nothing was cut mid-character.
+        assert!(out.chars().count() > 0);
+    }
+
+    #[test]
+    fn small_results_pass_through_untouched() {
+        let small = serde_json::json!({ "total": 3 });
+        assert_eq!(
+            truncate_tool_result(&small, 24_000),
+            (r#"{"total":3}"#.to_string(), false)
+        );
+    }
+
+    /// The budget has to follow the model. A million-token window and a 131k one
+    /// cannot share a constant: one would be starved, the other overrun.
+    #[test]
+    fn the_budget_scales_with_the_declared_window() {
+        let big = ContextBudget::for_model(&model("v4", Some(1_000_000)), "v4");
+        let small = ContextBudget::for_model(&model("oss", Some(131_072)), "oss");
+        assert!(
+            big.single_result > small.single_result * 5,
+            "a 1M model got {} and a 131k model got {}",
+            big.single_result,
+            small.single_result
+        );
+        // Room for every abstract in a large library in one call.
+        assert!(big.single_result > 100_000, "{}", big.single_result);
+        assert!(big.transcript > big.single_result);
+    }
+
+    /// An unconfigured window must be assumed small, not unlimited.
+    #[test]
+    fn an_unknown_window_is_assumed_conservative() {
+        let unknown = ContextBudget::for_model(&model("m", None), "m");
+        let known = ContextBudget::for_model(&model("m", Some(1_000_000)), "m");
+        assert!(unknown.single_result < known.single_result);
+        assert!(unknown.single_result >= MIN_RESULT_TOKENS);
+
+        // A model declaring something absurd still gets a usable budget.
+        let tiny = ContextBudget::for_model(&model("m", Some(10)), "m");
+        assert_eq!(tiny.single_result, MIN_RESULT_TOKENS);
+    }
+
+    /// Eviction has to blank the oldest results, not remove the messages: a
+    /// `tool` message removed from the transcript orphans the `tool_calls` entry
+    /// that referenced it, and providers reject that outright.
+    #[test]
+    fn eviction_blanks_the_oldest_and_keeps_every_message() {
+        let mut convo = vec![
+            serde_json::json!({"role": "system", "content": "s"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "a", "content": "x".repeat(4000)}),
+            serde_json::json!({"role": "tool", "tool_call_id": "b", "content": "y".repeat(4000)}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c", "content": "z".repeat(4000)}),
+        ];
+        let before = convo.len();
+        // Everything is fair game: nothing belongs to a round in progress.
+        let dropped = evict_old_tool_results(&mut convo, 1500, before);
+
+        assert_eq!(convo.len(), before, "a message was removed, orphaning its call id");
+        assert!(dropped >= 1);
+        assert!(convo[1]["content"].as_str().unwrap().contains("dropped"), "the oldest survived");
+        assert_eq!(
+            convo[3]["content"].as_str().unwrap().chars().count(),
+            4000,
+            "the newest result — the one being reasoned about — was evicted"
+        );
+        for msg in &convo {
+            assert!(msg["role"].is_string());
+        }
+    }
+
+    #[test]
+    fn eviction_leaves_a_transcript_within_budget_alone() {
+        let mut convo = vec![
+            serde_json::json!({"role": "tool", "tool_call_id": "a", "content": "small"}),
+        ];
+        assert_eq!(evict_old_tool_results(&mut convo, 10_000, 1), 0);
+        assert_eq!(convo[0]["content"], "small");
+    }
+
+    /// Results from the round in progress must survive even when the transcript
+    /// is over budget. Blanking one the model has not read yet tells it to call
+    /// the tool again, and the re-fetched copy evicts another result from the
+    /// same round — a loop that burns a billed round every time round it goes.
+    #[test]
+    fn the_round_in_progress_is_never_evicted() {
+        let mut convo = vec![
+            serde_json::json!({"role": "tool", "tool_call_id": "old", "content": "o".repeat(8000)}),
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": []}),
+            serde_json::json!({"role": "tool", "tool_call_id": "n1", "content": "a".repeat(8000)}),
+            serde_json::json!({"role": "tool", "tool_call_id": "n2", "content": "b".repeat(8000)}),
+        ];
+        // This round's results begin at index 2. The budget is far too small for
+        // all three, so without the guard the parallel calls would eat each other.
+        let dropped = evict_old_tool_results(&mut convo, 100, 2);
+
+        assert_eq!(dropped, 1, "only the previous round's result was available");
+        assert!(convo[0]["content"].as_str().unwrap().contains("dropped"));
+        assert_eq!(convo[2]["content"].as_str().unwrap().chars().count(), 8000);
+        assert_eq!(convo[3]["content"].as_str().unwrap().chars().count(), 8000);
+    }
+
+    /// The loop must be bounded: a model that keeps calling tools cannot be
+    /// allowed to spend the user's credits without end.
+    /// Chinese answers are multi-byte; chunking on bytes would panic mid-character.
+    #[test]
+    fn chunking_respects_character_boundaries() {
+        let answer = "这是一个中文回答，混合 English 和标点。".repeat(5);
+        let chars: Vec<char> = answer.chars().collect();
+        let rejoined: String = chars.chunks(24).flat_map(|c| c.iter()).collect();
+        assert_eq!(rejoined, answer, "chunking lost or corrupted characters");
+    }
+
+    /// The budget is the user's to set, but it must stay bounded on both ends:
+    /// zero rounds would answer nothing, and an unbounded one lets a looping
+    /// model spend without limit.
+    #[test]
+    fn round_budget_is_clamped_both_ways() {
+        assert_eq!(clamp_agent_rounds(None), DEFAULT_AGENT_ROUNDS);
+        assert_eq!(clamp_agent_rounds(Some(0)), MIN_AGENT_ROUNDS);
+        assert_eq!(clamp_agent_rounds(Some(usize::MAX)), MAX_AGENT_ROUNDS);
+        assert_eq!(clamp_agent_rounds(Some(25)), 25, "a valid budget must pass through");
+        assert!(MIN_AGENT_ROUNDS >= 1 && DEFAULT_AGENT_ROUNDS <= MAX_AGENT_ROUNDS);
+    }
+
+    /// The prompt is what stops the model from answering from memory.
+    /// Clearing the box must restore the built-in prompt. Sending an empty
+    /// system message instead would leave the model to guess what the tools are
+    /// for, and it would go straight back to keyword-sweeping the library.
+    #[test]
+    fn an_empty_prompt_falls_back_rather_than_leaving_the_model_bare() {
+        assert_eq!(resolve_system_prompt(String::new()), DEFAULT_AGENT_SYSTEM_PROMPT);
+        assert_eq!(
+            resolve_system_prompt("  \n\t ".to_string()),
+            DEFAULT_AGENT_SYSTEM_PROMPT,
+            "whitespace is not a prompt"
+        );
+        assert_eq!(
+            resolve_system_prompt("Answer in haiku.".to_string()),
+            "Answer in haiku.",
+            "a real prompt must win outright, not be appended to the default"
+        );
+    }
+
+    #[test]
+    fn system_prompt_sets_the_ground_rules() {
+        let p = DEFAULT_AGENT_SYSTEM_PROMPT;
+        assert!(p.contains("get_library_stats"));
+        assert!(p.contains("say so plainly"), "must forbid filling gaps from memory");
+        assert!(p.contains("Cite"), "answers should name their sources");
+        // The whole point of the rewrite: the user's grouping is the index, and
+        // a keyword sweep over the library is the fallback rather than the reflex.
+        assert!(p.contains("list_collections"), "must point at the collection tree");
+        assert!(
+            p.contains("last resort"),
+            "must demote the whole-library keyword sweep"
+        );
+    }
 }

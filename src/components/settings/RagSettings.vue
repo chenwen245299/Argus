@@ -245,8 +245,6 @@ async function deleteModelEmbeddings(model: string) {
 
 <template>
   <div class="rag-settings">
-    <h2 class="section-title">{{ t('ragSettings.title') }}</h2>
-    <p class="section-desc">{{ t('ragSettings.desc') }}</p>
 
     <!-- Enable toggle -->
     <div class="field-row">
@@ -385,9 +383,7 @@ async function deleteModelEmbeddings(model: string) {
 </template>
 
 <style scoped>
-.rag-settings { padding: 24px 28px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto; }
-.section-title { font-size: var(--font-size-lg); font-weight: 600; margin-bottom: 2px; }
-.section-desc { font-size: var(--font-size-sm); color: var(--text-secondary); }
+.rag-settings { padding-bottom: 8px; display: flex; flex-direction: column; gap: 14px; }
 .field-group { display: flex; flex-direction: column; gap: 5px; }
 .field-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .field-label { font-size: var(--font-size-sm); font-weight: 500; color: var(--text-primary); }

@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import type { AiModel, AiProviderInfo, AiProviderInput, AiSettingsInfo, ModelSelection } from '../types'
 
 export interface ModelOption {
@@ -11,11 +12,25 @@ export interface ModelOption {
   contextLength?: number
   capabilities: string[]
   label: string  // "ProviderName / ModelName"
+  // Price-list facts, carried so every picker can badge a model without
+  // reaching back into the raw provider settings.
+  paramBillions?: number
+  isFree?: boolean
+  discountPercent?: number
+  discountWindows?: [number, number][]
 }
 
 export const useAiStore = defineStore('ai', () => {
   const settings = ref<AiSettingsInfo>({ providers: [] })
   const loaded = ref(false)
+
+  // The backend re-reads model prices in the background a while after launch.
+  // Reloading here is what makes a withdrawn free tier stop showing FREE in an
+  // already-open window, rather than waiting for the next restart. Registered
+  // once per window, for as long as the window lives.
+  listen('ai-models-refreshed', () => {
+    if (loaded.value) load()
+  }).catch(() => {})
 
   async function load() {
     try {
@@ -39,6 +54,10 @@ export const useAiStore = defineStore('ai', () => {
             contextLength: m.context_length,
             capabilities: m.capabilities,
             label: `${p.name} / ${m.display_name}`,
+            paramBillions: m.param_billions,
+            isFree: m.is_free,
+            discountPercent: m.discount_percent,
+            discountWindows: m.discount_windows,
           }))
       )
   )

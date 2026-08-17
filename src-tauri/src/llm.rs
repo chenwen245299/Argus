@@ -1784,6 +1784,7 @@ async fn fetch_ollama_models(provider: &AiProvider, api_key: &str) -> Result<Vec
                 }
             }
             let context_length = item["details"]["context_length"].as_u64();
+            let id_for_size = id.clone();
             Some(AiModel {
                 id: id.clone(),
                 display_name: id,
@@ -1799,6 +1800,13 @@ async fn fetch_ollama_models(provider: &AiProvider, api_key: &str) -> Result<Vec
                 input_price_usd_per_million: None,
                 output_price_usd_per_million: None,
                 provider_order: vec![],
+                // Ollama tags carry the size directly ("qwen3.6:35b").
+                param_billions: scan_param_size(&id_for_size),
+                // Local models: free in the sense that matters, but the tag is
+                // about a provider's price list and Ollama has none.
+                is_free: false,
+                discount_percent: None,
+                discount_windows: vec![],
             })
         })
         .collect();
@@ -2209,6 +2217,9 @@ fn parse_model_item(item: &serde_json::Value) -> Option<AiModel> {
     let input_price_usd_per_million = parse_price_usd_per_million(&item["pricing"]["prompt"]);
     let output_price_usd_per_million =
         parse_price_usd_per_million(&item["pricing"]["completion"]);
+    let is_free = quotes_free(&item["pricing"]);
+    let param_billions = parse_param_billions(item);
+    let (discount_percent, discount_windows) = parse_time_discount(&item["pricing"]);
     Some(AiModel {
         id: id.to_string(),
         display_name,
@@ -2224,7 +2235,69 @@ fn parse_model_item(item: &serde_json::Value) -> Option<AiModel> {
         input_price_usd_per_million,
         output_price_usd_per_million,
         provider_order: vec![],
+        is_free,
+        param_billions,
+        discount_percent,
+        discount_windows,
     })
+}
+
+/// Whether the catalogue quotes nothing for either direction.
+///
+/// Both must be zero. A model that is free to read but charges to generate is
+/// not free, and labelling it so would be the expensive kind of wrong.
+fn quotes_free(pricing: &serde_json::Value) -> bool {
+    let zero = |v: &serde_json::Value| {
+        parse_price_usd_per_million(v).is_some_and(|p| p == 0.0)
+    };
+    zero(&pricing["prompt"]) && zero(&pricing["completion"])
+}
+
+/// A standing time-of-day discount, if the catalogue advertises one.
+///
+/// OpenRouter puts two unrelated things in `pricing.overrides`:
+///
+/// - `min_prompt_tokens` entries, which *raise* the price above a context
+///   threshold. At the time of writing 64 of 414 models carry one of these and
+///   every one is a surcharge. Reading them as discounts would tag the most
+///   expensive long-context models as bargains.
+/// - `utc_start` / `utc_end` entries (HHMM), which is how off-peak pricing is
+///   expressed. Only these are considered, and only when they are cheaper than
+///   the base rate.
+fn parse_time_discount(pricing: &serde_json::Value) -> (Option<u32>, Vec<[u32; 2]>) {
+    let Some(base) = parse_price_usd_per_million(&pricing["prompt"]).filter(|p| *p > 0.0) else {
+        return (None, Vec::new());
+    };
+    let Some(overrides) = pricing["overrides"].as_array() else {
+        return (None, Vec::new());
+    };
+
+    let mut windows = Vec::new();
+    let mut deepest = 0u32;
+    for entry in overrides {
+        let (Some(start), Some(end)) = (entry["utc_start"].as_u64(), entry["utc_end"].as_u64())
+        else {
+            continue; // a size-based surcharge, not a schedule
+        };
+        let Some(discounted) = parse_price_usd_per_million(&entry["prompt"]) else {
+            continue;
+        };
+        if discounted >= base {
+            continue; // the peak-rate half of the schedule
+        }
+        let percent = (((base - discounted) / base) * 100.0).round() as u32;
+        if percent == 0 {
+            continue;
+        }
+        deepest = deepest.max(percent);
+        windows.push([start as u32, end as u32]);
+    }
+
+    if windows.is_empty() {
+        (None, Vec::new())
+    } else {
+        (Some(deepest.min(100)), windows)
+    }
 }
 
 fn parse_price_usd_per_million(value: &serde_json::Value) -> Option<f64> {
@@ -2236,6 +2309,162 @@ fn parse_price_usd_per_million(value: &serde_json::Value) -> Option<f64> {
     } else {
         None
     }
+}
+
+/// The promotional discount OpenRouter is currently running on a model.
+///
+/// `Ok(Some(percent))` when a promotion is running, `Ok(None)` when the
+/// catalogue was read and says there is none, and `Err` when it could not be
+/// read at all. The caller has to be able to tell those last two apart: writing
+/// a failed lookup to disk as "no promotion" is how a working discount silently
+/// loses its badge because the network blinked.
+///
+/// **This is not in the bulk `/models` list.** At the time of writing, zero of
+/// its 414 entries carry `pricing.discount`; it appears only per endpoint under
+/// `/models/{id}/endpoints`. That is why the first version of this feature saw
+/// no discounts at all — it was reading a field that endpoint never sends.
+///
+/// A model is served by several endpoints at different prices and different
+/// discounts (`gpt-5.6-luna-pro`: 50% off via OpenAI, nothing via Azure). The
+/// one that matters is the endpoint whose price is the one being displayed, so
+/// `quoted_prompt_usd_per_million` selects it. Reporting the best discount
+/// across all endpoints would advertise a rate the user's requests may never be
+/// billed at.
+pub async fn fetch_openrouter_discount(
+    provider: &AiProvider,
+    api_key: &str,
+    model_id: &str,
+    quoted_prompt_usd_per_million: Option<f64>,
+) -> Result<Option<u32>, String> {
+    let client = build_client().map_err(|e| e.to_string())?;
+    let url = format!(
+        "{}/models/{model_id}/endpoints",
+        provider.base_url.trim_end_matches('/')
+    );
+    let resp = client
+        .get(&url)
+        .timeout(REQUEST_TIMEOUT)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("{model_id}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("{model_id}: HTTP {}", resp.status()));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("{model_id}: malformed response: {e}"))?;
+    Ok(discount_of_quoted_endpoint(
+        &json["data"]["endpoints"],
+        quoted_prompt_usd_per_million,
+    ))
+}
+
+/// Pick the endpoint being quoted and read its discount. Split out so the
+/// selection rule is testable against real catalogue shapes.
+fn discount_of_quoted_endpoint(
+    endpoints: &serde_json::Value,
+    quoted_prompt_usd_per_million: Option<f64>,
+) -> Option<u32> {
+    let list = endpoints.as_array()?;
+    let priced = |e: &serde_json::Value| parse_price_usd_per_million(&e["pricing"]["prompt"]);
+
+    let chosen = quoted_prompt_usd_per_million
+        .and_then(|quoted| {
+            list.iter().find(|e| {
+                // Float equality through two string round-trips; compare with a
+                // relative tolerance rather than `==`.
+                priced(e).is_some_and(|p| (p - quoted).abs() <= quoted.abs() * 1e-6 + 1e-9)
+            })
+        })
+        // Endpoints arrive in OpenRouter's own routing order, so the first is
+        // the sensible guess when the quoted price matches nothing.
+        .or_else(|| list.first())?;
+
+    let fraction = chosen["pricing"]["discount"]
+        .as_f64()
+        .or_else(|| chosen["pricing"]["discount"].as_str()?.parse().ok())?;
+    if !(fraction.is_finite() && fraction > 0.0) {
+        return None;
+    }
+    let percent = (fraction * 100.0).round() as u32;
+    (percent > 0 && percent < 100).then_some(percent)
+}
+
+/// Parameter count in billions, dug out of whatever the catalogue says.
+///
+/// No provider publishes this as a field, so it comes from the naming
+/// (`nemotron-3-embed-1b`, `qwen3.8-2.4t-a95b`) and, failing that, the prose
+/// description. That reaches about a third of OpenRouter's catalogue; the rest
+/// are closed models whose size is simply not public, and `None` says so.
+pub fn parse_param_billions(item: &serde_json::Value) -> Option<f64> {
+    let named = [
+        item["id"].as_str(),
+        item["name"].as_str(),
+        item["canonical_slug"].as_str(),
+        item["hugging_face_id"].as_str(),
+    ];
+    for text in named.into_iter().flatten() {
+        if let Some(v) = scan_param_size(text) {
+            return Some(v);
+        }
+    }
+    // Descriptions are prose and can mention other numbers, so they are the
+    // last resort rather than the first.
+    let description = item["description"].as_str()?;
+    scan_param_size(&description.chars().take(600).collect::<String>())
+}
+
+/// Largest plausible `<number><unit>` in `text`, in billions.
+///
+/// Largest, not first: a mixture-of-experts model is named for its total *and*
+/// its active parameters (`550b-a55b`), and the total is the size people mean.
+fn scan_param_size(text: &str) -> Option<f64> {
+    let lower = text.to_lowercase().replace(":free", " ");
+    let bytes: Vec<char> = lower.chars().collect();
+    let mut best: Option<f64> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // A digit preceded by a letter, digit or dot is part of a version or an
+        // identifier ("qwen3.8", "gpt-5.6"), not a size.
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == '.') {
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == '.') {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == '.') {
+            i += 1;
+        }
+        let number: String = bytes[start..i].iter().collect();
+        let Some(unit) = bytes.get(i).copied() else { break };
+        let multiplier = match unit {
+            'm' => 0.001,
+            'b' => 1.0,
+            't' => 1000.0,
+            _ => continue,
+        };
+        // The unit has to end the token: "3ba" is not three billion.
+        if bytes.get(i + 1).is_some_and(|c| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let Ok(value) = number.parse::<f64>() else {
+            continue;
+        };
+        let billions = value * multiplier;
+        // Bounds keep years, context sizes and prices out.
+        if (0.05..=100_000.0).contains(&billions) {
+            best = Some(best.map_or(billions, |b: f64| b.max(billions)));
+        }
+    }
+    best
 }
 
 fn parse_capabilities(item: &serde_json::Value) -> Vec<String> {
@@ -2412,6 +2641,10 @@ pub fn kimi_known_models() -> Vec<AiModel> {
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
             provider_order: vec![],
+            param_billions: None,
+            is_free: false,
+            discount_percent: None,
+            discount_windows: vec![],
         },
     ]
 }
@@ -2433,6 +2666,10 @@ fn anthropic_known_models() -> Vec<AiModel> {
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
             provider_order: vec![],
+            param_billions: None,
+            is_free: false,
+            discount_percent: None,
+            discount_windows: vec![],
         },
         AiModel {
             id: "claude-sonnet-4-5".to_string(),
@@ -2449,6 +2686,10 @@ fn anthropic_known_models() -> Vec<AiModel> {
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
             provider_order: vec![],
+            param_billions: None,
+            is_free: false,
+            discount_percent: None,
+            discount_windows: vec![],
         },
         AiModel {
             id: "claude-haiku-4-5-20251001".to_string(),
@@ -2465,6 +2706,10 @@ fn anthropic_known_models() -> Vec<AiModel> {
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
             provider_order: vec![],
+            param_billions: None,
+            is_free: false,
+            discount_percent: None,
+            discount_windows: vec![],
         },
     ]
 }
@@ -2619,5 +2864,637 @@ fn friendly_error(status: u16, body: &str) -> String {
         404 => format!("Endpoint or model not found (404). Verify your API address and model ID. Response: {preview}"),
         429 => "Rate limited (429). Please wait a moment and try again.".to_string(),
         _ => format!("API error {status}: {preview}"),
+    }
+}
+
+// ── Tool calling ─────────────────────────────────────────────────────────────
+//
+// Used by the library Q&A agent mode. Deliberately non-streaming: the agent
+// loop needs the *complete* set of tool calls before it can run them, and
+// reconstructing them from three different streaming dialects (OpenAI-compat,
+// Anthropic, Ollama) would be a lot of parser surface for no user-visible gain.
+// The user sees progress through per-tool events instead, and the final answer
+// is streamed by the normal path once the tools are done.
+
+/// One tool invocation the model asked for.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    /// Provider-assigned id, echoed back with the result so the model can match
+    /// them up when it requested several at once.
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// What one round of an agent loop cost.
+///
+/// Reported back to the caller instead of emitted, because an agent answer is
+/// several rounds and the user is owed their sum, not the last one's figures.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub cost_usd: Option<f64>,
+}
+
+impl TurnUsage {
+    /// Fold another round in. `cost_usd` stays `None` until some round reports
+    /// one, so "the provider never told us" does not become "it was free".
+    pub fn add(&mut self, other: &TurnUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_hit_tokens = self.cache_hit_tokens.saturating_add(other.cache_hit_tokens);
+        if let Some(c) = other.cost_usd {
+            *self.cost_usd.get_or_insert(0.0) += c;
+        }
+    }
+}
+
+/// What the model returned when it had tools available.
+#[derive(Debug, Default)]
+pub struct ToolTurn {
+    /// Prose the model emitted alongside its tool calls, if any.
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: TurnUsage,
+}
+
+/// Send a usage figure to the front-end for `event_name`.
+///
+/// Public so the agent loop can report the total for a multi-round answer; every
+/// single-request path emits its own from inside `llm`.
+pub fn emit_usage(app: &tauri::AppHandle, event_name: &str, usage: &TurnUsage) {
+    emit_stream_usage(
+        app,
+        event_name,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.input_tokens.saturating_add(usage.output_tokens),
+        usage.cost_usd,
+        usage.cache_hit_tokens,
+    );
+}
+
+/// Whether this provider can take a `tools` parameter at all.
+///
+/// The agent loop checks this up front so the user gets "this model cannot do
+/// agent mode" rather than a confusing 400 from the API.
+pub fn supports_tool_calling(provider: &AiProvider) -> bool {
+    // OpenAI-compatible `/chat/completions` carries `tools` — that covers
+    // DeepSeek, OpenRouter, Kimi and any custom OpenAI-compatible endpoint.
+    // Anthropic and Ollama use different shapes and are not wired up here yet.
+    !is_anthropic_protocol(provider) && !is_ollama(provider)
+}
+
+/// Arguments arrive as a JSON *string* in OpenAI-compatible responses. A model
+/// that emits nothing, or malformed JSON, should not abort the whole turn — the
+/// tool layer already rejects arguments it cannot use, with a message the model
+/// can read and correct on the next round.
+fn parse_tool_arguments(raw: Option<&str>) -> serde_json::Value {
+    match raw.map(str::trim) {
+        None | Some("") => serde_json::json!({}),
+        Some(s) => serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({})),
+    }
+}
+
+/// The smallest request that still refreshes a provider's prompt cache.
+///
+/// Providers with automatic prefix caching (DeepSeek, Kimi, OpenAI) keep an
+/// entry alive for a handful of minutes after it is last *used* — DeepSeek's
+/// expires in about ten. Re-sending the same prefix with `max_tokens: 1` counts
+/// as a use, so the next real question still hits the cache instead of paying
+/// full price to re-read the whole conversation.
+///
+/// The input is billed at the cache-hit rate, which is where the saving comes
+/// from: a hit costs roughly a tenth of a miss, so one ping is far cheaper than
+/// the miss it prevents. It is still the user's money, so the call is recorded
+/// in the usage ledger under its own source name.
+///
+/// Returns the cache-hit tokens the provider reported, which is the only
+/// evidence available that the caching is real for this provider.
+pub async fn touch_prompt_cache(
+    provider: &AiProvider,
+    api_key: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    tools: &[serde_json::Value],
+) -> Result<u64, String> {
+    let client = build_client()?;
+    let url = format!(
+        "{}/chat/completions",
+        provider.base_url.trim_end_matches('/')
+    );
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": false,
+        // One token. The answer is discarded; only the prefix read matters.
+        "max_tokens": 1,
+    });
+    // The tool declarations are part of the prompt the provider hashes, so a
+    // ping without them would refresh a prefix nothing else will ever ask for.
+    if !tools.is_empty() {
+        body["tools"] = serde_json::json!(tools);
+        body["tool_choice"] = serde_json::json!("auto");
+    }
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(friendly_error(status, &text));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Invalid response: {e}"))?;
+    let usage = &json["usage"];
+    let input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
+    let cache_hit_tokens = usage["prompt_cache_hit_tokens"]
+        .as_u64()
+        .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+        .unwrap_or(0);
+
+    // Its own source, so this background spend is visible in the usage stats
+    // rather than folded into the answers the user actually asked for.
+    crate::token_usage::record_full(
+        "cache-keepalive",
+        &provider.id,
+        model,
+        input_tokens,
+        output_tokens,
+        usage_cost_usd(usage),
+        cache_hit_tokens,
+    );
+    Ok(cache_hit_tokens)
+}
+
+/// One round-trip with tools available, streamed.
+///
+/// Content deltas go to `event_name` as they arrive, so the user watches the
+/// answer appear instead of waiting for the whole turn. Tool calls arrive in the
+/// same stream, spread across chunks: each `delta.tool_calls[i]` carries a
+/// fragment of `function.arguments` that must be concatenated by index before
+/// the call can be parsed.
+///
+/// Does **not** emit the terminal `{done:true}` — the agent loop may run several
+/// of these for one answer, and the UI must see exactly one completion.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_with_tools(
+    provider: &AiProvider,
+    api_key: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    tools: &[serde_json::Value],
+    event_name: &str,
+    app: &tauri::AppHandle,
+    use_reasoning: bool,
+    reasoning_effort: Option<&str>,
+    source: &str,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<ToolTurn, String> {
+    if !supports_tool_calling(provider) {
+        return Err(format!(
+            "{} does not support tool calling in Argus yet.",
+            provider.name
+        ));
+    }
+
+    let client = build_client()?;
+    let url = format!(
+        "{}/chat/completions",
+        provider.base_url.trim_end_matches('/')
+    );
+    let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
+    let is_kimi = provider.kind == "kimi"
+        || provider.base_url.to_lowercase().contains("moonshot.cn")
+        || provider.base_url.to_lowercase().contains("api.kimi.com");
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    // An empty tool list must be omitted, not sent as `[]`: some gateways reject
+    // `tools: []` outright, and it is how the loop says "no more tools".
+    if !tools.is_empty() {
+        body["tools"] = serde_json::json!(tools);
+        body["tool_choice"] = serde_json::json!("auto");
+    }
+    if is_openrouter {
+        let order: Vec<&str> = provider
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .map(|m| m.provider_order.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        if !order.is_empty() {
+            body["provider"] = serde_json::json!({ "order": order, "allow_fallbacks": false });
+        }
+    }
+    if use_reasoning {
+        if is_deepseek(provider) {
+            body["thinking"] = serde_json::json!({"type": "enabled"});
+            body["reasoning_effort"] = serde_json::json!(match reasoning_effort.unwrap_or("high") {
+                "high" => "max",
+                _ => "high",
+            });
+        } else if is_openrouter {
+            body["reasoning"] = serde_json::json!({
+                "effort": reasoning_effort.unwrap_or("high"),
+                "exclude": false
+            });
+        } else if !is_kimi {
+            body["reasoning_effort"] = serde_json::json!(reasoning_effort.unwrap_or("high"));
+        }
+    }
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(friendly_error(status, &text));
+    }
+
+    let reasoning_event = format!("{event_name}-reasoning");
+    let mut stream = resp.bytes_stream();
+    let mut byte_buf: Vec<u8> = Vec::new();
+    let mut buf = String::new();
+    let mut accumulated = String::new();
+    // Tool calls keyed by the `index` the provider assigns, since fragments for
+    // several concurrent calls interleave in the stream.
+    let mut partial: std::collections::BTreeMap<u64, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut cache_hit_tokens: u64 = 0;
+    let mut cost_usd: Option<f64> = None;
+
+    'outer: while let Some(chunk) = stream.next().await {
+        if let Some(flag) = &cancel {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        byte_buf.extend_from_slice(&bytes);
+        let valid_up_to = match std::str::from_utf8(&byte_buf) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_up_to > 0 {
+            buf.push_str(unsafe { std::str::from_utf8_unchecked(&byte_buf[..valid_up_to]) });
+            byte_buf.drain(..valid_up_to);
+        }
+
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim_end_matches('\r').to_string();
+            buf.drain(..pos + 1);
+
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim_start();
+            if data == "[DONE]" {
+                break 'outer;
+            }
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+
+            if let Some(usage) = json.get("usage").filter(|v| !v.is_null()) {
+                if let Some(v) = usage["prompt_tokens"].as_u64() {
+                    input_tokens = v;
+                }
+                if let Some(v) = usage["completion_tokens"].as_u64() {
+                    output_tokens = v;
+                }
+                if let Some(v) = usage["prompt_cache_hit_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+                {
+                    cache_hit_tokens = v;
+                }
+                if (is_openrouter || is_kimi) && cost_usd.is_none() {
+                    cost_usd = usage_cost_usd(usage);
+                }
+            }
+
+            let delta = &json["choices"][0]["delta"];
+
+            if let Some(text) = delta["content"].as_str().filter(|s| !s.is_empty()) {
+                accumulated.push_str(text);
+                let _ = app.emit(event_name, serde_json::json!({"delta": text, "done": false}));
+            }
+            if let Some(r) = delta["reasoning_content"]
+                .as_str()
+                .or_else(|| delta["reasoning"].as_str())
+                .or_else(|| delta["thinking"].as_str())
+                .filter(|s| !s.is_empty())
+            {
+                let _ = app.emit(
+                    &reasoning_event,
+                    serde_json::json!({"delta": r, "done": false}),
+                );
+            }
+
+            if let Some(calls) = delta["tool_calls"].as_array() {
+                for c in calls {
+                    let idx = c["index"].as_u64().unwrap_or(0);
+                    let slot = partial.entry(idx).or_default();
+                    if let Some(id) = c["id"].as_str() {
+                        slot.0 = id.to_string();
+                    }
+                    if let Some(name) = c["function"]["name"].as_str() {
+                        slot.1.push_str(name);
+                    }
+                    if let Some(frag) = c["function"]["arguments"].as_str() {
+                        slot.2.push_str(frag);
+                    }
+                }
+            }
+        }
+    }
+
+    crate::token_usage::record_full(
+        source,
+        &provider.id,
+        model,
+        input_tokens,
+        output_tokens,
+        if is_openrouter || is_kimi { cost_usd } else { None },
+        cache_hit_tokens,
+    );
+    // Deliberately *not* emitted here: one answer is several of these rounds,
+    // and emitting per round would both flash a cost strip at the user mid-run
+    // and leave them looking at the last round's figures instead of the total.
+    // The agent loop sums these and emits once. See `emit_usage`.
+
+    let tool_calls = partial
+        .into_iter()
+        .filter(|(_, (_, name, _))| !name.is_empty())
+        .map(|(idx, (id, name, args))| ToolCall {
+            id: if id.is_empty() { format!("call_{idx}") } else { id },
+            arguments: parse_tool_arguments(Some(&args)),
+            name,
+        })
+        .collect();
+
+    Ok(ToolTurn {
+        content: accumulated,
+        tool_calls,
+        usage: TurnUsage {
+            input_tokens,
+            output_tokens,
+            cache_hit_tokens,
+            cost_usd: if is_openrouter || is_kimi { cost_usd } else { None },
+        },
+    })
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use super::*;
+
+    /// Both directions must be zero. A model free to read but charging to
+    /// generate is not free, and the tag would cost the user money.
+    #[test]
+    fn free_needs_both_sides_at_zero() {
+        assert!(quotes_free(&serde_json::json!({"prompt": "0", "completion": "0"})));
+        assert!(!quotes_free(&serde_json::json!({"prompt": "0", "completion": "0.000003"})));
+        assert!(!quotes_free(&serde_json::json!({"prompt": "0.0000005", "completion": "0"})));
+        // Absent pricing is unknown, not free.
+        assert!(!quotes_free(&serde_json::json!({})));
+    }
+
+    /// Verbatim from OpenRouter's catalogue: `deepseek/deepseek-v4-pro` prices
+    /// two of the day's four windows at half rate.
+    #[test]
+    fn a_time_of_day_schedule_reads_as_a_discount() {
+        let pricing = serde_json::json!({
+            "prompt": "0.00000132",
+            "completion": "0.00000396",
+            "overrides": [
+                {"utc_start": 1000, "utc_end": 100,
+                 "prompt": "0.00000066", "completion": "0.00000198"},
+                {"utc_start": 100, "utc_end": 400,
+                 "prompt": "0.00000132", "completion": "0.00000396"},
+                {"utc_start": 400, "utc_end": 600,
+                 "prompt": "0.00000066", "completion": "0.00000198"},
+                {"utc_start": 600, "utc_end": 1000,
+                 "prompt": "0.00000132", "completion": "0.00000396"}
+            ]
+        });
+        let (percent, windows) = parse_time_discount(&pricing);
+        assert_eq!(percent, Some(50));
+        assert_eq!(windows, vec![[1000, 100], [400, 600]], "the full-rate windows were kept");
+    }
+
+    /// The trap. OpenRouter reuses `overrides` for long-context *surcharges* —
+    /// 64 of 414 models carry one, and every one raises the price. Reading them
+    /// as discounts would tag the priciest models as bargains.
+    #[test]
+    fn a_long_context_surcharge_is_not_a_discount() {
+        // Verbatim from `x-ai/grok-4.6`: double price above 200k prompt tokens.
+        let pricing = serde_json::json!({
+            "prompt": "0.000002",
+            "completion": "0.000006",
+            "overrides": [
+                {"min_prompt_tokens": 200000, "prompt": "0.000004", "completion": "0.000012"}
+            ]
+        });
+        assert_eq!(parse_time_discount(&pricing), (None, Vec::new()));
+    }
+
+    /// The size is in the name for open models and nowhere for closed ones.
+    #[test]
+    fn a_size_in_the_name_is_read_out() {
+        assert_eq!(scan_param_size("nvidia/nemotron-3-embed-1b"), Some(1.0));
+        assert_eq!(scan_param_size("liquid/lfm-2.5-2.6b:free"), Some(2.6));
+        assert_eq!(scan_param_size("qwen/qwen3.8-27b"), Some(27.0));
+    }
+
+    /// A mixture-of-experts model is named for its total *and* its active
+    /// parameters. "550B" is the size people mean, not "55B".
+    #[test]
+    fn a_mixture_of_experts_reports_its_total() {
+        assert_eq!(scan_param_size("nvidia/nemotron-3-ultra-550b-a55b"), Some(550.0));
+        assert_eq!(scan_param_size("qwen/qwen3.8-2.4t-a95b"), Some(2400.0));
+    }
+
+    /// The trap: version numbers look exactly like sizes. `gpt-5.6` is not a
+    /// 5.6-billion-parameter model, and `qwen3.8` is not 3.8B.
+    #[test]
+    fn a_version_number_is_not_a_size() {
+        assert_eq!(scan_param_size("openai/gpt-5.6-luna-pro"), None);
+        assert_eq!(scan_param_size("x-ai/grok-4.6"), None);
+        assert_eq!(scan_param_size("meituan/longcat-2.0"), None);
+        assert_eq!(scan_param_size("deepseek/deepseek-v4-pro-0813"), None);
+    }
+
+    /// A digit glued to more letters is an identifier, not a measurement.
+    #[test]
+    fn a_unit_must_end_its_token() {
+        assert_eq!(scan_param_size("model-3ba-preview"), None);
+        assert_eq!(scan_param_size("seed-2-1-turbo"), None);
+    }
+
+    #[test]
+    fn the_description_is_the_last_resort() {
+        let item = serde_json::json!({
+            "id": "vendor/opaque-name",
+            "description": "A 284B-parameter mixture-of-experts model."
+        });
+        assert_eq!(parse_param_billions(&item), Some(284.0));
+
+        // The naming wins when it has an answer, prose being the less reliable
+        // of the two.
+        let named = serde_json::json!({
+            "id": "vendor/thing-7b",
+            "description": "Trained on 15T tokens."
+        });
+        assert_eq!(parse_param_billions(&named), Some(7.0));
+    }
+
+    /// Verbatim from `/models/openai/gpt-5.6-luna-pro/endpoints`: OpenAI serves
+    /// it at half price, Azure at full. The badge must describe the endpoint
+    /// whose price is on screen, not the best one going.
+    #[test]
+    fn the_discount_follows_the_price_being_quoted() {
+        let endpoints = serde_json::json!([
+            {"provider_name": "OpenAI", "pricing": {"prompt": "0.0000001", "discount": 0.5}},
+            {"provider_name": "OpenAI", "pricing": {"prompt": "0.00000005", "discount": 0.5}},
+            {"provider_name": "Azure",  "pricing": {"prompt": "0.0000002", "discount": 0}}
+        ]);
+        // $0.10/M is what the catalogue quotes → the first OpenAI endpoint.
+        assert_eq!(discount_of_quoted_endpoint(&endpoints, Some(0.1)), Some(50));
+        // $0.20/M is Azure, which is running no promotion.
+        assert_eq!(discount_of_quoted_endpoint(&endpoints, Some(0.2)), None);
+    }
+
+    /// `deepseek-v4-pro` is quoted at the first-party endpoint's price, which
+    /// carries no promotion even though cheaper resellers are discounting it.
+    #[test]
+    fn a_cheaper_endpoints_promotion_is_not_borrowed() {
+        let endpoints = serde_json::json!([
+            {"provider_name": "StreamLake", "pricing": {"prompt": "0.00000069426", "discount": 0.601}},
+            {"provider_name": "DeepSeek",   "pricing": {"prompt": "0.00000132", "discount": 0}}
+        ]);
+        assert_eq!(discount_of_quoted_endpoint(&endpoints, Some(1.32)), None);
+    }
+
+    #[test]
+    fn an_unmatched_price_falls_back_to_the_default_route() {
+        let endpoints = serde_json::json!([
+            {"pricing": {"prompt": "0.0000003", "discount": 0.6}},
+            {"pricing": {"prompt": "0.0000009", "discount": 0}}
+        ]);
+        assert_eq!(discount_of_quoted_endpoint(&endpoints, Some(99.0)), Some(60));
+        assert_eq!(discount_of_quoted_endpoint(&endpoints, None), Some(60));
+        assert_eq!(discount_of_quoted_endpoint(&serde_json::json!([]), None), None);
+    }
+
+    /// `discount: 0` is the overwhelmingly common value and must not become a
+    /// "0折" badge on every model.
+    #[test]
+    fn no_promotion_is_no_badge() {
+        let endpoints = serde_json::json!([{"pricing": {"prompt": "0.000002", "discount": 0}}]);
+        assert_eq!(discount_of_quoted_endpoint(&endpoints, None), None);
+        let missing = serde_json::json!([{"pricing": {"prompt": "0.000002"}}]);
+        assert_eq!(discount_of_quoted_endpoint(&missing, None), None);
+    }
+
+    #[test]
+    fn a_flat_price_advertises_nothing() {
+        let pricing = serde_json::json!({"prompt": "0.000002", "completion": "0.000006"});
+        assert_eq!(parse_time_discount(&pricing), (None, Vec::new()));
+        // A free model has no base to discount from; dividing by it would be
+        // an infinite percentage off.
+        let free = serde_json::json!({"prompt": "0", "completion": "0"});
+        assert_eq!(parse_time_discount(&free), (None, Vec::new()));
+    }
+}
+
+#[cfg(test)]
+mod tool_call_tests {
+    use super::*;
+
+    #[test]
+    fn arguments_survive_the_json_string_encoding() {
+        let v = parse_tool_arguments(Some(r#"{"slug":"attention-2017","limit":3}"#));
+        assert_eq!(v["slug"], "attention-2017");
+        assert_eq!(v["limit"], 3);
+    }
+
+    /// An agent answer is several provider calls. Reporting the last one's
+    /// figures would tell the user a five-round answer cost what its final
+    /// round did.
+    #[test]
+    fn rounds_are_summed_not_overwritten() {
+        let mut total = TurnUsage::default();
+        total.add(&TurnUsage {
+            input_tokens: 3_000,
+            output_tokens: 200,
+            cache_hit_tokens: 1_000,
+            cost_usd: Some(0.001),
+        });
+        total.add(&TurnUsage {
+            input_tokens: 5_000,
+            output_tokens: 400,
+            cache_hit_tokens: 2_500,
+            cost_usd: Some(0.002),
+        });
+        assert_eq!(total.input_tokens, 8_000);
+        assert_eq!(total.output_tokens, 600);
+        assert_eq!(total.cache_hit_tokens, 3_500);
+        assert_eq!(total.cost_usd, Some(0.003));
+    }
+
+    /// A provider that reports no cost must leave it unknown, not claim zero —
+    /// the front-end falls back to estimating from token counts.
+    #[test]
+    fn an_unreported_cost_stays_unknown() {
+        let mut total = TurnUsage::default();
+        total.add(&TurnUsage {
+            input_tokens: 100,
+            ..Default::default()
+        });
+        assert_eq!(total.cost_usd, None);
+
+        total.add(&TurnUsage {
+            cost_usd: Some(0.5),
+            ..Default::default()
+        });
+        assert_eq!(total.cost_usd, Some(0.5), "a later report must still land");
+    }
+
+    /// A model that emits `""` or broken JSON must not abort the turn — the
+    /// tool layer reports the problem in a way the model can act on.
+    #[test]
+    fn malformed_arguments_degrade_to_empty() {
+        for raw in [None, Some(""), Some("   "), Some("{not json")] {
+            assert_eq!(parse_tool_arguments(raw), serde_json::json!({}), "{raw:?}");
+        }
     }
 }

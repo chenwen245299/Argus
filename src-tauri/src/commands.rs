@@ -1681,9 +1681,82 @@ pub async fn save_provider_models(
     id: String,
     models: Vec<AiModel>,
     state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
-    ai_manager::save_provider_models(&root, &id, models)
+    ai_manager::save_provider_models(&root, &id, models)?;
+    // Newly added models arrive without their promotion badges — those are not
+    // in the list the fetch dialog reads. Fill them in shortly.
+    crate::offer_sync::spawn_after_edit(&app);
+    Ok(())
+}
+
+/// One model to look a promotion up for.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscountQuery {
+    pub id: String,
+    /// The price the catalogue quotes for this model, which selects *which*
+    /// endpoint's discount applies. See `llm::fetch_openrouter_discount`.
+    pub quoted_input_usd_per_million: Option<f64>,
+}
+
+/// Promotions for a batch of models, as `{ model_id: percent_off }`.
+///
+/// One request per model — OpenRouter publishes `pricing.discount` only under
+/// `/models/{id}/endpoints`, never in the bulk list — so this fans out rather
+/// than looping. Measured at roughly eight seconds for a full 414-model
+/// catalogue, which is why the model-picker dialog opens first and folds these
+/// in when they arrive instead of waiting.
+#[tauri::command]
+pub async fn fetch_openrouter_discounts(
+    provider_id: String,
+    models: Vec<DiscountQuery>,
+    state: State<'_, LibraryRoot>,
+) -> Result<std::collections::HashMap<String, u32>, String> {
+    use futures::StreamExt;
+
+    let root = get_root(&state)?;
+    let settings = ai_manager::read_ai_settings(&root);
+    let Some(provider) = settings.providers.iter().find(|p| p.id == provider_id) else {
+        return Ok(Default::default());
+    };
+    if !provider.base_url.to_lowercase().contains("openrouter") {
+        return Ok(Default::default());
+    }
+    let api_key = ai_manager::get_api_key(&root, &provider_id).unwrap_or_default();
+
+    /// Wide enough to finish a full catalogue in seconds, narrow enough not to
+    /// look like an attack to the provider.
+    const CONCURRENCY: usize = 8;
+
+    let found: Vec<(String, u32)> = futures::stream::iter(models)
+        .map(|q| {
+            let provider = provider.clone();
+            let api_key = api_key.clone();
+            async move {
+                crate::llm::fetch_openrouter_discount(
+                    &provider,
+                    &api_key,
+                    &q.id,
+                    q.quoted_input_usd_per_million,
+                )
+                .await
+                // A lookup that failed is simply left out of the map. Nothing
+                // here is written to disk — the map only decides which badges
+                // this dialog draws — so a missing entry costs a badge until
+                // the next refresh, not a saved offer.
+                .ok()
+                .flatten()
+                .map(|percent| (q.id, percent))
+            }
+        })
+        .buffer_unordered(CONCURRENCY)
+        .filter_map(|r| async move { r })
+        .collect()
+        .await;
+
+    Ok(found.into_iter().collect())
 }
 
 #[tauri::command]
@@ -1939,16 +2012,25 @@ pub async fn get_library_conversations(
     state: State<'_, LibraryRoot>,
 ) -> Result<serde_json::Value, String> {
     let root = get_root(&state)?;
-    Ok(copilot::read_library_conversations(&root))
+    Ok(copilot::load_library_conversations(&root))
 }
 
 #[tauri::command]
-pub async fn save_library_conversations(
-    conversations: serde_json::Value,
+pub async fn save_library_conversation(
+    conversation: serde_json::Value,
     state: State<'_, LibraryRoot>,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
-    copilot::write_library_conversations(&root, &conversations)
+    copilot::write_library_conversation(&root, &conversation)
+}
+
+#[tauri::command]
+pub async fn delete_library_conversation(
+    id: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    copilot::delete_library_conversation(&root, &id)
 }
 
 // ── M7: RAG Settings ─────────────────────────────────────────────────────────
@@ -2091,6 +2173,11 @@ pub async fn chat_with_library(
     reasoning_effort: Option<String>,
     request_id: Option<String>,
     web_search: Option<bool>,
+    // Agent mode only: how many tool rounds the model may take.
+    agent_max_rounds: Option<usize>,
+    // Opaque to the backend; echoed back in the cache-keepalive status so the
+    // chat window knows which conversation is being kept warm.
+    conversation_id: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -2100,6 +2187,25 @@ pub async fn chat_with_library(
         sources_event_name.unwrap_or_else(|| "library-chat-sources".to_string());
     // Register a cancel flag; the guard unregisters it on every exit path.
     let (_cancel_guard, cancel) = crate::cancel::CancelGuard::new(request_id);
+    // Agent mode drives its own retrieval through the MCP tools instead of
+    // taking a pre-built context, so it takes a different path entirely.
+    if knowledge_source.as_deref() == Some("agent") {
+        return copilot::chat_with_library_agent(
+            &root,
+            messages,
+            provider_id.as_deref(),
+            model_id.as_deref(),
+            &event_name,
+            use_reasoning.unwrap_or(false),
+            reasoning_effort.as_deref(),
+            agent_max_rounds,
+            conversation_id.as_deref(),
+            &app,
+            cancel,
+        )
+        .await;
+    }
+
     copilot::chat_with_library(
         &root,
         messages,
@@ -3355,4 +3461,107 @@ pub fn migrate_snippets_from_localstorage(
 ) -> Result<(), String> {
     let root = get_root(&state)?;
     snippets::migrate_from_localstorage(&root, libraries, snippets_by_library)
+}
+
+// ── MCP server ───────────────────────────────────────────────────────────────
+//
+// The server itself runs as a separate stdio process the MCP client launches
+// (`Argus --mcp-stdio`); these commands only report and flip the on/off switch
+// it reads from disk. See `crate::mcp`.
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpStatus {
+    pub enabled: bool,
+}
+
+#[tauri::command]
+pub async fn mcp_get_status(app: tauri::AppHandle) -> Result<McpStatus, String> {
+    Ok(McpStatus {
+        enabled: crate::mcp::read_settings(&app).enabled,
+    })
+}
+
+#[tauri::command]
+pub async fn mcp_set_enabled(enabled: bool, app: tauri::AppHandle) -> Result<McpStatus, String> {
+    crate::mcp::write_settings(&app, &crate::mcp::McpSettings { enabled })?;
+    Ok(McpStatus { enabled })
+}
+
+#[tauri::command]
+pub async fn mcp_get_client_config() -> Result<crate::mcp::ClientConfig, String> {
+    Ok(crate::mcp::client_config())
+}
+
+// ── Agent mode (智能问答) ─────────────────────────────────────────────────────
+
+/// The round budget and the external MCP servers, plus the read-only facts the
+/// settings tab shows about the built-in server.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSettingsView {
+    #[serde(flatten)]
+    pub settings: crate::mcp::client::AgentSettings,
+    /// How many tools the built-in library server contributes.
+    pub builtin_tool_count: usize,
+    /// The prompt in force when the user has not written one, so the panel can
+    /// show it as a placeholder and offer to restore it.
+    pub default_system_prompt: &'static str,
+    pub min_rounds: usize,
+    pub max_rounds_limit: usize,
+    pub max_servers: usize,
+}
+
+#[tauri::command]
+pub async fn agent_get_settings(app: tauri::AppHandle) -> Result<AgentSettingsView, String> {
+    Ok(AgentSettingsView {
+        settings: crate::mcp::client::read_settings(&app),
+        builtin_tool_count: crate::mcp::agent::tools().len(),
+        default_system_prompt: crate::copilot::DEFAULT_AGENT_SYSTEM_PROMPT,
+        min_rounds: crate::copilot::MIN_AGENT_ROUNDS,
+        max_rounds_limit: crate::copilot::MAX_AGENT_ROUNDS,
+        max_servers: crate::mcp::client::MAX_SERVERS,
+    })
+}
+
+#[tauri::command]
+pub async fn agent_save_settings(
+    settings: crate::mcp::client::AgentSettings,
+    app: tauri::AppHandle,
+) -> Result<AgentSettingsView, String> {
+    crate::mcp::client::write_settings(&app, &settings)?;
+    // The setting is read when a keepalive is armed, which happens at the end of
+    // an answer — so switching it off would otherwise leave the current loop
+    // pinging for up to an hour, with the indicator still breathing. Turning it
+    // off has to mean "stop now", not "stop after the next answer".
+    if !settings.keep_cache_warm {
+        crate::cache_keepalive::disarm_and_announce(&app);
+    }
+    agent_get_settings(app).await
+}
+
+/// Launch one configured server and report what it offers. Nothing is saved —
+/// this is the "does this actually work" button.
+#[tauri::command]
+pub async fn agent_probe_server(
+    server: crate::mcp::client::ExternalServer,
+) -> Result<crate::mcp::client::ProbeResult, String> {
+    Ok(crate::mcp::client::probe(&server).await)
+}
+
+/// The built-in tools, for the settings tab's "what can it do" list.
+#[tauri::command]
+pub async fn agent_list_builtin_tools() -> Result<Vec<crate::mcp::agent::AgentTool>, String> {
+    Ok(crate::mcp::agent::tools())
+}
+
+/// Stop holding the last agent conversation's prompt cache open.
+///
+/// Called when the chat window closes or leaves agent mode. The keepalive also
+/// checks for the window itself before every ping, so this is the fast path
+/// rather than the guarantee.
+#[tauri::command]
+pub async fn disarm_cache_keepalive(app: tauri::AppHandle) -> Result<(), String> {
+    crate::cache_keepalive::disarm_and_announce(&app);
+    Ok(())
 }

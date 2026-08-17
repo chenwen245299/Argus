@@ -7,9 +7,10 @@ import ThemeSettings from './settings/ThemeSettings.vue'
 import AiSettings from './settings/AiSettings.vue'
 import ExtractionSettings from './settings/ExtractionSettings.vue'
 import AboutSettings from './settings/AboutSettings.vue'
-import RagSettings from './settings/RagSettings.vue'
 import ArxivSettings from './settings/ArxivSettings.vue'
 import CanvasSettings from './settings/CanvasSettings.vue'
+import QaSettings from './settings/QaSettings.vue'
+import McpSettings from './settings/McpSettings.vue'
 
 const props = defineProps<{ initialSection?: string }>()
 const { t } = useI18n()
@@ -17,9 +18,14 @@ const emit = defineEmits<{ close: [] }>()
 
 const tlHover = ref(false)
 
-type Section = 'general' | 'themes' | 'ai' | 'extraction' | 'about' | 'arxiv' | 'rag' | 'canvas'
+type Section = 'general' | 'themes' | 'ai' | 'extraction' | 'about' | 'arxiv' | 'canvas' | 'agent' | 'mcp'
 
-const activeSection = ref<Section>((props.initialSection as Section) ?? 'general')
+// RAG moved under 智能问答 as a sub-tab. Callers that ask for it by name — the
+// chat's "configure RAG" prompts, the snippet library — must still land on it.
+const requested = props.initialSection
+const initialQaTab = requested === 'rag' ? 'rag' : 'agent'
+
+const activeSection = ref<Section>(requested === 'rag' ? 'agent' : ((requested as Section) ?? 'general'))
 
 const sections: { id: Section; label: string; placeholder?: boolean }[] = [
   { id: 'general', label: 'settings.general' },
@@ -27,8 +33,9 @@ const sections: { id: Section; label: string; placeholder?: boolean }[] = [
   { id: 'ai', label: 'settings.ai' },
   { id: 'extraction', label: 'settings.extraction' },
   { id: 'arxiv', label: 'settings.arxiv' },
-  { id: 'rag', label: 'settings.rag' },
   { id: 'canvas', label: 'settings.canvas' },
+  { id: 'agent', label: 'settings.agent' },
+  { id: 'mcp', label: 'settings.mcp' },
   { id: 'about', label: 'settings.about' },
 ]
 
@@ -98,10 +105,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <GeneralSettings v-if="activeSection === 'general'" />
               <ThemeSettings v-else-if="activeSection === 'themes'" />
               <AiSettings v-else-if="activeSection === 'ai'" />
-              <RagSettings v-else-if="activeSection === 'rag'" />
               <ArxivSettings v-else-if="activeSection === 'arxiv'" />
               <ExtractionSettings v-else-if="activeSection === 'extraction'" />
               <CanvasSettings v-else-if="activeSection === 'canvas'" />
+              <QaSettings v-else-if="activeSection === 'agent'" :initial-tab="initialQaTab" />
+              <McpSettings v-else-if="activeSection === 'mcp'" />
               <AboutSettings v-else-if="activeSection === 'about'" />
               <div v-else class="placeholder-panel">
                 <div class="placeholder-inner">

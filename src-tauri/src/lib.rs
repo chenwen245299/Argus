@@ -2,6 +2,7 @@ mod ai_manager;
 mod ai_summary;
 mod arxiv;
 mod arxiv_scheduler;
+mod cache_keepalive;
 mod cancel;
 mod canvas;
 mod canvas_enhance;
@@ -13,10 +14,12 @@ mod extraction;
 mod fsutil;
 mod library;
 mod llm;
+mod mcp;
 mod metadata;
 mod models;
 mod net;
 mod ocr;
+mod offer_sync;
 mod paper;
 mod path_guard;
 mod rag;
@@ -35,6 +38,15 @@ use tauri::Manager;
 use tauri_plugin_window_state::StateFlags;
 
 pub struct LibraryRoot(pub Mutex<Option<String>>);
+
+/// CLI flag that makes this binary serve MCP over stdio instead of opening the
+/// app. Re-exported so `main` can check it before any Tauri setup runs.
+pub const MCP_STDIO_FLAG: &str = mcp::STDIO_FLAG;
+
+/// Serve MCP over stdin/stdout. Returns a process exit code.
+pub fn run_mcp_stdio() -> i32 {
+    mcp::run_stdio()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -92,6 +104,9 @@ pub fn run() {
             // Start background scheduler
             arxiv_scheduler::start_scheduler(app.handle().clone());
 
+            // Re-read model prices well after launch, so a free tier that has
+            // been withdrawn stops advertising itself. Returns immediately.
+            offer_sync::spawn(app.handle());
 
             Ok(())
         })
@@ -221,7 +236,8 @@ pub fn run() {
             commands::save_library_chat_history,
             commands::clear_library_chat_history,
             commands::get_library_conversations,
-            commands::save_library_conversations,
+            commands::save_library_conversation,
+            commands::delete_library_conversation,
             // ── M7: RAG Settings ──
             commands::get_rag_settings,
             commands::save_rag_settings,
@@ -301,6 +317,7 @@ pub fn run() {
             commands::save_canvas_settings,
             commands::set_canvas_notes,
             commands::fetch_openrouter_endpoints,
+            commands::fetch_openrouter_discounts,
             // ── M10: Canvas Enhance ──
             commands::suggest_canvas_edges,
             commands::compute_canvas_layout,
@@ -336,6 +353,15 @@ pub fn run() {
             commands::migrate_snippets_from_localstorage,
             // ── File export ──
             commands::write_bytes_to_file,
+            // ── MCP endpoint ──
+            commands::mcp_get_status,
+            commands::mcp_set_enabled,
+            commands::mcp_get_client_config,
+            commands::agent_get_settings,
+            commands::agent_save_settings,
+            commands::agent_probe_server,
+            commands::agent_list_builtin_tools,
+            commands::disarm_cache_keepalive,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

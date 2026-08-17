@@ -299,6 +299,10 @@ export interface AiModel {
   input_price_usd_per_million?: number   // USD per 1M input tokens
   output_price_usd_per_million?: number  // USD per 1M output tokens
   provider_order?: string[]          // OpenRouter provider preference order
+  param_billions?: number            // parameter count, when the catalogue reveals it
+  is_free?: boolean                  // provider quotes zero both ways
+  discount_percent?: number          // percent off the base input price...
+  discount_windows?: [number, number][] // ...during these UTC [HHMM, HHMM] windows
 }
 
 export interface AiProviderInfo {

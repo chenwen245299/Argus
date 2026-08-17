@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { modelOffer, modelSizeLabel } from '../../utils/modelOffers'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
@@ -1041,6 +1042,19 @@ function modelLogo(modelId: string, providerName = '', providerId = '') {
     if (haystack.includes(key)) return modelIconMap[key]
   }
   return ''
+}
+
+/** The FREE / 折扣 badge for a picker row, from the provider's own price list. */
+function sizeOf(model: ModelOption) {
+  return modelSizeLabel(model.paramBillions)
+}
+
+function offerOf(model: ModelOption) {
+  return modelOffer({
+    is_free: model.isFree,
+    discount_percent: model.discountPercent,
+    discount_windows: model.discountWindows,
+  })
 }
 
 function capabilitiesLabel(model: ModelOption) {
@@ -2265,8 +2279,23 @@ function toggleContextPanel(nodeId: string) {
                 <img v-if="modelLogo(model.modelId, model.providerName, model.providerId)" :src="modelLogo(model.modelId, model.providerName, model.providerId)" class="model-logo" alt="" />
                 <span v-else class="model-logo fallback">{{ model.displayName.charAt(0).toUpperCase() }}</span>
                 <span class="model-info">
-                  <span class="model-name">{{ model.displayName }}</span>
-                  <span class="model-meta">{{ capabilitiesLabel(model).join(' · ') || model.modelId }}</span>
+                  <span class="model-name">
+                    {{ model.displayName }}
+                    <span
+                      v-if="offerOf(model)"
+                      class="offer-tag"
+                      :class="[offerOf(model)!.kind, { idle: !offerOf(model)!.activeNow }]"
+                      :title="offerOf(model)!.title"
+                    >{{ offerOf(model)!.label }}</span>
+                  </span>
+                  <span class="model-meta">
+                    <span
+                      class="row-size"
+                      :class="{ assumed: !sizeOf(model).known }"
+                      :title="sizeOf(model).title"
+                    >{{ sizeOf(model).text }}</span>
+                    {{ capabilitiesLabel(model).join(' · ') || model.modelId }}
+                  </span>
                 </span>
               </button>
             </div>
@@ -3096,6 +3125,33 @@ function toggleContextPanel(nodeId: string) {
   gap: 2px;
 }
 .model-name,
+.row-size {
+  margin-right: 6px;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  font-size: 9.5px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--text-secondary) 11%, transparent);
+}
+.row-size.assumed { opacity: 0.6; font-weight: 500; }
+
+/* Price-list badge. A discount outside its window is dimmed rather than hidden,
+   so the model still reads as "cheaper at some hours" without claiming it is
+   cheaper right now. */
+.offer-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 15px;
+  vertical-align: middle;
+}
+.offer-tag.free { color: #15803d; background: color-mix(in srgb, #22c55e 16%, transparent); }
+.offer-tag.discount { color: #b45309; background: color-mix(in srgb, #f59e0b 18%, transparent); }
+.offer-tag.discount.idle { color: var(--text-tertiary); background: color-mix(in srgb, var(--text-tertiary) 12%, transparent); }
+
 .model-meta {
   overflow: hidden;
   text-overflow: ellipsis;

@@ -651,6 +651,34 @@ pub struct AiModel {
     /// OpenRouter provider preference order (slugs like "Anthropic", "Together", etc.)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_order: Vec<String>,
+    /// The catalogue quotes zero for both input and output.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_free: bool,
+    /// Percent off the base input price during `discount_windows`.
+    ///
+    /// Only ever set from a *time-of-day* price override that is cheaper than
+    /// the base. OpenRouter uses the same `overrides` array for long-context
+    /// *surcharges*, which must never be read as a discount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discount_percent: Option<u32>,
+    /// Parameter count in billions, when the catalogue reveals it.
+    ///
+    /// Read out of the model's naming and description — no provider publishes
+    /// it as a field, and the closed models mostly never say. `None` means
+    /// unknown, which the UI shows as an estimate rather than a fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param_billions: Option<f64>,
+    /// UTC windows the discount applies in, as `[HHMM_start, HHMM_end]`. A
+    /// window whose end is below its start wraps past midnight.
+    ///
+    /// Stored rather than resolved to "on right now" because the answer changes
+    /// while the app is open; the UI evaluates it against the current clock.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discount_windows: Vec<[u32; 2]>,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

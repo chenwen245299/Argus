@@ -15,9 +15,10 @@ import { buildChunks } from '../utils/chunker'
 import { sortPapersByRecentAccess } from '../utils/recentPapers'
 import { serveAddPapersToChat } from '../utils/chatPapers'
 import { estimateCostCny } from '../utils/modelPricing'
+import { modelOffer, modelSizeLabel } from '../utils/modelOffers'
 import type { ChatContentPart, ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
 
-const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag'] }>()
+const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag' | 'agent'] }>()
 const { t } = useI18n()
 // On Windows the native decorations are off, so we drop the macOS traffic-light
 // gutter and render our own window controls (see WindowControls).
@@ -96,6 +97,28 @@ async function syncMissing() {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/** One entry in the agent's visible trail of what it looked at. */
+interface AgentStep {
+  tool: string
+  /** Which external MCP server served this tool. Absent for the library's own. */
+  server?: string
+  /** Compacted arguments for the collapsed row, e.g. `slug: cogs, limit: 3`. */
+  args: string
+  /** Pretty-printed arguments, shown when expanded. */
+  argsJson: string
+  /** undefined while running, then whether the call succeeded. */
+  ok?: boolean
+  /** Size of the result the model got back. */
+  chars?: number
+  /** Bounded slice of the result, shown when expanded. */
+  preview?: string
+  /** Whether `preview` is only part of what the model received. */
+  truncated?: boolean
+  /** Whether the *saved* copy was shortened to keep the conversation file small.
+   *  Distinct from `truncated`, which is about what the model itself got. */
+  previewClipped?: boolean
+}
+
 interface LibraryAnswerVariant {
   id: string
   content: string
@@ -116,6 +139,17 @@ interface LibraryAnswerVariant {
   // heavy `contextContent` is stripped) so the per-message badge + dedup survive
   // a reload — mirrors how AiTab persists its context flags.
   contextPaperLabels?: string[]
+  /** Agent mode: which tools the model called, in order. */
+  agentSteps?: AgentStep[]
+  /** Agent mode: configured MCP servers that failed to start for this answer. */
+  agentServerErrors?: { name: string; error: string }[]
+  /** Agent mode: tool results dropped to stay inside the model's context window. */
+  agentEvicted?: number
+  /** Agent mode: set when the round budget ran out before the model was done
+   *  looking. Without it a truncated answer is indistinguishable from a
+   *  complete one — the model is asked to admit the gap, and routinely does
+   *  not. */
+  agentLimit?: { rounds: number; max: number }
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
@@ -143,6 +177,17 @@ interface LibraryUiMessage {
   reasoningContent?: string
   contextContent?: LibrarySentContextPayload
   contextPaperLabels?: string[]
+  /** Agent mode: which tools the model called, in order. */
+  agentSteps?: AgentStep[]
+  /** Agent mode: configured MCP servers that failed to start for this answer. */
+  agentServerErrors?: { name: string; error: string }[]
+  /** Agent mode: tool results dropped to stay inside the model's context window. */
+  agentEvicted?: number
+  /** Agent mode: set when the round budget ran out before the model was done
+   *  looking. Without it a truncated answer is indistinguishable from a
+   *  complete one — the model is asked to admit the gap, and routinely does
+   *  not. */
+  agentLimit?: { rounds: number; max: number }
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
@@ -160,6 +205,74 @@ interface LibraryConversation {
   selectedPaperSlugs: string[]
   createdAt: string
   updatedAt: string
+}
+
+interface AgentEventPayload {
+  phase: 'thinking' | 'tool' | 'result' | 'answering' | 'limit' | 'servers' | 'evicted'
+  round?: number
+  /** `limit` phase: rounds of tools actually run, and the budget they hit. */
+  rounds?: number
+  max?: number
+  tool?: string
+  /** Which external MCP server the tool belongs to, if any. */
+  server?: string | null
+  arguments?: Record<string, unknown>
+  ok?: boolean
+  chars?: number
+  /** Bounded slice of the result, for the expandable view. */
+  preview?: string
+  /** Whether `preview` is only part of what the model received. */
+  truncated?: boolean
+  /** `servers` phase: how many extra tools the external servers contributed. */
+  extraTools?: number
+  /** `servers` phase: servers that were configured but could not be reached. */
+  failed?: { name: string; error: string }[]
+  /** `evicted` phase: how many old tool results were dropped this round. */
+  dropped?: number
+}
+
+/** Expanded agent steps, keyed by `${answerId}:${index}`. Collapsed by default:
+ *  the trail is a summary, and the payloads are long. */
+const expandedSteps = ref(new Set<string>())
+function stepKey(answerId: string, i: number) { return `${answerId}:${i}` }
+function toggleStep(answerId: string, i: number) {
+  const k = stepKey(answerId, i)
+  // Replace the Set rather than mutating it: Vue does not track Set mutations
+  // deeply enough to re-render every dependent binding here.
+  const next = new Set(expandedSteps.value)
+  if (next.has(k)) next.delete(k)
+  else next.add(k)
+  expandedSteps.value = next
+}
+
+/** Height of the tool trail, in rows. Fixed: the trail is supporting evidence,
+ *  and a twelve-call answer that grows every time a step is opened pushes the
+ *  answer itself off the screen. */
+const AGENT_TRAIL_ROWS = 10
+/** Height of one collapsed step row, in px. Matches `.agent-step`. */
+const AGENT_TRAIL_ROW_PX = 23
+
+/** True while any step in this answer is still waiting on its result. */
+function agentRunning(answer: { agentSteps?: AgentStep[] }): boolean {
+  return !!answer.agentSteps?.some(s => s.ok === undefined)
+}
+
+/** Compact byte-ish size for a tool result, so a long trail stays scannable. */
+function formatChars(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+/** Render tool arguments as one short line. Values are truncated because a
+ *  query can be a whole sentence, and this sits inline under the answer. */
+function summarizeArgs(args?: Record<string, unknown>): string {
+  if (!args) return ''
+  return Object.entries(args)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => {
+      const text = typeof v === 'string' ? v : JSON.stringify(v)
+      return `${k}: ${text.length > 40 ? text.slice(0, 40) + '…' : text}`
+    })
+    .join(', ')
 }
 
 interface GroupedSource {
@@ -255,10 +368,42 @@ async function loadConversations(): Promise<LibraryConversation[]> {
     try { localStorage.removeItem(STORAGE_KEY) } catch {}
     if (convs.length === 0) {
       convs = legacy
-      persistConversations(convs)
+      for (const conv of convs) persistOne(conv)
     }
   }
   return convs
+}
+
+// ── Persisting the agent trail ────────────────────────────────────────────────
+// These are runaway guards, not space savings. With one file per conversation a
+// large trail is paid for by the conversation holding it and nothing else, so
+// the caps only exist to stop a single pathological run — 500 rounds against a
+// million-token model, each result up to half a megabyte — from producing a file
+// that is slow to rewrite while it is being streamed into.
+//
+// Both sit far above real usage: the 90th percentile of measured tool results is
+// about 24k characters, so nothing anyone would actually open gets clipped.
+
+/** Per tool result. */
+const PERSIST_STEP_CHARS = 200_000
+/** Per answer, across all its tool calls. */
+const PERSIST_ANSWER_CHARS = 2_000_000
+
+/** Trim an answer's tool payloads to what is worth writing to disk. */
+function persistableSteps(steps?: AgentStep[]): AgentStep[] | undefined {
+  if (!steps) return undefined
+  let budget = PERSIST_ANSWER_CHARS
+  return steps.map(step => {
+    if (!step.preview) return step
+    const room = Math.min(PERSIST_STEP_CHARS, budget)
+    if (room <= 0) {
+      const { preview, ...rest } = step
+      return { ...rest, previewClipped: true }
+    }
+    budget -= Math.min(step.preview.length, room)
+    if (step.preview.length <= room) return step
+    return { ...step, preview: step.preview.slice(0, room), previewClipped: true }
+  })
 }
 
 function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
@@ -268,22 +413,54 @@ function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
       const variantClone: LibraryAnswerVariant = { ...variant }
       delete variantClone.contextContent
       delete variantClone.displayContent
+      variantClone.agentSteps = persistableSteps(variant.agentSteps)
       return variantClone
     }),
   }
   delete clone.contextContent
+  clone.agentSteps = persistableSteps(msg.agentSteps)
   delete clone.displayContent
   return clone
 }
 
-function persistConversations(convs: LibraryConversation[]) {
-  const serializable = convs.slice(0, 50).map(conv => ({
+/** Write one conversation to its own file under `<library>/chats/`.
+ *
+ *  One file each is what makes this cheap: saving during a stream rewrites only
+ *  the conversation being streamed into, not every conversation ever held. The
+ *  old bulk save is also why there used to be a 50-conversation ceiling — that
+ *  is gone with it. */
+/** Bumped whenever the open library changes.
+ *
+ *  `save_library_conversation` resolves the library root from backend state, so
+ *  a write prepared before a switch would be filed under the library that is
+ *  open *now*. Work that outlives a switch — a stream still settling, a title
+ *  still generating — carries the epoch it started under and is dropped if it
+ *  no longer matches. */
+let libraryEpoch = 0
+
+/** Conversations the user deleted.
+ *
+ *  A stream in flight holds its conversation object directly, so its final
+ *  `persistConv` would write the file back and the conversation would reappear
+ *  on the next load. One file per conversation makes the write independent of
+ *  the on-screen list, which is exactly why the list can no longer be trusted
+ *  as the guard. */
+const deletedConvIds = new Set<string>()
+
+/** Whether a write prepared under `epoch` may still go to disk. */
+function stillWritable(convId: string, epoch: number): boolean {
+  return epoch === libraryEpoch && !deletedConvIds.has(convId)
+}
+
+function persistOne(conv: LibraryConversation, epoch = libraryEpoch) {
+  if (!stillWritable(conv.id, epoch)) return
+  const serializable = {
     ...conv,
     selectedPaperSlugs: normalizeSelectedPaperSlugs(conv.selectedPaperSlugs),
     messages: conv.messages.map(stripTransientContext),
-  }))
-  // Fire-and-forget: persisted into the active library's `.argus/` folder.
-  invoke('save_library_conversations', { conversations: serializable }).catch(() => {})
+  }
+  // Fire-and-forget.
+  invoke('save_library_conversation', { conversation: serializable }).catch(() => {})
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -295,7 +472,27 @@ const attachments = ref<Attachment[]>([])
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const previewImage = ref<string | null>(null)
 const previewPdf = ref<string | null>(null)
-const loading = ref(false)
+/** Conversations with a generation in flight.
+ *
+ *  Per conversation rather than one global flag: a conversation left generating
+ *  keeps running in the background while the user opens or starts another, which
+ *  is only possible if "busy" is scoped to the conversation being viewed. Event
+ *  names are already unique per answer, and listeners hold the target object
+ *  directly, so nothing else had to change for the streams to survive a switch.
+ */
+const generatingConvIds = ref(new Set<string>())
+function markGenerating(convId: string | null, on: boolean) {
+  if (!convId) return
+  const next = new Set(generatingConvIds.value)
+  if (on) next.add(convId)
+  else next.delete(convId)
+  generatingConvIds.value = next
+}
+function isGenerating(convId: string | null | undefined) {
+  return !!convId && generatingConvIds.value.has(convId)
+}
+/** Busy state of the conversation on screen. */
+const loading = computed(() => isGenerating(activeConvId.value))
 const messagesEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const selectedModel = ref<ModelSelection | null>(null)
@@ -318,15 +515,16 @@ const modelPickerMsg = computed(() =>
 
 // ── Knowledge source picker ───────────────────────────────────────────────────
 /** 'none' = plain conversation, no library context at all. */
-type KnowledgeSource = 'paper-rag' | 'papers' | 'snippets' | 'none'
+type KnowledgeSource = 'paper-rag' | 'papers' | 'snippets' | 'agent' | 'none'
 
 function loadKnowledgeSource(): KnowledgeSource {
   const saved = localStorage.getItem(KNOWLEDGE_SOURCE_KEY)
-  if (saved === 'papers' || saved === 'paper-rag' || saved === 'snippets' || saved === 'none') return saved
+  if (saved === 'papers' || saved === 'paper-rag' || saved === 'snippets' || saved === 'agent' || saved === 'none') return saved
   return 'paper-rag'
 }
 
 const knowledgeSource = ref<KnowledgeSource>(loadKnowledgeSource())
+
 const sourcePickerOpen = ref(false)
 
 // Server-side web search is a DeepSeek Responses-API feature, so the toggle only
@@ -341,6 +539,56 @@ const webSearchAvailable = computed(() => {
 watch(webSearchAvailable, (ok) => { if (!ok) useWebSearch.value = false })
 /** Live server-side search phase while a turn is running. */
 const webSearchPhase = ref<string | null>(null)
+
+// ── Prompt-cache keepalive ────────────────────────────────────────────────────
+// The backend holds the last agent answer's prefix warm so a follow-up asked ten
+// minutes later still bills at the cache-hit rate. It spends a little money in
+// the background to do that, so it says so here rather than doing it invisibly.
+
+interface KeepaliveStatus {
+  active: boolean
+  /** Which conversation's prefix is being held. */
+  conversationId?: string | null
+  model?: string
+  pings?: number
+  /** When the hour of inactivity runs out, in epoch ms. */
+  stopsAtMs?: number
+  intervalSeconds?: number
+  lastHitTokens?: number
+  reason?: 'idle' | 'left' | 'failing' | 'disarmed'
+}
+
+const keepalive = ref<KeepaliveStatus>({ active: false })
+/** Ticks once a minute purely so the remaining-time readout stays honest. */
+const nowMs = ref(Date.now())
+let keepaliveClock: ReturnType<typeof setInterval> | null = null
+
+/** True for the one conversation whose cache is actually being held.
+ *
+ *  The cache is a single conversation's prefix, so showing the badge on every
+ *  conversation would claim something that is not true of any of the others. */
+function isCacheWarm(convId: string | null | undefined) {
+  return !!convId && keepalive.value.active && keepalive.value.conversationId === convId
+}
+
+const keepaliveMinutesLeft = computed(() => {
+  const stopsAt = keepalive.value.stopsAtMs
+  if (!stopsAt) return null
+  return Math.max(0, Math.round((stopsAt - nowMs.value) / 60000))
+})
+
+const keepaliveTitle = computed(() => {
+  const k = keepalive.value
+  const every = k.intervalSeconds ? Math.round(k.intervalSeconds / 60) : 5
+  const left = keepaliveMinutesLeft.value
+  return [
+    `正在保持上下文缓存，每 ${every} 分钟续期一次。`,
+    `下次提问会命中缓存，按缓存价计费而不是重读整段对话。`,
+    k.pings ? `已续期 ${k.pings} 次` : '尚未续期',
+    left !== null ? `· 约 ${left} 分钟后自动停止` : '',
+    '关闭窗口或切换知识库来源也会停止。',
+  ].filter(Boolean).join('\n')
+})
 
 // Reasoning / thinking-mode state (mirrors AiTab). DeepSeek exposes high/max;
 // everyone else low/medium/high — the backend maps DeepSeek's levels.
@@ -384,6 +632,12 @@ function setKnowledgeSource(src: KnowledgeSource) {
   knowledgeSource.value = src
   sourcePickerOpen.value = false
   try { localStorage.setItem(KNOWLEDGE_SOURCE_KEY, src) } catch {}
+  // Only agent mode arms the prompt-cache keepalive, so leaving it should stop
+  // the spend now rather than after the backend's hour-long fallback.
+  if (src !== 'agent') {
+    keepalive.value = { active: false }
+    invoke('disarm_cache_keepalive').catch(() => {})
+  }
 }
 
 // "文献库论文" rather than plain "文献库" — next to "文献库RAG" in the picker the
@@ -392,6 +646,7 @@ const knowledgeSourceLabel = computed(() => {
   switch (knowledgeSource.value) {
     case 'snippets': return '素材库'
     case 'paper-rag': return '文献库RAG'
+    case 'agent': return 'Agent 模式'
     case 'none': return '不使用知识库'
     default: return '文献库论文'
   }
@@ -401,7 +656,7 @@ function setActiveSelectedPaperSlugs(slugs: string[]) {
   const conv = conversations.value.find(c => c.id === activeConvId.value)
   if (!conv) return
   conv.selectedPaperSlugs = normalizeSelectedPaperSlugs(slugs)
-  persistConversations(conversations.value)
+  persistOne(conv)
 }
 
 const selectedPapers = computed(() => {
@@ -602,6 +857,9 @@ const stoppedTargetIds = new Set<string>()
 // Maps a streaming target id -> the backend request_id we sent, so stopStreaming
 // can tell the backend to truly cancel the in-flight HTTP request (stop billing).
 const activeRequestIds = new Map<string, string>()
+// Which conversation each streaming target belongs to, so stopping one
+// conversation does not cancel generations running in another.
+const targetConvIds = new Map<string, string>()
 
 // ── Throttled streaming render ────────────────────────────────────────────────
 // A streamed answer is re-parsed in full (marked + KaTeX + highlight.js) on every
@@ -626,12 +884,21 @@ function streamRenderInterval(id: string): number {
   return Math.min(STREAM_RENDER_MAX_MS, Math.max(STREAM_RENDER_MIN_MS, Math.round(cost * STREAM_RENDER_DUTY)))
 }
 
+/** Whether this streaming target belongs to the conversation on screen.
+ *
+ *  Background generations still render into their own message objects, but they
+ *  must not scroll the conversation the user is currently reading. */
+function isTargetVisible(targetId: string) {
+  const owner = targetConvIds.get(targetId)
+  return owner === undefined || owner === activeConvId.value
+}
+
 // nextTick fires after Vue has patched the DOM, so this times parse + patch.
 function applyStreamRender(target: StreamTarget) {
   const startedAt = performance.now()
   target.displayContent = target.content
   nextTick(() => streamRenderCost.set(target.id, performance.now() - startedAt))
-  scrollToBottom()
+  if (isTargetVisible(target.id)) scrollToBottom()
 }
 
 function scheduleStreamRender(target: StreamTarget) {
@@ -767,6 +1034,9 @@ async function generateAiTitle(conv: LibraryConversation) {
   const assistantMsg = assistantMsgs[0] as LibraryUiMessage
   const aiContent = activeAnswer(assistantMsg)?.content ?? assistantMsg.content
   if (!aiContent) return
+  // The title request is a round trip, and the user is free to switch
+  // conversations — or libraries — while it runs.
+  const epoch = libraryEpoch
   try {
     const title = await invoke<string>('generate_conversation_title', {
       userMsg: userMsgs[0].content,
@@ -774,7 +1044,10 @@ async function generateAiTitle(conv: LibraryConversation) {
     })
     if (title?.trim()) {
       conv.title = title.trim().slice(0, 60)
-      persistActive()
+      // `conv`, not the active conversation: by now the user may be looking at
+      // a different one, and persisting that instead both loses this title and
+      // reorders the list around an unrelated conversation.
+      persistConv(conv, epoch)
     }
   } catch { /* silently keep the derived title */ }
 }
@@ -913,6 +1186,26 @@ function modelCapabilityText(model: ModelOption) {
     .join(' · ')
 }
 
+/** The FREE / 折扣 badge for a picker row, or null when there is nothing to say.
+ *
+ *  Depends on `nowMs` — which already ticks once a minute for the keepalive
+ *  readout — so a scheduled discount starts and stops on its own rather than
+ *  when the menu next happens to be reopened. */
+function sizeOf(model: ModelOption) {
+  return modelSizeLabel(model.paramBillions)
+}
+
+function offerOf(model: ModelOption) {
+  return modelOffer(
+    {
+      is_free: model.isFree,
+      discount_percent: model.discountPercent,
+      discount_windows: model.discountWindows,
+    },
+    new Date(nowMs.value),
+  )
+}
+
 function selectModel(model: ModelOption) {
   selectedModel.value = { providerId: model.providerId, modelId: model.modelId }
   modelMenuOpen.value = false
@@ -945,30 +1238,25 @@ function modelFallbackInitial(answer: LibraryAnswerVariant) {
   return (answer.modelLabel ?? answer.model?.modelId ?? 'AI').trim().charAt(0).toUpperCase() || 'AI'
 }
 
+/**
+ * The answer a message is currently showing: its selected variant, or a view of
+ * the message itself when it has none.
+ *
+ * The fallback spreads rather than listing fields, because listing them meant
+ * every field added to `LibraryUiMessage` afterwards was silently dropped from
+ * everything the template reads through here. That is exactly how the agent
+ * trail came to never render: `content` and the token counts were copied,
+ * `agentSteps` was not, so the tools ran and nothing showed.
+ *
+ * Only the four message-only fields are removed. `agentSteps` and the rest stay
+ * by reference, so the streaming listener's mutations reach the DOM.
+ */
 function activeAnswer(msg: LibraryUiMessage): LibraryAnswerVariant {
   const variants = msg.variants ?? []
   const active = variants.find(v => v.id === msg.activeVariantId) ?? variants[variants.length - 1]
   if (active) return active
-  return {
-    id: `${msg.id}:base`,
-    content: msg.content,
-    sources: msg.sources,
-    streaming: msg.streaming,
-    error: msg.error,
-    createdAt: msg.createdAt,
-    model: msg.model,
-    modelLabel: msg.modelLabel,
-    reasoningContent: msg.reasoningContent,
-    contextContent: msg.contextContent,
-    contextPaperLabels: msg.contextPaperLabels,
-    inputTokens: msg.inputTokens,
-    outputTokens: msg.outputTokens,
-    totalTokens: msg.totalTokens,
-    cacheHitTokens: msg.cacheHitTokens,
-    costUsd: msg.costUsd,
-    startedAt: msg.startedAt,
-    endedAt: msg.endedAt,
-  }
+  const { role: _role, attachments: _attachments, variants: _variants, activeVariantId: _activeId, ...rest } = msg
+  return { ...rest, id: `${msg.id}:base` }
 }
 
 function answerSources(msg: LibraryUiMessage) {
@@ -979,26 +1267,15 @@ function answerVariants(msg: LibraryUiMessage): LibraryAnswerVariant[] {
   return msg.variants ?? []
 }
 
+/** Promote a bare message into its own first variant, so a second model's answer
+ *  can sit beside it. Spread for the same reason as `activeAnswer`: an
+ *  enumerated copy loses whatever was added to the message type later — here
+ *  that would silently drop the original answer's tool trail and reasoning the
+ *  moment the user asked another model. */
 function ensureAnswerVariants(msg: LibraryUiMessage) {
   if (!msg.variants || msg.variants.length === 0) {
-    msg.variants = [{
-      id: `${msg.id}:v0`,
-      content: msg.content,
-      sources: msg.sources,
-      streaming: msg.streaming,
-      error: msg.error,
-      createdAt: msg.createdAt,
-      model: msg.model,
-      modelLabel: msg.modelLabel,
-      contextContent: msg.contextContent,
-      inputTokens: msg.inputTokens,
-      outputTokens: msg.outputTokens,
-      totalTokens: msg.totalTokens,
-      cacheHitTokens: msg.cacheHitTokens,
-      costUsd: msg.costUsd,
-      startedAt: msg.startedAt,
-      endedAt: msg.endedAt,
-    }]
+    const { role: _role, attachments: _attachments, variants: _variants, activeVariantId: _activeId, ...rest } = msg
+    msg.variants = [{ ...rest, id: `${msg.id}:v0` }]
     msg.activeVariantId = msg.variants[0].id
   }
   return msg.variants
@@ -1128,10 +1405,6 @@ function formatCostCny(costUsd: number | null | undefined) {
   return cny.toFixed(cny < 1 ? 3 : 2)
 }
 
-function hasUsage(answer: LibraryAnswerVariant) {
-  return typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number'
-}
-
 function answerSpeed(answer: LibraryAnswerVariant) {
   if (!answer.startedAt || typeof answer.outputTokens !== 'number') return ''
   const end = answer.endedAt ?? performance.now()
@@ -1223,7 +1496,7 @@ function newConversation() {
   }
   conversations.value.unshift(conv)
   activeConvId.value = conv.id
-  persistConversations(conversations.value)
+  persistOne(conv)
 }
 
 function startNewConversation() {
@@ -1234,23 +1507,40 @@ function startNewConversation() {
 function selectConversation(id: string) { activeConvId.value = id }
 
 function deleteConversation(id: string) {
+  // Before anything else: a conversation still generating holds its own object
+  // and would write the file back when its stream settles. Stop the request so
+  // the provider stops billing for an answer nobody will read, and bar the id
+  // from any further write.
+  deletedConvIds.add(id)
+  stopStreamingFor(id)
   conversations.value = conversations.value.filter(c => c.id !== id)
   if (activeConvId.value === id) {
     if (conversations.value.length > 0) activeConvId.value = conversations.value[0].id
     else newConversation()
   }
-  persistConversations(conversations.value)
+  // Its own file, so deleting is removing that file — not rewriting the rest.
+  invoke('delete_library_conversation', { id }).catch(() => {})
+}
+
+function persistConv(conv: LibraryConversation | null, epoch = libraryEpoch) {
+  if (!conv) return
+  // Checked before the mutations below, not just before the write: bumping
+  // `updatedAt` and reordering the list for a conversation that is gone (or
+  // belongs to a library that is no longer open) is wrong on its own.
+  if (!stillWritable(conv.id, epoch)) return
+  conv.updatedAt = new Date().toISOString()
+  const idx = conversations.value.findIndex(c => c.id === conv.id)
+  if (idx > 0) {
+    const [moved] = conversations.value.splice(idx, 1)
+    conversations.value.unshift(moved)
+  }
+  // The reorder above is for the list on screen; on disk the order comes from
+  // `updatedAt`, so only this one conversation needs writing.
+  persistOne(conv, epoch)
 }
 
 function persistActive() {
-  if (!activeConv.value) return
-  activeConv.value.updatedAt = new Date().toISOString()
-  const idx = conversations.value.findIndex(c => c.id === activeConvId.value)
-  if (idx > 0) {
-    const [conv] = conversations.value.splice(idx, 1)
-    conversations.value.unshift(conv)
-  }
-  persistConversations(conversations.value)
+  persistConv(activeConv.value)
 }
 
 // ── Messaging ─────────────────────────────────────────────────────────────────
@@ -1345,6 +1635,10 @@ async function runAssistantRequest(
   history: ChatMessage[],
   sel: ModelSelection | null,
 ) {
+  // Captured up front: the user may switch away mid-stream, so the busy flag
+  // must be cleared on the conversation this request belongs to, not whichever
+  // one happens to be on screen when it finishes.
+  const streamConvId = conv.id
   const eventSafeId = target.id.replace(/[^A-Za-z0-9:_/-]/g, '-')
   const eventName = `library-chat-${eventSafeId}`
   const sourcesEventName = `${eventName}-sources`
@@ -1362,6 +1656,12 @@ async function runAssistantRequest(
   target.reasoningContent = undefined
   target.contextContent = undefined
   target.contextPaperLabels = undefined
+  // Without this a regenerate appends to the previous run's trail, so the
+  // answer claims tool calls it never made.
+  target.agentSteps = undefined
+  target.agentServerErrors = undefined
+  target.agentEvicted = undefined
+  target.agentLimit = undefined
   target.inputTokens = undefined
   target.outputTokens = undefined
   target.totalTokens = undefined
@@ -1371,7 +1671,11 @@ async function runAssistantRequest(
   target.model = sel
   target.modelLabel = modelLabel(sel)
   assistantMsg.streaming = true
-  loading.value = true
+  markGenerating(streamConvId, true)
+  // The library this answer belongs to. Checked again when it finishes, which
+  // may be after the user has switched to another library.
+  const streamEpoch = libraryEpoch
+  targetConvIds.set(target.id, streamConvId)
   // Backend cancellation id: generated per request, sent to `chat_with_library`,
   // and used by stopStreaming to invoke `cancel_ai_request`.
   const requestId = crypto.randomUUID()
@@ -1389,13 +1693,48 @@ async function runAssistantRequest(
     pendingSources = e.payload ?? []
   }))
 
+  offs.push(await listen<AgentEventPayload>(`${eventName}-agent`, (e) => {
+    const p = e.payload
+    if (!p) return
+    if (!target.agentSteps) target.agentSteps = []
+    if (p.phase === 'evicted') {
+      // The run outgrew the model's window and older results were dropped. The
+      // answer is still coming, but it was built on less than it collected.
+      target.agentEvicted = (target.agentEvicted ?? 0) + (p.dropped ?? 0)
+    } else if (p.phase === 'limit') {
+      // The model was still working when its tool budget ran out. What follows
+      // is an answer written from what it had, not from what it needed.
+      target.agentLimit = { rounds: p.rounds ?? 0, max: p.max ?? 0 }
+    } else if (p.phase === 'servers') {
+      // A server the user configured but that would not start. Silence here
+      // would look like the model simply chose not to use it.
+      if (p.failed?.length) target.agentServerErrors = p.failed
+    } else if (p.phase === 'tool') {
+      target.agentSteps.push({
+        tool: p.tool ?? '',
+        server: p.server ?? undefined,
+        args: summarizeArgs(p.arguments),
+        argsJson: JSON.stringify(p.arguments ?? {}, null, 2),
+      })
+    } else if (p.phase === 'result') {
+      // Match the most recent still-running step for this tool.
+      const step = [...target.agentSteps].reverse().find(x => x.tool === p.tool && x.ok === undefined)
+      if (step) {
+        step.ok = p.ok ?? true
+        step.chars = p.chars
+        step.preview = p.preview
+        step.truncated = p.truncated
+      }
+    }
+  }))
+
   offs.push(await listen<LibrarySentContextPayload>(contextEventName, (e) => {
     const sections = e.payload?.sections?.filter(s => s.content?.trim()) ?? []
     target.contextContent = { mode: e.payload?.mode, sections }
     // Persist just the labels (survives the transient-content strip) so the badge
     // and its dedup keep working after the conversation is reloaded.
     target.contextPaperLabels = sections.map(s => s.label)
-    persistActive()
+    persistConv(conv, streamEpoch)
   }))
 
   // Only collect reasoning when the user turned thinking mode on — some models
@@ -1408,7 +1747,7 @@ async function runAssistantRequest(
       const delta = e.payload.delta ?? ''
       if (!delta) return
       target.reasoningContent = (target.reasoningContent ?? '') + delta
-      scrollToBottom()
+      if (isTargetVisible(target.id)) scrollToBottom()
     }))
   }
 
@@ -1429,7 +1768,7 @@ async function runAssistantRequest(
     if (typeof usage.total_tokens === 'number') target.totalTokens = usage.total_tokens
     if (typeof usage.cache_hit_tokens === 'number') target.cacheHitTokens = usage.cache_hit_tokens
     if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) target.costUsd = usage.cost_usd
-    persistActive()
+    persistConv(conv, streamEpoch)
   }))
 
   offs.push(await listen<{ delta?: string; done?: boolean }>(eventName, (e) => {
@@ -1465,6 +1804,10 @@ async function runAssistantRequest(
       reasoningEffort: useReasoning.value ? effortToSend : null,
       requestId,
       webSearch: useWebSearch.value && webSearchAvailable.value,
+      // null = use the budget configured in 设置 → 智能问答. Passing it from here
+      // would pin the value read when this window opened.
+      agentMaxRounds: null,
+      conversationId: conv.id,
     })
     // If the user pressed stop, don't refill content the backend produced anyway.
     if (!stoppedTargetIds.has(target.id)) {
@@ -1476,7 +1819,7 @@ async function runAssistantRequest(
     target.endedAt = performance.now()
     assistantMsg.streaming = false
     flushStreamRender(target)
-    persistActive()
+    persistConv(conv, streamEpoch)
     // Auto-generate title after the first exchange (fire-and-forget)
     if (conv.messages.filter((m: LibraryUiMessage) => m.role === 'user').length === 1) {
       generateAiTitle(conv)
@@ -1492,12 +1835,13 @@ async function runAssistantRequest(
     assistantMsg.streaming = false
     flushStreamRender(target)
   } finally {
-    loading.value = false
+    markGenerating(streamConvId, false)
     stoppedTargetIds.delete(target.id)
     activeRequestIds.delete(target.id)
+    const wasVisible = isTargetVisible(target.id)
     detachListeners(target.id)
-    persistActive()
-    scrollToBottom()
+    persistConv(conv, streamEpoch)
+    if (wasVisible) scrollToBottom()
   }
 }
 
@@ -1508,6 +1852,21 @@ function detachListeners(targetId: string) {
     for (const off of offs) off()
     activeUnlisteners.delete(targetId)
   }
+  targetConvIds.delete(targetId)
+}
+
+/** Tear down every in-flight stream. For unmount and library switches only —
+ *  the stop button is scoped to one conversation. */
+function stopAllStreaming() {
+  for (const requestId of [...activeRequestIds.values()]) {
+    invoke('cancel_ai_request', { requestId }).catch(() => {})
+  }
+  for (const id of [...activeUnlisteners.keys()]) {
+    stoppedTargetIds.add(id)
+    detachListeners(id)
+  }
+  clearAllStreamRenderTimers()
+  generatingConvIds.value = new Set()
 }
 
 function createAssistantMessage(sel: ModelSelection | null): LibraryUiMessage {
@@ -1522,20 +1881,35 @@ function createAssistantMessage(sel: ModelSelection | null): LibraryUiMessage {
   }
 }
 
-// Stop all in-flight streaming: tell the backend to cancel the HTTP request
-// (via `cancel_ai_request`), detach front-end listeners, mark the streaming
-// targets stopped (so the pending `finalText` won't refill their content), and
-// reset UI state.
-function stopStreaming() {
+/** Cancel every in-flight request belonging to one conversation.
+ *
+ *  Split out of `stopStreaming` so deleting a conversation can stop it too:
+ *  without this the request runs to completion against the provider, billed in
+ *  full, for a conversation that no longer exists. */
+function stopStreamingFor(convId: string | null) {
   // Tell the backend to truly cancel each in-flight request (closes the HTTP
   // stream so the provider stops generating / billing).
-  for (const requestId of [...activeRequestIds.values()]) {
+  for (const [targetId, requestId] of [...activeRequestIds.entries()]) {
+    if (targetConvIds.get(targetId) !== convId) continue
     invoke('cancel_ai_request', { requestId }).catch(() => {})
   }
   for (const id of [...activeUnlisteners.keys()]) {
+    if (targetConvIds.get(id) !== convId) continue
     stoppedTargetIds.add(id)
     detachListeners(id)
   }
+  markGenerating(convId, false)
+}
+
+// Stop the streaming the user is looking at: cancel the HTTP request, detach
+// front-end listeners, mark the targets stopped (so a pending `finalText` won't
+// refill their content), and reset UI state.
+function stopStreaming() {
+  // Only this conversation's streams: another conversation may be generating in
+  // the background, and the stop button in front of the user means "stop what I
+  // am looking at".
+  const stoppingConvId = activeConvId.value
+  stopStreamingFor(stoppingConvId)
   const conv = activeConv.value
   if (conv) {
     for (const msg of conv.messages) {
@@ -1550,7 +1924,6 @@ function stopStreaming() {
       }
     }
   }
-  loading.value = false
   persistActive()
 }
 
@@ -1738,17 +2111,14 @@ function onCopyCode(e: Event) {
   navigator.clipboard.writeText((e.target as HTMLElement).textContent ?? '').catch(() => {})
 }
 
-// Switching conversations abandons any in-flight stream for the previous one:
-// detach its listeners and clear pending throttle timers so scheduled renders
-// don't fire against a conversation that's no longer visible.
-watch(activeConvId, () => {
-  for (const id of [...activeUnlisteners.keys()]) {
-    stoppedTargetIds.add(id)
-    detachListeners(id)
-  }
-  clearAllStreamRenderTimers()
-  loading.value = false
-})
+// Switching conversations deliberately does *nothing* to in-flight streams.
+//
+// It used to tear all of them down, which is what made "ask a question, then
+// start a new conversation" silently abandon the answer being generated. The
+// listeners hold their target message object directly and the event names are
+// unique per answer, so a stream that is no longer on screen keeps filling in
+// its own conversation and persists when it finishes. `scrollToBottom` is the
+// one thing that must not follow it — see `applyStreamRender`.
 
 async function refreshConversations() {
   const saved = await loadConversations()
@@ -1759,6 +2129,7 @@ async function refreshConversations() {
 
 let unlistenLibraryChanged: UnlistenFn | null = null
 let unlistenAddPapers: UnlistenFn | null = null
+let unlistenKeepalive: UnlistenFn | null = null
 
 onMounted(async () => {
   await settingsStore.load()
@@ -1776,12 +2147,11 @@ onMounted(async () => {
   // per-library data when the active library changes — otherwise it would show
   // (and, worse, save) the previous library's conversations against the new one.
   unlistenLibraryChanged = await listen('library-changed', async () => {
-    for (const id of [...activeUnlisteners.keys()]) {
-      stoppedTargetIds.add(id)
-      detachListeners(id)
-    }
-    clearAllStreamRenderTimers()
-    loading.value = false
+    // First, so that anything already in flight is barred from writing: the
+    // backend has already switched roots, and a stream that settles after this
+    // point would file the old library's conversation under the new one.
+    libraryEpoch++
+    stopAllStreaming()
     resetNewConversationContext()
     await ai.load()
     await ragStore.load()
@@ -1792,10 +2162,18 @@ onMounted(async () => {
 
   unlistenAddPapers = await serveAddPapersToChat(applyPapersFromGraph)
 
+  unlistenKeepalive = await listen<KeepaliveStatus>('cache-keepalive', (e) => {
+    keepalive.value = e.payload ?? { active: false }
+    nowMs.value = Date.now()
+  })
+  // A minute is fine: the readout is in minutes.
+  keepaliveClock = setInterval(() => { nowMs.value = Date.now() }, 60_000)
+
   // Window size is persisted by the Tauri window event handler.
 })
 
 onUnmounted(() => {
+  invoke('disarm_cache_keepalive').catch(() => {})
   document.removeEventListener('mousedown', closeModelMenu)
   window.removeEventListener('mousemove', onDividerMouseMove)
   window.removeEventListener('mouseup', onDividerMouseUp)
@@ -1804,6 +2182,8 @@ onUnmounted(() => {
   clearAllStreamRenderTimers()
   unlistenLibraryChanged?.()
   unlistenAddPapers?.()
+  unlistenKeepalive?.()
+  if (keepaliveClock) clearInterval(keepaliveClock)
 })
 </script>
 
@@ -1898,7 +2278,7 @@ onUnmounted(() => {
                   @click.stop="selectModel(model)"
                 >
                   <span class="lc-model-row-icon"><img v-if="modelLogo(model)" :src="modelLogo(model)" alt="" /><span v-else>{{ model.displayName.charAt(0).toUpperCase() }}</span></span>
-                  <span class="lc-model-row-text"><span class="lc-model-row-name">{{ model.displayName }}</span><span class="lc-model-row-meta">{{ modelCapabilityText(model) || model.modelId }}</span></span>
+                  <span class="lc-model-row-text"><span class="lc-model-row-name">{{ model.displayName }}<span v-if="offerOf(model)" class="offer-tag" :class="[offerOf(model)!.kind, { idle: !offerOf(model)!.activeNow }]" :title="offerOf(model)!.title">{{ offerOf(model)!.label }}</span></span><span class="lc-model-row-meta"><span class="row-size" :class="{ assumed: !sizeOf(model).known }" :title="sizeOf(model).title">{{ sizeOf(model).text }}</span>{{ modelCapabilityText(model) || model.modelId }}</span></span>
                 </button>
               </div>
             </div>
@@ -1948,7 +2328,18 @@ onUnmounted(() => {
             @click="selectConversation(conv.id)"
           >
             <div class="conv-body">
-              <div class="conv-title-text">{{ conv.title }}</div>
+              <div class="conv-title-text">
+                <span v-if="isGenerating(conv.id)" class="conv-pulse" title="正在后台生成" />
+                <!-- Only when idle: a conversation that is generating obviously
+                     still has a live context, and two dots would say the same
+                     thing twice. -->
+                <span
+                  v-else-if="isCacheWarm(conv.id)"
+                  class="conv-cache-dot"
+                  :title="keepaliveTitle"
+                />
+                {{ conv.title }}
+              </div>
               <div class="conv-meta">
                 <span>{{ formatDate(conv.updatedAt) }}</span>
                 <span v-if="userMsgCount(conv) > 0" class="conv-turns">{{ userMsgCount(conv) }} 轮</span>
@@ -2073,8 +2464,16 @@ onUnmounted(() => {
                       <span v-else>{{ model.displayName.charAt(0).toUpperCase() }}</span>
                     </span>
                     <span class="lc-model-row-text">
-                      <span class="lc-model-row-name">{{ model.displayName }}</span>
-                      <span class="lc-model-row-meta">{{ modelCapabilityText(model) || model.modelId }}</span>
+                      <span class="lc-model-row-name">
+                        {{ model.displayName }}
+                        <span
+                          v-if="offerOf(model)"
+                          class="offer-tag"
+                          :class="[offerOf(model)!.kind, { idle: !offerOf(model)!.activeNow }]"
+                          :title="offerOf(model)!.title"
+                        >{{ offerOf(model)!.label }}</span>
+                      </span>
+                      <span class="lc-model-row-meta"><span class="row-size" :class="{ assumed: !sizeOf(model).known }" :title="sizeOf(model).title">{{ sizeOf(model).text }}</span>{{ modelCapabilityText(model) || model.modelId }}</span>
                     </span>
                   </button>
                 </div>
@@ -2232,6 +2631,102 @@ onUnmounted(() => {
                     <Icon icon="fluent:globe-search-24-regular" width="13" height="13" />
                     {{ webSearchPhase === 'in_progress' ? '正在发起联网搜索…' : '正在检索网页…' }}
                   </div>
+                  <!-- Agent mode: the trail of tools the model consulted -->
+                  <div v-if="activeAnswer(msg).agentSteps?.length || activeAnswer(msg).agentServerErrors?.length" class="agent-trail">
+                    <div
+                      v-for="fail in activeAnswer(msg).agentServerErrors"
+                      :key="fail.name"
+                      class="agent-server-error"
+                      :title="fail.error"
+                    >
+                      <Icon icon="fluent:plug-disconnected-24-regular" width="11" height="11" />
+                      <span>MCP 服务器「{{ fail.name }}」未能连接，本次回答没有用到它的工具</span>
+                    </div>
+                    <div
+                      v-if="activeAnswer(msg).agentEvicted"
+                      class="agent-server-error"
+                      title="上下文窗口装不下全部工具结果，最早的几条已被丢弃。模型可以重新调用工具取回。"
+                    >
+                      <Icon icon="fluent:box-multiple-24-regular" width="11" height="11" />
+                      <span>查到的资料超出了模型的上下文窗口，最早的 {{ activeAnswer(msg).agentEvicted }} 条结果已释放</span>
+                    </div>
+                    <div
+                      v-if="activeAnswer(msg).agentLimit"
+                      class="agent-server-error"
+                      title="模型用完了工具调用次数，被要求用手上已有的资料作答。可以在 设置 → 智能问答 → Agent 里提高上限。"
+                    >
+                      <Icon icon="fluent:hourglass-24-regular" width="11" height="11" />
+                      <span>
+                        模型还没查完就用完了 {{ activeAnswer(msg).agentLimit!.max }} 次工具调用上限，
+                        这个回答是基于已查到的部分写的
+                      </span>
+                    </div>
+                    <div
+                      v-if="activeAnswer(msg).agentSteps?.length"
+                      class="agent-trail-head"
+                      :class="{ busy: agentRunning(activeAnswer(msg)) }"
+                    >
+                      <Icon icon="fluent:bot-sparkle-24-regular" width="12" height="12" />
+                      <span v-if="agentRunning(activeAnswer(msg))">
+                        正在查资料… 已调用 {{ activeAnswer(msg).agentSteps?.length ?? 0 }} 次工具
+                      </span>
+                      <span v-else>调用了 {{ activeAnswer(msg).agentSteps?.length ?? 0 }} 次工具</span>
+                    </div>
+                    <div
+                      class="agent-step-list"
+                      :style="{ '--trail-max': AGENT_TRAIL_ROWS * AGENT_TRAIL_ROW_PX + 'px' }"
+                    >
+                      <div v-for="(step, i) in activeAnswer(msg).agentSteps" :key="i" class="agent-step-wrap">
+                        <button
+                          class="agent-step"
+                          :class="{ open: expandedSteps.has(stepKey(activeAnswer(msg).id, i)) }"
+                          @click="toggleStep(activeAnswer(msg).id, i)"
+                        >
+                          <Icon
+                            width="10" height="10"
+                            class="agent-step-chevron"
+                            :class="{ open: expandedSteps.has(stepKey(activeAnswer(msg).id, i)) }"
+                            icon="fluent:chevron-right-24-regular"
+                          />
+                          <Icon
+                            width="11" height="11"
+                            class="agent-step-icon"
+                            :class="{ running: step.ok === undefined, failed: step.ok === false }"
+                            :icon="step.ok === undefined ? 'fluent:arrow-clockwise-24-regular'
+                                 : step.ok === false ? 'fluent:dismiss-circle-24-regular'
+                                 : 'fluent:checkmark-circle-24-regular'"
+                          />
+                          <span v-if="step.server" class="agent-step-server" :title="`来自 MCP 服务器：${step.server}`">{{ step.server }}</span>
+                          <code class="agent-step-tool">{{ step.tool }}</code>
+                          <span v-if="step.args" class="agent-step-args">{{ step.args }}</span>
+                          <span v-if="step.chars" class="agent-step-size">{{ formatChars(step.chars) }}</span>
+                        </button>
+
+                        <div v-if="expandedSteps.has(stepKey(activeAnswer(msg).id, i))" class="agent-step-detail">
+                          <div class="agent-detail-label">参数</div>
+                          <pre class="agent-detail-code">{{ step.argsJson }}</pre>
+                          <div v-if="!step.preview" class="agent-detail-label">
+                            返回
+                            <span class="agent-detail-note">
+                              （{{ formatChars(step.chars || 0) }} 字符，内容过长未随对话保存）
+                            </span>
+                          </div>
+                          <template v-else>
+                            <div class="agent-detail-label">
+                              返回
+                              <span class="agent-detail-note">
+                                （{{ formatChars(step.chars || step.preview.length) }} 字符<template
+                                  v-if="step.truncated">，已超出模型上下文预算并被截断</template><template
+                                  v-if="step.previewClipped">，此处保存了前 {{ formatChars(step.preview.length) }} 字符</template>）
+                              </span>
+                            </div>
+                            <pre class="agent-detail-code">{{ step.preview }}</pre>
+                          </template>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   <!-- Thinking / reasoning content (collapsible) -->
                   <div v-if="activeAnswer(msg).reasoningContent" class="reasoning-section">
                     <button
@@ -2276,8 +2771,12 @@ onUnmounted(() => {
                     </template>
                   </div>
 
-                  <!-- Action buttons -->
-                  <div v-if="!activeAnswer(msg).streaming || hasUsage(activeAnswer(msg))" class="assistant-action-row">
+                  <!-- Action buttons + the usage strip.
+                       Only once the turn is over: in agent mode the model is
+                       called several times, so showing usage the moment it
+                       arrives put a cost figure on screen during the first tool
+                       call — and one that covered only that round. -->
+                  <div v-if="!activeAnswer(msg).streaming" class="assistant-action-row">
                     <div v-if="!activeAnswer(msg).streaming" class="message-actions assistant-actions">
                       <button :title="copiedMsgIds.has(msg.id) ? '已复制' : '复制'" @click="copyMessage(msg)">
                         <Icon icon="fluent:copy-24-regular" width="13" height="13" />
@@ -2518,7 +3017,11 @@ onUnmounted(() => {
                     }"
                     @click="sourcePickerOpen = !sourcePickerOpen"
                   >
-                    <span class="ks-dot" />
+                    <span
+                      class="ks-dot"
+                      :class="{ warm: isCacheWarm(activeConvId) }"
+                      :title="isCacheWarm(activeConvId) ? keepaliveTitle : ''"
+                    />
                     {{ knowledgeSourceLabel }}
                     <Icon class="ks-chevron" :class="{ open: sourcePickerOpen }" icon="fluent:chevron-down-24-regular" width="10" height="10" />
                   </button>
@@ -2556,6 +3059,16 @@ onUnmounted(() => {
                     <div class="ks-sep" />
                     <button
                       class="ks-option"
+                      :class="{ selected: knowledgeSource === 'agent' }"
+                      @click="setKnowledgeSource('agent')"
+                    >
+                      <Icon icon="fluent:bot-sparkle-24-regular" width="12" height="12" />
+                      <span class="ks-option-text">Agent 模式</span>
+                      <Icon v-if="knowledgeSource === 'agent'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
+                    </button>
+                    <div class="ks-sep" />
+                    <button
+                      class="ks-option"
                       :class="{ selected: knowledgeSource === 'none' }"
                       @click="setKnowledgeSource('none')"
                     >
@@ -2565,6 +3078,15 @@ onUnmounted(() => {
                     </button>
                   </div>
                 </div>
+                <button
+                  v-if="knowledgeSource === 'agent'"
+                  class="agent-rounds"
+                  title="配置工具调用次数上限，以及要接入哪些 MCP 服务器"
+                  @click="emit('open-settings', 'agent')"
+                >
+                  <Icon icon="fluent:options-24-regular" width="12" height="12" />
+                  <span class="agent-rounds-label">工具设置</span>
+                </button>
                 <button
                   v-if="knowledgeSource === 'papers'"
                   class="add-paper-context-btn"
@@ -2611,7 +3133,15 @@ onUnmounted(() => {
           :key="selectionKey(model)"
           class="msg-model-row"
           @click="regenerateWithModel(modelPickerMsg!, model)"
-        >{{ model.displayName }}</button>
+        >
+          {{ model.displayName }}
+          <span
+            v-if="offerOf(model)"
+            class="offer-tag"
+            :class="[offerOf(model)!.kind, { idle: !offerOf(model)!.activeNow }]"
+            :title="offerOf(model)!.title"
+          >{{ offerOf(model)!.label }}</span>
+        </button>
       </div>
     </div>
   </Teleport>
@@ -2864,6 +3394,22 @@ onUnmounted(() => {
   transition: background 0.12s, box-shadow 0.12s;
   min-width: 0;
   border: 1px solid transparent;
+}
+
+/* Breathing dot: a conversation still generating while the user looks elsewhere. */
+.conv-pulse {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
+  animation: conv-breathe 1.5s ease-in-out infinite;
+}
+@keyframes conv-breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+  50% { opacity: 0.45; box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
 }
 
 .conv-item:hover { background: var(--bg-hover); }
@@ -3123,6 +3669,43 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 2px;
 }
+
+/* Price-list badge. Free is stated flatly; a discount that is not in effect
+   right now is dimmed, because "5折" on a model charging full rate would read
+   as a claim about this moment. */
+.offer-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 15px;
+  vertical-align: middle;
+  letter-spacing: 0.02em;
+}
+.offer-tag.free {
+  color: #15803d;
+  background: color-mix(in srgb, #22c55e 16%, transparent);
+}
+.offer-tag.discount {
+  color: #b45309;
+  background: color-mix(in srgb, #f59e0b 18%, transparent);
+}
+.offer-tag.discount.idle {
+  color: var(--text-tertiary);
+  background: color-mix(in srgb, var(--text-tertiary) 12%, transparent);
+}
+
+.row-size {
+  margin-right: 6px;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  font-size: 9.5px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--text-secondary) 11%, transparent);
+}
+.row-size.assumed { opacity: 0.6; font-weight: 500; }
 
 .lc-model-row-name {
   font-size: 13px;
@@ -3555,6 +4138,140 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 3px;
 }
+
+/* ── Agent tool trail ─────────────────────────────────────────────────────── */
+.agent-trail {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-secondary) 60%, var(--bg-primary));
+}
+.agent-trail-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+}
+/* The trail is a fixed ten rows tall and scrolls — including when a step is
+   expanded. The block keeps its place in the answer instead of shoving the
+   answer down every time something is opened.
+   This is the *only* scroller in the trail: `.agent-detail-code` deliberately
+   has no height of its own, or a payload would open a second scrollbar inside
+   this one. */
+.agent-step-list {
+  display: flex;
+  flex-direction: column;
+  max-height: var(--trail-max);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.agent-step-wrap { display: flex; flex-direction: column; }
+.agent-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 4px;
+  margin-left: -4px;
+  border-radius: var(--radius-sm);
+  background: none;
+  text-align: left;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  cursor: pointer;
+}
+.agent-step:hover { background: var(--bg-hover); }
+.agent-step-chevron {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  transition: transform 0.14s ease;
+}
+.agent-step-chevron.open { transform: rotate(90deg); }
+
+.agent-step-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0 6px 16px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--border-subtle);
+  background: var(--bg-primary);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+}
+.agent-detail-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  letter-spacing: 0.02em;
+}
+.agent-detail-note { font-weight: 400; }
+.agent-detail-code {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.55;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.agent-step-icon { flex-shrink: 0; color: #16a34a; }
+.agent-step-icon.running { color: var(--accent); animation: agent-spin 0.9s linear infinite; }
+/* The in-flight row breathes so the trail reads as alive, not stalled. */
+.agent-step-wrap:has(.agent-step-icon.running) { animation: agent-breathe 1.6s ease-in-out infinite; }
+@keyframes agent-breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+.agent-trail-head.busy { color: var(--accent); }
+.agent-trail-head.busy svg { animation: agent-breathe 1.6s ease-in-out infinite; }
+.agent-step-icon.failed { color: #dc2626; }
+@keyframes agent-spin { to { transform: rotate(360deg); } }
+.agent-step-tool {
+  flex-shrink: 0;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--text-primary);
+}
+/* Which external MCP server a tool came from. Absent for the library's own,
+   so the common case stays visually quiet. */
+.agent-step-server {
+  flex-shrink: 0;
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  color: var(--accent);
+}
+.agent-server-error {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 4px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  line-height: 1.5;
+  color: #b45309;
+  background: color-mix(in srgb, #f59e0b 11%, transparent);
+}
+.agent-server-error svg { flex-shrink: 0; }
+.agent-step-args {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+}
+.agent-step-size { flex-shrink: 0; margin-left: auto; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
 
 /* ── Thinking / reasoning box (思考过程) ───────────────────────────────────── */
 .websearch-status {
@@ -4400,6 +5117,41 @@ onUnmounted(() => {
 }
 .lightbox-close:hover { background: rgba(0, 0, 0, 0.65); }
 
+.agent-rounds {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+.agent-rounds:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* The conversation-list counterpart of the breathing mode dot, so the user can see which conversation
+   is being held warm without opening it. Green rather than the accent: this is
+   "ready", not "working". */
+.conv-cache-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: #22c55e;
+  vertical-align: middle;
+  flex-shrink: 0;
+  animation: conv-cache-breathe 2.4s ease-in-out infinite;
+}
+@keyframes conv-cache-breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
+  50% { opacity: 0.4; box-shadow: 0 0 0 4px rgba(34, 197, 94, 0); }
+}
+.agent-rounds-label { color: var(--text-tertiary); white-space: nowrap; }
+.agent-rounds:hover .agent-rounds-label { color: var(--text-primary); }
+
 .add-paper-context-btn {
   width: 28px;
   height: 28px;
@@ -4475,6 +5227,15 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 .ks-trigger.on .ks-dot { background: var(--accent); }
+/* The same dot breathes while this conversation's prompt cache is being held
+   open — the state belongs to the mode, so it belongs on the mode's indicator
+   rather than in a second pill saying the same thing. Slower than the agent's
+   working pulse: this is idle upkeep, not work in flight. */
+.ks-dot.warm { animation: ks-dot-breathe 2.4s ease-in-out infinite; }
+@keyframes ks-dot-breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
+  50% { opacity: 0.35; box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
+}
 
 /* ── Reasoning / thinking-mode picker (flat toolbar button + popover) ──────── */
 /* A 15px glyph in a 28px box carries 6.5px of air per side, which dominated the

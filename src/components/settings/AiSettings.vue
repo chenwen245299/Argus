@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { modelOffer, modelSizeLabel, cachedDiscounts, cacheDiscounts } from '../../utils/modelOffers'
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Icon } from '@iconify/vue'
@@ -34,7 +35,12 @@ const CAPABILITY_LABEL_ALIASES: Record<string, string> = {
 }
 
 const FETCH_GROUP_ORDER = ['embedding', 'vision', 'tool_calling', 'reasoning', 'other'] as const
-type FetchGroupId = typeof FETCH_GROUP_ORDER[number]
+type CapabilityGroupId = typeof FETCH_GROUP_ORDER[number]
+/** Under the 全部 filter, models with an offer are pulled out into their own
+ *  group at the top. Sorting inside the capability groups was not enough: a free
+ *  chat model still sat below every embedding model, hundreds of rows down. */
+type FetchGroupId = CapabilityGroupId | 'deals'
+const DEALS_GROUP: FetchGroupId = 'deals'
 
 type ModelForm = {
   id: string
@@ -86,6 +92,10 @@ const fetchStatus      = ref<'' | 'fetching'>('')
 const fetchErr         = ref('')
 const showFetchDialog  = ref(false)
 const fetchedModels    = ref<AiModel[]>([])
+// Promotions are not in the bulk list, so they arrive a few seconds later from
+// a fan-out of per-model lookups. The cache lives in the util module rather than
+// here, because this component is rebuilt every time the settings modal opens.
+const loadingDiscounts = ref(false)
 const fetchSelected    = ref<Set<string>>(new Set())
 const fetchSearch      = ref('')
 const fetchCapability  = ref<'all' | FetchGroupId>('all')
@@ -138,21 +148,45 @@ const fetchFilteredModels = computed(() => {
   return fetchedModels.value.filter(model => {
     const matchesSearch = !query || fetchModelSearchText(model).includes(query)
     const selectedCap = fetchCapability.value
-    const matchesCapability = selectedCap === 'all' || hasFetchCapability(model, selectedCap)
+    const matchesCapability =
+      selectedCap === 'all' || hasFetchCapability(model, selectedCap as CapabilityGroupId)
     return matchesSearch && matchesCapability
   })
 })
 
+/** Rank for the picker: free first, then the deepest discount, then the
+ *  catalogue's own order. Someone scrolling 446 models to find a deal should
+ *  not have to.
+ *
+ *  Free outranks any discount because free is the end of the scale — a 90%
+ *  discount is still a bill. */
+function offerRank(model: AiModel): number {
+  if (model.is_free) return 1000
+  return model.discount_percent ?? 0
+}
+
 const fetchGroupedModels = computed(() => {
   const groups = new Map<FetchGroupId, AiModel[]>()
+  const selectedCap = fetchCapability.value
   for (const model of fetchFilteredModels.value) {
-    const selectedCap = fetchCapability.value
-    const groupId = selectedCap === 'all' ? primaryFetchCapability(model) : selectedCap
+    // A model with an offer goes in the deals group *instead of* its capability
+    // group, not as well as: two checkboxes for one model reads like two models.
+    const groupId: FetchGroupId =
+      selectedCap !== 'all'
+        ? selectedCap
+        : offerRank(model) > 0
+          ? DEALS_GROUP
+          : primaryFetchCapability(model)
     if (!groups.has(groupId)) groups.set(groupId, [])
     groups.get(groupId)!.push(model)
   }
-  return FETCH_GROUP_ORDER
-    .map(id => ({ id, label: fetchGroupLabel(id), models: groups.get(id) ?? [] }))
+  return [DEALS_GROUP, ...FETCH_GROUP_ORDER]
+    .map(id => ({
+      id,
+      label: fetchGroupLabel(id),
+      // Stable: equal-ranked models keep the order the provider listed them in.
+      models: (groups.get(id) ?? []).slice().sort((a, b) => offerRank(b) - offerRank(a)),
+    }))
     .filter(group => group.models.length > 0)
 })
 
@@ -339,6 +373,10 @@ async function fetchModels() {
     fetchSelected.value = new Set()
     fetchStatus.value = ''
     showFetchDialog.value = true
+    // Deliberately not awaited: the list is usable immediately, sorted by the
+    // free tier, and the discounted models rise into place when the lookups
+    // land a few seconds later.
+    loadDiscounts(selectedId.value, fetched)
   } catch (e) {
     fetchErr.value = String(e)
     fetchStatus.value = ''
@@ -346,6 +384,42 @@ async function fetchModels() {
     fetchSelected.value = new Set()
     showFetchDialog.value = true
   }
+}
+
+/** Fill in the promotions the bulk catalogue omits, then let the sort re-run. */
+async function loadDiscounts(providerId: string, models: AiModel[]) {
+  const provider = ai.settings.providers.find(p => p.id === providerId)
+  if (!provider?.base_url.toLowerCase().includes('openrouter')) return
+
+  const cached = cachedDiscounts(providerId)
+  if (cached) {
+    applyDiscounts(cached)
+    return
+  }
+
+  loadingDiscounts.value = true
+  try {
+    const found = await invoke<Record<string, number>>('fetch_openrouter_discounts', {
+      providerId,
+      models: models.map(m => ({
+        id: m.id,
+        quotedInputUsdPerMillion: m.input_price_usd_per_million ?? null,
+      })),
+    })
+    cacheDiscounts(providerId, found)
+    applyDiscounts(found)
+  } catch {
+    // A missing badge is not worth an error dialog on a list that otherwise works.
+  } finally {
+    loadingDiscounts.value = false
+  }
+}
+
+function applyDiscounts(found: Record<string, number>) {
+  // Replace the array so the sort recomputes; mutating in place would leave the
+  // computed's dependency on `fetchedModels` untouched.
+  fetchedModels.value = fetchedModels.value.map(m =>
+    found[m.id] ? { ...m, discount_percent: found[m.id] } : m)
 }
 
 function toggleFetchSelect(id: string) {
@@ -593,6 +667,12 @@ function maskedKey(p: AiProviderInfo): string {
   return p.has_key ? '••••••••' : t('aiService.apiKeyNotSet')
 }
 
+/** FREE / 折扣 badge from the provider's own price list, for both the
+ *  fetch-from-provider dialog and the saved model list. */
+function offerOf(m: { is_free?: boolean; discount_percent?: number; discount_windows?: [number, number][] }) {
+  return modelOffer(m)
+}
+
 function capabilityOptionsFor(caps: string[]) {
   const known = new Set(CAPABILITY_OPTIONS.map(c => c.id))
   const extras = caps
@@ -662,6 +742,7 @@ function fetchModelCapabilityBadges(model: AiModel) {
 }
 
 function fetchGroupLabel(cap: FetchGroupId) {
+  if (cap === DEALS_GROUP) return '免费与折扣'
   return cap === 'other' ? t('aiService.capOther') : capabilityLabelById(cap)
 }
 
@@ -893,6 +974,10 @@ function toggleCapability(form: ModelForm, cap: string) {
               <div class="fetch-dialog-actions">
                 <button class="btn-ghost xs" @click="selectAllFetched">{{ t('aiService.selectAll') }}</button>
                 <button class="btn-ghost xs" @click="deselectAllFetched">{{ t('aiService.deselectAll') }}</button>
+                <span v-if="loadingDiscounts" class="fetch-discount-hint">
+                  <span class="fetch-discount-dot" />
+                  正在获取折扣信息…
+                </span>
                 <span class="fetch-selected-count">
                   {{ t('aiService.fetchSelectedCount', { selected: fetchSelected.size, shown: fetchFilteredModels.length, total: fetchedModels.length }) }}
                 </span>
@@ -915,7 +1000,20 @@ function toggleCapability(form: ModelForm, cap: string) {
                         @change="toggleFetchSelect(m.id)"
                       />
                       <div class="fetch-model-info">
-                        <span class="fetch-model-name">{{ m.display_name }}</span>
+                        <span class="fetch-model-name">
+                          {{ m.display_name }}
+                          <span
+                            v-if="offerOf(m)"
+                            class="offer-tag"
+                            :class="[offerOf(m)!.kind, { idle: !offerOf(m)!.activeNow }]"
+                            :title="offerOf(m)!.title"
+                          >{{ offerOf(m)!.label }}</span>
+                          <span
+                            class="size-tag"
+                            :class="{ assumed: !modelSizeLabel(m.param_billions).known }"
+                            :title="modelSizeLabel(m.param_billions).title"
+                          >{{ modelSizeLabel(m.param_billions).text }}</span>
+                        </span>
                         <span class="fetch-model-id">{{ m.id }}</span>
                       </div>
                       <div class="fetch-model-caps">
@@ -1185,7 +1283,18 @@ function toggleCapability(form: ModelForm, cap: string) {
                   <div class="model-main">
                     <div class="model-name-line">
                       <span class="model-display">{{ m.display_name }}</span>
+                      <span
+                        v-if="offerOf(m)"
+                        class="offer-tag"
+                        :class="[offerOf(m)!.kind, { idle: !offerOf(m)!.activeNow }]"
+                        :title="offerOf(m)!.title"
+                      >{{ offerOf(m)!.label }}</span>
                       <span v-for="cap in m.capabilities" :key="cap" class="cap-badge">{{ capabilityLabelById(cap) }}</span>
+                      <span
+                        class="size-tag"
+                        :class="{ assumed: !modelSizeLabel(m.param_billions).known }"
+                        :title="modelSizeLabel(m.param_billions).title"
+                      >{{ modelSizeLabel(m.param_billions).text }}</span>
                       <span v-if="m.context_length" class="ctx-badge">{{ formatCtx(m.context_length) }}</span>
                       <span
                         v-if="defaultSel?.providerId === selectedId && defaultSel?.modelId === m.id"
@@ -2203,6 +2312,58 @@ function toggleCapability(form: ModelForm, cap: string) {
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
 }
+
+/* Parameter count. Dimmed and prefixed with `~` when it is the assumption
+   rather than a figure the provider published. */
+.size-tag {
+  display: inline-block;
+  padding: 0 5px;
+  margin-left: 6px;
+  border-radius: var(--radius-sm);
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 15px;
+  vertical-align: middle;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-secondary) 11%, transparent);
+}
+.size-tag.assumed { color: var(--text-tertiary); opacity: 0.75; font-weight: 500; }
+
+.fetch-discount-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.fetch-discount-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #f59e0b;
+  animation: fetch-discount-breathe 1.4s ease-in-out infinite;
+}
+@keyframes fetch-discount-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+/* Price-list badge. A scheduled discount outside its window is dimmed rather
+   than hidden: the model is still cheaper at some hours, just not this one. */
+.offer-tag {
+  display: inline-block;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 15px;
+  vertical-align: middle;
+}
+.fetch-model-name .offer-tag { margin-left: 6px; }
+.offer-tag.free { color: #15803d; background: color-mix(in srgb, #22c55e 16%, transparent); }
+.offer-tag.discount { color: #b45309; background: color-mix(in srgb, #f59e0b 18%, transparent); }
+.offer-tag.discount.idle { color: var(--text-tertiary); background: color-mix(in srgb, var(--text-tertiary) 12%, transparent); }
 
 .fetch-model-row {
   display: flex;

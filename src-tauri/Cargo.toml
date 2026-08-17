@@ -43,6 +43,11 @@ roxmltree = "0.20"
 encoding_rs = "0.8"
 mobi = "0.8"
 notify = "8.2.0"
+# MCP server exposed to external agents (Claude Code / Claude Desktop). Runs as
+# a stdio subprocess the client launches — see src/mcp/. `schemars` and the
+# transports are not in rmcp's default feature set.
+rmcp = { version = "3", features = ["server", "client", "macros", "schemars", "transport-io", "transport-async-rw", "transport-child-process"] }
+schemars = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFData", "CFError", "CFString", "CFURL"] }
@@ -60,3 +65,4 @@ custom-protocol = ["tauri/custom-protocol"]
 lto = "thin"
 codegen-units = 1
 strip = true
+

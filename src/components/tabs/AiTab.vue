@@ -14,6 +14,7 @@ import { copyPngBlobToClipboard } from '../../utils/clipboard'
 import { beginDragSelectionGuard, endDragSelectionGuard } from '../../utils/dragSelectionGuard'
 import type { ChatContentPart, ChatMessage, PaperMeta, AgentWritePreview } from '../../types'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
+import ChatPageImage from '../ChatPageImage.vue'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
 import { askAiText } from '../../stores/translationHistory'
 import { estimateCostCny } from '../../utils/modelPricing'
@@ -84,6 +85,19 @@ interface AgentStep {
   preview?: string
   /** Whether the model's own copy was cut to fit its context budget. */
   truncated?: boolean
+  /** Page images rendered by `view_paper_page`, shown beneath the row. */
+  images?: AgentStepImage[]
+}
+
+/** One page image a `view_paper_page` call rendered. */
+interface AgentStepImage {
+  slug: string
+  page: number
+  /** Filename in the conversation's image folder; used to reload after saving. */
+  file?: string
+  /** Live data URL for immediate display; dropped before the conversation is
+   *  saved (the PNG lives on disk under `file`) and reloaded on demand. */
+  dataUrl?: string
 }
 
 interface Conversation {
@@ -413,15 +427,19 @@ function persistableSteps(steps?: AgentStep[]): AgentStep[] | undefined {
   if (!steps) return undefined
   let budget = PERSIST_ANSWER_CHARS
   return steps.map(step => {
-    if (!step.preview) return step
+    // Page images live on disk under `file`; drop the base64 `dataUrl` so the
+    // conversation JSON stays small and reloads the PNG by name instead.
+    const images = step.images?.map(({ dataUrl: _drop, ...img }) => img)
+    const base: AgentStep = images ? { ...step, images } : step
+    if (!base.preview) return base
     const room = Math.min(PERSIST_STEP_CHARS, budget)
     if (room <= 0) {
-      const { preview: _drop, ...rest } = step
+      const { preview: _drop, ...rest } = base
       return rest
     }
-    budget -= Math.min(step.preview.length, room)
-    if (step.preview.length <= room) return step
-    return { ...step, preview: step.preview.slice(0, room) }
+    budget -= Math.min(base.preview.length, room)
+    if (base.preview.length <= room) return base
+    return { ...base, preview: base.preview.slice(0, room) }
   })
 }
 
@@ -1299,6 +1317,7 @@ async function streamAnswer(
     chars?: number
     preview?: string
     truncated?: boolean
+    images?: AgentStepImage[] | null
     failed?: string[]
     rounds?: number
     max?: number
@@ -1322,6 +1341,7 @@ async function streamAnswer(
         step.chars = p.chars
         step.preview = p.preview
         step.truncated = p.truncated
+        if (p.images?.length) step.images = p.images
       }
     } else if (p.phase === 'servers') {
       if (p.failed?.length) reactiveAns.serverErrors = p.failed
@@ -2238,6 +2258,19 @@ onUnmounted(() => {
                       <span v-if="step.args" class="agent-step-args">{{ step.args }}</span>
                       <span v-if="step.chars" class="agent-step-size">{{ formatChars(step.chars) }}</span>
                     </button>
+
+                    <!-- Page thumbnails rendered by view_paper_page. Live view
+                         uses the inline data URL; a reloaded conversation fetches
+                         the saved PNG by file name. -->
+                    <div v-if="step.images?.length" class="agent-step-images">
+                      <ChatPageImage
+                        v-for="img in step.images"
+                        :key="`${img.slug}-${img.page}-${img.file || ''}`"
+                        :conversation-id="activeConversation?.id ?? null"
+                        :image="img"
+                        @open="previewImage = $event"
+                      />
+                    </div>
 
                     <!-- What the model actually sent and got back. Collapsed by
                          default; this is for checking an answer, not reading. -->
@@ -3677,6 +3710,12 @@ onUnmounted(() => {
 .agent-trail-head.busy { color: var(--accent); }
 
 .agent-step-wrap { display: flex; flex-direction: column; }
+.agent-step-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 2px 14px;
+}
 .agent-step {
   display: flex;
   align-items: center;

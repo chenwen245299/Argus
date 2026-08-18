@@ -5,6 +5,10 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 
+# PDFium dynamic library — fetched per-platform at build time by
+# scripts/fetch-pdfium.mjs, bundled into the app; too big to commit.
+src-tauri/lib/
+
 # VitePress docs build output & cache
 docs/.vitepress/cache/
 docs/.vitepress/dist/

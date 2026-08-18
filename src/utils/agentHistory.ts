@@ -11,16 +11,9 @@ export interface ReplayStep {
   args?: string
   /** undefined while running, then whether the call succeeded. */
   ok?: boolean
-  /** The result the model got back (already bounded by the backend budget). */
+  /** The result the model got back (as persisted; not further truncated here). */
   preview?: string
 }
-
-// Per-result and per-answer caps for the replayed results. What the model
-// already read was itself capped to the context budget, so these are generous —
-// full enough to reuse verbatim, bounded enough not to blow the window on a
-// long, tool-heavy conversation.
-const REPLAY_STEP_CHARS = 12_000
-const REPLAY_ANSWER_CHARS = 48_000
 
 /**
  * Rebuild one assistant turn's tool activity as an OpenAI-style tool exchange:
@@ -30,9 +23,11 @@ const REPLAY_ANSWER_CHARS = 48_000
  *
  * The default history a follow-up turn sends carries only the user text and the
  * final assistant answer; the tool calls and their results are dropped, so the
- * model re-fetches what it already had. Replaying the real calls and results —
- * as native tool messages the model is trained to read — lets it reuse them
- * instead of calling the same tool with the same arguments again.
+ * model re-fetches what it already had. Replaying the real calls and their
+ * **full** results — as native tool messages the model is trained to read —
+ * lets it reuse them instead of calling the same tool with the same arguments
+ * again. (Results are already bounded upstream: the live call truncates to the
+ * model's context budget, and the trail persists a capped slice.)
  *
  * Tool-call ids are synthesised as `call_<answerId>_<i>` and paired between the
  * assistant turn and its results; providers only require the pairing to line up
@@ -49,7 +44,6 @@ export function buildToolExchangeMessages(
 
   const calls: { id: string; name: string; args: string }[] = []
   const results: ChatMessage[] = []
-  let budget = REPLAY_ANSWER_CHARS
 
   steps.forEach((step, i) => {
     if (!step.tool) return
@@ -58,24 +52,10 @@ export function buildToolExchangeMessages(
     const args = (step.argsJson ?? '').trim() || '{}'
     calls.push({ id, name: step.tool, args })
 
-    let content: string
-    if (step.ok === false) {
-      content = (step.preview ?? '').trim() || '{"error":"tool call failed"}'
-    } else {
-      const result = (step.preview ?? '').trim()
-      const room = Math.min(REPLAY_STEP_CHARS, budget)
-      if (!result) {
-        content = ''
-      } else if (room <= 0) {
-        content = '（结果从略：复用上下文已达上限）'
-      } else if (result.length > room) {
-        content = `${result.slice(0, room)}\n…（结果过长，已截断）`
-        budget -= room
-      } else {
-        content = result
-        budget -= result.length
-      }
-    }
+    // The full result, verbatim — a follow-up turn should see exactly what the
+    // model already fetched so it can reuse it rather than re-calling the tool.
+    let content = (step.preview ?? '').trim()
+    if (!content && step.ok === false) content = '{"error":"tool call failed"}'
     results.push({ role: 'tool', tool_call_id: id, content })
   })
 

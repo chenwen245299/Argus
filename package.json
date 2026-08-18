@@ -9,7 +9,7 @@
     "build:fast": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "postinstall": "node scripts/setup-vditor.js",
+    "postinstall": "node scripts/setup-vditor.js && node scripts/fetch-pdfium.mjs",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs"

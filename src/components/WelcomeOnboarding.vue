@@ -10,6 +10,7 @@ import { Icon } from '@iconify/vue'
 import { useAiStore } from '../stores/ai'
 import { useSettingsStore } from '../stores/settings'
 import { ensureFluentIcons, fluentReady, fluentIconFor } from '../utils/fluentEmoji'
+import DoodleNote from './DoodleNote.vue'
 
 const { t } = useI18n()
 const aiStore = useAiStore()
@@ -65,6 +66,7 @@ onMounted(() => { ensureFluentIcons() })
               </div>
               <div class="ob-body">
                 <div class="ob-item-title">
+                  <Icon class="ob-doodle" icon="doodle:brain-circuit" width="17" height="17" />
                   {{ t('onboarding.modelTitle') }}
                   <span class="ob-badge required">{{ t('onboarding.required') }}</span>
                 </div>
@@ -84,6 +86,7 @@ onMounted(() => { ensureFluentIcons() })
               </div>
               <div class="ob-body">
                 <div class="ob-item-title">
+                  <Icon class="ob-doodle" icon="doodle:magnifier-loupe" width="17" height="17" />
                   {{ t('onboarding.ssTitle') }}
                   <span class="ob-badge recommended">{{ t('onboarding.recommended') }}</span>
                 </div>
@@ -95,6 +98,23 @@ onMounted(() => { ensureFluentIcons() })
               <span v-else class="ob-done-tag">{{ t('onboarding.configured') }}</span>
             </div>
           </div>
+
+          <!-- What to do once the checklist is done -->
+          <div class="ob-after">
+            <span class="ob-after-head">
+              <Icon icon="doodle:rocket" width="18" height="18" />
+              {{ t('onboarding.afterTitle') }}
+            </span>
+            <ul class="ob-after-list">
+              <li><Icon icon="doodle:paper-stack" width="16" height="16" />{{ t('onboarding.after1') }}</li>
+              <li><Icon icon="doodle:robot-helper" width="16" height="16" />{{ t('onboarding.after2') }}</li>
+              <li><Icon icon="doodle:highlighter" width="16" height="16" />{{ t('onboarding.after3') }}</li>
+            </ul>
+          </div>
+
+          <DoodleNote class="ob-note" icon="bulb" tone="plain" :tilt="0.4">
+            {{ t('onboarding.note') }}
+          </DoodleNote>
 
           <!-- Footer -->
           <div class="ob-footer">
@@ -172,7 +192,7 @@ onMounted(() => { ensureFluentIcons() })
   display: flex;
   flex-direction: column;
   gap: 10px;
-  margin-bottom: 24px;
+  margin-bottom: 12px;
 }
 .ob-item {
   display: flex;
@@ -224,6 +244,40 @@ onMounted(() => { ensureFluentIcons() })
   line-height: 1.5;
   color: var(--text-secondary);
 }
+.ob-doodle { flex-shrink: 0; color: var(--accent); }
+
+/* First-steps list — the part people actually need after the checklist. */
+.ob-after {
+  padding: 13px 15px;
+  margin-bottom: 12px;
+  border: 1px dashed color-mix(in srgb, var(--accent) 28%, transparent);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 4%, var(--bg-secondary));
+}
+.ob-after-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+.ob-after-head svg { color: var(--accent); }
+.ob-after-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.ob-after-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-hand);
+  font-size: 13px;
+  letter-spacing: 0.2px;
+  color: var(--text-secondary);
+}
+.ob-after-list svg { flex-shrink: 0; color: color-mix(in srgb, var(--accent) 55%, var(--text-tertiary)); }
+
+.ob-note { margin-bottom: 18px; }
+
 .ob-badge {
   font-size: 10px;
   font-weight: 500;

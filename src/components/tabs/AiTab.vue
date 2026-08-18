@@ -12,7 +12,9 @@ import MarkdownBody from '../MarkdownBody.vue'
 import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
 import { beginDragSelectionGuard, endDragSelectionGuard } from '../../utils/dragSelectionGuard'
-import type { ChatContentPart, ChatMessage, PaperMeta, PaperStatus, PaperSection } from '../../types'
+import type { ChatContentPart, ChatMessage, PaperMeta, AgentWritePreview } from '../../types'
+import WriteConfirmCard from '../WriteConfirmCard.vue'
+import { buildToolExchangeMessages } from '../../utils/agentHistory'
 import { askAiText } from '../../stores/translationHistory'
 import { estimateCostCny } from '../../utils/modelPricing'
 
@@ -61,15 +63,27 @@ interface AssistantAnswer {
   totalTokens?: number
   cacheHitTokens?: number
   costUsd?: number | null
-  contextMode?: string
-  usedPdf?: boolean
-  /** Whether this turn ran with DeepSeek's server-side web search. */
-  usedWebSearch?: boolean
-  // Titles of the paper sections selected as context for this turn.
-  sectionTitles?: string[]
   source?: 'chat' | 'metadataExtraction'
-  // Actual content injected into the system prompt, received via -context event
-  contextContent?: { metadata: string; summary: string; fulltext: string; sections?: string }
+  /** What the agent did to answer: one entry per tool call, in order. */
+  steps?: AgentStep[]
+  /** Servers the user configured that would not start this turn. */
+  serverErrors?: string[]
+  /** The model ran out of tool rounds before it was finished. */
+  limitHit?: { rounds: number; max: number }
+}
+
+/** One tool call the agent made, as shown in the trail above an answer. */
+interface AgentStep {
+  tool: string
+  server?: string
+  args: string
+  argsJson?: string
+  ok?: boolean
+  chars?: number
+  /** The tool result, as the model received it. Shown when the row is opened. */
+  preview?: string
+  /** Whether the model's own copy was cut to fit its context budget. */
+  truncated?: boolean
 }
 
 interface Conversation {
@@ -100,8 +114,6 @@ interface ExtractionProgressPayload {
   ok?: boolean
 }
 
-type PaperContextMode = 'none' | 'metadata' | 'summary' | 'fulltext' | 'summary+fulltext'
-type PaperContextSection = 'metadata' | 'summary' | 'fulltext'
 
 const STORAGE_PREFIX = 'argus.paper-ai-conversations.v2'
 
@@ -119,6 +131,69 @@ const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const selectedModelKeys = ref<string[]>([])
 const showModelMenu = ref(false)
 const showHistory = ref(false)
+
+/** Expanded tool rows, keyed by `${answerId}:${index}`. Collapsed by default —
+ *  the trail is a summary, and the payloads behind it are long. */
+const expandedSteps = ref(new Set<string>())
+function stepKey(answerId: string, i: number) { return `${answerId}:${i}` }
+function toggleStep(answerId: string, i: number) {
+  const k = stepKey(answerId, i)
+  // Replace the Set rather than mutate it: Vue does not track Set mutations
+  // deeply enough to re-render the bindings that depend on this.
+  const next = new Set(expandedSteps.value)
+  if (next.has(k)) next.delete(k)
+  else next.add(k)
+  expandedSteps.value = next
+}
+
+/** True while any step of this answer is still waiting on its result. */
+function agentRunning(answer: AssistantAnswer): boolean {
+  return !!answer.steps?.some(s => s.ok === undefined)
+}
+
+/** Compact size for a tool result, so a long trail stays scannable. */
+function formatChars(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+// ── Prompt-cache keepalive ──────────────────────────────────────────────────
+// The backend holds the last agent answer's prefix warm for an hour so a
+// follow-up asked much later still bills at the cache-hit rate. It spends a
+// little in the background doing that, so the conversation it is holding is
+// marked rather than left invisible. Same status event the library chat reads —
+// only one conversation is ever held at a time, app-wide.
+interface KeepaliveStatus {
+  active: boolean
+  conversationId?: string | null
+  model?: string
+  pings?: number
+  /** When the hour of inactivity runs out, in epoch ms. */
+  stopsAtMs?: number
+  intervalSeconds?: number
+  reason?: 'idle' | 'left' | 'failing' | 'disarmed'
+}
+const keepalive = ref<KeepaliveStatus>({ active: false })
+/** Ticks once a minute purely so the remaining-time readout stays honest. */
+const nowMs = ref(Date.now())
+let keepaliveClock: ReturnType<typeof setInterval> | null = null
+let unlistenKeepalive: UnlistenFn | null = null
+
+function isCacheWarm(convId: string | null | undefined) {
+  return !!convId && keepalive.value.active && keepalive.value.conversationId === convId
+}
+
+const keepaliveTitle = computed(() => {
+  const k = keepalive.value
+  const every = k.intervalSeconds ? Math.round(k.intervalSeconds / 60) : 5
+  const left = k.stopsAtMs ? Math.max(0, Math.round((k.stopsAtMs - nowMs.value) / 60000)) : null
+  return [
+    `正在保持这段对话的上下文缓存，每 ${every} 分钟续期一次。`,
+    '下次提问会命中缓存，按缓存价计费，而不是重读整段对话。',
+    k.pings ? `已续期 ${k.pings} 次` : '尚未续期',
+    left !== null ? `· 约 ${left} 分钟后自动停止` : '',
+    '关掉这个窗口也会停止。',
+  ].filter(Boolean).join('\n')
+})
 const previewImage = ref<string | null>(null)
 const previewPdf = ref<string | null>(null)
 const modelMenuRoot = ref<HTMLElement | null>(null)
@@ -139,11 +214,8 @@ interface PaperSession {
   input: string
 }
 const sessions = new Map<string, PaperSession>()
-const fulltextReady = ref(false)
-const fulltextChecking = ref(false)
 const abstractAvailable = ref(false)
 const activeAnswerTabs = ref<Record<string, string>>({})
-let unlistenExtractionProgress: UnlistenFn | null = null
 let unlistenMetaStart: UnlistenFn | null = null
 let unlistenMetaDone: UnlistenFn | null = null
 let unlistenMetaError: UnlistenFn | null = null
@@ -176,6 +248,30 @@ const copiedIds = ref(new Set<string>())
 const editingNodeId = ref<string | null>(null)
 const editingText = ref('')
 
+// ── Agent write confirmations ────────────────────────────────────────────────
+// The agent's one writing tool (create_paper_note) parks its request in the
+// backend and waits. The card above the composer shows the first one; the rest
+// queue behind it, since several models can be answering at once. Nothing is
+// written until answerWrite sends an approval back — the backend defaults every
+// other outcome (timeout, stop, this view closing) to "do not write".
+interface PendingWrite { requestId: string; preview: AgentWritePreview }
+const pendingWrites = ref<PendingWrite[]>([])
+const currentWrite = computed<PendingWrite | null>(() => pendingWrites.value[0] ?? null)
+
+function answerWrite(approved: boolean) {
+  const pending = currentWrite.value
+  if (!pending) return
+  // Drop it from the queue first so the button can't answer the same request twice.
+  pendingWrites.value = pendingWrites.value.slice(1)
+  invoke('resolve_agent_write', { requestId: pending.requestId, approved }).catch(() => {})
+}
+
+/** Take a request off the queue without answering — the backend already stopped
+ *  waiting for it (timeout, or the generation was stopped). */
+function dismissWrite(requestId: string) {
+  pendingWrites.value = pendingWrites.value.filter(w => w.requestId !== requestId)
+}
+
 async function copyText(id: string, text: string) {
   await navigator.clipboard.writeText(text).catch(() => {})
   copiedIds.value.add(id)
@@ -193,120 +289,6 @@ const useReasoning = ref(false)
 const reasoningLevel = ref<'low' | 'medium' | 'high'>('high')
 const reasoningOpen = ref(false)
 const reasoningRoot = ref<HTMLElement | null>(null)
-const sectionMenuRoot = ref<HTMLElement | null>(null)
-
-// Context mode: how much paper content to inject as system prompt context
-// Possible values: 'none' | 'metadata' | 'summary' | 'fulltext' | 'summary+fulltext'
-// All options are independent toggles; none = no context injected.
-const contextMode = ref<PaperContextMode>('none')
-const usePdf = ref(false)
-const summaryAvailable = ref(false)
-
-// Chapter (section) context: multi-select of the paper's detected sections.
-const availableSections = ref<PaperSection[]>([])
-const selectedSectionTitles = ref<string[]>([])
-const showSectionMenu = ref(false)
-const sectionsActive = computed(() => selectedSectionTitles.value.length > 0)
-
-async function loadSections(slug: string | null) {
-  availableSections.value = []
-  selectedSectionTitles.value = []
-  showSectionMenu.value = false
-  if (!slug) return
-  try {
-    const data = await invoke<{ sections: PaperSection[] } | null>('get_sections', { slug })
-    availableSections.value = data?.sections ?? []
-  } catch {
-    availableSections.value = []
-  }
-}
-
-function toggleSectionMenu() {
-  if (!availableSections.value.length) return
-  showSectionMenu.value = !showSectionMenu.value
-}
-
-// A section plus its descendants: the consecutive following entries whose level
-// is deeper than its own. Selecting a parent recursively (de)selects children.
-function sectionWithDescendants(i: number): string[] {
-  const secs = availableSections.value
-  const level = secs[i].level
-  const titles = [secs[i].title]
-  for (let j = i + 1; j < secs.length; j++) {
-    if (secs[j].level > level) titles.push(secs[j].title)
-    else break
-  }
-  return titles
-}
-
-function toggleSection(i: number) {
-  const titles = sectionWithDescendants(i)
-  const isSelected = selectedSectionTitles.value.includes(availableSections.value[i].title)
-  if (isSelected) {
-    selectedSectionTitles.value = selectedSectionTitles.value.filter(t => !titles.includes(t))
-  } else {
-    const set = new Set(selectedSectionTitles.value)
-    titles.forEach(t => set.add(t))
-    selectedSectionTitles.value = [...set]
-  }
-}
-
-function selectAllSections() {
-  selectedSectionTitles.value = availableSections.value.map(s => s.title)
-}
-
-function clearSelectedSections() {
-  selectedSectionTitles.value = []
-}
-
-function onSectionsUpdatedEvent(e: Event) {
-  const slug = (e as CustomEvent<{ slug?: string }>).detail?.slug
-  if (slug && slug === props.slug) loadSections(slug)
-}
-
-// PDF mode uses OpenAI-compatible inline file content parts, which only
-// OpenRouter reliably supports. Kimi / Moonshot endpoints reject the "file"
-// part type, so we keep the toggle disabled for those providers.
-// Ebook papers have no PDF at all — the toggle is disabled and the fulltext
-// context modes carry the book content instead.
-const paperIsEbook = ref(false)
-const pdfSupported = computed(() =>
-  !paperIsEbook.value &&
-  selectedModels.value.some(m => {
-    const p = ai.settings.providers.find(p => p.id === m.providerId)
-    if (!p) return false
-    return p.kind === 'openrouter' || p.base_url.toLowerCase().includes('openrouter')
-  })
-)
-
-const hasSummary = computed(() =>
-  contextMode.value === 'summary' || contextMode.value === 'summary+fulltext'
-)
-const hasFulltext = computed(() =>
-  contextMode.value === 'fulltext' || contextMode.value === 'summary+fulltext'
-)
-
-const effectiveContextMode = computed(() => {
-  // Fall back when fulltext not ready
-  if (hasFulltext.value && !fulltextReady.value) {
-    return hasSummary.value ? 'summary' : 'none'
-  }
-  return contextMode.value
-})
-
-// The model is stateless: anything it should keep "seeing" (the full text,
-// summary, selected chapters…) must be resent on EVERY turn. So each turn sends
-// the currently-selected context in full. We deliberately do NOT strip context
-// that already appeared in an earlier turn — that older behaviour made the model
-// lose the paper after the first message. "Not sending it twice" is already
-// guaranteed within a single request (one context block per turn).
-function contextPlanForConversation() {
-  return {
-    contextMode: effectiveContextMode.value,
-    usePdf: usePdf.value && pdfSupported.value,
-    sectionTitles: [...selectedSectionTitles.value],
-  }
-}
 
 const modelSvgModules = import.meta.glob<{ default: string }>('/src/assets/models/*.svg', { eager: true })
 const modelIconMap: Record<string, string> = {}
@@ -333,28 +315,6 @@ const isDeepSeekSelected = computed(() => {
   const provider = ai.settings.providers.find(p => p.id === primary.providerId)
   return !!provider?.base_url.toLowerCase().includes('deepseek')
 })
-
-// Server-side web search is a DeepSeek Responses-API feature, so the toggle only
-// appears when every selected model can actually honour it — a mixed multi-model
-// turn would otherwise silently search on some answers and not others.
-const useWebSearch = ref(false)
-const webSearchAvailable = computed(() =>
-  selectedModels.value.length > 0 &&
-  selectedModels.value.every(m => {
-    const provider = ai.settings.providers.find(p => p.id === m.providerId)
-    return !!provider?.base_url.toLowerCase().includes('deepseek')
-  })
-)
-watch(webSearchAvailable, (ok) => { if (!ok) useWebSearch.value = false })
-
-/** Live "searching the web…" state, keyed by answer id. */
-const webSearchStatus = ref<Record<string, string>>({})
-function setWebSearchStatus(answerId: string, status: string | null) {
-  const next = { ...webSearchStatus.value }
-  if (status) next[answerId] = status
-  else delete next[answerId]
-  webSearchStatus.value = next
-}
 
 // Access an answer through Vue's reactive proxy chain (fixes reactivity bug).
 // A streaming answer is looked up in its own conversation first, so a background
@@ -435,6 +395,50 @@ function cloneConversation(conv: Conversation): Conversation {
   return JSON.parse(JSON.stringify(conv)) as Conversation
 }
 
+// ── Persisting the agent trail ──────────────────────────────────────────────
+// Tool results are kept so an old answer can still be audited after a reload —
+// opening a step then shows what the model actually got, not an empty box. The
+// caps below are runaway guards rather than savings: every conversation for a
+// paper shares one file, so one pathological run (hundreds of rounds, each
+// result half a megabyte) would make that file slow to rewrite while the next
+// answer is still streaming into it. Real results sit far below these.
+
+/** Per tool result. */
+const PERSIST_STEP_CHARS = 60_000
+/** Per answer, across all of its tool calls. */
+const PERSIST_ANSWER_CHARS = 400_000
+
+/** Trim one answer's tool payloads down to what is worth writing to disk. */
+function persistableSteps(steps?: AgentStep[]): AgentStep[] | undefined {
+  if (!steps) return undefined
+  let budget = PERSIST_ANSWER_CHARS
+  return steps.map(step => {
+    if (!step.preview) return step
+    const room = Math.min(PERSIST_STEP_CHARS, budget)
+    if (room <= 0) {
+      const { preview: _drop, ...rest } = step
+      return rest
+    }
+    budget -= Math.min(step.preview.length, room)
+    if (step.preview.length <= room) return step
+    return { ...step, preview: step.preview.slice(0, room) }
+  })
+}
+
+/** A conversation as it goes to disk: no throttled render copies, tool payloads
+ *  capped. */
+function persistableConversation(conv: Conversation): Conversation {
+  const clone = cloneConversation(conv)
+  for (const node of clone.nodes) {
+    if (node.role !== 'assistantGroup') continue
+    for (const answer of node.answers) {
+      delete answer.displayContent
+      answer.steps = persistableSteps(answer.steps)
+    }
+  }
+  return clone
+}
+
 function createBlankConversation(slug: string): Conversation {
   const ts = nowIso()
   return { id: newId('conv'), slug, title: '新对话', createdAt: ts, updatedAt: ts, nodes: [] }
@@ -463,7 +467,7 @@ function persistedConversations(): Conversation[] {
   return conversations.value
     .filter(c => c.nodes.length > 0)
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-    .map(cloneConversation)
+    .map(persistableConversation)
 }
 
 async function saveConversationsToPaper(slug: string) {
@@ -585,197 +589,14 @@ function restoreSession(slug: string) {
   nextTick(() => scrollToBottom(true))
 }
 
-function applyFulltextReady(ready: boolean, resetMode = false) {
-  fulltextReady.value = ready
-  if (resetMode) {
-    contextMode.value = 'none'
-  } else if (!ready && hasFulltext.value) {
-    // Remove fulltext from mode; keep summary if active
-    contextMode.value = hasSummary.value ? 'summary' : 'none'
-  }
-}
-
-async function refreshSummaryAvailability(slug = props.slug) {
-  if (!slug) { summaryAvailable.value = false; return }
-  try {
-    const status = await invoke<{ ai_summary_done: boolean }>('get_paper_status', { slug })
-    if (props.slug === slug) summaryAvailable.value = !!status.ai_summary_done
-  } catch {
-    if (props.slug === slug) summaryAvailable.value = false
-  }
-}
-
 async function refreshAbstractAvailability(slug = props.slug) {
-  if (!slug) { abstractAvailable.value = false; paperIsEbook.value = false; return }
+  if (!slug) { abstractAvailable.value = false; return }
   try {
     const meta = await invoke<PaperMeta>('get_paper_meta', { slug })
-    if (props.slug === slug) {
-      abstractAvailable.value = !!meta.abstract?.trim()
-      paperIsEbook.value = !!meta.file_type && meta.file_type !== 'pdf'
-    }
+    if (props.slug === slug) abstractAvailable.value = !!meta.abstract?.trim()
   } catch {
     if (props.slug === slug) abstractAvailable.value = false
   }
-}
-
-async function refreshFulltextAvailability(slug = props.slug, resetMode = false) {
-  if (!slug) {
-    applyFulltextReady(false, resetMode)
-    fulltextChecking.value = false
-    return
-  }
-  fulltextChecking.value = true
-  try {
-    const status = await invoke<PaperStatus>('get_paper_status', { slug })
-    let ready = !!status.text_extracted
-    if (!ready) {
-      const text = await invoke<string>('get_fulltext', { slug })
-      ready = text.trim().length > 0
-    }
-    if (props.slug === slug) applyFulltextReady(ready, resetMode)
-  } catch {
-    if (props.slug === slug) applyFulltextReady(false, resetMode)
-  } finally {
-    if (props.slug === slug) fulltextChecking.value = false
-  }
-}
-
-function toggleContext(option: 'metadata' | 'summary' | 'fulltext') {
-  if (option === 'metadata') {
-    // Toggle metadata: deselect if already active (clears all), select if not active
-    contextMode.value = contextMode.value === 'metadata' ? 'none' : 'metadata'
-    return
-  }
-  if (option === 'fulltext') {
-    if (!fulltextReady.value) return
-    if (hasFulltext.value) {
-      contextMode.value = hasSummary.value ? 'summary' : 'none'
-    } else {
-      // Selecting fulltext clears metadata
-      contextMode.value = hasSummary.value ? 'summary+fulltext' : 'fulltext'
-    }
-    return
-  }
-  // option === 'summary'
-  if (!summaryAvailable.value) return
-  if (hasSummary.value) {
-    contextMode.value = hasFulltext.value ? 'fulltext' : 'none'
-  } else {
-    // Selecting summary clears metadata
-    contextMode.value = hasFulltext.value ? 'summary+fulltext' : 'summary'
-  }
-}
-
-// ── Context badge selection persistence ─────────────────────────────────────
-// The badge selection (context mode / PDF / sections) is persisted per paper in
-// localStorage, which is shared across webviews. This keeps the sidebar tab and
-// the standalone popup in sync, and lets us restore the selection when a
-// conversation from history is reopened.
-const CONTEXT_STORAGE_PREFIX = 'argus:ai-context'
-function contextStorageKey(slug: string) {
-  return `${CONTEXT_STORAGE_PREFIX}:${slug}`
-}
-
-interface ContextSelection {
-  contextMode?: string
-  usePdf?: boolean
-  sectionTitles?: string[]
-}
-
-// Guards programmatic selection changes (paper switch, history open, cross-window
-// sync) so they aren't re-persisted and echoed back into an update loop.
-let restoringContext = false
-
-function readContextSelection(slug: string): ContextSelection | null {
-  try {
-    const raw = localStorage.getItem(contextStorageKey(slug))
-    return raw ? (JSON.parse(raw) as ContextSelection) : null
-  } catch {
-    return null
-  }
-}
-
-function persistContextSelection() {
-  if (!props.slug) return
-  try {
-    const sel: ContextSelection = {
-      contextMode: contextMode.value,
-      usePdf: usePdf.value,
-      sectionTitles: selectedSectionTitles.value,
-    }
-    localStorage.setItem(contextStorageKey(props.slug), JSON.stringify(sel))
-  } catch {
-    // storage full / disabled — non-fatal
-  }
-}
-
-// Apply a saved/derived badge selection, downgrading to what this paper actually
-// supports (e.g. can't select fulltext before it's extracted, or summary before
-// it's generated).
-function applyContextSelection(sel: ContextSelection | null) {
-  if (!sel) return
-  const mode = (sel.contextMode as PaperContextMode) || 'none'
-  const wantsSummary =
-    (mode === 'summary' || mode === 'summary+fulltext') && summaryAvailable.value
-  const wantsFulltext =
-    (mode === 'fulltext' || mode === 'summary+fulltext') && fulltextReady.value
-  if (wantsFulltext && wantsSummary) contextMode.value = 'summary+fulltext'
-  else if (wantsFulltext) contextMode.value = 'fulltext'
-  else if (wantsSummary) contextMode.value = 'summary'
-  else contextMode.value = mode === 'metadata' ? 'metadata' : 'none'
-  usePdf.value = !!sel.usePdf && pdfSupported.value
-  selectedSectionTitles.value = Array.isArray(sel.sectionTitles) ? [...sel.sectionTitles] : []
-}
-
-// Restore the badges that were actually used in a saved conversation (from its
-// most recent assistant turn) so reopening history reflects that turn's context.
-function restoreContextFromConversation(conv: Conversation) {
-  const nodes = conv.nodes ?? []
-  for (let i = nodes.length - 1; i >= 0; i--) {
-    const node = nodes[i]
-    if (node.role === 'assistantGroup' && node.answers.length > 0) {
-      const a = node.answers[0]
-      const prev = restoringContext
-      restoringContext = true
-      try {
-        applyContextSelection({
-          contextMode: a.contextMode,
-          usePdf: a.usedPdf,
-          sectionTitles: a.sectionTitles,
-        })
-      } finally {
-        restoringContext = prev
-      }
-      return
-    }
-  }
-}
-
-// Live cross-window sync: when the other webview persists a new selection for the
-// current paper, adopt it here too.
-function onContextStorageSync(e: StorageEvent) {
-  if (!props.slug || e.key !== contextStorageKey(props.slug) || e.newValue == null) return
-  const prev = restoringContext
-  restoringContext = true
-  try {
-    applyContextSelection(JSON.parse(e.newValue) as ContextSelection)
-  } catch {
-    // ignore malformed payloads
-  } finally {
-    restoringContext = prev
-  }
-}
-
-function onWindowFocus() {
-  if (props.slug) {
-    refreshFulltextAvailability(props.slug).catch(() => {})
-    refreshSummaryAvailability(props.slug).catch(() => {})
-  }
-}
-
-function onPaperFulltextUpdated(event: Event) {
-  const slug = (event as CustomEvent<{ slug?: string }>).detail?.slug
-  if (slug && slug === props.slug) applyFulltextReady(true)
 }
 
 function onPaperMetaUpdated(event: Event) {
@@ -809,8 +630,6 @@ function openConversation(id: string) {
   // If this conversation still has a live generation, reopen the streaming
   // object itself — a snapshot would stop updating.
   activeConversation.value = liveConversationById(id) ?? cloneConversation(conv)
-  // Restore the badge selection this conversation was last used with.
-  restoreContextFromConversation(conv)
   activeAnswerTabs.value = {}
   showHistory.value = false
   nextTick(() => {
@@ -860,7 +679,7 @@ const backgroundSaves = new Map<string, Promise<void>>()
 
 function queueBackgroundSave(slug: string, conv: Conversation) {
   // Snapshot now: the live conversation keeps mutating while the write awaits.
-  const snapshot = cloneConversation(conv)
+  const snapshot = persistableConversation(conv)
   const prev = backgroundSaves.get(slug) ?? Promise.resolve()
   const next: Promise<void> = prev
     .catch(() => {})
@@ -1156,6 +975,9 @@ function buildHistoryUntil(conv: Conversation, stopGroupId?: string): ChatMessag
           : node.answers.find(a => !a.error && a.content.trim()) ??
             node.answers.find(a => a.content.trim())
       if (answer && answer.content.trim()) {
+        // Replay this turn's tool calls + results (as native tool messages)
+        // before its answer, so a follow-up reuses them instead of re-fetching.
+        messages.push(...buildToolExchangeMessages(answer.steps, answer.id))
         messages.push({ role: 'assistant', content: answer.content })
       }
     } else if (node.role === 'user') {
@@ -1183,7 +1005,6 @@ async function sendMessage() {
   // Read it back so `conv` is the reactive proxy, not the raw object: streaming
   // mutations (possibly from the background) must be tracked by Vue.
   const conv = activeConversation.value
-  const contextPlan = contextPlanForConversation()
 
   const userNode: ChatNode = {
     id: newId('user'),
@@ -1197,7 +1018,7 @@ async function sendMessage() {
     role: 'assistantGroup',
     promptId: userNode.id,
     createdAt: nowIso(),
-    answers: selectedModels.value.map(model => modelToAnswer(model, contextPlan.contextMode, contextPlan.usePdf, contextPlan.sectionTitles)),
+    answers: selectedModels.value.map(model => modelToAnswer(model)),
   }
   if (group.answers[0]) setActiveAnswer(group.id, group.answers[0].id)
   conv.nodes.push(userNode, group)
@@ -1213,12 +1034,7 @@ async function sendMessage() {
   await Promise.all(group.answers.map(answer => streamAnswer(slug, conv, answer, history)))
 }
 
-function modelToAnswer(
-  model: ModelOption,
-  contextModeToSend: PaperContextMode,
-  usePdfToSend: boolean,
-  sectionTitlesToSend: string[],
-): AssistantAnswer {
+function modelToAnswer(model: ModelOption): AssistantAnswer {
   return {
     id: newId('answer'),
     providerId: model.providerId,
@@ -1228,10 +1044,6 @@ function modelToAnswer(
     content: '',
     withReasoning: useReasoning.value,
     createdAt: nowIso(),
-    contextMode: contextModeToSend,
-    usedPdf: usePdfToSend,
-    usedWebSearch: useWebSearch.value && webSearchAvailable.value,
-    sectionTitles: sectionTitlesToSend,
   }
 }
 
@@ -1272,10 +1084,17 @@ function cancelEdit() {
 
 async function submitEdit(node: UserNode) {
   const conv = activeConversation.value
-  if (!conv || !props.slug || hasStreaming.value) return
+  if (!conv || !props.slug) return
   const slug = props.slug
   const newText = editingText.value.trim()
   if (!newText) return
+
+  // Editing resends the message, which truncates everything after this node —
+  // including any answer still generating. Cancel in-flight streams first,
+  // otherwise the old `hasStreaming` guard would silently swallow the resend:
+  // the 发送 button looked dead whenever a previous turn was still (or got
+  // stuck) streaming.
+  if (hasStreaming.value) stopAllStreaming()
 
   node.content = newText
   editingNodeId.value = null
@@ -1284,14 +1103,13 @@ async function submitEdit(node: UserNode) {
   // Truncate everything after this user node
   const idx = conv.nodes.indexOf(node)
   if (idx >= 0) conv.nodes.splice(idx + 1)
-  const contextPlan = contextPlanForConversation()
 
   const group: ChatNode = {
     id: newId('group'),
     role: 'assistantGroup',
     promptId: node.id,
     createdAt: nowIso(),
-    answers: selectedModels.value.map(model => modelToAnswer(model, contextPlan.contextMode, contextPlan.usePdf, contextPlan.sectionTitles)),
+    answers: selectedModels.value.map(model => modelToAnswer(model)),
   }
   if (group.answers[0]) setActiveAnswer(group.id, group.answers[0].id)
   conv.nodes.push(group)
@@ -1323,7 +1141,7 @@ function stopAllStreaming() {
     const requestId = activeRequestIds.get(answerId)
     if (requestId) invoke('cancel_ai_request', { requestId }).catch(() => {})
     activeRequestIds.delete(answerId)
-    for (const suffix of ['', '-reasoning', '-context', '-usage']) {
+    for (const suffix of ['', '-reasoning', '-context', '-usage', '-agent', '-confirm', '-confirm-close']) {
       const key = `${answerId}${suffix}`
       const off = unlisteners.get(key)
       if (off) off()
@@ -1337,6 +1155,11 @@ function stopAllStreaming() {
     }
     streamOwners.delete(answerId)
   }
+  // Any write the agent was still waiting on is refused when the user stops.
+  for (const pending of pendingWrites.value) {
+    invoke('resolve_agent_write', { requestId: pending.requestId, approved: false }).catch(() => {})
+  }
+  pendingWrites.value = []
   persistActiveConversation()
 }
 
@@ -1425,7 +1248,7 @@ async function streamAnswer(
   streamOwners.set(answer.id, { slug, conv: owner })
   const eventName = `paper-ai-chat-${answer.id}`
   const reasoningEventName = `${eventName}-reasoning`
-  // Backend cancellation id: sent to `chat_with_paper_event`, used by
+  // Backend cancellation id: sent to `chat_with_library`, used by
   // stopAllStreaming to invoke `cancel_ai_request`.
   const requestId = crypto.randomUUID()
   activeRequestIds.set(answer.id, requestId)
@@ -1464,28 +1287,67 @@ async function streamAnswer(
   })
   unlisteners.set(`${answer.id}-usage`, unlistenUsage)
 
-  // Receive the actual context injected into the system prompt for the transparency banner
-  const unlistenCtx = await listen<{ metadata: string; summary: string; fulltext: string; sections?: string }>(
-    `${eventName}-context`,
+  // The agent's trail: which tool it reached for, and how that went. This is
+  // what replaced the old "context" banner — the model now goes and gets what
+  // it needs, so what matters is showing the user what it went and got.
+  const unlistenAgent = await listen<{
+    phase?: string
+    tool?: string
+    server?: string | null
+    arguments?: unknown
+    ok?: boolean
+    chars?: number
+    preview?: string
+    truncated?: boolean
+    failed?: string[]
+    rounds?: number
+    max?: number
+  }>(`${eventName}-agent`, (event) => {
+    const p = event.payload
+    const reactiveAns = findReactiveAnswer(answer.id)
+    if (!p || !reactiveAns) return
+    if (p.phase === 'tool') {
+      if (!reactiveAns.steps) reactiveAns.steps = []
+      reactiveAns.steps.push({
+        tool: p.tool ?? '',
+        server: p.server ?? undefined,
+        args: summarizeToolArgs(p.arguments),
+        argsJson: JSON.stringify(p.arguments ?? {}, null, 2),
+      })
+      scrollToBottom()
+    } else if (p.phase === 'result') {
+      const step = [...(reactiveAns.steps ?? [])].reverse().find(x => x.tool === p.tool && x.ok === undefined)
+      if (step) {
+        step.ok = p.ok ?? true
+        step.chars = p.chars
+        step.preview = p.preview
+        step.truncated = p.truncated
+      }
+    } else if (p.phase === 'servers') {
+      if (p.failed?.length) reactiveAns.serverErrors = p.failed
+    } else if (p.phase === 'limit') {
+      reactiveAns.limitHit = { rounds: p.rounds ?? 0, max: p.max ?? 0 }
+    }
+  })
+  unlisteners.set(`${answer.id}-agent`, unlistenAgent)
+
+  // create_paper_note parks in the backend and waits for approval. Show the card
+  // above the composer; `-confirm-close` clears it if the backend gave up on its
+  // own (timeout, or the generation was stopped) so a stale card never lingers.
+  const unlistenConfirm = await listen<{ requestId: string; preview: AgentWritePreview }>(
+    `${eventName}-confirm`,
     (event) => {
-      const reactiveAns = findReactiveAnswer(answer.id)
-      if (reactiveAns) reactiveAns.contextContent = event.payload
+      const p = event.payload
+      if (!p?.requestId || !p.preview) return
+      pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview }]
     },
   )
-  unlisteners.set(`${answer.id}-context`, unlistenCtx)
-
-  // Web-search progress: DeepSeek runs the search server-side and reports
-  // in_progress / searching / completed before the answer starts streaming.
-  if (answer.usedWebSearch) {
-    const unlistenSearch = await listen<{ status: string }>(
-      `${eventName}-websearch`,
-      (event) => {
-        const status = event.payload.status
-        setWebSearchStatus(answer.id, status === 'done' || status === 'completed' ? null : status)
-      },
-    )
-    unlisteners.set(`${answer.id}-websearch`, unlistenSearch)
-  }
+  unlisteners.set(`${answer.id}-confirm`, unlistenConfirm)
+  const unlistenConfirmClose = await listen<{ requestId: string }>(
+    `${eventName}-confirm-close`,
+    (event) => { if (event.payload?.requestId) dismissWrite(event.payload.requestId) },
+  )
+  unlisteners.set(`${answer.id}-confirm-close`, unlistenConfirmClose)
 
   // Only listen to reasoning events when the user explicitly enabled the toggle.
   // Some models (e.g. DeepSeek) emit reasoning_content by default; suppress it here
@@ -1509,19 +1371,25 @@ async function streamAnswer(
     : reasoningLevel.value
 
   try {
-    const finalText = await invoke<string>('chat_with_paper_event', {
-      slug,
+    // Agent mode: the model reaches for what it needs instead of being handed a
+    // pre-built context. `paperSlug` puts this paper's `get_paper` card in the
+    // system prompt, so it starts knowing what it is reading.
+    const finalText = await invoke<string>('chat_with_library', {
       messages: history,
       providerId: answer.providerId || null,
       modelId: answer.modelId || null,
       eventName,
+      sourcesEventName: `${eventName}-sources`,
+      knowledgeSource: 'agent',
+      selectedPaperSlugs: [],
+      attachments: null,
       useReasoning: useReasoning.value,
       reasoningEffort: useReasoning.value ? effortToSend : null,
-      contextMode: answer.contextMode ?? 'none',
-      usePdf: !!answer.usedPdf,
-      sectionTitles: answer.sectionTitles ?? [],
       requestId,
-      webSearch: !!answer.usedWebSearch,
+      webSearch: false,
+      agentMaxRounds: null,
+      conversationId: conv.id,
+      paperSlug: slug,
     })
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) {
@@ -1547,16 +1415,18 @@ async function streamAnswer(
     const offR = unlisteners.get(`${answer.id}-reasoning`)
     if (offR) offR()
     unlisteners.delete(`${answer.id}-reasoning`)
-    const offCtx = unlisteners.get(`${answer.id}-context`)
-    if (offCtx) offCtx()
-    unlisteners.delete(`${answer.id}-context`)
+    const offAgent = unlisteners.get(`${answer.id}-agent`)
+    if (offAgent) offAgent()
+    unlisteners.delete(`${answer.id}-agent`)
     const offUsage = unlisteners.get(`${answer.id}-usage`)
     if (offUsage) offUsage()
     unlisteners.delete(`${answer.id}-usage`)
-    const offSearch = unlisteners.get(`${answer.id}-websearch`)
-    if (offSearch) offSearch()
-    unlisteners.delete(`${answer.id}-websearch`)
-    setWebSearchStatus(answer.id, null)
+    const offConfirm = unlisteners.get(`${answer.id}-confirm`)
+    if (offConfirm) offConfirm()
+    unlisteners.delete(`${answer.id}-confirm`)
+    const offConfirmClose = unlisteners.get(`${answer.id}-confirm-close`)
+    if (offConfirmClose) offConfirmClose()
+    unlisteners.delete(`${answer.id}-confirm-close`)
     activeRequestIds.delete(answer.id)
     const visible = isAnswerVisible(answer.id)
     streamOwners.delete(answer.id)
@@ -1803,6 +1673,19 @@ function onMessagesWheel(e: WheelEvent) {
   if (e.deltaY < 0) stickToBottom.value = false
 }
 
+/** One tool call's arguments, shortened for the trail line. Mirrors the library
+ *  chat's summary so the two panels read the same. */
+function summarizeToolArgs(args: unknown): string {
+  if (!args || typeof args !== 'object') return ''
+  return Object.entries(args as Record<string, unknown>)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => {
+      const text = typeof v === 'string' ? v : JSON.stringify(v)
+      return `${k}: ${text.length > 40 ? text.slice(0, 40) + '…' : text}`
+    })
+    .join(', ')
+}
+
 function scrollToBottom(force = false) {
   if (force) stickToBottom.value = true
   nextTick(() => {
@@ -1898,9 +1781,6 @@ function closeFloating(e: MouseEvent) {
   if (reasoningRoot.value && !reasoningRoot.value.contains(e.target as Node)) {
     reasoningOpen.value = false
   }
-  if (sectionMenuRoot.value && !sectionMenuRoot.value.contains(e.target as Node)) {
-    showSectionMenu.value = false
-  }
 }
 
 // The paper this view is currently showing, tracked separately from `props.slug`
@@ -1916,51 +1796,22 @@ watch(() => props.slug, async (slug) => {
   // `streamOwners` holds it, so clearing the refs below doesn't interrupt them.
   if (sessionSlug && sessionSlug !== slug) rememberSession(sessionSlug)
   sessionSlug = slug
-  const token = ++slugRunToken
-  // Guard the whole (re)initialization: every contextMode/usePdf/section change
-  // below is programmatic, so it must not be persisted (and thus not broadcast
-  // to the other window). The `savedSel` we read here is the source of truth.
-  restoringContext = true
-  try {
-    // Stream listeners are deliberately NOT torn down here: an answer that is
-    // still generating must keep running in the background. Each stream removes
-    // its own listeners when it finishes.
-    showHistory.value = false
-    showModelMenu.value = false
-    activeConversation.value = null
-    conversations.value = []
-    activeAnswerTabs.value = {}
-    input.value = ''
-    applyFulltextReady(false, true)
-    abstractAvailable.value = false
-    summaryAvailable.value = false
-    loadSections(slug)
-    if (slug) {
-      const savedSel = readContextSelection(slug)
-      await Promise.all([
-        refreshFulltextAvailability(slug, true),
-        refreshAbstractAvailability(slug),
-        refreshSummaryAvailability(slug),
-      ])
-      if (props.slug !== slug) return
-      await loadConversations(slug)
-      if (props.slug !== slug) return
-      // Restore the last badge selection for this paper (shared across windows
-      // via localStorage) so the sidebar tab and the standalone popup open in sync.
-      if (savedSel) applyContextSelection(savedSel)
-    }
-  } finally {
-    if (token === slugRunToken) restoringContext = false
+  // Stream listeners are deliberately NOT torn down here: an answer that is
+  // still generating must keep running in the background. Each stream removes
+  // its own listeners when it finishes.
+  showHistory.value = false
+  showModelMenu.value = false
+  activeConversation.value = null
+  conversations.value = []
+  activeAnswerTabs.value = {}
+  input.value = ''
+  abstractAvailable.value = false
+  if (slug) {
+    await refreshAbstractAvailability(slug)
+    if (props.slug !== slug) return
+    await loadConversations(slug)
   }
 }, { immediate: true })
-
-// Persist the badge selection whenever the user changes it. `flush: 'sync'` is
-// required so the write happens while `restoringContext` is still set during a
-// programmatic change — otherwise the (async) callback would run after the flag
-// was cleared and defeat the guard.
-watch([contextMode, usePdf, selectedSectionTitles], () => {
-  if (!restoringContext) persistContextSelection()
-}, { deep: true, flush: 'sync' })
 
 watch(() => allSelectableModels.value.map(modelKey).join('|'), ensureDefaultModels, { immediate: true })
 watch(input, resizeTextarea)
@@ -1983,16 +1834,11 @@ onMounted(async () => {
     panelResizeObserver.observe(rootRef.value)
   }
   document.addEventListener('mousedown', closeFloating)
-  window.addEventListener('focus', onWindowFocus)
-  window.addEventListener('argus-paper-fulltext-updated', onPaperFulltextUpdated)
   window.addEventListener('argus-paper-meta-updated', onPaperMetaUpdated)
-  window.addEventListener('argus-sections-updated', onSectionsUpdatedEvent)
-  window.addEventListener('storage', onContextStorageSync)
-  unlistenExtractionProgress = await listen<ExtractionProgressPayload>('extraction_progress', (event) => {
-    if (event.payload.slug === props.slug && event.payload.ok) {
-      applyFulltextReady(true)
-    }
+  unlistenKeepalive = await listen<KeepaliveStatus>('cache-keepalive', (event) => {
+    keepalive.value = event.payload ?? { active: false }
   })
+  keepaliveClock = setInterval(() => { nowMs.value = Date.now() }, 60_000)
 
   // `ai-meta-start` / `ai-meta-done` / `ai-meta-error` are broadcast globally
   // (Rust `app.emit`), so both the main window and the standalone popup receive
@@ -2088,101 +1934,28 @@ onUnmounted(() => {
   panelResizeObserver?.disconnect()
   panelResizeObserver = null
   document.removeEventListener('mousedown', closeFloating)
-  window.removeEventListener('focus', onWindowFocus)
-  window.removeEventListener('argus-paper-fulltext-updated', onPaperFulltextUpdated)
   window.removeEventListener('argus-paper-meta-updated', onPaperMetaUpdated)
-  window.removeEventListener('argus-sections-updated', onSectionsUpdatedEvent)
-  window.removeEventListener('storage', onContextStorageSync)
-  unlistenExtractionProgress?.()
+  // Only stop the keepalive if it is one of *these* conversations being held:
+  // the library chat and the canvas chat share the same single slot, and
+  // closing this panel must not cancel the warm prefix they are paying for.
+  if (keepalive.value.active && conversations.value.some(c => c.id === keepalive.value.conversationId)) {
+    invoke('disarm_cache_keepalive').catch(() => {})
+  }
+  unlistenKeepalive?.()
+  if (keepaliveClock) clearInterval(keepaliveClock)
   unlistenMetaStart?.()
   unlistenMetaDone?.()
   unlistenMetaError?.()
   for (const off of unlisteners.values()) off()
   unlisteners.clear()
+  // Refuse any write the agent was still waiting on so the backend doesn't hang.
+  for (const pending of pendingWrites.value) {
+    invoke('resolve_agent_write', { requestId: pending.requestId, approved: false }).catch(() => {})
+  }
+  pendingWrites.value = []
   clearAllStreamRenderTimers()
 })
 
-// ── Context banner ────────────────────────────────────────────────────────────
-const expandedContextId = ref<string | null>(null)
-
-function getFirstAnswer(userNodeId: string): AssistantAnswer | undefined {
-  const nodes = activeConversation.value?.nodes ?? []
-  const group = nodes.find(
-    n => n.role === 'assistantGroup' && (n as AssistantGroupNode).promptId === userNodeId,
-  ) as AssistantGroupNode | undefined
-  return group?.answers[0]
-}
-
-interface CtxFlags {
-  metadata: boolean
-  summary: boolean
-  fulltext: boolean
-  sections: boolean
-  pdf: boolean
-}
-
-// Which context types a single answer actually carried.
-function answerContextFlags(ans: AssistantAnswer): CtxFlags {
-  const c = ans.contextContent
-  if (c) {
-    return {
-      metadata: !!c.metadata?.trim(),
-      summary: !!c.summary?.trim(),
-      fulltext: !!c.fulltext?.trim(),
-      sections: !!c.sections?.trim(),
-      pdf: !!ans.usedPdf,
-    }
-  }
-  const mode = ans.contextMode ?? 'none'
-  return {
-    metadata: mode === 'metadata',
-    summary: mode === 'summary' || mode === 'summary+fulltext',
-    fulltext: mode === 'fulltext' || mode === 'summary+fulltext',
-    sections: !!ans.sectionTitles?.length,
-    pdf: !!ans.usedPdf,
-  }
-}
-
-// Context this turn introduces for the FIRST time (vs. earlier turns). The model
-// still receives the context every turn (it's stateless), but the badge is only
-// shown on the message that first added it — like an attachment shown once, not
-// re-announced on every follow-up.
-function newlyAddedContext(userNodeId: string): CtxFlags {
-  const empty: CtxFlags = { metadata: false, summary: false, fulltext: false, sections: false, pdf: false }
-  const conv = activeConversation.value
-  if (!conv) return empty
-  const prev = { ...empty }
-  for (const node of conv.nodes) {
-    if (node.role !== 'assistantGroup') continue
-    const ans = node.answers[0]
-    if (!ans) continue
-    const flags = answerContextFlags(ans)
-    if (node.promptId === userNodeId) {
-      return {
-        metadata: flags.metadata && !prev.metadata,
-        summary: flags.summary && !prev.summary,
-        fulltext: flags.fulltext && !prev.fulltext,
-        sections: flags.sections && !prev.sections,
-        pdf: flags.pdf && !prev.pdf,
-      }
-    }
-    prev.metadata = prev.metadata || flags.metadata
-    prev.summary = prev.summary || flags.summary
-    prev.fulltext = prev.fulltext || flags.fulltext
-    prev.sections = prev.sections || flags.sections
-    prev.pdf = prev.pdf || flags.pdf
-  }
-  return empty
-}
-
-function hasContextBanner(userNodeId: string): boolean {
-  const f = newlyAddedContext(userNodeId)
-  return f.metadata || f.summary || f.fulltext || f.sections || f.pdf
-}
-
-function toggleContextPanel(nodeId: string) {
-  expandedContextId.value = expandedContextId.value === nodeId ? null : nodeId
-}
 </script>
 
 <template>
@@ -2220,7 +1993,10 @@ function toggleContextPanel(nodeId: string) {
             :class="{ active: conv.id === activeConversation?.id }"
             @click="openConversation(conv.id)"
           >
-            <span class="history-title">{{ conv.title }}</span>
+            <span class="history-title">
+              <span v-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
+              {{ conv.title }}
+            </span>
             <span class="history-meta">{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
             <button class="history-delete" title="删除" @click="deleteConversation(conv.id, $event)">
               <Icon icon="fluent:delete-24-regular" width="13" height="13" />
@@ -2337,11 +2113,12 @@ function toggleContextPanel(nodeId: string) {
           @wheel.passive="onMessagesWheel"
         >
         <div v-if="!activeConversation?.nodes.length" class="empty-chat">
-          <div class="empty-orb">
-            <Icon icon="fluent:sparkle-24-regular" width="22" height="22" />
-          </div>
+          <!-- A hand-drawn reader rather than a glyph: this panel is someone
+               sitting down with a paper, and the drawing says that faster than
+               a sparkle does. -->
+          <Icon class="empty-doodle" icon="doodle:reading-document" width="72" height="72" />
           <p>基于这篇论文开始新对话</p>
-          <span>选择模型，开始与这篇论文对话。</span>
+          <span>问它任何问题，它会自己去翻这篇论文。</span>
         </div>
 
         <template v-for="node in activeConversation?.nodes ?? []" :key="node.id">
@@ -2366,41 +2143,6 @@ function toggleContextPanel(nodeId: string) {
               </template>
               <!-- Normal mode -->
               <template v-else>
-                <!-- Context banner: shows what was ACTUALLY sent to the AI for this message -->
-                <div v-if="hasContextBanner(node.id)" class="context-banner">
-                  <button class="ctx-pills" @click="toggleContextPanel(node.id)" :title="expandedContextId === node.id ? '收起' : '查看发送给 AI 的上下文'">
-                    <span v-if="newlyAddedContext(node.id).metadata" class="ctx-pill ctx-meta">元数据</span>
-                    <span v-if="newlyAddedContext(node.id).summary" class="ctx-pill ctx-summary">AI 总结</span>
-                    <span v-if="newlyAddedContext(node.id).sections" class="ctx-pill ctx-sections">章节</span>
-                    <span v-if="newlyAddedContext(node.id).fulltext" class="ctx-pill ctx-fulltext">全文</span>
-                    <span v-if="newlyAddedContext(node.id).pdf" class="ctx-pill ctx-pdf">PDF</span>
-                    <Icon class="ctx-chevron" :class="{ open: expandedContextId === node.id }" icon="fluent:chevron-down-24-regular" width="11" height="11" />
-                  </button>
-                  <div v-if="expandedContextId === node.id" class="ctx-preview">
-                    <template v-if="getFirstAnswer(node.id)?.contextContent">
-                      <div v-if="newlyAddedContext(node.id).metadata && getFirstAnswer(node.id)!.contextContent!.metadata" class="ctx-section">
-                        <div class="ctx-section-label">元数据</div>
-                        <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.metadata }}</pre>
-                      </div>
-                      <div v-if="newlyAddedContext(node.id).summary && getFirstAnswer(node.id)!.contextContent!.summary" class="ctx-section">
-                        <div class="ctx-section-label">AI 总结</div>
-                        <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.summary }}</pre>
-                      </div>
-                      <div v-if="newlyAddedContext(node.id).sections && getFirstAnswer(node.id)!.contextContent!.sections" class="ctx-section">
-                        <div class="ctx-section-label">章节</div>
-                        <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.sections }}</pre>
-                      </div>
-                      <div v-if="newlyAddedContext(node.id).fulltext && getFirstAnswer(node.id)!.contextContent!.fulltext" class="ctx-section">
-                        <div class="ctx-section-label">全文</div>
-                        <pre class="ctx-preview-text">{{ getFirstAnswer(node.id)!.contextContent!.fulltext }}</pre>
-                      </div>
-                      <div v-if="newlyAddedContext(node.id).pdf && !newlyAddedContext(node.id).fulltext" class="ctx-section">
-                        <pre class="ctx-preview-text">PDF 文件已直接发送给模型</pre>
-                      </div>
-                    </template>
-                    <div v-else class="ctx-loading">{{ getFirstAnswer(node.id)?.streaming ? '等待后端响应…' : '暂无上下文记录（旧对话不支持）' }}</div>
-                  </div>
-                </div>
                 <div v-if="node.attachments && node.attachments.length" class="user-attachments">
                   <button
                     v-for="att in node.attachments"
@@ -2455,28 +2197,69 @@ function toggleContextPanel(nodeId: string) {
                     />
                     <span v-else class="answer-logo fallback">{{ answer.modelName.charAt(0).toUpperCase() }}</span>
                     <span class="answer-name">{{ answerModelLabel(answer) }}</span>
-                    <span
-                      v-if="answer.usedPdf"
-                      class="pdf-badge"
-                      title="已将 PDF 直接发送给模型"
-                    >PDF</span>
-                    <span
-                      v-if="answer.usedWebSearch"
-                      class="websearch-badge"
-                      title="本轮启用了 DeepSeek 联网搜索"
-                    >
-                      <Icon icon="fluent:globe-search-24-regular" width="11" height="11" />
-                      联网
-                    </span>
                     <span v-if="answer.streaming" class="live-dot" />
                   </div>
                 </div>
 
-                <!-- Search runs server-side before any text arrives, so this is
-                     the only sign the turn is doing anything at all. -->
-                <div v-if="webSearchStatus[answer.id]" class="websearch-status">
-                  <Icon icon="fluent:globe-search-24-regular" width="13" height="13" />
-                  {{ webSearchStatus[answer.id] === 'in_progress' ? '正在发起联网搜索…' : '正在检索网页…' }}
+                <!-- What the agent went and read to answer. Replaces the old
+                     "context sent" banner: the model fetches what it needs now,
+                     so what is worth showing is what it actually fetched. -->
+                <div v-if="answer.steps?.length" class="agent-trail">
+                  <div class="agent-trail-head" :class="{ busy: agentRunning(answer) }">
+                    <Icon icon="fluent:bot-sparkle-24-regular" width="12" height="12" />
+                    <span v-if="agentRunning(answer)">正在查资料… 已调用 {{ answer.steps.length }} 次工具</span>
+                    <span v-else>调用了 {{ answer.steps.length }} 次工具</span>
+                  </div>
+                  <div v-for="(step, i) in answer.steps" :key="i" class="agent-step-wrap">
+                    <button
+                      class="agent-step"
+                      :class="{ open: expandedSteps.has(stepKey(answer.id, i)) }"
+                      @click="toggleStep(answer.id, i)"
+                    >
+                      <Icon
+                        class="agent-step-chevron"
+                        :class="{ open: expandedSteps.has(stepKey(answer.id, i)) }"
+                        icon="fluent:chevron-right-24-regular"
+                        width="10"
+                        height="10"
+                      />
+                      <Icon
+                        :icon="step.ok === false
+                          ? 'fluent:dismiss-circle-24-regular'
+                          : step.ok === undefined
+                            ? 'fluent:arrow-clockwise-24-regular'
+                            : 'fluent:checkmark-circle-24-regular'"
+                        width="11"
+                        height="11"
+                        :class="{ spin: step.ok === undefined, failed: step.ok === false }"
+                      />
+                      <span v-if="step.server" class="agent-step-server" :title="`来自 MCP 服务器：${step.server}`">{{ step.server }}</span>
+                      <code class="agent-step-tool">{{ step.tool }}</code>
+                      <span v-if="step.args" class="agent-step-args">{{ step.args }}</span>
+                      <span v-if="step.chars" class="agent-step-size">{{ formatChars(step.chars) }}</span>
+                    </button>
+
+                    <!-- What the model actually sent and got back. Collapsed by
+                         default; this is for checking an answer, not reading. -->
+                    <div v-if="expandedSteps.has(stepKey(answer.id, i))" class="agent-step-detail">
+                      <div class="agent-detail-label">参数</div>
+                      <pre class="agent-detail-code">{{ step.argsJson }}</pre>
+                      <div class="agent-detail-label">
+                        返回
+                        <span v-if="step.chars" class="agent-detail-note">
+                          （{{ formatChars(step.chars) }} 字符<template v-if="step.truncated">，已超出模型上下文预算并被截断</template>）
+                        </span>
+                      </div>
+                      <pre v-if="step.preview" class="agent-detail-code">{{ step.preview }}</pre>
+                      <div v-else class="agent-detail-note">这一步没有返回内容</div>
+                    </div>
+                  </div>
+                  <div v-if="answer.limitHit" class="agent-note">
+                    工具调用达到上限（{{ answer.limitHit.rounds }}/{{ answer.limitHit.max }} 轮），下面是它用已有信息写的回答。
+                  </div>
+                  <div v-if="answer.serverErrors?.length" class="agent-note">
+                    这些 MCP 服务器没能启动：{{ answer.serverErrors.join('、') }}
+                  </div>
                 </div>
 
                 <!-- Thinking / reasoning content (collapsible) -->
@@ -2572,6 +2355,17 @@ function toggleContextPanel(nodeId: string) {
         </div>
         </div>
 
+        <!-- Approval for a write the agent asked for, directly above the composer. -->
+        <div v-if="currentWrite" class="write-confirm-slot">
+          <WriteConfirmCard
+            :key="currentWrite.requestId"
+            :preview="currentWrite.preview"
+            :queued="pendingWrites.length - 1"
+            @approve="answerWrite(true)"
+            @reject="answerWrite(false)"
+          />
+        </div>
+
         <footer class="composer">
         <div
           class="composer-resizer"
@@ -2579,76 +2373,6 @@ function toggleContextPanel(nodeId: string) {
           @pointerdown="onComposerResizeStart"
           @dblclick="resetComposerHeight"
         />
-        <div class="context-bar">
-          <button
-            class="context-btn"
-            :class="{ active: contextMode === 'metadata' }"
-            @click="toggleContext('metadata')"
-          >元数据</button>
-          <button
-            class="context-btn"
-            :class="{ active: hasSummary }"
-            :disabled="!summaryAvailable"
-            :title="summaryAvailable ? 'AI 总结（可与全文同时选择）' : '尚无 AI 总结，请先生成'"
-            @click="toggleContext('summary')"
-          >AI 总结</button>
-          <div ref="sectionMenuRoot" class="context-section-wrap">
-            <button
-              class="context-btn context-btn-sections"
-              :class="{ active: sectionsActive }"
-              :disabled="!availableSections.length"
-              :title="availableSections.length ? '按章节作为上下文（可多选）' : '尚未识别到章节，请先在「章节」页签识别'"
-              @click="toggleSectionMenu"
-            >
-              <span class="context-btn-label">章节</span>
-              <span v-if="sectionsActive" class="context-count">{{ selectedSectionTitles.length }}</span>
-              <Icon class="context-caret" :class="{ open: showSectionMenu }" icon="fluent:chevron-down-24-regular" width="9" height="9" />
-            </button>
-            <Transition name="section-menu">
-              <div v-if="showSectionMenu" class="section-menu">
-                <div class="section-menu-head">
-                  <span class="section-menu-title">选择章节作为上下文</span>
-                  <div class="section-menu-actions">
-                    <button class="section-menu-link" @click="selectAllSections">全选</button>
-                    <button class="section-menu-link" @click="clearSelectedSections">清空</button>
-                  </div>
-                </div>
-                <div class="section-menu-list">
-                  <label
-                    v-for="(sec, i) in availableSections"
-                    :key="i"
-                    class="section-menu-item"
-                    :class="`level-${sec.level}`"
-                    :title="sec.title"
-                  >
-                    <input
-                      type="checkbox"
-                      :checked="selectedSectionTitles.includes(sec.title)"
-                      @change="toggleSection(i)"
-                    />
-                    <span class="section-menu-item-title">{{ sec.title }}</span>
-                    <span v-if="sec.page > 0" class="section-menu-item-page">p.{{ sec.page }}</span>
-                  </label>
-                </div>
-              </div>
-            </Transition>
-          </div>
-          <button
-            class="context-btn"
-            :class="{ active: hasFulltext }"
-            :disabled="!fulltextReady"
-            :title="fulltextReady ? '全文（可与 AI 总结同时选择）' : '请先获取全文'"
-            @click="toggleContext('fulltext')"
-          >全文</button>
-          <button
-            class="context-btn context-btn-pdf"
-            :class="{ active: usePdf }"
-            :disabled="!pdfSupported"
-            :title="pdfSupported ? 'PDF（直接将 PDF 文件发给模型，仅 OpenRouter 支持）' : '当前模型不支持直接上传 PDF'"
-            @click="usePdf = pdfSupported ? !usePdf : usePdf"
-          >PDF</button>
-          <span v-if="!fulltextReady && !fulltextChecking" class="context-hint">请先获取全文</span>
-        </div>
         <div class="composer-box">
           <div v-if="attachments.length" class="attachment-row">
             <div
@@ -2689,17 +2413,6 @@ function toggleContextPanel(nodeId: string) {
             </button>
             <button class="toolbar-btn" title="上传图片或 PDF" @click="openFilePicker">
               <Icon icon="fluent:attach-24-regular" width="15" height="15" />
-            </button>
-
-            <!-- Server-side web search (DeepSeek only) -->
-            <button
-              v-if="webSearchAvailable"
-              class="toolbar-btn"
-              :class="{ 'toolbar-btn-active': useWebSearch }"
-              :title="useWebSearch ? '联网搜索：已开启' : '联网搜索：让模型在回答前检索网页'"
-              @click="useWebSearch = !useWebSearch"
-            >
-              <Icon icon="fluent:globe-search-24-regular" width="15" height="15" />
             </button>
 
             <!-- Reasoning / thinking mode picker -->
@@ -2790,7 +2503,10 @@ function toggleContextPanel(nodeId: string) {
                 :class="{ active: conv.id === activeConversation?.id }"
                 @click="openConversation(conv.id)"
               >
-                <span class="history-title">{{ conv.title }}</span>
+                <span class="history-title">
+                  <span v-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
+                  {{ conv.title }}
+                </span>
                 <span class="history-meta">{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
                 <button class="history-delete" title="删除" @click="deleteConversation(conv.id, $event)">
                   <Icon icon="fluent:delete-24-regular" width="13" height="13" />
@@ -3124,14 +2840,20 @@ function toggleContextPanel(nodeId: string) {
   flex-direction: column;
   gap: 2px;
 }
-.model-name,
+/* Parameter count. Plain text rather than a filled chip: every row carries one,
+   and a grid of grey blocks buried the model names they were meant to annotate.
+   The dot separates it from the capability list that follows. */
 .row-size {
-  margin-right: 6px;
-  padding: 0 4px;
-  border-radius: var(--radius-sm);
-  font-size: 9.5px;
+  margin-right: 5px;
+  font-size: 10px;
   font-weight: 600;
-  background: color-mix(in srgb, var(--text-secondary) 11%, transparent);
+  color: var(--text-tertiary);
+}
+.row-size::after {
+  content: '·';
+  margin-left: 5px;
+  font-weight: 400;
+  opacity: 0.55;
 }
 .row-size.assumed { opacity: 0.6; font-weight: 500; }
 
@@ -3268,15 +2990,9 @@ function toggleContextPanel(nodeId: string) {
 .standalone .empty-chat {
   min-height: 100%;
 }
-.empty-orb {
-  width: 46px;
-  height: 46px;
-  border-radius: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 11%, transparent);
+.empty-doodle {
+  color: color-mix(in srgb, var(--accent) 62%, var(--text-tertiary));
+  margin-bottom: 2px;
 }
 .empty-chat p {
   margin: 0;
@@ -3396,47 +3112,6 @@ function toggleContextPanel(nodeId: string) {
   display: flex;
   align-items: center;
   gap: 7px;
-}
-.websearch-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  flex-shrink: 0;
-  padding: 1px 5px;
-  border-radius: 4px;
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-}
-.websearch-status {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  /* Same horizontal inset as .answer-body — without it the icon sat flush
-     against the card border while the text below it was indented. */
-  padding: 9px 11px 0;
-  font-size: 11.5px;
-  color: var(--text-secondary);
-}
-.websearch-status svg { animation: websearch-pulse 1.4s ease-in-out infinite; }
-@keyframes websearch-pulse {
-  0%, 100% { opacity: 0.45; }
-  50% { opacity: 1; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .websearch-status svg { animation: none; }
-}
-.pdf-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: #fee2e2;
-  color: #b91c1c;
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.02em;
 }
 .answer-logo {
   width: 21px;
@@ -3676,6 +3351,9 @@ function toggleContextPanel(nodeId: string) {
 .usage-cost-est { color: var(--text-tertiary); font-weight: 400; }
 .error-badge { color: #ef4444; }
 
+/* Holds the agent write-approval card, aligned to the composer's inner width. */
+.write-confirm-slot { flex-shrink: 0; padding: 0 10px; }
+
 .composer {
   position: relative;
   flex-shrink: 0;
@@ -3764,180 +3442,6 @@ function toggleContextPanel(nodeId: string) {
 .composer-box:focus-within {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border-default));
 }
-.context-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 2px;
-}
-.context-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  padding: 3px 10px;
-  border-radius: 6px;
-  font-size: 11.5px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  border: 1.5px solid var(--border-subtle);
-  background: color-mix(in srgb, var(--bg-primary) 70%, transparent);
-  transition: all .12s ease;
-}
-.context-btn:hover {
-  color: var(--text-primary);
-  background: var(--bg-hover);
-}
-.context-btn:disabled {
-  color: var(--text-tertiary);
-  border-color: var(--border-subtle);
-  background: color-mix(in srgb, var(--text-primary) 4%, transparent);
-  opacity: .48;
-  cursor: not-allowed;
-}
-.context-btn:disabled:hover {
-  color: var(--text-tertiary);
-  background: color-mix(in srgb, var(--text-primary) 4%, transparent);
-}
-.context-btn.active {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 32%, var(--border-default));
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-.context-hint {
-  margin-left: 2px;
-  color: var(--text-tertiary);
-  font-size: 11.5px;
-  line-height: 1;
-}
-.context-btn-pdf.active {
-  color: #b91c1c;
-  border-color: color-mix(in srgb, #b91c1c 32%, var(--border-default));
-  background: color-mix(in srgb, #b91c1c 10%, transparent);
-}
-
-.context-count {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 15px;
-  height: 15px;
-  padding: 0 4px;
-  border-radius: 8px;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
-  color: #fff;
-  background: var(--accent);
-}
-
-/* ── Section (chapter) context dropdown — opens upward, spans the composer ── */
-.context-section-wrap { display: inline-flex; }
-/* Reserve enough width up front so adding the count badge doesn't shift layout. */
-.context-btn-sections {
-  min-width: 74px;
-  justify-content: center;
-}
-.context-btn-label { flex-shrink: 0; }
-.context-caret {
-  flex-shrink: 0;
-  opacity: 0.55;
-  transition: transform 0.16s ease;
-}
-.context-caret.open { transform: rotate(180deg); }
-
-.section-menu {
-  position: absolute;
-  bottom: 100%;
-  left: 10px;
-  right: 10px;
-  margin-bottom: 6px;
-  z-index: 40;
-  background: var(--bg-primary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-.section-menu-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border-subtle);
-}
-.section-menu-title { font-size: 11.5px; font-weight: 600; color: var(--text-secondary); }
-.section-menu-actions { display: flex; gap: 8px; }
-.section-menu-link {
-  font-size: 11px;
-  color: var(--accent);
-  cursor: pointer;
-}
-.section-menu-link:hover { text-decoration: underline; }
-.section-menu-list {
-  max-height: 320px;
-  overflow-y: auto;
-  padding: 4px;
-}
-.section-menu-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 7px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  font-size: var(--font-size-sm);
-  color: var(--text-primary);
-}
-.section-menu-item:hover { background: var(--bg-hover); }
-/* Custom checkbox: the native control renders as an ugly black box in some
-   themes; draw our own rounded box with an accent check instead. */
-.section-menu-item input {
-  appearance: none;
-  -webkit-appearance: none;
-  flex-shrink: 0;
-  width: 15px;
-  height: 15px;
-  margin: 0;
-  border: 1.5px solid var(--border-default);
-  border-radius: 4px;
-  background: var(--bg-primary);
-  cursor: pointer;
-  position: relative;
-  transition: background 0.12s, border-color 0.12s;
-}
-.section-menu-item input:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-default)); }
-.section-menu-item input:checked {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-.section-menu-item input:checked::after {
-  content: '';
-  position: absolute;
-  left: 4px;
-  top: 1px;
-  width: 4px;
-  height: 8px;
-  border: solid #fff;
-  border-width: 0 2px 2px 0;
-  transform: rotate(45deg);
-}
-.section-menu-item.level-2 { padding-left: 20px; color: var(--text-secondary); }
-.section-menu-item.level-3 { padding-left: 34px; color: var(--text-tertiary); font-size: var(--font-size-xs); }
-.section-menu-item-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.section-menu-item-page {
-  flex-shrink: 0;
-  font-size: var(--font-size-xs);
-  color: var(--text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
-.section-menu-enter-active,
-.section-menu-leave-active { transition: opacity 0.12s ease, transform 0.12s ease; }
-.section-menu-enter-from,
-.section-menu-leave-to { opacity: 0; transform: translateY(6px); }
-
 .composer-input {
   flex: 1;
   min-height: 68px;
@@ -4151,6 +3655,122 @@ function toggleContextPanel(nodeId: string) {
 .reasoning-drop-leave-to { opacity: 0; transform: translateY(4px); }
 
 /* Reasoning section in answer card */
+.agent-trail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+}
+.agent-trail-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 3px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+}
+.agent-trail-head svg { flex-shrink: 0; }
+.agent-trail-head.busy { color: var(--accent); }
+
+.agent-step-wrap { display: flex; flex-direction: column; }
+.agent-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.agent-step:hover { background: var(--bg-hover); }
+.agent-step.open { background: var(--bg-hover); }
+.agent-step svg { flex-shrink: 0; color: var(--text-tertiary); }
+.agent-step svg.failed { color: #ef4444; }
+.agent-step-chevron { transition: transform 0.14s ease; }
+.agent-step-chevron.open { transform: rotate(90deg); }
+.agent-step-size { flex-shrink: 0; margin-left: auto; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.agent-step-tool {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: none;
+  padding: 0;
+}
+
+/* The payload behind a row. Capped and scrollable: a full-text slice is tens of
+   thousands of characters, and it must not push the answer off the screen. */
+.agent-step-detail {
+  margin: 2px 0 6px 20px;
+  padding: 7px 9px;
+  border-left: 2px solid var(--border-default);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--bg-primary);
+}
+.agent-detail-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  margin-bottom: 3px;
+}
+.agent-detail-label + .agent-detail-code { margin-bottom: 8px; }
+.agent-detail-note { font-weight: 400; color: var(--text-tertiary); }
+.agent-detail-code {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Marks the one conversation whose prompt cache is being kept warm. */
+.conv-cache-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: #22c55e;
+  vertical-align: middle;
+  flex-shrink: 0;
+  animation: conv-cache-breathe 2.4s ease-in-out infinite;
+}
+@keyframes conv-cache-breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
+  50% { opacity: 0.4; box-shadow: 0 0 0 4px rgba(34, 197, 94, 0); }
+}
+.agent-step-server {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 9.5px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.agent-step-args {
+  min-width: 0;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-note { font-size: 10.5px; line-height: 1.5; color: #b45309; }
+.spin { animation: agent-spin 1.1s linear infinite; }
+@keyframes agent-spin { to { transform: rotate(360deg); } }
+
 .reasoning-section {
   border-bottom: 1px solid var(--border-subtle);
   background: color-mix(in srgb, var(--accent) 4%, transparent);

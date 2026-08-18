@@ -35,7 +35,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::models::{Highlight, Note, PaperMeta};
-use crate::{canvas, collections, ebook, extraction, library, metadata, paper, search, sections, snippets};
+use crate::{canvas, collections, ebook, extraction, library, metadata, paper, search, snippets};
 
 /// Library artifacts that must never be reachable through an MCP tool.
 ///
@@ -77,7 +77,7 @@ pub const REDACTED_CONVERSATION_FIELDS: &[&str] = &[
 pub const DEFAULT_FULLTEXT_CHARS: usize = 8_000;
 /// Hard ceiling on a single fulltext slice, so a large `limit` cannot be used to
 /// pull an entire paper in one call.
-pub const MAX_FULLTEXT_CHARS: usize = 40_000;
+pub const MAX_FULLTEXT_CHARS: usize = 100_000;
 
 /// Per-message ceiling when returning a conversation.
 ///
@@ -89,32 +89,25 @@ pub const MAX_MESSAGE_CHARS: usize = 6_000;
 /// Preview length for a conversation in a listing.
 const PREVIEW_CHARS: usize = 160;
 
-/// How much of an abstract travels with a paper by default.
-///
-/// A default, not a ceiling: callers pass `abstract_detail: "full"` when they
-/// want the whole thing. Enough to triage a listing without making every
-/// `list_papers` carry a hundred kilobytes nobody asked for.
-const SUMMARY_ABSTRACT_CHARS: usize = 400;
-
-/// How much of an abstract a caller wants.
+/// Whether a caller wants each paper's abstract included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbstractDetail {
-    /// Omit it — for callers that only need identifiers.
+    /// Omit it — the default. Listings the caller only scans to pick papers by
+    /// title carry no abstract at all.
     None,
-    /// Opening lines, enough to tell what a paper is for.
-    Preview,
-    /// The whole abstract.
+    /// The whole abstract. Abstracts are short enough that there is no middle
+    /// ground worth offering: a caller either needs the text or does not.
     Full,
 }
 
 impl AbstractDetail {
-    /// Anything unrecognised is a preview: a typo in this argument should not
-    /// silently strip the abstracts a caller was relying on.
+    /// Off unless the caller types exactly "full". Omitting the abstract is the
+    /// safe default, so a missing argument or a typo leaves it out rather than
+    /// silently carrying it.
     pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(str::trim) {
             Some("full") => AbstractDetail::Full,
-            Some("none") => AbstractDetail::None,
-            _ => AbstractDetail::Preview,
+            _ => AbstractDetail::None,
         }
     }
 }
@@ -179,9 +172,13 @@ pub struct PaperSummary {
     pub has_bibtex: bool,
     /// How many papers the user linked this one to by hand.
     pub related_count: usize,
-    /// The abstract, at whatever detail `abstract_detail` asked for. Ends with
-    /// `…` when it was cut short.
+    /// The full abstract, present only when `abstract_detail: "full"` was asked
+    /// for; omitted otherwise.
     pub paper_abstract: Option<String>,
+    /// Matching excerpt from the paper's body, present only when the `content`
+    /// (full-text) query matched this paper. Says *where* the query hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -231,25 +228,6 @@ pub struct PaperDetail {
     /// Characters of extracted full text available via `get_paper_fulltext`.
     /// Zero means extraction has not run (or produced nothing) for this paper.
     pub fulltext_chars: usize,
-    pub has_sections: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct SearchResult {
-    pub slug: String,
-    pub title: String,
-    pub authors: Vec<String>,
-    pub year: Option<u32>,
-    /// Journal or conference.
-    pub venue: Option<String>,
-    /// Citation count, when the user recorded one.
-    pub cite_count: Option<u32>,
-    /// Matching excerpt with the query terms in context. Says *where* the query
-    /// hit; `abstract_preview` says what the paper is about.
-    pub snippet: String,
-    /// The abstract, at whatever detail `abstract_detail` asked for. Ends with
-    /// `…` when it was cut short.
-    pub paper_abstract: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -264,23 +242,6 @@ pub struct FulltextSlice {
     pub total: usize,
     /// True when more text follows — call again with `offset = offset + returned`.
     pub has_more: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct SectionEntry {
-    pub title: String,
-    /// 1 = section, 2 = subsection, 3 = sub-subsection.
-    pub level: u8,
-    /// 1-based page number; 0 when unknown.
-    pub page: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct PaperSectionList {
-    pub slug: String,
-    /// How the outline was derived: "outline" | "heuristic" | "ai".
-    pub source: String,
-    pub sections: Vec<SectionEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -310,9 +271,6 @@ pub struct HighlightEntry {
     pub text: String,
     /// The user's annotation on this highlight; empty when they only marked it.
     pub note: String,
-    pub color: String,
-    /// "highlight" | "underline" | …
-    pub style: String,
     pub created_at: String,
 }
 
@@ -356,7 +314,7 @@ pub struct LibraryStats {
     pub read: usize,
 
     /// Papers whose text has been extracted — i.e. `get_paper_fulltext` and
-    /// `search_papers` can reach them.
+    /// `find_papers`'s `content` search can reach them.
     pub with_fulltext: usize,
     /// Papers with an AI-generated analysis.
     pub with_ai_summary: usize,
@@ -373,7 +331,8 @@ pub struct LibraryStats {
     pub latest_year: Option<u32>,
     /// Papers with no publication year recorded.
     pub without_year: usize,
-    /// Publication years present, most recent first.
+    /// Publication years present, most recent first, capped at the 10 most
+    /// recent. The full span is still given by `earliest_year`/`latest_year`.
     pub by_year: Vec<YearCount>,
 
     pub distinct_tags: usize,
@@ -442,6 +401,19 @@ pub struct SnippetEntry {
     pub created_at: String,
 }
 
+/// Result of `search_snippets`: the matching snippets plus the full list of the
+/// user's snippet libraries (folded in so no separate listing call is needed).
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SnippetSearch {
+    /// Every snippet library the user has, with id and size, so a caller can
+    /// then narrow by `library_id`. Always included; it is small.
+    pub libraries: Vec<SnippetLibraryEntry>,
+    /// The matching snippets (all of them when no `query` was given).
+    pub snippets: Vec<SnippetEntry>,
+    /// How many snippets came back in `snippets`.
+    pub count: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ConversationSummary {
     pub conversation_id: String,
@@ -497,8 +469,8 @@ pub struct ConversationDetail {
 /// lowercasing does not preserve byte length: `İ` (U+0130) is two bytes and
 /// lowercases to three, `ẞ` is three and lowercases to two. Indexing the
 /// original with an offset taken from the copy therefore lands mid-character
-/// after any such letter, and `&original[..offset]` panics. Turkish and German
-/// names in a paper's front matter are enough to hit it.
+/// after any such letter, and `&original[..offset]` panics — a stray İ or ẞ in
+/// a conversation is enough to hit it.
 ///
 /// So the copy is built alongside a table saying which byte of the original each
 /// byte of the copy came from. Every offset that comes back out is a real char
@@ -561,41 +533,23 @@ fn venue_rank_of(meta: &PaperMeta) -> Option<VenueRank> {
 mod abstract_tests {
     use super::*;
 
+    /// "full" returns the whole abstract, untouched — long ones are no longer
+    /// cut, since preview is gone.
     #[test]
-    fn a_long_abstract_is_cut_and_marked() {
-        let long = "字".repeat(SUMMARY_ABSTRACT_CHARS + 50);
-        let out = abstract_at(Some(&long), AbstractDetail::Preview).unwrap();
-        // Character count, not bytes: a CJK abstract cut on a byte boundary
-        // would not be valid UTF-8 at all.
-        assert_eq!(out.chars().count(), SUMMARY_ABSTRACT_CHARS + 1);
-        assert!(out.ends_with('…'), "the reader must know it was cut");
-    }
-
-    #[test]
-    fn a_short_abstract_arrives_whole_and_unmarked() {
-        let short = "We propose the Transformer.".to_string();
+    fn full_detail_returns_the_whole_abstract() {
+        let text = "字".repeat(2000);
         assert_eq!(
-            abstract_at(Some(&short), AbstractDetail::Preview).as_deref(),
-            Some(short.as_str())
+            abstract_at(Some(&text), AbstractDetail::Full).as_deref(),
+            Some(text.as_str())
         );
     }
 
-    /// A missing abstract is `None`, not an empty string that reads to a model
-    /// like "this paper's abstract is blank".
+    /// A missing or blank abstract is `None`, not an empty string that reads to
+    /// a model like "this paper's abstract is blank".
     #[test]
-    fn nothing_to_preview_is_absent_not_empty() {
-        assert_eq!(abstract_at(None, AbstractDetail::Preview), None);
-        assert_eq!(abstract_at(Some(&"   \n ".to_string()), AbstractDetail::Preview), None);
-    }
-
-    /// The point of the detail argument: a caller with room for it gets the
-    /// whole abstract, uncut and unmarked.
-    #[test]
-    fn full_detail_returns_the_whole_abstract() {
-        let long = "字".repeat(SUMMARY_ABSTRACT_CHARS * 4);
-        let out = abstract_at(Some(&long), AbstractDetail::Full).unwrap();
-        assert_eq!(out.chars().count(), SUMMARY_ABSTRACT_CHARS * 4);
-        assert!(!out.ends_with('…'), "nothing was cut, so nothing should say it was");
+    fn nothing_to_return_is_absent_not_empty() {
+        assert_eq!(abstract_at(None, AbstractDetail::Full), None);
+        assert_eq!(abstract_at(Some(&"   \n ".to_string()), AbstractDetail::Full), None);
     }
 
     #[test]
@@ -604,17 +558,20 @@ mod abstract_tests {
         assert_eq!(abstract_at(Some(&text), AbstractDetail::None), None);
     }
 
-    /// A typo must not silently strip the abstracts the caller was counting on.
+    /// Omitting the abstract is the default, so anything that is not exactly
+    /// "full" — a missing argument, a typo, or the retired "preview"/"none"
+    /// values — leaves it out.
     #[test]
-    fn an_unrecognised_detail_falls_back_to_preview() {
-        assert_eq!(AbstractDetail::parse(Some("wat")), AbstractDetail::Preview);
-        assert_eq!(AbstractDetail::parse(None), AbstractDetail::Preview);
-        assert_eq!(AbstractDetail::parse(Some("full")), AbstractDetail::Full);
+    fn anything_but_full_falls_back_to_none() {
+        assert_eq!(AbstractDetail::parse(None), AbstractDetail::None);
+        assert_eq!(AbstractDetail::parse(Some("wat")), AbstractDetail::None);
+        assert_eq!(AbstractDetail::parse(Some("preview")), AbstractDetail::None);
         assert_eq!(AbstractDetail::parse(Some("none")), AbstractDetail::None);
+        assert_eq!(AbstractDetail::parse(Some("full")), AbstractDetail::Full);
     }
 }
 
-/// The abstract as the caller asked for it.
+/// The abstract when the caller asked for it (`Full`), otherwise nothing.
 fn abstract_at(text: Option<&String>, detail: AbstractDetail) -> Option<String> {
     if detail == AbstractDetail::None {
         return None;
@@ -623,15 +580,7 @@ fn abstract_at(text: Option<&String>, detail: AbstractDetail) -> Option<String> 
     if trimmed.is_empty() {
         return None;
     }
-    if detail == AbstractDetail::Full {
-        return Some(trimmed.to_string());
-    }
-    let cut: String = trimmed.chars().take(SUMMARY_ABSTRACT_CHARS).collect();
-    Some(if trimmed.chars().count() > SUMMARY_ABSTRACT_CHARS {
-        format!("{cut}…")
-    } else {
-        cut
-    })
+    Some(trimmed.to_string())
 }
 
 fn summarize(
@@ -657,6 +606,7 @@ fn summarize(
         added_at: entry.added_at.clone(),
         has_bibtex: entry.has_bibtex.unwrap_or(false),
         related_count: entry.related_ids.len(),
+        snippet: None,
     }
 }
 
@@ -677,14 +627,20 @@ fn matches_query(entry: &crate::models::PaperIndexEntry, needle: &str) -> bool {
 
 // ── Tool implementations ─────────────────────────────────────────────────────
 
-pub struct ListPapersArgs<'a> {
+pub struct FindPapersArgs<'a> {
+    /// Case-insensitive substring over title/authors/tags/venue — matches all
+    /// papers, extracted or not.
     pub query: Option<&'a str>,
+    /// Full-text FTS5 query over the extracted body. Restricts results to papers
+    /// whose text matched, ranks them by relevance, and attaches a `snippet`.
+    pub content: Option<&'a str>,
     pub tag: Option<&'a str>,
     pub collection_id: Option<&'a str>,
     pub reading_status: Option<&'a str>,
     pub year_from: Option<u32>,
     pub year_to: Option<u32>,
-    /// "added" | "year" | "citations" | "title". Defaults to "added".
+    /// "added" | "year" | "citations" | "title". Defaults to "added", or to
+    /// full-text relevance when `content` is given and no sort is requested.
     pub sort_by: Option<&'a str>,
     /// "desc" (default) | "asc".
     pub order: Option<&'a str>,
@@ -694,17 +650,40 @@ pub struct ListPapersArgs<'a> {
     pub min_citations: Option<u32>,
     /// Only papers whose text has been extracted (i.e. readable and searchable).
     pub has_fulltext: Option<bool>,
-    /// "preview" (default) | "full" | "none".
+    /// "none" (default) | "full".
     pub abstract_detail: Option<&'a str>,
     pub limit: usize,
     pub offset: usize,
 }
 
-pub fn list_papers(root: &str, args: ListPapersArgs<'_>) -> Result<PaperListPage, String> {
+pub fn find_papers(root: &str, args: FindPapersArgs<'_>) -> Result<PaperListPage, String> {
     // `scan_library` is incremental — it stats meta.json and only re-reads the
     // ones whose mtime moved — so this stays cheap while still picking up papers
     // imported since the index was last written.
     let mut entries = library::scan_library(root)?;
+
+    // Full-text axis. Run FTS first: it both filters (keep only papers whose
+    // body matched) and ranks (relevance order), and carries the snippet each
+    // matching paper gets. `content_rank` doubles as the "matched full text" set.
+    let (content_snippets, content_rank) = match args.content.filter(|c| !c.trim().is_empty()) {
+        Some(q) => {
+            // The FTS index is a rebuildable cache and may lag a library edited
+            // on another machine; refresh before querying.
+            let _ = search::ensure_current(root);
+            let hits = search::search_fulltext(root, q)?;
+            let mut snippets: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut rank: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for (i, h) in hits.into_iter().enumerate() {
+                rank.entry(h.slug.clone()).or_insert(i);
+                snippets.entry(h.slug).or_insert(h.snippet);
+            }
+            (Some(snippets), Some(rank))
+        }
+        None => (None, None),
+    };
+    if let Some(rank) = &content_rank {
+        entries.retain(|e| rank.contains_key(&e.slug));
+    }
 
     // A collection filter needs the assignment table, which is keyed by paper
     // `id` rather than slug.
@@ -749,10 +728,15 @@ pub fn list_papers(root: &str, args: ListPapersArgs<'_>) -> Result<PaperListPage
     }
 
     // Default: newest first. An agent asking for "my papers" usually wants
-    // recent work, and truncation at `limit` should drop the oldest.
+    // recent work, and truncation at `limit` should drop the oldest. But when a
+    // full-text query is in play and no explicit sort was asked for, order by
+    // relevance instead — the rank the FTS hit list gave each paper.
     let descending = !matches!(args.order, Some("asc"));
-    match args.sort_by {
-        Some("year") => {
+    match (args.sort_by, &content_rank) {
+        (None, Some(rank)) => {
+            entries.sort_by_key(|e| *rank.get(&e.slug).unwrap_or(&usize::MAX));
+        }
+        (Some("year"), _) => {
             // Papers with no year sort last either way — an unknown year is not
             // "year zero", and burying them at the top of an ascending list
             // would hide the oldest real papers.
@@ -763,13 +747,13 @@ pub fn list_papers(root: &str, args: ListPapersArgs<'_>) -> Result<PaperListPage
                 (None, None) => a.title.cmp(&b.title),
             });
         }
-        Some("citations") => {
+        (Some("citations"), _) => {
             entries.sort_by(|a, b| {
                 let (x, y) = (a.cite_count.unwrap_or(0), b.cite_count.unwrap_or(0));
                 if descending { y.cmp(&x) } else { x.cmp(&y) }
             });
         }
-        Some("title") => {
+        (Some("title"), _) => {
             entries.sort_by(|a, b| {
                 let (x, y) = (a.title.to_lowercase(), b.title.to_lowercase());
                 if descending { y.cmp(&x) } else { x.cmp(&y) }
@@ -786,12 +770,19 @@ pub fn list_papers(root: &str, args: ListPapersArgs<'_>) -> Result<PaperListPage
         }
     }
 
+    let detail = AbstractDetail::parse(args.abstract_detail);
     let total = entries.len();
     let papers = entries
         .iter()
         .skip(args.offset)
         .take(args.limit)
-        .map(|e| summarize(root, e, AbstractDetail::parse(args.abstract_detail)))
+        .map(|e| {
+            let mut summary = summarize(root, e, detail);
+            if let Some(snips) = &content_snippets {
+                summary.snippet = snips.get(&e.slug).cloned();
+            }
+            summary
+        })
         .collect();
     Ok(PaperListPage {
         total,
@@ -852,43 +843,7 @@ pub fn get_paper(root: &str, slug: &str) -> Result<PaperDetail, String> {
         notes,
         highlight_count: paper::read_highlights(root, slug).len(),
         fulltext_chars: extraction::read_fulltext(root, slug).chars().count(),
-        has_sections: sections::read_sections(root, slug).is_some(),
     })
-}
-
-pub fn search_papers(
-    root: &str,
-    query: &str,
-    limit: usize,
-    detail: AbstractDetail,
-) -> Result<Vec<SearchResult>, String> {
-    // Keep the FTS index current before querying it; the index is a rebuildable
-    // cache and may lag a library edited on another machine.
-    let _ = search::ensure_current(root);
-    let hits = search::search_fulltext(root, query)?;
-    Ok(hits
-        .into_iter()
-        .take(limit)
-        .map(|h| {
-            // One `meta.json` read per returned hit, bounded by `limit`, so a
-            // result can carry what the paper is about rather than only where
-            // the query matched.
-            let meta = paper::read_meta(root, &h.slug).ok();
-            SearchResult {
-                year: meta.as_ref().and_then(|m| m.year),
-                venue: meta.as_ref().and_then(|m| m.venue.clone()),
-                cite_count: meta.as_ref().and_then(|m| m.cite_count),
-                paper_abstract: abstract_at(
-                    meta.as_ref().and_then(|m| m.paper_abstract.as_ref()),
-                    detail,
-                ),
-                slug: h.slug,
-                title: h.title,
-                authors: h.authors,
-                snippet: h.snippet,
-            }
-        })
-        .collect())
 }
 
 pub fn get_paper_fulltext(
@@ -896,91 +851,23 @@ pub fn get_paper_fulltext(
     slug: &str,
     offset: usize,
     limit: usize,
-    section: Option<&str>,
 ) -> Result<FulltextSlice, String> {
     // Fail loudly on an unknown slug rather than returning an empty slice that
     // reads like "this paper has no text".
     paper::read_meta(root, slug)?;
     let full = extraction::read_fulltext(root, slug);
 
-    // A section name narrows the window before paging. The heading text in
-    // sections.json is what the extractor saw in the document, so a plain
-    // case-insensitive search for it in the full text locates the section start.
-    let (base, base_offset) = match section {
-        Some(name) if !name.trim().is_empty() => {
-            // Folded once and reused: the sibling-heading scan below searches
-            // the same text again for every section in the document.
-            let folded = CaseFolded::new(&full);
-            let needle = name.trim().to_lowercase();
-            match folded.find(&needle) {
-                Some(byte_start) => {
-                    // Byte index → char index, since the whole API is char-based.
-                    let char_start = full[..byte_start].chars().count();
-                    let next = sections::read_sections(root, slug)
-                        .map(|s| s.sections)
-                        .unwrap_or_default()
-                        .iter()
-                        .filter_map(|s| {
-                            let n = s.title.trim().to_lowercase();
-                            if n.is_empty() || n == needle {
-                                return None;
-                            }
-                            folded
-                                .find(&n)
-                                .map(|b| full[..b].chars().count())
-                                .filter(|c| *c > char_start)
-                        })
-                        .min()
-                        .unwrap_or_else(|| full.chars().count());
-                    let slice: String = full
-                        .chars()
-                        .skip(char_start)
-                        .take(next.saturating_sub(char_start))
-                        .collect();
-                    (slice, char_start)
-                }
-                None => {
-                    return Err(format!(
-                        "Section '{name}' not found in the extracted text of '{slug}'. \
-                         Call get_paper_sections to see the available headings."
-                    ));
-                }
-            }
-        }
-        _ => (full, 0),
-    };
-
-    let total = base.chars().count();
+    let total = full.chars().count();
     let limit = limit.clamp(1, MAX_FULLTEXT_CHARS);
-    let text: String = base.chars().skip(offset).take(limit).collect();
+    let text: String = full.chars().skip(offset).take(limit).collect();
     let returned = text.chars().count();
     Ok(FulltextSlice {
         slug: slug.to_string(),
         text,
-        offset: base_offset + offset,
+        offset,
         returned,
         total,
         has_more: offset + returned < total,
-    })
-}
-
-pub fn get_paper_sections(root: &str, slug: &str) -> Result<PaperSectionList, String> {
-    paper::read_meta(root, slug)?;
-    let data = sections::read_sections(root, slug).ok_or_else(|| {
-        format!("No section outline has been generated for '{slug}'. Use get_paper_fulltext instead.")
-    })?;
-    Ok(PaperSectionList {
-        slug: slug.to_string(),
-        source: data.source,
-        sections: data
-            .sections
-            .into_iter()
-            .map(|s| SectionEntry {
-                title: s.title,
-                level: s.level,
-                page: s.page,
-            })
-            .collect(),
     })
 }
 
@@ -1019,16 +906,65 @@ pub fn get_document_path(root: &str, slug: &str) -> Result<DocumentLocation, Str
     })
 }
 
-pub fn list_notes(root: &str, slug: &str) -> Result<Vec<NoteSummary>, String> {
-    paper::read_meta(root, slug)?;
-    Ok(paper::list_notes(root, slug)
-        .into_iter()
-        .map(|n| NoteSummary {
-            note_id: n.id,
-            title: n.title,
-            updated_at: n.updated_at,
-        })
-        .collect())
+/// Max pages one `view_paper_page` call may render, so a single call cannot
+/// return a multi-megabyte pile of images.
+pub const MAX_RENDER_PAGES: usize = 8;
+
+/// One rendered page: the PNG image plus that page's extracted text.
+///
+/// Not an MCP output shape — it is consumed by the two callers (`server` wraps
+/// the PNG as an image content block; the in-app agent base64s it and hands it
+/// to `copilot`), so it carries raw bytes rather than deriving `JsonSchema`.
+pub struct RenderedPage {
+    pub page: u32,
+    /// PNG bytes of the rendered page.
+    pub png: Vec<u8>,
+    /// Extracted text of that page; empty for a scanned page.
+    pub text: String,
+}
+
+/// Render one or more pages of a paper's PDF to PNG images (with each page's
+/// text), for an agent that needs to *see* the page — figures, diagrams, plots,
+/// tables, layout — or to read one specific page instead of the whole document.
+pub fn render_paper_pages(
+    root: &str,
+    slug: &str,
+    pages: &[u32],
+) -> Result<Vec<RenderedPage>, String> {
+    let meta = paper::read_meta(root, slug)?;
+    if ebook::is_ebook_file_type(meta.file_type.as_deref()) {
+        return Err(format!(
+            "Page rendering is only available for PDFs; '{slug}' is a {}.",
+            meta.file_type.as_deref().unwrap_or("non-PDF file")
+        ));
+    }
+    let pdf_path = metadata::find_pdf_in_dir(root, slug);
+    if !pdf_path.is_file() {
+        return Err(format!("No PDF file found for '{slug}'."));
+    }
+
+    // Dedup and cap. Pages are 1-based, so 0 is dropped rather than rendered.
+    let mut wanted: Vec<u32> = pages.iter().copied().filter(|p| *p >= 1).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted.is_empty() {
+        return Err("No valid page numbers given — pages are 1-based.".to_string());
+    }
+    wanted.truncate(MAX_RENDER_PAGES);
+
+    // Text for all requested pages in a single document load, then one
+    // `pdftoppm` invocation per page for the images.
+    let texts = extraction::extract_pages_text(&pdf_path, &wanted);
+    let mut out = Vec::with_capacity(wanted.len());
+    for p in wanted {
+        let png = crate::render::render_pdf_page_png(&pdf_path, p, crate::render::DEFAULT_DPI)?;
+        out.push(RenderedPage {
+            page: p,
+            png,
+            text: texts.get(&p).cloned().unwrap_or_default(),
+        });
+    }
+    Ok(out)
 }
 
 pub fn get_note(root: &str, slug: &str, note_id: Option<&str>) -> Result<NoteContent, String> {
@@ -1069,8 +1005,6 @@ pub fn get_highlights(root: &str, slug: &str) -> Result<Vec<HighlightEntry>, Str
             page: h.page,
             text: h.text,
             note: h.note.unwrap_or_default(),
-            color: h.color,
-            style: h.style,
             created_at: h.created_at,
         })
         .collect())
@@ -1152,6 +1086,10 @@ pub fn list_collections(root: &str) -> Result<Vec<CollectionEntry>, String> {
 /// flood the response.
 pub const MAX_TOP_TAGS: usize = 30;
 
+/// Cap on `LibraryStats::by_year`, keeping only the most recent years so a
+/// library spanning decades does not return one bucket per year.
+pub const MAX_YEAR_BUCKETS: usize = 10;
+
 fn counted_desc(counts: std::collections::HashMap<String, usize>) -> Vec<CountedValue> {
     let mut out: Vec<CountedValue> = counts
         .into_iter()
@@ -1166,7 +1104,7 @@ fn counted_desc(counts: std::collections::HashMap<String, usize>) -> Vec<Counted
 ///
 /// Everything about papers comes from one incremental index scan — the index
 /// already carries reading status, tags, year, file type and the pipeline flags
-/// — so this costs about the same as `list_papers` and saves the agent from
+/// — so this costs about the same as `find_papers` and saves the agent from
 /// probing with a series of filtered listings.
 pub fn library_stats(root: &str) -> Result<LibraryStats, String> {
     use std::collections::HashMap;
@@ -1258,6 +1196,9 @@ pub fn library_stats(root: &str) -> Result<LibraryStats, String> {
         .map(|(year, count)| YearCount { year, count })
         .collect();
     by_year.sort_by(|a, b| b.year.cmp(&a.year));
+    // Only the most recent years; the full span stays visible via
+    // earliest_year/latest_year.
+    by_year.truncate(MAX_YEAR_BUCKETS);
     stats.by_year = by_year;
 
     // The other stores are small index files; read them rather than making the
@@ -1339,7 +1280,8 @@ pub fn get_canvas(root: &str, id: &str) -> Result<CanvasDetail, String> {
     })
 }
 
-pub fn list_snippet_libraries(root: &str) -> Result<Vec<SnippetLibraryEntry>, String> {
+/// The user's snippet libraries, each with its id, name and current size.
+fn snippet_libraries(root: &str) -> Result<Vec<SnippetLibraryEntry>, String> {
     Ok(snippets::list_snippet_libraries(root)?
         .into_iter()
         .map(|lib| {
@@ -1355,20 +1297,21 @@ pub fn list_snippet_libraries(root: &str) -> Result<Vec<SnippetLibraryEntry>, St
         .collect())
 }
 
-pub fn list_snippets(
+pub fn search_snippets(
     root: &str,
     library_id: Option<&str>,
     query: Option<&str>,
     limit: usize,
-) -> Result<Vec<SnippetEntry>, String> {
+) -> Result<SnippetSearch, String> {
+    // The library list always travels with the results: it is small, and it is
+    // what a caller needs in order to then narrow by `library_id`.
+    let libraries = snippet_libraries(root)?;
+
     // No library id means "search everything" — the agent usually does not know
     // or care how the user partitioned their snippet libraries.
     let libs: Vec<String> = match library_id {
         Some(id) => vec![id.to_string()],
-        None => snippets::list_snippet_libraries(root)?
-            .into_iter()
-            .map(|l| l.id)
-            .collect(),
+        None => libraries.iter().map(|l| l.id.clone()).collect(),
     };
 
     let needle = query
@@ -1376,7 +1319,7 @@ pub fn list_snippets(
         .filter(|q| !q.is_empty());
 
     let mut out = Vec::new();
-    for lib in libs {
+    'libs: for lib in libs {
         for s in snippets::get_snippets(root, &lib)? {
             if let Some(n) = &needle {
                 let hit = s.text.to_lowercase().contains(n)
@@ -1398,11 +1341,15 @@ pub fn list_snippets(
                 created_at: s.created_at,
             });
             if out.len() >= limit {
-                return Ok(out);
+                break 'libs;
             }
         }
     }
-    Ok(out)
+    Ok(SnippetSearch {
+        count: out.len(),
+        libraries,
+        snippets: out,
+    })
 }
 
 // ── Conversations ────────────────────────────────────────────────────────────
@@ -1600,9 +1547,16 @@ pub fn list_conversations(
         .filter(|q| !q.is_empty());
     let mut out: Vec<ConversationSummary> = Vec::new();
 
-    // A slug always narrows to that paper, whatever `scope` says.
-    let want_library = slug.is_none() && matches!(scope, "library" | "all");
-    let want_papers = slug.is_some() || matches!(scope, "paper" | "all");
+    // `scope` is required and binary: "library" for library-wide Q&A, "paper"
+    // for per-paper chats. A `slug` only narrows the "paper" scope; it is
+    // ignored under "library".
+    let want_library = scope == "library";
+    let want_papers = scope == "paper";
+    if !want_library && !want_papers {
+        return Err(format!(
+            "scope must be \"paper\" or \"library\", got {scope:?}."
+        ));
+    }
 
     if want_library {
         for conv in as_conversation_array(crate::copilot::read_library_conversations(root)) {

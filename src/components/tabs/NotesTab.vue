@@ -372,6 +372,7 @@ function fmtDate(iso: string) {
       <div v-if="loadingList" class="empty">…</div>
 
       <div v-else-if="notes.length === 0" class="empty-list">
+        <Icon class="empty-doodle" icon="doodle:writing-notebook" width="64" height="64" />
         <p>{{ t('notes.noNotes') }}</p>
         <span>{{ t('notes.noNotesHint') }}</span>
 
@@ -621,6 +622,13 @@ function fmtDate(iso: string) {
 .new-btn:hover { background: var(--bg-tertiary); }
 
 /* ── Empty list ── */
+/* Hand-drawn figure for this panel's empty state: someone doing the thing the
+   panel fills up with. Muted so it reads as an illustration, not a control. */
+.empty-doodle {
+  color: color-mix(in srgb, var(--accent) 55%, var(--text-tertiary));
+  margin-bottom: 2px;
+}
+
 .empty-list {
   flex: 1;
   display: flex;

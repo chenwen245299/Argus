@@ -23,9 +23,13 @@
 //! guarantee that AI provider config and API keys stay unreachable lives.
 
 pub mod agent;
+pub mod app_tools;
 pub mod client;
 mod server;
-mod tools;
+// `tools` is the read-only data layer. `pub(crate)` rather than private so
+// the paper AI panel can front-load a paper's `get_paper` card into its system
+// prompt; still not `pub`, so nothing outside the crate reaches it.
+pub(crate) mod tools;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -591,18 +595,23 @@ mod protocol_tests {
             .find(|m| m["id"] == 1)
             .unwrap_or_else(|| panic!("no tools/list response: {out:?}"));
         let tools = listing["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17, "unexpected tool count");
+        assert_eq!(tools.len(), 14, "unexpected tool count");
 
         // The two schema rules that made every tool vanish when broken.
         let wire = listing["result"].to_string();
         assert!(!wire.contains("$ref"), "a dangling $ref reached the client");
         assert!(!wire.contains("$defs"), "$defs reached the client");
         for tool in tools {
-            assert_eq!(
-                tool["outputSchema"]["type"], "object",
-                "tool '{}' has a non-object outputSchema",
-                tool["name"]
-            );
+            // `view_paper_page` returns image content, not structured JSON, so it
+            // declares no outputSchema; the object rule only applies where one
+            // is present.
+            if tool.get("outputSchema").is_some_and(|s| s.is_object()) {
+                assert_eq!(
+                    tool["outputSchema"]["type"], "object",
+                    "tool '{}' has a non-object outputSchema",
+                    tool["name"]
+                );
+            }
         }
     }
 
@@ -616,7 +625,8 @@ mod protocol_tests {
                 initialized(),
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                    "params": { "name": "list_papers", "arguments": {} }
+                    "params": { "name": "find_papers",
+                                "arguments": { "abstract_detail": "full" } }
                 }),
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -627,12 +637,12 @@ mod protocol_tests {
         )
         .await;
 
-        let page = out.iter().find(|m| m["id"] == 1).expect("no list_papers response");
+        let page = out.iter().find(|m| m["id"] == 1).expect("no find_papers response");
         let structured = &page["result"]["structuredContent"];
         assert_eq!(structured["total"], 1, "{page}");
         assert_eq!(structured["papers"][0]["slug"], "attention-2017");
-        // A listing has to say what a paper is *about*, not just name it, or the
-        // reader must open every one to find the relevant few.
+        // Abstracts are opt-in now: with `abstract_detail: "full"` the whole
+        // abstract has to survive serialization back to the caller.
         assert_eq!(
             structured["papers"][0]["paper_abstract"], "We propose the Transformer.",
             "the abstract did not survive the wire: {structured}"
@@ -682,7 +692,7 @@ mod protocol_tests {
                 initialized(),
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                    "params": { "name": "list_papers", "arguments": {} }
+                    "params": { "name": "find_papers", "arguments": {} }
                 }),
             ],
         )

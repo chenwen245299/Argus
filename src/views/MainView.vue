@@ -92,8 +92,9 @@ const MAIN_RIGHT_WIDTH_KEY = 'argus:layout:right-width'
 const MAIN_RIGHT_VISIBLE_KEY = 'argus:layout:right-visible'
 const MAIN_RIGHT_TAB_KEY = 'argus:layout:right-tab'
 const PAPER_TABS = ['notes', 'highlights', 'sections', 'ai', 'metadata']
-// Tabs available while the canvas/graph is shown (翻译/批注 hidden, 绘图 added).
-const CANVAS_TABS = ['draw', 'notes', 'ai', 'metadata']
+// Tabs available while the canvas/graph is shown (翻译/批注 hidden, 绘图 and the
+// canvas chat added).
+const CANVAS_TABS = ['draw', 'canvasChat', 'notes', 'ai', 'metadata']
 const MIN_LEFT_WIDTH = 240
 const MAX_LEFT_WIDTH = 360
 const DEFAULT_LEFT_WIDTH = 220

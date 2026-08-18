@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
 use crate::models::{
-    AiProvider, ChatContent, ChatContentPart, ChatMessage, FileData, PaperMeta, RetrievedChunk,
+    AgentMessage, AiProvider, ChatContent, ChatContentPart, ChatMessage, FileData, PaperMeta,
+    RetrievedChunk,
 };
 use crate::{ai_manager, ai_summary, extraction, llm, paper, rag};
 
@@ -254,6 +255,110 @@ pub fn delete_library_conversation(root: &str, id: &str) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Delete conversation: {e}")),
     }
+}
+
+/// Directory holding a conversation's rendered page images, beside its JSON.
+///
+/// A conversation is the file `chats/<stem>.json`; its images live in the folder
+/// `chats/<stem>/`. `read_library_conversations` only scans for `*.json`, so the
+/// folder does not show up as a stray conversation.
+fn conversation_images_dir(root: &str, conversation_id: &str) -> PathBuf {
+    conversations_dir(root).join(conversation_file_stem(conversation_id))
+}
+
+/// Read one saved page image back as a `data:image/png;base64,...` URL, for the
+/// frontend to show when a conversation is reopened.
+pub fn read_conversation_image(
+    root: &str,
+    conversation_id: &str,
+    file: &str,
+) -> Result<String, String> {
+    use base64::Engine;
+    crate::path_guard::validate_segment("page image", file)?;
+    let path = conversation_images_dir(root, conversation_id).join(file);
+    let bytes = std::fs::read(&path).map_err(|e| format!("Read page image: {e}"))?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
+/// Decode and save the PNGs a `view_paper_page` result carries into the
+/// conversation's image folder, returning display metadata per page.
+///
+/// The base64 becomes real PNG files so the persisted conversation references
+/// files, not multi-megabyte strings. `dataUrl` is included for the live view;
+/// the frontend drops it before saving and reloads by `file` name afterwards.
+fn save_view_page_images(
+    root: &str,
+    conversation_id: Option<&str>,
+    value: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    use base64::Engine;
+    let slug = value.get("slug").and_then(|s| s.as_str()).unwrap_or("");
+    let dir = conversation_id.map(|id| conversation_images_dir(root, id));
+    if let Some(d) = &dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let mut out = Vec::new();
+    for page in value
+        .get("pages")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let n = page.get("page").and_then(|p| p.as_u64()).unwrap_or(0);
+        let b64 = page.get("png_base64").and_then(|p| p.as_str()).unwrap_or("");
+        if b64.is_empty() {
+            continue;
+        }
+        // Persist to disk (for reload) and return inline (for the live view).
+        let mut file = String::new();
+        if let Some(d) = &dir {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                let name = format!("{slug}-p{n}.png");
+                if crate::path_guard::validate_segment("page image", &name).is_ok()
+                    && crate::fsutil::atomic_write(&d.join(&name), &bytes).is_ok()
+                {
+                    file = name;
+                }
+            }
+        }
+        out.push(serde_json::json!({
+            "page": n,
+            "slug": slug,
+            "file": file,                                 // "" when not persisted
+            "dataUrl": format!("data:image/png;base64,{b64}"),
+        }));
+    }
+    out
+}
+
+/// The text a `view_paper_page` result contributes to the model's transcript:
+/// page numbers and each page's extracted text, but never the base64 image —
+/// that goes back to a vision model as a separate image message instead.
+fn view_page_summary(value: &serde_json::Value) -> serde_json::Value {
+    let pages: Vec<serde_json::Value> = value
+        .get("pages")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|page| {
+                    serde_json::json!({
+                        "page": page.get("page").cloned().unwrap_or(serde_json::Value::Null),
+                        "text": page.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "slug": value.get("slug").and_then(|s| s.as_str()).unwrap_or(""),
+        "note": "The requested page(s) were rendered as images and shown to the user. \
+                 If you can see images, the rendered page(s) accompany this result. \
+                 Each page's extracted text is below.",
+        "pages": pages,
+    })
 }
 
 /// Split the old single-file store into one file per conversation.
@@ -1747,9 +1852,9 @@ impl ContextBudget {
 /// The prompt used when the user has not written their own.
 ///
 /// The collection-first instruction is the substantive part. A model left to
-/// itself reaches for a keyword `list_papers` across the whole library, which
-/// matches on titles and misses the structure the user built by hand — their
-/// grouping encodes intent that a keyword cannot recover.
+/// itself reaches for a keyword search with `find_papers` across the whole
+/// library, which matches on titles and misses the structure the user built by
+/// hand — their grouping encodes intent that a keyword cannot recover.
 pub const DEFAULT_AGENT_SYSTEM_PROMPT: &str = r#"You are a research assistant with direct read access to the user's literature library through MCP tools.
 
 Answer by looking things up. Anything you say about what is or is not in this library must come from a tool call, never from memory.
@@ -1759,21 +1864,27 @@ Answer by looking things up. Anything you say about what is or is not in this li
 The library is organised into collections, and the user has already done that work. Papers filed together are related in the way the user thinks about them, which is information no keyword search contains. So navigate down rather than searching across:
 
 1. `list_collections` — see the structure, with each collection's readable path and paper count.
-2. `list_papers` with the `collection_id` of the branch that fits the question.
+2. `find_papers` with the `collection_id` of the branch that fits the question.
 3. Only then narrow, with `query`, `tag`, `year_from` / `year_to`, `venue`, `min_citations`, or by sorting on `citations` or `year`.
 
 Descend one level at a time when a collection has children; the leaf the user filed something under is usually more specific than the question implies.
 
-Use `search_papers` when the question is about something *inside* the papers — a method, a phrase, a finding. That searches full text, not titles.
+Use `find_papers`'s `content` argument when the question is about something *inside* the papers — a method, a phrase, a finding. It searches full text (not just titles), ranks by relevance, and still respects the collection/tag/year filters.
 
-A bare keyword `list_papers` across the whole library is the last resort, not the first move. It matches titles the user never grouped that way, and misses the ones they did.
+A bare `find_papers` keyword sweep across the whole library is the last resort, not the first move. It matches titles the user never grouped that way, and misses the ones they did.
 
 ## Reading
 
 - `get_library_stats` when you need the shape of the library before anything else.
-- `list_papers` and `search_papers` return an abstract with each paper. The default is a preview; pass `abstract_detail: "full"` when you intend to reason over the abstracts themselves rather than just pick papers from them, and `"none"` when you only need identifiers. Read those before opening anything, and open only what the question actually needs.
-- `get_paper_sections`, then `get_paper_fulltext` with a `section`, to read the relevant part instead of paging through a whole paper.
+- `find_papers` omits the abstract by default to stay compact; pass `abstract_detail: "full"` to include the whole abstract when you intend to reason over the abstracts themselves rather than just pick papers from them. Read those before opening anything, and open only what the question actually needs.
+- `get_paper_fulltext` to read the extracted text, paged with `offset` — pull the slices you need rather than the whole paper at once.
 - `get_note` and `get_highlights` for what the user wrote or marked themselves. Often the best answer to "what did I think about this".
+
+## Writing a note
+
+`create_paper_note` is the only tool here that changes anything. It adds a new note to a paper; it cannot edit, overwrite or delete a note that already exists, so everything you want kept goes in `content`.
+
+Do not reach for it on your own initiative. Offer the note in your reply, and call the tool when the user asks you to save it. Every call is shown to the user — the exact title and body — and written only if they approve, so send the note you actually mean to save. If the result says they declined, stop there and ask what they would rather have; do not rephrase and try again.
 
 ## Answering
 
@@ -1787,6 +1898,32 @@ Reply in the language the user wrote in."#;
 /// system messages or the warmed prefix is not the one the next question asks for.
 fn agent_system_prompt(app: &tauri::AppHandle) -> String {
     resolve_system_prompt(crate::mcp::client::read_settings(app).system_prompt)
+}
+
+/// The paper a conversation is anchored to, rendered as a system message.
+///
+/// The paper AI panel always talks about one paper, so its card is put in front
+/// of the model rather than left for it to fetch: this is exactly what
+/// `get_paper` would return, which saves the first round trip of every single
+/// conversation and stops the model from opening with "let me look that up".
+///
+/// Stable for a given paper, so it extends the cached prefix instead of
+/// breaking it — the same reason the full-text tasks front-load their own
+/// canonical block. Returns `None` when there is no paper, or when it cannot be
+/// read; a conversation without the card still works, the model just has to
+/// call `get_paper` itself.
+fn paper_context_block(root: &str, slug: &str) -> Option<String> {
+    let detail = crate::mcp::tools::get_paper(root, slug).ok()?;
+    let json = serde_json::to_string_pretty(&detail).ok()?;
+    Some(format!(
+        "The user is reading this paper right now, and their question is about it unless they \
+         say otherwise. This is the output of `get_paper` for slug `{slug}` — do not call that \
+         tool again for this paper:\n\n{json}\n\n\
+         Everything else still needs a tool call: `get_paper_fulltext` for the text (paged — \
+         `fulltext_chars` above tells you how much there is), `view_paper_page` to actually see \
+         a page's figures or tables, `get_note` and `get_highlights` for what the user wrote \
+         themselves, `find_papers` to bring in others from their library."
+    ))
 }
 
 /// A blank or whitespace-only prompt means the default, not silence.
@@ -1901,9 +2038,33 @@ fn evict_old_tool_results(
 /// tears the connections down on every exit path — including cancellation, which
 /// is why the loop lives in its own function.
 #[allow(clippy::too_many_arguments)]
+/// One incoming agent message as the provider-facing JSON. Preserves an
+/// OpenAI-style tool exchange when the frontend replayed a prior turn's tool
+/// activity: an assistant turn's `tool_calls`, a `tool` result's `tool_call_id`,
+/// and the optional `name`. A plain user/assistant message comes out exactly as
+/// `{role, content}`.
+fn agent_message_to_json(m: &AgentMessage) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("role".into(), serde_json::Value::String(m.role.clone()));
+    map.insert(
+        "content".into(),
+        serde_json::to_value(&m.content).unwrap_or(serde_json::Value::Null),
+    );
+    if let Some(tool_calls) = &m.tool_calls {
+        map.insert("tool_calls".into(), tool_calls.clone());
+    }
+    if let Some(id) = &m.tool_call_id {
+        map.insert("tool_call_id".into(), serde_json::Value::String(id.clone()));
+    }
+    if let Some(name) = &m.name {
+        map.insert("name".into(), serde_json::Value::String(name.clone()));
+    }
+    serde_json::Value::Object(map)
+}
+
 pub async fn chat_with_library_agent(
     root: &str,
-    messages: Vec<ChatMessage>,
+    messages: Vec<AgentMessage>,
     provider_id: Option<&str>,
     model_id: Option<&str>,
     event_name: &str,
@@ -1914,6 +2075,13 @@ pub async fn chat_with_library_agent(
     // the cache-keepalive status so the chat window can put the indicator on
     // the right conversation.
     conversation_id: Option<&str>,
+    // The paper this conversation is about, when it is anchored to one (the
+    // paper AI panel). Its `get_paper` card is put in the system prompt.
+    paper_slug: Option<&str>,
+    // Label of the window this answer was asked from. The cache keepalive stops
+    // when that window goes away, so it must be the window the user is actually
+    // looking at — not a hardcoded one.
+    owner_window: &str,
     app: &tauri::AppHandle,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String, String> {
@@ -1936,6 +2104,10 @@ pub async fn chat_with_library_agent(
         );
     }
 
+    // Built once and shared with the keepalive: the warmed prefix has to be the
+    // one the next question sends, byte for byte.
+    let paper_block = paper_slug.and_then(|slug| paper_context_block(root, slug));
+
     let warm_from = messages.clone();
     let outcome = run_agent_loop(
         root,
@@ -1946,6 +2118,8 @@ pub async fn chat_with_library_agent(
         use_reasoning,
         reasoning_effort,
         max_rounds,
+        conversation_id,
+        paper_block.as_deref(),
         &bridge,
         app,
         cancel,
@@ -1955,7 +2129,13 @@ pub async fn chat_with_library_agent(
     // Snapshot before shutting the servers down: the external tool declarations
     // are part of the prefix that has to stay warm, and a keepalive sending a
     // different tools block would refresh a cache entry nothing will ask for.
-    let tool_defs = agent_tool_defs(&bridge);
+    // The vision flag is resolved the same way the loop resolved it, for the
+    // same reason — a tools block missing `view_paper_page` in one place and
+    // carrying it in the other is two different prefixes.
+    let vision = ai_manager::resolve_provider_model(root, provider_id, model_id)
+        .map(|(provider, _, model)| model_sees_images(&provider, &model))
+        .unwrap_or(false);
+    let tool_defs = agent_tool_defs(&bridge, vision);
     bridge.shutdown().await;
 
     // Keep the prefix this answer just built warm, so the user can think for
@@ -1969,6 +2149,8 @@ pub async fn chat_with_library_agent(
             &warm_from,
             answer,
             tool_defs,
+            paper_block.as_deref(),
+            owner_window,
             app,
         );
     }
@@ -1985,9 +2167,11 @@ fn arm_cache_keepalive(
     provider_id: Option<&str>,
     model_id: Option<&str>,
     conversation_id: Option<&str>,
-    messages: &[ChatMessage],
+    messages: &[AgentMessage],
     answer: &str,
     tool_defs: Vec<serde_json::Value>,
+    paper_block: Option<&str>,
+    owner_window: &str,
     app: &tauri::AppHandle,
 ) {
     if !crate::mcp::client::read_settings(app).keep_cache_warm {
@@ -2012,11 +2196,12 @@ fn arm_cache_keepalive(
         "role": "system",
         "content": agent_system_prompt(app),
     })];
-    warm.extend(
-        messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": &m.content})),
-    );
+    // The paper card sits where the loop puts it, or the warmed prefix is a
+    // different prefix.
+    if let Some(block) = paper_block {
+        warm.push(serde_json::json!({ "role": "system", "content": block }));
+    }
+    warm.extend(messages.iter().map(agent_message_to_json));
     warm.push(serde_json::json!({ "role": "assistant", "content": answer }));
 
     crate::cache_keepalive::arm(
@@ -2028,6 +2213,7 @@ fn arm_cache_keepalive(
             model,
             messages: warm,
             tools: tool_defs,
+            owner_window: owner_window.to_string(),
         },
     );
 }
@@ -2040,12 +2226,35 @@ fn arm_cache_keepalive(
 static LAST_AGENT_CACHE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Whether this model can be shown an image.
+///
+/// Decided from the model's declared capabilities, and used for two things that
+/// must agree: whether `view_paper_page` is offered at all, and whether rendered
+/// pages are fed back as images.
+fn model_sees_images(provider: &crate::models::AiProvider, model_id: &str) -> bool {
+    provider
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .is_some_and(|m| m.capabilities.iter().any(|c| c == "vision"))
+}
+
 /// The tool array an agent turn sends: the library's own, then the external
 /// servers'. Built in one place so the keepalive cannot drift from the real
 /// request — a differing tools block is a different cached prefix.
-fn agent_tool_defs(bridge: &crate::mcp::client::ToolBridge) -> Vec<serde_json::Value> {
+///
+/// `vision` drops `view_paper_page` for a text-only model. Offering it would be
+/// an invitation to render a page the model cannot be shown: the answer would be
+/// built on the page's extracted text while the model believed it had seen the
+/// figure, and on some providers the oversized request simply fails. A model
+/// that cannot see is better told the tool does not exist.
+fn agent_tool_defs(
+    bridge: &crate::mcp::client::ToolBridge,
+    vision: bool,
+) -> Vec<serde_json::Value> {
     crate::mcp::agent::tools()
         .into_iter()
+        .filter(|t| vision || t.name != crate::mcp::agent::VIEW_PAGE_TOOL)
         .chain(bridge.tools().iter().cloned())
         .map(|t| {
             serde_json::json!({
@@ -2060,16 +2269,59 @@ fn agent_tool_defs(bridge: &crate::mcp::client::ToolBridge) -> Vec<serde_json::V
         .collect()
 }
 
+/// Put one writing tool call in front of the user, and carry it out only if
+/// they approve it.
+///
+/// The order here is the safety property: the call is parsed and validated into
+/// a `PendingWrite` *first*, the dialog is rendered from that value, and the
+/// same value is what executes. The model's arguments are never read again
+/// after the user has seen them, so what was approved is what happens.
+async fn run_confirmed_write(
+    root: &str,
+    name: &str,
+    args: &serde_json::Value,
+    event_name: &str,
+    app: &tauri::AppHandle,
+    cancel: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<serde_json::Value, String> {
+    use crate::mcp::app_tools::PendingWrite;
+
+    // A malformed call is the model's mistake to fix; the user is not
+    // interrupted for it.
+    let pending = PendingWrite::parse(root, name, args)?;
+
+    let preview = {
+        let root_owned = root.to_string();
+        let pending = pending.clone();
+        tokio::task::spawn_blocking(move || pending.preview(&root_owned))
+            .await
+            .map_err(|e| format!("preview task failed: {e}"))?
+    };
+
+    let decision = crate::write_confirm::request(app, event_name, &preview, cancel.clone()).await;
+    if !decision.approved() {
+        return Err(decision.message().to_string());
+    }
+
+    let root_owned = root.to_string();
+    tokio::task::spawn_blocking(move || pending.execute(&root_owned))
+        .await
+        .map_err(|e| format!("write task failed: {e}"))?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     root: &str,
-    messages: Vec<ChatMessage>,
+    messages: Vec<AgentMessage>,
     provider_id: Option<&str>,
     model_id: Option<&str>,
     event_name: &str,
     use_reasoning: bool,
     reasoning_effort: Option<&str>,
     max_rounds: usize,
+    conversation_id: Option<&str>,
+    // `get_paper` for the paper this conversation is anchored to, if any.
+    paper_block: Option<&str>,
     bridge: &crate::mcp::client::ToolBridge,
     app: &tauri::AppHandle,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -2087,6 +2339,11 @@ async fn run_agent_loop(
         ));
     }
 
+    // Whether this model can see images. A text-only model is not offered
+    // `view_paper_page` at all (see `agent_tool_defs`), so this also decides
+    // whether a page render can ever reach the request.
+    let model_sees_images = model_sees_images(&provider, &model);
+
     let budget = ContextBudget::for_model(&provider, &model);
     let agent_event = format!("{event_name}-agent");
     let cancelled = || {
@@ -2097,17 +2354,18 @@ async fn run_agent_loop(
 
     // Tool declarations in OpenAI-compatible form, built once per answer: the
     // library's own tools first, then whatever the configured servers offer.
-    let tool_defs = agent_tool_defs(bridge);
+    let tool_defs = agent_tool_defs(bridge, model_sees_images);
 
     let mut convo: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
         "content": agent_system_prompt(app),
     })];
-    convo.extend(
-        messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": &m.content})),
-    );
+    // Directly after the instructions and before the turns, so it is part of
+    // the stable prefix every question in this conversation shares.
+    if let Some(block) = paper_block {
+        convo.push(serde_json::json!({ "role": "system", "content": block }));
+    }
+    convo.extend(messages.iter().map(agent_message_to_json));
 
     let mut rounds = 0usize;
     // Rounds whose tool calls were actually run — which is what the user's
@@ -2231,6 +2489,10 @@ async fn run_agent_loop(
         tool_rounds += 1;
         // Where this round's results begin, so eviction can leave them alone.
         let round_start = convo.len();
+        // Page images rendered this round, fed back to a vision model as one
+        // image message after all the round's tool results (a tool_call must be
+        // answered before any other message can follow the assistant turn).
+        let mut round_image_parts: Vec<serde_json::Value> = Vec::new();
         for call in &turn.tool_calls {
             if cancelled() {
                 break 'rounds Err("cancelled".to_string());
@@ -2248,7 +2510,23 @@ async fn run_agent_loop(
                 }),
             );
 
-            let outcome = if bridge.handles(&call.name) {
+            let outcome = if call.name == crate::mcp::agent::VIEW_PAGE_TOOL && !model_sees_images {
+                // The tool was not offered to this model, so a call for it can
+                // only come from a model inventing one (or from a stale tools
+                // block). Refuse before anything is rendered: the point is that
+                // no page image is produced for a model that cannot be shown it.
+                Err("This model cannot see images, so view_paper_page is unavailable. \
+                     Use get_paper_fulltext for the page's text, and tell the user a \
+                     vision-capable model is needed to look at figures."
+                    .to_string())
+            } else if crate::mcp::app_tools::is_write_tool(&call.name) {
+                // The only tools that change the library. Nothing is written
+                // until the user has looked at this exact note and approved it;
+                // every other outcome (declined, unanswered, generation
+                // stopped) leaves the library untouched and tells the model so.
+                run_confirmed_write(root, &call.name, &call.arguments, event_name, app, &cancel)
+                    .await
+            } else if bridge.handles(&call.name) {
                 // An external server is another process on the far end of a
                 // pipe — already async, and nothing to move off this thread.
                 bridge.call(&call.name, &call.arguments).await
@@ -2272,7 +2550,29 @@ async fn run_agent_loop(
             // A failed tool is fed back as text rather than aborting: the model
             // can read the message and correct itself (wrong slug, bad section
             // name) on the next round.
+            // `view_paper_page` returns images. Keep the base64 out of the
+            // token-costed tool message (it gets the page text instead), save the
+            // PNGs to the conversation folder for the UI, and — for a vision
+            // model — queue the images to feed back after this round's results.
+            let mut result_images: Option<serde_json::Value> = None;
             let (content, ok, cut) = match &outcome {
+                Ok(value) if call.name == crate::mcp::agent::VIEW_PAGE_TOOL => {
+                    let saved = save_view_page_images(root, conversation_id, value);
+                    if model_sees_images {
+                        for img in &saved {
+                            if let Some(url) = img.get("dataUrl").and_then(|u| u.as_str()) {
+                                round_image_parts.push(serde_json::json!({
+                                    "type": "image_url",
+                                    "image_url": { "url": url },
+                                }));
+                            }
+                        }
+                    }
+                    let (text, cut) =
+                        truncate_tool_result(&view_page_summary(value), budget.single_result);
+                    result_images = Some(serde_json::Value::Array(saved));
+                    (text, true, cut)
+                }
                 Ok(value) => {
                     let (text, cut) = truncate_tool_result(value, budget.single_result);
                     (text, true, cut)
@@ -2300,6 +2600,8 @@ async fn run_agent_loop(
                     "chars": content.chars().count(),
                     "preview": content,
                     "truncated": cut,
+                    // Rendered page images for view_paper_page; null otherwise.
+                    "images": result_images,
                 }),
             );
 
@@ -2322,6 +2624,17 @@ async fn run_agent_loop(
                     }),
                 );
             }
+        }
+
+        // Feed the pages a vision model needs to see back as one image message,
+        // now that every tool result for this round has been recorded.
+        if !round_image_parts.is_empty() {
+            let mut parts = vec![serde_json::json!({
+                "type": "text",
+                "text": "Rendered images of the page(s) you asked to view:",
+            })];
+            parts.extend(round_image_parts);
+            convo.push(serde_json::json!({ "role": "user", "content": parts }));
         }
     }
     };
@@ -2368,6 +2681,94 @@ mod agent_tests {
             }))
             .expect("AiModel fixture")],
         }
+    }
+
+    fn vision_model(id: &str, vision: bool) -> AiProvider {
+        AiProvider {
+            models: vec![serde_json::from_value(serde_json::json!({
+                "id": id,
+                "display_name": id,
+                "capabilities": if vision { vec!["tools", "vision"] } else { vec!["tools"] },
+            }))
+            .expect("AiModel fixture")],
+            ..model(id, None)
+        }
+    }
+
+    /// The paper card replaces the `get_paper` call every paper conversation
+    /// used to open with, so it has to carry that call's output and say plainly
+    /// that the tool is not needed again.
+    #[test]
+    fn the_paper_card_carries_get_papers_output() {
+        let root = std::env::temp_dir()
+            .join(format!("argus-paper-card-{}", uuid::Uuid::new_v4().simple()));
+        let dir = root.join("papers").join("a-paper");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::json!({
+                "id": "a-paper",
+                "title": "Compositional Generalization",
+                "authors": ["Ann Author"],
+                "year": 2025,
+                "added_at": "2026-01-01T00:00:00Z",
+                "reading_status": "reading",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let root = root.to_string_lossy().to_string();
+
+        let block = paper_context_block(&root, "a-paper").expect("a card for a real paper");
+        assert!(block.contains("Compositional Generalization"), "{block}");
+        assert!(block.contains("Ann Author"), "{block}");
+        assert!(block.contains("do not call that tool again"), "{block}");
+        // The tools it should still reach for are named, so it does not assume
+        // the card is all there is.
+        assert!(block.contains("get_paper_fulltext"), "{block}");
+        assert!(block.contains("get_highlights"), "{block}");
+
+        // Stable across calls — this block is part of the cached prefix.
+        assert_eq!(Some(block), paper_context_block(&root, "a-paper"));
+        // A paper that is not there yields nothing rather than a broken card.
+        assert!(paper_context_block(&root, "no-such-paper").is_none());
+    }
+
+    #[test]
+    fn vision_capability_is_read_from_the_model() {
+        assert!(model_sees_images(&vision_model("m", true), "m"));
+        assert!(!model_sees_images(&vision_model("m", false), "m"));
+        // A model id that is not in the provider's list cannot be assumed to see.
+        assert!(!model_sees_images(&vision_model("m", true), "other"));
+    }
+
+    /// A text-only model must never be handed the page-rendering tool: the
+    /// images it produces cannot be shown to such a model, and the request that
+    /// would carry them is what breaks on some providers.
+    #[test]
+    fn a_text_only_model_is_not_offered_the_page_viewer() {
+        let bridge = crate::mcp::client::ToolBridge::none();
+
+        let names = |vision: bool| -> Vec<String> {
+            agent_tool_defs(&bridge, vision)
+                .into_iter()
+                .filter_map(|t| {
+                    t["function"]["name"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+
+        let with_vision = names(true);
+        let text_only = names(false);
+        assert!(with_vision.iter().any(|n| n == crate::mcp::agent::VIEW_PAGE_TOOL));
+        assert!(
+            !text_only.iter().any(|n| n == crate::mcp::agent::VIEW_PAGE_TOOL),
+            "view_paper_page was offered to a model that cannot see images"
+        );
+        // Only that one tool differs — a text-only model keeps everything else.
+        assert_eq!(with_vision.len(), text_only.len() + 1);
     }
 
     #[test]

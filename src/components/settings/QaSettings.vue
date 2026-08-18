@@ -1,43 +1,62 @@
 <script setup lang="ts">
 /**
- * The 智能问答 settings section.
+ * The AI 随航 settings section.
  *
- * Both ways the app answers a question about the library live here: agent mode,
- * where the model calls tools itself, and RAG, where chunks are retrieved and
- * handed to it. They were separate top-level sections, which made them look
- * like unrelated features rather than two settings for the same thing.
+ * Everything the AI does with the library lives here as a sub-tab: the two ways
+ * a question gets answered (agent mode, where the model calls tools itself, and
+ * RAG, where chunks are retrieved for it), the per-task analysis models, and the
+ * arXiv crawler. They used to be four separate top-level sections, which made
+ * settings read as a list of unrelated features rather than one place where the
+ * AI is configured.
  */
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AgentSettings from './AgentSettings.vue'
 import RagSettings from './RagSettings.vue'
+import ExtractionSettings from './ExtractionSettings.vue'
+import ArxivSettings from './ArxivSettings.vue'
 
 const props = defineProps<{ initialTab?: string }>()
 const { t } = useI18n()
 
-type Tab = 'agent' | 'rag'
+type Tab = 'agent' | 'rag' | 'extraction' | 'arxiv'
+const TABS: Tab[] = ['agent', 'rag', 'extraction', 'arxiv']
 
 const tabs: { id: Tab; label: string }[] = [
   { id: 'agent', label: 'qaSettings.agentTab' },
   { id: 'rag', label: 'qaSettings.ragTab' },
+  { id: 'extraction', label: 'qaSettings.extractionTab' },
+  { id: 'arxiv', label: 'qaSettings.arxivTab' },
 ]
 
-const activeTab = ref<Tab>(props.initialTab === 'rag' ? 'rag' : 'agent')
+function asTab(value: string | undefined): Tab | null {
+  return TABS.includes(value as Tab) ? (value as Tab) : null
+}
 
-// Opening settings straight at RAG (from the chat's "configure RAG" prompts)
-// has to land on the RAG tab even when this component is already mounted.
+const activeTab = ref<Tab>(asTab(props.initialTab) ?? 'agent')
+
+// Opening settings straight at a tab (the chat's "configure RAG" prompt, an
+// arXiv or analysis entry point) has to land there even when this component is
+// already mounted.
 watch(() => props.initialTab, (tab) => {
-  if (tab === 'rag' || tab === 'agent') activeTab.value = tab
+  const next = asTab(tab)
+  if (next) activeTab.value = next
 })
+
+const DESCRIPTIONS: Record<Tab, string> = {
+  agent: 'agentSettings.desc',
+  rag: 'ragSettings.desc',
+  extraction: 'settings.extractionDesc',
+  arxiv: 'arxivSettings.desc',
+}
+const description = computed(() => t(DESCRIPTIONS[activeTab.value]))
 </script>
 
 <template>
   <div class="qa-settings">
     <div class="qa-heading">
       <h2 class="qa-title">{{ t('settings.agent') }}</h2>
-      <p class="qa-desc">
-        {{ activeTab === 'agent' ? t('agentSettings.desc') : t('ragSettings.desc') }}
-      </p>
+      <p class="qa-desc">{{ description }}</p>
     </div>
 
     <div class="qa-tabs">
@@ -52,9 +71,11 @@ watch(() => props.initialTab, (tab) => {
       </button>
     </div>
 
-    <div class="qa-panel">
+    <div class="qa-panel" :class="{ 'qa-panel-flush': activeTab === 'extraction' || activeTab === 'arxiv' }">
       <AgentSettings v-if="activeTab === 'agent'" />
-      <RagSettings v-else />
+      <RagSettings v-else-if="activeTab === 'rag'" />
+      <ExtractionSettings v-else-if="activeTab === 'extraction'" />
+      <ArxivSettings v-else />
     </div>
   </div>
 </template>
@@ -96,4 +117,8 @@ watch(() => props.initialTab, (tab) => {
   min-height: 0;
   overflow-y: auto;
 }
+/* Those two panels were written as full settings pages with their own padding;
+   the heading above already provides it, so pull it back. */
+.qa-panel-flush :deep(.settings-panel),
+.qa-panel-flush :deep(.settings-body) { padding: 0; }
 </style>

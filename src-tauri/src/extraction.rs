@@ -22,6 +22,28 @@ fn extract_all_pages(pdf_path: &Path) -> Result<(String, usize), String> {
     Ok((text, page_count))
 }
 
+/// Per-page text for the given 1-based pages, loading the document once.
+///
+/// Best-effort: a page that lopdf cannot read (or a document that fails to
+/// load, e.g. a scanned PDF) maps to an empty string rather than an error, so a
+/// caller rendering a page image still gets the image with whatever text exists.
+pub fn extract_pages_text(
+    pdf_path: &Path,
+    pages: &[u32],
+) -> std::collections::HashMap<u32, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(bytes) = std::fs::read(pdf_path) else {
+        return out;
+    };
+    let Ok(doc) = lopdf::Document::load_mem(&bytes) else {
+        return out;
+    };
+    for &p in pages {
+        out.insert(p, doc.extract_text(&[p]).unwrap_or_default());
+    }
+    out
+}
+
 /// Decide whether the extracted text is sufficient (not a scanned-only PDF).
 fn is_sufficient(text: &str, page_count: usize) -> bool {
     if page_count == 0 {

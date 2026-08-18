@@ -336,8 +336,14 @@ export type ChatContentPart =
   | { type: 'file'; file: { filename: string; file_data: string } }
 
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant' | string
+  role: 'system' | 'user' | 'assistant' | 'tool' | string
   content: string | ChatContentPart[]
+  /** OpenAI-style tool calls carried by an assistant turn (agent history replay). */
+  tool_calls?: unknown[]
+  /** Links a `tool` result back to the `tool_calls` entry it answers. */
+  tool_call_id?: string
+  /** Optional function name on a `tool` result. */
+  name?: string
 }
 
 export interface ModelSelection {
@@ -625,4 +631,21 @@ export interface EmbeddingMapData {
   dimension: number
   embedding_model: string | null
   available_models: EmbeddingModelStat[]
+}
+
+/** What the agent proposes to write, as shown in the approval card.
+ *
+ * Mirrors `WritePreview` in src-tauri/src/mcp/app_tools.rs — the backend builds
+ * it from the same value it will execute, so this is literally what lands on
+ * disk once the user approves. */
+export interface AgentWritePreview {
+  /** Tool asking for the write; currently only `create_paper_note`. */
+  tool: string
+  slug: string
+  paperTitle: string
+  noteTitle: string
+  /** Markdown, rendered read-only in the card. */
+  content: string
+  /** A note with this title already exists — nothing is overwritten either way. */
+  duplicateTitle: boolean
 }

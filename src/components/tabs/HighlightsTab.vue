@@ -74,13 +74,13 @@ function colorStyle(color: string, alpha = 0.35): string {
 <template>
   <div class="highlights-tab">
     <div v-if="!isReaderActive" class="empty">
-      <Icon icon="fluent:highlight-24-regular" width="28" height="28" />
+      <Icon class="empty-doodle" icon="doodle:person-highlighting-article" width="64" height="64" />
       <p>{{ t('hl.openPdf') }}</p>
       <span>{{ t('hl.doubleClick') }}</span>
     </div>
 
     <div v-else-if="sortedHighlights.length === 0" class="empty">
-      <Icon icon="fluent:highlight-24-regular" width="28" height="28" />
+      <Icon class="empty-doodle" icon="doodle:person-highlighting-article" width="64" height="64" />
       <p>{{ t('hl.noHighlights') }}</p>
       <span>{{ t('hl.selectToHighlight') }}</span>
     </div>
@@ -126,6 +126,13 @@ function colorStyle(color: string, alpha = 0.35): string {
 
 <style scoped>
 .highlights-tab { height: 100%; overflow-y: auto; display: flex; flex-direction: column; }
+
+/* Hand-drawn figure for this panel's empty state: someone doing the thing the
+   panel fills up with. Muted so it reads as an illustration, not a control. */
+.empty-doodle {
+  color: color-mix(in srgb, var(--accent) 55%, var(--text-tertiary));
+  margin-bottom: 2px;
+}
 
 .empty {
   flex: 1;

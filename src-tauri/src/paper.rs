@@ -230,6 +230,38 @@ pub fn create_note(root: &str, slug: &str) -> Result<Note, String> {
     Ok(note)
 }
 
+/// Create a brand-new note carrying `title` and `content`.
+///
+/// Always a *new* note. Unlike [`upsert_note_by_title`] it never opens an
+/// existing one, even when the title is identical — a duplicate title is
+/// allowed, since notes are addressed by id. That is the property that makes
+/// this safe to reach from the agent's write tool: the worst outcome is a note
+/// the user deletes, never a paragraph of theirs that is gone.
+///
+/// The title only ever lands in `index.json`; the file on disk is named after a
+/// fresh uuid, so nothing here can be steered at another path.
+pub fn create_note_with(root: &str, slug: &str, title: &str, content: &str) -> Result<Note, String> {
+    validate_slug(slug)?;
+    maybe_migrate_legacy_note(root, slug);
+    let dir = notes_dir(root, slug);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create notes dir: {e}"))?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let note = Note {
+        id: id.clone(),
+        title: title.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    atomic_write(&dir.join(format!("{id}.md")), content)
+        .map_err(|e| format!("Failed to create note file: {e}"))?;
+    let mut notes = read_notes_index(root, slug);
+    notes.push(note.clone());
+    write_notes_index(root, slug, &notes)?;
+    Ok(note)
+}
+
 pub fn upsert_note_by_title(
     root: &str,
     slug: &str,

@@ -564,12 +564,12 @@ mod tests {
         assert_eq!(prefix_from("---"), None);
     }
 
-    /// The prefix is what stops an external `search_papers` from shadowing ours.
+    /// The prefix is what stops an external `find_papers` from shadowing ours.
     #[test]
     fn external_tools_cannot_collide_with_library_tools() {
         let mut taken = HashSet::new();
-        let name = namespaced("other", "search_papers", &mut taken);
-        assert_ne!(name, "search_papers");
+        let name = namespaced("other", "find_papers", &mut taken);
+        assert_ne!(name, "find_papers");
         assert!(name.starts_with("other__"));
     }
 
@@ -664,7 +664,7 @@ mod tests {
         let listing = result
             .tools
             .iter()
-            .find(|t| t.name == "list_papers")
+            .find(|t| t.name == "find_papers")
             .unwrap_or_else(|| panic!("the server answered but not with our tools: {:?}", result.tools));
         assert!(
             listing.read_only,

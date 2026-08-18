@@ -13,10 +13,18 @@
 //! match. The risk that comes with that is drift: a tool added to `server.rs`
 //! and forgotten here. `dispatch_covers_every_tool` fails when that happens.
 
+use base64::Engine;
 use serde::Serialize;
 
+use super::app_tools;
 use super::server;
 use super::tools;
+
+/// The one tool whose result carries images. `copilot` special-cases it: the
+/// base64 PNGs are stripped out of the token-costed tool message, saved as files
+/// under the conversation folder, and — for a vision model — fed back as a
+/// separate image message. Kept here so both sides name it the same thing.
+pub const VIEW_PAGE_TOOL: &str = "view_paper_page";
 
 /// A tool as the LLM needs to see it: name, purpose, and argument schema.
 #[derive(Debug, Clone, Serialize)]
@@ -42,8 +50,11 @@ pub fn declares_read_only(tool: &rmcp::model::Tool) -> bool {
         .unwrap_or(false)
 }
 
-/// Every tool the agent may call, taken from the same router the MCP server
-/// serves, so the two can never describe different tools.
+/// Every tool the agent may call: the MCP server's read-only surface, plus the
+/// writing tools that exist only inside the app (see [`app_only_tools`]).
+///
+/// The read-only half is taken from the same router the MCP server serves, so
+/// the two can never describe different tools.
 pub fn tools() -> Vec<AgentTool> {
     server::tool_declarations()
         .into_iter()
@@ -53,7 +64,51 @@ pub fn tools() -> Vec<AgentTool> {
             description: t.description.map(|d| d.to_string()).unwrap_or_default(),
             input_schema: serde_json::Value::Object((*t.input_schema).clone()),
         })
+        .chain(app_only_tools())
         .collect()
+}
+
+/// Tools the in-app agent has and the MCP endpoint does not.
+///
+/// These write, and a write only happens after the user has approved that exact
+/// change in the Argus window. The stdio server has no window to ask in, so it
+/// is never told these exist — external clients see the read-only list only.
+///
+/// The schemas are written by hand rather than derived: `server`'s `#[tool]`
+/// macro is what publishes a tool to the MCP router, and using it here would
+/// hand the write tool to external clients too.
+fn app_only_tools() -> Vec<AgentTool> {
+    vec![AgentTool {
+        name: app_tools::CREATE_NOTE_TOOL.to_string(),
+        read_only: false,
+        description: "Create a NEW note on a paper in the user's library, holding markdown you \
+                      wrote — a summary, an outline, an answer worth keeping. The user is shown \
+                      the exact title and body and must approve them before anything is written, \
+                      so propose the note in your reply first and call this once they ask for it. \
+                      This only ever adds a note: it cannot edit, overwrite or delete an existing \
+                      one, so put everything you want kept in `content`. Use `find_papers` or \
+                      `get_paper` to get the `slug`."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "slug": {
+                    "type": "string",
+                    "description": "Slug of the paper the note belongs to, from find_papers/get_paper.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Short title for the note, shown in the paper's note list. One line.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The note itself, in markdown. Written verbatim — include everything you want kept.",
+                },
+            },
+            "required": ["slug", "title", "content"],
+            "additionalProperties": false,
+        }),
+    }]
 }
 
 /// Deserialize `args` into `P`, defaulting when the model sent nothing.
@@ -82,18 +137,30 @@ fn ok<T: Serialize>(value: T) -> Result<serde_json::Value, String> {
     serde_json::to_value(value).map_err(|e| format!("cannot serialize result: {e}"))
 }
 
-/// Run one tool against `root`.
+/// Run one **read-only** tool against `root`.
+///
+/// Writing tools are refused here on purpose. They go through
+/// `app_tools::PendingWrite`, which the caller must first put in front of the
+/// user; routing them here as well would make "forgot to ask" a one-line
+/// mistake instead of an impossible one.
 ///
 /// Blocking file and SQLite work, so callers must keep this off the async
 /// runtime's worker threads — `copilot` wraps it in `spawn_blocking`.
 pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if app_tools::is_write_tool(name) {
+        return Err(format!(
+            "'{name}' changes the library and cannot be run here — it must go through \
+             the user's confirmation."
+        ));
+    }
     match name {
-        "list_papers" => {
-            let p: server::ListPapersParams = params(args)?;
-            ok(tools::list_papers(
+        "find_papers" => {
+            let p: server::FindPapersParams = params(args)?;
+            ok(tools::find_papers(
                 root,
-                tools::ListPapersArgs {
+                tools::FindPapersArgs {
                     query: p.query.as_deref(),
+                    content: p.content.as_deref(),
                     tag: p.tag.as_deref(),
                     collection_id: p.collection_id.as_deref(),
                     reading_status: p.reading_status.as_deref(),
@@ -114,36 +181,31 @@ pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_js
             let p: server::SlugParams = params(args)?;
             ok(tools::get_paper(root, &p.slug)?)
         }
-        "search_papers" => {
-            let p: server::SearchParams = params(args)?;
-            ok(tools::search_papers(
-                root,
-                &p.query,
-                p.limit.clamp(1, 100),
-                tools::AbstractDetail::parse(p.abstract_detail.as_deref()),
-            )?)
-        }
         "get_paper_fulltext" => {
             let p: server::FulltextParams = params(args)?;
-            ok(tools::get_paper_fulltext(
-                root,
-                &p.slug,
-                p.offset,
-                p.limit,
-                p.section.as_deref(),
-            )?)
+            ok(tools::get_paper_fulltext(root, &p.slug, p.offset, p.limit)?)
         }
-        "get_paper_sections" => {
-            let p: server::SlugParams = params(args)?;
-            ok(tools::get_paper_sections(root, &p.slug)?)
-        }
-        "get_paper_pdf_path" => {
+        "get_paper_file_path" => {
             let p: server::SlugParams = params(args)?;
             ok(tools::get_document_path(root, &p.slug)?)
         }
-        "list_notes" => {
-            let p: server::SlugParams = params(args)?;
-            ok(tools::ItemList::from(tools::list_notes(root, &p.slug)?))
+        "view_paper_page" => {
+            let p: server::ViewPageParams = params(args)?;
+            let pages = tools::render_paper_pages(root, &p.slug, &p.pages)?;
+            // Return each page's text plus its PNG as base64. `copilot` decodes
+            // and saves the PNGs, keeps the base64 out of the token-costed tool
+            // message, and (for a vision model) feeds the images back separately.
+            ok(serde_json::json!({
+                "slug": p.slug,
+                "pages": pages
+                    .iter()
+                    .map(|r| serde_json::json!({
+                        "page": r.page,
+                        "text": r.text,
+                        "png_base64": base64::engine::general_purpose::STANDARD.encode(&r.png),
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
         }
         "get_note" => {
             let p: server::NoteParams = params(args)?;
@@ -160,21 +222,20 @@ pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_js
             let p: server::CanvasParams = params(args)?;
             ok(tools::get_canvas(root, &p.canvas_id)?)
         }
-        "list_snippet_libraries" => ok(tools::ItemList::from(tools::list_snippet_libraries(root)?)),
         "search_snippets" => {
             let p: server::SnippetParams = params(args)?;
-            ok(tools::ItemList::from(tools::list_snippets(
+            ok(tools::search_snippets(
                 root,
                 p.library_id.as_deref(),
                 p.query.as_deref(),
                 p.limit.clamp(1, 500),
-            )?))
+            )?)
         }
         "list_conversations" => {
             let p: server::ListConversationsParams = params(args)?;
             ok(tools::ItemList::from(tools::list_conversations(
                 root,
-                &p.scope,
+                p.scope.as_str(),
                 p.slug.as_deref(),
                 p.query.as_deref(),
                 p.limit.clamp(1, 200),
@@ -204,12 +265,51 @@ mod tests {
     #[test]
     fn dispatch_covers_every_tool() {
         for tool in tools() {
+            // Writing tools deliberately have no arm here — they run through
+            // `app_tools::PendingWrite` after the user approves. The next test
+            // checks they are refused rather than missing.
+            if app_tools::is_write_tool(&tool.name) {
+                continue;
+            }
             let err = call("/nonexistent-library", &tool.name, &serde_json::json!({}))
                 .err()
                 .unwrap_or_default();
             assert!(
                 !err.contains("unknown tool"),
                 "tool '{}' is declared to the model but has no dispatch arm",
+                tool.name
+            );
+        }
+    }
+
+    /// The read-only dispatcher must never perform a write, whatever it is
+    /// handed. This is the backstop for a caller that forgets to route a write
+    /// through the confirmation.
+    #[test]
+    fn the_read_only_dispatcher_refuses_write_tools() {
+        let err = call(
+            "/nonexistent-library",
+            app_tools::CREATE_NOTE_TOOL,
+            &serde_json::json!({"slug": "s", "title": "t", "content": "c"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("confirmation"), "{err}");
+    }
+
+    /// The write tool exists for the in-app agent only. An external MCP client
+    /// must not even see it declared: that process has no window in which the
+    /// user could approve anything.
+    #[test]
+    fn no_write_tool_is_exposed_through_the_mcp_server() {
+        for tool in server::tool_declarations() {
+            assert!(
+                !app_tools::is_write_tool(&tool.name),
+                "tool '{}' writes but is declared to external MCP clients",
+                tool.name
+            );
+            assert!(
+                declares_read_only(&tool),
+                "tool '{}' is served over MCP without a read_only_hint",
                 tool.name
             );
         }
@@ -246,14 +346,14 @@ mod tests {
         // Models often omit the arguments object entirely for a no-arg tool.
         // The defaults that apply are serde's — the page size the tool
         // documents — not the derived `usize` zero.
-        let p: server::ListPapersParams = params(&serde_json::Value::Null).unwrap();
-        assert_eq!(p.limit, 50, "the documented default page size must apply");
-        let p: server::ListPapersParams = params(&serde_json::json!({})).unwrap();
-        assert_eq!(p.limit, 50);
+        let p: server::FindPapersParams = params(&serde_json::Value::Null).unwrap();
+        assert_eq!(p.limit, 20, "the documented default page size must apply");
+        let p: server::FindPapersParams = params(&serde_json::json!({})).unwrap();
+        assert_eq!(p.limit, 20);
         assert!(p.query.is_none());
 
         // A populated object still deserializes normally.
-        let p: server::ListPapersParams =
+        let p: server::FindPapersParams =
             params(&serde_json::json!({"query": "attention", "limit": 5})).unwrap();
         assert_eq!(p.query.as_deref(), Some("attention"));
         assert_eq!(p.limit, 5);
@@ -266,13 +366,14 @@ mod tests {
     #[test]
     fn an_empty_argument_object_never_yields_a_zero_limit() {
         let empty = serde_json::json!({});
-        let p: server::ListPapersParams = params(&empty).unwrap();
-        assert_eq!(p.limit, 50);
+        let p: server::FindPapersParams = params(&empty).unwrap();
+        assert_eq!(p.limit, 20);
         let p: server::SnippetParams = params(&empty).unwrap();
         assert_eq!(p.limit, 50);
-        let p: server::ListConversationsParams = params(&empty).unwrap();
+        let p: server::ListConversationsParams =
+            params(&serde_json::json!({"scope": "paper"})).unwrap();
         assert_eq!(p.limit, 30);
-        assert_eq!(p.scope, "all");
+        assert_eq!(p.scope.as_str(), "paper");
         let p: server::GetConversationParams =
             params(&serde_json::json!({"conversation_id": "c1"})).unwrap();
         assert_eq!(p.limit, 20);
@@ -282,24 +383,51 @@ mod tests {
     /// silently searching for the empty string.
     #[test]
     fn a_missing_required_argument_is_an_error() {
-        let err = params::<server::SearchParams>(&serde_json::json!({})).unwrap_err();
-        assert!(err.contains("query"), "{err}");
+        let err = params::<server::ListConversationsParams>(&serde_json::json!({})).unwrap_err();
+        assert!(err.contains("scope"), "{err}");
         let err = params::<server::SlugParams>(&serde_json::Value::Null).unwrap_err();
         assert!(err.contains("slug"), "{err}");
     }
 
-    /// The library server is read-only by construction, and the settings tab
-    /// labels each tool from this flag — so a tool that forgets the annotation
-    /// would be shown to the user as one that writes.
+    /// Every tool states honestly whether it changes anything: the settings tab
+    /// labels tools from this flag, and the agent loop uses it to decide what
+    /// needs the user's approval. A read tool that forgot its annotation would
+    /// be shown as a writer; a write tool claiming to be read-only would skip
+    /// the confirmation entirely.
     #[test]
-    fn every_library_tool_carries_its_read_only_claim() {
+    fn every_tool_states_whether_it_writes() {
         for tool in tools() {
-            assert!(
+            assert_eq!(
                 tool.read_only,
-                "tool '{}' does not declare read_only_hint",
+                !app_tools::is_write_tool(&tool.name),
+                "tool '{}' misreports whether it writes",
                 tool.name
             );
         }
+    }
+
+    /// The write tool has to be usable by a model on its own terms: named the
+    /// same everywhere, and with a schema that spells out all three arguments.
+    #[test]
+    fn the_write_tool_is_declared_with_a_complete_schema() {
+        let tool = tools()
+            .into_iter()
+            .find(|t| t.name == app_tools::CREATE_NOTE_TOOL)
+            .expect("the create-note tool is declared to the in-app agent");
+        assert!(!tool.read_only);
+        let props = tool.input_schema["properties"]
+            .as_object()
+            .expect("object schema");
+        for field in ["slug", "title", "content"] {
+            assert!(props.contains_key(field), "schema is missing '{field}'");
+        }
+        let required: Vec<&str> = tool.input_schema["required"]
+            .as_array()
+            .expect("required list")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, ["slug", "title", "content"]);
     }
 
     #[test]

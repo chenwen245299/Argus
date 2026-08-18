@@ -10,9 +10,12 @@
 //! streaming, and parking one of its workers on a 5000-paper scan would stall
 //! the UI.
 
+use base64::Engine;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{Implementation, JsonObject, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, JsonObject, ServerCapabilities, ServerInfo,
+};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::Value;
@@ -27,18 +30,21 @@ const INSTRUCTIONS: &str = "\
 Read-only access to the user's Argus literature library: papers, extracted full \
 text, notes, highlights, collections, relationship canvases and snippet libraries.
 
-Every paper is identified by its `slug`. Start with `list_papers` or \
-`search_papers` to find one, then use `get_paper` for its metadata and an \
-inventory of what else is available for it.
+Every paper is identified by its `slug`. Start with `find_papers` to find one — \
+its `query` matches title/author metadata and its `content` searches the full \
+text — then use `get_paper` for its metadata and an inventory of what else is \
+available for it.
 
 Reading a paper:
 - `get_paper_fulltext` returns the extracted text in slices. It is paged on \
-purpose — a whole paper will not fit comfortably in context. Call \
-`get_paper_sections` first and request the section you need, or page with \
-`offset`.
-- `get_paper_pdf_path` returns an absolute path to the PDF. Open it with your \
-own file-reading tool when you need figures, tables or layout; the extracted \
-text is faster for everything else.
+purpose — a whole paper will not fit comfortably in context. Page with \
+`offset`, continuing from the previous call's `offset + returned`.
+- `get_paper_file_path` returns an absolute path to the PDF or ebook. Open it \
+with your own file-reading tool when you need figures, tables or layout; the \
+extracted text is faster for everything else.
+- `view_paper_page` renders specific PDF pages to images — use it to look at a \
+figure, diagram or result plot, or to read one page, without paging the whole \
+extracted text.
 
 `list_conversations` and `get_conversation` reach the user's own AI \
 conversations about this library — useful for picking up a line of thought they \
@@ -72,7 +78,7 @@ where
 fn default_limit() -> usize {
     50
 }
-fn default_search_limit() -> usize {
+fn default_list_limit() -> usize {
     20
 }
 fn default_fulltext_limit() -> usize {
@@ -80,10 +86,16 @@ fn default_fulltext_limit() -> usize {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema, Default)]
-pub struct ListPapersParams {
-    /// Case-insensitive substring match against title, authors, tags and venue.
-    /// For searching inside paper *content*, use `search_papers` instead.
+pub struct FindPapersParams {
+    /// Case-insensitive substring match against title, authors, tags and venue —
+    /// matches every paper, whether or not its text has been extracted. To
+    /// search inside paper *content*, use `content`; the two combine.
     pub query: Option<String>,
+    /// Full-text search over the extracted body (SQLite FTS5 syntax, so
+    /// `"neural network"` is a phrase and `attention AND transformer` a
+    /// conjunction). Restricts results to papers whose text matched, orders them
+    /// by relevance unless `sort_by` overrides, and attaches a `snippet` to each.
+    pub content: Option<String>,
     /// Exact tag name.
     pub tag: Option<String>,
     /// Collection id from `list_collections`.
@@ -99,17 +111,17 @@ pub struct ListPapersParams {
     /// true = only papers whose text has been extracted (searchable and
     /// readable); false = only those still missing it.
     pub has_fulltext: Option<bool>,
-    /// "added" (default) | "year" | "citations" | "title".
+    /// "added" (default) | "year" | "citations" | "title". With `content` and no
+    /// explicit sort, results come back in full-text relevance order.
     pub sort_by: Option<String>,
     /// "desc" (default) | "asc".
     pub order: Option<String>,
-    /// How much of each abstract to include: "preview" (default, first 400
-    /// characters), "full" (the whole abstract — use it when you intend to
-    /// reason over the abstracts rather than just pick papers from them), or
-    /// "none".
+    /// Whether to include each paper's abstract: "none" (default) or "full".
+    /// Omitted by default to keep listings compact; pass "full" when you intend
+    /// to reason over the abstracts rather than just pick papers by title.
     pub abstract_detail: Option<String>,
-    /// Max papers to return. Default 50.
-    #[serde(default = "default_limit")]
+    /// Max papers to return. Default 20.
+    #[serde(default = "default_list_limit")]
     pub limit: usize,
     /// Papers to skip, for paging through a large result set.
     #[serde(default)]
@@ -118,19 +130,8 @@ pub struct ListPapersParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema, Default)]
 pub struct SlugParams {
-    /// Paper identifier from `list_papers` or `search_papers`.
+    /// Paper identifier from `find_papers`.
     pub slug: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema, Default)]
-pub struct SearchParams {
-    /// Full-text query. Supports SQLite FTS5 syntax, so `"neural network"` is a
-    /// phrase and `attention AND transformer` is a conjunction.
-    pub query: String,
-    /// "preview" (default) | "full" | "none". See `list_papers`.
-    pub abstract_detail: Option<String>,
-    #[serde(default = "default_search_limit")]
-    pub limit: usize,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema, Default)]
@@ -140,18 +141,24 @@ pub struct FulltextParams {
     /// to continue.
     #[serde(default)]
     pub offset: usize,
-    /// Characters to return. Default 8000, capped at 40000.
+    /// Characters to return. Default 8000, capped at 100000.
     #[serde(default = "default_fulltext_limit")]
     pub limit: usize,
-    /// Restrict to one section, by its heading from `get_paper_sections`.
-    /// Offsets are then relative to that section.
-    pub section: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema, Default)]
+pub struct ViewPageParams {
+    /// Paper identifier from `find_papers`.
+    pub slug: String,
+    /// 1-based page numbers to render, e.g. [3] or [4, 5]. Several may be
+    /// requested at once; capped at 8 per call.
+    pub pages: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema, Default)]
 pub struct NoteParams {
     pub slug: String,
-    /// Note id from `list_notes`. Omit for the most recently edited note.
+    /// Note id from `get_paper`'s `notes`. Omit for the most recently edited note.
     pub note_id: Option<String>,
 }
 
@@ -175,9 +182,6 @@ pub struct SnippetParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema, Default)]
 pub struct NoParams {}
 
-fn default_conversation_scope() -> String {
-    "all".to_string()
-}
 fn default_conversation_limit() -> usize {
     30
 }
@@ -185,13 +189,33 @@ fn default_message_limit() -> usize {
     20
 }
 
+/// Which conversations `list_conversations` returns. Required — the two stores
+/// are distinct enough that a caller should say which one it wants.
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversationScope {
+    /// Library-wide Q&A.
+    #[default]
+    Library,
+    /// Per-paper chats.
+    Paper,
+}
+
+impl ConversationScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConversationScope::Library => "library",
+            ConversationScope::Paper => "paper",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListConversationsParams {
-    /// "library" for library-wide Q&A, "paper" for per-paper chats, or "all"
-    /// (the default).
-    #[serde(default = "default_conversation_scope")]
-    pub scope: String,
-    /// Restrict to one paper's conversations. Implies scope "paper".
+    /// Which conversations to list: "library" for library-wide Q&A, or "paper"
+    /// for per-paper chats. Required.
+    pub scope: ConversationScope,
+    /// Restrict to one paper's conversations. Only applies when scope is "paper".
     pub slug: Option<String>,
     /// Case-insensitive substring match against conversation titles and message
     /// text. Matching conversations come back with an excerpt.
@@ -203,7 +227,7 @@ pub struct ListConversationsParams {
 impl Default for ListConversationsParams {
     fn default() -> Self {
         Self {
-            scope: default_conversation_scope(),
+            scope: ConversationScope::default(),
             slug: None,
             query: None,
             limit: default_conversation_limit(),
@@ -371,23 +395,23 @@ impl ArgusMcpServer {
 
 #[tool_router(router = generated_tool_router)]
 impl ArgusMcpServer {
-    /// List papers in the library, newest first. Supports filtering by title or
-    /// author text, tag, collection, reading status and year range.
+    /// Find papers by metadata substring and/or full-text content.
     #[tool(
-        name = "list_papers",
-        description = "List papers in the user's literature library, newest first. Filter by title/author text, tag, collection, reading status, year range, venue, minimum citations, or whether full text is available. Sort by `added` (default), `year`, `citations` or `title`, in either direction. Each row carries venue, DOI, arXiv id, citation count and CCF/SCI ranking. The response also carries `total` (matches before paging), so limit=1 turns this into a cheap counter for any filter.",
-        annotations(title = "List papers", read_only_hint = true)
+        name = "find_papers",
+        description = "Find papers in the user's library. `query` matches title/author/tag/venue metadata across all papers; `content` runs a full-text search over the extracted body (only papers with text, ranked by relevance, each carrying a matching `snippet`) — the two can be combined. Also filter by tag, collection, reading status, year range, venue, minimum citations, or whether full text exists. Sort by `added` (default, newest first), `year`, `citations` or `title`; with `content` and no sort, results come back by relevance. Each row carries venue, DOI, arXiv id, citation count and CCF/SCI ranking. The response carries `total` (matches before paging), so limit=1 is a cheap counter for any filter.",
+        annotations(title = "Find papers", read_only_hint = true)
     )]
-    async fn list_papers(
+    async fn find_papers(
         &self,
-        Parameters(p): Parameters<ListPapersParams>,
+        Parameters(p): Parameters<FindPapersParams>,
     ) -> Result<Json<tools::PaperListPage>, ErrorData> {
         let root = self.root()?;
         blocking(move || {
-            tools::list_papers(
+            tools::find_papers(
                 &root,
-                tools::ListPapersArgs {
+                tools::FindPapersArgs {
                     query: p.query.as_deref(),
+                    content: p.content.as_deref(),
                     tag: p.tag.as_deref(),
                     collection_id: p.collection_id.as_deref(),
                     reading_status: p.reading_status.as_deref(),
@@ -405,7 +429,7 @@ impl ArgusMcpServer {
             )
         })
         .await
-        .map(|v| Json(v.into()))
+        .map(Json)
     }
 
     /// Full metadata for one paper plus an inventory of what else is available.
@@ -424,33 +448,10 @@ impl ArgusMcpServer {
             .map(Json)
     }
 
-    /// Full-text search across the library.
-    #[tool(
-        name = "search_papers",
-        description = "Search the full text of every paper in the library and return matching excerpts. This searches paper *content*; to filter by title or author metadata use list_papers.",
-        annotations(title = "Search papers", read_only_hint = true)
-    )]
-    async fn search_papers(
-        &self,
-        Parameters(p): Parameters<SearchParams>,
-    ) -> Result<Json<tools::ItemList<tools::SearchResult>>, ErrorData> {
-        let root = self.root()?;
-        blocking(move || {
-            tools::search_papers(
-                &root,
-                &p.query,
-                p.limit.clamp(1, 100),
-                tools::AbstractDetail::parse(p.abstract_detail.as_deref()),
-            )
-        })
-            .await
-            .map(|v| Json(v.into()))
-    }
-
     /// A slice of a paper's extracted text.
     #[tool(
         name = "get_paper_fulltext",
-        description = "Read the extracted text of a paper, in slices. Papers are far too long to return whole, so this pages: use `section` to jump to one part (see get_paper_sections), or `offset` to continue where the last call stopped. Check `has_more` in the response.",
+        description = "Read the extracted text of a paper, in slices. Papers are far too long to return whole, so this pages: use `offset` to continue where the last call stopped (the previous `offset + returned`). Check `has_more` in the response.",
         annotations(title = "Read paper text", read_only_hint = true)
     )]
     async fn get_paper_fulltext(
@@ -459,35 +460,19 @@ impl ArgusMcpServer {
     ) -> Result<Json<tools::FulltextSlice>, ErrorData> {
         let root = self.root()?;
         blocking(move || {
-            tools::get_paper_fulltext(&root, &p.slug, p.offset, p.limit, p.section.as_deref())
+            tools::get_paper_fulltext(&root, &p.slug, p.offset, p.limit)
         })
         .await
-        .map(|v| Json(v.into()))
+        .map(Json)
     }
 
-    /// The paper's section outline.
+    /// Where the paper's PDF or ebook lives on disk.
     #[tool(
-        name = "get_paper_sections",
-        description = "Get a paper's section outline (headings, nesting level, page number). Use this to decide which part of a long paper to read, then pass a heading to get_paper_fulltext.",
-        annotations(title = "Get paper outline", read_only_hint = true)
-    )]
-    async fn get_paper_sections(
-        &self,
-        Parameters(p): Parameters<SlugParams>,
-    ) -> Result<Json<tools::PaperSectionList>, ErrorData> {
-        let root = self.root()?;
-        blocking(move || tools::get_paper_sections(&root, &p.slug))
-            .await
-            .map(Json)
-    }
-
-    /// Where the paper's PDF lives on disk.
-    #[tool(
-        name = "get_paper_pdf_path",
+        name = "get_paper_file_path",
         description = "Get the absolute path to a paper's PDF or ebook file, so you can open it with your own file-reading tool. Use this when you need figures, tables or page layout; for plain reading, get_paper_fulltext is cheaper.",
         annotations(title = "Locate paper file", read_only_hint = true)
     )]
-    async fn get_paper_pdf_path(
+    async fn get_paper_file_path(
         &self,
         Parameters(p): Parameters<SlugParams>,
     ) -> Result<Json<tools::DocumentLocation>, ErrorData> {
@@ -497,20 +482,33 @@ impl ArgusMcpServer {
             .map(Json)
     }
 
-    /// The paper's notes, by title and modification time.
+    /// Render specific PDF pages to images the model can actually look at.
     #[tool(
-        name = "list_notes",
-        description = "List the notes the user has written on a paper, with their ids and last-modified times.",
-        annotations(title = "List notes", read_only_hint = true)
+        name = "view_paper_page",
+        description = "Render specific pages of a paper's PDF and return them as images, so you can SEE the page — figures, architecture/model diagrams, plots and result curves, tables, equations, and layout — not just its text. This is also how to read one specific page (pass its number) instead of paging the whole extracted text with get_paper_fulltext. `pages` is 1-based; request several at once (capped at 8). Each page's extracted text is included alongside its image.",
+        annotations(title = "View paper page", read_only_hint = true)
     )]
-    async fn list_notes(
+    async fn view_paper_page(
         &self,
-        Parameters(p): Parameters<SlugParams>,
-    ) -> Result<Json<tools::ItemList<tools::NoteSummary>>, ErrorData> {
+        Parameters(p): Parameters<ViewPageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let root = self.root()?;
-        blocking(move || tools::list_notes(&root, &p.slug))
-            .await
-            .map(|v| Json(v.into()))
+        let pages = blocking(move || tools::render_paper_pages(&root, &p.slug, &p.pages)).await?;
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        for page in &pages {
+            // The page's text precedes its image so a text-only client still has
+            // something to read; capped so one dense page cannot balloon the reply.
+            let text: String = page.text.chars().take(4000).collect();
+            let label = if text.trim().is_empty() {
+                format!("Page {} (image only — no extractable text):", page.page)
+            } else {
+                format!("Page {}:\n{}", page.page, text)
+            };
+            blocks.push(ContentBlock::text(label));
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&page.png);
+            blocks.push(ContentBlock::image(b64, "image/png"));
+        }
+        Ok(CallToolResult::success(blocks))
     }
 
     /// One note's markdown source.
@@ -562,7 +560,7 @@ impl ArgusMcpServer {
     /// The user's collection tree.
     #[tool(
         name = "list_collections",
-        description = "List the user's collections — their folder tree for organizing papers — with each one's readable path, nesting depth, direct paper count, and total count including sub-collections. Pass a collection id to list_papers to see the papers themselves.",
+        description = "List the user's collections — their folder tree for organizing papers — with each one's readable path, nesting depth, direct paper count, and total count including sub-collections. Pass a collection id to find_papers to see the papers themselves.",
         annotations(title = "List collections", read_only_hint = true)
     )]
     async fn list_collections(
@@ -607,26 +605,10 @@ impl ArgusMcpServer {
             .map(Json)
     }
 
-    /// Snippet libraries.
-    #[tool(
-        name = "list_snippet_libraries",
-        description = "List the user's snippet libraries — collections of excerpts they saved while reading, typically for citing later.",
-        annotations(title = "List snippet libraries", read_only_hint = true)
-    )]
-    async fn list_snippet_libraries(
-        &self,
-        Parameters(_): Parameters<NoParams>,
-    ) -> Result<Json<tools::ItemList<tools::SnippetLibraryEntry>>, ErrorData> {
-        let root = self.root()?;
-        blocking(move || tools::list_snippet_libraries(&root))
-            .await
-            .map(|v| Json(v.into()))
-    }
-
     /// The user's own conversations with AI about their literature.
     #[tool(
         name = "list_conversations",
-        description = "List the user's AI conversations — both library-wide Q&A and per-paper chats — newest first. Pass `query` to find conversations mentioning something; matches come back with an excerpt. Returns ids and slugs for get_conversation.",
+        description = "List the user's AI conversations, newest first. Required `scope`: \"library\" for library-wide Q&A, or \"paper\" for per-paper chats (add `slug` to narrow to one paper). Pass `query` to find conversations mentioning something; matches come back with an excerpt. Returns ids and slugs for get_conversation.",
         annotations(title = "List AI conversations", read_only_hint = true)
     )]
     async fn list_conversations(
@@ -637,7 +619,7 @@ impl ArgusMcpServer {
         blocking(move || {
             tools::list_conversations(
                 &root,
-                &p.scope,
+                p.scope.as_str(),
                 p.slug.as_deref(),
                 p.query.as_deref(),
                 p.limit.clamp(1, 200),
@@ -671,19 +653,19 @@ impl ArgusMcpServer {
         .map(|v| Json(v.into()))
     }
 
-    /// Saved excerpts, optionally filtered.
+    /// Saved excerpts (plus the list of snippet libraries), optionally filtered.
     #[tool(
         name = "search_snippets",
-        description = "Search the excerpts the user saved to their snippet libraries, including the note and tags they attached and the source paper. Omit `query` to list them all.",
+        description = "Search the excerpts the user saved to their snippet libraries — with the note, tags and source paper — and get the list of their snippet libraries alongside (in `libraries`). Omit `query` to list all excerpts; pass `library_id` (an id from `libraries`) to restrict to one library.",
         annotations(title = "Search snippets", read_only_hint = true)
     )]
     async fn search_snippets(
         &self,
         Parameters(p): Parameters<SnippetParams>,
-    ) -> Result<Json<tools::ItemList<tools::SnippetEntry>>, ErrorData> {
+    ) -> Result<Json<tools::SnippetSearch>, ErrorData> {
         let root = self.root()?;
         blocking(move || {
-            tools::list_snippets(
+            tools::search_snippets(
                 &root,
                 p.library_id.as_deref(),
                 p.query.as_deref(),
@@ -691,7 +673,7 @@ impl ArgusMcpServer {
             )
         })
         .await
-        .map(|v| Json(v.into()))
+        .map(Json)
     }
 }
 
@@ -714,23 +696,20 @@ mod tests {
     /// Every tool this server exposes. Kept as a literal so that adding a tool
     /// is a deliberate two-place edit rather than something that slips in.
     const EXPECTED_TOOLS: &[&str] = &[
+        "find_papers",
         "get_canvas",
         "get_conversation",
         "get_highlights",
         "get_library_stats",
         "get_note",
         "get_paper",
+        "get_paper_file_path",
         "get_paper_fulltext",
-        "get_paper_pdf_path",
-        "get_paper_sections",
         "list_canvases",
         "list_collections",
         "list_conversations",
-        "list_notes",
-        "list_papers",
-        "list_snippet_libraries",
-        "search_papers",
         "search_snippets",
+        "view_paper_page",
     ];
 
     /// Exercises the `#[tool_router]` expansion without needing a Tauri runtime:
@@ -798,19 +777,19 @@ mod tests {
     }
 
     /// Flattening must preserve content, not just remove references. The nested
-    /// `PaperSummary` fields have to survive inlining into `list_papers`.
+    /// `PaperSummary` fields have to survive inlining into `find_papers`.
     #[test]
     fn inlining_keeps_the_nested_fields() {
         let tool = router()
             .list_all()
             .into_iter()
-            .find(|t| t.name == "list_papers")
-            .expect("list_papers missing");
+            .find(|t| t.name == "find_papers")
+            .expect("find_papers missing");
         let rendered = serde_json::to_string(tool.output_schema.as_ref().unwrap()).unwrap();
         for field in ["slug", "title", "authors", "reading_status", "total", "offset"] {
             assert!(
                 rendered.contains(field),
-                "inlining dropped '{field}' from list_papers output schema"
+                "inlining dropped '{field}' from find_papers output schema"
             );
         }
     }
@@ -909,9 +888,8 @@ mod tests {
         let per_paper = [
             "get_paper",
             "get_paper_fulltext",
-            "get_paper_sections",
-            "get_paper_pdf_path",
-            "list_notes",
+            "get_paper_file_path",
+            "view_paper_page",
             "get_note",
             "get_highlights",
         ];

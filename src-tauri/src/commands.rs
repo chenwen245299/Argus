@@ -1,7 +1,8 @@
 use tauri::{Emitter, Manager, State};
 
 use crate::models::{
-    AiModel, AiProviderInfo, AiProviderInput, AiSettingsInfo, AppSettings, ArxivConfig, ArxivInbox,
+    AgentMessage, AiModel, AiProviderInfo, AiProviderInput, AiSettingsInfo, AppSettings,
+    ArxivConfig, ArxivInbox,
     ArxivPaper, ArxivScheduleStatus, Canvas, CanvasIndexEntry, CanvasSettings, ChatMessage,
     Collection, CollectionsFile, Highlight, ImportResult, LibraryConfig, NodePosition, Note,
     PaperIndexEntry, PaperMeta, PaperStatus,
@@ -1878,6 +1879,15 @@ pub async fn extract_abstract_ai(
 }
 
 // ── M5: Copilot ───────────────────────────────────────────────────────────────
+//
+// `chat_with_paper` / `chat_with_paper_event` are the pre-agent paper chat: the
+// caller picked how much of the paper to inject (metadata / summary / sections /
+// full text / the PDF itself) and the backend built that context. The paper AI
+// panel now runs in agent mode instead — it sends `chat_with_library` with a
+// `paper_slug`, gets the paper's `get_paper` card in the system prompt, and the
+// model fetches whatever else it needs. Nothing in the app calls the two
+// commands below any more; they are kept for now rather than removed together
+// with the UI change.
 
 #[tauri::command]
 pub async fn chat_with_paper(
@@ -2033,6 +2043,18 @@ pub async fn delete_library_conversation(
     copilot::delete_library_conversation(&root, &id)
 }
 
+/// Read a page image the agent rendered for a conversation, as a data URL, so
+/// the chat can show it again after the conversation is reopened.
+#[tauri::command]
+pub async fn read_chat_image(
+    conversation_id: String,
+    file: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<String, String> {
+    let root = get_root(&state)?;
+    copilot::read_conversation_image(&root, &conversation_id, &file)
+}
+
 // ── M7: RAG Settings ─────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -2161,7 +2183,11 @@ pub async fn search_library_chunks(
 
 #[tauri::command]
 pub async fn chat_with_library(
-    messages: Vec<ChatMessage>,
+    // Agent-capable: an assistant turn may carry `tool_calls` and a `tool`
+    // message its `tool_call_id`, so a follow-up turn can replay what earlier
+    // turns already looked up. The RAG path converts these down to plain
+    // role/content messages, which is all it uses.
+    messages: Vec<AgentMessage>,
     provider_id: Option<String>,
     model_id: Option<String>,
     event_name: Option<String>,
@@ -2178,7 +2204,15 @@ pub async fn chat_with_library(
     // Opaque to the backend; echoed back in the cache-keepalive status so the
     // chat window knows which conversation is being kept warm.
     conversation_id: Option<String>,
+    // Agent mode only: the paper this conversation is about, if it is anchored
+    // to one. The paper AI panel sends it so the model starts with that paper's
+    // card already in front of it.
+    paper_slug: Option<String>,
     state: State<'_, LibraryRoot>,
+    // Which window asked. The cache keepalive runs until this window closes,
+    // and agent mode is reachable from the main window (paper AI panel, canvas
+    // chat), the popped-out paper AI window, and the chat window.
+    window: tauri::Window,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
@@ -2200,6 +2234,8 @@ pub async fn chat_with_library(
             reasoning_effort.as_deref(),
             agent_max_rounds,
             conversation_id.as_deref(),
+            paper_slug.as_deref(),
+            window.label(),
             &app,
             cancel,
         )
@@ -2208,7 +2244,14 @@ pub async fn chat_with_library(
 
     copilot::chat_with_library(
         &root,
-        messages,
+        // RAG has no tool loop: drop any replayed tool exchange (the `tool`
+        // results and the empty assistant turn that carried the `tool_calls`),
+        // leaving the plain user/assistant/system messages it expects.
+        messages
+            .iter()
+            .filter(|m| m.role != "tool" && m.tool_calls.is_none())
+            .map(AgentMessage::to_chat_message)
+            .collect(),
         provider_id.as_deref(),
         model_id.as_deref(),
         &event_name,
@@ -3053,6 +3096,27 @@ pub async fn rename_canvas(
 pub async fn delete_canvas(state: State<'_, LibraryRoot>, id: String) -> Result<(), String> {
     let root = get_root(&state)?;
     canvas::delete_canvas(&root, &id)
+}
+
+/// A canvas's own AI conversations, stored beside the canvas so they follow it
+/// — the same arrangement papers have.
+#[tauri::command]
+pub async fn get_canvas_ai_conversations(
+    state: State<'_, LibraryRoot>,
+    canvas_id: String,
+) -> Result<serde_json::Value, String> {
+    let root = get_root(&state)?;
+    canvas::read_ai_conversations(&root, &canvas_id)
+}
+
+#[tauri::command]
+pub async fn save_canvas_ai_conversations(
+    state: State<'_, LibraryRoot>,
+    canvas_id: String,
+    conversations: serde_json::Value,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    canvas::write_ai_conversations(&root, &canvas_id, &conversations)
 }
 
 #[tauri::command]

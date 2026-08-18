@@ -358,7 +358,7 @@ onMounted(refresh)
       <div v-if="showBuiltinTools" class="tool-groups">
         <div v-for="group in [
                { key: 'ro', label: t('agentSettings.readOnly'), note: t('agentSettings.readOnlyHint'), tools: byAccess(builtinTools).readOnly },
-               { key: 'rw', label: t('agentSettings.canWrite'), note: t('agentSettings.canWriteHint'), tools: byAccess(builtinTools).writes },
+               { key: 'rw', label: t('agentSettings.canWrite'), note: t('agentSettings.builtinWriteHint'), tools: byAccess(builtinTools).writes },
              ]"
              :key="group.key"
              v-show="group.tools.length"

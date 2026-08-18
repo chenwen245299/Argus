@@ -154,7 +154,7 @@ const modelIcon = computed(() =>
     <!-- Current translation view -->
     <div v-if="view === 'current'" class="current-view">
       <div v-if="!currentTranslation.sourceText" class="empty">
-        <Icon icon="argus:translate" width="28" height="28" />
+        <Icon class="empty-doodle" icon="doodle:looking-up-word-dictionary" width="64" height="64" />
         <p>暂无翻译</p>
         <span>在 PDF 中选中文字后点击翻译</span>
       </div>
@@ -222,7 +222,7 @@ const modelIcon = computed(() =>
     <!-- History view -->
     <template v-else>
       <div v-if="translationHistory.entries.length === 0" class="empty">
-        <Icon icon="fluent:clock-24-regular" width="28" height="28" />
+        <Icon class="empty-doodle" icon="doodle:looking-up-word-dictionary" width="64" height="64" />
         <p>暂无翻译记录</p>
       </div>
 
@@ -298,6 +298,13 @@ const modelIcon = computed(() =>
   flex-direction: column;
   padding: 14px;
   gap: 8px;
+}
+
+/* Hand-drawn figure for this panel's empty state: someone doing the thing the
+   panel fills up with. Muted so it reads as an illustration, not a control. */
+.empty-doodle {
+  color: color-mix(in srgb, var(--accent) 55%, var(--text-tertiary));
+  margin-bottom: 2px;
 }
 
 .empty {

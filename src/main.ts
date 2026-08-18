@@ -54,3 +54,5 @@ app.mount('#app')
 // paint. Iconify's <Icon> picks the icons up reactively once each set lands.
 import('./utils/fluentIcons').then(m => m.ensureFluentUiIcons())
 import('./utils/fluentEmoji').then(m => m.ensureFluentIcons())
+// Hand-drawn icons for tutorials and tips (DoodleNote.vue and friends).
+import('./utils/doodleIcons').then(m => m.ensureDoodleIcons())

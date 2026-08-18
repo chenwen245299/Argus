@@ -6,6 +6,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { useSelectionStore } from '../stores/selection'
 import { useLibraryStore } from '../stores/library'
 import { useReaderStore } from '../stores/reader'
+import { useCanvasStore } from '../stores/canvas'
 import MetadataTab from './tabs/MetadataTab.vue'
 import NotesTab from './tabs/NotesTab.vue'
 import HighlightsTab from './tabs/HighlightsTab.vue'
@@ -13,6 +14,7 @@ import SectionsTab from './tabs/SectionsTab.vue'
 import AnalysisTab from './tabs/AnalysisTab.vue'
 import TranslationHistoryTab from './tabs/TranslationHistoryTab.vue'
 import DrawTab from './tabs/DrawTab.vue'
+import CanvasChatTab from './tabs/CanvasChatTab.vue'
 import type { PaperMeta } from '../types'
 
 const props = defineProps<{ activeTab: string }>()
@@ -33,6 +35,14 @@ const paperTab = computed(() => props.activeTab === 'library' ? 'notes' : props.
 // interrupts an in-flight answer.
 const aiSlug = ref<string | null>(null)
 watch(activePaperSlug, (s) => { if (s) aiSlug.value = s }, { immediate: true })
+
+// The canvas chat is kept mounted for the same reason as the AI tab: an answer
+// in flight keeps streaming while the user flips to the drawing panel, or opens
+// a paper, and is still there when they come back. Sticky like `aiSlug`, so
+// leaving canvas mode (which clears the active canvas) does not tear it down.
+const canvasStore = useCanvasStore()
+const chatCanvasId = ref<string | null>(null)
+watch(() => canvasStore.activeCanvasId, (id) => { if (id) chatCanvasId.value = id }, { immediate: true })
 
 watch(activePaperSlug, async (slug) => {
   meta.value = null
@@ -104,39 +114,49 @@ async function onSlugChanged(newSlug: string) {
       />
     </div>
 
-    <!-- Drawing properties: canvas-scoped, independent of paper selection -->
-    <DrawTab v-if="props.activeTab === 'draw'" />
+    <!-- Canvas chat: canvas-scoped and kept mounted, so a running answer is not
+         cancelled by switching tabs. Only its visibility is toggled. -->
+    <div v-if="chatCanvasId" v-show="props.activeTab === 'canvasChat'" class="tab-content">
+      <CanvasChatTab :canvas-id="chatCanvasId" />
+    </div>
 
-    <!-- Translation history: always available regardless of paper selection -->
-    <TranslationHistoryTab v-else-if="paperTab === 'translations'" />
+    <!-- Everything else. Skipped entirely while the canvas chat is showing, so
+         the "no paper selected" placeholder does not appear underneath it. -->
+    <template v-if="props.activeTab !== 'canvasChat'">
+      <!-- Drawing properties: canvas-scoped, independent of paper selection -->
+      <DrawTab v-if="props.activeTab === 'draw'" />
 
-    <template v-else-if="!activePaperSlug">
-      <!-- No paper selected -->
-      <div class="no-selection">
-        <Icon icon="fluent:book-24-regular" width="28" height="28" />
-        <p>{{ t('sidebar.selectPaper') }}</p>
-      </div>
-    </template>
+      <!-- Translation history: always available regardless of paper selection -->
+      <TranslationHistoryTab v-else-if="paperTab === 'translations'" />
 
-    <!-- Paper selected (the AI tab is handled by the persistent block above) -->
-    <template v-else>
-      <div v-show="paperTab !== 'ai'" class="tab-content">
-        <MetadataTab
-          v-if="paperTab === 'metadata'"
-          :slug="activePaperSlug"
-          :meta="meta"
-          @saved="onMetaSaved"
-          @slug-changed="onSlugChanged"
-        />
-        <NotesTab
-          v-else-if="paperTab === 'notes'"
-          :slug="activePaperSlug"
-          :canvas-notes="meta?.canvas_notes ?? []"
-          @update:canvas-notes="onCanvasNotesUpdated"
-        />
-        <HighlightsTab v-else-if="paperTab === 'highlights'" />
-        <SectionsTab v-else-if="paperTab === 'sections'" :slug="activePaperSlug" />
-      </div>
+      <template v-else-if="!activePaperSlug">
+        <!-- No paper selected -->
+        <div class="no-selection">
+          <Icon icon="fluent:book-24-regular" width="28" height="28" />
+          <p>{{ t('sidebar.selectPaper') }}</p>
+        </div>
+      </template>
+
+      <!-- Paper selected (the AI tab is handled by the persistent block above) -->
+      <template v-else>
+        <div v-show="paperTab !== 'ai'" class="tab-content">
+          <MetadataTab
+            v-if="paperTab === 'metadata'"
+            :slug="activePaperSlug"
+            :meta="meta"
+            @saved="onMetaSaved"
+            @slug-changed="onSlugChanged"
+          />
+          <NotesTab
+            v-else-if="paperTab === 'notes'"
+            :slug="activePaperSlug"
+            :canvas-notes="meta?.canvas_notes ?? []"
+            @update:canvas-notes="onCanvasNotesUpdated"
+          />
+          <HighlightsTab v-else-if="paperTab === 'highlights'" />
+          <SectionsTab v-else-if="paperTab === 'sections'" :slug="activePaperSlug" />
+        </div>
+      </template>
     </template>
   </div>
 </template>

@@ -7,6 +7,11 @@
 
   --font-sans: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif;
   --font-mono: 'SF Mono', SFMono-Regular, ui-monospace, Menlo, monospace;
+  /* Handwriting, for margin notes and tutorial scribbles only (DoodleNote.vue).
+     System fonts throughout — CJK first so Chinese renders as handwriting too,
+     then the Latin faces macOS/Windows ship with. */
+  --font-hand: 'Hanzipen SC', 'Hannotate SC', 'Bradley Hand', 'Segoe Print',
+               'Comic Sans MS', 'Yuanti SC', 'STKaiti', 'KaiTi', cursive;
   --font-size-xs: 11px;
   --font-size-sm: 12px;
   --font-size-base: 13px;

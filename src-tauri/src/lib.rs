@@ -23,6 +23,7 @@ mod offer_sync;
 mod paper;
 mod path_guard;
 mod rag;
+mod render;
 mod search;
 mod sections;
 mod security_bookmark;
@@ -31,6 +32,7 @@ mod snippets;
 mod token_usage;
 mod url_import;
 mod watcher;
+mod write_confirm;
 mod writing;
 
 use std::sync::Mutex;
@@ -238,6 +240,7 @@ pub fn run() {
             commands::get_library_conversations,
             commands::save_library_conversation,
             commands::delete_library_conversation,
+            commands::read_chat_image,
             // ── M7: RAG Settings ──
             commands::get_rag_settings,
             commands::save_rag_settings,
@@ -257,6 +260,8 @@ pub fn run() {
             // ── M7: Library chat ──
             commands::chat_with_library,
             cancel::cancel_ai_request,
+            // The window's answer when the agent asks to write something.
+            write_confirm::resolve_agent_write,
             commands::open_note_window,
             commands::open_paper_ai_window,
             commands::open_library_chat_window,
@@ -312,6 +317,8 @@ pub fn run() {
             commands::delete_canvas,
             // ── M9: Node hover content ──
             commands::get_node_display_content,
+            commands::get_canvas_ai_conversations,
+            commands::save_canvas_ai_conversations,
             // ── M9: Canvas settings ──
             commands::get_canvas_settings,
             commands::save_canvas_settings,

@@ -218,9 +218,56 @@ pub fn delete_canvas(root: &str, id: &str) -> Result<(), String> {
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| format!("Delete canvas: {e}"))?;
     }
+    // The canvas's AI conversations belong to it, so they go with it. A failure
+    // here must not block the delete: the canvas itself is already gone, and a
+    // leftover chat file for an id that no longer exists is inert.
+    if let Ok(chat) = ai_conversations_path(root, id) {
+        let _ = std::fs::remove_file(chat);
+    }
     let mut index = read_index(root);
     index.retain(|e| e.id != id);
     write_index(root, &index)
+}
+
+// ── AI conversations ──────────────────────────────────────────────────────────
+//
+// A canvas's chat lives beside the canvas, exactly as a paper's lives in the
+// paper's folder: open the canvas and its conversations are there; delete the
+// canvas and they go too. The shape of a conversation is the frontend's
+// business — this is JSON in, JSON out, with the array check being the one
+// invariant worth enforcing here so a corrupt file cannot masquerade as one
+// conversation object.
+
+fn ai_conversations_path(root: &str, id: &str) -> Result<PathBuf, String> {
+    validate_canvas_id(id)?;
+    Ok(canvases_dir(root).join(format!("{id}.chat.json")))
+}
+
+pub fn read_ai_conversations(root: &str, id: &str) -> Result<serde_json::Value, String> {
+    let path = ai_conversations_path(root, id)?;
+    if !path.exists() {
+        return Ok(serde_json::json!([]));
+    }
+    Ok(std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .filter(|v: &serde_json::Value| v.is_array())
+        .unwrap_or_else(|| serde_json::json!([])))
+}
+
+pub fn write_ai_conversations(
+    root: &str,
+    id: &str,
+    conversations: &serde_json::Value,
+) -> Result<(), String> {
+    if !conversations.is_array() {
+        return Err("Canvas AI conversations must be an array.".to_string());
+    }
+    let path = ai_conversations_path(root, id)?;
+    ensure_canvases_dir(root)?;
+    let content = serde_json::to_string_pretty(conversations)
+        .map_err(|e| format!("Serialize canvas AI conversations: {e}"))?;
+    atomic_write(&path, &content).map_err(|e| format!("Write canvas chat: {e}"))
 }
 
 // ── Hover content ─────────────────────────────────────────────────────────────

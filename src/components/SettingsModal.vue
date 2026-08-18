@@ -5,10 +5,7 @@ import { updateStore } from '../stores/update'
 import GeneralSettings from './settings/GeneralSettings.vue'
 import ThemeSettings from './settings/ThemeSettings.vue'
 import AiSettings from './settings/AiSettings.vue'
-import ExtractionSettings from './settings/ExtractionSettings.vue'
 import AboutSettings from './settings/AboutSettings.vue'
-import ArxivSettings from './settings/ArxivSettings.vue'
-import CanvasSettings from './settings/CanvasSettings.vue'
 import QaSettings from './settings/QaSettings.vue'
 import McpSettings from './settings/McpSettings.vue'
 
@@ -18,22 +15,26 @@ const emit = defineEmits<{ close: [] }>()
 
 const tlHover = ref(false)
 
-type Section = 'general' | 'themes' | 'ai' | 'extraction' | 'about' | 'arxiv' | 'canvas' | 'agent' | 'mcp'
+type Section = 'general' | 'themes' | 'ai' | 'about' | 'agent' | 'mcp'
 
-// RAG moved under 智能问答 as a sub-tab. Callers that ask for it by name — the
-// chat's "configure RAG" prompts, the snippet library — must still land on it.
+// Everything the AI does now lives under AI 随航 as a sub-tab: RAG, paper
+// analysis and the arXiv crawler used to be top-level sections, and callers
+// still ask for them by their old names — the chat's "configure RAG" prompt,
+// the snippet library, the analysis entry points. Those names are mapped to the
+// tab rather than dropped, so no existing link goes nowhere.
+const QA_TABS = ['agent', 'rag', 'extraction', 'arxiv'] as const
 const requested = props.initialSection
-const initialQaTab = requested === 'rag' ? 'rag' : 'agent'
+const isQaTab = (QA_TABS as readonly string[]).includes(requested ?? '')
+const initialQaTab = isQaTab ? requested : 'agent'
 
-const activeSection = ref<Section>(requested === 'rag' ? 'agent' : ((requested as Section) ?? 'general'))
+const activeSection = ref<Section>(
+  isQaTab ? 'agent' : ((requested as Section) ?? 'general'),
+)
 
 const sections: { id: Section; label: string; placeholder?: boolean }[] = [
   { id: 'general', label: 'settings.general' },
   { id: 'themes', label: 'settings.themes' },
   { id: 'ai', label: 'settings.ai' },
-  { id: 'extraction', label: 'settings.extraction' },
-  { id: 'arxiv', label: 'settings.arxiv' },
-  { id: 'canvas', label: 'settings.canvas' },
   { id: 'agent', label: 'settings.agent' },
   { id: 'mcp', label: 'settings.mcp' },
   { id: 'about', label: 'settings.about' },
@@ -105,9 +106,6 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <GeneralSettings v-if="activeSection === 'general'" />
               <ThemeSettings v-else-if="activeSection === 'themes'" />
               <AiSettings v-else-if="activeSection === 'ai'" />
-              <ArxivSettings v-else-if="activeSection === 'arxiv'" />
-              <ExtractionSettings v-else-if="activeSection === 'extraction'" />
-              <CanvasSettings v-else-if="activeSection === 'canvas'" />
               <QaSettings v-else-if="activeSection === 'agent'" :initial-tab="initialQaTab" />
               <McpSettings v-else-if="activeSection === 'mcp'" />
               <AboutSettings v-else-if="activeSection === 'about'" />

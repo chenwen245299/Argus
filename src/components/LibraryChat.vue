@@ -8,7 +8,10 @@ import { useAiStore, type ModelOption } from '../stores/ai'
 import { useRagStore } from '../stores/rag'
 import { useSettingsStore } from '../stores/settings'
 import MarkdownBody from './MarkdownBody.vue'
+import WriteConfirmCard from './WriteConfirmCard.vue'
+import { buildToolExchangeMessages } from '../utils/agentHistory'
 import WindowControls from './WindowControls.vue'
+import ChatPageImage from './ChatPageImage.vue'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
 import { buildChunks } from '../utils/chunker'
@@ -16,7 +19,8 @@ import { sortPapersByRecentAccess } from '../utils/recentPapers'
 import { serveAddPapersToChat } from '../utils/chatPapers'
 import { estimateCostCny } from '../utils/modelPricing'
 import { modelOffer, modelSizeLabel } from '../utils/modelOffers'
-import type { ChatContentPart, ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
+import { modelLogo as logoFor, modelCapabilityText } from '../utils/modelLogo'
+import type { AgentWritePreview, ChatContentPart, ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
 
 const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag' | 'agent'] }>()
 const { t } = useI18n()
@@ -117,6 +121,19 @@ interface AgentStep {
   /** Whether the *saved* copy was shortened to keep the conversation file small.
    *  Distinct from `truncated`, which is about what the model itself got. */
   previewClipped?: boolean
+  /** Page images rendered by `view_paper_page`, shown beneath the row. */
+  images?: AgentStepImage[]
+}
+
+/** One page image a `view_paper_page` call rendered. */
+interface AgentStepImage {
+  slug: string
+  page: number
+  /** Filename in the conversation's image folder; used to reload after saving. */
+  file?: string
+  /** Live data URL for immediate display; dropped before the conversation is
+   *  saved (the PNG lives on disk under `file`) and reloaded on demand. */
+  dataUrl?: string
 }
 
 interface LibraryAnswerVariant {
@@ -223,6 +240,8 @@ interface AgentEventPayload {
   preview?: string
   /** Whether `preview` is only part of what the model received. */
   truncated?: boolean
+  /** `result` phase, `view_paper_page` only: the rendered page images. */
+  images?: AgentStepImage[] | null
   /** `servers` phase: how many extra tools the external servers contributed. */
   extraTools?: number
   /** `servers` phase: servers that were configured but could not be reached. */
@@ -394,15 +413,19 @@ function persistableSteps(steps?: AgentStep[]): AgentStep[] | undefined {
   if (!steps) return undefined
   let budget = PERSIST_ANSWER_CHARS
   return steps.map(step => {
-    if (!step.preview) return step
+    // Page images live on disk under `file`; drop the base64 `dataUrl` so the
+    // conversation JSON stays small and reloads the PNG by name instead.
+    const images = step.images?.map(({ dataUrl: _drop, ...img }) => img)
+    const base: AgentStep = images ? { ...step, images } : step
+    if (!base.preview) return base
     const room = Math.min(PERSIST_STEP_CHARS, budget)
     if (room <= 0) {
-      const { preview, ...rest } = step
+      const { preview, ...rest } = base
       return { ...rest, previewClipped: true }
     }
-    budget -= Math.min(step.preview.length, room)
-    if (step.preview.length <= room) return step
-    return { ...step, preview: step.preview.slice(0, room), previewClipped: true }
+    budget -= Math.min(base.preview.length, room)
+    if (base.preview.length <= room) return base
+    return { ...base, preview: base.preview.slice(0, room), previewClipped: true }
   })
 }
 
@@ -506,6 +529,32 @@ const copiedMsgIds = ref(new Set<string>())
 const modelPickerMsgId = ref<string | null>(null)
 const modelPickerPos = ref<{ top: number; left: number }>({ top: 0, left: 0 })
 const expandedContextId = ref<string | null>(null)
+
+// ── Agent write confirmations ────────────────────────────────────────────────
+//
+// The agent's one writing tool (create_paper_note) parks its request here and
+// waits. The card above the composer shows the first one; the rest queue behind
+// it, since two conversations can be generating at once. Nothing is written
+// until `answerWrite` sends an approval back — the backend defaults every other
+// outcome (timeout, stop, this window closing) to "do not write".
+interface PendingWrite { requestId: string; preview: AgentWritePreview }
+const pendingWrites = ref<PendingWrite[]>([])
+const currentWrite = computed<PendingWrite | null>(() => pendingWrites.value[0] ?? null)
+
+function answerWrite(approved: boolean) {
+  const pending = currentWrite.value
+  if (!pending) return
+  // Drop it from the queue first: the button must not stay live for a request
+  // that has already been answered.
+  pendingWrites.value = pendingWrites.value.slice(1)
+  invoke('resolve_agent_write', { requestId: pending.requestId, approved }).catch(() => {})
+}
+
+/** Take a request off the queue without answering — the backend has already
+ *  stopped waiting for it (timeout, or the user stopped the generation). */
+function dismissWrite(requestId: string) {
+  pendingWrites.value = pendingWrites.value.filter(w => w.requestId !== requestId)
+}
 
 const modelPickerMsg = computed(() =>
   modelPickerMsgId.value
@@ -1014,12 +1063,6 @@ function effectiveModel() { return selectedModel.value ?? ai.defaultSelection ??
 
 const selectedModelOption = computed(() => ai.findModel(effectiveModel()))
 
-const modelSvgModules = import.meta.glob<{ default: string }>('/src/assets/models/*.svg', { eager: true })
-const modelIconMap: Record<string, string> = {}
-for (const [path, mod] of Object.entries(modelSvgModules)) {
-  modelIconMap[path.replace(/^.*\//, '').replace(/\.svg$/, '')] = mod.default
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function deriveTitleFromMsg(text: string): string {
@@ -1124,66 +1167,11 @@ function persistSelectedModel(sel: ModelSelection | null) {
   } catch {}
 }
 
+/** Brand mark for a row, resolved against this model's provider kind. The
+ *  matching itself lives in utils/modelLogo so every picker agrees. */
 function modelLogo(model?: ModelOption | null) {
-  if (!model) return ''
-  const provider = ai.settings.providers.find(p => p.id === model.providerId)
-  // "openai_compatible" is a generic adapter kind used for DeepSeek/Kimi/etc.
-  // It should not be treated as the OpenAI brand.
-  const kind = provider?.kind === 'openai_compatible' ? '' : provider?.kind
-  const haystack = [
-    kind,
-    model.providerId,
-    model.providerName,
-    model.modelId,
-    model.displayName,
-  ]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase()
-
-  // Check model-specific brands first so generic adapter kinds don't win.
-  if (haystack.includes('deepseek')) return modelIconMap.deepseek
-  if (haystack.includes('kimi') || haystack.includes('moonshot')) return modelIconMap.kimi
-  if (haystack.includes('claude') || haystack.includes('anthropic')) return modelIconMap.claude
-  if (haystack.includes('gemma')) return modelIconMap.gemma
-  if (haystack.includes('gemini') || haystack.includes('google')) return modelIconMap.gemini
-  if (haystack.includes('qwen') || haystack.includes('通义') || haystack.includes('alibaba')) {
-    return modelIconMap.qwen ?? modelIconMap.alibaba
-  }
-  if (haystack.includes('grok') || haystack.includes('xai')) return modelIconMap.grok ?? modelIconMap.xai
-  if (haystack.includes('zhipu') || haystack.includes('智谱') || haystack.includes('glm')) return modelIconMap.zhipu
-  if (haystack.includes('baidu') || haystack.includes('ernie')) return modelIconMap.baidu
-  if (haystack.includes('doubao') || haystack.includes('bytedance')) return modelIconMap.bytedance
-  if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
-  if (haystack.includes('openai') || haystack.includes('gpt')) return modelIconMap.openai
-  // Ollama is a host, not a model brand — the provider name pollutes the
-  // haystack, so match its mark only after every real model brand above.
-  if (haystack.includes('ollama')) return modelIconMap['ollama-color']
-
-  // Fall back to filename-based matching for less common providers.
-  const keys = [
-    model.providerId,
-    model.providerName,
-    model.modelId.split('/')[0],
-    model.displayName.split(':')[0],
-  ]
-  for (const raw of keys) {
-    const key = raw.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
-    if (modelIconMap[key]) return modelIconMap[key]
-  }
-  return ''
-}
-
-function modelCapabilityText(model: ModelOption) {
-  const map: Record<string, string> = {
-    vision: '视觉',
-    reasoning: '推理',
-    tool_calling: '工具',
-  }
-  return model.capabilities
-    .filter(cap => cap !== 'embedding')
-    .map(cap => map[cap] ?? cap)
-    .join(' · ')
+  const provider = ai.settings.providers.find(p => p.id === model?.providerId)
+  return logoFor(model, provider?.kind)
 }
 
 /** The FREE / 折扣 badge for a picker row, or null when there is nothing to say.
@@ -1428,6 +1416,9 @@ function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
     } else {
       const ans = activeAnswer(m)
       if (ans.streaming || ans.error || !ans.content.trim()) continue
+      // Replay this turn's tool calls + results (as native tool messages) before
+      // its answer, so a follow-up reuses them instead of re-fetching.
+      history.push(...buildToolExchangeMessages(ans.agentSteps, m.id))
       history.push({ role: 'assistant', content: ans.content })
     }
   }
@@ -1724,8 +1715,24 @@ async function runAssistantRequest(
         step.chars = p.chars
         step.preview = p.preview
         step.truncated = p.truncated
+        if (p.images?.length) step.images = p.images
       }
     }
+  }))
+
+  // The agent wants to write something. Nothing happens until the user answers
+  // the card above the composer; `-confirm-close` fires for every outcome the
+  // backend decides on its own (timeout, stop), so a stale card never lingers.
+  offs.push(await listen<{ requestId: string; preview: AgentWritePreview }>(
+    `${eventName}-confirm`,
+    (e) => {
+      const p = e.payload
+      if (!p?.requestId || !p.preview) return
+      pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview }]
+    },
+  ))
+  offs.push(await listen<{ requestId: string }>(`${eventName}-confirm-close`, (e) => {
+    if (e.payload?.requestId) dismissWrite(e.payload.requestId)
   }))
 
   offs.push(await listen<LibrarySentContextPayload>(contextEventName, (e) => {
@@ -2173,6 +2180,13 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  // Answer any write still waiting on this window with a refusal. The backend
+  // would time out into the same outcome, but a closed window should release
+  // the agent immediately rather than leave it parked for minutes.
+  for (const pending of pendingWrites.value) {
+    invoke('resolve_agent_write', { requestId: pending.requestId, approved: false }).catch(() => {})
+  }
+  pendingWrites.value = []
   invoke('disarm_cache_keepalive').catch(() => {})
   document.removeEventListener('mousedown', closeModelMenu)
   window.removeEventListener('mousemove', onDividerMouseMove)
@@ -2522,9 +2536,7 @@ onUnmounted(() => {
           <!-- Empty state -->
           <div v-if="activeMessages.length === 0" class="empty-chat">
             <div class="empty-panel">
-              <div class="empty-icon">
-                <Icon icon="fluent:chat-24-regular" width="28" height="28" />
-              </div>
+              <Icon class="empty-doodle" icon="doodle:person-asking-question" width="72" height="72" />
               <p class="empty-title">{{ t('libraryChat.title') }}</p>
               <p class="empty-hint">{{ t('libraryChat.placeholder') }}</p>
               <div class="empty-suggestions">
@@ -2701,6 +2713,16 @@ onUnmounted(() => {
                           <span v-if="step.args" class="agent-step-args">{{ step.args }}</span>
                           <span v-if="step.chars" class="agent-step-size">{{ formatChars(step.chars) }}</span>
                         </button>
+
+                        <div v-if="step.images?.length" class="agent-step-images">
+                          <ChatPageImage
+                            v-for="img in step.images"
+                            :key="`${img.slug}-${img.page}-${img.file || ''}`"
+                            :conversation-id="activeConvId"
+                            :image="img"
+                            @open="previewImage = $event"
+                          />
+                        </div>
 
                         <div v-if="expandedSteps.has(stepKey(activeAnswer(msg).id, i))" class="agent-step-detail">
                           <div class="agent-detail-label">参数</div>
@@ -2897,6 +2919,16 @@ onUnmounted(() => {
 
         <!-- Input area -->
         <div class="input-area">
+          <!-- Approval for a write the agent asked for, directly above the
+               composer and the same width as it. -->
+          <WriteConfirmCard
+            v-if="currentWrite"
+            :key="currentWrite.requestId"
+            :preview="currentWrite.preview"
+            :queued="pendingWrites.length - 1"
+            @approve="answerWrite(true)"
+            @reject="answerWrite(false)"
+          />
           <div class="composer">
             <div v-if="attachments.length" class="attachment-row">
               <div
@@ -3697,13 +3729,19 @@ onUnmounted(() => {
   background: color-mix(in srgb, var(--text-tertiary) 12%, transparent);
 }
 
+/* Parameter count. Plain text rather than a filled chip — see AiTab: one grey
+   block per row competed with the model names themselves. */
 .row-size {
-  margin-right: 6px;
-  padding: 0 4px;
-  border-radius: var(--radius-sm);
-  font-size: 9.5px;
+  margin-right: 5px;
+  font-size: 10px;
   font-weight: 600;
-  background: color-mix(in srgb, var(--text-secondary) 11%, transparent);
+  color: var(--text-tertiary);
+}
+.row-size::after {
+  content: '·';
+  margin-left: 5px;
+  font-weight: 400;
+  opacity: 0.55;
 }
 .row-size.assumed { opacity: 0.6; font-weight: 500; }
 
@@ -3997,16 +4035,11 @@ onUnmounted(() => {
   gap: 12px;
 }
 
-.empty-icon {
-  width: 64px;
-  height: 64px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 18px;
-  background: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
-  color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+/* Hand-drawn figure asking a question — this panel is where you ask the whole
+   library something, and the drawing says that better than a chat bubble. */
+.empty-doodle {
+  color: color-mix(in srgb, var(--accent) 55%, var(--text-tertiary));
+  margin-bottom: 2px;
 }
 
 .empty-title {
@@ -4173,6 +4206,12 @@ onUnmounted(() => {
   overscroll-behavior: contain;
 }
 .agent-step-wrap { display: flex; flex-direction: column; }
+.agent-step-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 2px 14px;
+}
 .agent-step {
   display: flex;
   align-items: center;

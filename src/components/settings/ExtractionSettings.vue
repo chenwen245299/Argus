@@ -452,8 +452,8 @@ watch(sectionsPromptDraft, (val) => {
 
 <template>
   <div class="settings-panel">
-    <h2>{{ t('settings.extraction') }}</h2>
-    <p class="desc">{{ t('settings.extractionDesc') }}</p>
+    <!-- Title and description come from the AI 随航 heading this panel is a
+         tab of; repeating them here would say the same thing twice. -->
 
     <!-- Translate model and prompt -->
     <div class="setting-group">
@@ -839,7 +839,7 @@ watch(sectionsPromptDraft, (val) => {
 <style scoped>
 .settings-panel { padding: 24px 28px; }
 h2 { font-size: 18px; font-weight: 600; margin-bottom: 8px; color: var(--text-primary); }
-.desc { font-size: var(--font-size-sm); color: var(--text-secondary); margin-bottom: 24px; line-height: 1.5; }
+.desc { font-size: var(--font-size-sm); color: var(--text-secondary); margin-bottom: 14px; line-height: 1.5; }
 
 .setting-group { margin-bottom: 24px; }
 .setting-label {

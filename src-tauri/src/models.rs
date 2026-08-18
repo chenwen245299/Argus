@@ -738,6 +738,36 @@ pub struct ChatMessage {
     pub content: ChatContent,
 }
 
+/// A chat message on the agent path. Unlike [`ChatMessage`], it can also carry an
+/// OpenAI-style tool exchange: an assistant turn's `tool_calls`, and a `tool`
+/// result's `tool_call_id`. The chat command receives these so a follow-up turn
+/// can replay what earlier turns already looked up (the exact call and its
+/// result), instead of the model re-calling the same tool with the same
+/// arguments. Everything but `role`/`content` is optional, so a plain
+/// user/assistant message deserializes exactly as a [`ChatMessage`] would.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AgentMessage {
+    pub role: String,
+    pub content: ChatContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl AgentMessage {
+    /// Drop the tool fields for the non-agent (RAG) path, which only knows about
+    /// role + content.
+    pub fn to_chat_message(&self) -> ChatMessage {
+        ChatMessage {
+            role: self.role.clone(),
+            content: self.content.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum ChatContent {

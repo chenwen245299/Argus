@@ -166,7 +166,7 @@ function sourceLabel(source: string): string {
 
     <!-- No structure detected -->
     <div v-else-if="!loading" class="empty">
-      <Icon icon="fluent:text-bullet-list-24-regular" width="28" height="28" />
+      <Icon class="empty-doodle" icon="doodle:person-highlighting-chapter" width="64" height="64" />
       <p>{{ t('sectionsTab.noSections') }}</p>
       <span>{{ t('sectionsTab.noSectionsHint') }}</span>
       <p v-if="error" class="error-text">{{ error }}</p>
@@ -188,6 +188,13 @@ function sourceLabel(source: string): string {
 
 <style scoped>
 .sections-tab { height: 100%; overflow-y: auto; display: flex; flex-direction: column; }
+
+/* Hand-drawn figure for this panel's empty state: someone doing the thing the
+   panel fills up with. Muted so it reads as an illustration, not a control. */
+.empty-doodle {
+  color: color-mix(in srgb, var(--accent) 55%, var(--text-tertiary));
+  margin-bottom: 2px;
+}
 
 .empty {
   flex: 1;

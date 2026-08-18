@@ -102,13 +102,25 @@ const drawTabDef = computed((): SidebarTabDef => ({
   icon: 'fluent:edit-24-regular',
 }))
 
+/** Chat about the canvas itself — canvas-scoped, like the drawing panel, and
+ *  distinct from the paper 'ai' tab (which analyses the selected paper). */
+const canvasChatTabDef = computed((): SidebarTabDef => ({
+  id: 'canvasChat',
+  label: t('toolbarTabs.canvasChat'),
+  icon: 'fluent:chat-sparkle-24-regular',
+}))
+
 const sidebarTabs = computed((): SidebarTabDef[] => {
   // In canvas/graph mode, hide PDF-only tabs (translations/highlights) and
-  // surface the drawing properties tab to the left of notes.
+  // surface the canvas-scoped tabs (drawing properties, canvas chat) to the
+  // left of notes.
   if (props.canvasMode) {
     return baseSidebarTabs.value.filter(t => t.id === 'notes' || t.id === 'ai' || t.id === 'metadata')
       .reduce<SidebarTabDef[]>((acc, t) => {
-        if (t.id === 'notes') acc.push(drawTabDef.value)
+        if (t.id === 'notes') {
+          acc.push(drawTabDef.value)
+          acc.push(canvasChatTabDef.value)
+        }
         acc.push(t)
         return acc
       }, [])

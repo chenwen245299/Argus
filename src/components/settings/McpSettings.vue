@@ -63,11 +63,16 @@ const fileSteps = computed(() => {
   ]
 })
 
-const clientNote = computed(() => {
-  if (activeClient.value === 'code') return t('mcpSettings.codeNote')
-  if (activeClient.value === 'desktop') return t('mcpSettings.desktopNote')
-  return t('mcpSettings.codexNote')
+/** "How do I know it worked" differs per client — same slot, different sentence. */
+const verifyNote = computed(() => {
+  if (activeClient.value === 'code') return t('mcpSettings.verifyCode')
+  if (activeClient.value === 'desktop') return t('mcpSettings.verifyDesktop')
+  return t('mcpSettings.verifyCodex')
 })
+
+/** The doodle in the card corner follows the tab: a terminal for the one-liner,
+ *  a config file for the two clients that need one edited. */
+const clientDoodle = computed(() => (activeClient.value === 'code' ? 'terminal' : 'config-file'))
 
 async function refresh() {
   try {
@@ -122,12 +127,29 @@ onMounted(refresh)
       <p v-if="error" class="error-text">{{ error }}</p>
     </div>
 
+    <!-- What the endpoint is for -->
+    <div class="settings-card">
+      <div class="field-row">
+        <div>
+          <label class="setting-label">{{ t('mcpSettings.what') }}</label>
+          <p class="setting-hint">{{ t('mcpSettings.whatHint') }}</p>
+        </div>
+      </div>
+    </div>
+
     <!-- How to connect -->
     <div class="settings-card">
       <div class="field-row">
         <div>
           <label class="setting-label">{{ t('mcpSettings.connect') }}</label>
           <p class="setting-hint">{{ t('mcpSettings.connectHint') }}</p>
+        </div>
+        <!-- Fills the empty top-right of the card: a drawing of whatever the
+             current tab asks you to open, with a scribbled pointer down to it. -->
+        <div class="corner-doodle">
+          <Icon :icon="`doodle:${clientDoodle}`" width="38" height="38" />
+          <span class="corner-hand">{{ t('mcpSettings.connectDoodle') }}</span>
+          <Icon class="corner-arrow" icon="doodle:curved-arrow" width="34" height="25" />
         </div>
       </div>
 
@@ -144,13 +166,18 @@ onMounted(refresh)
       </div>
 
       <!-- Claude Code: one command -->
-      <div v-if="activeClient === 'code'" class="snippet-wrap">
-        <pre class="snippet">{{ config.claudeCode }}</pre>
-        <button class="snippet-copy" @click="copy('code', config.claudeCode)">
-          <Icon :icon="copiedKey === 'code' ? 'fluent:checkmark-24-regular' : 'fluent:copy-24-regular'" width="14" height="14" />
-          <span>{{ copiedKey === 'code' ? t('mcpSettings.copied') : t('mcpSettings.copy') }}</span>
-        </button>
-      </div>
+      <ol v-if="activeClient === 'code'" class="steps">
+        <li>
+          <span>{{ t('mcpSettings.codeStep1') }}</span>
+          <div class="snippet-wrap">
+            <pre class="snippet">{{ config.claudeCode }}</pre>
+            <button class="snippet-copy" @click="copy('code', config.claudeCode)">
+              <Icon :icon="copiedKey === 'code' ? 'fluent:checkmark-24-regular' : 'fluent:copy-24-regular'" width="14" height="14" />
+              <span>{{ copiedKey === 'code' ? t('mcpSettings.copied') : t('mcpSettings.copy') }}</span>
+            </button>
+          </div>
+        </li>
+      </ol>
 
       <!-- Claude Desktop: edit a config file -->
       <ol v-else class="steps">
@@ -166,10 +193,12 @@ onMounted(refresh)
         </li>
       </ol>
 
-      <p class="caveat">
-        <Icon icon="fluent:info-24-regular" width="14" height="14" />
-        <span>{{ clientNote }}</span>
-      </p>
+      <!-- Verifying is the step people ask about most, so it gets its own block
+           rather than a line buried in the steps above. -->
+      <div class="verify-block">
+        <span class="verify-head">{{ t('mcpSettings.verify') }}</span>
+        <p class="verify-line">{{ verifyNote }}</p>
+      </div>
     </div>
 
     <!-- What it can and cannot see -->
@@ -179,6 +208,7 @@ onMounted(refresh)
           <label class="setting-label">{{ t('mcpSettings.scope') }}</label>
           <p class="setting-hint">{{ t('mcpSettings.scopeHint') }}</p>
         </div>
+        <Icon class="card-mark" icon="doodle:shield-lock" width="40" height="40" />
       </div>
       <div class="scope-grid">
         <div class="scope-col allow">
@@ -300,20 +330,53 @@ onMounted(refresh)
 }
 .snippet-copy:hover { color: var(--text-primary); background: var(--bg-hover); }
 
-.caveat {
+/* ── Hand-drawn tutorial bits ── */
+
+/* Corner drawing in the "how to connect" card, pointing at the tabs below. */
+.corner-doodle {
+  flex-shrink: 0;
   display: flex;
-  align-items: flex-start;
-  gap: 7px;
-  margin: 0;
-  padding: 9px 11px;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-primary));
-  border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
-  border-radius: var(--radius-md);
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 152px;
+  color: color-mix(in srgb, var(--accent) 70%, var(--text-tertiary));
+  transform: rotate(-1.5deg);
 }
-.caveat svg { flex-shrink: 0; margin-top: 2px; color: var(--accent); }
+.corner-hand {
+  font-family: var(--font-hand);
+  font-size: 11.5px;
+  line-height: 1.4;
+  text-align: center;
+  letter-spacing: 0.2px;
+  color: var(--text-tertiary);
+}
+.corner-arrow { transform: rotate(105deg) scaleY(-1); opacity: 0.75; margin-top: -2px; }
+
+/* Faint drawing that labels a card without competing with its text. */
+.card-mark {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  opacity: 0.55;
+  transform: rotate(-4deg);
+}
+
+.verify-block {
+  padding: 11px 13px;
+  border: 1px solid color-mix(in srgb, #22c55e 30%, var(--border-subtle));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, #22c55e 5%, var(--bg-primary));
+}
+.verify-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 5px;
+}
+.verify-line { margin: 0; font-size: 12px; line-height: 1.65; color: var(--text-secondary); }
 
 .scope-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .scope-col {
@@ -339,5 +402,6 @@ onMounted(refresh)
 
 @media (max-width: 760px) {
   .scope-grid { grid-template-columns: 1fr; }
+  .corner-doodle { display: none; }
 }
 </style>

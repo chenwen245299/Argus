@@ -157,8 +157,8 @@ const arxivNeedsCategories = computed(() => form.value.fetch_arxiv && form.value
     </div>
 
     <div class="settings-body">
-    <h2 v-if="!props.standalone" class="section-title">{{ t('arxivSettings.title') }}</h2>
-    <p class="section-desc">{{ t('arxivSettings.desc') }}</p>
+    <!-- Embedded as a tab of AI 随航, whose heading already carries the title
+         and description; the standalone window has its own title bar. -->
 
     <!-- Auto-fetch toggle (prominent) -->
     <div class="field-row highlight-row">

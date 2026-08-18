@@ -18,8 +18,8 @@
 //! Three independent conditions, because a background loop that spends money
 //! must not be able to outlive its reason to exist:
 //!
-//! - the chat window is gone (checked before every ping, so it holds even if
-//!   the front-end never gets to say goodbye),
+//! - the window that started it is gone (checked before every ping, so it holds
+//!   even if the front-end never gets to say goodbye),
 //! - an hour has passed with no new question,
 //! - two pings in a row failed — a revoked key should not be retried twelve
 //!   times an hour.
@@ -49,8 +49,6 @@ const IDLE_LIMIT: Duration = Duration::from_secs(60 * 60);
 /// Consecutive failures tolerated before giving up.
 const MAX_FAILURES: u32 = 2;
 
-/// The window agent mode runs in. Its absence is what "the user left" means.
-const CHAT_WINDOW: &str = "library-chat";
 
 /// Where the chat window hears about all of this. Background spending the user
 /// cannot see is background spending they cannot judge.
@@ -104,6 +102,11 @@ pub struct Warm {
     pub messages: Vec<serde_json::Value>,
     /// The exact tool array the last turn sent, verbatim.
     pub tools: Vec<serde_json::Value>,
+    /// Label of the window that asked the question. Its disappearance is what
+    /// "the user left" means — and it is not always the chat window: the paper
+    /// AI panel and the canvas chat run agent mode inside the main window, and
+    /// the paper AI can also be popped out into a window of its own.
+    pub owner_window: String,
 }
 
 /// Cancellation flag of the running loop, if any.
@@ -182,7 +185,7 @@ pub fn arm(app: &tauri::AppHandle, warm: Warm) {
             // The authoritative check. The front-end also disarms explicitly,
             // but a window torn down without running its cleanup must not leave
             // this spending for the next hour.
-            if app.get_webview_window(CHAT_WINDOW).is_none() {
+            if app.get_webview_window(&warm.owner_window).is_none() {
                 break Stopped::Left;
             }
 

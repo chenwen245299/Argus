@@ -308,7 +308,7 @@ export interface AiModel {
 export interface AiProviderInfo {
   id: string
   name: string
-  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'ollama' | string
+  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'qwenai' | 'ollama' | string
   base_url: string
   enabled: boolean
   has_key: boolean
@@ -648,4 +648,63 @@ export interface AgentWritePreview {
   content: string
   /** A note with this title already exists — nothing is overwritten either way. */
   duplicateTitle: boolean
+}
+
+/** One validated canvas edit, as the panel applies it. Mirrors `CanvasOp` in
+ *  src-tauri/src/canvas_edit.rs — the backend froze and validated it, so the
+ *  panel draws and (on approval) applies exactly this, never the model's words. */
+export interface CanvasEditOp {
+  kind:
+    | 'addText'
+    | 'addShape'
+    | 'addPaper'
+    | 'addEdge'
+    | 'updateNode'
+    | 'updateEdge'
+    | 'deleteNode'
+    | 'deleteEdge'
+  /** Batch-local id an add* op assigns, so an addEdge in the same call can point at it. */
+  reference?: string
+  nodeId?: string
+  edgeId?: string
+  slug?: string
+  paperId?: string
+  x?: number
+  y?: number
+  width?: number
+  height?: number
+  content?: string
+  color?: string
+  fillColor?: string
+  fontSize?: number
+  shapeKind?: 'rect' | 'ellipse' | 'diamond'
+  /** Edge endpoints: each an existing node id or a `reference` from this batch. */
+  from?: string
+  to?: string
+  label?: string
+  /** Short human label for the card (paper title, node text, …). */
+  display?: string
+}
+
+export interface CanvasEditSummary {
+  addedNodes: number
+  addedEdges: number
+  updatedNodes: number
+  updatedEdges: number
+  removedNodes: number
+  removedEdges: number
+  /** One short phrase per operation, in order. */
+  lines: string[]
+}
+
+/** What the agent proposes to draw on a canvas, shown in the approval card while
+ *  the change itself is previewed on the canvas. Mirrors `CanvasEditPreview` in
+ *  src-tauri/src/canvas_edit.rs. */
+export interface CanvasEditPreview {
+  /** Always `edit_canvas`; lets the chat pick this card over the note card. */
+  tool: string
+  canvasId: string
+  canvasName: string
+  ops: CanvasEditOp[]
+  summary: CanvasEditSummary
 }

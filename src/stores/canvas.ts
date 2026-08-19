@@ -1,7 +1,25 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import type { Canvas, CanvasIndexEntry, CanvasSettings } from '../types'
+import type { Canvas, CanvasEditOp, CanvasIndexEntry, CanvasSettings } from '../types'
+
+/** An AI canvas edit as it travels from the canvas chat (which owns the
+ *  backend approval handshake) to the CanvasPanel (which owns the live document
+ *  and draws/applies the change). One request at a time, keyed by `requestId`:
+ *
+ *   - `preview`  — the panel draws the change on the canvas, awaiting a decision
+ *   - `apply`    — the user approved; the panel applies these same ops and saves
+ *   - `discard`  — declined/timed out/left; the panel just clears the preview
+ *
+ *  `seq` bumps on every phase change so the panel's watcher fires even when the
+ *  request id is unchanged, matching how pendingPatch/pendingAction work. */
+export interface CanvasEditRequest {
+  requestId: string
+  canvasId: string
+  ops: CanvasEditOp[]
+  phase: 'preview' | 'apply' | 'discard'
+  seq: number
+}
 
 /** Editable snapshot of the currently selected canvas node, shared between the
  *  canvas (CanvasPanel) and the right-sidebar properties panel (DrawTab). */
@@ -74,8 +92,11 @@ export const useCanvasStore = defineStore('canvas', () => {
   const pendingPatch = ref<{ nodeId: string; patch: Partial<DrawNodeSnapshot>; seq: number } | null>(null)
   // Generic action channel for batch ops (align/distribute/z-order/duplicate/…).
   const pendingAction = ref<{ type: string; payload?: unknown; seq: number } | null>(null)
+  // An AI edit the canvas chat is proposing to this canvas (see CanvasEditRequest).
+  const canvasEditRequest = ref<CanvasEditRequest | null>(null)
   let patchSeq = 0
   let actionSeq = 0
+  let canvasEditSeq = 0
 
   /** Called by CanvasPanel to publish the selected node's current properties. */
   function setSelectedNode(snap: DrawNodeSnapshot | null) {
@@ -98,6 +119,29 @@ export const useCanvasStore = defineStore('canvas', () => {
   /** Called by DrawTab to request a canvas-level action on the selection. */
   function requestAction(type: string, payload?: unknown) {
     pendingAction.value = { type, payload, seq: ++actionSeq }
+  }
+
+  // ── AI canvas edits (canvas chat ↔ CanvasPanel) ────────────────────────────
+
+  /** The canvas chat asks the matching panel to preview an AI edit. */
+  function proposeCanvasEdit(requestId: string, canvasId: string, ops: CanvasEditOp[]) {
+    canvasEditRequest.value = { requestId, canvasId, ops, phase: 'preview', seq: ++canvasEditSeq }
+  }
+
+  /** The user answered the approval card: apply the preview or drop it. Ignored
+   *  if it does not name the request currently on screen (a stale click). */
+  function resolveCanvasEdit(requestId: string, action: 'apply' | 'discard') {
+    const cur = canvasEditRequest.value
+    if (!cur || cur.requestId !== requestId) return
+    canvasEditRequest.value = { ...cur, phase: action, seq: ++canvasEditSeq }
+  }
+
+  /** Drop the pending edit entirely (nothing to preview any more). */
+  function clearCanvasEdit(requestId?: string) {
+    const cur = canvasEditRequest.value
+    if (!cur) return
+    if (requestId && cur.requestId !== requestId) return
+    canvasEditRequest.value = null
   }
 
   // Auto-save debounce, one timer per open canvas — a shared timer would let a
@@ -254,10 +298,14 @@ export const useCanvasStore = defineStore('canvas', () => {
     selectedNodeIds,
     pendingPatch,
     pendingAction,
+    canvasEditRequest,
     setSelectedNode,
     setSelectedNodeIds,
     patchNode,
     requestAction,
+    proposeCanvasEdit,
+    resolveCanvasEdit,
+    clearCanvasEdit,
     loadList,
     createCanvas,
     openCanvas,

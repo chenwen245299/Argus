@@ -367,6 +367,9 @@ pub struct CanvasNodeEntry {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CanvasEdgeEntry {
+    /// The edge's own id, so an agent editing the canvas can name it in an
+    /// `update_edge` / `delete_edge` operation.
+    pub edge_id: String,
     pub source_node_id: String,
     pub target_node_id: String,
     /// The user's word for the relationship ("extends", "contradicts", …).
@@ -1266,6 +1269,7 @@ pub fn get_canvas(root: &str, id: &str) -> Result<CanvasDetail, String> {
         .edges
         .iter()
         .map(|e| CanvasEdgeEntry {
+            edge_id: e.edge_id.clone(),
             source_node_id: e.from_node_id.clone(),
             target_node_id: e.to_node_id.clone(),
             label: e.label.clone().unwrap_or_default(),

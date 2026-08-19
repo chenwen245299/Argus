@@ -34,9 +34,11 @@ pub const CREATE_NOTE_TOOL: &str = "create_paper_note";
 ///
 /// The read-only dispatcher (`super::agent::call`) refuses these, so forgetting
 /// to ask the user is not a mistake that can be made quietly — the call fails
-/// instead of writing.
+/// instead of writing. Covers the canvas-editing tool too (see
+/// [`crate::canvas_edit`]): it never runs read-only either, and lives behind the
+/// same confirmation.
 pub fn is_write_tool(name: &str) -> bool {
-    name == CREATE_NOTE_TOOL
+    name == CREATE_NOTE_TOOL || crate::canvas_edit::is_edit_tool(name)
 }
 
 /// Longest note title accepted. Titles show up in lists and tabs; a model that

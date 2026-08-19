@@ -57,6 +57,13 @@ export function modelLogo(model?: ModelOption | null, providerKind?: string): st
     const key = raw.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
     if (modelIconMap[key]) return modelIconMap[key]
   }
+  // Last resort: an icon filename that appears anywhere in the names. This
+  // catches marks like `dots` inside "Dots Studio: Dots3-Note Preview", which
+  // the split-key lookup above misses ("dots-studio" ≠ "dots"). Runs after every
+  // explicit brand check so it can't steal an ambiguous match.
+  for (const key of Object.keys(modelIconMap)) {
+    if (haystack.includes(key)) return modelIconMap[key]
+  }
   return ''
 }
 
@@ -69,8 +76,11 @@ export function modelLogo(model?: ModelOption | null, providerKind?: string): st
 export function modelCapabilityText(model: ModelOption): string {
   const map: Record<string, string> = {
     vision: '视觉',
+    audio: '音频',
     reasoning: '推理',
     tool_calling: '工具',
+    image_gen: '文生图',
+    video: '视频',
   }
   return (model.capabilities ?? [])
     .filter(cap => cap !== 'embedding')

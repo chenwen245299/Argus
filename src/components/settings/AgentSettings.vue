@@ -50,14 +50,14 @@ function byAccess(tools: ToolInfo[]) {
 }
 
 const view = ref<AgentSettingsView>({
-  maxRounds: 10,
+  maxRounds: 50,
   keepCacheWarm: true,
   systemPrompt: '',
   defaultSystemPrompt: '',
   servers: [],
   builtinToolCount: 0,
   minRounds: 1,
-  maxRoundsLimit: 50,
+  maxRoundsLimit: 500,
   maxServers: 20,
 })
 const builtinTools = ref<ToolInfo[]>([])
@@ -90,7 +90,7 @@ function setRounds(value: number) {
   const n = Math.round(Number(value))
   view.value.maxRounds = Number.isFinite(n)
     ? Math.min(Math.max(n, view.value.minRounds), view.value.maxRoundsLimit)
-    : 10
+    : 50
   persist()
 }
 

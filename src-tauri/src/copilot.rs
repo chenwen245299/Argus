@@ -1752,7 +1752,7 @@ fn build_system_prompt(
 // the model is doing rather than a blank pause.
 
 /// Default tool rounds per answer when the caller does not say.
-pub const DEFAULT_AGENT_ROUNDS: usize = 10;
+pub const DEFAULT_AGENT_ROUNDS: usize = 50;
 /// Lower bound — one round is still a useful "look something up, then answer".
 pub const MIN_AGENT_ROUNDS: usize = 1;
 /// Hard ceiling, whatever the user configures.
@@ -2078,12 +2078,16 @@ pub async fn chat_with_library_agent(
     // The paper this conversation is about, when it is anchored to one (the
     // paper AI panel). Its `get_paper` card is put in the system prompt.
     paper_slug: Option<&str>,
+    // The canvas this conversation is about, when it is (the "问画布" chat). Its
+    // presence is what unlocks the `edit_canvas` tool, and nothing else does.
+    canvas_id: Option<&str>,
     // Label of the window this answer was asked from. The cache keepalive stops
     // when that window goes away, so it must be the window the user is actually
     // looking at — not a hardcoded one.
     owner_window: &str,
     app: &tauri::AppHandle,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    web_search: bool,
 ) -> Result<String, String> {
     use tauri::Emitter;
 
@@ -2120,9 +2124,11 @@ pub async fn chat_with_library_agent(
         max_rounds,
         conversation_id,
         paper_block.as_deref(),
+        canvas_id,
         &bridge,
         app,
         cancel,
+        web_search,
     )
     .await;
 
@@ -2135,7 +2141,7 @@ pub async fn chat_with_library_agent(
     let vision = ai_manager::resolve_provider_model(root, provider_id, model_id)
         .map(|(provider, _, model)| model_sees_images(&provider, &model))
         .unwrap_or(false);
-    let tool_defs = agent_tool_defs(&bridge, vision);
+    let tool_defs = agent_tool_defs(&bridge, vision, canvas_id.is_some());
     bridge.shutdown().await;
 
     // Keep the prefix this answer just built warm, so the user can think for
@@ -2248,12 +2254,19 @@ fn model_sees_images(provider: &crate::models::AiProvider, model_id: &str) -> bo
 /// built on the page's extracted text while the model believed it had seen the
 /// figure, and on some providers the oversized request simply fails. A model
 /// that cannot see is better told the tool does not exist.
+///
+/// `canvas_edit` adds the canvas-editing tool, and only then: it is offered when
+/// the question is about a canvas and nowhere else. Passed identically to the
+/// loop and the keepalive, for the same reason `vision` is — a tools block that
+/// carries it in one place and not the other is two different cached prefixes.
 fn agent_tool_defs(
     bridge: &crate::mcp::client::ToolBridge,
     vision: bool,
+    canvas_edit: bool,
 ) -> Vec<serde_json::Value> {
     crate::mcp::agent::tools()
         .into_iter()
+        .chain(canvas_edit.then(crate::mcp::agent::canvas_edit_tool))
         .filter(|t| vision || t.name != crate::mcp::agent::VIEW_PAGE_TOOL)
         .chain(bridge.tools().iter().cloned())
         .map(|t| {
@@ -2298,7 +2311,13 @@ async fn run_confirmed_write(
             .map_err(|e| format!("preview task failed: {e}"))?
     };
 
-    let decision = crate::write_confirm::request(app, event_name, &preview, cancel.clone()).await;
+    let decision = crate::write_confirm::request(
+        app,
+        event_name,
+        serde_json::to_value(&preview).unwrap_or_default(),
+        cancel.clone(),
+    )
+    .await;
     if !decision.approved() {
         return Err(decision.message().to_string());
     }
@@ -2307,6 +2326,42 @@ async fn run_confirmed_write(
     tokio::task::spawn_blocking(move || pending.execute(&root_owned))
         .await
         .map_err(|e| format!("write task failed: {e}"))?
+}
+
+/// Put one canvas edit in front of the user, and — if they approve — hand the
+/// model a success so it can describe what it did.
+///
+/// Unlike [`run_confirmed_write`], the write itself never happens here. A canvas
+/// is a live document in the panel, so the *frontend* draws the preview and, on
+/// approval, applies these same operations to the open canvas and lets its
+/// autosave persist them (see [`crate::canvas_edit`]). This function's job is the
+/// handshake: validate, show the preview, and report the decision to the model.
+async fn run_confirmed_canvas_edit(
+    root: &str,
+    canvas_id: &str,
+    args: &serde_json::Value,
+    event_name: &str,
+    app: &tauri::AppHandle,
+    cancel: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<serde_json::Value, String> {
+    // A malformed call is the model's to fix; the user is not interrupted for it.
+    let edit = {
+        let root_owned = root.to_string();
+        let canvas_id_owned = canvas_id.to_string();
+        let args = args.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::canvas_edit::CanvasEdit::parse(&root_owned, &canvas_id_owned, &args)
+        })
+        .await
+        .map_err(|e| format!("canvas edit parse task failed: {e}"))??
+    };
+
+    let preview = serde_json::to_value(edit.preview()).unwrap_or_default();
+    let decision = crate::write_confirm::request(app, event_name, preview, cancel.clone()).await;
+    if !decision.approved() {
+        return Err(decision.message().to_string());
+    }
+    Ok(edit.result())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2322,9 +2377,15 @@ async fn run_agent_loop(
     conversation_id: Option<&str>,
     // `get_paper` for the paper this conversation is anchored to, if any.
     paper_block: Option<&str>,
+    // The canvas this answer is about, if any. `Some` unlocks `edit_canvas` and
+    // is the id every edit is aimed at — the model never gets to choose it.
+    canvas_id: Option<&str>,
     bridge: &crate::mcp::client::ToolBridge,
     app: &tauri::AppHandle,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // Qwen's native web search, threaded down to each `stream_with_tools` call so
+    // the model can search the web in the same turns it calls the agent's tools.
+    web_search: bool,
 ) -> Result<String, String> {
     use tauri::Emitter;
 
@@ -2354,7 +2415,7 @@ async fn run_agent_loop(
 
     // Tool declarations in OpenAI-compatible form, built once per answer: the
     // library's own tools first, then whatever the configured servers offer.
-    let tool_defs = agent_tool_defs(bridge, model_sees_images);
+    let tool_defs = agent_tool_defs(bridge, model_sees_images, canvas_id.is_some());
 
     let mut convo: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
@@ -2412,6 +2473,7 @@ async fn run_agent_loop(
             reasoning_effort,
             "library-agent",
             cancel.clone(),
+            web_search,
         )
         .await;
         let turn = match turn {
@@ -2458,6 +2520,7 @@ async fn run_agent_loop(
                 reasoning_effort,
                 "library-agent",
                 cancel.clone(),
+                web_search,
             )
             .await;
             let final_turn = match final_turn {
@@ -2519,6 +2582,29 @@ async fn run_agent_loop(
                      Use get_paper_fulltext for the page's text, and tell the user a \
                      vision-capable model is needed to look at figures."
                     .to_string())
+            } else if crate::canvas_edit::is_edit_tool(&call.name) {
+                // Editing the canvas. Offered only when this answer is about one,
+                // so a call without a canvas in scope can only be the model
+                // inventing the tool — refuse it. Otherwise the user sees the
+                // change drawn on the canvas and nothing is saved until they
+                // approve it. (Checked before the note branch below, since
+                // `is_write_tool` now covers this name too.)
+                match canvas_id {
+                    Some(cid) => {
+                        run_confirmed_canvas_edit(
+                            root,
+                            cid,
+                            &call.arguments,
+                            event_name,
+                            app,
+                            &cancel,
+                        )
+                        .await
+                    }
+                    None => Err("edit_canvas is only available when the question is about a \
+                                 specific canvas."
+                        .to_string()),
+                }
             } else if crate::mcp::app_tools::is_write_tool(&call.name) {
                 // The only tools that change the library. Nothing is written
                 // until the user has looked at this exact note and approved it;
@@ -2750,7 +2836,7 @@ mod agent_tests {
         let bridge = crate::mcp::client::ToolBridge::none();
 
         let names = |vision: bool| -> Vec<String> {
-            agent_tool_defs(&bridge, vision)
+            agent_tool_defs(&bridge, vision, false)
                 .into_iter()
                 .filter_map(|t| {
                     t["function"]["name"]

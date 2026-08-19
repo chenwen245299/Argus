@@ -5,6 +5,7 @@ mod arxiv_scheduler;
 mod cache_keepalive;
 mod cancel;
 mod canvas;
+mod canvas_edit;
 mod canvas_enhance;
 mod collections;
 mod commands;

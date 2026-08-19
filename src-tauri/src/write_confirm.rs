@@ -84,10 +84,15 @@ fn registry() -> &'static Mutex<HashMap<String, oneshot::Sender<bool>>> {
 /// `event_name` is the streaming event prefix of the answer being generated, so
 /// the request lands in the window and the conversation that asked for it — a
 /// second chat window running its own agent never sees this dialog.
+///
+/// `preview` is already-serialized JSON so the one handshake serves both writes
+/// that have a preview shape of their own — a note ([`crate::mcp::app_tools`])
+/// and a canvas edit ([`crate::canvas_edit`]). The window tells them apart by the
+/// `tool` field inside it.
 pub async fn request(
     app: &tauri::AppHandle,
     event_name: &str,
-    preview: &crate::mcp::app_tools::WritePreview,
+    preview: serde_json::Value,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Decision {
     let id = uuid::Uuid::new_v4().to_string();

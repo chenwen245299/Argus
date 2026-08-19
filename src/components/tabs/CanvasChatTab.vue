@@ -20,9 +20,10 @@ import { useAiStore, type ModelOption } from '../../stores/ai'
 import { useCanvasStore } from '../../stores/canvas'
 import MarkdownBody from '../MarkdownBody.vue'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
+import CanvasEditConfirmCard from '../CanvasEditConfirmCard.vue'
 import { modelLogo as logoFor, modelCapabilityText } from '../../utils/modelLogo'
 import { modelOffer, modelSizeLabel } from '../../utils/modelOffers'
-import type { AgentWritePreview, ChatMessage, ModelSelection } from '../../types'
+import type { AgentWritePreview, CanvasEditPreview, ChatMessage, ModelSelection } from '../../types'
 
 const props = defineProps<{ canvasId: string }>()
 
@@ -64,11 +65,19 @@ const model = ref<ModelSelection | null>(null)
 const messagesEl = ref<HTMLElement | null>(null)
 const errorText = ref('')
 
-// A write the agent asked for, waiting on the user. Same card the library chat
-// uses; nothing is written until it is answered.
-interface PendingWrite { requestId: string; preview: AgentWritePreview }
+// A write the agent asked for, waiting on the user. Two shapes share the queue:
+// a note (the same card the library chat uses) and a canvas edit (drawn on the
+// canvas, approved here). Nothing happens until the card is answered.
+type PendingWrite =
+  | { kind: 'note'; requestId: string; preview: AgentWritePreview }
+  | { kind: 'canvas'; requestId: string; preview: CanvasEditPreview }
 const pendingWrites = ref<PendingWrite[]>([])
 const currentWrite = computed<PendingWrite | null>(() => pendingWrites.value[0] ?? null)
+// Narrowed views so each card gets the exact preview type it expects.
+const currentCanvasWrite = computed(() =>
+  currentWrite.value?.kind === 'canvas' ? currentWrite.value : null)
+const currentNoteWrite = computed(() =>
+  currentWrite.value?.kind === 'note' ? currentWrite.value : null)
 
 // ── Model picker ─────────────────────────────────────────────────────────────
 //
@@ -275,20 +284,30 @@ async function send() {
     },
   ))
 
-  // The agent asking to write a note. Handled exactly as in the library chat:
-  // the card appears above the composer and nothing happens until it is
-  // answered; `-confirm-close` clears it when the backend gave up waiting.
-  unlisteners.push(await listen<{ requestId: string; preview: AgentWritePreview }>(
+  // The agent asking to write. A note card renders in place; a canvas edit is
+  // drawn on the canvas (via the store) and this card is just the legend and the
+  // yes/no. `-confirm-close` clears it when the backend gave up waiting.
+  unlisteners.push(await listen<{ requestId: string; preview: AgentWritePreview | CanvasEditPreview }>(
     `${eventName}-confirm`,
     (e) => {
       const p = e.payload
       if (!p?.requestId || !p.preview) return
-      pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview }]
+      if (p.preview.tool === 'edit_canvas') {
+        const preview = p.preview as CanvasEditPreview
+        pendingWrites.value = [...pendingWrites.value, { kind: 'canvas', requestId: p.requestId, preview }]
+        // Ask the matching canvas panel to draw the change as a preview.
+        canvasStore.proposeCanvasEdit(p.requestId, preview.canvasId, preview.ops)
+      } else {
+        pendingWrites.value = [...pendingWrites.value, { kind: 'note', requestId: p.requestId, preview: p.preview as AgentWritePreview }]
+      }
     },
   ))
   unlisteners.push(await listen<{ requestId: string }>(`${eventName}-confirm-close`, (e) => {
     const id = e.payload?.requestId
-    if (id) pendingWrites.value = pendingWrites.value.filter(w => w.requestId !== id)
+    if (!id) return
+    const closing = pendingWrites.value.find(w => w.requestId === id)
+    if (closing?.kind === 'canvas') canvasStore.clearCanvasEdit(id)
+    pendingWrites.value = pendingWrites.value.filter(w => w.requestId !== id)
   }))
 
   try {
@@ -307,6 +326,9 @@ async function send() {
       webSearch: false,
       agentMaxRounds: null,
       conversationId: conv.id,
+      // Anchors this answer to the canvas: it is what unlocks the `edit_canvas`
+      // tool and the only canvas any edit can touch.
+      canvasId: props.canvasId,
     })
     if (final && !live.content) live.content = final
   } catch (e) {
@@ -353,6 +375,10 @@ function answerWrite(approved: boolean) {
   const pending = currentWrite.value
   if (!pending) return
   pendingWrites.value = pendingWrites.value.slice(1)
+  // A canvas edit is applied (or dropped) by the panel that drew it.
+  if (pending.kind === 'canvas') {
+    canvasStore.resolveCanvasEdit(pending.requestId, approved ? 'apply' : 'discard')
+  }
   invoke('resolve_agent_write', { requestId: pending.requestId, approved }).catch(() => {})
 }
 
@@ -405,6 +431,11 @@ watch(() => props.canvasId, (id) => {
   // conversation the user can no longer see.
   if (loading.value) stop()
   detachListeners()
+  // Any edit still parked on the canvas we are leaving is dropped, preview and all.
+  for (const pending of pendingWrites.value) {
+    if (pending.kind === 'canvas') canvasStore.clearCanvasEdit(pending.requestId)
+    invoke('resolve_agent_write', { requestId: pending.requestId, approved: false }).catch(() => {})
+  }
   pendingWrites.value = []
   loading.value = false
   void load(id)
@@ -429,6 +460,7 @@ onUnmounted(() => {
   // Release any write still parked on this tab; the backend would otherwise
   // wait out its timeout before telling the model nothing was written.
   for (const pending of pendingWrites.value) {
+    if (pending.kind === 'canvas') canvasStore.clearCanvasEdit(pending.requestId)
     invoke('resolve_agent_write', { requestId: pending.requestId, approved: false }).catch(() => {})
   }
   pendingWrites.value = []
@@ -441,12 +473,12 @@ onUnmounted(() => {
     <!-- Header: which canvas, plus conversation controls -->
     <div class="cc-header">
       <div class="cc-title">
-        <Icon icon="doodle:chat-panel" width="16" height="16" />
+        <Icon icon="fluent:chat-sparkle-24-regular" width="15" height="15" />
         <span class="cc-canvas-name" :title="canvasName">{{ canvasName || t('canvasChat.untitled') }}</span>
       </div>
       <div class="cc-header-actions">
         <button class="cc-icon-btn" :title="t('canvasChat.newChat')" @click="startNewConversation">
-          <Icon icon="fluent:compose-24-regular" width="15" height="15" />
+          <Icon icon="fluent:add-24-regular" width="15" height="15" />
         </button>
         <button
           class="cc-icon-btn"
@@ -563,10 +595,18 @@ onUnmounted(() => {
 
     <!-- Composer -->
     <div class="cc-composer-wrap">
+      <CanvasEditConfirmCard
+        v-if="currentCanvasWrite"
+        :key="currentCanvasWrite.requestId"
+        :preview="currentCanvasWrite.preview"
+        :queued="pendingWrites.length - 1"
+        @approve="answerWrite(true)"
+        @reject="answerWrite(false)"
+      />
       <WriteConfirmCard
-        v-if="currentWrite"
-        :key="currentWrite.requestId"
-        :preview="currentWrite.preview"
+        v-else-if="currentNoteWrite"
+        :key="currentNoteWrite.requestId"
+        :preview="currentNoteWrite.preview"
         :queued="pendingWrites.length - 1"
         @approve="answerWrite(true)"
         @reject="answerWrite(false)"
@@ -753,24 +793,27 @@ onUnmounted(() => {
 .cc-offer-tag.discount.idle { color: var(--text-tertiary); background: color-mix(in srgb, var(--text-tertiary) 12%, transparent); }
 
 .cc-header {
+  height: var(--content-header-height);
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  padding: 10px 12px;
+  padding: 0 10px 0 12px;
   border-bottom: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--bg-secondary) 68%, var(--bg-primary));
   flex-shrink: 0;
 }
 .cc-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .cc-title svg { color: var(--accent); flex-shrink: 0; }
 .cc-canvas-name {
-  font-size: 13px;
-  font-weight: 600;
+  font-size: var(--font-size-sm);
+  font-weight: 650;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.cc-header-actions { margin-left: auto; display: flex; gap: 2px; flex-shrink: 0; }
+.cc-header-actions { margin-left: auto; display: flex; gap: 6px; flex-shrink: 0; }
 .cc-icon-btn {
   display: inline-flex;
   align-items: center;
@@ -785,6 +828,22 @@ onUnmounted(() => {
 .cc-icon-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .cc-icon-btn.active { background: var(--bg-active); color: var(--accent); }
 .cc-icon-btn.tiny { padding: 3px; }
+
+/* Header buttons match the AI tab's .icon-btn: a fixed 30px outlined box that
+   turns accent on hover — while the base .cc-icon-btn stays compact for the
+   history list's inline delete (.tiny), which is not inside .cc-header-actions. */
+.cc-header-actions .cc-icon-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 9px;
+  border: 1px solid transparent;
+}
+.cc-header-actions .cc-icon-btn:hover {
+  color: var(--accent);
+  border-color: var(--border-default);
+  background: var(--bg-hover);
+}
 
 .cc-history {
   flex-shrink: 0;

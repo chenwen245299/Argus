@@ -28,10 +28,19 @@ pub fn is_deepseek(provider: &AiProvider) -> bool {
     provider.base_url.to_lowercase().contains("deepseek")
 }
 
-/// Server-side web search is a DeepSeek Responses-API feature; no other provider
-/// wired up here exposes one, so the toggle is only offered for DeepSeek.
-pub fn supports_web_search(provider: &AiProvider) -> bool {
-    is_deepseek(provider)
+/// Qwen (Alibaba Model Studio / QwenCloud Token Plan). OpenAI-compatible, so it
+/// rides the generic `/chat/completions` path; detection is only needed for the
+/// features layered on top of it — native web search and model enrichment.
+///
+/// Both providers that expose a server-side web search do so differently:
+/// DeepSeek needs its Responses API (see the dispatch in `chat_completion_stream`),
+/// while Qwen keeps the standard `/chat/completions` shape and only adds an
+/// `enable_search` field to the body — which is why the two are detected
+/// separately rather than behind one `supports_web_search` predicate.
+pub fn is_qwen(provider: &AiProvider) -> bool {
+    provider.kind == "qwenai"
+        || provider.base_url.to_lowercase().contains("dashscope")
+        || provider.base_url.to_lowercase().contains("maas.aliyuncs")
 }
 
 /// Ollama's native endpoints live at `/api/*` off the server root. Accept a
@@ -79,10 +88,11 @@ pub async fn chat_completion_stream(
     cancel: Option<Arc<AtomicBool>>,
     web_search: bool,
 ) -> Result<String, String> {
-    // Web search lives on a different protocol (DeepSeek's Responses API), so it
-    // takes its own path rather than adding a `tools` field to a request the
-    // /chat/completions endpoint would ignore.
-    if web_search && supports_web_search(provider) {
+    // DeepSeek's web search lives on a different protocol (its Responses API), so
+    // it takes its own path. Qwen's, by contrast, is just an `enable_search` flag
+    // on the ordinary /chat/completions body, so it stays on the openai-compat
+    // path below with `web_search` threaded through.
+    if web_search && is_deepseek(provider) {
         return stream_deepseek_responses(
             provider,
             api_key,
@@ -136,6 +146,7 @@ pub async fn chat_completion_stream(
             reasoning_effort,
             source,
             cancel,
+            web_search,
         )
         .await
     }
@@ -186,6 +197,18 @@ pub async fn list_models(provider: &AiProvider, api_key: &str) -> Result<Vec<AiM
         // ordinary API keys (it typically returns 401). Return a hard-coded
         // well-known list instead.
         return Ok(kimi_known_models());
+    }
+    if is_qwen(provider) {
+        // QwenCloud's /models lists the OpenAI-compatible chat models available to
+        // this key — the text/VL/reasoning ones, not the console's full media
+        // catalogue (image/video/audio/embedding ride DashScope-native endpoints).
+        // It returns bare ids with no modality, so overlay an id-derived capability
+        // table onto each. Errors surface like every other provider's rather than
+        // being masked by a stale hardcoded list the user can't tell apart from a
+        // genuinely short result; anything the endpoint omits can still be added by
+        // id via 手动添加.
+        let models = fetch_openai_models(provider, api_key).await?;
+        return Ok(models.into_iter().map(enrich_qwen_model).collect());
     }
     match provider.kind.as_str() {
         "anthropic" => Ok(anthropic_known_models()),
@@ -940,6 +963,7 @@ async fn stream_openai_compat(
     reasoning_effort: Option<&str>,
     source: &str,
     cancel: Option<Arc<AtomicBool>>,
+    web_search: bool,
 ) -> Result<String, String> {
     let client = build_client()?;
     let url = format!(
@@ -1002,9 +1026,22 @@ async fn stream_openai_compat(
         } else if is_kimi_for_coding && use_reasoning {
             // Kimi Code subscription model supports thinking but does not require it.
             body["thinking"] = serde_json::json!({"type": "enabled"});
+        } else if is_qwen(provider) {
+            // Qwen's compatible mode gates thinking with `enable_thinking`, not
+            // OpenAI's `reasoning_effort` (which its strict validator rejects).
+            body["enable_thinking"] = serde_json::json!(true);
         } else {
             body["reasoning_effort"] = serde_json::json!(reasoning_effort.unwrap_or("high"));
         }
+    }
+
+    // Qwen's native web search: unlike DeepSeek it stays on /chat/completions and
+    // just takes an `enable_search` flag on the body. `forced_search` makes it
+    // actually search rather than deciding on its own; `enable_source` returns
+    // the pages it consulted.
+    if web_search && is_qwen(provider) {
+        body["enable_search"] = serde_json::json!(true);
+        body["search_options"] = serde_json::json!({ "forced_search": true, "enable_source": true });
     }
 
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
@@ -2649,6 +2686,58 @@ pub fn kimi_known_models() -> Vec<AiModel> {
     ]
 }
 
+/// Capabilities inferred from a Qwen model id. QwenCloud's /models endpoint
+/// reports no modalities, so the id is the only signal. `image_gen`/`video` are
+/// labelled for display only — Argus does not drive those models (out of scope),
+/// but the fetch dialog still shows what each id is.
+fn qwen_capabilities(model_id: &str) -> Vec<String> {
+    let id = model_id.to_lowercase();
+    let mut caps = Vec::new();
+    // Pure media-generation models: tag and stop — they are not chat/tool models.
+    if id.contains("wan") || id.contains("-image") || id.contains("t2i") || id.contains("cogview") {
+        add_capability(&mut caps, "image_gen");
+        return caps;
+    }
+    if id.contains("t2v") || id.contains("i2v") || id.contains("happyhorse") {
+        add_capability(&mut caps, "video");
+        return caps;
+    }
+    // Vision: the -vl family, QvQ visual reasoning, and the omni multimodal line.
+    if id.contains("-vl") || id.contains("vl-") || id.contains("qvq") || id.contains("omni") {
+        add_capability(&mut caps, "vision");
+    }
+    // Audio understanding / speech.
+    if id.contains("audio") || id.contains("omni") || id.contains("asr") || id.contains("tts") {
+        add_capability(&mut caps, "audio");
+    }
+    // Reasoning / thinking lines.
+    if id.contains("qwq") || id.contains("qvq") || id.contains("thinking") || id.contains("-r1") {
+        add_capability(&mut caps, "reasoning");
+    }
+    // Every Qwen text/VL chat model carries OpenAI-style function calling; skip
+    // the embedding models, which are not chat models.
+    if id.contains("qwen") && !id.contains("embed") {
+        add_capability(&mut caps, "tool_calling");
+    }
+    caps
+}
+
+/// Overlay id-derived Qwen capabilities onto a fetched model. Non-destructive:
+/// capabilities are unioned with whatever `/models` reported.
+///
+/// Pricing is deliberately left untouched. QwenCloud's `/models` returns none,
+/// the Token Plan bills in Credits rather than per-token CNY, and the 2026
+/// flagship rates (e.g. qwen3.8-max at ¥12/¥36 per 1M) differ several-fold from
+/// the classic tiers — so a name-guessed price would put a confidently wrong
+/// number on the cost estimate. Users can type exact per-model prices in the UI
+/// when they want a CNY figure; token counts and the cache-hit rate stay accurate.
+fn enrich_qwen_model(mut m: AiModel) -> AiModel {
+    for cap in qwen_capabilities(&m.id) {
+        add_capability(&mut m.capabilities, &cap);
+    }
+    m
+}
+
 fn anthropic_known_models() -> Vec<AiModel> {
     vec![
         AiModel {
@@ -3064,6 +3153,7 @@ pub async fn stream_with_tools(
     reasoning_effort: Option<&str>,
     source: &str,
     cancel: Option<Arc<AtomicBool>>,
+    web_search: bool,
 ) -> Result<ToolTurn, String> {
     if !supports_tool_calling(provider) {
         return Err(format!(
@@ -3094,6 +3184,12 @@ pub async fn stream_with_tools(
         body["tools"] = serde_json::json!(tools);
         body["tool_choice"] = serde_json::json!("auto");
     }
+    // Qwen's native web search sits alongside the tools on the same body — the
+    // model can both search the web and call the agent's tools in one turn.
+    if web_search && is_qwen(provider) {
+        body["enable_search"] = serde_json::json!(true);
+        body["search_options"] = serde_json::json!({ "forced_search": true, "enable_source": true });
+    }
     if is_openrouter {
         let order: Vec<&str> = provider
             .models
@@ -3117,6 +3213,9 @@ pub async fn stream_with_tools(
                 "effort": reasoning_effort.unwrap_or("high"),
                 "exclude": false
             });
+        } else if is_qwen(provider) {
+            // Qwen gates thinking with `enable_thinking`, not `reasoning_effort`.
+            body["enable_thinking"] = serde_json::json!(true);
         } else if !is_kimi {
             body["reasoning_effort"] = serde_json::json!(reasoning_effort.unwrap_or("high"));
         }

@@ -40,7 +40,7 @@ import LineNode from './canvas/LineNode.vue'
 import ImageNode from './canvas/ImageNode.vue'
 import SuggestPanel from './canvas/SuggestPanel.vue'
 import ExportDialog from './canvas/ExportDialog.vue'
-import type { PaperIndexEntry, CanvasNode as CNode, CanvasEdge as CEdge, SuggestedEdge, NodePosition } from '../types'
+import type { PaperIndexEntry, CanvasNode as CNode, CanvasEdge as CEdge, SuggestedEdge, NodePosition, CanvasEditOp } from '../types'
 
 const { t } = useI18n()
 const canvasStore = useCanvasStore()
@@ -689,7 +689,9 @@ function buildVfEdges(cedges: CEdge[]): VfEdge[] {
 }
 
 function extractCanvasNodes(): CNode[] {
-  return (nodes.value as VfNode[]).map((n): CNode => {
+  // Preview ghosts (an AI edit awaiting approval) are decoration only: they live
+  // in the flow but must never reach the store or disk.
+  return (nodes.value as VfNode[]).filter(n => !(n.data as any)?.__preview).map((n): CNode => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const d = n.data as any
     const nt = n.type as string
@@ -769,7 +771,7 @@ function extractCanvasNodes(): CNode[] {
 }
 
 function extractCanvasEdges(): CEdge[] {
-  return (edges.value as VfEdge[]).map((e): CEdge => {
+  return (edges.value as VfEdge[]).filter(e => !(e.data as any)?.__preview).map((e): CEdge => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const data = e.data as any
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1045,8 +1047,11 @@ function publishSelection(nodeId: string) {
   canvasStore.setSelectedNode(n ? snapshotFromVf(n) : null)
 }
 
-// Apply a property change coming from the DrawTab panel onto the live node.
-function applyNodePatch(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
+// Apply a property change onto the live node. The `core` half does the work but
+// leaves persistence to the caller, so a batch change (an AI canvas edit) can
+// save and record a single undo step for the whole thing rather than one per
+// field. The DrawTab entry point below wraps it to save immediately.
+function applyNodePatchCore(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const dataPatch: Record<string, any> = {}
   let posX: number | undefined
@@ -1104,6 +1109,11 @@ function applyNodePatch(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
       })
     }
   }
+}
+
+/** The DrawTab entry point: apply one field change and persist it right away. */
+function applyNodePatch(nodeId: string, patch: Partial<DrawNodeSnapshot>) {
+  applyNodePatchCore(nodeId, patch)
   triggerSave()
   recordHistory()
 }
@@ -1379,6 +1389,219 @@ watch(
       case 'paste': pasteClipboard(); break
       case 'delete': deleteSelection(); break
     }
+  }
+)
+
+// ── AI canvas edits (proposed by the canvas chat) ─────────────────────────────
+//
+// The chat owns the backend approval handshake; this panel owns the live
+// document. So the chat publishes the proposed edit on the store and this panel
+// — the one whose id matches — draws it as a preview (green = new, amber =
+// changed, red = to be removed) and, only if the user approves, applies those
+// same operations to the canvas and lets autosave persist them. The panel never
+// writes on its own; every op it applies came pre-validated from the backend.
+
+interface EditPlan {
+  addNodes: { id: string; cnode: CNode }[]
+  addEdges: { id: string; cedge: CEdge }[]
+  updates: { nodeId: string; patch: Partial<DrawNodeSnapshot> }[]
+  deleteNodeIds: string[]
+  deleteEdgeIds: string[]
+}
+
+// What is currently drawn as a preview, so it can be cleaned up on apply/discard.
+let activeEdit: {
+  requestId: string
+  plan: EditPlan
+  ghostNodeIds: string[]
+  ghostEdgeIds: string[]
+  markedNodeIds: string[]
+  markedEdgeIds: string[]
+} | null = null
+
+/** Turn the validated ops into concrete flow work, resolving batch refs to the
+ *  real ids the new nodes will carry (so edges added in the same call connect). */
+function planFromOps(ops: CanvasEditOp[]): EditPlan {
+  const refToId = new Map<string, string>()
+  const plan: EditPlan = { addNodes: [], addEdges: [], updates: [], deleteNodeIds: [], deleteEdgeIds: [] }
+  let ni = 0
+  for (const op of ops) {
+    if (op.kind === 'addText' || op.kind === 'addShape' || op.kind === 'addPaper') {
+      const id = newNodeId(ni++)
+      if (op.reference) refToId.set(op.reference, id)
+      plan.addNodes.push({ id, cnode: cnodeFromAdd(op, id) })
+    }
+  }
+  let ei = 0
+  const resolve = (x?: string) => (x && refToId.get(x)) || x || ''
+  for (const op of ops) {
+    if (op.kind === 'addEdge') {
+      const id = newEdgeId(ei++)
+      plan.addEdges.push({
+        id,
+        cedge: { edge_id: id, from_node_id: resolve(op.from), to_node_id: resolve(op.to), label: op.label, color: op.color },
+      })
+    } else if (op.kind === 'updateNode' && op.nodeId) {
+      plan.updates.push({ nodeId: op.nodeId, patch: patchFromUpdate(op) })
+    } else if (op.kind === 'deleteNode' && op.nodeId) {
+      plan.deleteNodeIds.push(op.nodeId)
+    } else if (op.kind === 'deleteEdge' && op.edgeId) {
+      plan.deleteEdgeIds.push(op.edgeId)
+    }
+  }
+  return plan
+}
+
+function cnodeFromAdd(op: CanvasEditOp, id: string): CNode {
+  if (op.kind === 'addText') {
+    return {
+      node_id: id, paper_id: '', node_type: 'text', x: op.x ?? 0, y: op.y ?? 0,
+      content: op.content ?? '', color: op.color, font_size: op.fontSize,
+    }
+  }
+  if (op.kind === 'addShape') {
+    return {
+      node_id: id, paper_id: '', node_type: 'shape', x: op.x ?? 0, y: op.y ?? 0,
+      width: op.width ?? DEFAULT_SHAPE_WIDTH, height: op.height ?? DEFAULT_SHAPE_HEIGHT,
+      shape_kind: op.shapeKind ?? 'rect', color: op.color, fill_color: op.fillColor, content: op.content,
+    }
+  }
+  // addPaper: a paper node is keyed by paper_id; buildVfNodes resolves the card.
+  return { node_id: id, paper_id: op.paperId ?? '', x: op.x ?? 0, y: op.y ?? 0 }
+}
+
+function patchFromUpdate(op: CanvasEditOp): Partial<DrawNodeSnapshot> {
+  const p: Partial<DrawNodeSnapshot> = {}
+  if (op.x !== undefined) p.x = op.x
+  if (op.y !== undefined) p.y = op.y
+  if (op.width !== undefined) p.width = op.width
+  if (op.height !== undefined) p.height = op.height
+  if (op.content !== undefined) p.content = op.content
+  if (op.color !== undefined) p.color = op.color
+  if (op.fillColor !== undefined) p.fillColor = op.fillColor
+  return p
+}
+
+function setEdgeClass(edgeId: string, cls: string | undefined) {
+  const e = (edges.value as VfEdge[]).find(x => x.id === edgeId)
+  if (e) e.class = cls
+}
+
+/** Turn a preview edge into a real one: clear its class and its no-persist flag. */
+function promoteEdge(edgeId: string) {
+  const e = (edges.value as VfEdge[]).find(x => x.id === edgeId)
+  if (!e) return
+  e.class = undefined
+  if (e.data && typeof e.data === 'object') (e.data as any).__preview = false
+}
+
+function drawEditPreview(req: { requestId: string; ops: CanvasEditOp[] }) {
+  discardEditPreview()
+  const plan = planFromOps(req.ops)
+
+  // New nodes/edges: real flow elements, tagged so they never persist and cannot
+  // be selected or dragged while they are only a proposal.
+  const ghostNodeIds: string[] = []
+  const ghostEdgeIds: string[] = []
+  if (plan.addNodes.length) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const vf = buildVfNodes(plan.addNodes.map(a => a.cnode)).map((n: any) => ({
+      ...n, class: 'vf-preview vf-preview-add', selectable: false, draggable: false,
+      data: { ...n.data, __preview: true },
+    }))
+    addNodes(vf)
+    ghostNodeIds.push(...plan.addNodes.map(a => a.id))
+  }
+  if (plan.addEdges.length) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const vf = buildVfEdges(plan.addEdges.map(a => a.cedge)).map((e: any) => ({
+      ...e, class: 'vf-preview vf-preview-add', selectable: false,
+      data: { ...e.data, __preview: true },
+    }))
+    addEdges(vf)
+    ghostEdgeIds.push(...plan.addEdges.map(a => a.id))
+  }
+
+  // Existing nodes/edges being changed or removed: ring them, leave props alone.
+  const markedNodeIds: string[] = []
+  const markedEdgeIds: string[] = []
+  for (const u of plan.updates) {
+    if (findNode(u.nodeId)) { updateNode(u.nodeId, { class: 'vf-preview vf-preview-update' }); markedNodeIds.push(u.nodeId) }
+  }
+  for (const id of plan.deleteNodeIds) {
+    if (findNode(id)) { updateNode(id, { class: 'vf-preview vf-preview-delete' }); markedNodeIds.push(id) }
+  }
+  for (const id of plan.deleteEdgeIds) { setEdgeClass(id, 'vf-preview vf-preview-delete'); markedEdgeIds.push(id) }
+
+  activeEdit = { requestId: req.requestId, plan, ghostNodeIds, ghostEdgeIds, markedNodeIds, markedEdgeIds }
+}
+
+function clearEditMarks() {
+  if (!activeEdit) return
+  for (const id of activeEdit.markedNodeIds) if (findNode(id)) updateNode(id, { class: '' })
+  for (const id of activeEdit.markedEdgeIds) setEdgeClass(id, undefined)
+}
+
+function discardEditPreview() {
+  if (!activeEdit) return
+  clearEditMarks()
+  if (activeEdit.ghostEdgeIds.length) removeEdges(activeEdit.ghostEdgeIds)
+  if (activeEdit.ghostNodeIds.length) removeNodes(activeEdit.ghostNodeIds)
+  activeEdit = null
+}
+
+function applyEditPreview() {
+  const edit = activeEdit
+  if (!edit) return
+  const { plan } = edit
+
+  // Promote the ghosts in place — strip the preview class, the no-persist flag,
+  // and the interaction locks — rather than removing and re-adding them, so the
+  // ids the preview edges already point at stay valid and nothing has to be
+  // rebuilt.
+  for (const id of edit.ghostNodeIds) {
+    if (!findNode(id)) continue
+    updateNode(id, { class: '', selectable: undefined, draggable: undefined })
+    updateNodeData(id, { __preview: false })
+  }
+  for (const id of edit.ghostEdgeIds) promoteEdge(id)
+
+  // Existing items: drop the rings, then make the real change.
+  for (const id of edit.markedNodeIds) if (findNode(id)) updateNode(id, { class: '' })
+  for (const id of edit.markedEdgeIds) setEdgeClass(id, undefined)
+  for (const u of plan.updates) applyNodePatchCore(u.nodeId, u.patch)
+
+  const delNodes = plan.deleteNodeIds.filter(id => findNode(id))
+  if (delNodes.length) {
+    // Edges touching a deleted node go too, or they dangle.
+    const touching = (edges.value as VfEdge[])
+      .filter(e => delNodes.includes(e.source) || delNodes.includes(e.target))
+      .map(e => e.id)
+    if (touching.length) removeEdges(touching)
+    removeNodes(delNodes)
+  }
+  const delEdges = plan.deleteEdgeIds.filter(id => (edges.value as VfEdge[]).some(e => e.id === id))
+  if (delEdges.length) removeEdges(delEdges)
+
+  activeEdit = null
+  triggerSave()
+  recordHistory()
+  // The model was told "applied"; make it durable now rather than on the debounce
+  // so a follow-up edit reads it back from disk.
+  void canvasStore.persistCanvas(props.canvasId)
+}
+
+watch(
+  () => canvasStore.canvasEditRequest,
+  (req) => {
+    // A request for another canvas (or none) takes down any preview we hold.
+    if (!req || req.canvasId !== props.canvasId) {
+      if (activeEdit && (!req || req.requestId !== activeEdit.requestId)) discardEditPreview()
+      return
+    }
+    if (req.phase === 'preview') drawEditPreview(req)
+    else if (req.phase === 'apply') { if (activeEdit?.requestId === req.requestId) applyEditPreview() }
+    else if (req.phase === 'discard') { if (activeEdit?.requestId === req.requestId) discardEditPreview() }
   }
 )
 
@@ -2043,6 +2266,9 @@ onUnmounted(() => {
   window.removeEventListener('argus-notes-updated', onNotesUpdated)
   window.removeEventListener('argus-canvas-export-fit', onExportFit)
   resetShapeDraft()
+  // A preview left on screen is only decoration; drop it so a torn-down instance
+  // does not strand ghost nodes in the flow.
+  discardEditPreview()
   if (hoverTimer) clearTimeout(hoverTimer)
 })
 
@@ -2743,6 +2969,69 @@ watch(() => library.papers, () => {
 :deep(.vue-flow__controls) { border-radius: 8px; overflow: hidden; }
 :deep(.vue-flow__minimap) { border-radius: 8px; overflow: hidden; }
 .canvas-minimap { bottom: 12px; right: 12px; }
+
+/* ── AI edit preview ──────────────────────────────────────────────────────────
+   A change the canvas chat has proposed and the user has not answered yet.
+   Colour tells the story: green = will be added, amber = will change, red = will
+   be removed. A corner glyph repeats it for anyone who cannot separate the hues.
+   The nodes/edges carrying these classes are decoration and never persist. */
+:deep(.vue-flow__node.vf-preview) { position: relative; }
+:deep(.vue-flow__node.vf-preview::after) {
+  position: absolute;
+  top: -10px;
+  right: -10px;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  z-index: 5;
+  pointer-events: none;
+}
+:deep(.vue-flow__node.vf-preview-add) {
+  outline: 2px dashed #22c55e;
+  outline-offset: 3px;
+  border-radius: 8px;
+  animation: vf-preview-pulse 1.6s ease-in-out infinite;
+}
+:deep(.vue-flow__node.vf-preview-add::after) { content: '＋'; background: #16a34a; }
+:deep(.vue-flow__node.vf-preview-update) {
+  outline: 2px solid #f59e0b;
+  outline-offset: 3px;
+  border-radius: 8px;
+}
+:deep(.vue-flow__node.vf-preview-update::after) { content: '✎'; background: #d97706; }
+:deep(.vue-flow__node.vf-preview-delete) {
+  outline: 2px solid #ef4444;
+  outline-offset: 3px;
+  border-radius: 8px;
+  opacity: 0.55;
+}
+:deep(.vue-flow__node.vf-preview-delete::after) { content: '✕'; background: #dc2626; opacity: 1; }
+
+/* Edges: colour the drawn path (and the arrow head inherits currentColor). */
+:deep(.vue-flow__edge.vf-preview-add .vue-flow__edge-path) {
+  stroke: #22c55e;
+  stroke-dasharray: 7 5;
+  stroke-width: 2.4;
+  animation: vf-preview-dash 0.7s linear infinite;
+}
+:deep(.vue-flow__edge.vf-preview-delete .vue-flow__edge-path) {
+  stroke: #ef4444;
+  stroke-dasharray: 4 4;
+  opacity: 0.7;
+}
+@keyframes vf-preview-pulse {
+  0%, 100% { outline-color: #22c55e; }
+  50% { outline-color: color-mix(in srgb, #22c55e 40%, transparent); }
+}
+@keyframes vf-preview-dash { to { stroke-dashoffset: -12; } }
 
 /* Outcome of sending papers to the library chat. Click to dismiss; it also
    times itself out. */

@@ -111,6 +111,82 @@ fn app_only_tools() -> Vec<AgentTool> {
     }]
 }
 
+/// The canvas-editing tool, offered **only** when a question is being asked
+/// about a specific canvas (the "问画布" chat passes its `canvas_id`).
+///
+/// It is deliberately not part of [`tools`]: the paper AI panel and the library
+/// chat must not see it, and — like the note tool — an external MCP client never
+/// does. `copilot::agent_tool_defs` appends it when, and only when, the answer is
+/// anchored to a canvas.
+///
+/// The tool takes no `canvas_id`: the backend already knows which canvas the
+/// chat is about and supplies it, so the model can never aim an edit at a canvas
+/// the user is not looking at. Every call is still shown to the user and applied
+/// only on approval (see [`crate::canvas_edit`]).
+pub fn canvas_edit_tool() -> AgentTool {
+    AgentTool {
+        name: crate::canvas_edit::EDIT_CANVAS_TOOL.to_string(),
+        read_only: false,
+        description: "Edit THIS canvas — add, change, connect or remove nodes and edges. \
+                      Applies to the canvas the user is looking at (its id is supplied for you). \
+                      Read it first with `get_canvas` to get node ids, then propose the change in \
+                      your reply and call this once the user asks for it. The user sees the change \
+                      drawn on the canvas and must approve it before anything is saved; a refusal \
+                      means stop, do not retry. Pass `operations`, an ordered array. Each item has \
+                      an `op`: `add_text` (x, y, content, optional color/font_size), `add_shape` \
+                      (x, y, optional width/height/shape_kind[rect|ellipse|diamond]/color/fill_color/content), \
+                      `add_paper` (slug, x, y), `add_edge` (from, to, optional label/color), \
+                      `update_node` (node_id + any of x/y/width/height/content/color/fill_color), \
+                      `update_edge` (edge_id + label and/or color), `delete_node` (node_id), \
+                      `delete_edge` (edge_id). To connect a node you are creating in the same call, \
+                      give the `add_*` op a `ref` and use that ref as an edge `from`/`to`. Colors \
+                      must be hex (e.g. #2563eb)."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "description": "Ordered list of edit operations to apply together.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {
+                                "type": "string",
+                                "enum": [
+                                    "add_text", "add_shape", "add_paper", "add_edge",
+                                    "update_node", "update_edge", "delete_node", "delete_edge"
+                                ],
+                                "description": "Which kind of change this operation makes.",
+                            },
+                            "ref": { "type": "string", "description": "Batch-local id for a node this call creates, so an add_edge in the same call can point at it." },
+                            "node_id": { "type": "string", "description": "Existing node id (update_node/delete_node). Get it from get_canvas." },
+                            "edge_id": { "type": "string", "description": "Existing edge id (update_edge/delete_edge)." },
+                            "slug": { "type": "string", "description": "Paper slug (add_paper)." },
+                            "from": { "type": "string", "description": "Edge start: an existing node id or a ref from this call (add_edge)." },
+                            "to": { "type": "string", "description": "Edge end: an existing node id or a ref from this call (add_edge)." },
+                            "label": { "type": "string", "description": "Edge label (add_edge/update_edge)." },
+                            "content": { "type": "string", "description": "Text of a text/shape node (add_text/add_shape/update_node)." },
+                            "x": { "type": "number" },
+                            "y": { "type": "number" },
+                            "width": { "type": "number" },
+                            "height": { "type": "number" },
+                            "shape_kind": { "type": "string", "enum": ["rect", "ellipse", "diamond"] },
+                            "color": { "type": "string", "description": "Hex color, e.g. #2563eb — stroke/text/accent." },
+                            "fill_color": { "type": "string", "description": "Hex fill color for a shape." },
+                            "font_size": { "type": "number" }
+                        },
+                        "required": ["op"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "required": ["operations"],
+            "additionalProperties": false,
+        }),
+    }
+}
+
 /// Deserialize `args` into `P`, defaulting when the model sent nothing.
 ///
 /// Models routinely omit the arguments object for a no-parameter tool, or send
@@ -294,6 +370,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("confirmation"), "{err}");
+    }
+
+    /// The canvas-editing tool writes too, so the read-only dispatcher must
+    /// refuse it — and it is never in the declared `tools()` list, because it is
+    /// offered only when the question is about a canvas.
+    #[test]
+    fn the_canvas_edit_tool_is_a_refused_write_and_not_declared_by_default() {
+        assert!(crate::mcp::app_tools::is_write_tool(
+            crate::canvas_edit::EDIT_CANVAS_TOOL
+        ));
+        let err = call(
+            "/nonexistent-library",
+            crate::canvas_edit::EDIT_CANVAS_TOOL,
+            &serde_json::json!({ "operations": [] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("confirmation"), "{err}");
+        assert!(
+            !tools()
+                .iter()
+                .any(|t| t.name == crate::canvas_edit::EDIT_CANVAS_TOOL),
+            "edit_canvas must not be in the always-on tool list"
+        );
+        // But it is a complete, model-usable declaration when offered.
+        let tool = canvas_edit_tool();
+        assert!(!tool.read_only);
+        assert_eq!(
+            tool.input_schema.get("type").and_then(|v| v.as_str()),
+            Some("object")
+        );
     }
 
     /// The write tool exists for the in-app agent only. An external MCP client

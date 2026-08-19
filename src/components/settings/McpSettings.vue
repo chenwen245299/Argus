@@ -139,13 +139,15 @@ onMounted(refresh)
 
     <!-- How to connect -->
     <div class="settings-card">
-      <div class="field-row">
+      <div class="field-row connect-row">
         <div>
           <label class="setting-label">{{ t('mcpSettings.connect') }}</label>
           <p class="setting-hint">{{ t('mcpSettings.connectHint') }}</p>
         </div>
         <!-- Fills the empty top-right of the card: a drawing of whatever the
-             current tab asks you to open, with a scribbled pointer down to it. -->
+             current tab asks you to open, with a scribbled pointer down to it.
+             Positioned out of flow so its height never leaves a blank band
+             above the tabs; `.connect-row` reserves the gutter it sits in. -->
         <div class="corner-doodle">
           <Icon :icon="`doodle:${clientDoodle}`" width="38" height="38" />
           <span class="corner-hand">{{ t('mcpSettings.connectDoodle') }}</span>
@@ -256,6 +258,7 @@ onMounted(refresh)
 .section-desc { font-size: 13px; color: var(--text-secondary); margin: 0; line-height: 1.5; }
 
 .settings-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -266,6 +269,9 @@ onMounted(refresh)
 }
 
 .field-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+/* Reserve the top-right gutter the (absolutely positioned) corner-doodle sits in,
+   so the description text keeps its old width instead of flowing under the mark. */
+.connect-row { padding-right: 168px; }
 .setting-label { font-size: 13px; font-weight: 600; color: var(--text-primary); display: block; margin-bottom: 5px; }
 .setting-hint { font-size: 12px; color: var(--text-tertiary); margin: 0; line-height: 1.5; }
 
@@ -332,9 +338,13 @@ onMounted(refresh)
 
 /* ── Hand-drawn tutorial bits ── */
 
-/* Corner drawing in the "how to connect" card, pointing at the tabs below. */
+/* Corner drawing in the "how to connect" card, pointing at the tabs below.
+   Absolutely placed so it decorates the corner without adding to the row height
+   (which is what left the blank band above the tabs). */
 .corner-doodle {
-  flex-shrink: 0;
+  position: absolute;
+  top: 18px;
+  right: 18px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -342,6 +352,8 @@ onMounted(refresh)
   width: 152px;
   color: color-mix(in srgb, var(--accent) 70%, var(--text-tertiary));
   transform: rotate(-1.5deg);
+  /* Purely decorative overlay — never let it capture clicks meant for the tabs. */
+  pointer-events: none;
 }
 .corner-hand {
   font-family: var(--font-hand);
@@ -402,6 +414,8 @@ onMounted(refresh)
 
 @media (max-width: 760px) {
   .scope-grid { grid-template-columns: 1fr; }
+  /* No doodle at this width, so its gutter would only be dead space. */
   .corner-doodle { display: none; }
+  .connect-row { padding-right: 0; }
 }
 </style>

@@ -19,6 +19,7 @@ const PRESETS = [
   { label: 'OpenRouter',   base_url: 'https://openrouter.ai/api/v1',      kind: 'openrouter' },
   { label: 'DeepSeek',     base_url: 'https://api.deepseek.com/v1',       kind: 'openai_compatible' },
   { label: 'Kimi Code',    base_url: 'https://api.kimi.com/coding/v1',    kind: 'kimi' },
+  { label: '千问 Token Plan', base_url: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', kind: 'qwenai' },
   { label: 'Ollama',       base_url: 'http://localhost:11434',            kind: 'ollama' },
   { label: 'Anthropic',    base_url: 'https://api.anthropic.com/v1',      kind: 'anthropic' },
 ]
@@ -26,15 +27,18 @@ const PRESETS = [
 const CAPABILITY_OPTIONS = [
   { id: 'reasoning', labelKey: 'aiService.capReasoning' },
   { id: 'vision', labelKey: 'aiService.capVision' },
+  { id: 'audio', labelKey: 'aiService.capAudio' },
   { id: 'tool_calling', labelKey: 'aiService.capToolCalling' },
   { id: 'embedding', labelKey: 'aiService.capEmbedding' },
 ]
 
 const CAPABILITY_LABEL_ALIASES: Record<string, string> = {
   function_calling: 'aiService.capFunctionCalling',
+  image_gen: 'aiService.capImageGen',
+  video: 'aiService.capVideo',
 }
 
-const FETCH_GROUP_ORDER = ['embedding', 'vision', 'tool_calling', 'reasoning', 'other'] as const
+const FETCH_GROUP_ORDER = ['embedding', 'vision', 'audio', 'tool_calling', 'reasoning', 'image_gen', 'video', 'other'] as const
 type CapabilityGroupId = typeof FETCH_GROUP_ORDER[number]
 /** Under the 全部 filter, models with an offer are pulled out into their own
  *  group at the top. Sorting inside the capability groups was not enough: a free
@@ -620,7 +624,11 @@ const LOGO_MAP: [string[], string][] = [
   [['huggingface', 'huggingface.co'], 'huggingface.svg'],
   [['lmstudio'], 'lmstudio.svg'],
   [['siliconflow', 'silicon'], 'siliconflow.svg'],
-  [['alibaba', 'qwen', 'dashscope', 'aliyun'], 'alibaba.svg'],
+  // Qwen's own mark, matched before the generic Alibaba Cloud one. Keyed on the
+  // Token-Plan host and the Qwen brand so a plain Aliyun endpoint still falls to
+  // alibaba.svg, while any Qwen-named provider gets qwenai.svg.
+  [['qwenai', 'token-plan', 'maas.aliyuncs', 'qwen', '千问', '通义'], 'qwenai.svg'],
+  [['alibaba', 'dashscope', 'aliyun'], 'alibaba.svg'],
   [['baidu', 'qianfan', 'baidubce'], 'baidu.svg'],
   [['zhipu', 'bigmodel', 'chatglm'], 'zhipu.svg'],
   [['tencent', 'hunyuan'], 'tencent.svg'],
@@ -709,14 +717,27 @@ function normalizedFetchCapabilities(model: AiModel) {
   if (/\b(embed|embedding|embeddings)\b/.test(text) || /text-embedding|bge-|gte-|e5-|voyage-/.test(text)) {
     caps.add('embedding')
   }
-  if (/vision|multimodal|image|qwen-vl|llava|pixtral|janus|gpt-4o|gemini|kimi-k2/.test(text)) {
+  // Media-generation ids (Qwen wan*/*-image, *t2v/happyhorse) get a display tag
+  // but no chat capability. Detected first so the vision rule can exclude them —
+  // "wan2.7-image" contains "image" but is not a vision (image-understanding) model.
+  if (/(^|[-_/])(wan|wanx|cogview)|[-_](image|t2i)(?=$|[-_/])/.test(text)) caps.add('image_gen')
+  if (/[-_](t2v|i2v)(?=$|[-_/])|happyhorse/.test(text)) caps.add('video')
+  if (/audio|[-_](asr|tts)(?=$|[-_/])|omni/.test(text)) caps.add('audio')
+  const isMediaGen = caps.has('image_gen') || caps.has('video')
+  if (!isMediaGen && /vision|multimodal|[-_]vl(?=$|[-_/])|qwen-vl|qvq|llava|pixtral|janus|gpt-4o|gemini|kimi-k2|omni/.test(text)) {
     caps.add('vision')
   }
-  if (/tool|function/.test(text)) {
+  if (!isMediaGen && /tool|function/.test(text)) {
     caps.add('tool_calling')
   }
   if (/\b(reason|reasoning|thinking)\b/.test(text) || /(^|[/_\-\s])(r1|o1|o3|o4|qwq)(?=$|[/_\-\s])/.test(text)) {
     caps.add('reasoning')
+  }
+  // A pure media-generation model is neither a vision nor a tool model; keep it
+  // out of those groups even if an earlier rule or the backend added them.
+  if (isMediaGen) {
+    caps.delete('vision')
+    caps.delete('tool_calling')
   }
 
   return caps
@@ -835,6 +856,7 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="openai_compatible">{{ t('aiService.openaiCompat') }}</option>
             <option value="openrouter">{{ t('aiService.openrouter') }}</option>
             <option value="kimi">{{ t('aiService.kimi') }}</option>
+            <option value="qwenai">{{ t('aiService.qwenai') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
             <option value="ollama">{{ t('aiService.ollama') }}</option>
           </select>
@@ -929,6 +951,7 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="openai_compatible">{{ t('aiService.openaiCompat') }}</option>
             <option value="openrouter">{{ t('aiService.openrouter') }}</option>
             <option value="kimi">{{ t('aiService.kimi') }}</option>
+            <option value="qwenai">{{ t('aiService.qwenai') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
             <option value="ollama">{{ t('aiService.ollama') }}</option>
           </select>

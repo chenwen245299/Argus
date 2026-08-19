@@ -576,14 +576,19 @@ const knowledgeSource = ref<KnowledgeSource>(loadKnowledgeSource())
 
 const sourcePickerOpen = ref(false)
 
-// Server-side web search is a DeepSeek Responses-API feature, so the toggle only
-// shows for a DeepSeek model (mirrors AiTab).
+// Server-side web search: DeepSeek exposes it via its Responses API, Qwen via an
+// `enable_search` flag on the standard chat body. Both surface the same toggle.
 const useWebSearch = ref(false)
 const webSearchAvailable = computed(() => {
   const sel = selectedModel.value ?? ai.defaultSelection ?? null
   if (!sel) return false
   const provider = ai.settings.providers.find(p => p.id === sel.providerId)
-  return !!provider?.base_url.toLowerCase().includes('deepseek')
+  if (!provider) return false
+  const url = provider.base_url.toLowerCase()
+  return url.includes('deepseek')
+    || provider.kind === 'qwenai'
+    || url.includes('dashscope')
+    || url.includes('maas.aliyuncs')
 })
 watch(webSearchAvailable, (ok) => { if (!ok) useWebSearch.value = false })
 /** Live server-side search phase while a turn is running. */

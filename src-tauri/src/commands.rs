@@ -2208,6 +2208,10 @@ pub async fn chat_with_library(
     // to one. The paper AI panel sends it so the model starts with that paper's
     // card already in front of it.
     paper_slug: Option<String>,
+    // Agent mode only: the canvas this conversation is about (the "问画布" chat).
+    // Its presence is what lets the model reach the `edit_canvas` tool, and it is
+    // the only canvas any edit can touch — the model never names one itself.
+    canvas_id: Option<String>,
     state: State<'_, LibraryRoot>,
     // Which window asked. The cache keepalive runs until this window closes,
     // and agent mode is reachable from the main window (paper AI panel, canvas
@@ -2235,9 +2239,11 @@ pub async fn chat_with_library(
             agent_max_rounds,
             conversation_id.as_deref(),
             paper_slug.as_deref(),
+            canvas_id.as_deref(),
             window.label(),
             &app,
             cancel,
+            web_search.unwrap_or(false),
         )
         .await;
     }

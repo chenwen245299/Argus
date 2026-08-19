@@ -62,9 +62,12 @@ export const useAiStore = defineStore('ai', () => {
       )
   )
 
-  // Chat-capable models: exclude pure embedding models (they only produce vectors, not text)
+  // Chat-capable models: exclude models that don't take a chat turn — pure
+  // embedding models (vectors only) and pure media-generation models (image/video
+  // out, labelled for the catalogue but not driven as chat here).
+  const NON_CHAT_CAPS = ['embedding', 'image_gen', 'video']
   const chatModels = computed<ModelOption[]>(() =>
-    enabledModels.value.filter(m => !m.capabilities.includes('embedding'))
+    enabledModels.value.filter(m => !m.capabilities.some(c => NON_CHAT_CAPS.includes(c)))
   )
 
   const groupedModels = computed(() => {

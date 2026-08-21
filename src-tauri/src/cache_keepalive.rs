@@ -258,7 +258,8 @@ mod tests {
             base_url: base_url.into(),
             models: vec![],
             enabled: true,
-            created_at: String::new(),
+            server_tools: Default::default(),
+        created_at: String::new(),
         }
     }
 

@@ -21,9 +21,14 @@ import { useCanvasStore } from '../../stores/canvas'
 import MarkdownBody from '../MarkdownBody.vue'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import CanvasEditConfirmCard from '../CanvasEditConfirmCard.vue'
+import ProviderBalanceTag from '../ProviderBalanceTag.vue'
+import ServerToolTraceCard from '../ServerToolTraceCard.vue'
+import { mergeServerToolTrace } from '../../utils/serverToolTrace'
 import { modelLogo as logoFor, modelCapabilityText } from '../../utils/modelLogo'
 import { modelOffer, modelSizeLabel } from '../../utils/modelOffers'
-import type { AgentWritePreview, CanvasEditPreview, ChatMessage, ModelSelection } from '../../types'
+import type {
+  AgentWritePreview, CanvasEditPreview, ChatMessage, ModelSelection, ServerToolTrace,
+} from '../../types'
 
 const props = defineProps<{ canvasId: string }>()
 
@@ -46,6 +51,8 @@ interface CanvasMessage {
   streaming?: boolean
   error?: boolean
   steps?: AgentStep[]
+  /** Transient: what OpenRouter's server tools contributed to this answer. */
+  serverTools?: ServerToolTrace
 }
 
 interface CanvasConversation {
@@ -112,6 +119,11 @@ function isSelected(option: ModelOption) {
 function pickModel(option: ModelOption) {
   model.value = { providerId: option.providerId, modelId: option.modelId }
   modelMenuOpen.value = false
+}
+/** Balances are looked up when the picker opens, not on every keystroke. */
+function toggleModelMenu() {
+  modelMenuOpen.value = !modelMenuOpen.value
+  if (modelMenuOpen.value) void ai.loadBalances()
 }
 function closeModelMenu(e: MouseEvent) {
   if (!modelPickerRoot.value?.contains(e.target as Node)) modelMenuOpen.value = false
@@ -266,6 +278,12 @@ async function send() {
     if (!delta) return
     live.content += delta
     scrollToBottom()
+  }))
+
+  // OpenRouter's server tools report what they consulted or drew. The agent loop
+  // emits one of these per round, so they are merged rather than replaced.
+  unlisteners.push(await listen<ServerToolTrace>(`${eventName}-servertools`, (e) => {
+    live.serverTools = mergeServerToolTrace(live.serverTools, e.payload)
   }))
 
   unlisteners.push(await listen<{ phase?: string; tool?: string; arguments?: unknown; ok?: boolean }>(
@@ -512,7 +530,7 @@ onUnmounted(() => {
 
     <!-- Model picker: floats over the thread, like the paper AI tab's -->
     <div ref="modelPickerRoot" class="cc-model-picker">
-      <button class="cc-model-trigger" @click.stop="modelMenuOpen = !modelMenuOpen">
+      <button class="cc-model-trigger" @click.stop="toggleModelMenu()">
         <span class="cc-model-icon">
           <img v-if="logoOf(selectedOption)" :src="logoOf(selectedOption)" alt="" />
           <span v-else class="cc-model-fallback">{{ selectedLabel.charAt(0).toUpperCase() }}</span>
@@ -523,7 +541,10 @@ onUnmounted(() => {
 
       <div v-if="modelMenuOpen" class="cc-model-menu">
         <div v-for="group in ai.groupedModels" :key="group.id" class="cc-model-group">
-          <div class="cc-model-group-name">{{ group.name }}</div>
+          <div class="cc-model-group-name">
+            <span>{{ group.name }}</span>
+            <ProviderBalanceTag :provider-id="group.id" />
+          </div>
           <button
             v-for="option in group.models"
             :key="`${option.providerId}::${option.modelId}`"
@@ -588,6 +609,7 @@ onUnmounted(() => {
           <div class="cc-answer" :class="{ error: msg.error }">
             <MarkdownBody :content="msg.content" :streaming="msg.streaming" />
             <span v-if="msg.streaming && !msg.content" class="cc-thinking">{{ t('canvasChat.thinking') }}</span>
+            <ServerToolTraceCard :trace="msg.serverTools" />
           </div>
         </template>
       </div>
@@ -651,24 +673,27 @@ onUnmounted(() => {
 /* ── Floating model picker ── */
 .cc-model-picker {
   position: absolute;
-  top: 52px;
+  /* Same offset and size as the AI tab's picker: the two sit in the same slot
+     of the same panel, so any difference reads as the pill jumping when the
+     user switches tabs. */
+  top: calc(var(--content-header-height) + 18px);
   left: 50%;
   transform: translateX(-50%);
   /* Sized here rather than on the button: the button's own `100%` would
      resolve against this box, which is sized by its content. */
-  width: min(250px, calc(100% - 24px));
+  width: min(240px, calc(100% - 24px));
   z-index: 20;
 }
 .cc-model-trigger {
-  height: 34px;
+  height: 36px;
   width: 100%;
   display: grid;
-  grid-template-columns: 18px 1fr 14px;
+  grid-template-columns: 20px 1fr 16px;
   align-items: center;
   gap: 7px;
   padding: 0 11px;
   border: 1px solid var(--border-default);
-  border-radius: 11px;
+  border-radius: 12px;
   color: var(--text-primary);
   background: color-mix(in srgb, var(--bg-primary) 90%, transparent);
   backdrop-filter: blur(18px) saturate(1.35);
@@ -678,10 +703,10 @@ onUnmounted(() => {
 }
 .cc-model-trigger:hover { background: var(--bg-hover); }
 .cc-model-icon { display: flex; align-items: center; justify-content: center; }
-.cc-model-icon img { width: 17px; height: 17px; border-radius: 5px; object-fit: contain; }
+.cc-model-icon img { width: 18px; height: 18px; border-radius: 5px; object-fit: contain; }
 .cc-model-fallback {
-  width: 17px;
-  height: 17px;
+  width: 18px;
+  height: 18px;
   border-radius: 5px;
   display: inline-flex;
   align-items: center;
@@ -724,6 +749,10 @@ onUnmounted(() => {
   border-top: 1px solid var(--border-subtle);
 }
 .cc-model-group-name {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 3px 8px 5px;
   font-size: 11px;
   font-weight: 700;

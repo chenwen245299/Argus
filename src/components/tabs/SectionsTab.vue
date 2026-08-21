@@ -216,7 +216,9 @@ function sourceLabel(source: string): string {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 8px 10px;
+  height: var(--content-header-height);
+  padding: 0 10px 0 12px;
+  background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
 }

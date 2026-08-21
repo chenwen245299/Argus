@@ -10,8 +10,9 @@ use crate::models::{
 };
 use crate::LibraryRoot;
 use crate::{
-    ai_manager, ai_summary, arxiv, arxiv_scheduler, canvas,
-    canvas_enhance, collections, copilot, ebook, extraction, library, llm, metadata, paper, rag,
+    ai_manager, ai_summary, arxiv, arxiv_scheduler, balance, canvas,
+    canvas_enhance, collections, copilot, deepseek, ebook, extraction, library, llm, metadata,
+    models, paper, rag,
     search, sections, security_bookmark, settings, snippets, url_import, watcher, writing,
 };
 // ── Library management ────────────────────────────────────────────────────────
@@ -1611,6 +1612,7 @@ pub async fn add_ai_provider(
         base_url: p.base_url,
         enabled: p.enabled,
         models: p.models,
+        server_tools: p.server_tools,
     })
 }
 
@@ -1768,6 +1770,169 @@ pub async fn set_default_model(
 ) -> Result<(), String> {
     let root = get_root(&state)?;
     ai_manager::set_default_model(&root, &provider_id, &model_id)
+}
+
+// ── Account balances ──────────────────────────────────────────────────────────
+
+/// One provider's balance lookup, successful or not.
+///
+/// A failure is reported per provider rather than failing the whole call: one
+/// expired key must not blank out the balances of every other provider in the
+/// picker.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceResult {
+    pub provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<balance::ProviderBalance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Balances for every enabled provider that publishes one and has a key.
+///
+/// Fans out rather than looping: the model picker asks for all of them at once
+/// when it opens, and two sequential round-trips would be visible.
+#[tauri::command]
+pub async fn fetch_provider_balances(
+    state: State<'_, LibraryRoot>,
+) -> Result<Vec<BalanceResult>, String> {
+    use futures::StreamExt;
+
+    let root = get_root(&state)?;
+    let settings = ai_manager::read_ai_settings(&root);
+
+    let targets: Vec<(models::AiProvider, String)> = settings
+        .providers
+        .iter()
+        .filter(|p| p.enabled && balance::supports_balance(p))
+        .filter_map(|p| ai_manager::get_api_key(&root, &p.id).map(|key| (p.clone(), key)))
+        .collect();
+
+    let results = futures::stream::iter(targets.into_iter().map(|(provider, key)| async move {
+        match balance::fetch(&provider, &key).await {
+            Ok(b) => BalanceResult {
+                provider_id: provider.id,
+                balance: Some(b),
+                error: None,
+            },
+            Err(e) => BalanceResult {
+                provider_id: provider.id,
+                balance: None,
+                error: Some(e),
+            },
+        }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+
+    Ok(results)
+}
+
+// ── DeepSeek Files API ────────────────────────────────────────────────────────
+//
+// DeepSeek's vision models can read an image either inline (base64 in the
+// request) or by handle, after it has been uploaded once. The handle route is
+// the only one that takes an image over 32 MiB, and it lets the same figure be
+// re-asked about across turns without re-sending the bytes — so the file store
+// is exposed here as its own small CRUD surface, alongside the automatic
+// uploads `deepseek::prepare_chat_messages` performs when a request would
+// otherwise be too large to send.
+
+/// Resolve a provider id to a DeepSeek provider plus its key.
+fn deepseek_provider(root: &str, id: &str) -> Result<(models::AiProvider, String), String> {
+    let settings = ai_manager::read_ai_settings(root);
+    let provider = settings
+        .providers
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| format!("Provider not found: {id}"))?
+        .clone();
+    if !llm::is_deepseek(&provider) {
+        return Err(format!(
+            "「{}」不是 DeepSeek 服务商，文件接口仅 DeepSeek 提供。",
+            provider.name
+        ));
+    }
+    let key = ai_manager::get_api_key(root, id)
+        .ok_or("No API key configured for this provider")?;
+    Ok((provider, key))
+}
+
+/// Upload one image to DeepSeek's file store.
+///
+/// Takes the image as a `data:` URL — the same form the composer already
+/// produces when a file is attached — so no new arbitrary-path read is added to
+/// the backend. `expires_after_seconds` is optional; omitting it keeps the file
+/// until it is deleted by hand.
+#[tauri::command]
+pub async fn deepseek_upload_file(
+    provider_id: String,
+    filename: String,
+    data_url: String,
+    expires_after_seconds: Option<u64>,
+    state: State<'_, LibraryRoot>,
+) -> Result<deepseek::DeepSeekFile, String> {
+    use base64::Engine;
+    let root = get_root(&state)?;
+    let (provider, key) = deepseek_provider(&root, &provider_id)?;
+
+    let payload = data_url
+        .split_once(",")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&data_url);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.replace(['\n', '\r'], ""))
+        .map_err(|e| format!("图片解码失败：{e}"))?;
+
+    deepseek::upload_file(&provider, &key, &filename, &bytes, expires_after_seconds).await
+}
+
+/// The documented vision limits, so the composer and the settings panel can
+/// describe (and pre-check) attachments against the same numbers the request
+/// path enforces. Pure data — no key or network needed.
+#[tauri::command]
+pub fn deepseek_vision_limits() -> deepseek::VisionLimits {
+    deepseek::vision_limits()
+}
+
+/// One page of the file store, newest first by default.
+#[tauri::command]
+pub async fn deepseek_list_files(
+    provider_id: String,
+    after: Option<String>,
+    limit: Option<u32>,
+    order: Option<String>,
+    state: State<'_, LibraryRoot>,
+) -> Result<deepseek::DeepSeekFileList, String> {
+    let root = get_root(&state)?;
+    let (provider, key) = deepseek_provider(&root, &provider_id)?;
+    deepseek::list_files(&provider, &key, after.as_deref(), limit, order.as_deref()).await
+}
+
+/// Metadata for one handle — used to confirm a `file_id` is still live.
+#[tauri::command]
+pub async fn deepseek_retrieve_file(
+    provider_id: String,
+    file_id: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<deepseek::DeepSeekFile, String> {
+    let root = get_root(&state)?;
+    let (provider, key) = deepseek_provider(&root, &provider_id)?;
+    deepseek::retrieve_file(&provider, &key, &file_id).await
+}
+
+/// Delete one file. Permanent on DeepSeek's side, so the caller confirms first.
+#[tauri::command]
+pub async fn deepseek_delete_file(
+    provider_id: String,
+    file_id: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<deepseek::DeepSeekFileDeleted, String> {
+    let root = get_root(&state)?;
+    let (provider, key) = deepseek_provider(&root, &provider_id)?;
+    deepseek::delete_file(&provider, &key, &file_id).await
 }
 
 // ── M5: AI Summary ────────────────────────────────────────────────────────────

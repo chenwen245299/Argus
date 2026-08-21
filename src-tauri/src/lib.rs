@@ -2,6 +2,7 @@ mod ai_manager;
 mod ai_summary;
 mod arxiv;
 mod arxiv_scheduler;
+mod balance;
 mod cache_keepalive;
 mod cancel;
 mod canvas;
@@ -10,6 +11,7 @@ mod canvas_enhance;
 mod collections;
 mod commands;
 mod copilot;
+mod deepseek;
 mod ebook;
 mod extraction;
 mod fsutil;
@@ -17,10 +19,12 @@ mod library;
 mod llm;
 mod mcp;
 mod metadata;
+mod mimo;
 mod models;
 mod net;
 mod ocr;
 mod offer_sync;
+mod openrouter;
 mod paper;
 mod path_guard;
 mod rag;
@@ -223,6 +227,13 @@ pub fn run() {
             commands::fetch_provider_models,
             commands::save_provider_models,
             commands::set_default_model,
+            // ── DeepSeek Files API (vision attachments) ──
+            commands::fetch_provider_balances,
+            commands::deepseek_vision_limits,
+            commands::deepseek_upload_file,
+            commands::deepseek_list_files,
+            commands::deepseek_retrieve_file,
+            commands::deepseek_delete_file,
             // ── M5: AI Summary ──
             commands::generate_summary,
             commands::get_summary,

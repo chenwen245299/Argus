@@ -2389,7 +2389,7 @@ function triggerInitialRender() {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 40px;
+  height: var(--content-header-height);
   padding: 0 10px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-subtle);

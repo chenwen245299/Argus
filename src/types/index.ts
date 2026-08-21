@@ -308,11 +308,45 @@ export interface AiModel {
 export interface AiProviderInfo {
   id: string
   name: string
-  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'qwenai' | 'ollama' | string
+  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'qwenai' | 'mimo' | 'ollama' | string
   base_url: string
   enabled: boolean
   has_key: boolean
   models: AiModel[]
+  server_tools: ServerTools
+}
+
+/**
+ * OpenRouter's server-side tools. Run on OpenRouter's own infrastructure while
+ * the answer is being written, so the model can reach for one without any
+ * client-side loop. Attached to every OpenRouter request by default; nothing is
+ * billed until the model actually calls one.
+ *
+ * @see https://openrouter.ai/docs/guides/features/server-tools
+ */
+export interface ServerTools {
+  web_search: boolean
+  web_fetch: boolean
+  datetime: boolean
+  image_generation: boolean
+  /** Results per search; OpenRouter's own default (5) applies when unset. */
+  web_search_max_results?: number
+  /** Which model draws the image; OpenRouter picks one when unset. */
+  image_model?: string
+  /** IANA zone reported by `datetime`; UTC when unset. */
+  timezone?: string
+  /** Ceiling on server-tool steps in one request (OpenRouter allows up to 30). */
+  max_tool_calls: number
+}
+
+/** What the server tools contributed to one answer. */
+export interface ServerToolTrace {
+  /** Pages a server-side search consulted, from `url_citation` annotations. */
+  citations: { url: string; title?: string }[]
+  /** Images the model generated, as URLs or data URIs. */
+  images: string[]
+  /** How many times each tool ran, e.g. `{ web_search: 2 }`. */
+  calls: Record<string, number>
 }
 
 export interface AiSettingsInfo {
@@ -328,12 +362,105 @@ export interface AiProviderInput {
   base_url: string
   enabled: boolean
   models: AiModel[]
+  /** Omit to leave the stored tool configuration untouched. */
+  server_tools?: ServerTools
 }
+
+/**
+ * DeepSeek's image fidelity hint. `low` rescales the image to 512x512 before the
+ * model sees it — cheaper and faster when fine detail does not matter; `high`,
+ * `original` and `auto` all keep the source resolution. Ignored by providers
+ * that do not implement it.
+ */
+export type ImageDetail = 'low' | 'high' | 'original' | 'auto'
 
 export type ChatContentPart =
   | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'image_url'; image_url: { url: string; detail?: ImageDetail } }
+  /** An attachment sent inline (OpenRouter / Kimi accept base64 PDFs this way). */
   | { type: 'file'; file: { filename: string; file_data: string } }
+  /** An attachment sent by reference to DeepSeek's Files API. */
+  | { type: 'file'; file_id: string }
+
+// ── Provider account balance ──────────────────────────────────────────────────
+
+/** What a provider says is left in the account. */
+export interface ProviderBalance {
+  providerId: string
+  /** What is left to spend, in `currency`. */
+  remaining: number
+  /** `CNY` for DeepSeek, `USD` for OpenRouter. */
+  currency: string
+  /** DeepSeek: the promotional part of `remaining`, which expires. */
+  granted?: number
+  /** DeepSeek: the paid-for part of `remaining`. */
+  toppedUp?: number
+  /** OpenRouter: credits bought to date. */
+  totalCredits?: number
+  /** OpenRouter: credits spent to date. */
+  totalUsage?: number
+  /** False once the account can no longer be charged for a call. */
+  isAvailable: boolean
+  /** Further currencies, when the account holds more than one. */
+  otherCurrencies?: { currency: string; remaining: number }[]
+}
+
+/** One provider's lookup — the balance, or why it could not be read. */
+export interface BalanceResult {
+  providerId: string
+  balance?: ProviderBalance
+  error?: string
+}
+
+// ── DeepSeek Files API ────────────────────────────────────────────────────────
+
+/** One image held in DeepSeek's file store, referenceable as `file_id`. */
+export interface DeepSeekFile {
+  id: string
+  object: string
+  bytes: number
+  created_at: number
+  filename: string
+  purpose: string
+  expires_at?: number | null
+}
+
+export interface DeepSeekFileList {
+  object: string
+  data: DeepSeekFile[]
+  first_id?: string | null
+  last_id?: string | null
+  has_more: boolean
+}
+
+export interface DeepSeekFileDeleted {
+  id: string
+  object: string
+  deleted: boolean
+}
+
+/**
+ * DeepSeek's documented vision limits, read from the backend so the UI and the
+ * request path never disagree about the numbers.
+ */
+export interface DeepSeekVisionLimits {
+  maxRequestBodyBytes: number
+  maxInlineImageBytes: number
+  maxFileImageBytes: number
+  maxImagesPerRequest: number
+  maxTotalInlineImageBytes: number
+  maxTotalImageBytesWithFiles: number
+  maxImageUrlLen: number
+  maxImageEdge: number
+  maxImageEdgeMany: number
+  manyImagesThreshold: number
+  supportedMimes: string[]
+  detailValues: ImageDetail[]
+  tokensPerImageLow: number
+  tokensPerImageOriginal: number
+  minExpiresAfterSeconds: number
+  maxExpiresAfterSeconds: number
+}
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool' | string

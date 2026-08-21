@@ -6,13 +6,18 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { useAiStore, type ModelOption } from '../../stores/ai'
+import { modelHasVision, useAiStore, type ModelOption } from '../../stores/ai'
+import ProviderBalanceTag from '../ProviderBalanceTag.vue'
+import ServerToolTraceCard from '../ServerToolTraceCard.vue'
+import { mergeServerToolTrace, persistableServerToolTrace } from '../../utils/serverToolTrace'
 import { useSettingsStore } from '../../stores/settings'
 import MarkdownBody from '../MarkdownBody.vue'
 import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
 import { beginDragSelectionGuard, endDragSelectionGuard } from '../../utils/dragSelectionGuard'
-import type { ChatContentPart, ChatMessage, PaperMeta, AgentWritePreview } from '../../types'
+import type {
+  ChatContentPart, ChatMessage, ImageDetail, PaperMeta, AgentWritePreview, ServerToolTrace,
+} from '../../types'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import ChatPageImage from '../ChatPageImage.vue'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
@@ -33,6 +38,12 @@ interface Attachment {
   type: 'image' | 'pdf'
   name: string
   dataUrl: string
+  /**
+   * DeepSeek image fidelity. Unset means full resolution; `low` rescales to
+   * 512x512, which costs roughly a third of the tokens. Other providers ignore
+   * it, so the field is only ever sent when the user picked it.
+   */
+  detail?: ImageDetail
 }
 
 type ChatNode =
@@ -65,6 +76,8 @@ interface AssistantAnswer {
   cacheHitTokens?: number
   costUsd?: number | null
   source?: 'chat' | 'metadataExtraction'
+  /** What OpenRouter's server tools contributed: pages cited, images drawn. */
+  serverTools?: ServerToolTrace
   /** What the agent did to answer: one entry per tool call, in order. */
   steps?: AgentStep[]
   /** Servers the user configured that would not start this turn. */
@@ -316,6 +329,17 @@ const selectedModels = computed(() =>
     .filter((m): m is ModelOption => !!m)
 )
 
+/**
+ * Images are queued but nothing selected can read them. Surfaced in the composer
+ * so the mismatch is visible before the request goes out — the backend refuses
+ * it too, but only after the user has pressed send.
+ */
+const visionUnsupported = computed(() =>
+  attachments.value.some(a => a.type === 'image') &&
+  selectedModels.value.length > 0 &&
+  selectedModels.value.every(m => !modelHasVision(m))
+)
+
 const hasStreaming = computed(() =>
   !!activeConversation.value?.nodes.some(n =>
     n.role === 'assistantGroup' && n.answers.some(a => a.streaming)
@@ -452,6 +476,7 @@ function persistableConversation(conv: Conversation): Conversation {
     for (const answer of node.answers) {
       delete answer.displayContent
       answer.steps = persistableSteps(answer.steps)
+      answer.serverTools = persistableServerToolTrace(answer.serverTools)
     }
   }
   return clone
@@ -871,6 +896,7 @@ function modelLogo(modelId: string, providerName = '', providerId = '') {
   if (haystack.includes('baidu') || haystack.includes('ernie')) return modelIconMap.baidu
   if (haystack.includes('doubao') || haystack.includes('bytedance')) return modelIconMap.bytedance
   if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
+  if (haystack.includes('mimo') || haystack.includes('xiaomi')) return modelIconMap.xiaomimimo
   if (haystack.includes('gpt') || haystack.includes('openai')) return modelIconMap.openai
   // Ollama is a host, not a model brand — the provider name pollutes the
   // haystack, so match its mark only after every real model brand above.
@@ -907,6 +933,12 @@ function formatContext(n: number) {
   if (n >= 1_000_000) return `${Math.round(n / 1_000_000)}M`
   if (n >= 1_000) return `${Math.round(n / 1_000)}K`
   return String(n)
+}
+
+/** Balances are looked up when the picker opens, not on every keystroke. */
+function toggleModelMenu() {
+  showModelMenu.value = !showModelMenu.value
+  if (showModelMenu.value) void ai.loadBalances()
 }
 
 function openFilePicker() {
@@ -969,12 +1001,26 @@ function buildUserContentParts(text: string, atts?: Attachment[]): ChatContentPa
   const parts: ChatContentPart[] = [{ type: 'text', text }]
   for (const att of atts ?? []) {
     if (att.type === 'image') {
-      parts.push({ type: 'image_url', image_url: { url: att.dataUrl } })
+      parts.push({
+        type: 'image_url',
+        image_url: att.detail ? { url: att.dataUrl, detail: att.detail } : { url: att.dataUrl },
+      })
     } else {
       parts.push({ type: 'file', file: { filename: att.name, file_data: att.dataUrl } })
     }
   }
   return parts
+}
+
+/**
+ * Flip one image between full resolution and DeepSeek's cheap `low` mode.
+ * Two states rather than four: `high`, `original` and `auto` all keep the source
+ * resolution, so the only choice worth a control is "downscale or not".
+ */
+function toggleAttachmentDetail(id: string) {
+  const att = attachments.value.find(a => a.id === id)
+  if (!att || att.type !== 'image') return
+  att.detail = att.detail === 'low' ? undefined : 'low'
 }
 
 function buildHistoryUntil(conv: Conversation, stopGroupId?: string): ChatMessage[] {
@@ -1286,6 +1332,7 @@ async function streamAnswer(
     ra.outputTokens = undefined
     ra.totalTokens = undefined
     ra.costUsd = undefined
+    ra.serverTools = undefined
   }
 
   const unlisten = await listen<StreamPayload>(eventName, (event) => {
@@ -1304,6 +1351,19 @@ async function streamAnswer(
     if (reactiveAns) applyUsage(reactiveAns, event.payload)
   })
   unlisteners.set(`${answer.id}-usage`, unlistenUsage)
+
+  // OpenRouter's server tools report what they consulted or drew. The agent
+  // loop emits one of these per round, so they are merged rather than replaced.
+  const unlistenServerTools = await listen<ServerToolTrace>(
+    `${eventName}-servertools`,
+    (event) => {
+      const reactiveAns = findReactiveAnswer(answer.id)
+      if (reactiveAns) {
+        reactiveAns.serverTools = mergeServerToolTrace(reactiveAns.serverTools, event.payload)
+      }
+    }
+  )
+  unlisteners.set(`${answer.id}-servertools`, unlistenServerTools)
 
   // The agent's trail: which tool it reached for, and how that went. This is
   // what replaced the old "context" banner — the model now goes and gets what
@@ -2049,7 +2109,7 @@ onUnmounted(() => {
         </header>
 
         <div v-if="!activeConversationIsMetadataExtraction" ref="modelMenuRoot" class="model-picker floating-model-picker">
-          <button class="model-trigger" @click.stop="showModelMenu = !showModelMenu">
+          <button class="model-trigger" @click.stop="toggleModelMenu()">
             <span class="model-trigger-icon">
               <template v-if="selectedModels[0]">
                 <img v-if="modelLogo(selectedModels[0].modelId, selectedModels[0].providerName, selectedModels[0].providerId)" :src="modelLogo(selectedModels[0].modelId, selectedModels[0].providerName, selectedModels[0].providerId)" alt="" />
@@ -2063,7 +2123,10 @@ onUnmounted(() => {
           <div v-if="showModelMenu" class="model-menu">
             <div class="menu-title">选择回答模型</div>
             <div v-for="group in ai.groupedModels" :key="group.id" class="model-group">
-              <div class="group-label">{{ group.name }}</div>
+              <div class="group-label">
+                <span>{{ group.name }}</span>
+                <ProviderBalanceTag :provider-id="group.id" />
+              </div>
               <button
                 v-for="model in group.models"
                 :key="modelKey(model)"
@@ -2318,6 +2381,7 @@ onUnmounted(() => {
                     <div v-else-if="!answer.reasoningContent" class="thinking-placeholder">{{ answer.withReasoning ? '正在思考…' : '生成中…' }}</div>
                   </template>
                   <MarkdownBody v-else :content="answer.content" />
+                  <ServerToolTraceCard :trace="answer.serverTools" />
                 </div>
               </article>
 
@@ -2407,6 +2471,10 @@ onUnmounted(() => {
           @dblclick="resetComposerHeight"
         />
         <div class="composer-box">
+          <div v-if="visionUnsupported" class="attachment-warning">
+            <Icon icon="fluent:warning-24-regular" width="13" height="13" />
+            <span>{{ t('chat.visionUnsupported') }}</span>
+          </div>
           <div v-if="attachments.length" class="attachment-row">
             <div
               v-for="att in attachments"
@@ -2418,6 +2486,15 @@ onUnmounted(() => {
               <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
               <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
               <span class="attachment-name">{{ att.name }}</span>
+              <button
+                v-if="att.type === 'image'"
+                class="attachment-detail"
+                :class="{ low: att.detail === 'low' }"
+                :title="att.detail === 'low' ? t('chat.imageDetailLowHint') : t('chat.imageDetailFullHint')"
+                @click="toggleAttachmentDetail(att.id)"
+              >
+                {{ att.detail === 'low' ? t('chat.imageDetailLow') : t('chat.imageDetailFull') }}
+              </button>
               <button class="attachment-remove" title="移除" @click="removeAttachment(att.id)">
                 <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
               </button>
@@ -2552,21 +2629,25 @@ onUnmounted(() => {
       </section>
     </template>
 
-    <!-- Attachment preview lightbox -->
-    <Teleport to="body">
-      <div v-if="previewImage" class="attachment-lightbox" @click.self="closePreview">
-        <img :src="previewImage" class="lightbox-image" alt="" />
-        <button class="lightbox-close" @click="closePreview">
-          <Icon icon="fluent:dismiss-24-regular" width="18" height="18" />
-        </button>
-      </div>
-      <div v-if="previewPdf" class="attachment-lightbox pdf-lightbox" @click.self="closePreview">
-        <iframe :src="previewPdf" class="lightbox-pdf" frameborder="0"></iframe>
-        <button class="lightbox-close" @click="closePreview">
-          <Icon icon="fluent:dismiss-24-regular" width="18" height="18" />
-        </button>
-      </div>
-    </Teleport>
+    <!-- Attachment / page preview.
+         Covers this panel rather than the window: what is being previewed came
+         from this panel, and the paper it belongs to is open in the reader right
+         next to it — blacking that out to show a thumbnail of one of its own
+         pages hid the very thing the preview is meant to be compared against.
+         Stays inside `.paper-ai` (which is `position: relative`) rather than
+         being teleported to the body, which is what made it cover the window. -->
+    <div v-if="previewImage" class="attachment-lightbox" @click.self="closePreview">
+      <img :src="previewImage" class="lightbox-image" alt="" />
+      <button class="lightbox-close" title="关闭" @click="closePreview">
+        <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
+      </button>
+    </div>
+    <div v-if="previewPdf" class="attachment-lightbox pdf-lightbox" @click.self="closePreview">
+      <iframe :src="previewPdf" class="lightbox-pdf" frameborder="0"></iframe>
+      <button class="lightbox-close" title="关闭" @click="closePreview">
+        <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
+      </button>
+    </div>
   </div>
 </template>
 
@@ -2715,6 +2796,11 @@ onUnmounted(() => {
   top: calc(var(--content-header-height) + 18px);
   left: 50%;
   transform: translateX(-50%);
+  /* Sized here rather than on the button: the button's own `100%` would resolve
+     against this box, which is otherwise sized by its content. Panel-relative
+     rather than viewport-relative, so dragging the sidebar down to its 220px
+     minimum shrinks the pill instead of leaving it overhanging the edge. */
+  width: min(240px, calc(100% - 24px));
   z-index: 70;
 }
 .standalone .floating-model-picker {
@@ -2723,6 +2809,10 @@ onUnmounted(() => {
   right: 20px;
   transform: none;
   z-index: 80;
+  /* Back to shrink-to-fit: the standalone window pins the pill to the right
+     edge and its button carries its own width, so the panel-relative box above
+     would leave it floating short of that edge. */
+  width: auto;
 }
 .standalone .model-trigger {
   height: 34px;
@@ -2739,7 +2829,7 @@ onUnmounted(() => {
 }
 .model-trigger {
   height: 36px;
-  width: min(240px, calc(100vw - 40px));
+  width: 100%;
   display: grid;
   grid-template-columns: 20px 1fr 16px;
   align-items: center;
@@ -2832,6 +2922,10 @@ onUnmounted(() => {
 }
 .model-group + .model-group { margin-top: 8px; }
 .group-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 4px 7px;
   font-size: 10px;
   font-weight: 700;
@@ -3524,6 +3618,40 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Shown when images are queued and the selected model cannot read them. */
+.attachment-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 12px 0;
+  padding: 5px 8px;
+  border: 1px solid var(--warning-border, rgba(210, 140, 0, 0.35));
+  border-radius: 8px;
+  background: var(--warning-bg, rgba(255, 176, 32, 0.10));
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+/* Per-image fidelity switch: full resolution, or DeepSeek's cheap 512x512 mode. */
+.attachment-detail {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 14px;
+  cursor: pointer;
+}
+.attachment-detail:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+.attachment-detail.low {
+  border-color: var(--accent);
+  color: var(--accent);
+}
 .attachment-remove {
   display: inline-flex;
   align-items: center;
@@ -4101,45 +4229,51 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
+/* Absolute, not fixed: the mask is the panel, not the window. Above everything
+   else in here — the floating model picker tops out at 100. */
 .attachment-lightbox {
-  position: fixed;
+  position: absolute;
   inset: 0;
-  z-index: 9999;
+  z-index: 300;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.78);
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.62);
   backdrop-filter: blur(2px);
 }
 .lightbox-image {
-  max-width: 92vw;
-  max-height: 92vh;
-  border-radius: 10px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.35);
 }
 .lightbox-pdf {
-  width: 92vw;
-  height: 92vh;
-  border-radius: 10px;
+  width: 100%;
+  height: 100%;
+  border-radius: 8px;
   background: #fff;
 }
 .lightbox-close {
   position: absolute;
-  top: 16px;
-  right: 16px;
+  top: 10px;
+  right: 10px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: 28px;
+  height: 28px;
   border: none;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.12);
+  /* Dark rather than translucent white: a page render is mostly white paper,
+     and the old chip disappeared into it. */
+  background: rgba(0, 0, 0, 0.55);
   color: #fff;
   cursor: pointer;
   transition: background 0.15s;
 }
 .lightbox-close:hover {
-  background: rgba(255, 255, 255, 0.22);
+  background: rgba(0, 0, 0, 0.75);
 }
 </style>

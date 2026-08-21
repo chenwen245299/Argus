@@ -2805,7 +2805,7 @@ watch(() => library.papers, () => {
 }
 
 .canvas-toolbar {
-  height: 40px;
+  height: var(--content-header-height);
   flex-shrink: 0;
   display: flex;
   align-items: center;

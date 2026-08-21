@@ -28,6 +28,22 @@ pub fn is_deepseek(provider: &AiProvider) -> bool {
     provider.base_url.to_lowercase().contains("deepseek")
 }
 
+/// Run a DeepSeek request's `messages` through the multimodal guard before it is
+/// sent. A no-op for every other provider, and for a DeepSeek request that
+/// carries no attachments — the common case, which must stay byte-identical so
+/// the prompt-cache prefix keeps hitting.
+async fn prepare_deepseek_messages(
+    provider: &AiProvider,
+    api_key: &str,
+    model: &str,
+    msgs: Vec<serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    if !is_deepseek(provider) {
+        return Ok(msgs);
+    }
+    crate::deepseek::prepare_chat_messages(provider, api_key, model, msgs).await
+}
+
 /// Qwen (Alibaba Model Studio / QwenCloud Token Plan). OpenAI-compatible, so it
 /// rides the generic `/chat/completions` path; detection is only needed for the
 /// features layered on top of it — native web search and model enrichment.
@@ -41,6 +57,26 @@ pub fn is_qwen(provider: &AiProvider) -> bool {
     provider.kind == "qwenai"
         || provider.base_url.to_lowercase().contains("dashscope")
         || provider.base_url.to_lowercase().contains("maas.aliyuncs")
+}
+
+/// Attach a provider's auth header(s) to an OpenAI-compatible request.
+///
+/// Everything on this path authenticates with `Authorization: Bearer`. MiMo's
+/// platform documents an `api-key:` header instead; it also accepts Bearer (its
+/// OpenAI-SDK compatibility guarantees that), so both are sent and the endpoint
+/// simply ignores the one it does not read. A no-op change of headers for every
+/// other provider.
+fn openai_auth(
+    req: reqwest::RequestBuilder,
+    provider: &AiProvider,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    let req = req.header("Authorization", format!("Bearer {api_key}"));
+    if crate::mimo::is_mimo(provider) {
+        req.header("api-key", api_key)
+    } else {
+        req
+    }
 }
 
 /// Ollama's native endpoints live at `/api/*` off the server root. Accept a
@@ -210,6 +246,13 @@ pub async fn list_models(provider: &AiProvider, api_key: &str) -> Result<Vec<AiM
         let models = fetch_openai_models(provider, api_key).await?;
         return Ok(models.into_iter().map(enrich_qwen_model).collect());
     }
+    if crate::mimo::is_mimo(provider) {
+        // MiMo's /models lists its ids but reports no modality, so overlay an
+        // id-derived capability table (and the documented 1M context) onto each,
+        // the same way Qwen's ids are enriched above.
+        let models = fetch_openai_models(provider, api_key).await?;
+        return Ok(models.into_iter().map(crate::mimo::enrich_mimo_model).collect());
+    }
     match provider.kind.as_str() {
         "anthropic" => Ok(anthropic_known_models()),
         _ => fetch_openai_models(provider, api_key).await,
@@ -310,8 +353,8 @@ pub async fn test_connection(provider: &AiProvider, api_key: &str) -> Result<Str
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
     let mut req = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json");
+    req = openai_auth(req, provider, api_key);
     if is_kimi_coding_endpoint {
         // Kimi Code's /coding endpoint gates access by User-Agent whitelist.
         // Pretend to be a whitelisted coding agent so ordinary API keys work.
@@ -654,6 +697,14 @@ async fn stream_with_pdf_injected(
         }
     }
 
+    // Same server tools as an ordinary chat: reading a paper is exactly where a
+    // model is likely to want to look something up.
+    let server_tools = crate::openrouter::server_tool_defs(provider, model);
+    if !server_tools.is_empty() {
+        body["tools"] = serde_json::json!(server_tools);
+        body["max_tool_calls"] = serde_json::json!(crate::openrouter::max_tool_calls(provider));
+    }
+
     if use_reasoning || is_kimi_k2 {
         if is_openrouter {
             body["reasoning"] = serde_json::json!({
@@ -703,6 +754,7 @@ async fn stream_with_pdf_injected(
     let mut cache_hit_tokens: u64 = 0;
     let mut cost_usd: Option<f64> = None;
     let mut usage_emitted = false;
+    let mut trace = crate::openrouter::ServerToolTrace::default();
 
     while let Some(chunk) = stream.next().await {
         // Backend cancellation: if the user pressed stop, break out of the loop.
@@ -794,7 +846,9 @@ async fn stream_with_pdf_injected(
                                     cache_hit_tokens,
                                 );
                                 usage_emitted = true;
+                                trace.absorb_usage(usage);
                             }
+                            trace.absorb(&json["choices"][0]["delta"]);
                             let content_delta = json["choices"][0]["delta"]["content"]
                                 .as_str()
                                 .unwrap_or("");
@@ -850,6 +904,7 @@ async fn stream_with_pdf_injected(
             cache_hit_tokens,
         );
     }
+    emit_server_tool_trace(app, event_name, &trace);
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
 }
@@ -877,6 +932,7 @@ async fn chat_openai_compat(
         .iter()
         .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
         .collect();
+    let msgs = prepare_deepseek_messages(provider, api_key, model, msgs).await?;
     let is_kimi_for_coding = is_kimi && model == "kimi-for-coding";
 
     let mut body = serde_json::json!({"model": model, "messages": msgs});
@@ -910,8 +966,8 @@ async fn chat_openai_compat(
     let mut req = client
         .post(&url)
         .timeout(REQUEST_TIMEOUT)
-        .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json");
+    req = openai_auth(req, provider, api_key);
     if is_kimi_coding_endpoint {
         req = req.header("User-Agent", "KimiCLI/1.5");
     }
@@ -974,6 +1030,7 @@ async fn stream_openai_compat(
         .iter()
         .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
         .collect();
+    let msgs = prepare_deepseek_messages(provider, api_key, model, msgs).await?;
 
     let is_deepseek = provider.base_url.to_lowercase().contains("deepseek");
     let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
@@ -1030,9 +1087,23 @@ async fn stream_openai_compat(
             // Qwen's compatible mode gates thinking with `enable_thinking`, not
             // OpenAI's `reasoning_effort` (which its strict validator rejects).
             body["enable_thinking"] = serde_json::json!(true);
+        } else if crate::mimo::is_mimo(provider) {
+            // MiMo gates deep thinking with `thinking: {type: enabled}` and
+            // streams the reasoning back as `reasoning_content`, like DeepSeek.
+            body["thinking"] = serde_json::json!({"type": "enabled"});
         } else {
             body["reasoning_effort"] = serde_json::json!(reasoning_effort.unwrap_or("high"));
         }
+    }
+
+    // OpenRouter's server-side tools ride along on every chat request. They are
+    // run by OpenRouter mid-answer rather than handed back to us, so no client
+    // loop is needed and nothing is billed unless the model actually reaches for
+    // one — which is why they are attached rather than gated behind a toggle.
+    let server_tools = crate::openrouter::server_tool_defs(provider, model);
+    if !server_tools.is_empty() {
+        body["tools"] = serde_json::json!(server_tools);
+        body["max_tool_calls"] = serde_json::json!(crate::openrouter::max_tool_calls(provider));
     }
 
     // Qwen's native web search: unlike DeepSeek it stays on /chat/completions and
@@ -1044,11 +1115,21 @@ async fn stream_openai_compat(
         body["search_options"] = serde_json::json!({ "forced_search": true, "enable_source": true });
     }
 
+    // MiMo's native web search is a tool the platform runs itself; unlike an
+    // Argus tool it never comes back as a call, only as `annotations` the
+    // `ServerToolTrace` below already reads. Append it to whatever `tools` the
+    // body may already carry (none, on this plain-chat path, for MiMo).
+    if web_search && crate::mimo::is_mimo(provider) {
+        let mut tools = body["tools"].as_array().cloned().unwrap_or_default();
+        tools.push(crate::mimo::web_search_tool());
+        body["tools"] = serde_json::json!(tools);
+    }
+
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
     let mut req = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json");
+    req = openai_auth(req, provider, api_key);
     if is_kimi_coding_endpoint {
         req = req.header("User-Agent", "KimiCLI/1.5");
         // Kimi Code may return a gzipped SSE stream; ask for identity to keep it plain text.
@@ -1072,6 +1153,7 @@ async fn stream_openai_compat(
     let mut cache_hit_tokens: u64 = 0;
     let mut cost_usd: Option<f64> = None;
     let mut usage_emitted = false;
+    let mut trace = crate::openrouter::ServerToolTrace::default();
 
     while let Some(chunk) = stream.next().await {
         // Backend cancellation: if the user pressed stop, break out of the loop.
@@ -1165,7 +1247,11 @@ async fn stream_openai_compat(
                                     cache_hit_tokens,
                                 );
                                 usage_emitted = true;
+                                trace.absorb_usage(usage);
                             }
+                            // Web pages the server-side search consulted, and any
+                            // image it drew, both ride the delta alongside the text.
+                            trace.absorb(&json["choices"][0]["delta"]);
                             // Main content delta
                             let content_delta = json["choices"][0]["delta"]["content"].as_str();
                             let reasoning_delta = json["choices"][0]["delta"]["reasoning_content"]
@@ -1229,6 +1315,7 @@ async fn stream_openai_compat(
             cache_hit_tokens,
         );
     }
+    emit_server_tool_trace(app, event_name, &trace);
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
 }
@@ -1240,27 +1327,12 @@ async fn stream_openai_compat(
 // toggle switches protocol, not just a request field. Differences that matter:
 //   * system messages become the top-level `instructions` string;
 //   * the remaining turns go in `input` as `{role, content}` items;
-//   * image/PDF parts are NOT supported here, so content is flattened to text;
+//   * images ride `input_image` blocks; a PDF part has no equivalent and is
+//     dropped, and every non-user turn is flattened to text;
 //   * the SSE stream carries typed events, not `choices[].delta`.
 // Unsupported request fields are documented as silently ignored, so sending the
 // OpenAI-shaped `reasoning.effort` is safe even where DeepSeek's own naming
 // differs.
-
-/// Flatten a message to plain text: the Responses API rejects nothing here, but
-/// DeepSeek ignores image/file input, so only the text parts carry meaning.
-fn responses_input_text(m: &ChatMessage) -> String {
-    match &m.content {
-        ChatContent::Text(s) => s.clone(),
-        ChatContent::Parts(parts) => parts
-            .iter()
-            .filter_map(|p| match p {
-                ChatContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 async fn stream_deepseek_responses(
@@ -1278,22 +1350,20 @@ async fn stream_deepseek_responses(
     let client = build_client()?;
     let url = format!("{}/responses", provider.base_url.trim_end_matches('/'));
 
-    let mut instructions = String::new();
-    let mut input: Vec<serde_json::Value> = Vec::new();
-    for m in messages {
-        let text = responses_input_text(m);
-        if m.role == "system" {
-            if text.trim().is_empty() {
-                continue;
-            }
-            if !instructions.is_empty() {
-                instructions.push_str("\n\n");
-            }
-            instructions.push_str(&text);
-        } else {
-            input.push(serde_json::json!({ "role": m.role, "content": text }));
-        }
-    }
+    // Images survive this path: DeepSeek's Responses API takes them as
+    // `input_image` blocks, so a question about a figure keeps working with web
+    // search on. The same limits guard runs first, on the chat-shaped array.
+    let prepared = prepare_deepseek_messages(
+        provider,
+        api_key,
+        model,
+        messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
+            .collect(),
+    )
+    .await?;
+    let (instructions, input) = crate::deepseek::to_responses_input(&prepared);
 
     let mut body = serde_json::json!({
         "model": model,
@@ -1308,10 +1378,10 @@ async fn stream_deepseek_responses(
         body["reasoning"] = serde_json::json!({ "effort": reasoning_effort.unwrap_or("high") });
     }
 
-    let resp = client
+    let req = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    let resp = openai_auth(req, provider, api_key)
         .json(&body)
         .send()
         .await
@@ -2127,6 +2197,25 @@ async fn stream_anthropic(
     Ok(accumulated)
 }
 
+/// Announce what OpenRouter's server tools contributed, once the answer is
+/// complete. Emitted only when something actually ran, so the ordinary answer
+/// carries no extra event — and deliberately at the end rather than per delta,
+/// since annotations arrive repeatedly and a citation strip that reshuffles
+/// itself mid-answer is worse than one that appears when the answer is done.
+fn emit_server_tool_trace(
+    app: &tauri::AppHandle,
+    event_name: &str,
+    trace: &crate::openrouter::ServerToolTrace,
+) {
+    if trace.is_empty() {
+        return;
+    }
+    let _ = app.emit(
+        format!("{event_name}-servertools").as_str(),
+        trace.to_payload(),
+    );
+}
+
 fn emit_stream_usage(
     app: &tauri::AppHandle,
     event_name: &str,
@@ -2172,11 +2261,11 @@ async fn fetch_openai_models(provider: &AiProvider, api_key: &str) -> Result<Vec
     let base = provider.base_url.trim_end_matches('/');
     let url = format!("{base}/models");
 
-    let resp = client
+    let req = client
         .get(&url)
         .timeout(REQUEST_TIMEOUT)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    let resp = openai_auth(req, provider, api_key)
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
@@ -2255,7 +2344,8 @@ fn parse_model_item(item: &serde_json::Value) -> Option<AiModel> {
     let output_price_usd_per_million =
         parse_price_usd_per_million(&item["pricing"]["completion"]);
     let is_free = quotes_free(&item["pricing"]);
-    let param_billions = parse_param_billions(item);
+    // The catalogue's own naming first; the hand-kept table only fills the gap.
+    let param_billions = parse_param_billions(item).or_else(|| known_param_billions(id));
     let (discount_percent, discount_windows) = parse_time_discount(&item["pricing"]);
     Some(AiModel {
         id: id.to_string(),
@@ -2427,6 +2517,43 @@ fn discount_of_quoted_endpoint(
     }
     let percent = (fraction * 100.0).round() as u32;
     (percent > 0 && percent < 100).then_some(percent)
+}
+
+/// Sizes the catalogues do not carry but that the vendor has stated publicly.
+///
+/// Without this the UI falls back to its "assume a large model" placeholder and
+/// renders `~100B`, which for a 1.6T model is not so much a rough estimate as a
+/// wrong one. Keyed on the family rather than the exact id so dated snapshots
+/// and variants (`-0813`, `-vision-exp`) inherit the figure instead of dropping
+/// back to the placeholder.
+///
+/// Matched on the model id alone, so a DeepSeek model served through OpenRouter
+/// (`deepseek/deepseek-v4-pro`) gets the same answer as the first-party one —
+/// the parameter count is a fact about the model, not about who hosts it.
+fn known_param_billions(model_id: &str) -> Option<f64> {
+    let id = model_id.to_lowercase();
+    // Gated on the vendor as well as the family: `v4-pro` is a generic enough
+    // suffix that some unrelated model could carry it, and a confidently wrong
+    // 1.6T would be worse than the honest `~100B` placeholder.
+    if !id.contains("deepseek") {
+        return None;
+    }
+    if id.contains("v4-pro") {
+        return Some(1600.0);
+    }
+    if id.contains("v4-flash") {
+        return Some(284.0);
+    }
+    None
+}
+
+/// Fill in a size the catalogue did not give us. Never overrides one it did:
+/// a figure scanned out of the model's own name is first-hand, while this table
+/// is maintained by hand and will go stale.
+pub fn apply_known_param_size(model: &mut AiModel) {
+    if model.param_billions.is_none() {
+        model.param_billions = known_param_billions(&model.id);
+    }
 }
 
 /// Parameter count in billions, dug out of whatever the catalogue says.
@@ -2813,7 +2940,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Process-wide shared client: reuses the connection pool (TCP + TLS sessions)
 /// across requests instead of paying a fresh handshake per AI call, which
 /// matters most for request bursts like batch analysis and embeddings.
-fn build_client() -> Result<reqwest::Client, String> {
+pub(crate) fn build_client() -> Result<reqwest::Client, String> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
@@ -2945,7 +3072,7 @@ fn char_prefix(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-fn friendly_error(status: u16, body: &str) -> String {
+pub(crate) fn friendly_error(status: u16, body: &str) -> String {
     let preview = char_prefix(body, 300);
     match status {
         401 => "Authentication failed (401). Check your API key in Settings → AI Services.".to_string(),
@@ -3089,10 +3216,10 @@ pub async fn touch_prompt_cache(
         body["tool_choice"] = serde_json::json!("auto");
     }
 
-    let resp = client
+    let req = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    let resp = openai_auth(req, provider, api_key)
         .json(&body)
         .send()
         .await
@@ -3172,17 +3299,55 @@ pub async fn stream_with_tools(
         || provider.base_url.to_lowercase().contains("moonshot.cn")
         || provider.base_url.to_lowercase().contains("api.kimi.com");
 
+    // The agent replays its whole transcript each round, so page renders fed
+    // back by `view_paper_page` pass through here too and get the same limits
+    // check (and, when they are large, the same move to the Files API). Only
+    // DeepSeek pays for the copy — everyone else keeps using the caller's slice.
+    let prepared;
+    let messages: &[serde_json::Value] = if is_deepseek(provider) {
+        prepared =
+            crate::deepseek::prepare_chat_messages(provider, api_key, model, messages.to_vec())
+                .await?;
+        &prepared
+    } else {
+        messages
+    };
+
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
+    // Argus's own tools come back as calls this loop has to run; OpenRouter's
+    // server tools are run by OpenRouter and never surface as a call, so the two
+    // sets sit side by side in the same array without interfering.
+    let openrouter_tools = crate::openrouter::server_tool_defs(provider, model);
+    let mut server_tools = openrouter_tools.clone();
+    // MiMo runs its `web_search` tool itself and reports what it consulted as
+    // annotations, exactly like OpenRouter's server tools — so it joins the same
+    // set here rather than surfacing as a call for the loop to run. The model can
+    // both search the web and call the agent's tools in one turn.
+    if web_search && crate::mimo::is_mimo(provider) {
+        server_tools.push(crate::mimo::web_search_tool());
+    }
     // An empty tool list must be omitted, not sent as `[]`: some gateways reject
     // `tools: []` outright, and it is how the loop says "no more tools".
-    if !tools.is_empty() {
-        body["tools"] = serde_json::json!(tools);
-        body["tool_choice"] = serde_json::json!("auto");
+    if !tools.is_empty() || !server_tools.is_empty() {
+        let mut all: Vec<serde_json::Value> = tools.to_vec();
+        all.extend(server_tools.iter().cloned());
+        body["tools"] = serde_json::json!(all);
+        // `tool_choice: auto` only when the model has a function it could pick;
+        // with server tools alone there is nothing for it to choose between, and
+        // the loop's "no more tools" signal must stay unambiguous.
+        if !tools.is_empty() {
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+    }
+    // `max_tool_calls` is an OpenRouter extension — only OpenRouter gets it, so a
+    // strict validator elsewhere (MiMo included) never sees an unknown field.
+    if !openrouter_tools.is_empty() {
+        body["max_tool_calls"] = serde_json::json!(crate::openrouter::max_tool_calls(provider));
     }
     // Qwen's native web search sits alongside the tools on the same body — the
     // model can both search the web and call the agent's tools in one turn.
@@ -3216,15 +3381,19 @@ pub async fn stream_with_tools(
         } else if is_qwen(provider) {
             // Qwen gates thinking with `enable_thinking`, not `reasoning_effort`.
             body["enable_thinking"] = serde_json::json!(true);
+        } else if crate::mimo::is_mimo(provider) {
+            // MiMo gates thinking with `thinking: {type: enabled}`, streaming the
+            // reasoning back as `reasoning_content` (already read below).
+            body["thinking"] = serde_json::json!({"type": "enabled"});
         } else if !is_kimi {
             body["reasoning_effort"] = serde_json::json!(reasoning_effort.unwrap_or("high"));
         }
     }
 
-    let resp = client
+    let req = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    let resp = openai_auth(req, provider, api_key)
         .json(&body)
         .send()
         .await
@@ -3249,6 +3418,7 @@ pub async fn stream_with_tools(
     let mut output_tokens: u64 = 0;
     let mut cache_hit_tokens: u64 = 0;
     let mut cost_usd: Option<f64> = None;
+    let mut trace = crate::openrouter::ServerToolTrace::default();
 
     'outer: while let Some(chunk) = stream.next().await {
         if let Some(flag) = &cancel {
@@ -3298,9 +3468,11 @@ pub async fn stream_with_tools(
                 if (is_openrouter || is_kimi) && cost_usd.is_none() {
                     cost_usd = usage_cost_usd(usage);
                 }
+                trace.absorb_usage(usage);
             }
 
             let delta = &json["choices"][0]["delta"];
+            trace.absorb(delta);
 
             if let Some(text) = delta["content"].as_str().filter(|s| !s.is_empty()) {
                 accumulated.push_str(text);
@@ -3349,6 +3521,11 @@ pub async fn stream_with_tools(
     // and emitting per round would both flash a cost strip at the user mid-run
     // and leave them looking at the last round's figures instead of the total.
     // The agent loop sums these and emits once. See `emit_usage`.
+    //
+    // The server-tool trace *is* emitted per round: unlike the cost strip it is
+    // additive on the frontend, and a citation found in round one should not
+    // wait for round five to appear.
+    emit_server_tool_trace(app, event_name, &trace);
 
     let tool_calls = partial
         .into_iter()
@@ -3457,6 +3634,61 @@ mod offer_tests {
     fn a_unit_must_end_its_token() {
         assert_eq!(scan_param_size("model-3ba-preview"), None);
         assert_eq!(scan_param_size("seed-2-1-turbo"), None);
+    }
+
+    #[test]
+    fn deepseek_sizes_come_from_the_table_the_catalogue_lacks() {
+        assert_eq!(known_param_billions("deepseek-v4-pro"), Some(1600.0));
+        assert_eq!(known_param_billions("deepseek-v4-flash"), Some(284.0));
+        // Variants inherit their family rather than dropping to the placeholder.
+        assert_eq!(known_param_billions("deepseek-v4-pro-0813"), Some(1600.0));
+        assert_eq!(
+            known_param_billions("deepseek-v4-flash-vision-exp"),
+            Some(284.0)
+        );
+        // Same model, served through OpenRouter.
+        assert_eq!(
+            known_param_billions("deepseek/deepseek-v4-pro"),
+            Some(1600.0)
+        );
+    }
+
+    /// The family suffixes are generic, so the vendor has to be there too.
+    #[test]
+    fn the_table_does_not_reach_past_deepseek() {
+        assert_eq!(known_param_billions("acme/thing-v4-pro"), None);
+        assert_eq!(known_param_billions("gpt-5.2"), None);
+        assert_eq!(known_param_billions("deepseek-v3"), None);
+    }
+
+    /// A size read off the model's own name is first-hand; the hand-kept table
+    /// is not allowed to overwrite it.
+    #[test]
+    fn a_catalogued_size_wins_over_the_table() {
+        let mut model: AiModel = serde_json::from_value(serde_json::json!({
+            "id": "deepseek-v4-pro",
+            "display_name": "DeepSeek V4 Pro",
+            "param_billions": 900.0,
+        }))
+        .unwrap();
+        apply_known_param_size(&mut model);
+        assert_eq!(model.param_billions, Some(900.0));
+
+        let mut unknown: AiModel = serde_json::from_value(serde_json::json!({
+            "id": "deepseek-v4-flash",
+            "display_name": "DeepSeek V4 Flash",
+        }))
+        .unwrap();
+        apply_known_param_size(&mut unknown);
+        assert_eq!(unknown.param_billions, Some(284.0));
+    }
+
+    /// DeepSeek's `/models` returns bare ids, so the fetch path has nothing to
+    /// scan and has to reach the table for the size to appear at all.
+    #[test]
+    fn a_bare_deepseek_id_still_gets_its_size() {
+        let item = serde_json::json!({ "id": "deepseek-v4-pro", "object": "model" });
+        assert_eq!(parse_model_item(&item).unwrap().param_billions, Some(1600.0));
     }
 
     #[test]

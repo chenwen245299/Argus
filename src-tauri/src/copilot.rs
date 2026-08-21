@@ -1665,10 +1665,11 @@ fn encode_pdf_attachment(pdf_path: &std::path::Path) -> Option<ChatContentPart> 
         .unwrap_or("paper.pdf")
         .to_string();
     Some(ChatContentPart::File {
-        file: FileData {
+        file: Some(FileData {
             filename,
             file_data: format!("data:application/pdf;base64,{b64}"),
-        },
+        }),
+        file_id: None,
     })
 }
 
@@ -2759,7 +2760,8 @@ mod agent_tests {
             kind: "openai_compatible".into(),
             base_url: "https://example.com/v1".into(),
             enabled: true,
-            created_at: String::new(),
+            server_tools: Default::default(),
+        created_at: String::new(),
             models: vec![serde_json::from_value(serde_json::json!({
                 "id": id,
                 "display_name": id,

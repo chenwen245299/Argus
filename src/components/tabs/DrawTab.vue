@@ -273,7 +273,7 @@ const opacityPct = computed({
 <style scoped>
 .draw-tab { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
 .list-toolbar {
-  display: flex; align-items: center; height: 40px; padding: 0 12px;
+  display: flex; align-items: center; height: var(--content-header-height); padding: 0 10px 0 12px;
   background: var(--bg-secondary); border-bottom: 1px solid var(--border-subtle); flex-shrink: 0;
 }
 .list-heading { flex: 1; font-size: var(--font-size-sm); font-weight: 600; color: var(--text-primary); }

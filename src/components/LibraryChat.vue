@@ -4,7 +4,10 @@ import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { useAiStore, type ModelOption } from '../stores/ai'
+import { modelHasVision, useAiStore, type ModelOption } from '../stores/ai'
+import ProviderBalanceTag from './ProviderBalanceTag.vue'
+import ServerToolTraceCard from './ServerToolTraceCard.vue'
+import { mergeServerToolTrace, persistableServerToolTrace } from '../utils/serverToolTrace'
 import { useRagStore } from '../stores/rag'
 import { useSettingsStore } from '../stores/settings'
 import MarkdownBody from './MarkdownBody.vue'
@@ -20,7 +23,10 @@ import { serveAddPapersToChat } from '../utils/chatPapers'
 import { estimateCostCny } from '../utils/modelPricing'
 import { modelOffer, modelSizeLabel } from '../utils/modelOffers'
 import { modelLogo as logoFor, modelCapabilityText } from '../utils/modelLogo'
-import type { AgentWritePreview, ChatContentPart, ChatMessage, ModelSelection, RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput } from '../types'
+import type {
+  AgentWritePreview, ChatContentPart, ChatMessage, ImageDetail, ModelSelection,
+  RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput, ServerToolTrace,
+} from '../types'
 
 const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag' | 'agent'] }>()
 const { t } = useI18n()
@@ -156,6 +162,8 @@ interface LibraryAnswerVariant {
   // heavy `contextContent` is stripped) so the per-message badge + dedup survive
   // a reload — mirrors how AiTab persists its context flags.
   contextPaperLabels?: string[]
+  /** What OpenRouter's server tools contributed: pages cited, images drawn. */
+  serverTools?: ServerToolTrace
   /** Agent mode: which tools the model called, in order. */
   agentSteps?: AgentStep[]
   /** Agent mode: configured MCP servers that failed to start for this answer. */
@@ -194,6 +202,8 @@ interface LibraryUiMessage {
   reasoningContent?: string
   contextContent?: LibrarySentContextPayload
   contextPaperLabels?: string[]
+  /** What OpenRouter's server tools contributed: pages cited, images drawn. */
+  serverTools?: ServerToolTrace
   /** Agent mode: which tools the model called, in order. */
   agentSteps?: AgentStep[]
   /** Agent mode: configured MCP servers that failed to start for this answer. */
@@ -317,6 +327,12 @@ interface Attachment {
   type: 'image' | 'pdf'
   name: string
   dataUrl: string
+  /**
+   * DeepSeek image fidelity. Unset means full resolution; `low` rescales to
+   * 512x512, which costs roughly a third of the tokens. Other providers ignore
+   * it, so the field is only ever sent when the user picked it.
+   */
+  detail?: ImageDetail
 }
 
 interface StreamUsagePayload {
@@ -437,11 +453,13 @@ function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
       delete variantClone.contextContent
       delete variantClone.displayContent
       variantClone.agentSteps = persistableSteps(variant.agentSteps)
+      variantClone.serverTools = persistableServerToolTrace(variant.serverTools)
       return variantClone
     }),
   }
   delete clone.contextContent
   clone.agentSteps = persistableSteps(msg.agentSteps)
+  clone.serverTools = persistableServerToolTrace(msg.serverTools)
   delete clone.displayContent
   return clone
 }
@@ -589,6 +607,8 @@ const webSearchAvailable = computed(() => {
     || provider.kind === 'qwenai'
     || url.includes('dashscope')
     || url.includes('maas.aliyuncs')
+    || provider.kind === 'mimo'
+    || url.includes('xiaomimimo')
 })
 watch(webSearchAvailable, (ok) => { if (!ok) useWebSearch.value = false })
 /** Live server-side search phase while a turn is running. */
@@ -851,6 +871,13 @@ function openModelPicker(msgId: string, e: MouseEvent) {
   // Store the top of the button; popup uses translateY(-100%) to appear above it
   modelPickerPos.value = { top: rect.top - 6, left: rect.left }
   modelPickerMsgId.value = msgId
+  void ai.loadBalances()
+}
+
+/** Balances are looked up when the picker opens, not on every keystroke. */
+function toggleModelMenu() {
+  modelMenuOpen.value = !modelMenuOpen.value
+  if (modelMenuOpen.value) void ai.loadBalances()
 }
 
 // ── Sidebar resize ─────────────────────────────────────────────────────────────
@@ -1067,6 +1094,14 @@ const promptSuggestions = computed(() => [
 function effectiveModel() { return selectedModel.value ?? ai.defaultSelection ?? null }
 
 const selectedModelOption = computed(() => ai.findModel(effectiveModel()))
+
+/**
+ * Images are queued but the chosen model cannot read them. Shown in the composer
+ * so the mismatch is caught before the request is sent.
+ */
+const visionUnsupported = computed(() =>
+  attachments.value.some(a => a.type === 'image') && !modelHasVision(selectedModelOption.value)
+)
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1616,12 +1651,26 @@ function buildUserContentParts(text: string, atts?: Attachment[]): ChatContentPa
   const parts: ChatContentPart[] = [{ type: 'text', text }]
   for (const att of atts ?? []) {
     if (att.type === 'image') {
-      parts.push({ type: 'image_url', image_url: { url: att.dataUrl } })
+      parts.push({
+        type: 'image_url',
+        image_url: att.detail ? { url: att.dataUrl, detail: att.detail } : { url: att.dataUrl },
+      })
     } else {
       parts.push({ type: 'file', file: { filename: att.name, file_data: att.dataUrl } })
     }
   }
   return parts
+}
+
+/**
+ * Flip one image between full resolution and DeepSeek's cheap `low` mode.
+ * Two states rather than four: `high`, `original` and `auto` all keep the source
+ * resolution, so the only choice worth a control is "downscale or not".
+ */
+function toggleAttachmentDetail(id: string) {
+  const att = attachments.value.find(a => a.id === id)
+  if (!att || att.type !== 'image') return
+  att.detail = att.detail === 'low' ? undefined : 'low'
 }
 
 async function runAssistantRequest(
@@ -1780,6 +1829,13 @@ async function runAssistantRequest(
     if (typeof usage.total_tokens === 'number') target.totalTokens = usage.total_tokens
     if (typeof usage.cache_hit_tokens === 'number') target.cacheHitTokens = usage.cache_hit_tokens
     if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) target.costUsd = usage.cost_usd
+    persistConv(conv, streamEpoch)
+  }))
+
+  // OpenRouter's server tools report what they consulted or drew. The agent loop
+  // emits one of these per round, so they are merged rather than replaced.
+  offs.push(await listen<ServerToolTrace>(`${eventName}-servertools`, (e) => {
+    target.serverTools = mergeServerToolTrace(target.serverTools, e.payload)
     persistConv(conv, streamEpoch)
   }))
 
@@ -2277,7 +2333,7 @@ onUnmounted(() => {
             </button>
           </template>
           <div ref="modelMenuRoot" class="lc-model-picker">
-            <button class="lc-model-trigger" @click.stop="modelMenuOpen = !modelMenuOpen">
+            <button class="lc-model-trigger" @click.stop="toggleModelMenu()">
               <span class="lc-model-icon">
                 <img v-if="modelLogo(selectedModelOption)" :src="modelLogo(selectedModelOption)" alt="" />
                 <span v-else>{{ selectedModelLabel().charAt(0).toUpperCase() }}</span>
@@ -2287,7 +2343,10 @@ onUnmounted(() => {
             </button>
             <div v-if="modelMenuOpen" class="lc-model-menu">
               <div v-for="group in ai.groupedModels" :key="group.id" class="lc-model-group">
-                <div class="lc-model-group-name">{{ group.name }}</div>
+                <div class="lc-model-group-name">
+                  <span>{{ group.name }}</span>
+                  <ProviderBalanceTag :provider-id="group.id" />
+                </div>
                 <button
                   v-for="model in group.models"
                   :key="selectionKey(model)"
@@ -2454,7 +2513,7 @@ onUnmounted(() => {
             </template>
 
             <div ref="modelMenuRoot" class="lc-model-picker">
-              <button class="lc-model-trigger" @click.stop="modelMenuOpen = !modelMenuOpen">
+              <button class="lc-model-trigger" @click.stop="toggleModelMenu()">
                 <span class="lc-model-icon">
                   <img
                     v-if="modelLogo(selectedModelOption)"
@@ -2469,7 +2528,10 @@ onUnmounted(() => {
 
               <div v-if="modelMenuOpen" class="lc-model-menu">
                 <div v-for="group in ai.groupedModels" :key="group.id" class="lc-model-group">
-                  <div class="lc-model-group-name">{{ group.name }}</div>
+                  <div class="lc-model-group-name">
+                  <span>{{ group.name }}</span>
+                  <ProviderBalanceTag :provider-id="group.id" />
+                </div>
                   <button
                     v-for="model in group.models"
                     :key="selectionKey(model)"
@@ -2796,6 +2858,7 @@ onUnmounted(() => {
                     <template v-else>
                       <MarkdownBody :content="activeAnswer(msg).content" />
                     </template>
+                    <ServerToolTraceCard :trace="activeAnswer(msg).serverTools" />
                   </div>
 
                   <!-- Action buttons + the usage strip.
@@ -2935,6 +2998,10 @@ onUnmounted(() => {
             @reject="answerWrite(false)"
           />
           <div class="composer">
+            <div v-if="visionUnsupported" class="attachment-warning">
+              <Icon icon="fluent:warning-24-regular" width="13" height="13" />
+              <span>{{ t('chat.visionUnsupported') }}</span>
+            </div>
             <div v-if="attachments.length" class="attachment-row">
               <div
                 v-for="att in attachments"
@@ -2946,6 +3013,15 @@ onUnmounted(() => {
                 <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
                 <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
                 <span class="attachment-name">{{ att.name }}</span>
+                <button
+                  v-if="att.type === 'image'"
+                  class="attachment-detail"
+                  :class="{ low: att.detail === 'low' }"
+                  :title="att.detail === 'low' ? t('chat.imageDetailLowHint') : t('chat.imageDetailFullHint')"
+                  @click="toggleAttachmentDetail(att.id)"
+                >
+                  {{ att.detail === 'low' ? t('chat.imageDetailLow') : t('chat.imageDetailFull') }}
+                </button>
                 <button class="attachment-remove" title="移除" @click="removeAttachment(att.id)">
                   <Icon icon="fluent:dismiss-24-regular" width="12" height="12" />
                 </button>
@@ -3164,7 +3240,10 @@ onUnmounted(() => {
       @click.stop
     >
       <div v-for="group in ai.groupedModels" :key="group.id" class="msg-model-group">
-        <div class="msg-model-group-name">{{ group.name }}</div>
+        <div class="msg-model-group-name">
+          <span>{{ group.name }}</span>
+          <ProviderBalanceTag :provider-id="group.id" />
+        </div>
         <button
           v-for="model in group.models"
           :key="selectionKey(model)"
@@ -3672,6 +3751,10 @@ onUnmounted(() => {
 }
 
 .lc-model-group-name {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 3px 8px 6px;
   color: var(--text-tertiary);
   font-size: 11px;
@@ -4741,6 +4824,10 @@ onUnmounted(() => {
 }
 
 .msg-model-group-name {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 2px 8px 5px;
   font-size: 10px;
   font-weight: 700;
@@ -5064,6 +5151,40 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Shown when images are queued and the selected model cannot read them. */
+.attachment-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 12px 0;
+  padding: 5px 8px;
+  border: 1px solid var(--warning-border, rgba(210, 140, 0, 0.35));
+  border-radius: 8px;
+  background: var(--warning-bg, rgba(255, 176, 32, 0.10));
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+/* Per-image fidelity switch: full resolution, or DeepSeek's cheap 512x512 mode. */
+.attachment-detail {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 14px;
+  cursor: pointer;
+}
+.attachment-detail:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+.attachment-detail.low {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .attachment-remove {
   display: inline-flex;

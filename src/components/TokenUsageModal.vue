@@ -96,7 +96,7 @@ const MODEL_ICON_RULES: [string[], string][] = [
   [['huggingface', 'hf-'], 'huggingface.svg'],
   [['nvidia'], 'nvidia.svg'],
   [['kling'], 'kling.svg'],
-  [['mi-', 'xiaomi'], 'xiaomi.svg'],
+  [['mimo', 'xiaomimimo', 'xiaomi'], 'xiaomimimo.svg'],
 ]
 
 function modelIconUrl(model: string, provider: string): string | null {

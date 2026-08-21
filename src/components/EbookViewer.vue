@@ -1574,7 +1574,7 @@ defineExpose({ closeToList: handleBack })
   height: var(--content-header-height);
   min-height: var(--content-header-height);
   padding: 0 12px;
-  border-bottom: 1px solid var(--divider);
+  border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-secondary);
   flex-shrink: 0;
 }

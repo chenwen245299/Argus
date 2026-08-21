@@ -107,6 +107,7 @@ function modelLogo(modelId = '', providerName = '', providerId = '') {
   if (haystack.includes('baidu') || haystack.includes('ernie')) return modelIconMap.baidu
   if (haystack.includes('doubao') || haystack.includes('bytedance')) return modelIconMap.bytedance
   if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
+  if (haystack.includes('mimo') || haystack.includes('xiaomi')) return modelIconMap.xiaomimimo
   if (haystack.includes('gpt') || haystack.includes('openai')) return modelIconMap.openai
   if (haystack.includes('ollama')) return modelIconMap['ollama-color']
   for (const key of Object.keys(modelIconMap)) {
@@ -261,7 +262,7 @@ const modelIcon = computed(() =>
 .list-toolbar {
   display: flex;
   align-items: center;
-  height: 40px;
+  height: var(--content-header-height);
   padding: 0 10px 0 12px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-subtle);

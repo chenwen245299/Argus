@@ -6,7 +6,11 @@ import { Icon } from '@iconify/vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useAiStore } from '../../stores/ai'
 import { useSettingsStore } from '../../stores/settings'
-import type { AiModel, AiProviderInfo, AiProviderInput, ModelSelection } from '../../types'
+import ProviderBalanceTag from '../ProviderBalanceTag.vue'
+import type {
+  AiModel, AiProviderInfo, AiProviderInput, DeepSeekFile, DeepSeekFileList,
+  DeepSeekVisionLimits, ModelSelection, ServerTools,
+} from '../../types'
 
 const { t } = useI18n()
 const ai = useAiStore()
@@ -20,6 +24,7 @@ const PRESETS = [
   { label: 'DeepSeek',     base_url: 'https://api.deepseek.com/v1',       kind: 'openai_compatible' },
   { label: 'Kimi Code',    base_url: 'https://api.kimi.com/coding/v1',    kind: 'kimi' },
   { label: '千问 Token Plan', base_url: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', kind: 'qwenai' },
+  { label: 'MiMo',         base_url: 'https://api.xiaomimimo.com/v1',     kind: 'mimo' },
   { label: 'Ollama',       base_url: 'http://localhost:11434',            kind: 'ollama' },
   { label: 'Anthropic',    base_url: 'https://api.anthropic.com/v1',      kind: 'anthropic' },
 ]
@@ -199,6 +204,190 @@ const fetchAvailableVisibleCount = computed(() => {
   return fetchFilteredModels.value.filter(m => !existingIds.has(m.id)).length
 })
 
+// ── OpenRouter server tools ───────────────────────────────────────────────────
+//
+// These ride along on every OpenRouter request so the model can search, fetch a
+// page, check the date or draw an image mid-answer without a client-side loop.
+// Attached by default — nothing is billed until the model reaches for one — but
+// a search or an image *is* billed when it does, so each is switchable here and
+// the step budget is visible rather than buried.
+
+const DEFAULT_SERVER_TOOLS: ServerTools = {
+  web_search: true,
+  web_fetch: true,
+  datetime: true,
+  image_generation: true,
+  max_tool_calls: 8,
+}
+
+const editServerTools = ref<ServerTools>({ ...DEFAULT_SERVER_TOOLS })
+
+/**
+ * Matches the backend's `openrouter::is_openrouter` rather than the narrower
+ * `editKind === 'openrouter'` used by the endpoint picker below: a provider
+ * added as plain `openai_compatible` but pointed at openrouter.ai still gets the
+ * server tools attached, so it must still be configurable here.
+ */
+const serverToolsAvailable = computed(() =>
+  selectedProvider.value?.kind === 'openrouter' ||
+  !!selectedProvider.value?.base_url.toLowerCase().includes('openrouter')
+)
+
+const SERVER_TOOL_KEYS = ['web_search', 'web_fetch', 'datetime', 'image_generation'] as const
+type ServerToolKey = (typeof SERVER_TOOL_KEYS)[number]
+
+/** Nothing enabled means nothing is sent — the model gets no server tools. */
+const noServerToolsEnabled = computed(() =>
+  SERVER_TOOL_KEYS.every(k => !editServerTools.value[k])
+)
+
+async function toggleServerTool(key: ServerToolKey) {
+  editServerTools.value = { ...editServerTools.value, [key]: !editServerTools.value[key] }
+  await saveServerTools()
+}
+
+async function saveServerTools() {
+  if (!selectedId.value) return
+  // OpenRouter caps a request at 30 steps; keep the stored value inside that so
+  // a typo cannot make every request fail.
+  const budget = Number(editServerTools.value.max_tool_calls)
+  editServerTools.value.max_tool_calls = Number.isFinite(budget)
+    ? Math.min(30, Math.max(1, Math.round(budget)))
+    : DEFAULT_SERVER_TOOLS.max_tool_calls
+  await saveProvider({ server_tools: { ...editServerTools.value } })
+}
+
+// ── DeepSeek file store ───────────────────────────────────────────────────────
+//
+// DeepSeek's vision models can read an image either inline or by handle. The
+// handle route is the only one that takes an image above 32 MiB and the only one
+// that survives across turns without re-sending the bytes, so the store gets its
+// own panel: what is in it, what each file costs in space, and a `file_id` to
+// paste into a request.
+
+const dsFiles = ref<DeepSeekFile[]>([])
+const dsLoading = ref(false)
+const dsUploading = ref(false)
+const dsError = ref('')
+const dsHasMore = ref(false)
+const dsLimits = ref<DeepSeekVisionLimits | null>(null)
+const dsCopiedId = ref('')
+/** Seconds until an upload expires; 0 keeps it until it is deleted by hand. */
+const dsExpiry = ref(0)
+const dsFileInput = ref<HTMLInputElement | null>(null)
+
+const isDeepSeekProvider = computed(() =>
+  !!selectedProvider.value?.base_url.toLowerCase().includes('deepseek')
+)
+
+const dsExpiryOptions = computed(() => [
+  { value: 0, label: t('aiService.dsExpiryNever') },
+  { value: 24 * 3600, label: t('aiService.dsExpiryDays', { n: 1 }) },
+  { value: 7 * 24 * 3600, label: t('aiService.dsExpiryDays', { n: 7 }) },
+  { value: 30 * 24 * 3600, label: t('aiService.dsExpiryDays', { n: 30 }) },
+])
+
+function dsBytes(n: number) {
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`
+  if (n >= 1024) return `${Math.round(n / 1024)} KiB`
+  return `${n} B`
+}
+
+function dsDate(unixSeconds?: number | null) {
+  if (!unixSeconds) return ''
+  return new Date(unixSeconds * 1000).toLocaleString()
+}
+
+function resetDeepSeekFiles() {
+  dsFiles.value = []
+  dsError.value = ''
+  dsHasMore.value = false
+  dsCopiedId.value = ''
+}
+
+/** Load a page. `append` continues after the last row instead of replacing it. */
+async function loadDeepSeekFiles(append = false) {
+  const providerId = selectedId.value
+  if (!providerId || !isDeepSeekProvider.value || dsLoading.value) return
+  dsLoading.value = true
+  dsError.value = ''
+  try {
+    if (!dsLimits.value) {
+      dsLimits.value = await invoke<DeepSeekVisionLimits>('deepseek_vision_limits')
+    }
+    const page = await invoke<DeepSeekFileList>('deepseek_list_files', {
+      providerId,
+      after: append ? dsFiles.value[dsFiles.value.length - 1]?.id : undefined,
+      limit: 50,
+      order: 'desc',
+    })
+    dsFiles.value = append ? [...dsFiles.value, ...page.data] : page.data
+    dsHasMore.value = page.has_more
+  } catch (e) {
+    dsError.value = String(e)
+  } finally {
+    dsLoading.value = false
+  }
+}
+
+async function onDeepSeekUpload(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  const providerId = selectedId.value
+  if (!providerId || files.length === 0) return
+
+  dsUploading.value = true
+  dsError.value = ''
+  try {
+    for (const file of files) {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result as string)
+        reader.onerror = () => reject(reader.error)
+        reader.readAsDataURL(file)
+      })
+      const uploaded = await invoke<DeepSeekFile>('deepseek_upload_file', {
+        providerId,
+        filename: file.name,
+        dataUrl,
+        expiresAfterSeconds: dsExpiry.value > 0 ? dsExpiry.value : undefined,
+      })
+      dsFiles.value = [uploaded, ...dsFiles.value]
+    }
+  } catch (e) {
+    dsError.value = String(e)
+  } finally {
+    dsUploading.value = false
+  }
+}
+
+/** Deletion is permanent on DeepSeek's side, so it is confirmed first. */
+async function deleteDeepSeekFile(file: DeepSeekFile) {
+  const providerId = selectedId.value
+  if (!providerId) return
+  if (!window.confirm(t('aiService.dsDeleteConfirm', { name: file.filename || file.id }))) return
+  dsError.value = ''
+  try {
+    await invoke('deepseek_delete_file', { providerId, fileId: file.id })
+    dsFiles.value = dsFiles.value.filter(f => f.id !== file.id)
+  } catch (e) {
+    dsError.value = String(e)
+  }
+}
+
+async function copyDeepSeekFileId(file: DeepSeekFile) {
+  try {
+    await navigator.clipboard.writeText(file.id)
+    dsCopiedId.value = file.id
+    setTimeout(() => {
+      if (dsCopiedId.value === file.id) dsCopiedId.value = ''
+    }, 1500)
+  } catch {
+    /* clipboard unavailable — the id is on screen and can be selected by hand */
+  }
+}
+
 function selectProvider(id: string) {
   closeProviderCtx()
   isAdding.value = false
@@ -225,6 +414,11 @@ function selectProvider(id: string) {
   orEndpoints.value = []
   orEndpointStatus.value = ''
   orEndpointErr.value = ''
+  editServerTools.value = { ...DEFAULT_SERVER_TOOLS, ...(p.server_tools ?? {}) }
+  resetDeepSeekFiles()
+  // Only auto-load with a key on file: without one the list call would fail and
+  // greet the user with an error box they did not ask for.
+  if (p.base_url.toLowerCase().includes('deepseek') && p.has_key) void loadDeepSeekFiles()
 }
 
 watch(() => ai.settings.providers, (providers) => {
@@ -268,7 +462,7 @@ async function submitAdd() {
 
 // ── Save provider details ─────────────────────────────────────────────────────
 
-async function saveProvider() {
+async function saveProvider(patch: Partial<AiProviderInput> = {}) {
   if (!selectedId.value) return
   saveStatus.value = 'saving'
   const input: AiProviderInput = {
@@ -278,6 +472,9 @@ async function saveProvider() {
     kind: editKind.value,
     enabled: editEnabled.value,
     models: editModels.value.map(m => ({ ...m, enabled: true })),
+    // `server_tools` is left out unless a caller passes it: the backend reads
+    // its absence as "unchanged", so an ordinary rename cannot reset the tools.
+    ...patch,
   }
   try {
     await ai.updateProvider(input, editKey.value || undefined)
@@ -625,9 +822,11 @@ const LOGO_MAP: [string[], string][] = [
   [['lmstudio'], 'lmstudio.svg'],
   [['siliconflow', 'silicon'], 'siliconflow.svg'],
   // Qwen's own mark, matched before the generic Alibaba Cloud one. Keyed on the
-  // Token-Plan host and the Qwen brand so a plain Aliyun endpoint still falls to
-  // alibaba.svg, while any Qwen-named provider gets qwenai.svg.
-  [['qwenai', 'token-plan', 'maas.aliyuncs', 'qwen', '千问', '通义'], 'qwenai.svg'],
+  // Aliyun MaaS host and the Qwen brand so a plain Aliyun endpoint still falls to
+  // alibaba.svg, while any Qwen-named provider gets qwenai.svg. Deliberately NOT
+  // keyed on "token-plan": MiMo's Token-Plan host is token-plan-cn.xiaomimimo.com,
+  // which must reach the MiMo mark below rather than being caught here.
+  [['qwenai', 'maas.aliyuncs', 'qwen', '千问', '通义'], 'qwenai.svg'],
   [['alibaba', 'dashscope', 'aliyun'], 'alibaba.svg'],
   [['baidu', 'qianfan', 'baidubce'], 'baidu.svg'],
   [['zhipu', 'bigmodel', 'chatglm'], 'zhipu.svg'],
@@ -635,7 +834,7 @@ const LOGO_MAP: [string[], string][] = [
   [['bytedance', 'doubao', 'volcengine', 'volces'], 'bytedance.svg'],
   [['nvidia', 'integrate.api.nvidia'], 'nvidia.svg'],
   [['microsoft', 'azure', 'openai.azure'], 'microsoft.svg'],
-  [['xiaomi', 'micloud'], 'xiaomi.svg'],
+  [['mimo', 'xiaomimimo', 'xiaomi', 'micloud'], 'xiaomimimo.svg'],
   [['mole', 'moleapi'], 'MoleAPI.svg'],
 ]
 
@@ -889,7 +1088,13 @@ function toggleCapability(form: ModelForm, cap: string) {
             class="detail-logo"
             alt=""
           />
-          <span class="detail-title">{{ selectedProvider.name }}</span>
+          <div class="detail-heading">
+            <span class="detail-title">{{ selectedProvider.name }}</span>
+            <!-- Same tag the model pickers show. This is the page you come to in
+                 order to check or top up, so the figure belongs here too — and
+                 it is why opening this section refreshes it. -->
+            <ProviderBalanceTag :provider-id="selectedProvider.id" />
+          </div>
           <div class="header-actions">
             <button class="btn-ghost sm" @click="testConnection" :disabled="testStatus === 'testing'">
               {{ testStatus === 'testing' ? '…' : t('aiService.testConn') }}
@@ -912,7 +1117,7 @@ function toggleCapability(form: ModelForm, cap: string) {
 
         <div class="field-group">
           <div class="field-label">{{ t('aiService.providerName') }}</div>
-          <input v-model="editName" class="text-input" @blur="saveProvider" />
+          <input v-model="editName" class="text-input" @blur="saveProvider()" />
         </div>
 
         <div class="field-group">
@@ -933,8 +1138,8 @@ function toggleCapability(form: ModelForm, cap: string) {
               class="text-input"
               style="margin-top:6px"
               :placeholder="editKind === 'ollama' ? t('aiService.ollamaKeyPlaceholder') : t('aiService.apiKeyPlaceholder')"
-              @keydown.enter="saveProvider"
-              @blur="saveProvider"
+              @keydown.enter="saveProvider()"
+              @blur="saveProvider()"
             />
             <div class="field-note">{{ editKind === 'ollama' ? t('aiService.ollamaKeyHint') : t('aiService.apiKeyNote') }}</div>
           </template>
@@ -942,12 +1147,12 @@ function toggleCapability(form: ModelForm, cap: string) {
 
         <div class="field-group">
           <div class="field-label">{{ t('aiService.baseUrl') }}</div>
-          <input v-model="editUrl" class="text-input" @blur="saveProvider" />
+          <input v-model="editUrl" class="text-input" @blur="saveProvider()" />
         </div>
 
         <div class="field-group">
           <div class="field-label">{{ t('aiService.serviceType') }}</div>
-          <select v-model="editKind" class="select-input" @change="saveProvider">
+          <select v-model="editKind" class="select-input" @change="saveProvider()">
             <option value="openai_compatible">{{ t('aiService.openaiCompat') }}</option>
             <option value="openrouter">{{ t('aiService.openrouter') }}</option>
             <option value="kimi">{{ t('aiService.kimi') }}</option>
@@ -955,6 +1160,150 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
             <option value="ollama">{{ t('aiService.ollama') }}</option>
           </select>
+        </div>
+
+        <!-- OpenRouter server tools: run by OpenRouter mid-answer -->
+        <div v-if="serverToolsAvailable" class="field-group ot-tools">
+          <div class="field-label">{{ t('aiService.otToolsTitle') }}</div>
+          <div class="field-note">{{ t('aiService.otToolsNote') }}</div>
+
+          <div class="ot-tool-list">
+            <button
+              v-for="key in SERVER_TOOL_KEYS"
+              :key="key"
+              class="ot-tool"
+              :class="{ on: editServerTools[key] }"
+              :title="t(`aiService.otTool_${key}_hint`)"
+              @click="toggleServerTool(key)"
+            >
+              <Icon
+                :icon="editServerTools[key] ? 'fluent:checkbox-checked-24-filled' : 'fluent:checkbox-unchecked-24-regular'"
+                width="15"
+                height="15"
+              />
+              <span class="ot-tool-text">
+                <span class="ot-tool-name">{{ t(`aiService.otTool_${key}`) }}</span>
+                <span class="ot-tool-cost">{{ t(`aiService.otTool_${key}_cost`) }}</span>
+              </span>
+            </button>
+          </div>
+
+          <div v-if="noServerToolsEnabled" class="field-note">{{ t('aiService.otToolsAllOff') }}</div>
+
+          <div class="ot-advanced">
+            <label class="ot-field">
+              <span>{{ t('aiService.otMaxToolCalls') }}</span>
+              <input
+                v-model.number="editServerTools.max_tool_calls"
+                type="number"
+                min="1"
+                max="30"
+                class="text-input xs"
+                @blur="saveServerTools()"
+              />
+            </label>
+            <label class="ot-field">
+              <span>{{ t('aiService.otMaxResults') }}</span>
+              <input
+                v-model.number="editServerTools.web_search_max_results"
+                type="number"
+                min="1"
+                max="20"
+                class="text-input xs"
+                :placeholder="t('aiService.otDefault')"
+                @blur="saveServerTools()"
+              />
+            </label>
+            <label class="ot-field">
+              <span>{{ t('aiService.otTimezone') }}</span>
+              <input
+                v-model="editServerTools.timezone"
+                class="text-input xs"
+                placeholder="Asia/Shanghai"
+                @blur="saveServerTools()"
+              />
+            </label>
+            <label class="ot-field wide">
+              <span>{{ t('aiService.otImageModel') }}</span>
+              <input
+                v-model="editServerTools.image_model"
+                class="text-input xs"
+                :placeholder="t('aiService.otDefault')"
+                @blur="saveServerTools()"
+              />
+            </label>
+          </div>
+        </div>
+
+        <!-- DeepSeek file store: images uploaded once and referenced by id -->
+        <div v-if="isDeepSeekProvider" class="field-group ds-files">
+          <div class="ds-files-header">
+            <div class="field-label">{{ t('aiService.dsFilesTitle') }}</div>
+            <div class="ds-files-actions">
+              <select v-model.number="dsExpiry" class="select-input xs" :title="t('aiService.dsExpiryLabel')">
+                <option v-for="opt in dsExpiryOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+              </select>
+              <button class="btn-ghost sm" :disabled="dsUploading" @click="dsFileInput?.click()">
+                {{ dsUploading ? t('aiService.dsUploading') : t('aiService.dsUpload') }}
+              </button>
+              <button class="btn-ghost sm" :disabled="dsLoading" @click="loadDeepSeekFiles(false)">
+                {{ t('aiService.dsRefresh') }}
+              </button>
+            </div>
+          </div>
+          <div class="field-note">
+            {{ dsLimits
+              ? t('aiService.dsFilesNote', {
+                  inline: Math.round(dsLimits.maxInlineImageBytes / 1024 / 1024),
+                  file: Math.round(dsLimits.maxFileImageBytes / 1024 / 1024),
+                  count: dsLimits.maxImagesPerRequest,
+                  tokens: dsLimits.tokensPerImageOriginal,
+                })
+              : t('aiService.dsFilesNoteShort') }}
+          </div>
+          <input
+            ref="dsFileInput"
+            type="file"
+            accept="image/jpeg,image/png,image/gif,image/webp"
+            multiple
+            style="display: none"
+            @change="onDeepSeekUpload"
+          />
+
+          <div v-if="dsError" class="test-result error">{{ dsError }}</div>
+
+          <div v-if="dsFiles.length === 0 && !dsLoading" class="ds-files-empty">
+            {{ t('aiService.dsFilesEmpty') }}
+          </div>
+          <div v-else class="ds-file-list">
+            <div v-for="file in dsFiles" :key="file.id" class="ds-file-row">
+              <div class="ds-file-main">
+                <span class="ds-file-name" :title="file.filename">{{ file.filename || file.id }}</span>
+                <span class="ds-file-meta">
+                  {{ dsBytes(file.bytes) }} · {{ dsDate(file.created_at) }}
+                  <template v-if="file.expires_at">
+                    · {{ t('aiService.dsExpiresAt', { at: dsDate(file.expires_at) }) }}
+                  </template>
+                </span>
+                <code class="ds-file-id">{{ file.id }}</code>
+              </div>
+              <div class="ds-file-actions">
+                <button
+                  class="btn-ghost xs"
+                  :title="t('aiService.dsCopyIdHint')"
+                  @click="copyDeepSeekFileId(file)"
+                >
+                  {{ dsCopiedId === file.id ? t('aiService.dsCopied') : t('aiService.dsCopyId') }}
+                </button>
+                <button class="btn-ghost xs danger" @click="deleteDeepSeekFile(file)">
+                  {{ t('aiService.dsDelete') }}
+                </button>
+              </div>
+            </div>
+          </div>
+          <button v-if="dsHasMore" class="btn-ghost sm" :disabled="dsLoading" @click="loadDeepSeekFiles(true)">
+            {{ t('aiService.dsLoadMore') }}
+          </button>
         </div>
 
         <!-- Fetch model selection dialog -->
@@ -1623,11 +1972,35 @@ function toggleCapability(form: ModelForm, cap: string) {
   gap: 10px;
   margin-bottom: 22px;
 }
+/* Groups the name with its balance so the two travel together, and carries the
+   `flex: 1` that keeps the actions pinned right — the tag renders nothing for
+   most providers, so it cannot be the one holding that space open. */
+.detail-heading {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .detail-title {
   font-size: 16px;
   font-weight: 600;
   color: var(--text-primary);
-  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A shade bigger than in the pickers: there it sits beside a 10px label, here
+   beside a 16px title. */
+.detail-heading :deep(.balance-tag) {
+  padding: 0 7px;
+  font-size: 11px;
+  line-height: 18px;
+}
+.detail-heading :deep(.balance-refresh) {
+  width: 20px;
+  height: 20px;
 }
 .header-actions { display: flex; gap: 6px; align-items: center; }
 
@@ -1702,6 +2075,142 @@ function toggleCapability(form: ModelForm, cap: string) {
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-primary.sm { padding: 3px 10px; font-size: var(--font-size-xs); }
+
+/* ── OpenRouter server tools ──────────────────────────────────────────────── */
+.ot-tool-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 6px;
+  margin-top: 6px;
+}
+.ot-tool {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 9px;
+  border: 1px solid var(--border-default);
+  border-radius: 9px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+}
+.ot-tool:hover { border-color: var(--text-tertiary); }
+.ot-tool.on {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--accent);
+}
+.ot-tool-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.ot-tool-name {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.ot-tool.on .ot-tool-name { color: var(--accent); }
+.ot-tool-cost {
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+.ot-advanced {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 6px 10px;
+  margin-top: 10px;
+}
+.ot-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ot-field.wide { grid-column: 1 / -1; }
+/* The full-width row would otherwise leave its 110px input marooned at the far
+   right with a lane of empty space in front of it. */
+.ot-field.wide .text-input { width: auto; flex: 1; }
+.text-input.xs {
+  width: 110px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+/* ── DeepSeek file store ──────────────────────────────────────────────────── */
+.ds-files-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ds-files-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.select-input.xs {
+  width: auto;
+  padding: 3px 22px 3px 8px;
+  font-size: 11px;
+}
+.ds-files-empty {
+  padding: 10px 0;
+  color: var(--text-tertiary, var(--text-secondary));
+  font-size: var(--font-size-xs);
+}
+.ds-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.ds-file-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+}
+.ds-file-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ds-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+  color: var(--text-primary);
+}
+.ds-file-meta {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ds-file-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+.ds-file-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+}
 
 .btn-ghost {
   padding: 6px 10px;

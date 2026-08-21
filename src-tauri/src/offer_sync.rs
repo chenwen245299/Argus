@@ -390,7 +390,8 @@ mod tests {
             base_url: url.into(),
             enabled: true,
             models: vec![],
-            created_at: String::new(),
+            server_tools: Default::default(),
+        created_at: String::new(),
         };
         assert!(publishes_prices(&provider("https://openrouter.ai/api/v1")));
         assert!(!publishes_prices(&provider("https://api.deepseek.com/v1")));

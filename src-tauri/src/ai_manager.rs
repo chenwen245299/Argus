@@ -184,7 +184,20 @@ pub fn to_info(root: &str, settings: &AiSettings) -> AiSettingsInfo {
                 base_url: p.base_url.clone(),
                 enabled: p.enabled,
                 has_key: has_api_key(root, &p.id),
-                models: p.models.clone(),
+                // Fill in sizes the provider's catalogue never carried. Done on
+                // the way out rather than on save, so models added before the
+                // table existed are right immediately instead of waiting for
+                // the user to re-fetch the list.
+                models: p
+                    .models
+                    .iter()
+                    .cloned()
+                    .map(|mut m| {
+                        crate::llm::apply_known_param_size(&mut m);
+                        m
+                    })
+                    .collect(),
+                server_tools: p.server_tools.clone(),
             })
             .collect(),
         default_provider_id: settings.default_provider_id.clone(),
@@ -220,6 +233,7 @@ pub fn add_provider(
         base_url: input.base_url,
         enabled: input.enabled,
         models,
+        server_tools: input.server_tools.unwrap_or_default(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     if !api_key.is_empty() {
@@ -255,6 +269,11 @@ pub fn update_provider(
     } else {
         input.models
     };
+    // Absent means "unchanged": the provider edit form does not carry the tool
+    // switches, and a rename must not reset them.
+    if let Some(tools) = input.server_tools {
+        p.server_tools = tools;
+    }
     if let Some(key) = api_key {
         if !key.is_empty() {
             save_api_key(root, id, key)?;

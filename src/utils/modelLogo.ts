@@ -41,6 +41,9 @@ export function modelLogo(model?: ModelOption | null, providerKind?: string): st
   if (haystack.includes('baidu') || haystack.includes('ernie')) return modelIconMap.baidu
   if (haystack.includes('doubao') || haystack.includes('bytedance')) return modelIconMap.bytedance
   if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
+  // MiMo ids ("mimo-v2.5-…") and the provider name both carry "mimo"; the icon
+  // file is xiaomimimo.svg, which the haystack never spells out on its own.
+  if (haystack.includes('mimo') || haystack.includes('xiaomi')) return modelIconMap.xiaomimimo
   if (haystack.includes('openai') || haystack.includes('gpt')) return modelIconMap.openai
   // Ollama is a host, not a model brand — the provider name pollutes the
   // haystack, so match its mark only after every real model brand above.

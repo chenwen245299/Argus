@@ -691,7 +691,78 @@ pub struct AiProvider {
     pub enabled: bool,
     #[serde(default)]
     pub models: Vec<AiModel>,
+    /// OpenRouter's server-side tools. Meaningless for every other provider, so
+    /// it is written out only when it differs from the default.
+    #[serde(default, skip_serializing_if = "ServerTools::is_default")]
+    pub server_tools: ServerTools,
     pub created_at: String,
+}
+
+/// Tools OpenRouter runs on its own infrastructure on the model's behalf.
+///
+/// Unlike Argus's own tools these need no client loop: the model asks for one
+/// mid-answer, OpenRouter runs it and feeds the result back, and the stream
+/// simply continues. Offering them costs nothing until the model actually calls
+/// one — but a call is billed (a web search is a few tenths of a cent, an
+/// image is a model-priced generation), which is why each is switchable and why
+/// the step budget is capped well below the 30 OpenRouter allows.
+///
+/// See <https://openrouter.ai/docs/guides/features/server-tools>.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct ServerTools {
+    /// Search the web for current information.
+    #[serde(default = "bool_true")]
+    pub web_search: bool,
+    /// Fetch and extract the content of a URL.
+    #[serde(default = "bool_true")]
+    pub web_fetch: bool,
+    /// Read the current date and time. Free beyond the tokens it costs.
+    #[serde(default = "bool_true")]
+    pub datetime: bool,
+    /// Generate an image from a prompt.
+    #[serde(default = "bool_true")]
+    pub image_generation: bool,
+    /// Results per search. OpenRouter defaults to 5 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_max_results: Option<u32>,
+    /// Which model draws the image. OpenRouter picks one when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_model: Option<String>,
+    /// IANA zone reported by `datetime`. UTC when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Ceiling on server-tool steps in one request.
+    #[serde(default = "default_server_tool_calls")]
+    pub max_tool_calls: u32,
+}
+
+/// Deliberately below OpenRouter's own default of 30. Every step past the first
+/// few is usually a model going in circles, and each search step is billed, so
+/// the budget errs towards a bounded bill rather than a bounded chance of the
+/// model needing one more look.
+fn default_server_tool_calls() -> u32 {
+    8
+}
+
+impl Default for ServerTools {
+    fn default() -> Self {
+        Self {
+            web_search: true,
+            web_fetch: true,
+            datetime: true,
+            image_generation: true,
+            web_search_max_results: None,
+            image_model: None,
+            timezone: None,
+            max_tool_calls: default_server_tool_calls(),
+        }
+    }
+}
+
+impl ServerTools {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -712,6 +783,8 @@ pub struct AiProviderInfo {
     pub enabled: bool,
     pub has_key: bool,
     pub models: Vec<AiModel>,
+    #[serde(default)]
+    pub server_tools: ServerTools,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -730,6 +803,10 @@ pub struct AiProviderInput {
     pub base_url: String,
     pub enabled: bool,
     pub models: Vec<AiModel>,
+    /// `None` leaves the stored configuration alone, so an edit that only
+    /// renames the provider does not silently reset its tools.
+    #[serde(default)]
+    pub server_tools: Option<ServerTools>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -782,13 +859,27 @@ pub enum ChatContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrlData },
+    /// An attachment carried either inline (`file`, OpenRouter/Kimi-style base64
+    /// `file_data`) or by reference (`file_id`, DeepSeek's Files API handle).
+    /// Both providers spell the block `{"type": "file", …}`, so the two payloads
+    /// share one variant and each is omitted when absent.
     #[serde(rename = "file")]
-    File { file: FileData },
+    File {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<FileData>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ImageUrlData {
     pub url: String,
+    /// DeepSeek image fidelity hint: `low` (downscale to 512x512, cheaper),
+    /// `high` / `original` (keep the source resolution) or `auto`. Omitted for
+    /// providers that do not understand it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

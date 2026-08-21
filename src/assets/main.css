@@ -24,6 +24,9 @@
   --radius-pill: 100px;
 
   --toolbar-height: 48px;
+  /* The header band directly under the toolbar. The centre column and the right
+     panel each put their own header there, side by side across the divider, so
+     every one of them has to be this tall or the seam visibly steps. */
   --content-header-height: 36px;
   --left-sidebar-min: 160px;
   --right-sidebar-min: 220px;

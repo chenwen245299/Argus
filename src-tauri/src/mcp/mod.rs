@@ -190,6 +190,10 @@ pub struct ClientConfig {
     pub codex_config_path: String,
     /// TOML block to merge into that file.
     pub codex_snippet: String,
+    /// The single argument every client passes (`--mcp-stdio`). Exposed on its
+    /// own so a GUI-based client — Codex's "add MCP server" form — can show it as
+    /// the value for the "参数 / Arguments" field, separate from the command.
+    pub stdio_flag: String,
 }
 
 /// Where Claude Desktop keeps its config, written the way documentation does.
@@ -209,6 +213,20 @@ fn desktop_config_path() -> &'static str {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "~/.config/Claude/claude_desktop_config.json"
+    }
+}
+
+/// Where Codex keeps its config, written the way its docs do (`~/.codex` on
+/// Unix, under the profile on Windows). Like `desktop_config_path`, kept
+/// unexpanded so the panel never puts the account name on screen.
+fn codex_config_path() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "%USERPROFILE%\\.codex\\config.toml"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "~/.codex/config.toml"
     }
 }
 
@@ -250,8 +268,9 @@ pub fn client_config() -> ClientConfig {
         claude_code: format!("claude mcp add argus \"{exe}\" {STDIO_FLAG}"),
         desktop_config_path: desktop_config_path().to_string(),
         desktop_snippet: desktop_snippet(&exe),
-        codex_config_path: "~/.codex/config.toml".to_string(),
+        codex_config_path: codex_config_path().to_string(),
         codex_snippet: codex_snippet(&exe),
+        stdio_flag: STDIO_FLAG.to_string(),
         executable: exe,
     }
 }
@@ -380,6 +399,7 @@ mod tests {
             desktop_snippet: desktop_snippet("/Applications/My App/Argus"),
             codex_config_path: "~/.codex/config.toml".into(),
             codex_snippet: codex_snippet("/Applications/My App/Argus"),
+            stdio_flag: STDIO_FLAG.into(),
         };
         assert!(
             cfg.claude_code.contains("\"/Applications/My App/Argus\""),

@@ -18,6 +18,7 @@ interface ClientConfig {
   desktopSnippet: string
   codexConfigPath: string
   codexSnippet: string
+  stdioFlag: string
 }
 
 const status = ref<McpStatus>({ enabled: false })
@@ -28,6 +29,7 @@ const config = ref<ClientConfig>({
   desktopSnippet: '',
   codexConfigPath: '',
   codexSnippet: '',
+  stdioFlag: '',
 })
 const activeClient = ref<'code' | 'desktop' | 'codex'>('code')
 const busy = ref(false)
@@ -40,28 +42,14 @@ const clientTabs = [
   { id: 'codex', label: 'Codex' },
 ] as const
 
-/** Claude Desktop and Codex differ only in file, format and restart wording, so
- *  they share one step renderer. */
-const fileSteps = computed(() => {
-  const desktop = activeClient.value === 'desktop'
-  return [
-    {
-      text: desktop ? t('mcpSettings.desktopStep1') : t('mcpSettings.codexStep1'),
-      code: desktop ? config.value.desktopConfigPath : config.value.codexConfigPath,
-      key: 'path',
-    },
-    {
-      text: t('mcpSettings.fileStep2'),
-      code: desktop ? config.value.desktopSnippet : config.value.codexSnippet,
-      key: 'snippet',
-    },
-    {
-      text: desktop ? t('mcpSettings.desktopStep3') : t('mcpSettings.codexStep3'),
-      code: '',
-      key: '',
-    },
-  ]
-})
+/** Claude Desktop is the only client that still needs a config file edited by
+ *  hand — Codex is done through its form (the block in the template), Claude Code
+ *  through one command. Path, snippet and restart each get their own step. */
+const fileSteps = computed(() => [
+  { text: t('mcpSettings.desktopStep1'), code: config.value.desktopConfigPath, key: 'path' },
+  { text: t('mcpSettings.fileStep2'), code: config.value.desktopSnippet, key: 'snippet' },
+  { text: t('mcpSettings.desktopStep3'), code: '', key: '' },
+])
 
 /** "How do I know it worked" differs per client — same slot, different sentence. */
 const verifyNote = computed(() => {
@@ -167,6 +155,50 @@ onMounted(refresh)
         </button>
       </div>
 
+      <!-- Codex adds MCP servers through a form (类型/启动命令/参数). Give the exact
+           value for each field, each on its own copy button, so the user just
+           pastes — no config file to hand-edit. -->
+      <div v-if="activeClient === 'codex'" class="gui-block">
+        <span class="gui-head">{{ t('mcpSettings.codexGuiHead') }}</span>
+        <div class="gui-fields">
+          <div class="gui-field">
+            <span class="gui-key">{{ t('mcpSettings.codexGuiName') }}</span>
+            <div class="snippet-wrap">
+              <pre class="snippet">argus</pre>
+              <button class="snippet-copy" @click="copy('gname', 'argus')">
+                <Icon :icon="copiedKey === 'gname' ? 'fluent:checkmark-24-regular' : 'fluent:copy-24-regular'" width="14" height="14" />
+                <span>{{ copiedKey === 'gname' ? t('mcpSettings.copied') : t('mcpSettings.copy') }}</span>
+              </button>
+            </div>
+          </div>
+          <div class="gui-field">
+            <span class="gui-key">{{ t('mcpSettings.codexGuiType') }}</span>
+            <code class="gui-static">STDIO</code>
+          </div>
+          <div class="gui-field">
+            <span class="gui-key">{{ t('mcpSettings.codexGuiCommand') }}</span>
+            <div class="snippet-wrap">
+              <pre class="snippet">{{ config.executable }}</pre>
+              <button class="snippet-copy" @click="copy('gcmd', config.executable)">
+                <Icon :icon="copiedKey === 'gcmd' ? 'fluent:checkmark-24-regular' : 'fluent:copy-24-regular'" width="14" height="14" />
+                <span>{{ copiedKey === 'gcmd' ? t('mcpSettings.copied') : t('mcpSettings.copy') }}</span>
+              </button>
+            </div>
+          </div>
+          <div class="gui-field">
+            <span class="gui-key">{{ t('mcpSettings.codexGuiArgs') }}</span>
+            <div class="snippet-wrap">
+              <pre class="snippet">{{ config.stdioFlag }}</pre>
+              <button class="snippet-copy" @click="copy('gargs', config.stdioFlag)">
+                <Icon :icon="copiedKey === 'gargs' ? 'fluent:checkmark-24-regular' : 'fluent:copy-24-regular'" width="14" height="14" />
+                <span>{{ copiedKey === 'gargs' ? t('mcpSettings.copied') : t('mcpSettings.copy') }}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+        <p class="gui-rest">{{ t('mcpSettings.codexGuiRest') }}</p>
+      </div>
+
       <!-- Claude Code: one command -->
       <ol v-if="activeClient === 'code'" class="steps">
         <li>
@@ -181,8 +213,10 @@ onMounted(refresh)
         </li>
       </ol>
 
-      <!-- Claude Desktop: edit a config file -->
-      <ol v-else class="steps">
+      <!-- Claude Desktop: edit a config file (it has no GUI for local stdio
+           servers, so this route is unavoidable — Codex, which does, is handled
+           by the form block above). -->
+      <ol v-else-if="activeClient === 'desktop'" class="steps">
         <li v-for="step in fileSteps" :key="step.text">
           <span>{{ step.text }}</span>
           <div v-if="step.code" class="snippet-wrap">
@@ -335,6 +369,24 @@ onMounted(refresh)
   border-radius: var(--radius-sm);
 }
 .snippet-copy:hover { color: var(--text-primary); background: var(--bg-hover); }
+
+/* ── Codex GUI form guidance ── */
+.gui-block { display: flex; flex-direction: column; gap: 10px; }
+.gui-head { font-size: 12.5px; font-weight: 600; color: var(--text-primary); }
+.gui-fields { display: flex; flex-direction: column; gap: 10px; }
+.gui-field { display: flex; flex-direction: column; gap: 5px; }
+.gui-key { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.gui-static {
+  align-self: flex-start;
+  padding: 5px 10px;
+  font-size: 11.5px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+.gui-rest { margin: 2px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-tertiary); }
 
 /* ── Hand-drawn tutorial bits ── */
 

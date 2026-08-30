@@ -613,11 +613,23 @@ pub async fn translate_text_stream(
     let event_name = format!("translate-stream-{}", event_id);
 
     tauri::async_runtime::spawn(async move {
-        let _ = crate::llm::chat_completion_stream(
+        let result = crate::llm::chat_completion_stream(
             &provider, &api_key, &model, &messages,
             &event_name, &app, false, None, "translate", None, false,
         )
         .await;
+        // On success the stream helper emits its own terminal `{done:true}` event.
+        // On failure it returns `Err` WITHOUT emitting anything, so the frontend —
+        // which only stops "loading" when it sees `done` — would spin forever
+        // (this is why a failing translate hangs while the AI tab, whose invoke
+        // awaits the same call, surfaces the error). Emit a terminal event
+        // carrying the error so the UI can stop and show what went wrong.
+        if let Err(e) = result {
+            let _ = app.emit(
+                &event_name,
+                serde_json::json!({ "delta": "", "done": true, "error": e }),
+            );
+        }
     });
 
     Ok(())
@@ -3205,10 +3217,43 @@ fn copy_file_to_clipboard(path: String) -> Result<(), String> {
         });
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // Put the file itself on the clipboard as a CF_HDROP file-drop list (what
+        // Explorer pastes as the actual file), mirroring the macOS branch above.
+        // The path is handed to PowerShell through an environment variable rather
+        // than interpolated into the script text, so a path containing quotes or
+        // newlines can't break out of the string and inject a second command.
+        // CREATE_NO_WINDOW (0x0800_0000) keeps a console window from flashing.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-STA",
+                "-Command",
+                "Set-Clipboard -LiteralPath $env:ARGUS_CLIP_PATH",
+            ])
+            .env("ARGUS_CLIP_PATH", &path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            "Failed to copy PDF file".to_string()
+        } else {
+            err
+        });
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = path;
-        Err("Copying files to clipboard is currently only supported on macOS".to_string())
+        Err("Copying files to clipboard is currently only supported on macOS and Windows".to_string())
     }
 }
 

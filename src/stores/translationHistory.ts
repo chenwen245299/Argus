@@ -190,11 +190,14 @@ export async function runTranslation(sourceText: string) {
       `translate-stream-${eventId}-usage`,
       ({ payload }) => applyTranslationUsage(payload),
     )
-    const offStream = await listen<{ delta: string; done: boolean }>(
+    const offStream = await listen<{ delta: string; done: boolean; error?: string }>(
       `translate-stream-${eventId}`,
       ({ payload }) => {
         if (payload.done) {
-          finishTranslation()
+          // The backend attaches `error` to the terminal event when the stream
+          // failed; without this the tab would sit in a permanent loading state.
+          if (payload.error) failTranslation(payload.error)
+          else finishTranslation()
           cleanupTranslateListeners()
           return
         }

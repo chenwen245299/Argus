@@ -726,6 +726,14 @@ const knowledgeSourceLabel = computed(() => {
   }
 })
 
+// RAG (an embedding provider + vector store) is only used by the two modes that
+// retrieve by similarity: 文献库RAG and 素材库. Agent mode reaches for tools,
+// 文献库论文 injects the papers you pick, and 不使用知识库 sends no context — none
+// of them touch RAG, so a "RAG 未配置" warning in those modes is just noise.
+const knowledgeSourceNeedsRag = computed(
+  () => knowledgeSource.value === 'paper-rag' || knowledgeSource.value === 'snippets'
+)
+
 function setActiveSelectedPaperSlugs(slugs: string[]) {
   const conv = conversations.value.find(c => c.id === activeConvId.value)
   if (!conv) return
@@ -2278,8 +2286,8 @@ onUnmounted(() => {
         </div>
         <div class="lc-titlebar-fill" data-tauri-drag-region />
         <div class="lc-titlebar-actions">
-          <!-- RAG not configured -->
-          <button v-if="knowledgeSource !== 'papers' && knowledgeSource !== 'none' && !ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
+          <!-- RAG not configured — only the RAG-backed modes (文献库RAG / 素材库). -->
+          <button v-if="knowledgeSourceNeedsRag && !ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
             <Icon icon="fluent:database-24-regular" width="11" height="11" />
             RAG
           </button>
@@ -2563,8 +2571,10 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <!-- RAG hint banner -->
-        <div v-if="ragStore.loaded && !ragStore.isConfigured" class="rag-hint-bar">
+        <!-- RAG hint banner — only in the modes that actually retrieve by
+             similarity. Agent / 文献库论文 / 不使用知识库 never use RAG, so the
+             "answering from general knowledge" warning would be misleading there. -->
+        <div v-if="ragStore.loaded && !ragStore.isConfigured && knowledgeSourceNeedsRag" class="rag-hint-bar">
           <div class="rag-hint-icon">
             <Icon icon="fluent:info-24-regular" width="13" height="13" />
           </div>

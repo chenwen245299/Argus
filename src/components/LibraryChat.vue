@@ -4,7 +4,7 @@ import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { modelHasVision, useAiStore, type ModelOption } from '../stores/ai'
+import { modelHasVision, modelHasVideo, useAiStore, type ModelOption } from '../stores/ai'
 import ProviderBalanceTag from './ProviderBalanceTag.vue'
 import ServerToolTraceCard from './ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../utils/serverToolTrace'
@@ -29,6 +29,10 @@ import type {
 } from '../types'
 
 const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag' | 'agent'] }>()
+import {
+  ATTACHMENT_ACCEPT, buildContentParts, readAttachmentFile, type Attachment,
+} from '../utils/attachments'
+
 const { t } = useI18n()
 // On Windows the native decorations are off, so we drop the macOS traffic-light
 // gutter and render our own window controls (see WindowControls).
@@ -157,6 +161,10 @@ interface LibraryAnswerVariant {
   // Accumulated thinking/reasoning tokens (shown in the collapsible 思考过程 box)
   // when reasoning mode was on for this turn.
   reasoningContent?: string
+  // Throttled copy of `reasoningContent`, for the same reason as
+  // `displayContent`: reasoning arrives token by token too, and a 30k-character
+  // chain of thought re-rendered per token freezes the panel on its own.
+  displayReasoning?: string
   contextContent?: LibrarySentContextPayload
   // Titles of the papers sent as context on this turn. Kept when persisting (the
   // heavy `contextContent` is stripped) so the per-message badge + dedup survive
@@ -200,6 +208,7 @@ interface LibraryUiMessage {
   variants?: LibraryAnswerVariant[]
   activeVariantId?: string
   reasoningContent?: string
+  displayReasoning?: string
   contextContent?: LibrarySentContextPayload
   contextPaperLabels?: string[]
   /** What OpenRouter's server tools contributed: pages cited, images drawn. */
@@ -322,18 +331,7 @@ interface LibrarySentContextPayload {
   sections?: LibrarySentContextSection[]
 }
 
-interface Attachment {
-  id: string
-  type: 'image' | 'pdf'
-  name: string
-  dataUrl: string
-  /**
-   * DeepSeek image fidelity. Unset means full resolution; `low` rescales to
-   * 512x512, which costs roughly a third of the tokens. Other providers ignore
-   * it, so the field is only ever sent when the user picked it.
-   */
-  detail?: ImageDetail
-}
+// `Attachment` now lives in utils/attachments.ts, shared with the library chat.
 
 interface StreamUsagePayload {
   input_tokens?: number
@@ -452,6 +450,7 @@ function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
       const variantClone: LibraryAnswerVariant = { ...variant }
       delete variantClone.contextContent
       delete variantClone.displayContent
+      delete variantClone.displayReasoning
       variantClone.agentSteps = persistableSteps(variant.agentSteps)
       variantClone.serverTools = persistableServerToolTrace(variant.serverTools)
       return variantClone
@@ -461,6 +460,7 @@ function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
   clone.agentSteps = persistableSteps(msg.agentSteps)
   clone.serverTools = persistableServerToolTrace(msg.serverTools)
   delete clone.displayContent
+  delete clone.displayReasoning
   return clone
 }
 
@@ -513,6 +513,9 @@ const attachments = ref<Attachment[]>([])
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const previewImage = ref<string | null>(null)
 const previewPdf = ref<string | null>(null)
+const previewVideo = ref<string | null>(null)
+/** Why the last picked file was refused (currently only an oversized clip). */
+const attachmentError = ref<string | null>(null)
 /** Conversations with a generation in flight.
  *
  *  Per conversation rather than one global flag: a conversation left generating
@@ -595,7 +598,8 @@ const knowledgeSource = ref<KnowledgeSource>(loadKnowledgeSource())
 const sourcePickerOpen = ref(false)
 
 // Server-side web search: DeepSeek exposes it via its Responses API, Qwen via an
-// `enable_search` flag on the standard chat body. Both surface the same toggle.
+// `enable_search` flag on the standard chat body, MiMo and GLM as a tool the
+// platform runs for itself. All four surface the same toggle.
 const useWebSearch = ref(false)
 const webSearchAvailable = computed(() => {
   const sel = selectedModel.value ?? ai.defaultSelection ?? null
@@ -609,6 +613,9 @@ const webSearchAvailable = computed(() => {
     || url.includes('maas.aliyuncs')
     || provider.kind === 'mimo'
     || url.includes('xiaomimimo')
+    || provider.kind === 'zhipu'
+    || url.includes('bigmodel')
+    || url.includes('api.z.ai')
 })
 watch(webSearchAvailable, (ok) => { if (!ok) useWebSearch.value = false })
 /** Live server-side search phase while a turn is running. */
@@ -688,11 +695,30 @@ function toggleReasoning(id: string) {
   collapsedReasoning.value = next
 }
 // "126 词 · 147 字符" — CJK chars count as one word each, Latin runs as one word.
-function reasoningStats(text: string) {
+//
+// Memoized per answer. This is called from the template, where nothing is
+// memoized: it ran two whole-string regex scans (each allocating an array with
+// one entry per matched character) for every answer on every re-render of the
+// list. On a 30k-character chain of thought that is ~10k array entries per
+// answer per frame — which, while the same answer is streaming, is most of the
+// frame. The text only ever grows, so comparing it to the last one we measured
+// makes every repeat call free.
+const reasoningStatsCache = new Map<string, { text: string; out: string }>()
+function reasoningStats(id: string, text: string) {
+  const hit = reasoningStatsCache.get(id)
+  if (hit && hit.text === text) return hit.out
   const chars = text.length
   const cjk = (text.match(/[一-鿿぀-ヿ가-힯]/g) ?? []).length
   const latin = (text.match(/[A-Za-z0-9]+/g) ?? []).length
-  return `${cjk + latin} 词 · ${chars} 字符`
+  const out = `${cjk + latin} 词 · ${chars} 字符`
+  reasoningStatsCache.set(id, { text, out })
+  return out
+}
+
+/** The reasoning text to paint: the throttled copy while it streams, the real
+ *  one once it is done. */
+function reasoningText(a: { reasoningContent?: string; displayReasoning?: string; streaming?: boolean }) {
+  return (a.streaming ? a.displayReasoning ?? a.reasoningContent : a.reasoningContent) ?? ''
 }
 
 const paperPickerOpen = ref(false)
@@ -986,6 +1012,7 @@ function isTargetVisible(targetId: string) {
 function applyStreamRender(target: StreamTarget) {
   const startedAt = performance.now()
   target.displayContent = target.content
+  target.displayReasoning = target.reasoningContent
   nextTick(() => streamRenderCost.set(target.id, performance.now() - startedAt))
   if (isTargetVisible(target.id)) scrollToBottom()
 }
@@ -1016,6 +1043,7 @@ function flushStreamRender(target: StreamTarget) {
   streamRenderLast.delete(target.id)
   streamRenderCost.delete(target.id)
   target.displayContent = target.content
+  target.displayReasoning = target.reasoningContent
 }
 
 // Clear every pending throttle timer (session switch / unmount).
@@ -1032,6 +1060,14 @@ const activeConv = computed(() =>
   conversations.value.find(c => c.id === activeConvId.value) ?? null
 )
 const activeMessages = computed(() => activeConv.value?.messages ?? [])
+
+/** id -> position in `activeMessages`. Built once per list change so the
+ *  per-message lookups below stay O(1) instead of scanning the list. */
+const messageIndexById = computed(() => {
+  const idx = new Map<string, number>()
+  activeMessages.value.forEach((m, i) => idx.set(m.id, i))
+  return idx
+})
 
 // Left-rail message navigation: one tick per user message, hover previews the
 // text, click scrolls to it. Mirrors the per-paper AI chat (AiTab) rail.
@@ -1109,6 +1145,11 @@ const selectedModelOption = computed(() => ai.findModel(effectiveModel()))
  */
 const visionUnsupported = computed(() =>
   attachments.value.some(a => a.type === 'image') && !modelHasVision(selectedModelOption.value)
+)
+
+/** Same check for a clip: only MiniMax's M3 line reads video on the chat path. */
+const videoUnsupported = computed(() =>
+  attachments.value.some(a => a.type === 'video') && !modelHasVideo(selectedModelOption.value)
 )
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1278,21 +1319,41 @@ function modelFallbackInitial(answer: LibraryAnswerVariant) {
  * The answer a message is currently showing: its selected variant, or a view of
  * the message itself when it has none.
  *
- * The fallback spreads rather than listing fields, because listing them meant
- * every field added to `LibraryUiMessage` afterwards was silently dropped from
- * everything the template reads through here. That is exactly how the agent
- * trail came to never render: `content` and the token counts were copied,
- * `agentSteps` was not, so the tools ran and nothing showed.
+ * The fallback forwards every field rather than listing the ones to keep,
+ * because listing them meant every field added to `LibraryUiMessage` afterwards
+ * was silently dropped from everything the template reads through here. That is
+ * exactly how the agent trail came to never render: `content` and the token
+ * counts were copied, `agentSteps` was not, so the tools ran and nothing showed.
  *
- * Only the four message-only fields are removed. `agentSteps` and the rest stay
- * by reference, so the streaming listener's mutations reach the DOM.
+ * It used to forward by spreading into a fresh object on every call. The
+ * template calls this ~65 times per assistant message, and the list re-renders
+ * on every streaming tick, so that was 65 copies of the whole message per
+ * message per tick. A cached copy would not work — it would freeze the fields
+ * the streaming listener mutates — so the cached view is a Proxy instead: reads
+ * go straight to the live (reactive) message, so they still track their
+ * dependencies and still see the latest value. Only `id` is overridden, keeping
+ * the `:base` suffix that the per-answer collapse/expand state keys off.
+ *
+ * Unlike the old copy this view also exposes the message-only fields (`role`,
+ * `attachments`, `variants`, `activeVariantId`). Nothing reads them through
+ * here; don't spread this object into a variant, which would nest them.
  */
+const baseAnswerViews = new WeakMap<LibraryUiMessage, LibraryAnswerVariant>()
+
 function activeAnswer(msg: LibraryUiMessage): LibraryAnswerVariant {
   const variants = msg.variants ?? []
   const active = variants.find(v => v.id === msg.activeVariantId) ?? variants[variants.length - 1]
   if (active) return active
-  const { role: _role, attachments: _attachments, variants: _variants, activeVariantId: _activeId, ...rest } = msg
-  return { ...rest, id: `${msg.id}:base` }
+  const cached = baseAnswerViews.get(msg)
+  if (cached) return cached
+  const baseId = `${msg.id}:base`
+  const view = new Proxy(msg, {
+    // No receiver: reads go through the reactive message exactly as `msg[k]`
+    // would, so tracking behaves identically to the old copy.
+    get: (t, k) => (k === 'id' ? baseId : Reflect.get(t, k)),
+  }) as unknown as LibraryAnswerVariant
+  baseAnswerViews.set(msg, view)
+  return view
 }
 
 function answerSources(msg: LibraryUiMessage) {
@@ -1326,7 +1387,7 @@ function answerContextSections(answer: LibraryAnswerVariant) {
 // context the backend emitted for that turn.
 function answerForUserTurn(userMsg: LibraryUiMessage): LibraryAnswerVariant | null {
   const msgs = activeMessages.value
-  const idx = msgs.findIndex(m => m.id === userMsg.id)
+  const idx = messageIndexById.value.get(userMsg.id) ?? -1
   if (idx < 0) return null
   const ans = msgs[idx + 1]
   if (!ans || ans.role !== 'assistant') return null
@@ -1354,17 +1415,26 @@ function turnPaperContent(userMsg: LibraryUiMessage, label: string): string {
 // model still receives every selected paper each turn — they live in the system
 // prompt, so we never stop sending them — but the badge is only shown on the turn
 // that first added a paper, like an attachment announced once, not on every reply.
-function newlyAddedPapers(userMsg: LibraryUiMessage): string[] {
+//
+// Computed once for the whole list rather than per message. As a function this
+// walked every message (and every walk did its own findIndex) for each user
+// turn, and the template asked three times per turn — cubic in the number of
+// turns, re-run on every streaming tick. A long conversation froze on this
+// alone.
+const newlyAddedPapersByMsgId = computed(() => {
+  const out = new Map<string, string[]>()
   const seen = new Set<string>()
   for (const m of activeMessages.value) {
     if (m.role !== 'user') continue
     const labels = turnPaperLabels(m)
-    if (m.id === userMsg.id) {
-      return labels.filter(l => !seen.has(l))
-    }
+    out.set(m.id, labels.filter(l => !seen.has(l)))
     for (const l of labels) seen.add(l)
   }
-  return []
+  return out
+})
+
+function newlyAddedPapers(userMsg: LibraryUiMessage): string[] {
+  return newlyAddedPapersByMsgId.value.get(userMsg.id) ?? []
 }
 
 function answerUsedPdf(answer: LibraryAnswerVariant) {
@@ -1457,7 +1527,7 @@ function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
       // conversation history. Each PDF only needs to be uploaded once; later
       // turns can reference it via the prior messages.
       if (m.attachments?.length) {
-        history.push({ role: 'user', content: buildUserContentParts(m.content, m.attachments) })
+        history.push({ role: 'user', content: buildContentParts(m.content, m.attachments) })
       } else {
         history.push({ role: 'user', content: m.content })
       }
@@ -1563,6 +1633,8 @@ function deleteConversation(id: string) {
 
 function persistConv(conv: LibraryConversation | null, epoch = libraryEpoch) {
   if (!conv) return
+  // This write supersedes any merged one still waiting for this conversation.
+  cancelPendingPersist(conv.id)
   // Checked before the mutations below, not just before the write: bumping
   // `updatedAt` and reordering the list for a conversation that is gone (or
   // belongs to a library that is no longer open) is wrong on its own.
@@ -1578,15 +1650,48 @@ function persistConv(conv: LibraryConversation | null, epoch = libraryEpoch) {
   persistOne(conv, epoch)
 }
 
+// Writes issued from inside a stream are merged. Every write re-serializes the
+// whole conversation — tool payloads included, which is hundreds of KB by the
+// end of a long agent run — on the main thread, and `-usage` / `-servertools`
+// fire once per agent round. A deferred write is dropped the moment a direct
+// `persistConv` for the same conversation happens (the end of the turn always
+// does one), so nothing can be lost by delaying it.
+const PERSIST_MERGE_MS = 400
+const pendingPersists = new Map<string, ReturnType<typeof setTimeout>>()
+
+function persistConvSoon(conv: LibraryConversation | null, epoch = libraryEpoch) {
+  if (!conv) return
+  if (pendingPersists.has(conv.id)) return
+  const timer = setTimeout(() => {
+    pendingPersists.delete(conv.id)
+    persistConv(conv, epoch)
+  }, PERSIST_MERGE_MS)
+  pendingPersists.set(conv.id, timer)
+}
+
+function cancelPendingPersist(convId: string) {
+  const timer = pendingPersists.get(convId)
+  if (timer) { clearTimeout(timer); pendingPersists.delete(convId) }
+}
+
 function persistActive() {
   persistConv(activeConv.value)
 }
 
 // ── Messaging ─────────────────────────────────────────────────────────────────
 
+// Coalesced to one scroll per animation frame. Reading `scrollHeight` forces a
+// synchronous layout of the whole (very tall) message list, so calling this per
+// streamed token cost more than the render it followed. rAF also runs after
+// Vue has patched the DOM, so the height it reads is the new one.
+let scrollFramePending = false
 function scrollToBottom() {
-  nextTick(() => {
-    if (messagesEl.value) messagesEl.value.scrollTop = messagesEl.value.scrollHeight
+  if (scrollFramePending) return
+  scrollFramePending = true
+  requestAnimationFrame(() => {
+    scrollFramePending = false
+    const el = messagesEl.value
+    if (el) el.scrollTop = el.scrollHeight
   })
 }
 
@@ -1604,15 +1709,16 @@ function openFilePicker() {
 }
 
 function addAttachmentFromFile(file: File) {
-  if (!file.type.startsWith('image/') && file.type !== 'application/pdf') return false
-  const reader = new FileReader()
-  reader.onload = () => {
-    const dataUrl = reader.result as string
-    const type: Attachment['type'] = file.type.startsWith('image/') ? 'image' : 'pdf'
-    const name = file.name || (type === 'image' ? 'pasted-image.png' : 'pasted-file.pdf')
-    attachments.value.push({ id: crypto.randomUUID(), type, name, dataUrl })
-  }
-  reader.readAsDataURL(file)
+  const pending = readAttachmentFile(file)
+  if (!pending) return false
+  void pending.then((res) => {
+    if (res.status === 'ok') {
+      attachmentError.value = null
+      attachments.value.push(res.attachment)
+    } else {
+      attachmentError.value = t('chat.videoTooLarge', { name: res.name, mb: res.limitMb })
+    }
+  })
   return true
 }
 
@@ -1640,11 +1746,14 @@ function onPaste(e: ClipboardEvent) {
 
 function removeAttachment(id: string) {
   attachments.value = attachments.value.filter(a => a.id !== id)
+  if (attachments.value.length === 0) attachmentError.value = null
 }
 
 function previewAttachment(att: Attachment) {
   if (att.type === 'image') {
     previewImage.value = att.dataUrl
+  } else if (att.type === 'video') {
+    previewVideo.value = att.dataUrl
   } else {
     previewPdf.value = att.dataUrl
   }
@@ -1653,22 +1762,9 @@ function previewAttachment(att: Attachment) {
 function closePreview() {
   previewImage.value = null
   previewPdf.value = null
+  previewVideo.value = null
 }
 
-function buildUserContentParts(text: string, atts?: Attachment[]): ChatContentPart[] {
-  const parts: ChatContentPart[] = [{ type: 'text', text }]
-  for (const att of atts ?? []) {
-    if (att.type === 'image') {
-      parts.push({
-        type: 'image_url',
-        image_url: att.detail ? { url: att.dataUrl, detail: att.detail } : { url: att.dataUrl },
-      })
-    } else {
-      parts.push({ type: 'file', file: { filename: att.name, file_data: att.dataUrl } })
-    }
-  }
-  return parts
-}
 
 /**
  * Flip one image between full resolution and DeepSeek's cheap `low` mode.
@@ -1707,6 +1803,7 @@ async function runAssistantRequest(
   target.streaming = true
   target.sources = undefined
   target.reasoningContent = undefined
+  target.displayReasoning = undefined
   target.contextContent = undefined
   target.contextPaperLabels = undefined
   // Without this a regenerate appends to the previous run's trail, so the
@@ -1816,7 +1913,10 @@ async function runAssistantRequest(
       const delta = e.payload.delta ?? ''
       if (!delta) return
       target.reasoningContent = (target.reasoningContent ?? '') + delta
-      if (isTargetVisible(target.id)) scrollToBottom()
+      // Same throttle as the answer text. Painting (and scrolling to) a chain of
+      // thought on every token is what froze the panel: each tick re-lays out the
+      // whole <pre> and scrollToBottom forces a synchronous layout on top.
+      scheduleStreamRender(target)
     }))
   }
 
@@ -1837,14 +1937,14 @@ async function runAssistantRequest(
     if (typeof usage.total_tokens === 'number') target.totalTokens = usage.total_tokens
     if (typeof usage.cache_hit_tokens === 'number') target.cacheHitTokens = usage.cache_hit_tokens
     if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) target.costUsd = usage.cost_usd
-    persistConv(conv, streamEpoch)
+    persistConvSoon(conv, streamEpoch)
   }))
 
   // OpenRouter's server tools report what they consulted or drew. The agent loop
   // emits one of these per round, so they are merged rather than replaced.
   offs.push(await listen<ServerToolTrace>(`${eventName}-servertools`, (e) => {
     target.serverTools = mergeServerToolTrace(target.serverTools, e.payload)
-    persistConv(conv, streamEpoch)
+    persistConvSoon(conv, streamEpoch)
   }))
 
   offs.push(await listen<{ delta?: string; done?: boolean }>(eventName, (e) => {
@@ -2263,6 +2363,13 @@ onUnmounted(() => {
   messagesEl.value?.removeEventListener('copy-code', onCopyCode)
   for (const id of [...activeUnlisteners.keys()]) detachListeners(id)
   clearAllStreamRenderTimers()
+  // Any merged write still waiting goes out now rather than dying with the window.
+  for (const [convId, timer] of pendingPersists) {
+    clearTimeout(timer)
+    const conv = conversations.value.find(c => c.id === convId)
+    if (conv) persistOne(conv)
+  }
+  pendingPersists.clear()
   unlistenLibraryChanged?.()
   unlistenAddPapers?.()
   unlistenKeepalive?.()
@@ -2827,7 +2934,7 @@ onUnmounted(() => {
                   </div>
 
                   <!-- Thinking / reasoning content (collapsible) -->
-                  <div v-if="activeAnswer(msg).reasoningContent" class="reasoning-section">
+                  <div v-if="reasoningText(activeAnswer(msg))" class="reasoning-section">
                     <button
                       class="reasoning-summary"
                       @click="toggleReasoning(activeAnswer(msg).id)"
@@ -2840,12 +2947,12 @@ onUnmounted(() => {
                       />
                       思考过程
                       <span v-if="activeAnswer(msg).streaming && !activeAnswer(msg).content" class="reasoning-live-dot" />
-                      <span class="reasoning-count">{{ reasoningStats(activeAnswer(msg).reasoningContent || '') }}</span>
+                      <span class="reasoning-count">{{ reasoningStats(activeAnswer(msg).id, reasoningText(activeAnswer(msg))) }}</span>
                     </button>
                     <pre
                       v-show="!isReasoningCollapsed(activeAnswer(msg).id)"
                       class="reasoning-body"
-                    >{{ activeAnswer(msg).reasoningContent }}</pre>
+                    >{{ reasoningText(activeAnswer(msg)) }}</pre>
                   </div>
 
                   <div
@@ -3008,7 +3115,15 @@ onUnmounted(() => {
             @reject="answerWrite(false)"
           />
           <div class="composer">
-            <div v-if="visionUnsupported" class="attachment-warning">
+            <div v-if="attachmentError" class="attachment-warning">
+            <Icon icon="fluent:warning-24-regular" width="13" height="13" />
+            <span>{{ attachmentError }}</span>
+          </div>
+          <div v-if="videoUnsupported" class="attachment-warning">
+            <Icon icon="fluent:warning-24-regular" width="13" height="13" />
+            <span>{{ t('chat.videoUnsupported') }}</span>
+          </div>
+          <div v-if="visionUnsupported" class="attachment-warning">
               <Icon icon="fluent:warning-24-regular" width="13" height="13" />
               <span>{{ t('chat.visionUnsupported') }}</span>
             </div>
@@ -3017,10 +3132,11 @@ onUnmounted(() => {
                 v-for="att in attachments"
                 :key="att.id"
                 class="attachment-chip"
-                :class="{ pdf: att.type === 'pdf' }"
+                :class="{ pdf: att.type === 'pdf', video: att.type === 'video' }"
                 :title="att.name"
               >
                 <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
+                <Icon v-else-if="att.type === 'video'" icon="fluent:video-clip-24-regular" width="14" height="14" />
                 <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
                 <span class="attachment-name">{{ att.name }}</span>
                 <button
@@ -3052,7 +3168,7 @@ onUnmounted(() => {
             <input
               ref="fileInputRef"
               type="file"
-              accept="image/*,.pdf"
+              :accept="ATTACHMENT_ACCEPT"
               multiple
               style="display: none"
               @change="onFileSelected"
@@ -3064,7 +3180,7 @@ onUnmounted(() => {
                 </button>
                 <button
                   class="attach-btn"
-                  title="添加图片或 PDF 附件"
+                  title="添加图片、PDF 或视频附件"
                   :disabled="loading"
                   @click="openFilePicker"
                 >
@@ -3334,6 +3450,12 @@ onUnmounted(() => {
       <img :src="previewImage" class="lightbox-image" alt="" />
       <button class="lightbox-close" @click="closePreview">
         <Icon icon="fluent:dismiss-24-regular" width="18" height="18" />
+      </button>
+    </div>
+    <div v-if="previewVideo" class="attachment-lightbox" @click.self="closePreview">
+      <video :src="previewVideo" class="lightbox-video" controls autoplay></video>
+      <button class="lightbox-close" title="关闭" @click="closePreview">
+        <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
       </button>
     </div>
     <div v-if="previewPdf" class="attachment-lightbox pdf-lightbox" @click.self="closePreview">
@@ -5150,6 +5272,11 @@ onUnmounted(() => {
   border-color: #f0c0c0;
   color: #8b1e1e;
 }
+.attachment-chip.video {
+  background: #f2f0ff;
+  border-color: #ccc4f0;
+  color: #4c2f8b;
+}
 .attachment-thumb {
   width: 18px;
   height: 18px;
@@ -5948,5 +6075,11 @@ onUnmounted(() => {
 .msg-model-menu-teleport .msg-model-row:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+.lightbox-video {
+  max-width: 86vw;
+  max-height: 86vh;
+  border-radius: 10px;
+  background: #000;
 }
 </style>

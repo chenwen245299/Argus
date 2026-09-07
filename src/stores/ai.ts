@@ -33,6 +33,15 @@ export function modelHasVision(model: Pick<ModelOption, 'capabilities'> | null |
 }
 
 /**
+ * Whether a model can be sent video. Only MiniMax's M3 line reads video on the
+ * chat path today, so this is deliberately a separate question from vision —
+ * every model that takes a clip also takes a still, but not the other way round.
+ */
+export function modelHasVideo(model: Pick<ModelOption, 'capabilities'> | null | undefined): boolean {
+  return !!model?.capabilities?.some(c => /video/i.test(c))
+}
+
+/**
  * Whether a provider publishes an account balance. Mirrors `supports_balance`
  * in `src-tauri/src/balance.rs` — kept here only so a picker knows whether to
  * leave room for a balance while the lookup is still in flight; the backend
@@ -97,9 +106,19 @@ export const useAiStore = defineStore('ai', () => {
   // Chat-capable models: exclude models that don't take a chat turn — pure
   // embedding models (vectors only) and pure media-generation models (image/video
   // out, labelled for the catalogue but not driven as chat here).
+  //
+  // "Pure" is the operative word. Every catalogue that sets `video` on a
+  // generation model sets it *alone*, but MiniMax's M3 carries it next to
+  // reasoning and tool_calling because it *reads* video in an ordinary chat
+  // turn. So a model is dropped only when it has nothing else to offer — never
+  // merely for mentioning a medium, which would have hidden M3 from every
+  // picker. A model that declares no capabilities at all is a normal chat model
+  // whose provider simply reported nothing, so it stays.
   const NON_CHAT_CAPS = ['embedding', 'image_gen', 'video']
   const chatModels = computed<ModelOption[]>(() =>
-    enabledModels.value.filter(m => !m.capabilities.some(c => NON_CHAT_CAPS.includes(c)))
+    enabledModels.value.filter(m =>
+      m.capabilities.length === 0 || m.capabilities.some(c => !NON_CHAT_CAPS.includes(c))
+    )
   )
 
   const groupedModels = computed(() => {
@@ -181,11 +200,20 @@ export const useAiStore = defineStore('ai', () => {
 
   const isConfigured = computed(() => chatModels.value.length > 0)
 
+  /** Enabled models keyed by provider + id.
+   *
+   *  `findModel` is called from chat templates — once per answer per re-render,
+   *  several times over — and a linear scan of every enabled model there adds up
+   *  to real time on an account with a few hundred models enabled. */
+  const modelIndex = computed(() => {
+    const idx = new Map<string, ModelOption>()
+    for (const m of enabledModels.value) idx.set(`${m.providerId}\u0000${m.modelId}`, m)
+    return idx
+  })
+
   function findModel(sel: ModelSelection | null): ModelOption | null {
     if (!sel) return null
-    return enabledModels.value.find(
-      m => m.providerId === sel.providerId && m.modelId === sel.modelId
-    ) ?? null
+    return modelIndex.value.get(`${sel.providerId}\u0000${sel.modelId}`) ?? null
   }
 
   // ── CRUD helpers ─────────────────────────────────────────────────────────────

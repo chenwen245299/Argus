@@ -656,6 +656,17 @@ pub async fn prepare_chat_messages(
                         ));
                     }
                 }
+                "video_url" => {
+                    // MiniMax is the only provider here that reads video on the
+                    // chat path. Saying so beats letting DeepSeek answer with an
+                    // opaque 400 about an unknown content block.
+                    if is_user {
+                        return Err(
+                            "DeepSeek 不支持视频输入，视觉模型只接受图片。请改用 MiniMax 等支持视频的服务商，                             或先把关键画面截成图片。"
+                                .to_string(),
+                        );
+                    }
+                }
                 _ => kept.push(part),
             }
         }
@@ -756,7 +767,7 @@ fn carries_attachments(msgs: &[serde_json::Value]) -> bool {
                 parts.iter().any(|p| {
                     matches!(
                         p.get("type").and_then(|t| t.as_str()),
-                        Some("image_url") | Some("file")
+                        Some("image_url") | Some("file") | Some("video_url")
                     )
                 })
             })

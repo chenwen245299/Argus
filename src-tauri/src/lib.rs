@@ -20,6 +20,7 @@ mod llm;
 mod mcp;
 mod metadata;
 mod mimo;
+mod minimax;
 mod models;
 mod net;
 mod ocr;
@@ -39,6 +40,7 @@ mod url_import;
 mod watcher;
 mod write_confirm;
 mod writing;
+mod zhipu;
 
 use std::sync::Mutex;
 use tauri::Manager;

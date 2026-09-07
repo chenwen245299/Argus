@@ -6,7 +6,7 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { modelHasVision, useAiStore, type ModelOption } from '../../stores/ai'
+import { modelHasVision, modelHasVideo, useAiStore, type ModelOption } from '../../stores/ai'
 import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import ServerToolTraceCard from '../ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../../utils/serverToolTrace'
@@ -29,22 +29,15 @@ const props = withDefaults(defineProps<{ slug: string | null; standalone?: boole
 })
 const emit = defineEmits<{ 'open-settings': [] }>()
 
+import {
+  ATTACHMENT_ACCEPT, buildContentParts, readAttachmentFile, type Attachment,
+} from '../../utils/attachments'
+
 const { t } = useI18n()
 const ai = useAiStore()
 const settingsStore = useSettingsStore()
 
-interface Attachment {
-  id: string
-  type: 'image' | 'pdf'
-  name: string
-  dataUrl: string
-  /**
-   * DeepSeek image fidelity. Unset means full resolution; `low` rescales to
-   * 512x512, which costs roughly a third of the tokens. Other providers ignore
-   * it, so the field is only ever sent when the user picked it.
-   */
-  detail?: ImageDetail
-}
+// `Attachment` now lives in utils/attachments.ts, shared with the library chat.
 
 type ChatNode =
   | { id: string; role: 'user'; content: string; attachments?: Attachment[]; createdAt: string }
@@ -62,6 +55,10 @@ interface AssistantAnswer {
   // streaming (re-rendering the full markdown on every token freezes the UI).
   displayContent?: string
   reasoningContent?: string
+  // Throttled copy of `reasoningContent`, for the same reason as
+  // `displayContent`: reasoning streams token by token too, and repainting a
+  // long chain of thought on every one of them freezes the tab by itself.
+  displayReasoning?: string
   withReasoning?: boolean
   createdAt: string
   startedAt?: number
@@ -223,6 +220,9 @@ const keepaliveTitle = computed(() => {
 })
 const previewImage = ref<string | null>(null)
 const previewPdf = ref<string | null>(null)
+const previewVideo = ref<string | null>(null)
+/** Why the last picked file was refused (currently only an oversized clip). */
+const attachmentError = ref<string | null>(null)
 const modelMenuRoot = ref<HTMLElement | null>(null)
 const unlisteners = new Map<string, UnlistenFn>()
 // Maps answer.id -> backend request_id, so stopAllStreaming can tell the backend
@@ -338,6 +338,13 @@ const visionUnsupported = computed(() =>
   attachments.value.some(a => a.type === 'image') &&
   selectedModels.value.length > 0 &&
   selectedModels.value.every(m => !modelHasVision(m))
+)
+
+/** Same check for a clip: only MiniMax's M3 line reads video on the chat path. */
+const videoUnsupported = computed(() =>
+  attachments.value.some(a => a.type === 'video') &&
+  selectedModels.value.length > 0 &&
+  selectedModels.value.every(m => !modelHasVideo(m))
 )
 
 const hasStreaming = computed(() =>
@@ -475,6 +482,7 @@ function persistableConversation(conv: Conversation): Conversation {
     if (node.role !== 'assistantGroup') continue
     for (const answer of node.answers) {
       delete answer.displayContent
+      delete answer.displayReasoning
       answer.steps = persistableSteps(answer.steps)
       answer.serverTools = persistableServerToolTrace(answer.serverTools)
     }
@@ -896,6 +904,7 @@ function modelLogo(modelId: string, providerName = '', providerId = '') {
   if (haystack.includes('baidu') || haystack.includes('ernie')) return modelIconMap.baidu
   if (haystack.includes('doubao') || haystack.includes('bytedance')) return modelIconMap.bytedance
   if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
+  if (haystack.includes('minimax') || haystack.includes('hailuo')) return modelIconMap.minimax
   if (haystack.includes('mimo') || haystack.includes('xiaomi')) return modelIconMap.xiaomimimo
   if (haystack.includes('gpt') || haystack.includes('openai')) return modelIconMap.openai
   // Ollama is a host, not a model brand — the provider name pollutes the
@@ -924,6 +933,7 @@ function capabilitiesLabel(model: ModelOption) {
   const caps = model.capabilities ?? []
   const labels: string[] = []
   if (caps.some(c => /vision|image/i.test(c))) labels.push('视觉')
+  if (caps.some(c => /video/i.test(c))) labels.push('视频')
   if (caps.some(c => /reason|thinking/i.test(c))) labels.push('推理')
   if (model.contextLength) labels.push(formatContext(model.contextLength))
   return labels
@@ -946,15 +956,16 @@ function openFilePicker() {
 }
 
 function addAttachmentFromFile(file: File) {
-  if (!file.type.startsWith('image/') && file.type !== 'application/pdf') return false
-  const reader = new FileReader()
-  reader.onload = () => {
-    const dataUrl = reader.result as string
-    const type: Attachment['type'] = file.type.startsWith('image/') ? 'image' : 'pdf'
-    const name = file.name || (type === 'image' ? 'pasted-image.png' : 'pasted-file.pdf')
-    attachments.value.push({ id: crypto.randomUUID(), type, name, dataUrl })
-  }
-  reader.readAsDataURL(file)
+  const pending = readAttachmentFile(file)
+  if (!pending) return false
+  void pending.then((res) => {
+    if (res.status === 'ok') {
+      attachmentError.value = null
+      attachments.value.push(res.attachment)
+    } else {
+      attachmentError.value = t('chat.videoTooLarge', { name: res.name, mb: res.limitMb })
+    }
+  })
   return true
 }
 
@@ -982,11 +993,14 @@ function onPaste(e: ClipboardEvent) {
 
 function removeAttachment(id: string) {
   attachments.value = attachments.value.filter(a => a.id !== id)
+  if (attachments.value.length === 0) attachmentError.value = null
 }
 
 function previewAttachment(att: Attachment) {
   if (att.type === 'image') {
     previewImage.value = att.dataUrl
+  } else if (att.type === 'video') {
+    previewVideo.value = att.dataUrl
   } else {
     previewPdf.value = att.dataUrl
   }
@@ -995,22 +1009,9 @@ function previewAttachment(att: Attachment) {
 function closePreview() {
   previewImage.value = null
   previewPdf.value = null
+  previewVideo.value = null
 }
 
-function buildUserContentParts(text: string, atts?: Attachment[]): ChatContentPart[] {
-  const parts: ChatContentPart[] = [{ type: 'text', text }]
-  for (const att of atts ?? []) {
-    if (att.type === 'image') {
-      parts.push({
-        type: 'image_url',
-        image_url: att.detail ? { url: att.dataUrl, detail: att.detail } : { url: att.dataUrl },
-      })
-    } else {
-      parts.push({ type: 'file', file: { filename: att.name, file_data: att.dataUrl } })
-    }
-  }
-  return parts
-}
 
 /**
  * Flip one image between full resolution and DeepSeek's cheap `low` mode.
@@ -1046,7 +1047,7 @@ function buildHistoryUntil(conv: Conversation, stopGroupId?: string): ChatMessag
       }
     } else if (node.role === 'user') {
       if (node.attachments?.length) {
-        messages.push({ role: 'user', content: buildUserContentParts(node.content, node.attachments) })
+        messages.push({ role: 'user', content: buildContentParts(node.content, node.attachments) })
       } else {
         messages.push({ role: 'user', content: node.content })
       }
@@ -1119,6 +1120,7 @@ async function regenerate(group: ChatNode, answer: AssistantAnswer) {
   if (ra) {
     ra.content = ''
     ra.reasoningContent = ''
+    ra.displayReasoning = ''
     ra.error = false
     ra.errorText = ''
     ra.tokenEstimate = undefined
@@ -1254,6 +1256,7 @@ function streamRenderInterval(ansId: string): number {
 function applyStreamRender(ans: AssistantAnswer) {
   const startedAt = performance.now()
   ans.displayContent = ans.content
+  ans.displayReasoning = ans.reasoningContent
   nextTick(() => streamRenderCost.set(ans.id, performance.now() - startedAt))
   // An answer streaming in the background must not scroll the paper on screen.
   if (isAnswerVisible(ans.id)) scrollToBottom()
@@ -1286,6 +1289,13 @@ function flushStreamRender(ans: AssistantAnswer) {
   streamRenderLast.delete(ans.id)
   streamRenderCost.delete(ans.id)
   ans.displayContent = ans.content
+  ans.displayReasoning = ans.reasoningContent
+}
+
+/** The reasoning text to paint: the throttled copy while it streams, the real
+ *  one once it is done. */
+function reasoningText(a: AssistantAnswer) {
+  return (a.streaming ? a.displayReasoning ?? a.reasoningContent : a.reasoningContent) ?? ''
 }
 
 // Clear every pending throttle timer (used on session switch / unmount so
@@ -1325,6 +1335,7 @@ async function streamAnswer(
     ra.errorText = ''
     ra.content = ''
     ra.reasoningContent = ''
+    ra.displayReasoning = ''
     ra.startedAt = performance.now()
     ra.endedAt = undefined
     ra.tokenEstimate = undefined
@@ -1438,6 +1449,10 @@ async function streamAnswer(
       const reactiveAns = findReactiveAnswer(answer.id)
       if (!reactiveAns) return
       reactiveAns.reasoningContent = (reactiveAns.reasoningContent ?? '') + event.payload.delta
+      // Same throttle as the answer text: without it every reasoning token
+      // re-rendered the whole tab and re-laid out a <pre> that ends up tens of
+      // thousands of characters long.
+      scheduleStreamRender(reactiveAns)
     })
     unlisteners.set(`${answer.id}-reasoning`, unlistenReasoning)
   }
@@ -2359,18 +2374,18 @@ onUnmounted(() => {
                 </div>
 
                 <!-- Thinking / reasoning content (collapsible) -->
-                <details v-if="answer.reasoningContent" class="reasoning-section">
+                <details v-if="reasoningText(answer)" class="reasoning-section">
                   <summary class="reasoning-summary">
                     <Icon class="reasoning-chevron" icon="fluent:chevron-right-24-regular" width="11" height="11" />
                     思考过程
                     <span v-if="answer.streaming && !answer.content" class="reasoning-live-dot" />
                   </summary>
-                  <pre class="reasoning-body">{{ answer.reasoningContent }}</pre>
+                  <pre class="reasoning-body">{{ reasoningText(answer) }}</pre>
                 </details>
 
                 <div
                   class="answer-body markdown-body"
-                  :class="{ pending: answer.streaming && !answer.content && !answer.reasoningContent }"
+                  :class="{ pending: answer.streaming && !answer.content && !reasoningText(answer) }"
                 >
                   <template v-if="answer.streaming">
                     <MarkdownBody
@@ -2378,7 +2393,7 @@ onUnmounted(() => {
                       :content="answer.displayContent ?? answer.content"
                       :streaming="true"
                     />
-                    <div v-else-if="!answer.reasoningContent" class="thinking-placeholder">{{ answer.withReasoning ? '正在思考…' : '生成中…' }}</div>
+                    <div v-else-if="!reasoningText(answer)" class="thinking-placeholder">{{ answer.withReasoning ? '正在思考…' : '生成中…' }}</div>
                   </template>
                   <MarkdownBody v-else :content="answer.content" />
                   <ServerToolTraceCard :trace="answer.serverTools" />
@@ -2471,6 +2486,14 @@ onUnmounted(() => {
           @dblclick="resetComposerHeight"
         />
         <div class="composer-box">
+          <div v-if="attachmentError" class="attachment-warning">
+            <Icon icon="fluent:warning-24-regular" width="13" height="13" />
+            <span>{{ attachmentError }}</span>
+          </div>
+          <div v-if="videoUnsupported" class="attachment-warning">
+            <Icon icon="fluent:warning-24-regular" width="13" height="13" />
+            <span>{{ t('chat.videoUnsupported') }}</span>
+          </div>
           <div v-if="visionUnsupported" class="attachment-warning">
             <Icon icon="fluent:warning-24-regular" width="13" height="13" />
             <span>{{ t('chat.visionUnsupported') }}</span>
@@ -2480,10 +2503,11 @@ onUnmounted(() => {
               v-for="att in attachments"
               :key="att.id"
               class="attachment-chip"
-              :class="{ pdf: att.type === 'pdf' }"
+              :class="{ pdf: att.type === 'pdf', video: att.type === 'video' }"
               :title="att.name"
             >
               <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
+              <Icon v-else-if="att.type === 'video'" icon="fluent:video-clip-24-regular" width="14" height="14" />
               <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
               <span class="attachment-name">{{ att.name }}</span>
               <button
@@ -2512,7 +2536,7 @@ onUnmounted(() => {
           <input
             ref="fileInputRef"
             type="file"
-            accept="image/*,.pdf"
+            :accept="ATTACHMENT_ACCEPT"
             multiple
             style="display: none"
             @change="onFileSelected"
@@ -2521,7 +2545,7 @@ onUnmounted(() => {
             <button class="toolbar-btn" title="新建对话" @click="startNewConversation(true)">
               <Icon icon="fluent:compose-24-regular" width="15" height="15" />
             </button>
-            <button class="toolbar-btn" title="上传图片或 PDF" @click="openFilePicker">
+            <button class="toolbar-btn" title="上传图片、PDF 或视频" @click="openFilePicker">
               <Icon icon="fluent:attach-24-regular" width="15" height="15" />
             </button>
 
@@ -2638,6 +2662,12 @@ onUnmounted(() => {
          being teleported to the body, which is what made it cover the window. -->
     <div v-if="previewImage" class="attachment-lightbox" @click.self="closePreview">
       <img :src="previewImage" class="lightbox-image" alt="" />
+      <button class="lightbox-close" title="关闭" @click="closePreview">
+        <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
+      </button>
+    </div>
+    <div v-if="previewVideo" class="attachment-lightbox" @click.self="closePreview">
+      <video :src="previewVideo" class="lightbox-video" controls autoplay></video>
       <button class="lightbox-close" title="关闭" @click="closePreview">
         <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
       </button>
@@ -3606,6 +3636,11 @@ onUnmounted(() => {
   border-color: #f0c0c0;
   color: #8b1e1e;
 }
+.attachment-chip.video {
+  background: #f2f0ff;
+  border-color: #ccc4f0;
+  color: #4c2f8b;
+}
 .attachment-thumb {
   width: 18px;
   height: 18px;
@@ -4275,5 +4310,11 @@ onUnmounted(() => {
 }
 .lightbox-close:hover {
   background: rgba(0, 0, 0, 0.75);
+}
+.lightbox-video {
+  max-width: 86vw;
+  max-height: 86vh;
+  border-radius: 10px;
+  background: #000;
 }
 </style>

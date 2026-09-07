@@ -253,6 +253,26 @@ pub async fn list_models(provider: &AiProvider, api_key: &str) -> Result<Vec<AiM
         let models = fetch_openai_models(provider, api_key).await?;
         return Ok(models.into_iter().map(crate::mimo::enrich_mimo_model).collect());
     }
+    if crate::minimax::is_minimax(provider) {
+        // Same arrangement as Zhipu below: MiniMax documents no /models
+        // endpoint, so the documented catalogue is the floor rather than a
+        // fallback — try the endpoint, keep whatever it reports, and append the
+        // documented ids it left out. `测试连接` is what validates the key.
+        let fetched = fetch_openai_models(provider, api_key).await.unwrap_or_default();
+        return Ok(crate::minimax::merge_catalogue(fetched));
+    }
+    if crate::zhipu::is_zhipu(provider) {
+        // BigModel documents no /models endpoint — the path answers, but only
+        // behind the platform's blanket auth gate, so whether it lists anything
+        // is anyone's guess. The documented catalogue is therefore the floor
+        // rather than a fallback: try the endpoint, keep whatever it reports
+        // (that is how a model newer than this build appears), and append every
+        // documented id it left out. A failure there is not surfaced as an
+        // error, because an undocumented endpoint going quiet says nothing about
+        // the key — 测试连接 is what validates that, against /chat/completions.
+        let fetched = fetch_openai_models(provider, api_key).await.unwrap_or_default();
+        return Ok(crate::zhipu::merge_catalogue(fetched));
+    }
     match provider.kind.as_str() {
         "anthropic" => Ok(anthropic_known_models()),
         _ => fetch_openai_models(provider, api_key).await,
@@ -1040,6 +1060,9 @@ async fn stream_openai_compat(
     let is_kimi_k2 = is_kimi && model.starts_with("kimi-k2");
     let is_kimi_for_coding = is_kimi && model == "kimi-for-coding";
 
+    let is_zhipu = crate::zhipu::is_zhipu(provider);
+    let is_minimax = crate::minimax::is_minimax(provider);
+
     let mut body = serde_json::json!({
         "model": model, "messages": msgs, "stream": true,
         "stream_options": {"include_usage": true}
@@ -1096,6 +1119,20 @@ async fn stream_openai_compat(
         }
     }
 
+    // GLM is the one provider here that thinks unless told not to, so its
+    // controls are written in both directions — and outside the block above,
+    // which only runs when reasoning is on. `apply_thinking` owns `thinking` and
+    // `reasoning_effort` for GLM, including clearing the generic value the chain
+    // may have just set.
+    if is_zhipu {
+        crate::zhipu::apply_thinking(&mut body, model, use_reasoning, reasoning_effort);
+    }
+    // MiniMax also thinks unless told not to — and, left alone, returns the
+    // thinking inside `content`. `apply_thinking` handles both.
+    if is_minimax {
+        crate::minimax::apply_thinking(&mut body, model, use_reasoning);
+    }
+
     // OpenRouter's server-side tools ride along on every chat request. They are
     // run by OpenRouter mid-answer rather than handed back to us, so no client
     // loop is needed and nothing is billed unless the model actually reaches for
@@ -1122,6 +1159,15 @@ async fn stream_openai_compat(
     if web_search && crate::mimo::is_mimo(provider) {
         let mut tools = body["tools"].as_array().cloned().unwrap_or_default();
         tools.push(crate::mimo::web_search_tool());
+        body["tools"] = serde_json::json!(tools);
+    }
+
+    // GLM's native web search is the same arrangement: a tool the platform runs
+    // itself, reporting the pages it read in a top-level `web_search` array
+    // rather than as a call for us to answer.
+    if web_search && is_zhipu {
+        let mut tools = body["tools"].as_array().cloned().unwrap_or_default();
+        tools.push(crate::zhipu::web_search_tool());
         body["tools"] = serde_json::json!(tools);
     }
 
@@ -1252,6 +1298,11 @@ async fn stream_openai_compat(
                             // Web pages the server-side search consulted, and any
                             // image it drew, both ride the delta alongside the text.
                             trace.absorb(&json["choices"][0]["delta"]);
+                            // GLM hangs its search results off the chunk itself
+                            // rather than the delta, so that level is read too.
+                            if is_zhipu {
+                                trace.absorb(&json);
+                            }
                             // Main content delta
                             let content_delta = json["choices"][0]["delta"]["content"].as_str();
                             let reasoning_delta = json["choices"][0]["delta"]["reasoning_content"]
@@ -1556,7 +1607,10 @@ fn to_ollama_message(m: &ChatMessage) -> serde_json::Value {
                             images.push(image_url.url.clone());
                         }
                     }
-                    ChatContentPart::File { .. } => {}
+                    // Ollama's native API has no video block, and a PDF is not
+                    // something a vision model can ingest — both are dropped
+                    // rather than mangled into the text.
+                    ChatContentPart::VideoUrl { .. } | ChatContentPart::File { .. } => {}
                 }
             }
             let mut obj = serde_json::json!({"role": m.role, "content": text});
@@ -2997,7 +3051,8 @@ fn to_anthropic_content(content: &ChatContent) -> Vec<serde_json::Value> {
                 }
                 // Kimi Code's /coding endpoint accepts Anthropic image blocks but
                 // does not support PDF document blocks, so drop file attachments.
-                ChatContentPart::File { .. } => None,
+                // Anthropic has no video block at all, so those go the same way.
+                ChatContentPart::VideoUrl { .. } | ChatContentPart::File { .. } => None,
             })
             .collect(),
     }
@@ -3299,6 +3354,9 @@ pub async fn stream_with_tools(
         || provider.base_url.to_lowercase().contains("moonshot.cn")
         || provider.base_url.to_lowercase().contains("api.kimi.com");
 
+    let is_zhipu = crate::zhipu::is_zhipu(provider);
+    let is_minimax = crate::minimax::is_minimax(provider);
+
     // The agent replays its whole transcript each round, so page renders fed
     // back by `view_paper_page` pass through here too and get the same limits
     // check (and, when they are large, the same move to the Files API). Only
@@ -3331,6 +3389,10 @@ pub async fn stream_with_tools(
     if web_search && crate::mimo::is_mimo(provider) {
         server_tools.push(crate::mimo::web_search_tool());
     }
+    // GLM's built-in search behaves the same way, so it joins the same set.
+    if web_search && is_zhipu {
+        server_tools.push(crate::zhipu::web_search_tool());
+    }
     // An empty tool list must be omitted, not sent as `[]`: some gateways reject
     // `tools: []` outright, and it is how the loop says "no more tools".
     if !tools.is_empty() || !server_tools.is_empty() {
@@ -3342,6 +3404,13 @@ pub async fn stream_with_tools(
         // the loop's "no more tools" signal must stay unambiguous.
         if !tools.is_empty() {
             body["tool_choice"] = serde_json::json!("auto");
+            // GLM-5.3+ streams a call's arguments in fragments only when asked
+            // to, and the docs pair `tool_stream` with `stream` for those
+            // models. The accumulator below reads either shape, so this only
+            // makes the call surface sooner.
+            if is_zhipu && crate::zhipu::supports_tool_stream(model) {
+                body["tool_stream"] = serde_json::json!(true);
+            }
         }
     }
     // `max_tool_calls` is an OpenRouter extension — only OpenRouter gets it, so a
@@ -3388,6 +3457,14 @@ pub async fn stream_with_tools(
         } else if !is_kimi {
             body["reasoning_effort"] = serde_json::json!(reasoning_effort.unwrap_or("high"));
         }
+    }
+    // GLM thinks unless told otherwise, so both directions are written here
+    // rather than only inside the block above. See `zhipu::apply_thinking`.
+    if is_zhipu {
+        crate::zhipu::apply_thinking(&mut body, model, use_reasoning, reasoning_effort);
+    }
+    if is_minimax {
+        crate::minimax::apply_thinking(&mut body, model, use_reasoning);
     }
 
     let req = client
@@ -3473,6 +3550,10 @@ pub async fn stream_with_tools(
 
             let delta = &json["choices"][0]["delta"];
             trace.absorb(delta);
+            // GLM reports its search results on the chunk, not the delta.
+            if is_zhipu {
+                trace.absorb(&json);
+            }
 
             if let Some(text) = delta["content"].as_str().filter(|s| !s.is_empty()) {
                 accumulated.push_str(text);

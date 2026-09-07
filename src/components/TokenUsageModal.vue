@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import type { AiModel, AiSettingsInfo, AppSettings } from '../types'
 import { estimateCostCny, hasConfiguredPrice, DEFAULT_USD_TO_CNY_RATE } from '../utils/modelPricing'
+import { providerLogo } from '../utils/providerLogo'
 
 const { t } = useI18n()
 
@@ -21,6 +22,8 @@ interface UsageRecord {
 }
 
 type Range = 'today' | 'week' | 'month' | 'year'
+/** What one stacked segment of the time chart stands for. */
+type Grouping = 'model' | 'provider'
 
 const emit = defineEmits<{ close: [] }>()
 
@@ -29,6 +32,9 @@ const aiSettings = ref<AiSettingsInfo | null>(null)
 const appSettings = ref<AppSettings | null>(null)
 const loading = ref(false)
 const range = ref<Range>('week')
+const chartGroup = ref<Grouping>('model')
+
+const GROUPINGS: { key: Grouping }[] = [{ key: 'model' }, { key: 'provider' }]
 
 const RANGES: { key: Range }[] = [
   { key: 'today' },
@@ -69,6 +75,18 @@ function providerName(id: string) {
   return providerNameMap.value.get(id) ?? id
 }
 
+// The mark is matched on name *and* base URL, because a provider added as a
+// plain OpenAI-compatible adapter is identified only by where it points.
+const providerUrlMap = computed(() => {
+  const map = new Map<string, string>()
+  for (const p of (aiSettings.value?.providers ?? [])) map.set(p.id, p.base_url)
+  return map
+})
+
+function providerIconUrl(id: string): string {
+  return providerLogo(providerName(id), providerUrlMap.value.get(id) ?? '')
+}
+
 // ── Model icon matching ───────────────────────────────────────────────────────
 
 const modelIconModules = import.meta.glob('../assets/models/*.svg', {
@@ -96,6 +114,7 @@ const MODEL_ICON_RULES: [string[], string][] = [
   [['huggingface', 'hf-'], 'huggingface.svg'],
   [['nvidia'], 'nvidia.svg'],
   [['kling'], 'kling.svg'],
+  [['minimax', 'hailuo'], 'minimax.svg'],
   [['mimo', 'xiaomimimo', 'xiaomi'], 'xiaomimimo.svg'],
 ]
 
@@ -179,9 +198,8 @@ const totalCost   = computed(() => {
 // ── Bar chart grouping ─────────────────────────────────────────────────────────
 
 interface BarSegment {
+  /** Identifies the group this segment belongs to, and picks its colour. */
   key: string
-  model: string
-  provider: string
   total: number
 }
 
@@ -197,14 +215,19 @@ function emptyBar(label: string): Bar {
   return { label, input: 0, output: 0, cost: 0, segments: [] }
 }
 
+/** The group one record's tokens are stacked into, under the active grouping. */
+function segmentKey(rec: UsageRecord) {
+  return chartGroup.value === 'provider' ? rec.provider : `${rec.provider}::${rec.model}`
+}
+
 function addRecordToBar(bar: Bar, rec: UsageRecord) {
   bar.input += rec.input_tokens
   bar.output += rec.output_tokens
   bar.cost += recordCost(rec)
-  const key = `${rec.provider}::${rec.model}`
+  const key = segmentKey(rec)
   let seg = bar.segments.find(s => s.key === key)
   if (!seg) {
-    seg = { key, model: rec.model, provider: rec.provider, total: 0 }
+    seg = { key, total: 0 }
     bar.segments.push(seg)
   }
   seg.total += rec.input_tokens + rec.output_tokens
@@ -347,8 +370,9 @@ const modelRanking = computed<ModelRow[]>(() => {
 })
 
 // Cache hits are a subset of input tokens, so the rate is over input only.
-// Returns null when the model has no cached input (hide the chip entirely).
-function modelCacheRate(row: ModelRow): number | null {
+// Returns null when there was no cached input (hide the chip entirely). Shared
+// by the model and provider rows, which agree on these two fields.
+function cacheRate(row: { cacheHit: number; input: number }): number | null {
   if (row.cacheHit <= 0 || row.input <= 0) return null
   return Math.round((row.cacheHit / row.input) * 100)
 }
@@ -367,13 +391,101 @@ function colorForModel(key: string) {
   return modelColorMap.value.get(key) ?? MODEL_COLORS[0]
 }
 
-const modelLegend = computed(() =>
-  modelRanking.value.slice(0, 6).map(row => ({
-    key: row.key,
-    model: row.model,
-    color: colorForModel(row.key),
-  }))
-)
+// ── Provider ranking ───────────────────────────────────────────────────────────
+// Which provider is actually the better deal is a question about *unit price*,
+// not about totals: the provider you used most is simply the one you used most.
+// So each row carries the price the usage worked out to, in CNY per million
+// tokens — and carries it honestly, which is what `priced*` is for. A record can
+// only be priced when the model has prices configured or the provider reported a
+// cost; averaging over unpriced tokens too would quietly make the least
+// configured provider look like the cheapest one, which is the exact opposite of
+// what this card is for.
+
+interface ProviderRow {
+  key: string
+  name: string
+  input: number
+  output: number
+  total: number
+  cost: number
+  cacheHit: number
+  calls: number
+  modelCount: number
+  /** Tokens the unit price below is averaged over. */
+  pricedTokens: number
+  pricedCost: number
+}
+
+const providerRanking = computed<ProviderRow[]>(() => {
+  const map = new Map<string, ProviderRow & { modelIds: Set<string> }>()
+  for (const r of filteredRecords.value) {
+    let row = map.get(r.provider)
+    if (!row) {
+      row = {
+        key: r.provider, name: providerName(r.provider),
+        input: 0, output: 0, total: 0, cost: 0, cacheHit: 0,
+        calls: 0, modelCount: 0, modelIds: new Set<string>(),
+        pricedTokens: 0, pricedCost: 0,
+      }
+      map.set(r.provider, row)
+    }
+    const tokens = r.input_tokens + r.output_tokens
+    const cost = recordCost(r)
+    row.input += r.input_tokens
+    row.output += r.output_tokens
+    row.total += tokens
+    row.cost += cost
+    row.cacheHit += r.cache_hit_tokens ?? 0
+    row.calls += 1
+    row.modelIds.add(r.model)
+    if (recordHasCostData(r)) {
+      row.pricedTokens += tokens
+      row.pricedCost += cost
+    }
+  }
+  return [...map.values()]
+    .map(({ modelIds, ...row }) => ({ ...row, modelCount: modelIds.size }))
+    .sort((a, b) => b.total - a.total)
+})
+
+const providerRankingMax = computed(() => Math.max(...providerRanking.value.map(r => r.total), 1))
+
+/** CNY per million tokens, over the part of the usage that could be priced. */
+function unitPrice(row: ProviderRow): number | null {
+  if (row.pricedTokens <= 0) return null
+  return (row.pricedCost / row.pricedTokens) * 1e6
+}
+
+/** Percentage of a provider's tokens the unit price is based on, 0-100. */
+function pricedShare(row: ProviderRow): number {
+  if (row.total <= 0) return 0
+  return Math.round((row.pricedTokens / row.total) * 100)
+}
+
+const providerColorMap = computed(() => {
+  const map = new Map<string, string>()
+  providerRanking.value.forEach((row, i) => {
+    map.set(row.key, MODEL_COLORS[i % MODEL_COLORS.length])
+  })
+  return map
+})
+
+/** Colour of one stacked segment, under whichever grouping is showing. */
+function colorForSegment(key: string) {
+  return chartGroup.value === 'provider'
+    ? providerColorMap.value.get(key) ?? MODEL_COLORS[0]
+    : colorForModel(key)
+}
+
+const chartLegend = computed(() => {
+  const rows = chartGroup.value === 'provider'
+    ? providerRanking.value.map(r => ({ key: r.key, label: r.name }))
+    : modelRanking.value.map(r => ({ key: r.key, label: r.model }))
+  return {
+    items: rows.slice(0, 6).map(r => ({ ...r, color: colorForSegment(r.key) })),
+    hidden: Math.max(0, rows.length - 6),
+  }
+})
 
 // ── Formatting ─────────────────────────────────────────────────────────────────
 
@@ -386,6 +498,16 @@ function fmtT(n: number) {
 function fmtCost(n: number) {
   if (n < 0.001) return n === 0 ? '' : '<¥0.01'
   return '¥' + n.toFixed(n < 1 ? 3 : 2)
+}
+
+// A unit price spans several orders of magnitude across providers (cents per
+// million for a Flash model, tens of yuan for a frontier one), so the precision
+// follows the magnitude instead of being fixed.
+function fmtUnitPrice(n: number) {
+  if (n < 0.01) return '<¥0.01'
+  if (n >= 100) return '¥' + n.toFixed(0)
+  if (n >= 10) return '¥' + n.toFixed(1)
+  return '¥' + n.toFixed(2)
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────────
@@ -461,7 +583,16 @@ onMounted(load)
           <div class="chart-head">
             <div>
               <div class="chart-title">{{ t('tokenUsage.byTime') }}</div>
-              <div class="chart-subtitle">{{ t('tokenUsage.byTimeSub') }}</div>
+              <div class="chart-subtitle">
+                {{ chartGroup === 'provider' ? t('tokenUsage.byTimeSubProvider') : t('tokenUsage.byTimeSub') }}
+              </div>
+            </div>
+            <div class="range-tabs group-tabs">
+              <button
+                v-for="g in GROUPINGS" :key="g.key"
+                class="range-tab" :class="{ active: chartGroup === g.key }"
+                @click="chartGroup = g.key"
+              >{{ t('tokenUsage.groupBy_' + g.key) }}</button>
             </div>
           </div>
 
@@ -488,7 +619,7 @@ onMounted(load)
                     class="bar-seg model-seg"
                     :style="{
                       height: chartMax > 0 ? ((segment.total / chartMax) * BAR_STACK_HEIGHT) + 'px' : '0',
-                      background: colorForModel(segment.key),
+                      background: colorForSegment(segment.key),
                     }"
                   />
                 </div>
@@ -502,10 +633,10 @@ onMounted(load)
 
             <!-- Legend -->
             <div class="chart-legend">
-              <template v-for="item in modelLegend" :key="item.key">
-                <span class="legend-dot" :style="{ background: item.color }" />{{ item.model }}
+              <template v-for="item in chartLegend.items" :key="item.key">
+                <span class="legend-dot" :style="{ background: item.color }" />{{ item.label }}
               </template>
-              <span v-if="modelRanking.length > modelLegend.length" class="legend-hint">+{{ modelRanking.length - modelLegend.length }}</span>
+              <span v-if="chartLegend.hidden > 0" class="legend-hint">+{{ chartLegend.hidden }}</span>
               <template v-if="!hasCostData">
                 <span class="legend-hint">{{ t('tokenUsage.priceHint') }}</span>
               </template>
@@ -534,6 +665,71 @@ onMounted(load)
           <div class="hour-labels">
             <span>0</span><span>6</span><span>12</span><span>18</span><span>24</span>
           </div>
+        </div>
+
+        <!-- Provider ranking -->
+        <div v-if="providerRanking.length > 0" class="chart-card provider-chart-card">
+          <div class="chart-head">
+            <div>
+              <div class="chart-title">{{ t('tokenUsage.byProvider') }}</div>
+              <div class="chart-subtitle">{{ t('tokenUsage.byProviderSub') }}</div>
+            </div>
+          </div>
+          <div class="model-list">
+            <div v-for="row in providerRanking" :key="row.key" class="provider-ranking-row">
+              <div class="model-info">
+                <span class="model-icon-wrap">
+                  <img v-if="providerIconUrl(row.key)" :src="providerIconUrl(row.key)" class="model-icon" alt="" />
+                  <span v-else class="model-icon-fallback">{{ row.name.slice(0, 1).toUpperCase() }}</span>
+                </span>
+                <div class="model-text">
+                  <span class="model-name">{{ row.name }}</span>
+                  <span class="model-provider">
+                    {{ t('tokenUsage.providerMeta', { models: row.modelCount, calls: row.calls }) }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="model-mid">
+                <!-- Input vs output split: the mix is what makes two unit prices
+                     comparable or not, so it is shown rather than summed away. -->
+                <div
+                  class="prov-bar-wrap"
+                  :title="t('tokenUsage.ioSplit', { input: fmtT(row.input), output: fmtT(row.output) })"
+                >
+                  <span class="prov-bar-in"  :style="{ width: (row.input  / providerRankingMax * 100) + '%' }" />
+                  <span class="prov-bar-out" :style="{ width: (row.output / providerRankingMax * 100) + '%' }" />
+                </div>
+                <span
+                  v-if="cacheRate(row) !== null"
+                  class="model-cache"
+                  :title="t('tokenUsage.cacheHitRate')"
+                >
+                  <Icon icon="fluent:flash-24-regular" width="12" height="12" />
+                  {{ cacheRate(row) }}%
+                </span>
+              </div>
+
+              <div class="prov-unit">
+                <template v-if="unitPrice(row) !== null">
+                  <span class="prov-unit-value">{{ fmtUnitPrice(unitPrice(row)!) }}</span>
+                  <span class="prov-unit-label">{{ t('tokenUsage.perMillion') }}</span>
+                  <span
+                    v-if="pricedShare(row) < 100"
+                    class="prov-partial"
+                    :title="t('tokenUsage.partialPriced', { pct: pricedShare(row) })"
+                  >{{ t('tokenUsage.partialPricedShort', { pct: pricedShare(row) }) }}</span>
+                </template>
+                <span v-else class="prov-unit-none" :title="t('tokenUsage.priceHint')">—</span>
+              </div>
+
+              <div class="model-nums">
+                <span class="model-total">{{ fmtT(row.total) }}</span>
+                <span v-if="row.cost > 0" class="model-cost cost-color">{{ fmtCost(row.cost) }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="prov-foot">{{ t('tokenUsage.byProviderFoot') }}</div>
         </div>
 
         <!-- Model ranking -->
@@ -567,12 +763,12 @@ onMounted(load)
                   />
                 </div>
                 <span
-                  v-if="modelCacheRate(row) !== null"
+                  v-if="cacheRate(row) !== null"
                   class="model-cache"
                   :title="t('tokenUsage.cacheHitRate')"
                 >
                   <Icon icon="fluent:flash-24-regular" width="12" height="12" />
-                  {{ modelCacheRate(row) }}%
+                  {{ cacheRate(row) }}%
                 </span>
               </div>
               <div class="model-nums">
@@ -914,4 +1110,50 @@ onMounted(load)
 }
 .model-total { font-size: 13px; font-weight: 650; color: var(--usage-text); }
 .model-cost  { font-size: 11px; }
+
+/* Provider ranking */
+.provider-chart-card { min-height: 0; height: auto; }
+.group-tabs { flex-shrink: 0; }
+.provider-ranking-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.1fr) minmax(140px, 1fr) 96px 86px;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 0;
+}
+.prov-bar-wrap {
+  flex: 1 1 auto; min-width: 0;
+  height: 8px; background: var(--bg-tertiary);
+  border-radius: 999px; overflow: hidden;
+  display: flex;
+}
+.prov-bar-in,
+.prov-bar-out {
+  height: 100%;
+  transition: width 0.4s ease;
+}
+.prov-bar-in  { background: var(--usage-blue); }
+.prov-bar-out { background: var(--usage-purple); }
+.prov-unit {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 1px;
+  min-width: 0;
+}
+.prov-unit-value {
+  font-size: 13px; font-weight: 650;
+  color: var(--usage-orange);
+  white-space: nowrap;
+}
+.prov-unit-label,
+.prov-unit-none { font-size: 10px; color: var(--usage-faint); white-space: nowrap; }
+.prov-unit-none { font-size: 13px; font-weight: 650; }
+.prov-partial {
+  font-size: 10px; font-style: italic;
+  color: var(--usage-faint);
+  white-space: nowrap;
+}
+.prov-foot {
+  margin-top: 12px;
+  font-size: 10px; line-height: 1.5;
+  color: var(--usage-faint);
+}
 </style>

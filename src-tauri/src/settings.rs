@@ -8,7 +8,7 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     }
 
     let metadata_prompt = settings.metadata_ai_prompt.trim();
-    if metadata_prompt.is_empty() || metadata_prompt.contains("a concise paper abstract") {
+    if metadata_prompt.is_empty() || crate::models::is_legacy_metadata_ai_prompt(metadata_prompt) {
         settings.metadata_ai_prompt = crate::models::default_metadata_ai_prompt();
     }
 

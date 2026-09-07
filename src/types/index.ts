@@ -308,7 +308,7 @@ export interface AiModel {
 export interface AiProviderInfo {
   id: string
   name: string
-  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'qwenai' | 'mimo' | 'ollama' | string
+  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'qwenai' | 'mimo' | 'zhipu' | 'minimax' | 'ollama' | string
   base_url: string
   enabled: boolean
   has_key: boolean
@@ -377,6 +377,8 @@ export type ImageDetail = 'low' | 'high' | 'original' | 'auto'
 export type ChatContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string; detail?: ImageDetail } }
+  /** A video clip. Only MiniMax reads these on the chat path. */
+  | { type: 'video_url'; video_url: { url: string; detail?: string } }
   /** An attachment sent inline (OpenRouter / Kimi accept base64 PDFs this way). */
   | { type: 'file'; file: { filename: string; file_data: string } }
   /** An attachment sent by reference to DeepSeek's Files API. */

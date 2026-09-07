@@ -131,6 +131,12 @@ impl ServerToolTrace {
 
     /// Read a streaming `choices[].delta` or a whole `message` — both carry the
     /// same `annotations` / `images` fields.
+    ///
+    /// GLM is the exception: it lists what its built-in search read in a
+    /// `web_search` array hung off the chunk rather than the delta, so callers
+    /// for that provider hand this the chunk as well. Every other provider's
+    /// delta simply has no such field, and the two shapes de-duplicate against
+    /// each other by URL.
     pub fn absorb(&mut self, node: &serde_json::Value) {
         if let Some(annotations) = node.get("annotations").and_then(|a| a.as_array()) {
             for annotation in annotations {
@@ -146,6 +152,32 @@ impl ServerToolTrace {
                 self.citations.push(Citation {
                     url: url.to_string(),
                     title: body
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string),
+                });
+            }
+        }
+
+        // GLM's `web_search`: `[{"title":…,"link":…,"content":…,"refer":"ref_1"}]`.
+        // The URL is spelled `link` here; `url` is accepted too so a variant of
+        // the shape still lands.
+        if let Some(results) = node.get("web_search").and_then(|w| w.as_array()) {
+            for result in results {
+                let Some(url) = result
+                    .get("link")
+                    .or_else(|| result.get("url"))
+                    .and_then(|u| u.as_str())
+                else {
+                    continue;
+                };
+                if url.is_empty() || self.citations.iter().any(|c| c.url == url) {
+                    continue;
+                }
+                self.citations.push(Citation {
+                    url: url.to_string(),
+                    title: result
                         .get("title")
                         .and_then(|t| t.as_str())
                         .filter(|t| !t.is_empty())
@@ -346,6 +378,28 @@ mod tests {
         assert_eq!(payload["citations"].as_array().unwrap().len(), 2);
         assert_eq!(payload["citations"][0]["title"], "A");
         // A citation without a title omits the field rather than sending "".
+        assert!(payload["citations"][1].get("title").is_none());
+    }
+
+    #[test]
+    fn glm_web_search_results_become_citations() {
+        let mut trace = ServerToolTrace::default();
+        // GLM hangs the array off the chunk, so the whole chunk is absorbed.
+        let chunk = serde_json::json!({
+            "id": "1",
+            "web_search": [
+                {"title": "A", "link": "https://a.test", "refer": "ref_1"},
+                {"title": "", "link": "https://b.test"},
+                {"title": "no link"},
+            ],
+            "choices": [{"delta": {"content": "hi"}}],
+        });
+        trace.absorb(&chunk);
+        // Repeated chunks must not repeat the sources.
+        trace.absorb(&chunk);
+        let payload = trace.to_payload();
+        assert_eq!(payload["citations"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["citations"][0]["title"], "A");
         assert!(payload["citations"][1].get("title").is_none());
     }
 

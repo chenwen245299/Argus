@@ -7,6 +7,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { useAiStore } from '../../stores/ai'
 import { useSettingsStore } from '../../stores/settings'
 import ProviderBalanceTag from '../ProviderBalanceTag.vue'
+import { providerLogo } from '../../utils/providerLogo'
 import type {
   AiModel, AiProviderInfo, AiProviderInput, DeepSeekFile, DeepSeekFileList,
   DeepSeekVisionLimits, ModelSelection, ServerTools,
@@ -25,6 +26,8 @@ const PRESETS = [
   { label: 'Kimi Code',    base_url: 'https://api.kimi.com/coding/v1',    kind: 'kimi' },
   { label: '千问 Token Plan', base_url: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', kind: 'qwenai' },
   { label: 'MiMo',         base_url: 'https://api.xiaomimimo.com/v1',     kind: 'mimo' },
+  { label: '智谱 GLM',      base_url: 'https://open.bigmodel.cn/api/paas/v4', kind: 'zhipu' },
+  { label: 'MiniMax',      base_url: 'https://api.minimax.cn/v1',          kind: 'minimax' },
   { label: 'Ollama',       base_url: 'http://localhost:11434',            kind: 'ollama' },
   { label: 'Anthropic',    base_url: 'https://api.anthropic.com/v1',      kind: 'anthropic' },
 ]
@@ -33,6 +36,7 @@ const CAPABILITY_OPTIONS = [
   { id: 'reasoning', labelKey: 'aiService.capReasoning' },
   { id: 'vision', labelKey: 'aiService.capVision' },
   { id: 'audio', labelKey: 'aiService.capAudio' },
+  { id: 'video', labelKey: 'aiService.capVideo' },
   { id: 'tool_calling', labelKey: 'aiService.capToolCalling' },
   { id: 'embedding', labelKey: 'aiService.capEmbedding' },
 ]
@@ -40,7 +44,6 @@ const CAPABILITY_OPTIONS = [
 const CAPABILITY_LABEL_ALIASES: Record<string, string> = {
   function_calling: 'aiService.capFunctionCalling',
   image_gen: 'aiService.capImageGen',
-  video: 'aiService.capVideo',
 }
 
 const FETCH_GROUP_ORDER = ['embedding', 'vision', 'audio', 'tool_calling', 'reasoning', 'image_gen', 'video', 'other'] as const
@@ -806,46 +809,11 @@ async function setDefaultModel(providerId: string, modelId: string) {
 }
 
 // ── Provider logo ─────────────────────────────────────────────────────────────
-
-const LOGO_MAP: [string[], string][] = [
-  [['deepseek', 'api.deepseek.com'], 'deepseek.svg'],
-  [['openai', 'api.openai.com'], 'openai.svg'],
-  [['anthropic', 'claude', 'api.anthropic.com'], 'claude.svg'],
-  [['openrouter', 'openrouter.ai'], 'openrouter.svg'],
-  [['kimi', 'moonshot'], 'kimi.svg'],
-  [['ollama', '11434'], 'ollama-color.svg'],
-  [['gemini', 'generativelanguage.googleapis.com'], 'gemini.svg'],
-  [['gemma'], 'gemma.svg'],
-  [['grok'], 'grok.svg'],
-  [['xai', 'x.ai', 'api.x.ai'], 'xai.svg'],
-  [['huggingface', 'huggingface.co'], 'huggingface.svg'],
-  [['lmstudio'], 'lmstudio.svg'],
-  [['siliconflow', 'silicon'], 'siliconflow.svg'],
-  // Qwen's own mark, matched before the generic Alibaba Cloud one. Keyed on the
-  // Aliyun MaaS host and the Qwen brand so a plain Aliyun endpoint still falls to
-  // alibaba.svg, while any Qwen-named provider gets qwenai.svg. Deliberately NOT
-  // keyed on "token-plan": MiMo's Token-Plan host is token-plan-cn.xiaomimimo.com,
-  // which must reach the MiMo mark below rather than being caught here.
-  [['qwenai', 'maas.aliyuncs', 'qwen', '千问', '通义'], 'qwenai.svg'],
-  [['alibaba', 'dashscope', 'aliyun'], 'alibaba.svg'],
-  [['baidu', 'qianfan', 'baidubce'], 'baidu.svg'],
-  [['zhipu', 'bigmodel', 'chatglm'], 'zhipu.svg'],
-  [['tencent', 'hunyuan'], 'tencent.svg'],
-  [['bytedance', 'doubao', 'volcengine', 'volces'], 'bytedance.svg'],
-  [['nvidia', 'integrate.api.nvidia'], 'nvidia.svg'],
-  [['microsoft', 'azure', 'openai.azure'], 'microsoft.svg'],
-  [['mimo', 'xiaomimimo', 'xiaomi', 'micloud'], 'xiaomimimo.svg'],
-  [['mole', 'moleapi'], 'MoleAPI.svg'],
-]
+// The map itself lives in utils/providerLogo.ts so the usage dashboard shows the
+// same mark for the same provider.
 
 function providerLogoUrl(name: string, baseUrl: string): string | null {
-  const haystack = `${name} ${baseUrl}`.toLowerCase()
-  for (const [keywords, file] of LOGO_MAP) {
-    if (keywords.some(k => haystack.includes(k))) {
-      return new URL(`../../assets/providers/${file}`, import.meta.url).href
-    }
-  }
-  return null
+  return providerLogo(name, baseUrl) || null
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1056,6 +1024,9 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="openrouter">{{ t('aiService.openrouter') }}</option>
             <option value="kimi">{{ t('aiService.kimi') }}</option>
             <option value="qwenai">{{ t('aiService.qwenai') }}</option>
+            <option value="mimo">{{ t('aiService.mimo') }}</option>
+            <option value="zhipu">{{ t('aiService.zhipu') }}</option>
+            <option value="minimax">{{ t('aiService.minimax') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
             <option value="ollama">{{ t('aiService.ollama') }}</option>
           </select>
@@ -1157,6 +1128,9 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="openrouter">{{ t('aiService.openrouter') }}</option>
             <option value="kimi">{{ t('aiService.kimi') }}</option>
             <option value="qwenai">{{ t('aiService.qwenai') }}</option>
+            <option value="mimo">{{ t('aiService.mimo') }}</option>
+            <option value="zhipu">{{ t('aiService.zhipu') }}</option>
+            <option value="minimax">{{ t('aiService.minimax') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
             <option value="ollama">{{ t('aiService.ollama') }}</option>
           </select>

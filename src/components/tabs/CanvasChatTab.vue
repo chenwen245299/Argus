@@ -46,6 +46,10 @@ interface CanvasMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
+  /** Transient throttled copy of `content` used while streaming. Repainting on
+   *  every token re-renders the whole panel and forces a layout of an answer
+   *  that keeps growing, which is what froze the tab on long answers. */
+  displayContent?: string
   createdAt: string
   /** Transient: true while this answer is still streaming. Never persisted. */
   streaming?: boolean
@@ -179,7 +183,7 @@ function persistable(list: CanvasConversation[]) {
     .filter(c => c.messages.length > 0)
     .map(c => ({
       ...c,
-      messages: c.messages.map(({ streaming: _streaming, ...m }) => m),
+      messages: c.messages.map(({ streaming: _streaming, displayContent: _display, ...m }) => m),
     }))
 }
 
@@ -277,7 +281,7 @@ async function send() {
     const delta = e.payload?.delta ?? ''
     if (!delta) return
     live.content += delta
-    scrollToBottom()
+    scheduleStreamRender(live)
   }))
 
   // OpenRouter's server tools report what they consulted or drew. The agent loop
@@ -358,6 +362,7 @@ async function send() {
       errorText.value = message
     }
   } finally {
+    flushStreamRender(live)
     live.streaming = false
     loading.value = false
     activeRequestId = null
@@ -428,11 +433,59 @@ function deleteConversation(id: string) {
   scheduleSave()
 }
 
+// Coalesced to one scroll per frame: reading `scrollHeight` forces a synchronous
+// layout of the whole message list, so calling it per streamed token cost more
+// than the render it followed. rAF runs after Vue has patched the DOM, so the
+// height it reads is the new one.
+let scrollFramePending = false
 function scrollToBottom() {
-  void nextTick(() => {
+  if (scrollFramePending) return
+  scrollFramePending = true
+  requestAnimationFrame(() => {
+    scrollFramePending = false
     const el = messagesEl.value
     if (el) el.scrollTop = el.scrollHeight
   })
+}
+
+// ── Throttled streaming render ────────────────────────────────────────────────
+// The answer is repainted from a `displayContent` copy refreshed on an interval,
+// not on every token. Mirrors LibraryChat / AiTab.
+const STREAM_RENDER_MS = 90
+let streamRenderTimer: ReturnType<typeof setTimeout> | null = null
+let streamRenderLast = 0
+
+function applyStreamRender(msg: CanvasMessage) {
+  msg.displayContent = msg.content
+  scrollToBottom()
+}
+
+function scheduleStreamRender(msg: CanvasMessage) {
+  const elapsed = Date.now() - streamRenderLast
+  if (elapsed >= STREAM_RENDER_MS) {
+    streamRenderLast = Date.now()
+    applyStreamRender(msg)
+    return
+  }
+  if (streamRenderTimer) return
+  streamRenderTimer = setTimeout(() => {
+    streamRenderTimer = null
+    streamRenderLast = Date.now()
+    applyStreamRender(msg)
+  }, STREAM_RENDER_MS - elapsed)
+}
+
+/** The answer text to paint: the throttled copy while it streams, the real one
+ *  once it is done. */
+function streamText(msg: CanvasMessage) {
+  return (msg.streaming ? msg.displayContent ?? msg.content : msg.content) ?? ''
+}
+
+/** Final flush, so the last tokens show even if a throttle window was pending. */
+function flushStreamRender(msg: CanvasMessage) {
+  if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null }
+  streamRenderLast = 0
+  msg.displayContent = msg.content
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -607,8 +660,8 @@ onUnmounted(() => {
             </div>
           </div>
           <div class="cc-answer" :class="{ error: msg.error }">
-            <MarkdownBody :content="msg.content" :streaming="msg.streaming" />
-            <span v-if="msg.streaming && !msg.content" class="cc-thinking">{{ t('canvasChat.thinking') }}</span>
+            <MarkdownBody :content="streamText(msg)" :streaming="msg.streaming" />
+            <span v-if="msg.streaming && !streamText(msg)" class="cc-thinking">{{ t('canvasChat.thinking') }}</span>
             <ServerToolTraceCard :trace="msg.serverTools" />
           </div>
         </template>

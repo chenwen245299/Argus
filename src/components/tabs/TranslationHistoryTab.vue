@@ -107,6 +107,7 @@ function modelLogo(modelId = '', providerName = '', providerId = '') {
   if (haystack.includes('baidu') || haystack.includes('ernie')) return modelIconMap.baidu
   if (haystack.includes('doubao') || haystack.includes('bytedance')) return modelIconMap.bytedance
   if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
+  if (haystack.includes('minimax') || haystack.includes('hailuo')) return modelIconMap.minimax
   if (haystack.includes('mimo') || haystack.includes('xiaomi')) return modelIconMap.xiaomimimo
   if (haystack.includes('gpt') || haystack.includes('openai')) return modelIconMap.openai
   if (haystack.includes('ollama')) return modelIconMap['ollama-color']

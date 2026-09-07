@@ -8,7 +8,40 @@ const { t } = useI18n()
 const settingsStore = useSettingsStore()
 const aiStore = useAiStore()
 
-const DEFAULT_METADATA_AI_PROMPT = `Extract academic paper metadata from the text below.
+// Must match the Rust `default_metadata_ai_prompt()` in src-tauri/src/models.rs.
+const DEFAULT_METADATA_AI_PROMPT = `Extract bibliographic metadata for the document the text below was taken from.
+The text is the beginning of that document, with its original line breaks.
+
+Rules:
+- Describe THIS document only. Never take a title, author, venue or year from a
+  reference list, bibliography, citation, or a "Publications" / "Selected Papers"
+  section — those describe other works.
+- The title is the heading printed at the top of the document's own first page,
+  normally alone on its line with the author names below it. A line that is
+  numbered or bulleted, or written in citation form (contains "et al.", "In
+  Proceedings of", "arXiv:", "pp.", or ends with a venue and a year), is a list
+  entry, not this document's title.
+- Do NOT guess or infer. Use null for anything the text does not state.
+- Set "document_type" to "paper" only when this document is itself a single
+  academic paper or preprint. Use "other" for a CV/resume, cover letter, slide
+  deck, book, manual, report, or any document that is mainly a list of works —
+  and then leave "year", "venue", "doi" and "arxiv_id" null, since those could
+  only belong to something the document merely cites.
+
+Reply with a JSON code block in exactly this format:
+
+\`\`\`json
+{"document_type": "paper", "title": "...", "authors": ["First Last", "First Last"], "year": 2024, "venue": "...", "doi": "...", "arxiv_id": "..."}
+\`\`\`
+
+File name: {filename}
+
+Text:
+{text}`
+
+// The prompt shipped before the document-identity rules. An untouched copy is
+// migrated to the current default; an edited prompt is always left alone.
+const LEGACY_METADATA_AI_PROMPT_V1 = `Extract academic paper metadata from the text below.
 Do NOT guess or infer missing fields — use null for anything not explicitly found in the text.
 Reply with a JSON code block in exactly this format:
 
@@ -18,7 +51,6 @@ Reply with a JSON code block in exactly this format:
 
 Text:
 {text}`
-
 const DEFAULT_AI_SUMMARY_PROMPT = '帮我用中文讲一下这篇论文，讲的越详细越好，我有这个领域的通用基础，但是没有这个小方向的基础。输出的时候只包含关于论文的讲解，不要包含寒暄的内容。开始时先用一段话总结这篇论文的核心内容。请用标准markdown形式输出你的讲解内容，数学公式要用$$包裹，不要出现\\(\\)这和[]格式的数学公式。'
 
 const DEFAULT_ABSTRACT_AI_PROMPT = `请只从下面给定的论文原文片段中抽取作者原文的 Abstract/摘要段落。
@@ -125,6 +157,7 @@ const DEFAULT_SECTIONS_AI_PROMPT = `You are an expert at analyzing the structure
 function normalizeMetadataPrompt(prompt?: string) {
   const trimmed = prompt?.trim()
   return !trimmed
+    || trimmed === LEGACY_METADATA_AI_PROMPT_V1.trim()
     || trimmed.includes('a concise paper abstract')
     || trimmed.includes('- abstract: string or null')
     || trimmed.includes('No markdown, no code blocks')

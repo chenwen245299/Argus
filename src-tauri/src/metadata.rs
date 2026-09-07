@@ -126,6 +126,71 @@ pub fn leading_words(text: &str, limit: usize) -> String {
     }
 }
 
+/// The head of a document with its line structure intact.
+///
+/// `leading_words` flattens every newline into a space. That is right for prose,
+/// and wrong for working out *which* document the text belongs to: on a title
+/// page the line breaks are the evidence — the title sits alone on its own line
+/// with the authors below it, while an entry in a publication list sits in a run
+/// of similar-looking lines. Flattened into one blob, a CV is indistinguishable
+/// from a paper, which is how the first work listed on a CV ends up recorded as
+/// the document's own title.
+pub fn leading_lines(text: &str, word_limit: usize) -> String {
+    const MAX_CHARS: usize = 12_000;
+    let mut out = String::new();
+    let mut words = 0usize;
+    let mut pending_blank = false;
+
+    for raw_line in text.lines() {
+        if words >= word_limit {
+            break;
+        }
+        let line = raw_line.trim();
+        if line.is_empty() {
+            // A run of blank lines collapses to one: PDF extraction produces
+            // them by the dozen, and they spend the character budget without
+            // carrying any structure.
+            pending_blank = !out.is_empty();
+            continue;
+        }
+
+        // Keep only as many words as the budget still allows, so a document
+        // extracted as one enormous line cannot blow past the limit.
+        let remaining = word_limit - words;
+        let line_words = line.split_whitespace().count();
+        let kept = if line_words > remaining {
+            line.split_whitespace()
+                .take(remaining)
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            line.to_string()
+        };
+
+        let separators = usize::from(!out.is_empty()) + usize::from(pending_blank);
+        if out.len() + separators + kept.len() > MAX_CHARS {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        if pending_blank {
+            out.push('\n');
+            pending_blank = false;
+        }
+        out.push_str(&kept);
+        words += line_words.min(remaining);
+    }
+
+    // A PDF whose text carries no newlines at all leaves nothing here; fall back
+    // to the flat form rather than sending an empty prompt.
+    if out.trim().is_empty() {
+        leading_words(text, word_limit)
+    } else {
+        out
+    }
+}
+
 fn normalize_space(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -160,6 +225,54 @@ pub fn find_arxiv_id(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The part of a document's front matter that can still be describing the
+/// document itself — everything before its first list of other works.
+///
+/// `find_arxiv_id` and `find_doi` take the first tagged identifier they see,
+/// which is right exactly as long as the text is a paper's own title block: the
+/// paper's stamp comes before its references. It stops being right the moment
+/// the page is a list of works. On a CV the first tagged id belongs to the first
+/// paper the person published, and on a short paper whose references start on
+/// page 2 it can belong to the first work cited — either way the whole metadata
+/// fetch then resolves to a stranger's paper.
+///
+/// Cutting the text at the list heading keeps the good case untouched (a title
+/// block has no such heading) and removes the guess from the bad one.
+fn identity_region(text: &str) -> &str {
+    const HEADINGS: [&str; 12] = [
+        "references",
+        "reference",
+        "bibliography",
+        "works cited",
+        "publications",
+        "selected publications",
+        "journal publications",
+        "conference publications",
+        "preprints",
+        "参考文献",
+        "发表论文",
+        "论文发表",
+    ];
+
+    let mut offset = 0usize;
+    for chunk in text.split_inclusive('\n') {
+        let trimmed = chunk.trim();
+        // A heading is a short line that *is* the word, possibly numbered
+        // ("5. References") or followed by a colon — not a sentence that happens
+        // to mention it.
+        let stripped = trimmed
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ')
+            .trim_end_matches([':', '\u{ff1a}'])
+            .trim()
+            .to_lowercase();
+        if trimmed.chars().count() <= 40 && HEADINGS.contains(&stripped.as_str()) {
+            return &text[..offset];
+        }
+        offset += chunk.len();
+    }
+    text
 }
 
 pub fn find_doi(text: &str) -> Option<String> {
@@ -621,7 +734,17 @@ pub async fn fetch_crossref_by_title(title: &str) -> Option<MetaUpdate> {
 
 // ── AI fallback ───────────────────────────────────────────────────────────────
 
-fn parse_ai_content(raw: &str) -> Option<MetaUpdate> {
+/// What the model said about one document: the fields it read off, plus whether
+/// it considers the document to be a paper at all.
+struct AiMetadata {
+    update: MetaUpdate,
+    /// False only when the model explicitly classified the document as something
+    /// other than a paper. A prompt that predates `document_type` — a user's own
+    /// edited one — omits the field, and its absence must keep meaning "paper".
+    is_paper: bool,
+}
+
+fn parse_ai_content(raw: &str) -> Option<AiMetadata> {
     // Extract JSON from a markdown code block first (```json ... ``` or ``` ... ```),
     // then fall back to scanning for the first { ... } pair.
     let json_str: &str = if let Some(s) = raw.find("```json") {
@@ -664,24 +787,95 @@ fn parse_ai_content(raw: &str) -> Option<MetaUpdate> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    Some(MetaUpdate {
-        title,
-        authors,
-        year,
-        doi,
-        arxiv_id,
-        venue,
-        paper_abstract: None,
-        cite_count: None,
+    // Anything that is not a recognised "this is a paper" answer counts as a
+    // paper, so a missing or unexpected value can never silently discard
+    // metadata that was extracted correctly.
+    let is_paper = !matches!(
+        json["document_type"]
+            .as_str()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("other") | Some("cv") | Some("resume") | Some("not_a_paper") | Some("none")
+    );
+
+    Some(AiMetadata {
+        update: MetaUpdate {
+            title,
+            authors,
+            year,
+            doi,
+            arxiv_id,
+            venue,
+            paper_abstract: None,
+            cite_count: None,
+        },
+        is_paper,
     })
 }
 
-fn render_metadata_prompt(template: &str, text: &str) -> String {
+/// Whether `title` occurs in `text` as an entry in a reference or publication
+/// list rather than as the document's own heading.
+///
+/// The backstop for the prompt: a model that ignores the rules (or a user's own
+/// older prompt that never carried them) still cannot turn the first paper on a
+/// CV into the CV's title, because that line reads as a citation and a real
+/// title line does not. Judged on the line the title sits on, with the title
+/// itself removed first — a paper genuinely called "… et al. …" is not caught by
+/// its own words.
+fn title_reads_as_citation(title: &str, text: &str) -> bool {
+    const MARKERS: [&str; 8] = [
+        "et al",
+        "in proceedings",
+        "arxiv:",
+        "doi:",
+        "doi.org",
+        "pp.",
+        "preprint arxiv",
+        "advances in neural information processing",
+    ];
+
+    let needle = normalize_space(title).to_lowercase();
+    if needle.len() < 12 {
+        // Too short to locate reliably; leave the verdict to the model.
+        return false;
+    }
+
+    for line in text.lines() {
+        let flat = normalize_space(line).to_lowercase();
+        let Some(at) = flat.find(&needle) else {
+            continue;
+        };
+        let mut around = String::with_capacity(flat.len());
+        around.push_str(&flat[..at]);
+        around.push(' ');
+        around.push_str(&flat[at + needle.len()..]);
+        if MARKERS.iter().any(|m| around.contains(m)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `{filename}` is optional: a template that predates it — a user's own edited
+/// prompt — simply keeps whatever it already said. The name is a hint, not an
+/// answer; the default prompt labels it "File name" rather than "Title" so a
+/// model does not copy it verbatim, but "…_CV.pdf" is often the plainest signal
+/// that the document is not a paper at all.
+fn render_metadata_prompt(template: &str, text: &str, filename: &str) -> String {
     let mut prompt = if template.trim().is_empty() {
         crate::models::default_metadata_ai_prompt()
     } else {
         template.to_string()
     };
+    let filename = filename.trim();
+    prompt = prompt.replace(
+        "{filename}",
+        if filename.is_empty() {
+            "(unknown)"
+        } else {
+            filename
+        },
+    );
     let had_text_placeholder = prompt.contains("{text}");
     prompt = prompt.replace("{text}", text);
 
@@ -711,8 +905,12 @@ pub async fn fetch_and_apply(
     .await
     .unwrap_or_default();
 
-    let arxiv_id = find_arxiv_id(&text);
-    let doi = find_doi(&text);
+    // Identifiers are only trusted from the region that can still be about this
+    // document — see `identity_region`. Everything past a "References" /
+    // "Publications" heading belongs to a work this document merely lists.
+    let identity = identity_region(&text);
+    let arxiv_id = find_arxiv_id(identity);
+    let doi = find_doi(identity);
 
     // Step 2: tier 1 — arXiv
     let update = if let Some(ref id) = arxiv_id {
@@ -1709,9 +1907,15 @@ pub async fn fetch_metadata_with_ai(
     let api_key = crate::ai_manager::get_api_key(root, &provider_id)
         .ok_or_else(|| format!("No API key set for '{}'.", provider.name))?;
 
-    // Build the prompt
-    let snippet = leading_words(&text, 512);
-    let prompt = render_metadata_prompt(&settings.metadata_ai_prompt, &snippet);
+    // Build the prompt. The snippet keeps its line breaks: identifying a document
+    // depends on seeing that the title stands alone above the authors, not buried
+    // in a run of publication-list entries — see `leading_lines`.
+    let snippet = leading_lines(&text, 512);
+    let filename = crate::paper::read_meta(root, slug)
+        .ok()
+        .and_then(|m| m.original_filename)
+        .unwrap_or_default();
+    let prompt = render_metadata_prompt(&settings.metadata_ai_prompt, &snippet, &filename);
 
     // Generate IDs for the streamed conversation entry
     let group_id = uuid::Uuid::new_v4().to_string();
@@ -1770,12 +1974,18 @@ pub async fn fetch_metadata_with_ai(
     };
 
     // Parse and apply metadata
-    let update = parse_ai_content(&raw)
+    let parsed = parse_ai_content(&raw)
         .ok_or_else(|| format!("Could not parse metadata JSON from: {raw}"))?;
+    let update = parsed.update;
 
     let mut meta = crate::paper::read_meta(root, slug)?;
     if let Some(t) = update.title {
-        if !t.is_empty() {
+        // A title lifted out of a reference or publication list is rejected even
+        // when the model was sure — see `title_reads_as_citation`. Rejecting
+        // means keeping the title the import already had (the file name), which
+        // is wrong but honestly wrong, rather than confidently naming the paper
+        // after something it merely cites.
+        if !t.is_empty() && !title_reads_as_citation(&t, &snippet) {
             meta.title = t;
         }
     }
@@ -1784,17 +1994,23 @@ pub async fn fetch_metadata_with_ai(
             meta.authors = a;
         }
     }
-    if let Some(y) = update.year {
-        meta.year = Some(y);
-    }
-    if update.venue.is_some() {
-        meta.venue = update.venue;
-    }
-    if update.doi.is_some() {
-        meta.doi = update.doi;
-    }
-    if update.arxiv_id.is_some() {
-        meta.arxiv_id = update.arxiv_id;
+    // A document that is not a paper has no year, venue, DOI or arXiv id of its
+    // own: anything the model found for those could only have come from a work
+    // the document cites. Its title and authors can still be real (a CV names
+    // itself and its owner), so those are applied above either way.
+    if parsed.is_paper {
+        if let Some(y) = update.year {
+            meta.year = Some(y);
+        }
+        if update.venue.is_some() {
+            meta.venue = update.venue;
+        }
+        if update.doi.is_some() {
+            meta.doi = update.doi;
+        }
+        if update.arxiv_id.is_some() {
+            meta.arxiv_id = update.arxiv_id;
+        }
     }
 
     crate::paper::write_meta(root, slug, &meta)?;
@@ -2035,5 +2251,168 @@ mod identifier_tests {
             "Open Intelligence",
             "Open Intelligence for Autonomous Multi-Agent Robotics Systems"
         ));
+    }
+}
+
+#[cfg(test)]
+mod ai_metadata_tests {
+    use super::{leading_lines, parse_ai_content, render_metadata_prompt, title_reads_as_citation};
+
+    /// The head of a CV, as PDF extraction hands it over.
+    const CV: &str = "\
+Qicheng Wen
+qicheng@example.edu · +1 555 0100
+
+Education
+National University of Singapore, PhD in Computer Science, 2023-
+
+Selected Publications
+1. Wen, Q., Liu, X., et al. Attention Is All You Need For Robots. In Proceedings of CVPR, 2024.
+2. Wen, Q. Learning To See In The Dark. NeurIPS 2023, pp. 100-112.
+";
+
+    #[test]
+    fn line_structure_survives_the_snippet() {
+        let out = leading_lines(CV, 512);
+        assert!(out.starts_with("Qicheng Wen\n"));
+        // The list entries stay on their own lines — that separation is the
+        // whole point, and `leading_words` would have destroyed it.
+        assert!(out.contains("\n1. Wen, Q., Liu, X., et al."));
+        assert!(out.lines().count() > 5);
+    }
+
+    #[test]
+    fn blank_runs_collapse_and_the_word_budget_holds() {
+        let text = "Title\n\n\n\n\nAuthors\n\nBody";
+        assert_eq!(leading_lines(text, 512), "Title\n\nAuthors\n\nBody");
+        // A budget smaller than the document truncates rather than overshooting.
+        assert_eq!(leading_lines("one two three four", 2), "one two");
+    }
+
+    #[test]
+    fn a_document_without_newlines_falls_back_to_flat_text() {
+        let flat = "Some Paper Title Ann Author Bo Buthor Abstract We show that";
+        assert_eq!(leading_lines(flat, 4), "Some Paper Title Ann");
+    }
+
+    #[test]
+    fn a_title_taken_from_a_publication_list_is_rejected() {
+        let snippet = leading_lines(CV, 512);
+        assert!(title_reads_as_citation(
+            "Attention Is All You Need For Robots",
+            &snippet
+        ));
+        assert!(title_reads_as_citation("Learning To See In The Dark", &snippet));
+        // The CV's own heading is not a citation entry.
+        assert!(!title_reads_as_citation("Curriculum Vitae — Qicheng Wen", &snippet));
+    }
+
+    #[test]
+    fn a_real_title_page_is_left_alone() {
+        let paper = "\
+Deep Residual Learning for Image Recognition
+
+Kaiming He   Xiangyu Zhang   Shaoqing Ren   Jian Sun
+Microsoft Research
+
+Abstract
+Deeper neural networks are more difficult to train.
+";
+        assert!(!title_reads_as_citation(
+            "Deep Residual Learning for Image Recognition",
+            paper
+        ));
+        // A paper whose own title contains a marker word is judged on the rest
+        // of its line, so it is not caught by its own words.
+        let quirky = "On the Use of et al. in Citation Practice\n\nAnn Author\n";
+        assert!(!title_reads_as_citation(
+            "On the Use of et al. in Citation Practice",
+            quirky
+        ));
+    }
+
+    #[test]
+    fn identifiers_are_not_taken_from_a_list_of_works() {
+        use super::{find_arxiv_id, find_doi, identity_region};
+
+        let cv = "\
+Qicheng Wen
+qicheng@example.edu
+
+Selected Publications
+1. Wen, Q. Attention For Robots. CVPR 2024. arXiv:2401.11111
+2. Wen, Q. Seeing In The Dark. doi:10.1145/1234567.8901234
+";
+        // Scanned whole, the CV hands over the first paper it lists.
+        assert_eq!(find_arxiv_id(cv), Some("2401.11111".to_string()));
+        // Cut at the heading, there is nothing to take.
+        let region = identity_region(cv);
+        assert_eq!(find_arxiv_id(region), None);
+        assert_eq!(find_doi(region), None);
+
+        // A paper's own stamp sits above its references and is still found.
+        let paper = "\
+arXiv:2501.11111v1 [cs.LG] 12 Jan 2025
+
+Deep Residual Learning
+Kaiming He
+
+References
+[1] A. Author. Something Else. arXiv:2306.02781
+";
+        assert_eq!(
+            find_arxiv_id(identity_region(paper)),
+            Some("2501.11111".to_string())
+        );
+    }
+
+    #[test]
+    fn a_heading_is_a_heading_not_a_mention() {
+        use super::identity_region;
+
+        // Numbered and colon-suffixed headings still cut.
+        assert!(identity_region("Top\n5. References\narXiv:2401.11111\n").trim() == "Top");
+        assert!(identity_region("Top\nPublications:\narXiv:2401.11111\n").trim() == "Top");
+        // A sentence that merely uses the word does not.
+        let prose = "Our references to prior work are extensive and the publications listed\nmatter.\n";
+        assert_eq!(identity_region(prose), prose);
+    }
+
+    #[test]
+    fn document_type_other_is_read_but_absence_means_paper() {
+        let other = parse_ai_content(
+            r#"```json
+{"document_type": "other", "title": "Curriculum Vitae", "authors": ["Qicheng Wen"], "year": 2024, "venue": "CVPR", "doi": null, "arxiv_id": null}
+```"#,
+        )
+        .unwrap();
+        assert!(!other.is_paper);
+        assert_eq!(other.update.title.as_deref(), Some("Curriculum Vitae"));
+
+        // A prompt the user edited before `document_type` existed omits it, and
+        // its metadata must still be applied in full.
+        let legacy = parse_ai_content(
+            r#"```json
+{"title": "A Paper", "authors": ["Ann Author"], "year": 2024, "venue": "CVPR"}
+```"#,
+        )
+        .unwrap();
+        assert!(legacy.is_paper);
+        assert_eq!(legacy.update.venue.as_deref(), Some("CVPR"));
+    }
+
+    #[test]
+    fn the_filename_hint_is_optional() {
+        let with = render_metadata_prompt("File name: {filename}\nText:\n{text}", "body", "cv.pdf");
+        assert_eq!(with, "File name: cv.pdf\nText:\nbody");
+
+        // An unknown name is said out loud rather than left as a bare label.
+        let unknown = render_metadata_prompt("File name: {filename}\n{text}", "body", "   ");
+        assert!(unknown.starts_with("File name: (unknown)"));
+
+        // A template from before the hint existed is untouched, and still gets
+        // its text appended when it carries no placeholder at all.
+        let old = render_metadata_prompt("Extract metadata.", "body", "cv.pdf");
+        assert_eq!(old, "Extract metadata.\n\nText:\nbody");
     }
 }

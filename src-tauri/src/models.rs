@@ -425,6 +425,45 @@ Do not invent headings that are not present, and do not emit the same heading tw
 }
 
 pub fn default_metadata_ai_prompt() -> String {
+    r#"Extract bibliographic metadata for the document the text below was taken from.
+The text is the beginning of that document, with its original line breaks.
+
+Rules:
+- Describe THIS document only. Never take a title, author, venue or year from a
+  reference list, bibliography, citation, or a "Publications" / "Selected Papers"
+  section — those describe other works.
+- The title is the heading printed at the top of the document's own first page,
+  normally alone on its line with the author names below it. A line that is
+  numbered or bulleted, or written in citation form (contains "et al.", "In
+  Proceedings of", "arXiv:", "pp.", or ends with a venue and a year), is a list
+  entry, not this document's title.
+- Do NOT guess or infer. Use null for anything the text does not state.
+- Set "document_type" to "paper" only when this document is itself a single
+  academic paper or preprint. Use "other" for a CV/resume, cover letter, slide
+  deck, book, manual, report, or any document that is mainly a list of works —
+  and then leave "year", "venue", "doi" and "arxiv_id" null, since those could
+  only belong to something the document merely cites.
+
+Reply with a JSON code block in exactly this format:
+
+```json
+{"document_type": "paper", "title": "...", "authors": ["First Last", "First Last"], "year": 2024, "venue": "...", "doi": "...", "arxiv_id": "..."}
+```
+
+File name: {filename}
+
+Text:
+{text}"#
+        .to_string()
+}
+
+/// The metadata prompt shipped before the document-identity rules were added.
+///
+/// It asked only for "academic paper metadata from the text below", which reads
+/// a CV's publication list as fair game — the first listed paper became the
+/// document's title. Kept so an untouched copy of it can be migrated to the
+/// current default; a prompt the user actually edited is never replaced.
+pub fn legacy_metadata_ai_prompt_v1() -> String {
     r#"Extract academic paper metadata from the text below.
 Do NOT guess or infer missing fields — use null for anything not explicitly found in the text.
 Reply with a JSON code block in exactly this format:
@@ -436,6 +475,12 @@ Reply with a JSON code block in exactly this format:
 Text:
 {text}"#
         .to_string()
+}
+
+pub fn is_legacy_metadata_ai_prompt(prompt: &str) -> bool {
+    let p = prompt.trim();
+    // The very first shape asked for an abstract field that no longer exists.
+    p.contains("a concise paper abstract") || p == legacy_metadata_ai_prompt_v1().trim()
 }
 
 pub fn default_ai_summary_prompt() -> String {
@@ -859,6 +904,11 @@ pub enum ChatContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrlData },
+    /// A video clip, spelled the way MiniMax's OpenAI-compatible endpoint reads
+    /// it. No other provider here accepts video on the chat path, so the UI only
+    /// offers the attachment for a model tagged `video`.
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrlData },
     /// An attachment carried either inline (`file`, OpenRouter/Kimi-style base64
     /// `file_data`) or by reference (`file_id`, DeepSeek's Files API handle).
     /// Both providers spell the block `{"type": "file", …}`, so the two payloads
@@ -878,6 +928,15 @@ pub struct ImageUrlData {
     /// DeepSeek image fidelity hint: `low` (downscale to 512x512, cheaper),
     /// `high` / `original` (keep the source resolution) or `auto`. Omitted for
     /// providers that do not understand it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VideoUrlData {
+    /// A `data:video/...;base64,…` URI or a remote URL.
+    pub url: String,
+    /// Sampling-fidelity hint, mirroring `image_url.detail`. Omitted unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }

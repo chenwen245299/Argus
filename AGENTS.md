@@ -131,6 +131,35 @@ npm run tauri        # Proxy to the Tauri CLI
 cargo test -p argus  # Run the few Rust unit tests
 ```
 
+### Upgrading Tauri
+
+Tauri refuses to build when an `@tauri-apps/*` npm package and its Rust crate
+differ in **major or minor** version, so the two sides have to move together.
+
+Every `@tauri-apps/*` entry in `package.json` is therefore a `~` range pinned to
+the minor its crate sits on (`~2.10.1` for `@tauri-apps/plugin-updater` against
+`tauri-plugin-updater` 2.10.1, and so on). That is deliberate — a `^` range lets
+`npm install` walk to the next minor on its own and break the build. Don't widen
+them back.
+
+To take a new Tauri version, move both sides in one commit:
+
+```bash
+cargo update -p tauri-plugin-updater      # in src-tauri/, note the new version
+# then edit the matching ~range in package.json and refresh the lock:
+npm install --package-lock-only
+```
+
+Check the pairs with:
+
+```bash
+grep -A1 'name = "tauri' src-tauri/Cargo.lock   # crate versions
+grep tauri-apps package.json                    # npm ranges
+```
+
+CI installs with `npm ci`, so the committed `package-lock.json` is what every
+release artifact is built from — on all three platforms.
+
 ---
 
 ## Architecture

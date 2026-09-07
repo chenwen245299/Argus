@@ -122,11 +122,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Remove lock file and node_modules (Windows)
-        if: matrix.platform == 'windows-latest'
-        shell: bash
-        run: rm -rf node_modules package-lock.json
-
       - name: Ensure icon.ico exists (Windows)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
@@ -138,9 +133,17 @@ jobs:
             Write-Host "icon.ico OK"
           }
 
+      # `npm ci`, not `npm install`: the lock file is the whole point of a
+      # release build. `npm install` re-resolves every `^` range against the
+      # registry, so the Windows job shipped different dependency versions than
+      # the macOS and Linux jobs from the same tag — and eventually broke
+      # outright, when a freshly-resolved `@tauri-apps/plugin-updater` 2.11.0
+      # stopped matching the `tauri-plugin-updater` 2.10.1 that Cargo.lock pins
+      # (Tauri refuses to build when an npm package and its Rust crate differ in
+      # major/minor).
       - name: Install frontend dependencies
         shell: bash
-        run: npm install
+        run: npm ci
 
       - uses: tauri-apps/tauri-action@v0
         env:

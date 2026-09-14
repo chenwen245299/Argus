@@ -331,5 +331,5 @@ onBeforeUnmount(async () => {
 }
 .nw-editor .vditor-ir a { color: var(--accent) !important; }
 .nw-editor .vditor__tip { display: none !important; }
-.nw-editor .katex-display { overflow-x: auto; overflow-y: hidden; }
+.nw-editor .katex-display { overflow-x: auto; overflow-y: hidden; padding-top: 0.25em; padding-bottom: 0.2em; }
 </style>

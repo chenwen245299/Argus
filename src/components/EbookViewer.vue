@@ -1125,10 +1125,42 @@ function currentPosition(): { chapter: number; ratio: number } | null {
 function onScroll() {
   updateDisplayChapter()
   updateDisplayPage()
+  repositionAnchoredPopups()
   if (progressDebounce) clearTimeout(progressDebounce)
   progressDebounce = setTimeout(() => {
     if (isActiveTab.value) flushReadingState()
   }, 700)
+}
+
+// The selection toolbar and highlight popups are `position: fixed` at viewport
+// coordinates, anchored to content (a text selection or a highlight). The content
+// scrolls 1:1 in the viewport but a fixed popup does not, so without this it ends
+// up stranded over unrelated text. Shift every open popup by the scroll delta to
+// keep it glued to its anchor; if the anchor scrolls off-screen the popup goes with
+// it (no clamping — clamping would re-detach it from the anchor).
+let lastPopupScrollTop = 0
+let lastPopupScrollLeft = 0
+function repositionAnchoredPopups() {
+  const el = containerRef.value
+  if (!el) return
+  const dx = el.scrollLeft - lastPopupScrollLeft
+  const dy = el.scrollTop - lastPopupScrollTop
+  lastPopupScrollTop = el.scrollTop
+  lastPopupScrollLeft = el.scrollLeft
+  if (!dx && !dy) return
+  if (selectionPopup.value) {
+    selectionPopup.value = {
+      ...selectionPopup.value,
+      x: selectionPopup.value.x - dx,
+      y: selectionPopup.value.y - dy,
+    }
+  }
+  if (hlNotePopup.value) {
+    hlNotePopup.value = { ...hlNotePopup.value, x: hlNotePopup.value.x - dx, y: hlNotePopup.value.y - dy }
+  }
+  if (hlColorPopup.value) {
+    hlColorPopup.value = { ...hlColorPopup.value, x: hlColorPopup.value.x - dx, y: hlColorPopup.value.y - dy }
+  }
 }
 
 function updateDisplayChapter() {
@@ -2202,6 +2234,8 @@ defineExpose({ closeToList: handleBack })
   margin: 6px 0;
   overflow-x: auto;
   overflow-y: hidden;
+  /* padding-top too, or the overflow box clips superscripts/roots. */
+  padding-top: 0.25em;
   padding-bottom: 2px;
 }
 .hl-note-text :deep(.katex-display > .katex) { font-size: 1.08em; }

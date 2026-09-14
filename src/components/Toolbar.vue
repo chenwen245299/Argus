@@ -80,6 +80,7 @@ const { aiSummaryJobs, aiMetaSlug, aiMetaStage, abstractSlug } = storeToRefs(pap
 
 const props = defineProps<{
   leftSidebarWidth?: number
+  leftSidebarOpen?: boolean
   rightSidebarOpen?: boolean
   rightSidebarWidth?: number
   sidebarTab?: string
@@ -621,6 +622,7 @@ function aiSummaryDetail(slug: string, job: AiSummaryJob): string {
   if (job.fulltextChars) parts.push(t('paper.summaryFulltextChars', { count: formatSummaryCount(job.fulltextChars) }))
   if (job.contextChars) parts.push(t('paper.summaryContextChars', { count: formatSummaryCount(job.contextChars) }))
   if (job.truncated) parts.push(t('paper.summaryTruncated'))
+  if (job.notice) parts.push(job.notice)
   if (job.message) parts.push(job.message)
   return `${paperTaskTitle(slug)}\n${parts.filter(Boolean).join('\n')}`
 }
@@ -822,18 +824,22 @@ onUnmounted(() => {
 
 <template>
   <div class="toolbar">
-    <div class="left-toolbar-reserve" :style="leftReserveStyle">
-      <!-- Left: vault picker button -->
-      <button class="lib-path-btn" @click="library.pickAndOpen()" :title="t('toolbar.switchTitle')">
-        <!-- Home icon -->
-        <Icon icon="fluent:home-24-regular" class="vault-icon" width="16" height="16" />
-        <span class="path-text">
-          {{ library.currentPath ? shortPath(library.currentPath) : t('toolbar.noLibrary') }}
-        </span>
-        <span v-if="library.isRefreshing" class="scan-dot" title="正在同步…" />
-        <Icon v-else icon="fluent:chevron-down-24-regular" class="chevron-icon" width="12" height="12" />
-      </button>
-    </div>
+    <!-- Collapses/expands its width in sync with the left sidebar panel below
+         (toggle lives in the title bar), mirroring the right reserve. -->
+    <Transition name="left-toolbar">
+      <div v-if="props.leftSidebarOpen" class="left-toolbar-reserve" :style="leftReserveStyle">
+        <!-- Left: vault picker button -->
+        <button class="lib-path-btn" @click="library.pickAndOpen()" :title="t('toolbar.switchTitle')">
+          <!-- Home icon -->
+          <Icon icon="fluent:home-24-regular" class="vault-icon" width="16" height="16" />
+          <span class="path-text">
+            {{ library.currentPath ? shortPath(library.currentPath) : t('toolbar.noLibrary') }}
+          </span>
+          <span v-if="library.isRefreshing" class="scan-dot" title="正在同步…" />
+          <Icon v-else icon="fluent:chevron-down-24-regular" class="chevron-icon" width="12" height="12" />
+        </button>
+      </div>
+    </Transition>
 
     <!-- Center: shrinkable section — clips horizontally so the right reserve
          (and its border) stays aligned with the sidebar below on narrow windows -->
@@ -1253,6 +1259,23 @@ onUnmounted(() => {
   padding: 0 10px 0 14px;
   border-right: 1px solid var(--border-default);
   box-sizing: border-box;
+  overflow: hidden;
+  will-change: width, opacity;
+}
+
+/* Collapse/expand in sync with the left sidebar panel below (see MainView .left-panel). */
+.left-toolbar-enter-active,
+.left-toolbar-leave-active {
+  transition:
+    width 0.18s ease,
+    min-width 0.18s ease,
+    opacity 0.14s ease;
+}
+.left-toolbar-enter-from,
+.left-toolbar-leave-to {
+  width: 0 !important;
+  min-width: 0 !important;
+  opacity: 0;
 }
 
 /* Vault picker button (left side) */

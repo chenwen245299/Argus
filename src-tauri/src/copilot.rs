@@ -665,8 +665,8 @@ pub async fn chat_with_paper_on_event(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     web_search: bool,
 ) -> Result<String, String> {
-    let (provider, api_key, model) =
-        ai_manager::resolve_provider_model(root, provider_id, model_id)?;
+    let (provider, api_key, model, _fallback) =
+        ai_manager::resolve_provider_model_or_default(root, provider_id, model_id)?;
 
     let meta = paper::read_meta(root, slug).ok();
 
@@ -858,8 +858,8 @@ pub async fn chat_with_library(
 ) -> Result<String, String> {
     use tauri::Emitter;
 
-    let (provider, api_key, model) =
-        ai_manager::resolve_provider_model(root, provider_id, model_id)?;
+    let (provider, api_key, model, _fallback) =
+        ai_manager::resolve_provider_model_or_default(root, provider_id, model_id)?;
 
     let use_snippets = knowledge_source.map_or(false, |s| s == "snippets");
     let use_selected_papers = knowledge_source.map_or(false, |s| s == "papers");
@@ -2139,8 +2139,8 @@ pub async fn chat_with_library_agent(
     // The vision flag is resolved the same way the loop resolved it, for the
     // same reason — a tools block missing `view_paper_page` in one place and
     // carrying it in the other is two different prefixes.
-    let vision = ai_manager::resolve_provider_model(root, provider_id, model_id)
-        .map(|(provider, _, model)| model_sees_images(&provider, &model))
+    let vision = ai_manager::resolve_provider_model_or_default(root, provider_id, model_id)
+        .map(|(provider, _, model, _)| model_sees_images(&provider, &model))
         .unwrap_or(false);
     let tool_defs = agent_tool_defs(&bridge, vision, canvas_id.is_some());
     bridge.shutdown().await;
@@ -2185,8 +2185,8 @@ fn arm_cache_keepalive(
         crate::cache_keepalive::disarm_and_announce(app);
         return;
     }
-    let Ok((provider, api_key, model)) =
-        ai_manager::resolve_provider_model(root, provider_id, model_id)
+    let Ok((provider, api_key, model, _fallback)) =
+        ai_manager::resolve_provider_model_or_default(root, provider_id, model_id)
     else {
         return;
     };
@@ -2390,8 +2390,8 @@ async fn run_agent_loop(
 ) -> Result<String, String> {
     use tauri::Emitter;
 
-    let (provider, api_key, model) =
-        ai_manager::resolve_provider_model(root, provider_id, model_id)?;
+    let (provider, api_key, model, _fallback) =
+        ai_manager::resolve_provider_model_or_default(root, provider_id, model_id)?;
 
     if !llm::supports_tool_calling(&provider) {
         return Err(format!(

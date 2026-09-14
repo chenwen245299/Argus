@@ -88,6 +88,7 @@ const showSettings = ref(false)
 const settingsAiSection = ref(false)  // true = open settings on AI Services tab
 const settingsSection = ref<string | undefined>(undefined)  // explicit section to open on
 const MAIN_LEFT_WIDTH_KEY = 'argus:layout:left-width'
+const MAIN_LEFT_VISIBLE_KEY = 'argus:layout:left-visible'
 const MAIN_RIGHT_WIDTH_KEY = 'argus:layout:right-width'
 const MAIN_RIGHT_VISIBLE_KEY = 'argus:layout:right-visible'
 const MAIN_RIGHT_TAB_KEY = 'argus:layout:right-tab'
@@ -135,6 +136,7 @@ function saveLayoutNumber(key: string, value: number) {
 
 interface MainLayoutState {
   leftWidth?: number
+  leftVisible?: boolean
   rightWidth?: number
   rightVisible?: boolean
   rightTab?: string
@@ -146,6 +148,7 @@ let isRestoringMainLayout = false
 function readLegacyMainLayout(): MainLayoutState {
   return {
     leftWidth: loadLayoutNumber(MAIN_LEFT_WIDTH_KEY, DEFAULT_LEFT_WIDTH, MIN_LEFT_WIDTH, MAX_LEFT_WIDTH),
+    leftVisible: loadLayoutBoolean(MAIN_LEFT_VISIBLE_KEY, true),
     rightWidth: loadLayoutNumber(MAIN_RIGHT_WIDTH_KEY, DEFAULT_RIGHT_WIDTH, MIN_RIGHT_WIDTH, MAX_RIGHT_WIDTH),
     rightVisible: loadLayoutBoolean(MAIN_RIGHT_VISIBLE_KEY, true),
     rightTab: loadSidebarTab(),
@@ -157,6 +160,7 @@ function normalizeMainLayout(input: unknown): MainLayoutState | null {
   const raw = input as MainLayoutState
   return {
     leftWidth: Number.isFinite(raw.leftWidth) ? Math.min(MAX_LEFT_WIDTH, Math.max(MIN_LEFT_WIDTH, Number(raw.leftWidth))) : undefined,
+    leftVisible: typeof raw.leftVisible === 'boolean' ? raw.leftVisible : undefined,
     rightWidth: Number.isFinite(raw.rightWidth) ? Math.min(MAX_RIGHT_WIDTH, Math.max(MIN_RIGHT_WIDTH, Number(raw.rightWidth))) : undefined,
     rightVisible: typeof raw.rightVisible === 'boolean' ? raw.rightVisible : undefined,
     rightTab: raw.rightTab && PAPER_TABS.includes(raw.rightTab) ? raw.rightTab : undefined,
@@ -167,6 +171,7 @@ function applyMainLayout(layout: MainLayoutState | null) {
   if (!layout) return
   isRestoringMainLayout = true
   if (layout.leftWidth) leftWidth.value = layout.leftWidth
+  if (typeof layout.leftVisible === 'boolean') leftSidebarVisible.value = layout.leftVisible
   if (layout.rightWidth) rightWidth.value = layout.rightWidth
   if (typeof layout.rightVisible === 'boolean') rightSidebarVisible.value = layout.rightVisible
   if (layout.rightTab) sidebarTab.value = layout.rightTab
@@ -192,6 +197,7 @@ function saveMainLayout(path = libraryStore.currentPath) {
   if (!path || isRestoringMainLayout) return
   const layout: MainLayoutState = {
     leftWidth: Math.round(leftWidth.value),
+    leftVisible: leftSidebarVisible.value,
     rightWidth: Math.round(rightWidth.value),
     rightVisible: rightSidebarVisible.value,
     rightTab: PAPER_TABS.includes(sidebarTab.value) ? sidebarTab.value : 'metadata',
@@ -205,6 +211,7 @@ function saveMainLayout(path = libraryStore.currentPath) {
     .catch(e => console.error('[main] save ui_state layout failed:', e))
 }
 
+const leftSidebarVisible = ref(loadLayoutBoolean(MAIN_LEFT_VISIBLE_KEY, true))
 const rightSidebarVisible = ref(loadLayoutBoolean(MAIN_RIGHT_VISIBLE_KEY, true))
 const sidebarTab = ref<string>(loadSidebarTab())
 // Slugs whose viewer has been created ("materialized"). A tab is materialized
@@ -857,6 +864,13 @@ watch(
   { deep: true, immediate: true }
 )
 
+watch(leftSidebarVisible, (visible) => {
+  try {
+    localStorage.setItem(MAIN_LEFT_VISIBLE_KEY, String(visible))
+  } catch {}
+  saveMainLayout()
+})
+
 watch(rightSidebarVisible, (visible) => {
   try {
     localStorage.setItem(MAIN_RIGHT_VISIBLE_KEY, String(visible))
@@ -950,11 +964,14 @@ watch(
          needs no per-workspace props: every tab kind lives in `reader.tabs`. -->
     <TabBar
       :right-sidebar-open="rightSidebarVisible"
+      :left-sidebar-open="leftSidebarVisible"
       @toggle-right-sidebar="rightSidebarVisible = !rightSidebarVisible"
+      @toggle-left-sidebar="leftSidebarVisible = !leftSidebarVisible"
     />
 
     <Toolbar
       :left-sidebar-width="leftWidth"
+      :left-sidebar-open="leftSidebarVisible"
       :right-sidebar-open="rightSidebarVisible"
       :right-sidebar-width="rightWidth"
       :sidebar-tab="sidebarTab"
@@ -964,24 +981,32 @@ watch(
     />
 
     <div class="columns">
-      <LeftSidebar
-        v-model:show-settings="showSettings"
-        :snippet-library-visible="showSnippetLibrary"
-        :active-snippet-library-id="activeSnippetLibraryId"
-        :active-workspace="activeWorkspace"
-        :style="{ width: leftWidth + 'px', minWidth: leftWidth + 'px' }"
-        @switch-workspace="onSwitchWorkspace"
-        @open-canvas="onOpenCanvas"
-        @open-snippet-library="onOpenSnippetLibrary"
-        @open-writing="onOpenWritingList"
-      />
+      <Transition name="left-panel">
+        <div
+          v-if="leftSidebarVisible"
+          class="left-panel-wrap"
+          :style="{ width: (leftWidth + 1) + 'px', minWidth: (leftWidth + 1) + 'px' }"
+        >
+          <LeftSidebar
+            v-model:show-settings="showSettings"
+            class="left-sidebar-panel"
+            :snippet-library-visible="showSnippetLibrary"
+            :active-snippet-library-id="activeSnippetLibraryId"
+            :active-workspace="activeWorkspace"
+            @switch-workspace="onSwitchWorkspace"
+            @open-canvas="onOpenCanvas"
+            @open-snippet-library="onOpenSnippetLibrary"
+            @open-writing="onOpenWritingList"
+          />
 
-      <div
-        class="divider"
-        :class="{ active: activeResizeSide === 'left' }"
-        @mousedown.prevent="startResize('left', $event)"
-        title="Drag to resize"
-      />
+          <div
+            class="divider"
+            :class="{ active: activeResizeSide === 'left' }"
+            @mousedown.prevent="startResize('left', $event)"
+            title="Drag to resize"
+          />
+        </div>
+      </Transition>
 
       <div class="paper-list-col center-col">
         <!-- One live viewer per open tab, created lazily on first view and kept
@@ -1291,6 +1316,36 @@ watch(
   background: var(--bg-primary);
 }
 .workspace-empty p { margin: 0; font-size: var(--font-size-sm); }
+
+.left-panel-wrap {
+  display: flex;
+  flex-shrink: 0;
+  overflow: hidden;
+  will-change: width, min-width, opacity;
+  align-self: stretch;
+  height: 100%;
+}
+
+.left-sidebar-panel {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
+.left-panel-enter-active,
+.left-panel-leave-active {
+  transition:
+    width 0.18s ease,
+    min-width 0.18s ease,
+    opacity 0.14s ease;
+}
+
+.left-panel-enter-from,
+.left-panel-leave-to {
+  width: 0 !important;
+  min-width: 0 !important;
+  opacity: 0;
+}
 
 .right-panel-wrap {
   display: flex;

@@ -347,12 +347,12 @@ pub fn resolve_provider_model(
                 .default_provider_id
                 .clone()
                 .filter(|s| !s.is_empty())
-                .ok_or("No AI provider configured. Please add a provider in Settings → AI Services.")?;
+                .ok_or("尚未配置 AI 服务商，请在「设置 → AI 服务」中添加。")?;
             let m = settings
                 .default_model_id
                 .clone()
                 .filter(|s| !s.is_empty())
-                .ok_or("No default model configured. Please select a model in Settings → AI Services.")?;
+                .ok_or("尚未设置默认模型，请在「设置 → AI 服务」中把某个模型设为默认。")?;
             (p, m)
         }
     };
@@ -361,18 +361,186 @@ pub fn resolve_provider_model(
         .providers
         .iter()
         .find(|p| p.id == pid && p.enabled)
-        .ok_or_else(|| format!("Provider '{pid}' not found or is disabled."))?
-        .clone();
+        .cloned()
+        .ok_or_else(|| {
+            provider_unavailable_reason(&settings, &pid)
+                + "请在「设置 → AI 服务」中重新选择或重新启用后再试。"
+        })?;
 
     // Ollama runs locally and is normally keyless, so an empty key is valid.
     let key = get_api_key(root, &pid)
         .or_else(|| (provider.kind == "ollama").then(String::new))
         .ok_or_else(|| {
             format!(
-                "No API key set for '{}'. Configure it in Settings → AI Services.",
+                "尚未为「{}」配置 API Key，请在「设置 → AI 服务」中填写。",
                 provider.name
             )
         })?;
 
     Ok((provider, key, mid))
+}
+
+/// A short, human-facing reason a provider id can't be resolved right now. Prefers
+/// the provider's display *name* over the opaque UUID, and distinguishes "disabled"
+/// (a toggle the user can flip back) from "gone" (the id no longer exists — e.g. the
+/// provider was deleted, or removed and re-added under a fresh id, leaving a stale
+/// per-task selection behind). Ends with a comma so it composes into a longer
+/// sentence.
+fn provider_unavailable_reason(settings: &AiSettings, pid: &str) -> String {
+    match settings.providers.iter().find(|p| p.id == pid) {
+        Some(p) => format!("所选 AI 服务商「{}」已被停用，", p.name),
+        None => "所选 AI 服务商已不存在（可能已被删除或重新添加），".to_string(),
+    }
+}
+
+/// Resolve a provider/model like [`resolve_provider_model`], but when an
+/// *explicitly requested* provider is missing or disabled, transparently fall back
+/// to the configured default provider+model instead of failing. The fourth tuple
+/// element is a human-facing notice describing the fallback (`None` when the request
+/// resolved normally), so the caller can tell the user which model actually ran and
+/// why — a stale per-task provider id is routine config drift, not a software fault,
+/// and should keep the feature working rather than surface a scary error.
+///
+/// Flows that need a capability the default can't satisfy — embeddings above all,
+/// where the default *chat* model is simply not a valid embedding model — must keep
+/// calling [`resolve_provider_model`] directly.
+pub fn resolve_provider_model_or_default(
+    root: &str,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+) -> Result<(AiProvider, String, String, Option<String>), String> {
+    match resolve_provider_model(root, provider_id, model_id) {
+        Ok((provider, key, model)) => Ok((provider, key, model, None)),
+        Err(primary_err) => {
+            let requested_pid = provider_id.filter(|s| !s.is_empty());
+            let has_explicit =
+                requested_pid.is_some() && model_id.map(|s| !s.is_empty()).unwrap_or(false);
+            let settings = read_ai_settings(root);
+
+            // Only fall back when the requested provider is unusable *as a
+            // selection* — missing or disabled. A provider that exists and is
+            // enabled but fails for another reason (e.g. no API key configured) is
+            // a fixable mistake the user should see, not silently paper over with
+            // the default. Checking the provider list directly (rather than
+            // sniffing the error text) also keeps `provider_unavailable_reason`'s
+            // disabled-vs-deleted wording accurate.
+            let stale = has_explicit
+                && requested_pid
+                    .map(|pid| !settings.providers.iter().any(|p| p.id == pid && p.enabled))
+                    .unwrap_or(false);
+            let default_pid = settings
+                .default_provider_id
+                .as_deref()
+                .filter(|s| !s.is_empty());
+            if !stale || requested_pid == default_pid {
+                return Err(primary_err);
+            }
+
+            // Retry with the default provider+model as a unit. If even the default
+            // is unusable, the requested-provider error names what the user actually
+            // picked and is the more useful one to show.
+            let (provider, key, model) =
+                resolve_provider_model(root, None, None).map_err(|_| primary_err)?;
+            let notice = format!(
+                "{}已自动改用默认模型「{} · {}」。",
+                provider_unavailable_reason(&settings, requested_pid.unwrap_or_default()),
+                provider.name,
+                model
+            );
+            Ok((provider, key, model, Some(notice)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AiProvider, AiSettings};
+
+    fn tmp_root(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("argus-aimgr-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().to_string()
+    }
+
+    /// Keyless (Ollama-kind) providers so the tests exercise the *selection*
+    /// resolution without needing the encrypted key store.
+    fn provider(id: &str, name: &str, enabled: bool) -> AiProvider {
+        AiProvider {
+            id: id.into(),
+            name: name.into(),
+            kind: "ollama".into(),
+            base_url: "http://localhost".into(),
+            enabled,
+            models: vec![],
+            server_tools: Default::default(),
+            created_at: String::new(),
+        }
+    }
+
+    fn write(root: &str, providers: Vec<AiProvider>, default: &str) {
+        write_ai_settings(
+            root,
+            &AiSettings {
+                providers,
+                default_provider_id: Some(default.into()),
+                default_model_id: Some("m-default".into()),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn valid_explicit_selection_resolves_without_a_notice() {
+        let root = tmp_root("valid");
+        write(&root, vec![provider("p1", "主力", true)], "p1");
+
+        let (prov, _key, model, notice) =
+            resolve_provider_model_or_default(&root, Some("p1"), Some("m-x")).unwrap();
+        assert_eq!(prov.id, "p1");
+        assert_eq!(model, "m-x");
+        assert!(notice.is_none(), "a working selection must not surface a notice");
+    }
+
+    #[test]
+    fn a_stale_provider_falls_back_to_the_default_model() {
+        let root = tmp_root("stale");
+        write(&root, vec![provider("default", "默认", true)], "default");
+
+        // "ghost" was configured for the task but no longer exists.
+        let (prov, _key, model, notice) =
+            resolve_provider_model_or_default(&root, Some("ghost"), Some("m-ghost")).unwrap();
+        assert_eq!(prov.id, "default", "should fall back to the default provider");
+        assert_eq!(model, "m-default", "should use the default model, not the stale one");
+        let notice = notice.expect("a fallback notice should be surfaced");
+        assert!(notice.contains("默认"), "notice names the model it used: {notice}");
+    }
+
+    #[test]
+    fn a_disabled_provider_falls_back_and_says_so() {
+        let root = tmp_root("disabled");
+        write(
+            &root,
+            vec![provider("picked", "被停用的", false), provider("default", "默认", true)],
+            "default",
+        );
+
+        let (prov, _key, model, notice) =
+            resolve_provider_model_or_default(&root, Some("picked"), Some("m-picked")).unwrap();
+        assert_eq!(prov.id, "default");
+        assert_eq!(model, "m-default");
+        assert!(notice.unwrap().contains("停用"), "disabled must be named as such");
+    }
+
+    #[test]
+    fn a_stale_default_is_not_papered_over() {
+        // When the default itself is the stale selection there is nothing to fall
+        // back to — surface the friendly error instead of looping.
+        let root = tmp_root("staledefault");
+        write(&root, vec![provider("other", "其它", true)], "gone");
+
+        let err = resolve_provider_model_or_default(&root, Some("gone"), Some("m")).unwrap_err();
+        assert!(err.contains("不存在") || err.contains("停用"), "friendly error: {err}");
+        assert!(!err.contains("ghost") && !err.contains("gone"), "no raw UUID leaks: {err}");
+    }
 }

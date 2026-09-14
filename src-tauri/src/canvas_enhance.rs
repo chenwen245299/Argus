@@ -396,8 +396,8 @@ async fn suggest_from_ai(
     provider_id: Option<&str>,
     model_id: Option<&str>,
 ) -> Result<Vec<SuggestedEdge>, String> {
-    let (provider, api_key, model) =
-        ai_manager::resolve_provider_model(root, provider_id, model_id)?;
+    let (provider, api_key, model, _fallback) =
+        ai_manager::resolve_provider_model_or_default(root, provider_id, model_id)?;
 
     let papers_text = metas
         .iter()

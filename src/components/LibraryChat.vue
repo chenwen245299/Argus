@@ -6000,6 +6000,9 @@ onUnmounted(() => {
 .markdown-body :deep(.katex-display) {
   overflow-x: auto;
   overflow-y: hidden;
+  /* Pad top/bottom so superscripts/roots aren't clipped by the overflow box. */
+  padding-top: 0.25em;
+  padding-bottom: 0.2em;
   margin: 0.6em 0;
 }
 

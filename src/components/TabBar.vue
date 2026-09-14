@@ -17,9 +17,11 @@ const collections = useCollectionsStore()
 
 const props = defineProps<{
   rightSidebarOpen?: boolean
+  leftSidebarOpen?: boolean
 }>()
 const emit = defineEmits<{
   'toggle-right-sidebar': []
+  'toggle-left-sidebar': []
 }>()
 
 /** Per-kind tab chrome. Feature tabs used to be three hand-written blocks; they
@@ -319,6 +321,17 @@ async function closeWindow() {
     <!-- Space for macOS traffic lights (~76px) — draggable -->
     <div class="tl-space" data-tauri-drag-region @mousedown="startDrag" />
 
+    <!-- Left-sidebar toggle — mirrors the right-sidebar toggle at the far right. -->
+    <button
+      class="titlebar-toggle-btn tl-left-toggle"
+      :class="{ active: props.leftSidebarOpen }"
+      :title="props.leftSidebarOpen ? t('pdf.hideSidebar') : t('pdf.showSidebar')"
+      @mousedown.stop
+      @click="emit('toggle-left-sidebar')"
+    >
+      <Icon icon="fluent:panel-left-24-regular" width="19" height="19" />
+    </button>
+
     <!-- Tabs -->
     <div ref="tabsScrollRef" class="tabs-scroll">
       <!-- Permanent home tab: always first, never dragged, never closed. It is
@@ -538,6 +551,7 @@ async function closeWindow() {
 <style scoped>
 .titlebar {
   --traffic-space: 76px;
+  --left-toggle-space: 34px;
   --right-controls-space: 60px;
   height: 38px;
   display: flex;
@@ -595,6 +609,14 @@ async function closeWindow() {
 .titlebar-toggle-btn:hover { background: var(--bg-hover); color: var(--text-secondary); }
 .titlebar-toggle-btn.active { color: var(--accent); }
 
+/* The left toggle sits directly in the (stretch-aligned) titlebar, so it needs to
+   center itself and stay out of the drag region. */
+.tl-left-toggle {
+  align-self: center;
+  flex-shrink: 0;
+  margin-left: 2px;
+}
+
 .window-controls {
   align-self: stretch;
   display: flex;
@@ -632,7 +654,7 @@ async function closeWindow() {
   align-items: stretch;
   overflow-x: auto;
   overflow-y: hidden;
-  max-width: calc(100% - var(--traffic-space) - var(--right-controls-space));
+  max-width: calc(100% - var(--traffic-space) - var(--left-toggle-space) - var(--right-controls-space));
   scrollbar-width: none;
   -webkit-app-region: no-drag;
   padding: 5px 3px 0;

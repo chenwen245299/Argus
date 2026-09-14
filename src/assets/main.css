@@ -248,8 +248,18 @@ input, textarea, select {
 .svg-code-block .svg-preview-area svg { max-width: 100%; height: auto; }
 .svg-source-pre { margin: 0; }
 
-/* KaTeX display math centering */
-.katex-display { overflow-x: auto; }
+/* KaTeX display math: wide formulas scroll horizontally, but the block must be
+   padded vertically so tall glyphs (superscripts, roots, fractions) aren't
+   clipped. Setting overflow-x alone makes the browser compute overflow-y to
+   `auto`, turning the block into a vertical clip box that shaves the top off
+   superscripts — so pin overflow-y explicitly and give the ink some breathing
+   room top and bottom. */
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-top: 0.25em;
+  padding-bottom: 0.2em;
+}
 
 /* hljs: transparent background so code blocks use our own bg.
    Per-theme dark-mode hljs palettes live in themes.css. */

@@ -809,8 +809,8 @@ pub async fn analyze_single(
         .as_deref()
         .ok_or("未配置 AI 模型，请前往设置 → arXiv 配置")?;
 
-    let (provider, api_key, model) =
-        ai_manager::resolve_provider_model(root, Some(provider_id), Some(model_id))?;
+    let (provider, api_key, model, _fallback) =
+        ai_manager::resolve_provider_model_or_default(root, Some(provider_id), Some(model_id))?;
 
     let keywords = if config.keywords.is_empty() {
         "machine learning, AI research".to_string()
@@ -927,8 +927,8 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
         .as_deref()
         .ok_or("No AI model configured for arXiv analysis. Go to Settings → arXiv.")?;
 
-    let (provider, api_key, model) =
-        ai_manager::resolve_provider_model(root, Some(provider_id), Some(model_id))?;
+    let (provider, api_key, model, _fallback) =
+        ai_manager::resolve_provider_model_or_default(root, Some(provider_id), Some(model_id))?;
 
     let keywords = if config.keywords.is_empty() {
         "machine learning, AI research".to_string()

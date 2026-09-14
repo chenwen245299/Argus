@@ -908,5 +908,8 @@ function fmtDate(iso: string) {
 .notes-preview .katex-display {
   overflow-x: auto;
   overflow-y: hidden;
+  /* Pad top/bottom so superscripts/roots aren't clipped by the overflow box. */
+  padding-top: 0.25em;
+  padding-bottom: 0.2em;
 }
 </style>

@@ -710,29 +710,102 @@ function destOffsetY(viewport: any, explicitDest: any[]): number {
   }
 }
 
-function linkifyTextLayer(textLayer: HTMLDivElement, overlay: HTMLDivElement) {
+/** Do two rects overlap by a meaningful fraction (ignoring hairline edge touches)? */
+function rectsOverlap(a: DOMRect, b: DOMRect): boolean {
+  const ix = Math.min(a.right, b.right) - Math.max(a.left, b.left)
+  const iy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top)
+  if (ix <= 1 || iy <= 1) return false
+  const smaller = Math.min(a.width * a.height, b.width * b.height)
+  return smaller > 0 && (ix * iy) / smaller > 0.3
+}
+
+function linkifyTextLayer(
+  textLayer: HTMLDivElement,
+  overlay: HTMLDivElement,
+  annotationLayer?: HTMLDivElement,
+) {
   const spans = Array.from(textLayer.querySelectorAll('span')).filter(
     s => !s.querySelector('span')
   ) as HTMLSpanElement[]
   const overlayRect = overlay.getBoundingClientRect()
+
+  // Rects already owned by real PDF link annotations (hyperref etc.). A wrapped
+  // URL keeps ONE annotation carrying the full target across both lines; laying a
+  // second, line-truncated linkify box on top of it would steal the click and send
+  // the user to just the first line's fragment. Skip anything an annotation covers.
+  const annotationRects: DOMRect[] = annotationLayer
+    ? Array.from(annotationLayer.querySelectorAll<HTMLElement>('a')).map(a =>
+        a.getBoundingClientRect()
+      )
+    : []
+  const coveredByAnnotation = (r: DOMRect) => annotationRects.some(a => rectsOverlap(a, r))
+
+  // Text nodes in reading order so a URL broken across lines can be stitched back
+  // together from the following span(s).
+  const nodes = spans.map(s =>
+    s.firstChild?.nodeType === Node.TEXT_NODE ? (s.firstChild as Text) : null
+  )
+
   const urlRegex = /https?:\/\/[^\s<>"{}|\\^`[\]]+/gi
-  for (const span of spans) {
-    const text = span.textContent ?? ''
+  for (let i = 0; i < spans.length; i++) {
+    const node = nodes[i]
+    if (!node) continue
+    const text = node.data
     let match: RegExpExecArray | null
+    urlRegex.lastIndex = 0
     while ((match = urlRegex.exec(text)) !== null) {
-      const rawUrl = match[0]
-      // Strip trailing punctuation that is part of sentence grammar, not the URL.
-      const url = rawUrl.replace(/[.,;:!?)\]}"'`]+$/, '')
-      if (!url) continue
       const start = match.index
-      const end = start + url.length
-      const textNode = span.firstChild
-      if (!textNode || textNode.nodeType !== Node.TEXT_NODE) continue
-      const range = document.createRange()
-      range.setStart(textNode, start)
-      range.setEnd(textNode, end)
-      for (const rect of range.getClientRects()) {
-        createTextLinkOverlay(overlay, rect, overlayRect, url)
+      const firstEnd = start + match[0].length
+      // Clickable ranges making up this (possibly multi-line) URL.
+      const pieces: { node: Text; start: number; end: number }[] = [
+        { node, start, end: firstEnd },
+      ]
+      let full = match[0]
+
+      // Follow the URL onto the next line(s) when it was broken mid-token. A break
+      // leaves the fragment flush against the end of its line (nothing after it),
+      // so only pursue continuations when the match reaches the end of the span.
+      let k = i
+      let reachedEnd = firstEnd === text.length
+      while (reachedEnd) {
+        const nextNode = nodes[k + 1]
+        const nextSpan = spans[k + 1]
+        if (!nextNode || !nextSpan) break
+        // The continuation must sit on a lower line (a wrap), not later on the same
+        // line — that filters out prose that merely follows a complete URL.
+        const curTop = spans[k].getBoundingClientRect().top
+        const nextTop = nextSpan.getBoundingClientRect().top
+        if (nextTop <= curTop + 1) break
+        const nextText = nextNode.data
+        const tok = nextText.match(/^\S+/)?.[0] ?? ''
+        if (!tok) break
+        if (/^https?:\/\//i.test(tok)) break // a fresh URL (e.g. a reference list), not a continuation
+        if (!/\/|\.[A-Za-z0-9]/.test(tok)) break // doesn't look like a domain/path continuation
+        full += tok
+        pieces.push({ node: nextNode, start: 0, end: tok.length })
+        reachedEnd = tok.length === nextText.length // whole next line was URL → it may wrap again
+        k++
+      }
+
+      // Strip trailing sentence punctuation from the assembled URL (safe now — any
+      // mid-URL dots that caused the line break are interior, not trailing).
+      const stripped = full.replace(/[.,;:!?)\]}"'`]+$/, '')
+      const dropped = full.length - stripped.length
+      if (!stripped) continue
+      if (dropped > 0) {
+        const last = pieces[pieces.length - 1]
+        last.end = Math.max(last.start, last.end - dropped)
+        if (last.end === last.start) pieces.pop()
+      }
+
+      for (const p of pieces) {
+        const range = document.createRange()
+        range.setStart(p.node, p.start)
+        range.setEnd(p.node, p.end)
+        for (const rect of range.getClientRects()) {
+          if (coveredByAnnotation(rect)) continue
+          createTextLinkOverlay(overlay, rect, overlayRect, stripped)
+        }
       }
     }
   }
@@ -1160,7 +1233,7 @@ async function renderPage(idx: number) {
     el.appendChild(linkifyDiv)
     appended.push(linkifyDiv)
     try {
-      linkifyTextLayer(textLayerDiv, linkifyDiv)
+      linkifyTextLayer(textLayerDiv, linkifyDiv, annotationLayerDiv)
     } catch (e) {
       console.warn('Linkify text layer failed:', e)
     }
@@ -1385,8 +1458,40 @@ async function ensurePageRendered(pageIndex: number) {
 function onScroll() {
   updateDisplayPage()
   showScrollThumbs()
+  repositionAnchoredPopups()
   if (progressDebounce) clearTimeout(progressDebounce)
   progressDebounce = setTimeout(flushReadingState, 700)
+}
+
+// The selection toolbar and highlight popups are `position: fixed` at viewport
+// coordinates, anchored to content (a text selection or a highlight). The content
+// scrolls 1:1 in the viewport but a fixed popup does not, so without this it ends
+// up stranded over unrelated text. Shift every open popup by the scroll delta to
+// keep it glued to its anchor; if the anchor scrolls off-screen the popup goes with
+// it (no clamping — clamping would re-detach it from the anchor).
+let lastPopupScrollTop = 0
+let lastPopupScrollLeft = 0
+function repositionAnchoredPopups() {
+  const el = containerRef.value
+  if (!el) return
+  const dx = el.scrollLeft - lastPopupScrollLeft
+  const dy = el.scrollTop - lastPopupScrollTop
+  lastPopupScrollTop = el.scrollTop
+  lastPopupScrollLeft = el.scrollLeft
+  if (!dx && !dy) return
+  if (selectionPopup.value) {
+    selectionPopup.value = {
+      ...selectionPopup.value,
+      x: selectionPopup.value.x - dx,
+      y: selectionPopup.value.y - dy,
+    }
+  }
+  if (hlNotePopup.value) {
+    hlNotePopup.value = { ...hlNotePopup.value, x: hlNotePopup.value.x - dx, y: hlNotePopup.value.y - dy }
+  }
+  if (hlColorPopup.value) {
+    hlColorPopup.value = { ...hlColorPopup.value, x: hlColorPopup.value.x - dx, y: hlColorPopup.value.y - dy }
+  }
 }
 
 function measureScrollThumb(clientSize: number, scrollSize: number, scrollOffset: number) {
@@ -3039,6 +3144,8 @@ function triggerInitialRender() {
   margin: 6px 0;
   overflow-x: auto;
   overflow-y: hidden;
+  /* padding-top too, or the overflow box clips superscripts/roots. */
+  padding-top: 0.25em;
   padding-bottom: 2px;
 }
 .hl-note-text :deep(.katex-display > .katex) { font-size: 1.08em; }

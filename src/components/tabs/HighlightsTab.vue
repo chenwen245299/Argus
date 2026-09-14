@@ -204,7 +204,7 @@ function colorStyle(color: string, alpha = 0.35): string {
 .hl-note :deep(pre) { max-width: 100%; overflow-x: auto; }
 .hl-note :deep(.md-code-block) { margin: 4px 0; }
 .hl-note :deep(.katex) { font-size: 1.05em; }
-.hl-note :deep(.katex-display) { margin: 4px 0; overflow-x: auto; overflow-y: hidden; }
+.hl-note :deep(.katex-display) { margin: 4px 0; overflow-x: auto; overflow-y: hidden; padding-top: 0.25em; padding-bottom: 0.2em; }
 .hl-note :deep(.katex-display > .katex) { font-size: 1.1em; }
 
 .hl-actions { display: flex; gap: 4px; flex-wrap: wrap; }

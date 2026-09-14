@@ -32,6 +32,9 @@ export interface AiSummaryJob {
   elapsedSeconds?: number
   truncated?: boolean
   message?: string
+  // Set when the configured provider was stale (disabled/deleted) and the backend
+  // fell back to the default model. Informational, not an error.
+  notice?: string
 }
 
 export interface AiSummaryProgressEvent {
@@ -43,6 +46,7 @@ export interface AiSummaryProgressEvent {
   model?: string
   elapsed_seconds?: number
   truncated?: boolean
+  notice?: string
 }
 
 export const usePaperTasksStore = defineStore('paperTasks', () => {
@@ -108,6 +112,7 @@ export const usePaperTasksStore = defineStore('paperTasks', () => {
         model: payload.model ?? existing?.model,
         elapsedSeconds: payload.elapsed_seconds ?? existing?.elapsedSeconds,
         truncated: payload.truncated ?? existing?.truncated,
+        notice: payload.notice ?? existing?.notice,
       })
     })
   }

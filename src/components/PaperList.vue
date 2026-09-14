@@ -958,15 +958,22 @@ async function copyPaperPdf(item: PaperIndexEntry) {
   }
 }
 
-// ── Inline error notification ─────────────────────────────────────────────────
+// ── Inline notification ───────────────────────────────────────────────────────
+// One toast, two severities: 'error' (red) for failures, 'info' (neutral) for
+// non-fatal notices like "fell back to the default model".
 const actionError = ref<string | null>(null)
+const actionErrorKind = ref<'error' | 'info'>('error')
 let errorTimer: ReturnType<typeof setTimeout> | null = null
 
-function showError(msg: string) {
+function showToastMsg(msg: string, kind: 'error' | 'info') {
   if (errorTimer) clearTimeout(errorTimer)
   actionError.value = msg
+  actionErrorKind.value = kind
   errorTimer = setTimeout(() => { actionError.value = null }, 6000)
 }
+
+function showError(msg: string) { showToastMsg(msg, 'error') }
+function showNotice(msg: string) { showToastMsg(msg, 'info') }
 
 // ── Export literature list as PDF ─────────────────────────────────────────────
 const exportBusy = ref(false)
@@ -1232,6 +1239,8 @@ async function generateAiSummary(item: PaperIndexEntry) {
   if (isAiSummaryButtonDisabled(item)) return
   try {
     await streamSummary(item, true)
+    const notice = aiSummaryJobs.value[item.slug]?.notice
+    if (notice) showNotice(notice)
     await library.refresh()
   } catch (e: unknown) {
     showError(String(e))
@@ -1337,6 +1346,10 @@ async function analyzeBatch() {
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, targets.length) }, () => drain()))
+  // Surface the fallback once for the whole batch — every paper that fell back
+  // used the same default model, so one toast is enough.
+  const fallbackNotice = targets.map(p => aiSummaryJobs.value[p.slug]?.notice).find(Boolean)
+  if (fallbackNotice) showNotice(fallbackNotice)
   await library.refresh()
 }
 
@@ -1429,8 +1442,8 @@ async function deleteBatch() {
 
     <!-- ── Action error toast ─────────────────────────────────────────────── -->
     <Transition name="err-toast">
-      <div v-if="actionError" class="action-error-toast" @click.self="actionError = null">
-        <Icon icon="fluent:error-circle-24-regular" width="14" height="14" style="flex-shrink:0" />
+      <div v-if="actionError" class="action-error-toast" :class="{ 'is-info': actionErrorKind === 'info' }" @click.self="actionError = null">
+        <Icon :icon="actionErrorKind === 'info' ? 'fluent:info-24-regular' : 'fluent:error-circle-24-regular'" width="14" height="14" style="flex-shrink:0" />
         <span>{{ actionError }}</span>
       </div>
     </Transition>
@@ -1982,6 +1995,10 @@ async function deleteBatch() {
 }
 .action-error-toast svg { color: #f87171; flex-shrink: 0; margin-top: 1px; }
 .action-error-toast span { font-size: var(--font-size-sm); color: #fca5a5; line-height: 1.4; word-break: break-word; flex: 1; }
+/* Informational (non-error) variant: neutral slate/blue instead of alarming red. */
+.action-error-toast.is-info { background: #1e293b; border-color: #3b556f; }
+.action-error-toast.is-info svg { color: #7dd3fc; }
+.action-error-toast.is-info span { color: #cbd5e1; }
 .err-toast-enter-active, .err-toast-leave-active { transition: opacity 0.2s, transform 0.2s; }
 .err-toast-enter-from, .err-toast-leave-to { opacity: 0; transform: translateX(-50%) translateY(8px); }
 

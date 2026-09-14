@@ -54,8 +54,14 @@ pub async fn generate_summary(
 
     let configured_provider_id = provider_id.or(app_settings.ai_summary_provider_id.as_deref());
     let configured_model_id = model_id.or(app_settings.ai_summary_model_id.as_deref());
-    let (provider, api_key, model) =
-        ai_manager::resolve_provider_model(root, configured_provider_id, configured_model_id)?;
+    // If the per-task provider was disabled or deleted (stale selection), fall back
+    // to the default model instead of failing, and carry the notice so the user is
+    // told which model actually ran.
+    let (provider, api_key, model, fallback_notice) = ai_manager::resolve_provider_model_or_default(
+        root,
+        configured_provider_id,
+        configured_model_id,
+    )?;
 
     // Use the SAME budget as the chat path so the truncated fulltext — and thus
     // the leading context block — is byte-identical across tasks (cache reuse).
@@ -105,6 +111,7 @@ pub async fn generate_summary(
             "fulltext_chars": fulltext_chars,
             "context_chars": context_chars,
             "truncated": truncated,
+            "notice": fallback_notice,
         }),
     );
 

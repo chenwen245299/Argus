@@ -569,7 +569,7 @@ pub async fn translate_text(
     let root = get_root(&state)?;
     let s = settings::read_settings(&root);
 
-    let (provider, api_key, model) = ai_manager::resolve_provider_model(
+    let (provider, api_key, model, _fallback) = ai_manager::resolve_provider_model_or_default(
         &root,
         s.translate_ai_provider_id.as_deref(),
         s.translate_ai_model_id.as_deref(),
@@ -599,7 +599,7 @@ pub async fn translate_text_stream(
     let root = get_root(&state)?;
     let s = settings::read_settings(&root);
 
-    let (provider, api_key, model) = ai_manager::resolve_provider_model(
+    let (provider, api_key, model, _fallback) = ai_manager::resolve_provider_model_or_default(
         &root,
         s.translate_ai_provider_id.as_deref(),
         s.translate_ai_model_id.as_deref(),
@@ -645,7 +645,7 @@ pub async fn generate_conversation_title(
     let root = get_root(&state)?;
     let s = settings::read_settings(&root);
 
-    let (provider, api_key, model) = ai_manager::resolve_provider_model(
+    let (provider, api_key, model, _fallback) = ai_manager::resolve_provider_model_or_default(
         &root,
         s.title_ai_provider_id.as_deref(),
         s.title_ai_model_id.as_deref(),
@@ -2017,7 +2017,8 @@ pub async fn extract_abstract_ai(
         .as_deref()
         .or(s.abstract_ai_provider_id.as_deref());
     let mdl_id = model_id.as_deref().or(s.abstract_ai_model_id.as_deref());
-    let (provider, api_key, model) = ai_manager::resolve_provider_model(&root, prov_id, mdl_id)?;
+    let (provider, api_key, model, _fallback) =
+        ai_manager::resolve_provider_model_or_default(&root, prov_id, mdl_id)?;
 
     let messages = vec![
         crate::models::ChatMessage {

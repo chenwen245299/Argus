@@ -248,7 +248,8 @@ pub async fn ai_split_sections(
     let s = crate::settings::read_settings(root);
     let pid = provider_id.or(s.sections_ai_provider_id.as_deref());
     let mid = model_id.or(s.sections_ai_model_id.as_deref());
-    let (provider, api_key, model) = crate::ai_manager::resolve_provider_model(root, pid, mid)?;
+    let (provider, api_key, model, _fallback) =
+        crate::ai_manager::resolve_provider_model_or_default(root, pid, mid)?;
 
     let system = if s.sections_ai_prompt.trim().is_empty() {
         crate::models::default_sections_ai_prompt()

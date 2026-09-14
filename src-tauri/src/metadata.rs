@@ -1875,37 +1875,17 @@ pub async fn fetch_metadata_with_ai(
 
     // Load AI config — need both the AiProvider struct (for llm streaming) and the prompt.
     let settings = crate::settings::read_settings(root);
-    let ai_settings = crate::ai_manager::read_ai_settings(root);
 
-    let (provider_id, model_id) = match (
-        settings.metadata_ai_provider_id.as_deref(),
-        settings.metadata_ai_model_id.as_deref(),
-    ) {
-        (Some(pid), Some(mid)) if !pid.is_empty() && !mid.is_empty() => {
-            (pid.to_string(), mid.to_string())
-        }
-        _ => {
-            let pid = ai_settings
-                .default_provider_id
-                .clone()
-                .ok_or("No AI provider configured.")?;
-            let mid = ai_settings
-                .default_model_id
-                .clone()
-                .ok_or("No default model configured.")?;
-            (pid, mid)
-        }
-    };
-
-    let provider = ai_settings
-        .providers
-        .iter()
-        .find(|p| p.id == provider_id && p.enabled)
-        .ok_or_else(|| format!("Provider '{provider_id}' not found or disabled."))?
-        .clone();
-
-    let api_key = crate::ai_manager::get_api_key(root, &provider_id)
-        .ok_or_else(|| format!("No API key set for '{}'.", provider.name))?;
+    // Resolve provider/model as a unit, falling back to the default when the
+    // configured metadata provider is stale (disabled or deleted) rather than
+    // failing with a raw "provider not found".
+    let (provider, api_key, model_id, _fallback) =
+        crate::ai_manager::resolve_provider_model_or_default(
+            root,
+            settings.metadata_ai_provider_id.as_deref(),
+            settings.metadata_ai_model_id.as_deref(),
+        )?;
+    let provider_id = provider.id.clone();
 
     // Build the prompt. The snippet keeps its line breaks: identifying a document
     // depends on seeing that the title stands alone above the authors, not buried

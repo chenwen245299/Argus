@@ -81,6 +81,10 @@ export const useLibraryStore = defineStore('library', () => {
 
       // Phase 3: keep up with edits synced in from other machines.
       _watchExternalChanges()
+
+      // Phase 4: safety-net reconcile for when the OS file watcher misses a change
+      // (iCloud/Dropbox events are unreliable for files synced in from elsewhere).
+      _startDiskReconcile()
     } catch (e) {
       error.value = String(e)
       isLoading.value = false
@@ -117,6 +121,50 @@ export const useLibraryStore = defineStore('library', () => {
         }
       },
     )
+  }
+
+  // ── Disk reconcile safety net ──────────────────────────────────────────────
+  // The OS watcher above is the fast path, but FSEvents is unreliable for files a
+  // sync client (iCloud/Dropbox) lands from another device — the event may fire on
+  // an `.icloud` placeholder we ignore, arrive before the data materialises, or not
+  // fire at all. So back it up two ways:
+  //   • whenever the window regains focus — the moment a returning user most expects
+  //     to see edits made elsewhere — do a full reconcile (list + open tabs);
+  //   • a low-frequency background poll for when Argus stays focused while a sync
+  //     lands. The poll only re-scans the list; it must NOT re-read open tabs, which
+  //     could clobber the reading position of a paper being actively scrolled.
+  // `scan_library` is incremental (meta.json mtimes are cached) so both are cheap.
+  const RECONCILE_INTERVAL_MS = 60_000
+  let reconcileTimer: ReturnType<typeof setInterval> | null = null
+  let reconcileListenersBound = false
+  let lastFocusReconcileAt = 0
+
+  async function _reconcileOnFocus() {
+    if (!currentPath.value || document.hidden) return
+    // `focus` and `visibilitychange` can both fire for one return — collapse them.
+    const now = Date.now()
+    if (now - lastFocusReconcileAt < 3000) return
+    lastFocusReconcileAt = now
+    await refresh()
+    // The window was inactive, so the user isn't mid-scroll here: safe to re-read
+    // open tabs for note/highlight edits synced in while they were away.
+    const reader = useReaderStore()
+    await Promise.all(reader.tabs.map(t => reader.reloadFromDisk(t.slug)))
+  }
+
+  function _startDiskReconcile() {
+    if (!reconcileTimer) {
+      reconcileTimer = setInterval(() => {
+        // Hidden windows get caught up by the focus handler; don't poll in the
+        // background. List only — never touch open tabs on the timer.
+        if (!document.hidden && currentPath.value) refresh()
+      }, RECONCILE_INTERVAL_MS)
+    }
+    if (!reconcileListenersBound) {
+      reconcileListenersBound = true
+      window.addEventListener('focus', _reconcileOnFocus)
+      document.addEventListener('visibilitychange', _reconcileOnFocus)
+    }
   }
 
   async function _backgroundScan() {

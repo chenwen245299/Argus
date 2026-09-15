@@ -521,10 +521,28 @@ function persistedConversations(): Conversation[] {
     .map(persistableConversation)
 }
 
+// Per-paper set of conversation ids we've already seen on disk. The backend now
+// merges conversations across machines (union by id), so a plain "save the array
+// I have" can't express a delete — a removed conversation would just resurrect
+// from disk. Diffing the ids we knew against what we're saving tells a real
+// delete (was known, now gone) apart from another machine's conversation (never
+// known here), and emits a tombstone only for the former.
+const knownConvIds = new Map<string, Set<string>>()
+
+function deletionTombstones(slug: string, persisted: Conversation[]): { id: string; deleted_at: string }[] {
+  const known = knownConvIds.get(slug) ?? new Set<string>()
+  const currentIds = new Set(persisted.map(c => c.id))
+  const tombs = [...known].filter(id => !currentIds.has(id)).map(id => ({ id, deleted_at: nowIso() }))
+  currentIds.forEach(id => known.add(id))
+  knownConvIds.set(slug, known)
+  return tombs
+}
+
 async function saveConversationsToPaper(slug: string) {
   const persisted = persistedConversations()
   conversations.value = persisted
-  await invoke('save_paper_ai_conversations', { slug, conversations: persisted })
+  const tombstones = deletionTombstones(slug, persisted)
+  await invoke('save_paper_ai_conversations', { slug, conversations: persisted, tombstones })
   try {
     localStorage.removeItem(storageKey(slug))
   } catch {
@@ -593,6 +611,7 @@ async function loadConversations(slug: string) {
   // The user may have switched papers again while this was loading.
   if (props.slug !== slug) return
   conversations.value = list
+  knownConvIds.set(slug, new Set(list.map(c => c.id)))
   await importLegacyHistory(slug)
   if (props.slug !== slug) return
   restoreSession(slug)

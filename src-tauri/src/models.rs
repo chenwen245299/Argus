@@ -200,6 +200,12 @@ pub struct Highlight {
     pub color: String,
     pub note: Option<String>,
     pub created_at: String,
+    /// Last time the highlight's content (note/color/style) was edited. Absent on
+    /// pre-CRDT highlights; the cross-machine merge falls back to `created_at`.
+    /// Resolves concurrent edits (last edit wins) and lets a re-edit beat an older
+    /// delete. See `paper::merge_highlights`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
     #[serde(default = "default_highlight_style")]
     pub style: String,
     /// Ebook-only reflow-safe anchor: character offsets into the sanitized
@@ -217,6 +223,25 @@ pub struct Highlight {
 
 fn default_highlight_style() -> String {
     "highlight".to_string()
+}
+
+/// A record that a highlight was deleted, kept so the delete propagates across a
+/// synced library instead of the highlight resurrecting from a machine that still
+/// has it. See `paper::merge_highlights`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HighlightTombstone {
+    pub id: String,
+    pub deleted_at: String,
+}
+
+/// On-disk highlights file. Historically a bare JSON array of `Highlight`;
+/// readers still accept that shape and treat it as `{ highlights, tombstones: [] }`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct HighlightsDoc {
+    #[serde(default)]
+    pub highlights: Vec<Highlight>,
+    #[serde(default)]
+    pub tombstones: Vec<HighlightTombstone>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

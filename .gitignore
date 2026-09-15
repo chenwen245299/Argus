@@ -9,6 +9,10 @@ src-tauri/gen/
 # scripts/fetch-pdfium.mjs, bundled into the app; too big to commit.
 src-tauri/lib/
 
+# pdf.js font/cmap data — copied from node_modules at postinstall by
+# scripts/setup-pdfjs-assets.js (like vditor's assets); regenerated, not committed.
+public/pdfjs/
+
 # VitePress docs build output & cache
 docs/.vitepress/cache/
 docs/.vitepress/dist/

@@ -186,16 +186,33 @@ pub fn get_canvas(root: &str, id: &str) -> Result<Canvas, String> {
     serde_json::from_str(&content).map_err(|e| format!("Parse canvas: {e}"))
 }
 
-pub fn save_canvas(root: &str, mut canvas: Canvas) -> Result<(), String> {
+/// Returned as the error when a save would clobber a newer version another
+/// machine synced in; the frontend reloads the newer canvas instead.
+pub const CANVAS_CONFLICT: &str = "CANVAS_CONFLICT";
+
+/// Save a canvas, returning its new `updated_at`. Guards against the cross-device
+/// clobber: `canvas.updated_at` is the version the caller loaded (its base); if
+/// the on-disk canvas is newer, another machine wrote it since — reject with
+/// `CANVAS_CONFLICT` rather than overwrite. The caller must feed the returned
+/// timestamp back as the base for its next save, or it would look stale to itself.
+pub fn save_canvas(root: &str, mut canvas: Canvas) -> Result<String, String> {
     ensure_canvases_dir(root)?;
     validate_canvas_id(&canvas.id)?;
+    let path = canvas_path(root, &canvas.id)?;
+    if let Some(disk) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<Canvas>(&c).ok())
+    {
+        if disk.updated_at.as_str() > canvas.updated_at.as_str() {
+            return Err(CANVAS_CONFLICT.to_string());
+        }
+    }
     canvas.updated_at = Utc::now().to_rfc3339();
     let content =
         serde_json::to_string_pretty(&canvas).map_err(|e| format!("Serialize canvas: {e}"))?;
-    atomic_write(&canvas_path(root, &canvas.id)?, &content)
-        .map_err(|e| format!("Write canvas: {e}"))?;
+    atomic_write(&path, &content).map_err(|e| format!("Write canvas: {e}"))?;
     upsert_index(root, &canvas);
-    Ok(())
+    Ok(canvas.updated_at)
 }
 
 pub fn rename_canvas(root: &str, id: &str, new_name: String) -> Result<(), String> {
@@ -243,29 +260,44 @@ fn ai_conversations_path(root: &str, id: &str) -> Result<PathBuf, String> {
     Ok(canvases_dir(root).join(format!("{id}.chat.json")))
 }
 
-pub fn read_ai_conversations(root: &str, id: &str) -> Result<serde_json::Value, String> {
+fn read_canvas_conversations_doc(root: &str, id: &str) -> Result<crate::crdt::IdKeyedDoc, String> {
     let path = ai_conversations_path(root, id)?;
-    if !path.exists() {
-        return Ok(serde_json::json!([]));
-    }
-    Ok(std::fs::read_to_string(&path)
+    let raw = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .filter(|v: &serde_json::Value| v.is_array())
-        .unwrap_or_else(|| serde_json::json!([])))
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    Ok(crate::crdt::parse_doc(&raw, "conversations"))
 }
 
+/// Effective (non-deleted) canvas AI conversations, newest first.
+pub fn read_ai_conversations(root: &str, id: &str) -> Result<serde_json::Value, String> {
+    let doc = read_canvas_conversations_doc(root, id)?;
+    Ok(serde_json::Value::Array(crate::crdt::effective_items(&doc, "updatedAt")))
+}
+
+/// Merge this machine's conversations + delete tombstones into the on-disk doc,
+/// so a stale save no longer wipes conversations another machine synced in.
 pub fn write_ai_conversations(
     root: &str,
     id: &str,
     conversations: &serde_json::Value,
+    tombstones: &serde_json::Value,
 ) -> Result<(), String> {
     if !conversations.is_array() {
         return Err("Canvas AI conversations must be an array.".to_string());
     }
     let path = ai_conversations_path(root, id)?;
+    let lock = crate::crdt::lock_for(&path.to_string_lossy());
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let incoming = crate::crdt::IdKeyedDoc {
+        items: conversations.as_array().cloned().unwrap_or_default(),
+        tombstones: tombstones.as_array().cloned().unwrap_or_default(),
+    };
+    let merged = crate::crdt::merge(read_canvas_conversations_doc(root, id)?, incoming, "updatedAt");
+
     ensure_canvases_dir(root)?;
-    let content = serde_json::to_string_pretty(conversations)
+    let content = serde_json::to_string_pretty(&crate::crdt::to_value(&merged, "conversations"))
         .map_err(|e| format!("Serialize canvas AI conversations: {e}"))?;
     atomic_write(&path, &content).map_err(|e| format!("Write canvas chat: {e}"))
 }
@@ -508,4 +540,47 @@ pub fn open_canvas_window(app: &tauri::AppHandle) -> Result<(), String> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    struct TempRoot(std::path::PathBuf);
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("argus-canvas-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempRoot(dir)
+        }
+        fn root(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn save_canvas_rejects_a_stale_overwrite_but_accepts_a_current_one() {
+        let tmp = TempRoot::new("guard");
+        let root = tmp.root();
+        let c = create_canvas(root, "t".to_string()).unwrap();
+
+        // First save establishes the on-disk version.
+        let disk_version = save_canvas(root, c.clone()).unwrap();
+
+        // A save whose base is older than disk (another machine wrote meanwhile)
+        // must be rejected rather than clobber the newer version.
+        let mut stale = c.clone();
+        stale.updated_at = "2000-01-01T00:00:00Z".to_string();
+        assert_eq!(save_canvas(root, stale), Err(CANVAS_CONFLICT.to_string()));
+
+        // A save based on the current disk version goes through.
+        let mut fresh = c.clone();
+        fresh.updated_at = disk_version;
+        assert!(save_canvas(root, fresh).is_ok());
+    }
 }

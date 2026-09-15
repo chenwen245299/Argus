@@ -1,3 +1,4 @@
+mod activity;
 mod ai_manager;
 mod ai_summary;
 mod arxiv;
@@ -11,6 +12,7 @@ mod canvas_enhance;
 mod collections;
 mod commands;
 mod copilot;
+mod crdt;
 mod deepseek;
 mod ebook;
 mod extraction;
@@ -164,6 +166,7 @@ pub fn run() {
             commands::copy_paper_pdf,
             commands::open_paper_folder,
             commands::read_pdf_bytes,
+            commands::render_page_png,
             // ── M0-M3: Import + metadata ──
             commands::pick_pdf_files,
             commands::import_pdf,
@@ -357,6 +360,7 @@ pub fn run() {
             // ── Activity + per-library UI state ──
             commands::get_activity_log,
             commands::save_activity_log,
+            commands::get_device_id,
             commands::get_library_ui_state,
             commands::save_library_ui_state,
             commands::patch_library_ui_state,

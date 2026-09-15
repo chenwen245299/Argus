@@ -233,6 +233,11 @@ export async function detectSectionsForSlug(slug: string): Promise<PaperSections
   const doc = await pdfjsLib.getDocument({
     data: new Uint8Array(bytes),
     isOffscreenCanvasSupported: false,
+    // Match the viewer so non-embedded/CID font text isn't dropped from the text
+    // pdf.js extracts for section detection (see PdfViewer's getDocument note).
+    standardFontDataUrl: '/pdfjs/standard_fonts/',
+    cMapUrl: '/pdfjs/cmaps/',
+    cMapPacked: true,
   }).promise
   try {
     return await computeSections(doc)

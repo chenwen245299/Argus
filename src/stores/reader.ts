@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed, shallowRef } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import type { Highlight, ReadingState } from '../types'
+import type { Highlight, HighlightTombstone, ReadingState } from '../types'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { recordPaperAccess } from '../utils/recentPapers'
 
@@ -83,6 +83,10 @@ export const useReaderStore = defineStore('reader', () => {
   // its highlights/reading-state are still here, so nothing reloads from disk.
   const pdfDoc              = shallowRef<PDFDocumentProxy | null>(null) // active tab's doc
   const highlightsBySlug    = ref<Record<string, Highlight[]>>({})
+  // Deletes made this session, sent with every save so the backend can propagate
+  // them across a synced library (union-by-id merge would otherwise resurrect a
+  // highlight another machine still has). Cleared when the tab's state is freed.
+  const highlightTombstones = ref<Record<string, HighlightTombstone[]>>({})
   const readingStateBySlug  = ref<Record<string, ReadingState | null>>({})
   // Transient commands aimed at the currently-active viewer.
   const scrollToHighlightId = ref<string | null>(null)
@@ -110,6 +114,9 @@ export const useReaderStore = defineStore('reader', () => {
   function discardTabState(slug: string) {
     if (slug in highlightsBySlug.value) {
       const next = { ...highlightsBySlug.value }; delete next[slug]; highlightsBySlug.value = next
+    }
+    if (slug in highlightTombstones.value) {
+      const next = { ...highlightTombstones.value }; delete next[slug]; highlightTombstones.value = next
     }
     if (slug in readingStateBySlug.value) {
       const next = { ...readingStateBySlug.value }; delete next[slug]; readingStateBySlug.value = next
@@ -506,7 +513,11 @@ export const useReaderStore = defineStore('reader', () => {
     const slug = activeSlug.value
     if (!slug) return
     try {
-      await invoke('save_highlights', { slug, highlights: highlightsBySlug.value[slug] ?? [] })
+      await invoke('save_highlights', {
+        slug,
+        highlights: highlightsBySlug.value[slug] ?? [],
+        tombstones: highlightTombstones.value[slug] ?? [],
+      })
     } catch (e) {
       console.error('Failed to save highlights:', e)
     }
@@ -527,13 +538,22 @@ export const useReaderStore = defineStore('reader', () => {
   ) {
     const slug = activeSlug.value
     if (!slug) return
-    setHighlights(slug, (highlightsBySlug.value[slug] ?? []).map(h => h.id === id ? { ...h, ...changes } : h))
+    // Stamp the edit time so a concurrent edit on another machine resolves
+    // last-writer-wins (and a re-edit can beat an older delete).
+    const edited = { ...changes, updated_at: new Date().toISOString() }
+    setHighlights(slug, (highlightsBySlug.value[slug] ?? []).map(h => h.id === id ? { ...h, ...edited } : h))
     saveHighlights()
   }
 
   function removeHighlight(id: string) {
     const slug = activeSlug.value
     if (!slug) return
+    // Record a tombstone so the delete survives the cross-machine union merge.
+    const tomb: HighlightTombstone = { id, deleted_at: new Date().toISOString() }
+    highlightTombstones.value = {
+      ...highlightTombstones.value,
+      [slug]: [...(highlightTombstones.value[slug] ?? []).filter(t => t.id !== id), tomb],
+    }
     setHighlights(slug, (highlightsBySlug.value[slug] ?? []).filter(h => h.id !== id))
     saveHighlights()
   }
@@ -561,7 +581,10 @@ export const useReaderStore = defineStore('reader', () => {
         invoke<Highlight[]>('get_highlights', { slug }),
         invoke<ReadingState | null>('get_reading_state', { slug }),
       ])
-      setHighlights(slug, hl)
+      // Keep local deletes whose tombstone may not have landed on disk yet, so a
+      // sync-in from another machine can't momentarily resurrect them here.
+      const pending = new Set((highlightTombstones.value[slug] ?? []).map(t => t.id))
+      setHighlights(slug, pending.size ? hl.filter(h => !pending.has(h.id)) : hl)
       setReadingState(slug, rs)
     } catch (e) {
       console.error(`[reader] reload ${slug} after external change failed:`, e)

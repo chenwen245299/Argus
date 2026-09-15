@@ -180,13 +180,21 @@ export const useCanvasStore = defineStore('canvas', () => {
     return canvas
   }
 
+  // The on-disk `updated_at` each open canvas was last known to have (its load or
+  // last successful save). Sent as the base for the save version-guard, tracked
+  // here rather than on the canvas object so a rapid edit mid-save can't capture a
+  // stale base and make the canvas conflict with its own in-flight write.
+  const canvasBaseVersion = new Map<string, string>()
+
   /** Load a canvas (if not already loaded) and make it the active one. */
   async function openCanvas(id: string) {
     activeCanvasId.value = id
     if (canvasesById.value[id]) return   // already open in another tab
     loading.value = true
     try {
-      setCanvas(id, await invoke<Canvas>('get_canvas', { id }))
+      const c = await invoke<Canvas>('get_canvas', { id })
+      setCanvas(id, c)
+      canvasBaseVersion.set(id, c.updated_at)
     } finally {
       loading.value = false
     }
@@ -222,17 +230,36 @@ export const useCanvasStore = defineStore('canvas', () => {
     const canvas = canvasById(key)
     if (!key || !canvas) return
     try {
-      await invoke('save_canvas', { canvasData: canvas })
+      // Send our tracked base as the canvas's updated_at so the backend guard can
+      // tell whether disk moved under us; adopt the returned new version as base.
+      const base = canvasBaseVersion.get(key) ?? canvas.updated_at
+      const newUpdatedAt = await invoke<string>('save_canvas', {
+        canvasData: { ...canvas, updated_at: base },
+      })
+      canvasBaseVersion.set(key, newUpdatedAt)
+      canvas.updated_at = newUpdatedAt
       // Refresh the index entry
       const idx = canvasList.value.findIndex(e => e.id === key)
       if (idx >= 0) {
         canvasList.value[idx] = {
           ...canvasList.value[idx],
           node_count: canvas.nodes.length,
-          updated_at: canvas.updated_at,
+          updated_at: newUpdatedAt,
         }
       }
     } catch (e) {
+      if (String(e).includes('CANVAS_CONFLICT')) {
+        // Another machine saved a newer version of this canvas since we loaded it.
+        // Per last-edit-wins, adopt the synced-in version rather than clobber it.
+        try {
+          const fresh = await invoke<Canvas>('get_canvas', { id: key })
+          setCanvas(key, fresh)
+          canvasBaseVersion.set(key, fresh.updated_at)
+        } catch (reloadErr) {
+          console.error('canvas conflict reload:', reloadErr)
+        }
+        return
+      }
       console.error('save_canvas:', e)
     }
   }

@@ -214,6 +214,21 @@ function requestRenderPage(idx: number): Promise<void> {
 }
 
 const scale = ref(1.25)
+// True when this PDF uses Type 3 fonts, which pdf.js renders as blank text (e.g.
+// figure labels vanish). Such pages are rasterised via the backend PDFium engine
+// instead. Set once at load; most modern PDFs stay on the crisp vector path.
+const rasterFallback = ref(false)
+
+/** Cheap scan for the Type 3 font subtype marker in the raw PDF bytes. */
+function pdfUsesType3(bytes: Uint8Array): boolean {
+  const needle = [0x2f, 0x54, 0x79, 0x70, 0x65, 0x33] // "/Type3"
+  const n = needle.length
+  outer: for (let i = 0, end = bytes.length - n; i <= end; i++) {
+    for (let j = 0; j < n; j++) if (bytes[i + j] !== needle[j]) continue outer
+    return true
+  }
+  return false
+}
 // First-open fit-to-width may be requested while the tab is backgrounded (0
 // width); this defers it until the tab becomes visible.
 const needsInitialFit = ref(false)
@@ -992,7 +1007,20 @@ async function loadPdf() {
 
   try {
     const uint8 = new Uint8Array(bytes)
-    const loadingTask = pdfjsLib.getDocument({ data: uint8, isOffscreenCanvasSupported: false })
+    // Type 3 fonts render blank in pdf.js; those PDFs use the PDFium raster path.
+    rasterFallback.value = pdfUsesType3(uint8)
+    const loadingTask = pdfjsLib.getDocument({
+      data: uint8,
+      isOffscreenCanvasSupported: false,
+      // Without these, non-embedded standard fonts (Helvetica/Times/Symbol — the
+      // ones figure labels and diagrams commonly use) and CID fonts render as
+      // BLANK: the shapes draw but their text is silently dropped, while embedded
+      // (e.g. LaTeX) body text still renders. The pdf.js font/cmap data is copied
+      // into /pdfjs by scripts/setup-pdfjs-assets.js (postinstall).
+      standardFontDataUrl: '/pdfjs/standard_fonts/',
+      cMapUrl: '/pdfjs/cmaps/',
+      cMapPacked: true,
+    })
     const doc = await loadingTask.promise
     pdfDoc.value = doc
     reader.setPdfDoc(doc, slug)
@@ -1117,7 +1145,7 @@ async function renderPage(idx: number) {
   // superseded — tearing it down too would leave a genuinely blank page, which
   // is the very thing this rework exists to prevent. It stays, gets resized to
   // whatever scale is now current, and the next render replaces it properly.
-  let committedCanvas: HTMLCanvasElement | null = null
+  let committedCanvas: HTMLElement | null = null
   const cleanupAppended = () => {
     appended.forEach(n => { if (n !== committedCanvas) n.remove() })
     if (committedCanvas) rescalePageDom(idx, scale.value)
@@ -1129,33 +1157,60 @@ async function renderPage(idx: number) {
     const dpr = window.devicePixelRatio || 1
     // Logical viewport for CSS layout / text layer / highlights
     const logicalVp = page.getViewport({ scale: scenScale })
-    // Physical viewport for crisp canvas rendering on HiDPI screens
-    const physicalVp = page.getViewport({ scale: scenScale * dpr })
 
-    // Canvas — pdfjs v5 takes the canvas element directly and owns the context.
-    // Rendered DETACHED: an empty canvas in the page would cover the old content
-    // with a white rectangle for the whole render, which is the flash we're
-    // avoiding. It only joins the DOM once it actually has the page on it.
-    const canvas = document.createElement('canvas')
-    canvas.className = 'pdf-canvas'
-    canvas.width = Math.round(physicalVp.width)
-    canvas.height = Math.round(physicalVp.height)
-    canvas.style.width = `${Math.round(logicalVp.width)}px`
-    canvas.style.height = `${Math.round(logicalVp.height)}px`
+    // The page's visual layer. Normally pdf.js renders vector-crisp to a canvas.
+    // But some PDFs use fonts pdf.js can't render (Type 3 figure fonts → the text
+    // renders blank); for those we rasterise the page with the bundled PDFium
+    // engine (the same one the AI page-view uses) and show it as an <img>, which
+    // also dodges WebKit's canvas size cap. Either way the text/highlight/
+    // annotation layers below are pdf.js's, so selection and highlights still work.
+    let contentEl: HTMLElement | null = null
+    if (rasterFallback.value) {
+      try {
+        const b64 = await invoke<string>('render_page_png', {
+          slug: props.slug, page: idx + 1, dpi: Math.round(72 * scenScale * dpr),
+        })
+        if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
+        const img = new Image()
+        img.className = 'pdf-canvas'
+        img.src = `data:image/png;base64,${b64}`
+        try { await img.decode() } catch { /* show it anyway */ }
+        img.style.width = `${Math.round(logicalVp.width)}px`
+        img.style.height = `${Math.round(logicalVp.height)}px`
+        contentEl = img
+      } catch (e) {
+        console.error(`render_page_png(${idx}) failed; falling back to pdf.js:`, e)
+        // fall through to the pdf.js canvas path below
+      }
+    }
+    if (!contentEl) {
+      // Physical viewport for crisp canvas rendering on HiDPI screens. Rendered
+      // DETACHED: an empty canvas in the page would cover the old content with a
+      // white rectangle for the whole render (the flash we're avoiding). It joins
+      // the DOM only once it actually has the page on it.
+      const physicalVp = page.getViewport({ scale: scenScale * dpr })
+      const canvas = document.createElement('canvas')
+      canvas.className = 'pdf-canvas'
+      canvas.width = Math.round(physicalVp.width)
+      canvas.height = Math.round(physicalVp.height)
+      canvas.style.width = `${Math.round(logicalVp.width)}px`
+      canvas.style.height = `${Math.round(logicalVp.height)}px`
 
-    const task = page.render({ canvas, viewport: physicalVp })
-    pageRenderTasks.set(idx, task)
-    await task.promise
-    pageRenderTasks.delete(idx)
+      const task = page.render({ canvas, viewport: physicalVp })
+      pageRenderTasks.set(idx, task)
+      await task.promise
+      pageRenderTasks.delete(idx)
+      contentEl = canvas
+    }
 
     // Scale changed during render — a newer generation owns the page now, so
     // bail without touching what's on screen.
     if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
 
-    // The swap: new canvas in, previous scale's content out, same frame.
-    el.appendChild(canvas)
-    appended.push(canvas)
-    committedCanvas = canvas
+    // The swap: new content in, previous scale's content out, same frame.
+    el.appendChild(contentEl)
+    appended.push(contentEl)
+    committedCanvas = contentEl
     stale.forEach(n => n.remove())
 
     // Text layer at logical scale so CSS positions match layout

@@ -424,10 +424,11 @@ pub async fn get_highlights(
 pub async fn save_highlights(
     slug: String,
     highlights: Vec<Highlight>,
+    tombstones: Option<Vec<crate::models::HighlightTombstone>>,
     state: State<'_, LibraryRoot>,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
-    paper::write_highlights(&root, &slug, &highlights)
+    paper::save_highlights_merged(&root, &slug, highlights, tombstones.unwrap_or_default())
 }
 
 #[tauri::command]
@@ -688,6 +689,30 @@ pub async fn read_pdf_bytes(
     let root = get_root(&state)?;
     let path = metadata::find_pdf_in_dir(&root, &slug);
     std::fs::read(&path).map_err(|e| format!("Cannot read PDF for {slug}: {e}"))
+}
+
+/// Rasterise one **1-based** page to a base64 PNG via the bundled PDFium engine.
+/// The viewer uses this only for PDFs whose figures use fonts pdf.js can't render
+/// (e.g. Type 3 fonts), where its own vector render drops the text — PDFium (the
+/// same engine the AI page-view uses) renders them faithfully. `dpi` should track
+/// the on-screen scale × devicePixelRatio so the raster stays crisp.
+#[tauri::command]
+pub async fn render_page_png(
+    slug: String,
+    page: u32,
+    dpi: u32,
+    state: State<'_, LibraryRoot>,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    let root = get_root(&state)?;
+    let pdf_path = metadata::find_pdf_in_dir(&root, &slug);
+    let dpi = dpi.clamp(72, 400);
+    let png = tauri::async_runtime::spawn_blocking(move || {
+        crate::render::render_pdf_page_png(&pdf_path, page, dpi)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png))
 }
 
 // ── PDF import ────────────────────────────────────────────────────────────────
@@ -2166,10 +2191,12 @@ pub async fn get_paper_ai_conversations(
 pub async fn save_paper_ai_conversations(
     slug: String,
     conversations: serde_json::Value,
+    tombstones: Option<serde_json::Value>,
     state: State<'_, LibraryRoot>,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
-    copilot::write_paper_ai_conversations(&root, &slug, &conversations)
+    let tombstones = tombstones.unwrap_or_else(|| serde_json::json!([]));
+    copilot::write_paper_ai_conversations(&root, &slug, &conversations, &tombstones)
 }
 
 #[tauri::command]
@@ -3293,8 +3320,11 @@ pub async fn get_canvas(state: State<'_, LibraryRoot>, id: String) -> Result<Can
     canvas::get_canvas(&root, &id)
 }
 
+/// Returns the canvas's new `updated_at`, which the caller must use as the base
+/// for its next save. Errors with `CANVAS_CONFLICT` when another machine's newer
+/// version is on disk — the caller reloads instead of clobbering it.
 #[tauri::command]
-pub async fn save_canvas(state: State<'_, LibraryRoot>, canvas_data: Canvas) -> Result<(), String> {
+pub async fn save_canvas(state: State<'_, LibraryRoot>, canvas_data: Canvas) -> Result<String, String> {
     let root = get_root(&state)?;
     canvas::save_canvas(&root, canvas_data)
 }
@@ -3331,9 +3361,11 @@ pub async fn save_canvas_ai_conversations(
     state: State<'_, LibraryRoot>,
     canvas_id: String,
     conversations: serde_json::Value,
+    tombstones: Option<serde_json::Value>,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
-    canvas::write_ai_conversations(&root, &canvas_id, &conversations)
+    let tombstones = tombstones.unwrap_or_else(|| serde_json::json!([]));
+    canvas::write_ai_conversations(&root, &canvas_id, &conversations, &tombstones)
 }
 
 #[tauri::command]
@@ -3509,34 +3541,29 @@ pub fn clear_token_usage(state: State<'_, LibraryRoot>) -> Result<(), String> {
 }
 
 // ── Activity log ─────────────────────────────────────────────────────────────
-
-fn activity_log_path(root: &str) -> std::path::PathBuf {
-    std::path::Path::new(root).join(".argus").join("activity.json")
-}
-
-fn empty_activity_log() -> serde_json::Value {
-    serde_json::json!({ "version": 1, "days": {} })
-}
+// Storage + the per-device CRDT merge live in `crate::activity`; these are thin
+// command wrappers. See that module for why a plain overwrite lost data across
+// machines and how the merge fixes it.
 
 #[tauri::command]
 pub fn get_activity_log(root: String) -> Result<serde_json::Value, String> {
-    let path = activity_log_path(&root);
-    if !path.exists() {
-        return Ok(empty_activity_log());
-    }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Read activity.json: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("Parse activity.json: {e}"))
+    Ok(crate::activity::read_log(&root))
 }
 
 #[tauri::command]
-pub fn save_activity_log(root: String, data: serde_json::Value) -> Result<(), String> {
-    let argus_dir = std::path::Path::new(&root).join(".argus");
-    std::fs::create_dir_all(&argus_dir).map_err(|e| format!("Create .argus: {e}"))?;
-    let content =
-        serde_json::to_string_pretty(&data).map_err(|e| format!("Serialize activity.json: {e}"))?;
-    crate::fsutil::atomic_write_str(&argus_dir.join("activity.json"), &content)
-        .map_err(|e| format!("Write activity.json: {e}"))
+pub fn save_activity_log(
+    root: String,
+    device_id: String,
+    data: serde_json::Value,
+) -> Result<(), String> {
+    crate::activity::save_log(&root, &device_id, &data)
+}
+
+/// A stable, machine-local id used to slot this device's activity so a synced
+/// library never loses another machine's reading time.
+#[tauri::command]
+pub fn get_device_id(app: tauri::AppHandle) -> Result<String, String> {
+    crate::activity::device_id(&app)
 }
 
 // ── Per-library UI state ─────────────────────────────────────────────────────

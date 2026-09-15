@@ -192,13 +192,29 @@ function scheduleSave() {
   saveTimer = setTimeout(() => { void save() }, 400)
 }
 
+// The backend merges canvas conversations across machines (union by id), so a
+// delete has to be expressed as a tombstone or it just resurrects from disk.
+// Diff the ids we've seen against what we're saving to spot real deletes.
+const knownConvIds = new Map<string, Set<string>>()
+
+function deletionTombstones(canvasId: string, persisted: { id: string }[]): { id: string; deleted_at: string }[] {
+  const known = knownConvIds.get(canvasId) ?? new Set<string>()
+  const currentIds = new Set(persisted.map(c => c.id))
+  const tombs = [...known].filter(id => !currentIds.has(id)).map(id => ({ id, deleted_at: new Date().toISOString() }))
+  currentIds.forEach(id => known.add(id))
+  knownConvIds.set(canvasId, known)
+  return tombs
+}
+
 async function save() {
   saveTimer = null
   const canvasId = props.canvasId
   try {
+    const persisted = persistable(conversations.value)
     await invoke('save_canvas_ai_conversations', {
       canvasId,
-      conversations: persistable(conversations.value),
+      conversations: persisted,
+      tombstones: deletionTombstones(canvasId, persisted),
     })
   } catch (e) {
     console.error('save_canvas_ai_conversations:', e)
@@ -216,6 +232,7 @@ async function load(canvasId: string) {
         .filter((c): c is CanvasConversation => !!c && typeof c === 'object' && Array.isArray((c as CanvasConversation).messages))
         .map(c => ({ ...c, messages: c.messages.map(m => ({ ...m, streaming: false })) }))
         .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))
+      knownConvIds.set(canvasId, new Set(conversations.value.map(c => c.id)))
     }
   } catch (e) {
     console.error('get_canvas_ai_conversations:', e)

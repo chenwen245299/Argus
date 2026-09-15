@@ -39,6 +39,9 @@ struct Pending {
     /// A change outside any single paper folder (paper added/removed, collections,
     /// settings) — the frontend has to re-scan rather than patch one entry.
     other: bool,
+    /// The activity log was changed by another machine (synced in). Reported on a
+    /// separate channel so the frontend re-merges it without a full library scan.
+    activity: bool,
     last_event: Instant,
     /// When the current batch started accumulating, for the MAX_HOLD ceiling.
     first_event: Instant,
@@ -46,7 +49,7 @@ struct Pending {
 
 impl Pending {
     fn is_empty(&self) -> bool {
-        self.slugs.is_empty() && !self.other
+        self.slugs.is_empty() && !self.other && !self.activity
     }
 
     fn record(&mut self) {
@@ -97,6 +100,16 @@ fn is_ignored(path: &Path, root: &Path) -> bool {
     false
 }
 
+/// The one file under `.argus` we DO react to: the activity log changes when
+/// another machine syncs in reading time, and the panel must re-merge it. Every
+/// other `.argus` path stays ignored (rebuildable caches / our own bookkeeping),
+/// so this is checked before `is_ignored`.
+fn is_activity_file(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root)
+        .map(|rel| rel == Path::new(".argus").join("activity.json").as_path())
+        .unwrap_or(false)
+}
+
 /// `<root>/papers/<slug>/…` → `slug`. Anything else → None (a structural change).
 fn slug_of(path: &Path, root: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
@@ -115,11 +128,22 @@ fn slug_of(path: &Path, root: &Path) -> Option<String> {
 pub fn watch(app: &AppHandle, root: &str) {
     stop();
     let app = app.clone();
-    let started = watch_with(root, DEBOUNCE, move |slugs, other| {
-        let _ = app.emit(
-            "library-files-changed",
-            serde_json::json!({ "slugs": slugs, "other": other }),
-        );
+    let started = watch_with(root, DEBOUNCE, move |slugs, other, activity| {
+        // Paper/structural edits → the existing full-refresh channel.
+        if !slugs.is_empty() || other {
+            let _ = app.emit(
+                "library-files-changed",
+                serde_json::json!({ "slugs": slugs, "other": other }),
+            );
+        }
+        // Activity log synced in from another machine → a targeted channel so the
+        // panel re-merges the file without triggering a whole-library rescan.
+        if activity {
+            let _ = app.emit(
+                "library-data-changed",
+                serde_json::json!({ "kind": "activity" }),
+            );
+        }
     });
     if let Ok(mut guard) = active().lock() {
         *guard = started;
@@ -130,7 +154,7 @@ pub fn watch(app: &AppHandle, root: &str) {
 /// `sink` receives one call per settled burst.
 fn watch_with<F>(root: &str, debounce: Duration, sink: F) -> Option<Active>
 where
-    F: Fn(Vec<String>, bool) + Send + 'static,
+    F: Fn(Vec<String>, bool, bool) + Send + 'static,
 {
     // Resolve symlinks up front. The OS reports events against real paths — on
     // macOS `/var/...` arrives as `/private/var/...`, and any symlink in a
@@ -140,6 +164,7 @@ where
     let pending = Arc::new(Mutex::new(Pending {
         slugs: HashSet::new(),
         other: false,
+        activity: false,
         last_event: Instant::now(),
         first_event: Instant::now(),
     }));
@@ -156,10 +181,20 @@ where
             return;
         }
         for path in &event.paths {
-            if is_ignored(path, &cb_root) || crate::fsutil::was_self_write(path) {
+            if crate::fsutil::was_self_write(path) {
                 continue;
             }
             let Ok(mut p) = cb_pending.lock() else { continue };
+            // The activity log is the one `.argus` file we react to; check it
+            // before `is_ignored` (which skips all of `.argus`).
+            if is_activity_file(path, &cb_root) {
+                p.record();
+                p.activity = true;
+                continue;
+            }
+            if is_ignored(path, &cb_root) {
+                continue;
+            }
             p.record();
             match slug_of(path, &cb_root) {
                 Some(slug) => { p.slugs.insert(slug); }
@@ -193,10 +228,12 @@ where
                 }
                 let slugs: Vec<String> = p.slugs.drain().collect();
                 let other = p.other;
+                let activity = p.activity;
                 p.other = false;
-                (slugs, other)
+                p.activity = false;
+                (slugs, other, activity)
             };
-            sink(payload.0, payload.1);
+            sink(payload.0, payload.1, payload.2);
         }
     });
 
@@ -292,12 +329,12 @@ mod tests {
         }
     }
 
-    fn collect(lib: &TempLib, act: impl FnOnce(&Path)) -> Option<(Vec<String>, bool)> {
+    fn collect(lib: &TempLib, act: impl FnOnce(&Path)) -> Option<(Vec<String>, bool, bool)> {
         let (tx, rx) = mpsc::channel();
         let handle = watch_with(
             lib.0.to_str().unwrap(),
             Duration::from_millis(200),
-            move |slugs, other| { let _ = tx.send((slugs, other)); },
+            move |slugs, other, activity| { let _ = tx.send((slugs, other, activity)); },
         )
         .expect("watcher should start");
         std::thread::sleep(Duration::from_millis(200));
@@ -315,7 +352,7 @@ mod tests {
         let got = collect(&lib, |root| {
             std::fs::write(root.join("papers/smith2020/meta.json"), r#"{"title":"x"}"#).unwrap();
         });
-        let (slugs, _) = got.expect("an external write must be reported");
+        let (slugs, _, _) = got.expect("an external write must be reported");
         assert_eq!(slugs, vec!["smith2020".to_string()]);
     }
 
@@ -350,7 +387,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let (slugs, _) = got.expect("burst must still be reported");
+        let (slugs, _, _) = got.expect("burst must still be reported");
         assert_eq!(slugs, vec!["smith2020".to_string()], "10 writes → 1 slug, 1 report");
     }
 
@@ -361,6 +398,7 @@ mod tests {
         let mut p = Pending {
             slugs: HashSet::from(["a".to_string()]),
             other: false,
+            activity: false,
             last_event: Instant::now(),
             first_event: Instant::now() - Duration::from_secs(30),
         };
@@ -385,7 +423,35 @@ mod tests {
         let got = collect(&lib, |root| {
             std::fs::create_dir_all(root.join("papers/jones2021")).unwrap();
         });
-        let (_, other) = got.expect("a new paper folder must be reported");
+        let (_, other, _) = got.expect("a new paper folder must be reported");
         assert!(other, "adding a paper folder is a list change, not an edit inside one paper");
+    }
+
+    #[test]
+    fn reports_an_external_activity_log_edit_on_the_data_channel() {
+        let lib = TempLib::new("activity");
+        std::fs::create_dir_all(lib.0.join(".argus")).unwrap();
+        let got = collect(&lib, |root| {
+            // Another machine syncs in a new activity log (a plain write, not via
+            // our atomic_write, so it is NOT tagged as a self-write).
+            std::fs::write(root.join(".argus/activity.json"), r#"{"version":2,"days":{}}"#).unwrap();
+        });
+        let (slugs, other, activity) = got.expect("an external activity-log write must be reported");
+        assert!(activity, "activity.json change → data channel");
+        assert!(slugs.is_empty() && !other, "must NOT look like a paper/structural change");
+    }
+
+    #[test]
+    fn does_not_report_our_own_activity_log_writes() {
+        let lib = TempLib::new("activity-self");
+        std::fs::create_dir_all(lib.0.join(".argus")).unwrap();
+        let got = collect(&lib, |root| {
+            crate::fsutil::atomic_write_str(
+                &root.join(".argus/activity.json"),
+                r#"{"version":2,"days":{}}"#,
+            )
+            .unwrap();
+        });
+        assert!(got.is_none(), "our own activity saves must not echo back as a sync-in");
     }
 }

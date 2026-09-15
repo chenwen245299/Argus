@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::models::{Highlight, Note, PaperMeta, PaperStatus, ReadingState};
+use crate::models::{
+    Highlight, HighlightTombstone, HighlightsDoc, Note, PaperMeta, PaperStatus, ReadingState,
+};
 
 /// Write `content` to `path` atomically (temp file + rename), preventing
 /// partial-write data loss if the process crashes mid-write.
@@ -438,26 +440,216 @@ pub fn read_note_asset(root: &str, slug: &str, name: &str) -> Result<Vec<u8>, St
 
 // ── Highlights ────────────────────────────────────────────────────────────────
 
-pub fn read_highlights(root: &str, slug: &str) -> Vec<Highlight> {
+fn highlights_path(root: &str, slug: &str) -> PathBuf {
+    paper_dir(root, slug).join("highlights.json")
+}
+
+/// The effective time of a highlight for conflict resolution: its last edit, or
+/// its creation time when it has never been edited.
+fn highlight_time(h: &Highlight) -> &str {
+    h.updated_at.as_deref().unwrap_or(&h.created_at)
+}
+
+/// Parse the highlights file, accepting both the merge-friendly doc object and
+/// the legacy bare array. A missing/corrupt file reads as empty.
+pub fn read_highlights_doc(root: &str, slug: &str) -> HighlightsDoc {
     if validate_slug(slug).is_err() {
-        return Vec::new();
+        return HighlightsDoc::default();
     }
-    let path = paper_dir(root, slug).join("highlights.json");
-    if !path.exists() {
-        return Vec::new();
+    let Ok(content) = std::fs::read_to_string(highlights_path(root, slug)) else {
+        return HighlightsDoc::default();
+    };
+    // v2 object first (an empty `{}` lands here too), then the legacy bare array.
+    if let Ok(doc) = serde_json::from_str::<HighlightsDoc>(&content) {
+        return doc;
     }
-    match std::fs::read_to_string(&path) {
-        Err(_) => Vec::new(),
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+    match serde_json::from_str::<Vec<Highlight>>(&content) {
+        Ok(highlights) => HighlightsDoc { highlights, tombstones: Vec::new() },
+        Err(_) => HighlightsDoc::default(),
     }
 }
 
-pub fn write_highlights(root: &str, slug: &str, highlights: &[Highlight]) -> Result<(), String> {
+/// Effective (non-deleted) highlights — what the UI, RAG and search consume.
+pub fn read_highlights(root: &str, slug: &str) -> Vec<Highlight> {
+    let doc = read_highlights_doc(root, slug);
+    let deleted: std::collections::HashMap<&str, &str> = doc
+        .tombstones
+        .iter()
+        .map(|t| (t.id.as_str(), t.deleted_at.as_str()))
+        .collect();
+    doc.highlights
+        .iter()
+        .filter(|h| match deleted.get(h.id.as_str()) {
+            // A delete wins only if it is at least as new as the last edit.
+            Some(&d) => highlight_time(h) > d,
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Merge one machine's `incoming` highlights/tombstones into the on-disk doc:
+/// union highlights by id (newer edit wins), union tombstones (newer delete
+/// wins), and drop any highlight a not-yet-superseded tombstone covers. A stale
+/// machine's save can no longer wipe annotations another machine synced in, and a
+/// real delete propagates instead of resurrecting.
+fn merge_highlights(
+    disk: HighlightsDoc,
+    incoming_highlights: Vec<Highlight>,
+    incoming_tombstones: Vec<HighlightTombstone>,
+) -> HighlightsDoc {
+    use std::collections::HashMap;
+
+    let mut by_id: HashMap<String, Highlight> = HashMap::new();
+    for h in disk.highlights.into_iter().chain(incoming_highlights) {
+        match by_id.get(&h.id) {
+            Some(existing) if highlight_time(existing) >= highlight_time(&h) => {}
+            _ => {
+                by_id.insert(h.id.clone(), h);
+            }
+        }
+    }
+
+    let mut tombs: HashMap<String, String> = HashMap::new();
+    for t in disk.tombstones.into_iter().chain(incoming_tombstones) {
+        if tombs.get(&t.id).map(|d| t.deleted_at > *d).unwrap_or(true) {
+            tombs.insert(t.id, t.deleted_at);
+        }
+    }
+    // A re-edit at/after the delete revives the highlight and retires its tombstone.
+    tombs.retain(|id, deleted_at| match by_id.get(id) {
+        Some(h) => highlight_time(h) <= deleted_at.as_str(),
+        None => true,
+    });
+
+    let mut highlights: Vec<Highlight> = by_id
+        .into_iter()
+        .filter(|(id, _)| !tombs.contains_key(id))
+        .map(|(_, h)| h)
+        .collect();
+    highlights.sort_by(|a, b| a.page.cmp(&b.page).then_with(|| a.created_at.cmp(&b.created_at)));
+    let mut tombstones: Vec<HighlightTombstone> = tombs
+        .into_iter()
+        .map(|(id, deleted_at)| HighlightTombstone { id, deleted_at })
+        .collect();
+    tombstones.sort_by(|a, b| a.id.cmp(&b.id));
+
+    HighlightsDoc { highlights, tombstones }
+}
+
+/// Read-merge-write the highlights file under a per-paper lock so concurrent
+/// saves can't interleave and drop a highlight.
+pub fn save_highlights_merged(
+    root: &str,
+    slug: &str,
+    incoming_highlights: Vec<Highlight>,
+    incoming_tombstones: Vec<HighlightTombstone>,
+) -> Result<(), String> {
     validate_slug(slug)?;
-    let path = paper_dir(root, slug).join("highlights.json");
-    let content = serde_json::to_string_pretty(highlights)
+    let lock = highlights_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let disk = read_highlights_doc(root, slug);
+    let merged = merge_highlights(disk, incoming_highlights, incoming_tombstones);
+    let content = serde_json::to_string_pretty(&merged)
         .map_err(|e| format!("Failed to serialize highlights: {e}"))?;
-    atomic_write(&path, &content)
+    atomic_write(&highlights_path(root, slug), &content)
+}
+
+type LockMap = std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>;
+
+fn highlights_lock(root: &str, slug: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<LockMap> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = format!("{root}\u{0}{slug}");
+    let mut map = locks.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key)
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+
+    fn hl(id: &str, created: &str, updated: Option<&str>) -> Highlight {
+        Highlight {
+            id: id.to_string(),
+            page: 1,
+            rects: Vec::new(),
+            text: String::new(),
+            color: "#FFEB3B".to_string(),
+            note: None,
+            created_at: created.to_string(),
+            updated_at: updated.map(|s| s.to_string()),
+            style: "highlight".to_string(),
+            start_offset: None,
+            end_offset: None,
+            anchor_prefix: None,
+            anchor_suffix: None,
+        }
+    }
+
+    fn tomb(id: &str, at: &str) -> HighlightTombstone {
+        HighlightTombstone { id: id.to_string(), deleted_at: at.to_string() }
+    }
+
+    fn ids(doc: &HighlightsDoc) -> Vec<String> {
+        let mut v: Vec<String> = doc.highlights.iter().map(|h| h.id.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn stale_save_keeps_the_other_machines_highlight() {
+        // Disk has A's highlight; B saves only its own — A must survive (union, not
+        // overwrite). This is the reported bug class for annotations.
+        let disk = HighlightsDoc { highlights: vec![hl("A", "2026-01-01", None)], tombstones: vec![] };
+        let merged = merge_highlights(disk, vec![hl("B", "2026-01-02", None)], vec![]);
+        assert_eq!(ids(&merged), vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn newer_edit_wins_on_the_same_id() {
+        let disk = HighlightsDoc { highlights: vec![hl("A", "2026-01-01", Some("2026-01-01T00:00:00Z"))], tombstones: vec![] };
+        let incoming = vec![hl("A", "2026-01-01", Some("2026-01-05T00:00:00Z"))];
+        let merged = merge_highlights(disk, incoming.clone(), vec![]);
+        assert_eq!(merged.highlights.len(), 1);
+        assert_eq!(merged.highlights[0].updated_at.as_deref(), Some("2026-01-05T00:00:00Z"));
+    }
+
+    #[test]
+    fn delete_propagates_and_does_not_resurrect() {
+        // Disk still has A; incoming carries a tombstone for it → A is removed and
+        // the tombstone is kept so other machines drop it too.
+        let disk = HighlightsDoc { highlights: vec![hl("A", "2026-01-01", None)], tombstones: vec![] };
+        let merged = merge_highlights(disk, vec![], vec![tomb("A", "2026-01-03T00:00:00Z")]);
+        assert!(merged.highlights.is_empty(), "deleted highlight removed");
+        assert_eq!(merged.tombstones.len(), 1, "tombstone retained to keep propagating");
+
+        // A stale machine that still has A re-submits it — the delete still wins.
+        let merged2 = merge_highlights(merged, vec![hl("A", "2026-01-01", None)], vec![]);
+        assert!(merged2.highlights.is_empty(), "delete beats a stale re-add");
+    }
+
+    #[test]
+    fn re_edit_after_delete_revives_the_highlight() {
+        let disk = HighlightsDoc { highlights: vec![], tombstones: vec![tomb("A", "2026-01-03T00:00:00Z")] };
+        // Edited AFTER the delete → comes back, tombstone retired.
+        let incoming = vec![hl("A", "2026-01-01", Some("2026-01-04T00:00:00Z"))];
+        let merged = merge_highlights(disk, incoming, vec![]);
+        assert_eq!(ids(&merged), vec!["A".to_string()]);
+        assert!(merged.tombstones.is_empty());
+    }
+
+    #[test]
+    fn legacy_bare_array_reads_as_a_doc() {
+        let arr = serde_json::to_string(&vec![hl("A", "2026-01-01", None)]).unwrap();
+        let doc: HighlightsDoc = serde_json::from_str::<HighlightsDoc>(&arr)
+            .or_else(|_| serde_json::from_str::<Vec<Highlight>>(&arr).map(|h| HighlightsDoc { highlights: h, tombstones: vec![] }))
+            .unwrap();
+        assert_eq!(ids(&doc), vec!["A".to_string()]);
+    }
 }
 
 // ── ReadingState ──────────────────────────────────────────────────────────────

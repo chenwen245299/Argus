@@ -41,31 +41,46 @@ fn paper_ai_conversations_path(root: &str, slug: &str) -> PathBuf {
     paper::paper_dir(root, slug).join("ai_conversations.json")
 }
 
-pub fn read_paper_ai_conversations(root: &str, slug: &str) -> serde_json::Value {
+fn read_paper_conversations_doc(root: &str, slug: &str) -> crate::crdt::IdKeyedDoc {
     let path = paper_ai_conversations_path(root, slug);
-    if !path.exists() {
-        return serde_json::json!([]);
-    }
-    std::fs::read_to_string(&path)
+    let raw = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .filter(|v: &serde_json::Value| v.is_array())
-        .unwrap_or_else(|| serde_json::json!([]))
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    crate::crdt::parse_doc(&raw, "conversations")
 }
 
+/// Effective (non-deleted) paper AI conversations, newest first.
+pub fn read_paper_ai_conversations(root: &str, slug: &str) -> serde_json::Value {
+    let doc = read_paper_conversations_doc(root, slug);
+    serde_json::Value::Array(crate::crdt::effective_items(&doc, "updatedAt"))
+}
+
+/// Merge this machine's conversations + delete tombstones into the on-disk doc,
+/// so a stale save no longer wipes conversations another machine synced in.
 pub fn write_paper_ai_conversations(
     root: &str,
     slug: &str,
     conversations: &serde_json::Value,
+    tombstones: &serde_json::Value,
 ) -> Result<(), String> {
     if !conversations.is_array() {
         return Err("Paper AI conversations must be an array.".to_string());
     }
     let path = paper_ai_conversations_path(root, slug);
+    let lock = crate::crdt::lock_for(&path.to_string_lossy());
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let incoming = crate::crdt::IdKeyedDoc {
+        items: conversations.as_array().cloned().unwrap_or_default(),
+        tombstones: tombstones.as_array().cloned().unwrap_or_default(),
+    };
+    let merged = crate::crdt::merge(read_paper_conversations_doc(root, slug), incoming, "updatedAt");
+
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("Create paper dir: {e}"))?;
     }
-    let content = serde_json::to_string_pretty(conversations)
+    let content = serde_json::to_string_pretty(&crate::crdt::to_value(&merged, "conversations"))
         .map_err(|e| format!("Serialize paper AI conversations: {e}"))?;
     crate::fsutil::atomic_write_str(&path, &content)
         .map_err(|e| format!("Write ai_conversations.json: {e}"))

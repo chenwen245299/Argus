@@ -84,12 +84,22 @@ export interface Highlight {
   color: string
   note?: string
   created_at: string
+  /** Last content edit (note/color/style). Drives cross-machine merge conflict
+   *  resolution (last edit wins) and lets a re-edit beat an older delete. */
+  updated_at?: string
   style?: 'highlight' | 'underline'
   /** Ebook-only reflow-safe anchor (char offsets into the sanitized chapter DOM text). */
   start_offset?: number
   end_offset?: number
   anchor_prefix?: string
   anchor_suffix?: string
+}
+
+/** Records a highlight deletion so it propagates across a synced library instead
+ *  of resurrecting from a machine that still has it. */
+export interface HighlightTombstone {
+  id: string
+  deleted_at: string
 }
 
 export interface Note {

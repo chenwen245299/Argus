@@ -5,6 +5,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { LibraryConfig, PaperIndexEntry } from '../types'
 import { useReaderStore } from './reader'
 import { useRanksStore } from './ranks'
+import { useActivityStore } from './activity'
 
 export const useLibraryStore = defineStore('library', () => {
   const currentPath = ref<string | null>(null)
@@ -121,6 +122,15 @@ export const useLibraryStore = defineStore('library', () => {
         }
       },
     )
+    // The activity log rides its own channel (it lives in .argus and must NOT
+    // trigger a full library rescan). Another machine syncing in reading time →
+    // re-merge the file into the panel's in-memory model, keeping this device's
+    // own live slot.
+    await listen<{ kind: string }>('library-data-changed', async (event) => {
+      if (event.payload.kind === 'activity') {
+        await useActivityStore().reloadFromDisk()
+      }
+    })
   }
 
   // ── Disk reconcile safety net ──────────────────────────────────────────────
@@ -150,6 +160,9 @@ export const useLibraryStore = defineStore('library', () => {
     // open tabs for note/highlight edits synced in while they were away.
     const reader = useReaderStore()
     await Promise.all(reader.tabs.map(t => reader.reloadFromDisk(t.slug)))
+    // FSEvents is unreliable for sync-client writes, so re-merge the activity log
+    // on return too — the moment a user most expects to see time logged elsewhere.
+    await useActivityStore().reloadFromDisk()
   }
 
   function _startDiskReconcile() {

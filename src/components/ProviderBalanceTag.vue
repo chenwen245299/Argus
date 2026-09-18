@@ -4,8 +4,8 @@
  * and in its settings panel, with a button to go and re-read it.
  *
  * Renders nothing at all for the providers that publish no balance (everyone
- * but DeepSeek and OpenRouter), so it can be dropped into every picker's group
- * header unconditionally.
+ * but DeepSeek, OpenRouter and MoleAPI), so it can be dropped into every
+ * picker's group header unconditionally.
  *
  * The store owns the fetching and the caching; this is display plus one action.
  */
@@ -20,7 +20,7 @@ const { t } = useI18n()
 const ai = useAiStore()
 
 /**
- * Only DeepSeek and OpenRouter have anything to show. Without this the
+ * Only DeepSeek, OpenRouter and MoleAPI have anything to show. Without this the
  * "checking…" state would flash on every provider's header, including the ones
  * that will never report a number.
  */
@@ -54,17 +54,32 @@ function amount(value: number, currency: string) {
   return `${symbol}${value.toFixed(2)}`
 }
 
+/**
+ * An uncapped key has no remaining figure — it draws on an account balance the
+ * key cannot see — so the tag says so rather than printing a "$0.00" that reads
+ * as empty. The spend is still in the tooltip.
+ */
 const label = computed(() => {
   const b = balance.value
   if (!b) return ''
+  if (b.unlimited) return t('balance.unlimited')
   return amount(b.remaining, b.currency)
 })
+
+/** `2026-09-17`, in the viewer's zone — a key's expiry is a calendar fact. */
+function expiryDate(unixSeconds: number) {
+  const d = new Date(unixSeconds * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
 
 /** The full breakdown, as a tooltip — whatever the provider chose to report. */
 const title = computed(() => {
   const b = balance.value
   if (!b) return error.value
-  const lines = [t('balance.remaining', { amount: amount(b.remaining, b.currency) })]
+  const lines = b.unlimited
+    ? [t('balance.unlimitedHint')]
+    : [t('balance.remaining', { amount: amount(b.remaining, b.currency) })]
   if (b.granted !== undefined && b.toppedUp !== undefined) {
     lines.push(t('balance.granted', { amount: amount(b.granted, b.currency) }))
     lines.push(t('balance.toppedUp', { amount: amount(b.toppedUp, b.currency) }))
@@ -72,10 +87,23 @@ const title = computed(() => {
   if (b.totalUsage !== undefined) {
     lines.push(t('balance.used', { amount: amount(b.totalUsage, b.currency) }))
   }
+  if (b.totalCredits !== undefined && !b.unlimited && b.granted === undefined) {
+    lines.push(t('balance.issued', { amount: amount(b.totalCredits, b.currency) }))
+  }
+  // The account figure leads; a key with its own cap stops first when that
+  // cap is the smaller number, so it is worth a line.
+  if (b.keyRemaining !== undefined) {
+    lines.push(t('balance.keyRemaining', { amount: amount(b.keyRemaining, b.currency) }))
+  }
   for (const other of b.otherCurrencies ?? []) {
     lines.push(amount(other.remaining, other.currency))
   }
-  if (!b.isAvailable) lines.push(t('balance.exhausted'))
+  const expired = b.expiresAt !== undefined && b.expiresAt * 1000 <= Date.now()
+  if (b.expiresAt !== undefined) {
+    lines.push(t(expired ? 'balance.expired' : 'balance.expiresOn', { date: expiryDate(b.expiresAt) }))
+  }
+  // An expired key is unavailable for a reason the line above already gives.
+  if (!b.isAvailable && !expired) lines.push(t('balance.exhausted'))
   return lines.join('\n')
 })
 
@@ -84,7 +112,10 @@ const low = computed(() => {
   const b = balance.value
   if (!b) return false
   if (!b.isAvailable) return true
-  return b.currency === 'CNY' ? b.remaining < 5 : b.remaining < 1
+  if (b.unlimited) return false
+  // Whichever runs out first — the account or the key's own cap.
+  const effective = b.keyRemaining !== undefined ? Math.min(b.remaining, b.keyRemaining) : b.remaining
+  return b.currency === 'CNY' ? effective < 5 : effective < 1
 })
 
 /**

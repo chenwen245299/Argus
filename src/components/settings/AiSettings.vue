@@ -28,6 +28,7 @@ const PRESETS = [
   { label: 'MiMo',         base_url: 'https://api.xiaomimimo.com/v1',     kind: 'mimo' },
   { label: '智谱 GLM',      base_url: 'https://open.bigmodel.cn/api/paas/v4', kind: 'zhipu' },
   { label: 'MiniMax',      base_url: 'https://api.minimax.cn/v1',          kind: 'minimax' },
+  { label: 'MoleAPI',      base_url: 'https://api.moleapi.com/v1',         kind: 'moleapi' },
   { label: 'Ollama',       base_url: 'http://localhost:11434',            kind: 'ollama' },
   { label: 'Anthropic',    base_url: 'https://api.anthropic.com/v1',      kind: 'anthropic' },
 ]
@@ -89,6 +90,8 @@ const addForm = ref({ name: '', base_url: '', kind: 'openai_compatible', enabled
 // Edit state for the selected provider (local copy, saved on submit)
 const editKey       = ref('')           // new key (blank = no change)
 const editKeyMode   = ref(false)        // show key input
+const editAccessToken     = ref('')     // MoleAPI 系统访问令牌 (blank = no change)
+const editAccessTokenMode = ref(false)
 const editName      = ref('')
 const editUrl       = ref('')
 const editKind      = ref('')
@@ -235,6 +238,44 @@ const serverToolsAvailable = computed(() =>
   selectedProvider.value?.kind === 'openrouter' ||
   !!selectedProvider.value?.base_url.toLowerCase().includes('openrouter')
 )
+
+/**
+ * MoleAPI has a second secret besides the API key: the console's 系统访问令牌,
+ * which is the only thing that can read the *account* balance. An API key
+ * issued as 无限额度 has no quota of its own, so without this the balance tag
+ * can only say "不限额". Keyed on the URL as well as the kind, like the server
+ * tools above, so a provider added as plain OpenAI-compatible still gets it.
+ */
+const accessTokenAvailable = computed(() =>
+  editKind.value === 'moleapi' || editUrl.value.toLowerCase().includes('moleapi')
+)
+
+// External links must go through the backend opener — a bare <a target="_blank">
+// does nothing inside the Tauri webview.
+function openUrl(url: string) {
+  invoke('open_url', { url }).catch(console.error)
+}
+
+/** Save what was typed. The input starts blank because the stored value is
+ *  never sent back to the UI, so blurring it untouched changes nothing —
+ *  clearing is its own button. */
+async function saveAccessToken() {
+  if (!selectedId.value) return
+  const token = editAccessToken.value.trim()
+  editAccessTokenMode.value = false
+  if (!token) return
+  try {
+    await ai.setProviderAccessToken(selectedId.value, token)
+    editAccessToken.value = ''
+  } catch (e) {
+    alert(String(e))
+  }
+}
+
+function clearAccessToken() {
+  if (!selectedId.value) return
+  ai.setProviderAccessToken(selectedId.value, '').catch(e => alert(String(e)))
+}
 
 const SERVER_TOOL_KEYS = ['web_search', 'web_fetch', 'datetime', 'image_generation'] as const
 type ServerToolKey = (typeof SERVER_TOOL_KEYS)[number]
@@ -399,6 +440,8 @@ function selectProvider(id: string) {
   if (!p) return
   editKey.value = ''
   editKeyMode.value = false
+  editAccessToken.value = ''
+  editAccessTokenMode.value = false
   editName.value = p.name
   editUrl.value = p.base_url
   editKind.value = p.kind
@@ -1027,6 +1070,7 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="mimo">{{ t('aiService.mimo') }}</option>
             <option value="zhipu">{{ t('aiService.zhipu') }}</option>
             <option value="minimax">{{ t('aiService.minimax') }}</option>
+            <option value="moleapi">{{ t('aiService.moleapi') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
             <option value="ollama">{{ t('aiService.ollama') }}</option>
           </select>
@@ -1116,6 +1160,37 @@ function toggleCapability(form: ModelForm, cap: string) {
           </template>
         </div>
 
+        <!-- MoleAPI: the console's access token, which reads the account balance -->
+        <div v-if="accessTokenAvailable" class="field-group">
+          <div class="field-label">{{ t('aiService.accessToken') }}</div>
+          <div class="key-row">
+            <span class="key-display" :class="{ configured: selectedProvider.has_access_token }">
+              {{ selectedProvider.has_access_token ? '••••••••' : t('aiService.accessTokenNotSet') }}
+            </span>
+            <button class="btn-ghost sm" @click="editAccessTokenMode = !editAccessTokenMode">
+              {{ selectedProvider.has_access_token ? t('aiService.modifyKey') : t('aiService.accessTokenAdd') }}
+            </button>
+            <button v-if="selectedProvider.has_access_token" class="btn-ghost sm" @click="clearAccessToken">
+              {{ t('aiService.accessTokenClear') }}
+            </button>
+          </div>
+          <template v-if="editAccessTokenMode">
+            <input
+              v-model="editAccessToken"
+              type="password"
+              class="text-input"
+              style="margin-top:6px"
+              :placeholder="t('aiService.accessTokenPlaceholder')"
+              @keydown.enter="saveAccessToken"
+              @blur="saveAccessToken"
+            />
+          </template>
+          <div class="field-note">
+            {{ t('aiService.accessTokenNote') }}
+            <a class="ext-link" @click="openUrl('https://home.moleapi.com/security')">{{ t('aiService.accessTokenLink') }}</a>
+          </div>
+        </div>
+
         <div class="field-group">
           <div class="field-label">{{ t('aiService.baseUrl') }}</div>
           <input v-model="editUrl" class="text-input" @blur="saveProvider()" />
@@ -1131,6 +1206,7 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="mimo">{{ t('aiService.mimo') }}</option>
             <option value="zhipu">{{ t('aiService.zhipu') }}</option>
             <option value="minimax">{{ t('aiService.minimax') }}</option>
+            <option value="moleapi">{{ t('aiService.moleapi') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
             <option value="ollama">{{ t('aiService.ollama') }}</option>
           </select>
@@ -2035,6 +2111,8 @@ function toggleCapability(form: ModelForm, cap: string) {
   font-family: var(--font-mono);
 }
 .key-display.configured { color: #2e7d32; }
+.ext-link { color: var(--accent); cursor: pointer; }
+.ext-link:hover { text-decoration: underline; }
 
 /* Buttons */
 .btn-primary {

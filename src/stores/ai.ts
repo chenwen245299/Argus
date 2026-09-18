@@ -52,7 +52,9 @@ export function providerSupportsBalance(
 ): boolean {
   if (!provider) return false
   const url = provider.base_url.toLowerCase()
-  return url.includes('deepseek') || provider.kind === 'openrouter' || url.includes('openrouter')
+  return url.includes('deepseek')
+    || provider.kind === 'openrouter' || url.includes('openrouter')
+    || provider.kind === 'moleapi' || url.includes('moleapi')
 }
 
 export const useAiStore = defineStore('ai', () => {
@@ -240,6 +242,18 @@ export const useAiStore = defineStore('ai', () => {
     await load()
   }
 
+  /**
+   * Store (empty = clear) a provider's account-level access token — MoleAPI's
+   * 系统访问令牌, which is what lets the balance show the *account*'s money
+   * rather than the key's cap. Forced refresh, since the whole point of
+   * changing it is a different figure.
+   */
+  async function setProviderAccessToken(id: string, token: string) {
+    await invoke('set_provider_access_token', { id, token })
+    await load()
+    void loadBalances(true)
+  }
+
   async function setProviderEnabled(id: string, enabled: boolean) {
     await invoke('set_provider_enabled', { id, enabled })
     const p = settings.value.providers.find(x => x.id === id)
@@ -283,6 +297,7 @@ export const useAiStore = defineStore('ai', () => {
     addProvider,
     updateProvider,
     deleteProvider,
+    setProviderAccessToken,
     setProviderEnabled,
     fetchModels,
     saveModels,

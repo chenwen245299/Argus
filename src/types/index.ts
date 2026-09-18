@@ -318,10 +318,12 @@ export interface AiModel {
 export interface AiProviderInfo {
   id: string
   name: string
-  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'qwenai' | 'mimo' | 'zhipu' | 'minimax' | 'ollama' | string
+  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'qwenai' | 'mimo' | 'zhipu' | 'minimax' | 'moleapi' | 'ollama' | string
   base_url: string
   enabled: boolean
   has_key: boolean
+  /** A second, account-level secret is on file (MoleAPI's 系统访问令牌). */
+  has_access_token?: boolean
   models: AiModel[]
   server_tools: ServerTools
 }
@@ -401,16 +403,28 @@ export interface ProviderBalance {
   providerId: string
   /** What is left to spend, in `currency`. */
   remaining: number
-  /** `CNY` for DeepSeek, `USD` for OpenRouter. */
+  /** `CNY` for DeepSeek, `USD` for OpenRouter and MoleAPI. */
   currency: string
   /** DeepSeek: the promotional part of `remaining`, which expires. */
   granted?: number
   /** DeepSeek: the paid-for part of `remaining`. */
   toppedUp?: number
-  /** OpenRouter: credits bought to date. */
+  /** OpenRouter: credits bought to date. MoleAPI: the quota the key was issued with. */
   totalCredits?: number
-  /** OpenRouter: credits spent to date. */
+  /** OpenRouter / MoleAPI: spent to date. */
   totalUsage?: number
+  /**
+   * The key has no cap of its own (an uncapped OpenRouter key, a MoleAPI key
+   * issued as 无限额度). `remaining` is then meaningless; show the spend.
+   */
+  unlimited?: boolean
+  /**
+   * MoleAPI, when `remaining` is the account balance: what the key itself may
+   * still spend, if it has a cap of its own.
+   */
+  keyRemaining?: number
+  /** MoleAPI: when the key stops working, as Unix seconds. Absent = never. */
+  expiresAt?: number
   /** False once the account can no longer be charged for a call. */
   isAvailable: boolean
   /** Further currencies, when the account holds more than one. */

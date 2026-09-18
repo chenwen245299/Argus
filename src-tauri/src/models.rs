@@ -852,6 +852,9 @@ pub struct AiProviderInfo {
     pub base_url: String,
     pub enabled: bool,
     pub has_key: bool,
+    /// A second, account-level secret is on file (MoleAPI's 系统访问令牌).
+    #[serde(default)]
+    pub has_access_token: bool,
     pub models: Vec<AiModel>,
     #[serde(default)]
     pub server_tools: ServerTools,

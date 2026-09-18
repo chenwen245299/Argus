@@ -53,11 +53,17 @@ const CHANGED_EVENT: &str = "ai-models-refreshed";
 
 /// Whether this provider's catalogue carries prices worth re-reading.
 ///
-/// OpenRouter is the one that publishes per-model pricing, free tiers and
-/// time-of-day discounts. Everyone else either has no public `/models` at all
-/// (Kimi, Anthropic), or returns bare ids with no prices — and running this
-/// against them would spend a request to learn nothing.
+/// OpenRouter publishes per-model pricing, free tiers and time-of-day
+/// discounts; MoleAPI publishes per-model rates in its price list. Everyone
+/// else either has no public `/models` at all (Kimi, Anthropic), or returns
+/// bare ids with no prices — and running this against them would spend a
+/// request to learn nothing.
 fn publishes_prices(provider: &AiProvider) -> bool {
+    is_openrouter(provider) || crate::moleapi::is_moleapi(provider)
+}
+
+/// The per-model promotion lookups below exist only on OpenRouter.
+fn is_openrouter(provider: &AiProvider) -> bool {
     provider.base_url.to_lowercase().contains("openrouter")
 }
 
@@ -162,6 +168,13 @@ async fn refresh_provider(root: &str, provider_id: &str) -> usize {
     let provider_snapshot = provider.clone();
     if changed > 0 && crate::ai_manager::write_ai_settings(root, &settings).is_err() {
         return 0;
+    }
+
+    // Promotions are an OpenRouter notion, read from an endpoint only it has;
+    // for every other price-publishing provider the bulk pass above is the
+    // whole refresh.
+    if !is_openrouter(&provider_snapshot) {
+        return changed;
     }
 
     // Promotions are not in the bulk list, so each saved model needs its own
@@ -394,6 +407,7 @@ mod tests {
         created_at: String::new(),
         };
         assert!(publishes_prices(&provider("https://openrouter.ai/api/v1")));
+        assert!(publishes_prices(&provider("https://api.moleapi.com/v1")));
         assert!(!publishes_prices(&provider("https://api.deepseek.com/v1")));
         assert!(!publishes_prices(&provider("http://localhost:11434/v1")));
     }

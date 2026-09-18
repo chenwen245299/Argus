@@ -132,6 +132,36 @@ pub fn delete_api_key(root: &str, provider_id: &str) {
     }
 }
 
+// ── Provider access tokens ────────────────────────────────────────────────────
+//
+// A second secret some providers have besides the inference key: MoleAPI's
+// 系统访问令牌, which opens the account-level management API (balance, group)
+// that the `sk-` key cannot reach. Stored in the same encrypted map under a
+// derived id, so it rides the existing master key and is removed with the
+// provider.
+
+/// The key-store id for a provider's access token. The `__` suffix keeps it
+/// clear of provider UUIDs and of the reserved `__…__` ids above.
+fn access_token_key_id(provider_id: &str) -> String {
+    format!("{provider_id}__access_token")
+}
+
+pub fn save_access_token(root: &str, provider_id: &str, token: &str) -> Result<(), String> {
+    save_api_key(root, &access_token_key_id(provider_id), token)
+}
+
+pub fn get_access_token(root: &str, provider_id: &str) -> Option<String> {
+    get_api_key(root, &access_token_key_id(provider_id))
+}
+
+pub fn has_access_token(root: &str, provider_id: &str) -> bool {
+    get_access_token(root, provider_id).is_some()
+}
+
+pub fn delete_access_token(root: &str, provider_id: &str) {
+    delete_api_key(root, &access_token_key_id(provider_id))
+}
+
 // ── AI settings persistence ───────────────────────────────────────────────────
 
 pub fn read_ai_settings(root: &str) -> AiSettings {
@@ -184,6 +214,7 @@ pub fn to_info(root: &str, settings: &AiSettings) -> AiSettingsInfo {
                 base_url: p.base_url.clone(),
                 enabled: p.enabled,
                 has_key: has_api_key(root, &p.id),
+                has_access_token: has_access_token(root, &p.id),
                 // Fill in sizes the provider's catalogue never carried. Done on
                 // the way out rather than on save, so models added before the
                 // table existed are right immediately instead of waiting for
@@ -290,6 +321,7 @@ pub fn delete_provider(root: &str, id: &str) -> Result<(), String> {
         return Err(format!("Provider not found: {id}"));
     }
     delete_api_key(root, id);
+    delete_access_token(root, id);
     if settings.default_provider_id.as_deref() == Some(id) {
         settings.default_provider_id = None;
         settings.default_model_id = None;

@@ -261,6 +261,25 @@ pub async fn list_models(provider: &AiProvider, api_key: &str) -> Result<Vec<AiM
         let fetched = fetch_openai_models(provider, api_key).await.unwrap_or_default();
         return Ok(crate::minimax::merge_catalogue(fetched));
     }
+    if crate::moleapi::is_moleapi(provider) {
+        // The relay's /models is the authority on what this key may call, but
+        // it returns bare ids. Modalities and per-token rates live in the public
+        // price list beside it, so overlay that — and drop the rows (speech,
+        // reranking, moderation) that cannot take a chat turn.
+        //
+        // The price list is required, not best-effort. Without it the result is
+        // six hundred ids with no way to tell a chat model from a reranker, and
+        // — worse — the background price refresh would read the missing rates
+        // as "no longer priced" and wipe the ones already saved. Both live on
+        // the same host, so one answering while the other does not is rare.
+        let (models, pricing) = tokio::join!(
+            fetch_openai_models(provider, api_key),
+            crate::moleapi::fetch_pricing(provider),
+        );
+        let models = models?;
+        let pricing = pricing.map_err(|e| format!("MoleAPI price list (/api/pricing): {e}"))?;
+        return Ok(crate::moleapi::enrich_models(models, &pricing));
+    }
     if crate::zhipu::is_zhipu(provider) {
         // BigModel documents no /models endpoint — the path answers, but only
         // behind the platform's blanket auth gate, so whether it lists anything

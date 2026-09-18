@@ -2078,6 +2078,25 @@ fn agent_message_to_json(m: &AgentMessage) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// Tack the reader's current page onto a user turn, in place, so the model can
+/// resolve "this page" without guessing. Handles both content shapes: a bare
+/// string, or the multimodal parts array a turn with image/file attachments
+/// carries.
+fn append_current_page_hint(msg: &mut serde_json::Value, page: u32) {
+    let hint = format!(
+        "\n\n[Reading context, not part of my question: I'm currently viewing page \
+         {page} of this paper. If I say \"this page\", \"here\", or point at something \
+         without naming a page, I mean page {page}.]"
+    );
+    match &mut msg["content"] {
+        serde_json::Value::String(s) => s.push_str(&hint),
+        serde_json::Value::Array(parts) => {
+            parts.push(serde_json::json!({ "type": "text", "text": hint }));
+        }
+        _ => {}
+    }
+}
+
 pub async fn chat_with_library_agent(
     root: &str,
     messages: Vec<AgentMessage>,
@@ -2094,6 +2113,10 @@ pub async fn chat_with_library_agent(
     // The paper this conversation is about, when it is anchored to one (the
     // paper AI panel). Its `get_paper` card is put in the system prompt.
     paper_slug: Option<&str>,
+    // The 1-based PDF page the reader is on, forwarded so "this page" resolves to
+    // a real page. Volatile, so it is appended to the live turn — never the
+    // cached paper card.
+    current_page: Option<u32>,
     // The canvas this conversation is about, when it is (the "问画布" chat). Its
     // presence is what unlocks the `edit_canvas` tool, and nothing else does.
     canvas_id: Option<&str>,
@@ -2140,6 +2163,7 @@ pub async fn chat_with_library_agent(
         max_rounds,
         conversation_id,
         paper_block.as_deref(),
+        current_page,
         canvas_id,
         &bridge,
         app,
@@ -2393,6 +2417,10 @@ async fn run_agent_loop(
     conversation_id: Option<&str>,
     // `get_paper` for the paper this conversation is anchored to, if any.
     paper_block: Option<&str>,
+    // The 1-based page the reader is looking at right now, when a paper is open.
+    // Appended to the latest user turn (never the cached `paper_block`) so "this
+    // page" resolves without breaking the warm prefix as the user scrolls.
+    current_page: Option<u32>,
     // The canvas this answer is about, if any. `Some` unlocks `edit_canvas` and
     // is the id every edit is aimed at — the model never gets to choose it.
     canvas_id: Option<&str>,
@@ -2443,6 +2471,17 @@ async fn run_agent_loop(
         convo.push(serde_json::json!({ "role": "system", "content": block }));
     }
     convo.extend(messages.iter().map(agent_message_to_json));
+    // Where the reader is right now, tacked onto their latest turn so "this page"
+    // / "here" resolves to a real page. Kept out of `paper_block` on purpose:
+    // that block is the warm cache prefix and has to stay byte-stable, but the
+    // page changes with every scroll. This only mutates `convo`, so the
+    // `messages` the keepalive re-warms are untouched and the next turn still
+    // hits. Gated on `paper_block` — no paper open, no page to speak of.
+    if let (Some(page), true) = (current_page, paper_block.is_some()) {
+        if let Some(msg) = convo.iter_mut().rev().find(|m| m["role"] == "user") {
+            append_current_page_hint(msg, page);
+        }
+    }
 
     let mut rounds = 0usize;
     // Rounds whose tool calls were actually run — which is what the user's

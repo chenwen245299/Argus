@@ -1643,6 +1643,7 @@ pub async fn add_ai_provider(
     let p = ai_manager::add_provider(&root, provider, &api_key)?;
     Ok(AiProviderInfo {
         has_key: ai_manager::has_api_key(&root, &p.id),
+        has_access_token: false,
         id: p.id,
         name: p.name,
         kind: p.kind,
@@ -1667,6 +1668,26 @@ pub async fn update_ai_provider(
 pub async fn delete_ai_provider(id: String, state: State<'_, LibraryRoot>) -> Result<(), String> {
     let root = get_root(&state)?;
     ai_manager::delete_provider(&root, &id)
+}
+
+/// Store (or clear, when empty) a provider's account-level access token,
+/// encrypted at rest beside its API key. MoleAPI's 系统访问令牌 is the one
+/// today: it lets the balance lookup read the account balance, which an
+/// uncapped API key cannot see for itself. Never returned to the frontend.
+#[tauri::command]
+pub async fn set_provider_access_token(
+    id: String,
+    token: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    let token = token.trim();
+    if token.is_empty() {
+        ai_manager::delete_access_token(&root, &id);
+        Ok(())
+    } else {
+        ai_manager::save_access_token(&root, &id, token)
+    }
 }
 
 #[tauri::command]
@@ -1839,15 +1860,18 @@ pub async fn fetch_provider_balances(
     let root = get_root(&state)?;
     let settings = ai_manager::read_ai_settings(&root);
 
-    let targets: Vec<(models::AiProvider, String)> = settings
+    let targets: Vec<(models::AiProvider, String, Option<String>)> = settings
         .providers
         .iter()
         .filter(|p| p.enabled && balance::supports_balance(p))
-        .filter_map(|p| ai_manager::get_api_key(&root, &p.id).map(|key| (p.clone(), key)))
+        .filter_map(|p| {
+            ai_manager::get_api_key(&root, &p.id)
+                .map(|key| (p.clone(), key, ai_manager::get_access_token(&root, &p.id)))
+        })
         .collect();
 
-    let results = futures::stream::iter(targets.into_iter().map(|(provider, key)| async move {
-        match balance::fetch(&provider, &key).await {
+    let results = futures::stream::iter(targets.into_iter().map(|(provider, key, token)| async move {
+        match balance::fetch(&provider, &key, token.as_deref()).await {
             Ok(b) => BalanceResult {
                 provider_id: provider.id,
                 balance: Some(b),
@@ -2413,6 +2437,10 @@ pub async fn chat_with_library(
     // to one. The paper AI panel sends it so the model starts with that paper's
     // card already in front of it.
     paper_slug: Option<String>,
+    // Agent mode only: the 1-based PDF page the reader is currently viewing, so
+    // the model can resolve "this page" to a real page. Volatile — appended to
+    // the live turn, never the cached paper card.
+    current_page: Option<u32>,
     // Agent mode only: the canvas this conversation is about (the "问画布" chat).
     // Its presence is what lets the model reach the `edit_canvas` tool, and it is
     // the only canvas any edit can touch — the model never names one itself.
@@ -2444,6 +2472,7 @@ pub async fn chat_with_library(
             agent_max_rounds,
             conversation_id.as_deref(),
             paper_slug.as_deref(),
+            current_page,
             canvas_id.as_deref(),
             window.label(),
             &app,

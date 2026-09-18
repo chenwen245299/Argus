@@ -23,6 +23,7 @@ mod mcp;
 mod metadata;
 mod mimo;
 mod minimax;
+mod moleapi;
 mod models;
 mod net;
 mod ocr;
@@ -227,6 +228,7 @@ pub fn run() {
             commands::add_ai_provider,
             commands::update_ai_provider,
             commands::delete_ai_provider,
+            commands::set_provider_access_token,
             commands::set_provider_enabled,
             commands::test_ai_provider,
             commands::fetch_provider_models,

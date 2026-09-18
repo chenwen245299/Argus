@@ -11,6 +11,7 @@ import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import ServerToolTraceCard from '../ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../../utils/serverToolTrace'
 import { useSettingsStore } from '../../stores/settings'
+import { useReaderStore } from '../../stores/reader'
 import MarkdownBody from '../MarkdownBody.vue'
 import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
@@ -36,6 +37,10 @@ import {
 const { t } = useI18n()
 const ai = useAiStore()
 const settingsStore = useSettingsStore()
+// Only for reading the current page, so the model can resolve "this page" in a
+// question. Empty in the popped-out AI window (no PdfViewer there) — the hint is
+// simply skipped, which is the intended graceful fallback.
+const reader = useReaderStore()
 
 // `Attachment` now lives in utils/attachments.ts, shared with the library chat.
 
@@ -1504,6 +1509,11 @@ async function streamAnswer(
       agentMaxRounds: null,
       conversationId: conv.id,
       paperSlug: slug,
+      // The page this question was asked from, so the model knows what "this
+      // page" points at. Tracks the PdfViewer's scroll position (persisted to
+      // the reader store within ~700ms); null before the paper has any reading
+      // state, which the backend treats as "no page hint".
+      currentPage: reader.readingStateFor(slug)?.page ?? null,
     })
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) {

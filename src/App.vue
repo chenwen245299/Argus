@@ -17,6 +17,8 @@ const CanvasView = defineAsyncComponent(() => import('./views/CanvasView.vue'))
 const LibraryChatView = defineAsyncComponent(() => import('./views/LibraryChatView.vue'))
 const EmbeddingMapView = defineAsyncComponent(() => import('./views/EmbeddingMapView.vue'))
 const PaperAiView = defineAsyncComponent(() => import('./views/PaperAiView.vue'))
+const MediaStudioView = defineAsyncComponent(() => import('./views/MediaStudioView.vue'))
+const AnnotationPrintView = defineAsyncComponent(() => import('./views/AnnotationPrintView.vue'))
 const NoteWindowView = defineAsyncComponent(() => import('./views/NoteWindowView.vue'))
 
 const libraryStore = useLibraryStore()
@@ -68,6 +70,8 @@ onMounted(async () => {
     <LibraryChatView v-else-if="windowLabel === 'library-chat'" />
     <EmbeddingMapView v-else-if="windowLabel === 'embedding-map'" />
     <PaperAiView v-else-if="windowLabel === 'paper-ai'" />
+    <MediaStudioView v-else-if="windowLabel === 'media-studio'" />
+    <AnnotationPrintView v-else-if="windowLabel === 'annotation-print'" />
     <NoteWindowView v-else-if="windowLabel.startsWith('note-window')" />
     <MainView v-else />
   </div>

@@ -10,7 +10,7 @@ import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import { providerLogo } from '../../utils/providerLogo'
 import type {
   AiModel, AiProviderInfo, AiProviderInput, DeepSeekFile, DeepSeekFileList,
-  DeepSeekVisionLimits, ModelSelection, ServerTools,
+  DeepSeekVisionLimits, ModelSelection, ServerTools, SpeechOutput,
 } from '../../types'
 
 const { t } = useI18n()
@@ -28,6 +28,7 @@ const PRESETS = [
   { label: 'MiMo',         base_url: 'https://api.xiaomimimo.com/v1',     kind: 'mimo' },
   { label: '智谱 GLM',      base_url: 'https://open.bigmodel.cn/api/paas/v4', kind: 'zhipu' },
   { label: 'MiniMax',      base_url: 'https://api.minimax.cn/v1',          kind: 'minimax' },
+  { label: '阶跃星辰 StepFun', base_url: 'https://api.stepfun.com/v1',       kind: 'stepfun' },
   { label: 'MoleAPI',      base_url: 'https://api.moleapi.com/v1',         kind: 'moleapi' },
   { label: 'Ollama',       base_url: 'http://localhost:11434',            kind: 'ollama' },
   { label: 'Anthropic',    base_url: 'https://api.anthropic.com/v1',      kind: 'anthropic' },
@@ -238,6 +239,55 @@ const serverToolsAvailable = computed(() =>
   selectedProvider.value?.kind === 'openrouter' ||
   !!selectedProvider.value?.base_url.toLowerCase().includes('openrouter')
 )
+
+// ── Spoken replies (StepFun) ──────────────────────────────────────────────────
+//
+// StepFun's end-to-end speech models can answer out loud as well as in text.
+// Provider-level like the server tools above, and off by default: a spoken reply
+// costs output tokens at the audio rate, and the toggle is a property of how this
+// endpoint is set up rather than a per-message decision.
+
+const DEFAULT_SPEECH: SpeechOutput = { enabled: false, voice: '' }
+const editSpeech = ref<SpeechOutput>({ ...DEFAULT_SPEECH })
+
+/**
+ * Keyed on the URL as well as the kind, matching the backend's
+ * `stepfun::is_stepfun`, so a provider added as plain OpenAI-compatible but
+ * pointed at api.stepfun.com is still configurable here.
+ */
+const speechAvailable = computed(() =>
+  selectedProvider.value?.kind === 'stepfun' ||
+  !!selectedProvider.value?.base_url.toLowerCase().includes('stepfun')
+)
+
+/**
+ * The four voices StepFun documents by name, all for the `step-audio-2` family.
+ * `step-1o-audio` and `step-audio-r1.5` take voice ids that no public endpoint
+ * enumerates (`GET /v1/audio/voices` lists only the caller's own cloned voices),
+ * so the field stays free text and these are offered as a shortcut, not a list
+ * to pick from.
+ */
+const STEP_VOICES = [
+  { id: 'wenrounansheng', labelKey: 'aiService.voiceWenrounansheng' },
+  { id: 'qingchunshaonv', labelKey: 'aiService.voiceQingchunshaonv' },
+  { id: 'livelybreezy-female', labelKey: 'aiService.voiceLivelybreezy' },
+  { id: 'elegantgentle-female', labelKey: 'aiService.voiceElegantgentle' },
+] as const
+
+async function saveSpeech() {
+  if (!selectedId.value) return
+  await saveProvider({ speech: { ...editSpeech.value, voice: editSpeech.value.voice.trim() } })
+}
+
+async function toggleSpeech() {
+  editSpeech.value.enabled = !editSpeech.value.enabled
+  await saveSpeech()
+}
+
+async function pickVoice(id: string) {
+  editSpeech.value.voice = editSpeech.value.voice === id ? '' : id
+  await saveSpeech()
+}
 
 /**
  * MoleAPI has a second secret besides the API key: the console's 系统访问令牌,
@@ -461,6 +511,7 @@ function selectProvider(id: string) {
   orEndpointStatus.value = ''
   orEndpointErr.value = ''
   editServerTools.value = { ...DEFAULT_SERVER_TOOLS, ...(p.server_tools ?? {}) }
+  editSpeech.value = { ...DEFAULT_SPEECH, ...(p.speech ?? {}) }
   resetDeepSeekFiles()
   // Only auto-load with a key on file: without one the list call would fail and
   // greet the user with an error box they did not ask for.
@@ -1070,6 +1121,7 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="mimo">{{ t('aiService.mimo') }}</option>
             <option value="zhipu">{{ t('aiService.zhipu') }}</option>
             <option value="minimax">{{ t('aiService.minimax') }}</option>
+            <option value="stepfun">{{ t('aiService.stepfun') }}</option>
             <option value="moleapi">{{ t('aiService.moleapi') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
             <option value="ollama">{{ t('aiService.ollama') }}</option>
@@ -1206,6 +1258,7 @@ function toggleCapability(form: ModelForm, cap: string) {
             <option value="mimo">{{ t('aiService.mimo') }}</option>
             <option value="zhipu">{{ t('aiService.zhipu') }}</option>
             <option value="minimax">{{ t('aiService.minimax') }}</option>
+            <option value="stepfun">{{ t('aiService.stepfun') }}</option>
             <option value="moleapi">{{ t('aiService.moleapi') }}</option>
             <option value="anthropic">{{ t('aiService.anthropic') }}</option>
             <option value="ollama">{{ t('aiService.ollama') }}</option>
@@ -1283,6 +1336,50 @@ function toggleCapability(form: ModelForm, cap: string) {
               />
             </label>
           </div>
+        </div>
+
+        <!-- StepFun spoken replies: only its end-to-end speech models read this -->
+        <div v-if="speechAvailable" class="field-group ot-tools">
+          <div class="field-label">{{ t('aiService.speechTitle') }}</div>
+          <div class="field-note">{{ t('aiService.speechNote') }}</div>
+
+          <div class="ot-tool-list">
+            <button class="ot-tool" :class="{ on: editSpeech.enabled }" @click="toggleSpeech">
+              <Icon
+                :icon="editSpeech.enabled ? 'fluent:checkbox-checked-24-filled' : 'fluent:checkbox-unchecked-24-regular'"
+                width="15"
+                height="15"
+              />
+              <span class="ot-tool-text">
+                <span class="ot-tool-name">{{ t('aiService.speechEnable') }}</span>
+                <span class="ot-tool-cost">{{ t('aiService.speechCost') }}</span>
+              </span>
+            </button>
+          </div>
+
+          <template v-if="editSpeech.enabled">
+            <div class="voice-row">
+              <button
+                v-for="v in STEP_VOICES"
+                :key="v.id"
+                class="cap-chip"
+                :class="{ active: editSpeech.voice === v.id }"
+                @click="pickVoice(v.id)"
+              >{{ t(v.labelKey) }}</button>
+            </div>
+            <div class="ot-advanced">
+              <label class="ot-field wide">
+                <span>{{ t('aiService.speechVoiceId') }}</span>
+                <input
+                  v-model="editSpeech.voice"
+                  class="text-input xs"
+                  :placeholder="t('aiService.speechVoicePlaceholder')"
+                  @blur="saveSpeech()"
+                />
+              </label>
+            </div>
+            <div class="field-note">{{ t('aiService.speechVoiceHint') }}</div>
+          </template>
         </div>
 
         <!-- DeepSeek file store: images uploaded once and referenced by id -->
@@ -2169,6 +2266,13 @@ function toggleCapability(form: ModelForm, cap: string) {
   font-size: 10px;
   color: var(--text-tertiary);
 }
+.voice-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 4px;
+}
+
 .ot-advanced {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));

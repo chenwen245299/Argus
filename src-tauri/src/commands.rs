@@ -10,9 +10,9 @@ use crate::models::{
 };
 use crate::LibraryRoot;
 use crate::{
-    ai_manager, ai_summary, arxiv, arxiv_scheduler, balance, canvas,
-    canvas_enhance, collections, copilot, deepseek, ebook, extraction, library, llm, metadata,
-    models, paper, rag,
+    ai_manager, ai_summary, annotations, arxiv, arxiv_scheduler, balance, canvas,
+    canvas_enhance, collections, copilot, deepseek, ebook, extraction, library, llm, media,
+    metadata, models, paper, rag,
     search, sections, security_bookmark, settings, snippets, url_import, watcher, writing,
 };
 // ── Library management ────────────────────────────────────────────────────────
@@ -1651,6 +1651,7 @@ pub async fn add_ai_provider(
         enabled: p.enabled,
         models: p.models,
         server_tools: p.server_tools,
+        speech: p.speech,
     })
 }
 
@@ -1889,6 +1890,260 @@ pub async fn fetch_provider_balances(
     .await;
 
     Ok(results)
+}
+
+// ── Exporting highlights and notes ────────────────────────────────────────────
+
+/// Gather what the user wrote on a set of papers.
+///
+/// Also what the PDF path uses: the print-preview window renders this same
+/// structure as HTML, so the three formats never drift apart in what they
+/// include.
+#[tauri::command]
+pub fn collect_annotations(
+    slugs: Vec<String>,
+    state: State<'_, LibraryRoot>,
+) -> Result<Vec<annotations::ExportedPaper>, String> {
+    let root = get_root(&state)?;
+    Ok(annotations::collect(&root, &slugs))
+}
+
+/// Gather the selected papers, or say why there is nothing to gather.
+fn papers_for_export(
+    root: &str,
+    slugs: &[String],
+) -> Result<Vec<annotations::ExportedPaper>, String> {
+    let papers = annotations::collect(root, slugs);
+    if papers.is_empty() {
+        return Err("没有可导出的论文。".to_string());
+    }
+    Ok(papers)
+}
+
+/// Everything in one file, for the user who wants exactly one file.
+///
+/// Returns the content rather than writing it: the save dialog belongs to the
+/// frontend, and `write_bytes_to_file` already guards where bytes may land.
+#[tauri::command]
+pub fn export_annotations(
+    slugs: Vec<String>,
+    format: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<annotations::ExportFile, String> {
+    let root = get_root(&state)?;
+    let papers = papers_for_export(&root, &slugs)?;
+    // Local time, because this lands in a document a person reads.
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let file_stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
+
+    match format.as_str() {
+        "markdown" => Ok(annotations::ExportFile {
+            path: format!("批注与笔记-{file_stamp}.md"),
+            content: annotations::to_markdown_combined(&papers, &stamp),
+        }),
+        "json" => Ok(annotations::ExportFile {
+            path: format!("批注与笔记-{file_stamp}.json"),
+            content: serde_json::to_string_pretty(&serde_json::json!({
+                "exportedAt": stamp,
+                "paperCount": papers.len(),
+                "papers": papers,
+            }))
+            .map_err(|e| format!("序列化失败：{e}"))?,
+        }),
+        other => Err(format!("不支持的导出格式：{other}")),
+    }
+}
+
+/// What a folder export reports back.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderExport {
+    /// Absolute path of the folder that was created.
+    pub dir: String,
+    /// Its name on its own, for a message the user reads.
+    pub name: String,
+    pub file_count: usize,
+    pub note_count: usize,
+}
+
+/// Write the whole export as one self-contained folder inside `parent`.
+///
+/// The writing happens here rather than through `write_bytes_to_file` per file
+/// because this is a tree, not a file: the directories have to exist before the
+/// contents, and doing that over one IPC call per file would leave a
+/// half-written folder behind the moment one of them failed.
+///
+/// The folder is always newly created — never written into an existing one — so
+/// an export cannot overwrite anything the user already had there.
+#[tauri::command]
+pub fn export_annotations_to_folder(
+    slugs: Vec<String>,
+    format: String,
+    parent: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<FolderExport, String> {
+    let root = get_root(&state)?;
+    let papers = papers_for_export(&root, &slugs)?;
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let file_stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
+    let files = annotations::build_tree(&papers, &format, &stamp)?;
+
+    let parent = std::path::Path::new(&parent);
+    if !parent.is_dir() {
+        return Err("选择的位置不是一个文件夹。".to_string());
+    }
+
+    // Two exports in the same minute would otherwise collide; `create_dir`
+    // failing on an existing name is the check, so there is no window between
+    // testing and creating.
+    let base = annotations::export_dir_name(&file_stamp);
+    let mut dir = parent.join(&base);
+    let mut n = 2;
+    loop {
+        match std::fs::create_dir(&dir) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if n > 50 {
+                    return Err("这个文件夹里同名的导出太多了，换个位置试试。".to_string());
+                }
+                dir = parent.join(format!("{base}-{n}"));
+                n += 1;
+            }
+            Err(e) => return Err(format!("创建导出文件夹失败：{e}")),
+        }
+    }
+
+    let note_count = files.iter().filter(|f| f.path.starts_with("笔记/")).count();
+    annotations::write_tree(&dir, &files)?;
+
+    // Show it: an export that reports success but leaves the user hunting for
+    // where it went has only half worked.
+    let _ = reveal_path_in_finder(&dir.to_string_lossy());
+
+    Ok(FolderExport {
+        name: dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| base.clone()),
+        dir: dir.to_string_lossy().to_string(),
+        file_count: files.len(),
+        note_count,
+    })
+}
+
+/// Open the print-preview window for a PDF export.
+///
+/// PDF goes through the system print dialog rather than being written here: a
+/// PDF authored in Rust would need an embedded CJK font (this app ships none,
+/// and the existing jsPDF export mangles Chinese for exactly that reason), while
+/// the webview already has the system's fonts and the app's own Markdown styling.
+#[tauri::command]
+pub async fn open_annotation_print_window(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    if let Some(win) = app.get_webview_window("annotation-print") {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    let builder = WebviewWindowBuilder::new(
+        &app,
+        "annotation-print",
+        WebviewUrl::App(std::path::PathBuf::from("/")),
+    )
+    .title("Argus — 导出批注与笔记")
+    .inner_size(860.0, 900.0)
+    .min_inner_size(600.0, 420.0);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition { x: 14.0, y: 18.0 });
+
+    builder
+        .build()
+        .map_err(|e| format!("Open annotation print window: {e}"))?;
+    Ok(())
+}
+
+/// Hand the preview window to the OS print dialog, where "Save as PDF" lives.
+///
+/// `WebviewWindow::print` rather than `window.print()` from JS: WKWebView does
+/// not implement the JS call, so on macOS the button would silently do nothing.
+#[tauri::command]
+pub fn print_annotation_window(app: tauri::AppHandle) -> Result<(), String> {
+    let win = app
+        .get_webview_window("annotation-print")
+        .ok_or("找不到打印预览窗口。")?;
+    win.print().map_err(|e| format!("打开打印对话框失败：{e}"))
+}
+
+// ── Media generation (off the chat path) ──────────────────────────────────────
+//
+// Text-to-image, speech, transcription, sound design, music. Provider-agnostic:
+// `media::capabilities` describes what each configured provider can do and what
+// knobs each task takes, and the studio renders its form from that — so adding a
+// provider is an adapter, not a UI change.
+
+/// What every configured provider can do off the chat path.
+///
+/// Providers with no media adapter are simply absent, which is how the studio
+/// knows not to list them. A provider with no key on file is skipped too: a task
+/// it could never run should not be offered.
+#[tauri::command]
+pub fn list_media_capabilities(
+    state: State<'_, LibraryRoot>,
+) -> Result<Vec<models::MediaProviderCapabilities>, String> {
+    let root = get_root(&state)?;
+    let settings = ai_manager::read_ai_settings(&root);
+    Ok(settings
+        .providers
+        .iter()
+        .filter(|p| p.enabled && ai_manager::get_api_key(&root, &p.id).is_some())
+        .filter_map(|p| {
+            let capabilities = media::capabilities(p);
+            if capabilities.is_empty() {
+                return None;
+            }
+            Some(models::MediaProviderCapabilities {
+                provider_id: p.id.clone(),
+                provider_name: p.name.clone(),
+                base_url: p.base_url.clone(),
+                capabilities,
+            })
+        })
+        .collect())
+}
+
+/// Run one media task.
+///
+/// Long by nature — a music job is polled for minutes — so the frontend shows a
+/// spinner rather than expecting this to return quickly.
+#[tauri::command]
+pub async fn run_media_task(
+    state: State<'_, LibraryRoot>,
+    request: media::MediaRequest,
+) -> Result<media::MediaResult, String> {
+    let root = get_root(&state)?;
+    let settings = ai_manager::read_ai_settings(&root);
+    let provider = settings
+        .providers
+        .iter()
+        .find(|p| p.id == request.provider_id)
+        .cloned()
+        .ok_or("找不到这个服务商，可能已经被删除了。")?;
+    let key = ai_manager::get_api_key(&root, &provider.id)
+        .ok_or_else(|| format!("{} 还没有配置 API Key。", provider.name))?;
+    media::run(&provider, &key, &request).await
+}
+
+/// Download a media artifact the provider hosts, so it can be saved locally.
+///
+/// The webview cannot do this itself: a cross-origin `fetch` from
+/// `tauri://localhost` to a provider CDN is blocked, and these links expire.
+#[tauri::command]
+pub async fn fetch_media_artifact(url: String) -> Result<Vec<u8>, String> {
+    media::fetch_artifact(&url).await
 }
 
 // ── DeepSeek Files API ────────────────────────────────────────────────────────
@@ -2746,6 +3001,42 @@ pub async fn open_embedding_map_window(app: tauri::AppHandle) -> Result<(), Stri
         let _ = win_c.set_size(tauri::LogicalSize::new(width, height));
     });
 
+    Ok(())
+}
+
+/// Open the media studio — text-to-image, speech, transcription, music.
+///
+/// Its own window rather than a tab: a generation run takes seconds to minutes
+/// and produces artifacts worth keeping on screen while reading a paper next to
+/// them. Deliberately simpler than `open_embedding_map_window`: there is nothing
+/// here whose size is worth persisting.
+#[tauri::command]
+pub async fn open_media_studio_window(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    if let Some(win) = app.get_webview_window("media-studio") {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+
+    let builder = WebviewWindowBuilder::new(
+        &app,
+        "media-studio",
+        WebviewUrl::App(std::path::PathBuf::from("/")),
+    )
+    .title("Argus — 媒体工坊")
+    .inner_size(1080.0, 760.0)
+    .min_inner_size(720.0, 520.0);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition { x: 14.0, y: 18.0 });
+
+    builder
+        .build()
+        .map_err(|e| format!("Open media studio window: {e}"))?;
     Ok(())
 }
 
@@ -3767,6 +4058,9 @@ pub fn write_bytes_to_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
     const ALLOWED_EXT: &[&str] = &[
         "pdf", "png", "jpg", "jpeg", "webp", "svg", "gif", "json", "csv", "md",
         "txt", "bib", "bibtex", "html",
+        // What the media studio produces: speech, sound design and music. All
+        // inert media types, same as the image formats above.
+        "mp3", "wav", "flac", "opus", "ogg",
     ];
     if path.is_empty() || path.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err("Refused: invalid export path".to_string());

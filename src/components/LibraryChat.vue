@@ -4,7 +4,7 @@ import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { modelHasVision, modelHasVideo, useAiStore, type ModelOption } from '../stores/ai'
+import { modelHasVision, modelHasVideo, modelHasAudio, useAiStore, type ModelOption } from '../stores/ai'
 import ProviderBalanceTag from './ProviderBalanceTag.vue'
 import ServerToolTraceCard from './ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../utils/serverToolTrace'
@@ -170,6 +170,16 @@ interface LibraryAnswerVariant {
   // heavy `contextContent` is stripped) so the per-message badge + dedup survive
   // a reload — mirrors how AiTab persists its context flags.
   contextPaperLabels?: string[]
+  /**
+   * A spoken reply from an end-to-end speech model, as a `data:audio/wav` URL.
+   * Set once, when the stream ends — the backend concatenates the PCM and gives
+   * it a header, because a half-written clip is not playable.
+   *
+   * Deliberately *not* persisted: a minute of wav is megabytes of base64 and the
+   * conversation file is rewritten on every edit. The transcript is the answer
+   * text, which is saved as usual.
+   */
+  audioUrl?: string
   /** What OpenRouter's server tools contributed: pages cited, images drawn. */
   serverTools?: ServerToolTrace
   /** Agent mode: which tools the model called, in order. */
@@ -211,6 +221,16 @@ interface LibraryUiMessage {
   displayReasoning?: string
   contextContent?: LibrarySentContextPayload
   contextPaperLabels?: string[]
+  /**
+   * A spoken reply from an end-to-end speech model, as a `data:audio/wav` URL.
+   * Set once, when the stream ends — the backend concatenates the PCM and gives
+   * it a header, because a half-written clip is not playable.
+   *
+   * Deliberately *not* persisted: a minute of wav is megabytes of base64 and the
+   * conversation file is rewritten on every edit. The transcript is the answer
+   * text, which is saved as usual.
+   */
+  audioUrl?: string
   /** What OpenRouter's server tools contributed: pages cited, images drawn. */
   serverTools?: ServerToolTrace
   /** Agent mode: which tools the model called, in order. */
@@ -451,12 +471,16 @@ function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
       delete variantClone.contextContent
       delete variantClone.displayContent
       delete variantClone.displayReasoning
+      // A spoken reply is megabytes of base64 wav and the whole conversation is
+      // re-serialized on every save; the answer text is already its transcript.
+      delete variantClone.audioUrl
       variantClone.agentSteps = persistableSteps(variant.agentSteps)
       variantClone.serverTools = persistableServerToolTrace(variant.serverTools)
       return variantClone
     }),
   }
   delete clone.contextContent
+  delete clone.audioUrl
   clone.agentSteps = persistableSteps(msg.agentSteps)
   clone.serverTools = persistableServerToolTrace(msg.serverTools)
   delete clone.displayContent
@@ -514,6 +538,7 @@ const fileInputRef = ref<HTMLInputElement | null>(null)
 const previewImage = ref<string | null>(null)
 const previewPdf = ref<string | null>(null)
 const previewVideo = ref<string | null>(null)
+const previewAudio = ref<string | null>(null)
 /** Why the last picked file was refused (currently only an oversized clip). */
 const attachmentError = ref<string | null>(null)
 /** Conversations with a generation in flight.
@@ -599,7 +624,9 @@ const sourcePickerOpen = ref(false)
 
 // Server-side web search: DeepSeek exposes it via its Responses API, Qwen via an
 // `enable_search` flag on the standard chat body, MiMo and GLM as a tool the
-// platform runs for itself. All four surface the same toggle.
+// platform runs for itself. StepFun does both — a tool for most of its models,
+// and its standalone /v1/search for the flagship, which the backend calls before
+// the request goes out. All of them surface the same toggle.
 const useWebSearch = ref(false)
 const webSearchAvailable = computed(() => {
   const sel = selectedModel.value ?? ai.defaultSelection ?? null
@@ -616,6 +643,8 @@ const webSearchAvailable = computed(() => {
     || provider.kind === 'zhipu'
     || url.includes('bigmodel')
     || url.includes('api.z.ai')
+    || provider.kind === 'stepfun'
+    || url.includes('stepfun')
 })
 watch(webSearchAvailable, (ok) => { if (!ok) useWebSearch.value = false })
 /** Live server-side search phase while a turn is running. */
@@ -1147,9 +1176,14 @@ const visionUnsupported = computed(() =>
   attachments.value.some(a => a.type === 'image') && !modelHasVision(selectedModelOption.value)
 )
 
-/** Same check for a clip: only MiniMax's M3 line reads video on the chat path. */
+/** Same check for a clip — only a couple of lines read video on the chat path. */
 const videoUnsupported = computed(() =>
   attachments.value.some(a => a.type === 'video') && !modelHasVideo(selectedModelOption.value)
+)
+
+/** And for a sound clip: StepFun's end-to-end speech models only. */
+const audioUnsupported = computed(() =>
+  attachments.value.some(a => a.type === 'audio') && !modelHasAudio(selectedModelOption.value)
 )
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1715,8 +1749,14 @@ function addAttachmentFromFile(file: File) {
     if (res.status === 'ok') {
       attachmentError.value = null
       attachments.value.push(res.attachment)
+    } else if (res.status === 'unreadable') {
+      attachmentError.value = t('chat.attachmentUnreadable', { name: res.name })
     } else {
-      attachmentError.value = t('chat.videoTooLarge', { name: res.name, mb: res.limitMb })
+      // Video and audio are capped for different reasons, so each says its own.
+      attachmentError.value = t(
+        res.type === 'audio' ? 'chat.audioTooLarge' : 'chat.videoTooLarge',
+        { name: res.name, mb: res.limitMb },
+      )
     }
   })
   return true
@@ -1754,6 +1794,8 @@ function previewAttachment(att: Attachment) {
     previewImage.value = att.dataUrl
   } else if (att.type === 'video') {
     previewVideo.value = att.dataUrl
+  } else if (att.type === 'audio') {
+    previewAudio.value = att.dataUrl
   } else {
     previewPdf.value = att.dataUrl
   }
@@ -1763,6 +1805,7 @@ function closePreview() {
   previewImage.value = null
   previewPdf.value = null
   previewVideo.value = null
+  previewAudio.value = null
 }
 
 
@@ -1816,6 +1859,7 @@ async function runAssistantRequest(
   target.outputTokens = undefined
   target.totalTokens = undefined
   target.costUsd = undefined
+  target.audioUrl = undefined
   target.startedAt = performance.now()
   target.endedAt = undefined
   target.model = sel
@@ -1841,6 +1885,11 @@ async function runAssistantRequest(
 
   offs.push(await listen<RetrievedChunk[]>(sourcesEventName, (e) => {
     pendingSources = e.payload ?? []
+  }))
+
+  // Spoken reply. Arrives once, after the text stream is done.
+  offs.push(await listen<{ audio?: string }>(`${eventName}-audio`, (e) => {
+    if (e.payload?.audio) target.audioUrl = e.payload.audio
   }))
 
   offs.push(await listen<AgentEventPayload>(`${eventName}-agent`, (e) => {
@@ -2976,6 +3025,12 @@ onUnmounted(() => {
                       <MarkdownBody :content="activeAnswer(msg).content" />
                     </template>
                     <ServerToolTraceCard :trace="activeAnswer(msg).serverTools" />
+                    <!-- An end-to-end speech model's spoken reply. The text above
+                         is its transcript, so this is an addition, not the answer. -->
+                    <div v-if="activeAnswer(msg).audioUrl" class="answer-audio">
+                      <Icon icon="fluent:music-note-2-24-regular" width="13" height="13" />
+                      <audio :src="activeAnswer(msg).audioUrl" controls preload="metadata"></audio>
+                    </div>
                   </div>
 
                   <!-- Action buttons + the usage strip.
@@ -3123,6 +3178,10 @@ onUnmounted(() => {
             <Icon icon="fluent:warning-24-regular" width="13" height="13" />
             <span>{{ t('chat.videoUnsupported') }}</span>
           </div>
+          <div v-if="audioUnsupported" class="attachment-warning">
+            <Icon icon="fluent:warning-24-regular" width="13" height="13" />
+            <span>{{ t('chat.audioUnsupported') }}</span>
+          </div>
           <div v-if="visionUnsupported" class="attachment-warning">
               <Icon icon="fluent:warning-24-regular" width="13" height="13" />
               <span>{{ t('chat.visionUnsupported') }}</span>
@@ -3132,11 +3191,12 @@ onUnmounted(() => {
                 v-for="att in attachments"
                 :key="att.id"
                 class="attachment-chip"
-                :class="{ pdf: att.type === 'pdf', video: att.type === 'video' }"
+                :class="{ pdf: att.type === 'pdf', video: att.type === 'video', audio: att.type === 'audio' }"
                 :title="att.name"
               >
                 <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
                 <Icon v-else-if="att.type === 'video'" icon="fluent:video-clip-24-regular" width="14" height="14" />
+                <Icon v-else-if="att.type === 'audio'" icon="fluent:music-note-2-24-regular" width="14" height="14" />
                 <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
                 <span class="attachment-name">{{ att.name }}</span>
                 <button
@@ -3180,7 +3240,7 @@ onUnmounted(() => {
                 </button>
                 <button
                   class="attach-btn"
-                  title="添加图片、PDF 或视频附件"
+                  title="添加图片、PDF、视频或音频附件"
                   :disabled="loading"
                   @click="openFilePicker"
                 >
@@ -3454,6 +3514,12 @@ onUnmounted(() => {
     </div>
     <div v-if="previewVideo" class="attachment-lightbox" @click.self="closePreview">
       <video :src="previewVideo" class="lightbox-video" controls autoplay></video>
+      <button class="lightbox-close" title="关闭" @click="closePreview">
+        <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
+      </button>
+    </div>
+    <div v-if="previewAudio" class="attachment-lightbox" @click.self="closePreview">
+      <audio :src="previewAudio" class="lightbox-audio" controls autoplay></audio>
       <button class="lightbox-close" title="关闭" @click="closePreview">
         <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
       </button>
@@ -5272,6 +5338,23 @@ onUnmounted(() => {
   border-color: #f0c0c0;
   color: #8b1e1e;
 }
+.answer-audio {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--text-secondary, #888);
+}
+
+.answer-audio audio {
+  height: 30px;
+  max-width: min(340px, 100%);
+}
+
+.attachment-chip.audio {
+  background: var(--accent-soft, rgba(80, 140, 255, 0.10));
+}
+
 .attachment-chip.video {
   background: #f2f0ff;
   border-color: #ccc4f0;
@@ -6079,6 +6162,10 @@ onUnmounted(() => {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
+.lightbox-audio {
+  width: min(520px, 90vw);
+}
+
 .lightbox-video {
   max-width: 86vw;
   max-height: 86vh;

@@ -33,12 +33,26 @@ export function modelHasVision(model: Pick<ModelOption, 'capabilities'> | null |
 }
 
 /**
- * Whether a model can be sent video. Only MiniMax's M3 line reads video on the
- * chat path today, so this is deliberately a separate question from vision —
- * every model that takes a clip also takes a still, but not the other way round.
+ * Whether a model can be sent video. A separate question from vision on purpose:
+ * every model that takes a clip also takes a still, but not the other way round,
+ * and only a couple of lines read video on the chat path at all (MiniMax's M3,
+ * StepFun's step-5-preview / step-3.7-flash / step-1o-turbo-vision).
  */
 export function modelHasVideo(model: Pick<ModelOption, 'capabilities'> | null | undefined): boolean {
   return !!model?.capabilities?.some(c => /video/i.test(c))
+}
+
+/**
+ * Whether a model can be sent a sound clip. Only StepFun's end-to-end speech
+ * models hear one on the chat path today.
+ *
+ * The capability string is shared with the pure speech models (TTS/ASR), which
+ * cannot take a chat turn at all — the same looseness `modelHasVideo` lives with
+ * for MiniMax's video *generators*. The backend is the real gate: it refuses an
+ * audio block for a model that cannot hear it, and names the ones that can.
+ */
+export function modelHasAudio(model: Pick<ModelOption, 'capabilities'> | null | undefined): boolean {
+  return !!model?.capabilities?.some(c => /audio/i.test(c))
 }
 
 /**
@@ -55,6 +69,7 @@ export function providerSupportsBalance(
   return url.includes('deepseek')
     || provider.kind === 'openrouter' || url.includes('openrouter')
     || provider.kind === 'moleapi' || url.includes('moleapi')
+    || provider.kind === 'stepfun' || url.includes('stepfun')
 }
 
 export const useAiStore = defineStore('ai', () => {
@@ -106,8 +121,10 @@ export const useAiStore = defineStore('ai', () => {
   )
 
   // Chat-capable models: exclude models that don't take a chat turn — pure
-  // embedding models (vectors only) and pure media-generation models (image/video
-  // out, labelled for the catalogue but not driven as chat here).
+  // embedding models (vectors only), pure media-generation models (image/video
+  // out) and pure speech models (TTS/ASR), all of which answer on their own
+  // endpoints and are catalogued only so the model list is honest about what the
+  // key reaches.
   //
   // "Pure" is the operative word. Every catalogue that sets `video` on a
   // generation model sets it *alone*, but MiniMax's M3 carries it next to
@@ -116,7 +133,15 @@ export const useAiStore = defineStore('ai', () => {
   // merely for mentioning a medium, which would have hidden M3 from every
   // picker. A model that declares no capabilities at all is a normal chat model
   // whose provider simply reported nothing, so it stays.
-  const NON_CHAT_CAPS = ['embedding', 'image_gen', 'video']
+  //
+  // `audio` obeys the same rule and for the same reason. Every provider here
+  // tags a speech-only line `['audio']` and nothing else (mimo.rs, zhipu.rs,
+  // minimax.rs and stepfun.rs all early-out on their ASR/TTS ids), while a model
+  // that *converses* in sound carries reasoning or tool_calling alongside it —
+  // step-audio-2, stepaudio-2.5-chat and step-audio-r1.5 all survive this filter.
+  // Without `audio` here, picking `stepaudio-3-tts` in a chat picker sends a
+  // /chat/completions request to a model that has no such endpoint.
+  const NON_CHAT_CAPS = ['embedding', 'image_gen', 'video', 'audio']
   const chatModels = computed<ModelOption[]>(() =>
     enabledModels.value.filter(m =>
       m.capabilities.length === 0 || m.capabilities.some(c => !NON_CHAT_CAPS.includes(c))

@@ -225,6 +225,11 @@ function chooseEmbeddingMap() {
   invoke('open_embedding_map_window').catch((e) => console.error('Open embedding map window:', e))
 }
 
+function chooseMediaStudio() {
+  showAiMenu.value = false
+  invoke('open_media_studio_window').catch((e) => console.error('Open media studio window:', e))
+}
+
 function chooseUsage() {
   showAiMenu.value = false
   showStatsMenu.value = false
@@ -1158,6 +1163,10 @@ onUnmounted(() => {
           <button class="import-menu-item" :title="t('toolbar.embeddingMapTitle')" @click="chooseEmbeddingMap">
             <Icon icon="fluent:data-scatter-24-regular" width="15" height="15" />
             {{ t('toolbar.embeddingMap') }}
+          </button>
+          <button class="import-menu-item" :title="t('toolbar.mediaStudioTitle')" @click="chooseMediaStudio">
+            <Icon icon="fluent:wand-24-regular" width="15" height="15" />
+            {{ t('toolbar.mediaStudio') }}
           </button>
           <div class="menu-divider" />
           <button

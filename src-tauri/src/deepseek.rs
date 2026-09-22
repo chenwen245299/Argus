@@ -657,14 +657,24 @@ pub async fn prepare_chat_messages(
                     }
                 }
                 "video_url" => {
-                    // MiniMax is the only provider here that reads video on the
-                    // chat path. Saying so beats letting DeepSeek answer with an
-                    // opaque 400 about an unknown content block.
+                    // Only MiniMax and StepFun read video on the chat path.
+                    // Saying so beats letting DeepSeek answer with an opaque 400
+                    // about an unknown content block.
                     if is_user {
-                        return Err(
-                            "DeepSeek 不支持视频输入，视觉模型只接受图片。请改用 MiniMax 等支持视频的服务商，                             或先把关键画面截成图片。"
-                                .to_string(),
-                        );
+                        return Err("DeepSeek 不支持视频输入，视觉模型只接受图片。\
+                                    请改用 MiniMax、阶跃星辰等支持视频的服务商，或先把关键画面截成图片。"
+                            .to_string());
+                    }
+                }
+                "input_audio" => {
+                    // Same reasoning as the video block above: StepFun's
+                    // end-to-end speech models are the only ones here that hear
+                    // an attachment, and an unknown block reaches DeepSeek as a
+                    // bare 400.
+                    if is_user {
+                        return Err("DeepSeek 不支持音频输入，视觉模型只接受图片。\
+                                    请改用阶跃星辰的端到端语音模型（step-audio-2 等），或先把音频转成文字。"
+                            .to_string());
                     }
                 }
                 _ => kept.push(part),
@@ -767,7 +777,10 @@ fn carries_attachments(msgs: &[serde_json::Value]) -> bool {
                 parts.iter().any(|p| {
                     matches!(
                         p.get("type").and_then(|t| t.as_str()),
-                        Some("image_url") | Some("file") | Some("video_url")
+                        Some("image_url")
+                            | Some("file")
+                            | Some("video_url")
+                            | Some("input_audio")
                     )
                 })
             })
@@ -1062,6 +1075,7 @@ mod tests {
                 })
                 .collect(),
             server_tools: Default::default(),
+            speech: Default::default(),
         created_at: "2026-01-01T00:00:00Z".into(),
         }
     }

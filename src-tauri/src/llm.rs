@@ -280,6 +280,17 @@ pub async fn list_models(provider: &AiProvider, api_key: &str) -> Result<Vec<AiM
         let pricing = pricing.map_err(|e| format!("MoleAPI price list (/api/pricing): {e}"))?;
         return Ok(crate::moleapi::enrich_models(models, &pricing));
     }
+    if crate::stepfun::is_stepfun(provider) {
+        // StepFun's `/models` answers, but the documented response is five chat
+        // ids with no modality — it omits every audio, speech and image model the
+        // key can actually call. So, as for Zhipu and MiniMax below, the
+        // documented catalogue is the floor rather than the fallback: keep
+        // whatever the endpoint reports (that is how a model newer than this
+        // build still appears), enrich it, and append every documented id it
+        // left out.
+        let fetched = fetch_openai_models(provider, api_key).await.unwrap_or_default();
+        return Ok(crate::stepfun::merge_catalogue(fetched));
+    }
     if crate::zhipu::is_zhipu(provider) {
         // BigModel documents no /models endpoint — the path answers, but only
         // behind the platform's blanket auth gate, so whether it lists anything
@@ -860,13 +871,18 @@ async fn stream_with_pdf_injected(
                                 if let Some(v) = usage["completion_tokens"].as_u64() {
                                     output_tokens = v;
                                 }
-                                if let Some(v) = usage["prompt_cache_hit_tokens"].as_u64() {
-                                    // DeepSeek reports cache hits here.
-                                    cache_hit_tokens = v;
-                                } else if let Some(v) =
-                                    usage["prompt_tokens_details"]["cached_tokens"].as_u64()
+                                if let Some(v) = usage["prompt_cache_hit_tokens"]
+                                    .as_u64()
+                                    // OpenAI / Kimi / OpenRouter report them here…
+                                    .or_else(|| {
+                                        usage["prompt_tokens_details"]["cached_tokens"].as_u64()
+                                    })
+                                    // …and StepFun's worked examples put the same
+                                    // figure at the top level instead. Reading only
+                                    // the nested path would report every hit as zero.
+                                    .or_else(|| usage["cached_tokens"].as_u64())
                                 {
-                                    // OpenAI / Kimi / OpenRouter report them here.
+                                    // DeepSeek reports cache hits at the first path.
                                     cache_hit_tokens = v;
                                 }
                                 if let Some(v) = usage_cost_usd(usage) {
@@ -972,6 +988,9 @@ async fn chat_openai_compat(
         .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
         .collect();
     let msgs = prepare_deepseek_messages(provider, api_key, model, msgs).await?;
+    if crate::stepfun::is_stepfun(provider) {
+        crate::stepfun::check_messages(model, &msgs)?;
+    }
     let is_kimi_for_coding = is_kimi && model == "kimi-for-coding";
 
     let mut body = serde_json::json!({"model": model, "messages": msgs});
@@ -1001,6 +1020,26 @@ async fn chat_openai_compat(
         body["frequency_penalty"] = serde_json::json!(0.0);
     }
 
+    // The three providers that reason unless told otherwise need their controls
+    // here too, not only on the streaming paths. This function serves the
+    // one-shot jobs — summaries, translation, titles, abstracts, the arXiv digest
+    // — none of which show a reasoning pane, so whatever the model thinks is
+    // either billed and thrown away or, worse, rendered as part of the answer:
+    // MiniMax returns its chain of thought inside `content` in `<think>` tags
+    // unless `reasoning_split` is asked for, and only `apply_thinking` asks.
+    //
+    // `use_reasoning: false` throughout, because a one-shot job has no toggle to
+    // read and none of these tasks wants deep thinking.
+    if crate::zhipu::is_zhipu(provider) {
+        crate::zhipu::apply_thinking(&mut body, model, false, None);
+    }
+    if crate::minimax::is_minimax(provider) {
+        crate::minimax::apply_thinking(&mut body, model, false);
+    }
+    if crate::stepfun::is_stepfun(provider) {
+        crate::stepfun::apply_reasoning(&mut body, model, false, None);
+    }
+
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
     let mut req = client
         .post(&url)
@@ -1025,6 +1064,7 @@ async fn chat_openai_compat(
     let cache_hit_tokens = json["usage"]["prompt_cache_hit_tokens"]
         .as_u64()
         .or_else(|| json["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64())
+        .or_else(|| json["usage"]["cached_tokens"].as_u64())
         .unwrap_or(0);
     let cost_usd = if is_openrouter || is_kimi {
         usage_cost_usd(&json["usage"])
@@ -1069,7 +1109,36 @@ async fn stream_openai_compat(
         .iter()
         .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
         .collect();
-    let msgs = prepare_deepseek_messages(provider, api_key, model, msgs).await?;
+    let mut msgs = prepare_deepseek_messages(provider, api_key, model, msgs).await?;
+
+    let is_stepfun = crate::stepfun::is_stepfun(provider);
+    if is_stepfun {
+        crate::stepfun::check_messages(model, &msgs)?;
+    }
+    // Pages fetched before the request goes out, for the one StepFun model that
+    // has no built-in search tool. Collected here so they can be shown as
+    // citations next to a server-run search's.
+    let mut preflight_hits: Vec<crate::stepfun::SearchHit> = Vec::new();
+    if web_search && is_stepfun && !crate::stepfun::supports_builtin_web_search(model) {
+        if let Some(query) = crate::stepfun::query_from_messages(&msgs) {
+            match crate::stepfun::search(provider, api_key, &query).await {
+                Ok(hits) if !hits.is_empty() => {
+                    // Appended, never prepended: the cached prefix every
+                    // long-running task front-loads must stay byte-identical.
+                    msgs.push(serde_json::json!({
+                        "role": "system",
+                        "content": crate::stepfun::search_context(&hits),
+                    }));
+                    preflight_hits = hits;
+                }
+                Ok(_) => {}
+                // A search that fails should not take the answer down with it —
+                // the model can still reply from what it knows.
+                Err(e) => eprintln!("[stepfun] web search skipped: {e}"),
+            }
+        }
+    }
+    let msgs = msgs;
 
     let is_deepseek = provider.base_url.to_lowercase().contains("deepseek");
     let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
@@ -1086,6 +1155,14 @@ async fn stream_openai_compat(
         "model": model, "messages": msgs, "stream": true,
         "stream_options": {"include_usage": true}
     });
+    if is_stepfun {
+        // StepFun documents no `stream_options` and does not need it: usage rides
+        // every chunk unconditionally. Sending an unknown field to a strict
+        // validator is a needless risk, so it is removed rather than left in.
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("stream_options");
+        }
+    }
 
     if is_openrouter || (is_kimi && !is_kimi_for_coding) {
         body["usage"] = serde_json::json!({"include": true});
@@ -1151,6 +1228,21 @@ async fn stream_openai_compat(
     if is_minimax {
         crate::minimax::apply_thinking(&mut body, model, use_reasoning);
     }
+    // StepFun cannot be told to stop thinking at all, so "off" has to become its
+    // cheapest setting rather than an omission — and the field has to be removed
+    // outright for the models that have none. Both directions, hence outside the
+    // block above. See `stepfun::apply_reasoning`.
+    if is_stepfun {
+        crate::stepfun::apply_reasoning(&mut body, model, use_reasoning, reasoning_effort);
+        if provider.speech.enabled {
+            crate::stepfun::apply_audio_output(
+                &mut body,
+                model,
+                Some(provider.speech.voice.as_str()),
+                true,
+            );
+        }
+    }
 
     // OpenRouter's server-side tools ride along on every chat request. They are
     // run by OpenRouter mid-answer rather than handed back to us, so no client
@@ -1190,6 +1282,15 @@ async fn stream_openai_compat(
         body["tools"] = serde_json::json!(tools);
     }
 
+    // StepFun's built-in search, for the models that carry it. The flagship does
+    // not, and was already served by the `/v1/search` preflight above — so the
+    // two branches are mutually exclusive and a turn is never searched twice.
+    if web_search && is_stepfun && crate::stepfun::supports_builtin_web_search(model) {
+        let mut tools = body["tools"].as_array().cloned().unwrap_or_default();
+        tools.push(crate::stepfun::web_search_tool());
+        body["tools"] = serde_json::json!(tools);
+    }
+
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
     let mut req = client
         .post(&url)
@@ -1219,6 +1320,18 @@ async fn stream_openai_compat(
     let mut cost_usd: Option<f64> = None;
     let mut usage_emitted = false;
     let mut trace = crate::openrouter::ServerToolTrace::default();
+    // Pages the client-side search read are citations too, even though they
+    // never appear in the response.
+    if !preflight_hits.is_empty() {
+        for hit in &preflight_hits {
+            trace.push_citation(&hit.url, Some(hit.title.as_str()));
+        }
+        trace.note_call("web_search", 1);
+    }
+    // Raw 24 kHz PCM from an end-to-end speech model, concatenated across chunks
+    // and given a WAV header once the stream ends. Stays empty for every other
+    // provider, and for StepFun with speech switched off.
+    let mut audio_pcm: Vec<u8> = Vec::new();
 
     while let Some(chunk) = stream.next().await {
         // Backend cancellation: if the user pressed stop, break out of the loop.
@@ -1285,13 +1398,18 @@ async fn stream_openai_compat(
                                 if let Some(v) = usage["completion_tokens"].as_u64() {
                                     output_tokens = v;
                                 }
-                                if let Some(v) = usage["prompt_cache_hit_tokens"].as_u64() {
-                                    // DeepSeek reports cache hits here.
-                                    cache_hit_tokens = v;
-                                } else if let Some(v) =
-                                    usage["prompt_tokens_details"]["cached_tokens"].as_u64()
+                                if let Some(v) = usage["prompt_cache_hit_tokens"]
+                                    .as_u64()
+                                    // OpenAI / Kimi / OpenRouter report them here…
+                                    .or_else(|| {
+                                        usage["prompt_tokens_details"]["cached_tokens"].as_u64()
+                                    })
+                                    // …and StepFun's worked examples put the same
+                                    // figure at the top level instead. Reading only
+                                    // the nested path would report every hit as zero.
+                                    .or_else(|| usage["cached_tokens"].as_u64())
                                 {
-                                    // OpenAI / Kimi / OpenRouter report them here.
+                                    // DeepSeek reports cache hits at the first path.
                                     cache_hit_tokens = v;
                                 }
                                 if is_openrouter || is_kimi {
@@ -1322,8 +1440,29 @@ async fn stream_openai_compat(
                             if is_zhipu {
                                 trace.absorb(&json);
                             }
+                            // An end-to-end speech reply arrives as base64 PCM
+                            // fragments, and its *text* comes back as the audio's
+                            // transcript rather than as `content`. The API
+                            // reference does not document `delta.audio` at all —
+                            // only the audio guide's sample code reads it — so
+                            // every field here is probed rather than assumed.
+                            let audio = &json["choices"][0]["delta"]["audio"];
+                            if let Some(b64) = audio["data"].as_str().filter(|s| !s.is_empty()) {
+                                use base64::Engine;
+                                if let Ok(bytes) =
+                                    base64::engine::general_purpose::STANDARD.decode(b64)
+                                {
+                                    audio_pcm.extend_from_slice(&bytes);
+                                }
+                            }
+                            let transcript_delta =
+                                audio["transcript"].as_str().filter(|s| !s.is_empty());
+
                             // Main content delta
-                            let content_delta = json["choices"][0]["delta"]["content"].as_str();
+                            let content_delta = json["choices"][0]["delta"]["content"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .or(transcript_delta);
                             let reasoning_delta = json["choices"][0]["delta"]["reasoning_content"]
                                 .as_str()
                                 .or_else(|| json["choices"][0]["delta"]["reasoning"].as_str())
@@ -1386,6 +1525,21 @@ async fn stream_openai_compat(
         );
     }
     emit_server_tool_trace(app, event_name, &trace);
+    // One event, at the end: the clip is only playable once it is complete and
+    // wrapped, and a half-written WAV is worse than a slightly late one.
+    if !audio_pcm.is_empty() {
+        use base64::Engine;
+        let wav = crate::stepfun::pcm_to_wav(&audio_pcm);
+        let _ = app.emit(
+            &format!("{event_name}-audio"),
+            serde_json::json!({
+                "audio": format!(
+                    "data:audio/wav;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(&wav)
+                ),
+            }),
+        );
+    }
     let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
     Ok(accumulated)
 }
@@ -1626,10 +1780,12 @@ fn to_ollama_message(m: &ChatMessage) -> serde_json::Value {
                             images.push(image_url.url.clone());
                         }
                     }
-                    // Ollama's native API has no video block, and a PDF is not
-                    // something a vision model can ingest — both are dropped
-                    // rather than mangled into the text.
-                    ChatContentPart::VideoUrl { .. } | ChatContentPart::File { .. } => {}
+                    // Ollama's native API has no video or audio block, and a PDF
+                    // is not something a vision model can ingest — all three are
+                    // dropped rather than mangled into the text.
+                    ChatContentPart::VideoUrl { .. }
+                    | ChatContentPart::InputAudio { .. }
+                    | ChatContentPart::File { .. } => {}
                 }
             }
             let mut obj = serde_json::json!({"role": m.role, "content": text});
@@ -3070,8 +3226,11 @@ fn to_anthropic_content(content: &ChatContent) -> Vec<serde_json::Value> {
                 }
                 // Kimi Code's /coding endpoint accepts Anthropic image blocks but
                 // does not support PDF document blocks, so drop file attachments.
-                // Anthropic has no video block at all, so those go the same way.
-                ChatContentPart::VideoUrl { .. } | ChatContentPart::File { .. } => None,
+                // Anthropic has no video or audio block at all, so those go the
+                // same way.
+                ChatContentPart::VideoUrl { .. }
+                | ChatContentPart::InputAudio { .. }
+                | ChatContentPart::File { .. } => None,
             })
             .collect(),
     }
@@ -3152,7 +3311,20 @@ pub(crate) fn friendly_error(status: u16, body: &str) -> String {
         401 => "Authentication failed (401). Check your API key in Settings → AI Services.".to_string(),
         403 => format!("Access denied (403). Your key may lack permission for this model. Response: {preview}"),
         404 => format!("Endpoint or model not found (404). Verify your API address and model ID. Response: {preview}"),
+        // StepFun returns 402 when the account is out of credit. "Try again"
+        // would be wrong advice, so it is named rather than left to the catch-all.
+        402 => format!("余额不足（402）。请先充值或更换服务商。Response: {preview}"),
+        // Two different 429s share the status and only the error identifier tells
+        // them apart: an ordinary rate limit clears in seconds, while a credit cap
+        // resets on the 1st of the month. Telling the user to wait a moment is
+        // actively misleading for the second, so the body decides the wording.
+        429 if body.contains("credit_limit_exceeded") => format!(
+            "配额已用尽（429）。该项目的额度要到下个计费周期才会恢复，请调整额度或更换服务商。Response: {preview}"
+        ),
         429 => "Rate limited (429). Please wait a moment and try again.".to_string(),
+        // StepFun's content-moderation refusal, on the request or the response.
+        // Most OpenAI-compatible clients have no mapping for it.
+        451 => format!("内容被安全策略拦截（451）。请调整提问或附件后重试。Response: {preview}"),
         _ => format!("API error {status}: {preview}"),
     }
 }
@@ -3237,6 +3409,28 @@ pub fn supports_tool_calling(provider: &AiProvider) -> bool {
     !is_anthropic_protocol(provider) && !is_ollama(provider)
 }
 
+/// Whether a streamed `delta.tool_calls[]` entry is a call this loop must run.
+///
+/// A server-run tool arrives in the same array but is not ours: StepFun's
+/// built-in search comes back as `type: "web_search"`, already answered, with the
+/// pages it read in `function.results`. Handing that to the local tool runner
+/// would make the loop try to execute `step_websearch`, fail, and burn a round
+/// telling the model so — and because that entry carries no `index`, it would
+/// also land in slot 0 and concatenate its name and arguments onto a genuine call
+/// sitting there. `ServerToolTrace::absorb` has already taken the citations out
+/// of it by this point, so dropping it here loses nothing.
+///
+/// Only an *explicitly* non-`function` type is skipped. A streamed continuation
+/// fragment carries neither `id` nor `type` — just the next slice of
+/// `function.arguments` — so treating a missing type as "not ours" would throw
+/// away most of every real call.
+fn is_local_tool_call(call: &serde_json::Value) -> bool {
+    match call.get("type").and_then(|t| t.as_str()) {
+        Some(t) => t == "function",
+        None => true,
+    }
+}
+
 /// Arguments arrive as a JSON *string* in OpenAI-compatible responses. A model
 /// that emits nothing, or malformed JSON, should not abort the whole turn — the
 /// tool layer already rejects arguments it cannot use, with a message the model
@@ -3315,6 +3509,7 @@ pub async fn touch_prompt_cache(
     let cache_hit_tokens = usage["prompt_cache_hit_tokens"]
         .as_u64()
         .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+        .or_else(|| usage["cached_tokens"].as_u64())
         .unwrap_or(0);
 
     // Its own source, so this background spend is visible in the usage stats
@@ -3355,6 +3550,13 @@ pub async fn stream_with_tools(
     source: &str,
     cancel: Option<Arc<AtomicBool>>,
     web_search: bool,
+    // Whether this is the opening round of a user turn. Only the opening round
+    // may run StepFun's billable `/v1/search` preflight: the agent loop appends
+    // synthetic `user` messages of its own — the tool-budget notice and the
+    // "here are the pages you asked to see" image turn — so "the last message is
+    // from the user" is not enough to tell a fresh question from a continuation,
+    // and searching on those would bill again with boilerplate as the query.
+    first_round: bool,
 ) -> Result<ToolTurn, String> {
     if !supports_tool_calling(provider) {
         return Err(format!(
@@ -3390,6 +3592,44 @@ pub async fn stream_with_tools(
         messages
     };
 
+    let is_stepfun = crate::stepfun::is_stepfun(provider);
+    if is_stepfun {
+        crate::stepfun::check_messages(model, messages)?;
+    }
+    // The flagship has no built-in search tool, so Argus runs StepFun's own
+    // `/v1/search` and writes the results in. `query_from_messages` returns None
+    // unless the transcript ends on a user turn, which is exactly how the first
+    // round of an agent turn is told from the rounds that answer a tool result —
+    // without that, every round would run (and bill) another search.
+    let searched;
+    let mut preflight_hits: Vec<crate::stepfun::SearchHit> = Vec::new();
+    let messages: &[serde_json::Value] =
+        if first_round && web_search && is_stepfun && !crate::stepfun::supports_builtin_web_search(model) {
+            match crate::stepfun::query_from_messages(messages) {
+                Some(query) => match crate::stepfun::search(provider, api_key, &query).await {
+                    Ok(hits) if !hits.is_empty() => {
+                        let mut with_context = messages.to_vec();
+                        with_context.push(serde_json::json!({
+                            "role": "system",
+                            "content": crate::stepfun::search_context(&hits),
+                        }));
+                        preflight_hits = hits;
+                        searched = with_context;
+                        &searched
+                    }
+                    Ok(_) => messages,
+                    // A failed search must not take the whole agent round down.
+                    Err(e) => {
+                        eprintln!("[stepfun] web search skipped: {e}");
+                        messages
+                    }
+                },
+                None => messages,
+            }
+        } else {
+            messages
+        };
+
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
@@ -3411,6 +3651,11 @@ pub async fn stream_with_tools(
     // GLM's built-in search behaves the same way, so it joins the same set.
     if web_search && is_zhipu {
         server_tools.push(crate::zhipu::web_search_tool());
+    }
+    // StepFun's too, for the models that carry it — the flagship was already
+    // served by the `/v1/search` preflight above, so the two never both fire.
+    if web_search && is_stepfun && crate::stepfun::supports_builtin_web_search(model) {
+        server_tools.push(crate::stepfun::web_search_tool());
     }
     // An empty tool list must be omitted, not sent as `[]`: some gateways reject
     // `tools: []` outright, and it is how the loop says "no more tools".
@@ -3485,6 +3730,21 @@ pub async fn stream_with_tools(
     if is_minimax {
         crate::minimax::apply_thinking(&mut body, model, use_reasoning);
     }
+    // StepFun has no off switch either; see `stepfun::apply_reasoning`.
+    //
+    // Deliberately no `apply_audio_output` here, unlike the plain-chat path: an
+    // agent answer is several rounds with tool calls in between, and asking each
+    // of them to speak would bill audio for commentary nobody hears and split one
+    // reply across several clips. Worse, with audio on the model's *text* arrives
+    // as `audio.transcript` rather than `content`, which this loop accumulates —
+    // so a spoken agent turn would come back looking empty.
+    if is_stepfun {
+        crate::stepfun::apply_reasoning(&mut body, model, use_reasoning, reasoning_effort);
+        // StepFun documents no `stream_options`; usage rides every chunk anyway.
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("stream_options");
+        }
+    }
 
     let req = client
         .post(&url)
@@ -3515,6 +3775,14 @@ pub async fn stream_with_tools(
     let mut cache_hit_tokens: u64 = 0;
     let mut cost_usd: Option<f64> = None;
     let mut trace = crate::openrouter::ServerToolTrace::default();
+    // Same as on the plain-chat path: a client-side search's pages are citations
+    // even though nothing in the response mentions them.
+    for hit in &preflight_hits {
+        trace.push_citation(&hit.url, Some(hit.title.as_str()));
+    }
+    if !preflight_hits.is_empty() {
+        trace.note_call("web_search", 1);
+    }
 
     'outer: while let Some(chunk) = stream.next().await {
         if let Some(flag) = &cancel {
@@ -3558,6 +3826,9 @@ pub async fn stream_with_tools(
                 if let Some(v) = usage["prompt_cache_hit_tokens"]
                     .as_u64()
                     .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+                    // StepFun puts it at the top level; see the note in
+                    // `stream_openai_compat`.
+                    .or_else(|| usage["cached_tokens"].as_u64())
                 {
                     cache_hit_tokens = v;
                 }
@@ -3574,7 +3845,16 @@ pub async fn stream_with_tools(
                 trace.absorb(&json);
             }
 
-            if let Some(text) = delta["content"].as_str().filter(|s| !s.is_empty()) {
+            // `audio.transcript` is the fallback, not the primary: an end-to-end
+            // speech model puts its words there instead of in `content`. This
+            // path does not request audio (see above), but a model configured to
+            // speak by default would otherwise stream an answer this loop reads
+            // as empty.
+            if let Some(text) = delta["content"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| delta["audio"]["transcript"].as_str().filter(|s| !s.is_empty()))
+            {
                 accumulated.push_str(text);
                 let _ = app.emit(event_name, serde_json::json!({"delta": text, "done": false}));
             }
@@ -3592,6 +3872,9 @@ pub async fn stream_with_tools(
 
             if let Some(calls) = delta["tool_calls"].as_array() {
                 for c in calls {
+                    if !is_local_tool_call(c) {
+                        continue;
+                    }
                     let idx = c["index"].as_u64().unwrap_or(0);
                     let slot = partial.entry(idx).or_default();
                     if let Some(id) = c["id"].as_str() {
@@ -3870,6 +4153,45 @@ mod offer_tests {
 #[cfg(test)]
 mod tool_call_tests {
     use super::*;
+
+    /// The shapes the OpenAI-compatible providers actually stream. Dropping any
+    /// of these would break tool calling for every provider, not just the new one.
+    #[test]
+    fn a_real_function_call_is_always_kept() {
+        // Opening fragment, fully spelled out.
+        assert!(is_local_tool_call(&serde_json::json!({
+            "index": 0, "id": "call_1", "type": "function",
+            "function": {"name": "view_paper_page", "arguments": ""}
+        })));
+        // Continuation fragments carry neither id nor type — only the next slice
+        // of the arguments. These are the majority of what a stream delivers.
+        assert!(is_local_tool_call(&serde_json::json!({
+            "index": 0, "function": {"arguments": "{\"page\":"}
+        })));
+        assert!(is_local_tool_call(&serde_json::json!({"index": 1})));
+        // A provider that sends the whole call in one chunk with no type at all.
+        assert!(is_local_tool_call(&serde_json::json!({
+            "id": "call_2", "function": {"name": "search", "arguments": "{}"}
+        })));
+    }
+
+    /// StepFun's built-in search: already answered by the platform, no `index`,
+    /// and carrying `results` rather than awaiting one.
+    #[test]
+    fn a_server_run_search_is_never_handed_to_the_local_runner() {
+        assert!(!is_local_tool_call(&serde_json::json!({
+            "id": "call_x", "type": "web_search",
+            "function": {
+                "name": "step_websearch",
+                "arguments": "{\"keyword\": \"x\"}",
+                "results": [{"index": 0, "url": "https://a.test", "title": "t", "summary": "s"}]
+            }
+        })));
+        // Anything else a platform decides to run for itself is skipped too,
+        // rather than being guessed at.
+        assert!(!is_local_tool_call(&serde_json::json!({"type": "retrieval"})));
+        assert!(!is_local_tool_call(&serde_json::json!({"type": "openrouter:web_search"})));
+    }
 
     #[test]
     fn arguments_survive_the_json_string_encoding() {

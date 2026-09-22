@@ -109,6 +109,10 @@ function modelLogo(modelId = '', providerName = '', providerId = '') {
   if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
   if (haystack.includes('minimax') || haystack.includes('hailuo')) return modelIconMap.minimax
   if (haystack.includes('mimo') || haystack.includes('xiaomi')) return modelIconMap.xiaomimimo
+  // StepFun's ids are `step-5-preview`, `step-3.7-flash`, `stepaudio-*` — the
+  // brand name itself rarely appears, so the `step-`/`stepaudio` prefixes carry
+  // the match. Placed after every other brand so a more specific one wins first.
+  if (haystack.includes('stepfun') || haystack.includes('阶跃') || haystack.includes('stepaudio') || haystack.includes('step-')) return modelIconMap.stepfun
   if (haystack.includes('gpt') || haystack.includes('openai')) return modelIconMap.openai
   if (haystack.includes('ollama')) return modelIconMap['ollama-color']
   for (const key of Object.keys(modelIconMap)) {

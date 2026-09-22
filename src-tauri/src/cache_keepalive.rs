@@ -259,6 +259,7 @@ mod tests {
             models: vec![],
             enabled: true,
             server_tools: Default::default(),
+            speech: Default::default(),
         created_at: String::new(),
         }
     }

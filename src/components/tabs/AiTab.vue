@@ -6,7 +6,7 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { modelHasVision, modelHasVideo, useAiStore, type ModelOption } from '../../stores/ai'
+import { modelHasVision, modelHasVideo, modelHasAudio, useAiStore, type ModelOption } from '../../stores/ai'
 import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import ServerToolTraceCard from '../ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../../utils/serverToolTrace'
@@ -78,6 +78,14 @@ interface AssistantAnswer {
   cacheHitTokens?: number
   costUsd?: number | null
   source?: 'chat' | 'metadataExtraction'
+  /**
+   * A spoken reply from an end-to-end speech model, as a `data:audio/wav` URL.
+   * Arrives once, when the stream ends — the backend concatenates the streamed
+   * PCM and gives it a header, because a half-written clip is not playable. Not
+   * persisted: a minute of wav is megabytes of base64, and the answer text is
+   * already its transcript.
+   */
+  audioUrl?: string
   /** What OpenRouter's server tools contributed: pages cited, images drawn. */
   serverTools?: ServerToolTrace
   /** What the agent did to answer: one entry per tool call, in order. */
@@ -226,10 +234,33 @@ const keepaliveTitle = computed(() => {
 const previewImage = ref<string | null>(null)
 const previewPdf = ref<string | null>(null)
 const previewVideo = ref<string | null>(null)
+const previewAudio = ref<string | null>(null)
 /** Why the last picked file was refused (currently only an oversized clip). */
 const attachmentError = ref<string | null>(null)
 const modelMenuRoot = ref<HTMLElement | null>(null)
 const unlisteners = new Map<string, UnlistenFn>()
+
+/**
+ * Every per-answer event channel, as suffixes on the answer id.
+ *
+ * One list rather than two hand-written chains: the teardown sites had already
+ * drifted apart and both had forgotten `-servertools`, so a listener stayed
+ * registered for the lifetime of the window and a late event could land on a
+ * regenerated answer. Registering a new channel means adding it here, once.
+ */
+const ANSWER_EVENT_SUFFIXES = [
+  '', '-reasoning', '-context', '-usage', '-audio', '-servertools',
+  '-agent', '-confirm', '-confirm-close',
+] as const
+
+function detachAnswerListeners(answerId: string) {
+  for (const suffix of ANSWER_EVENT_SUFFIXES) {
+    const key = `${answerId}${suffix}`
+    const off = unlisteners.get(key)
+    if (off) off()
+    unlisteners.delete(key)
+  }
+}
 // Maps answer.id -> backend request_id, so stopAllStreaming can tell the backend
 // to truly cancel the in-flight HTTP request (stop the provider generating/billing).
 const activeRequestIds = new Map<string, string>()
@@ -345,11 +376,18 @@ const visionUnsupported = computed(() =>
   selectedModels.value.every(m => !modelHasVision(m))
 )
 
-/** Same check for a clip: only MiniMax's M3 line reads video on the chat path. */
+/** Same check for a clip — only a couple of lines read video on the chat path. */
 const videoUnsupported = computed(() =>
   attachments.value.some(a => a.type === 'video') &&
   selectedModels.value.length > 0 &&
   selectedModels.value.every(m => !modelHasVideo(m))
+)
+
+/** And for a sound clip: StepFun's end-to-end speech models only. */
+const audioUnsupported = computed(() =>
+  attachments.value.some(a => a.type === 'audio') &&
+  selectedModels.value.length > 0 &&
+  selectedModels.value.every(m => !modelHasAudio(m))
 )
 
 const hasStreaming = computed(() =>
@@ -488,6 +526,9 @@ function persistableConversation(conv: Conversation): Conversation {
     for (const answer of node.answers) {
       delete answer.displayContent
       delete answer.displayReasoning
+      // A spoken reply is megabytes of base64 wav and the whole conversation is
+      // re-serialized on every save; the answer text is already its transcript.
+      delete answer.audioUrl
       answer.steps = persistableSteps(answer.steps)
       answer.serverTools = persistableServerToolTrace(answer.serverTools)
     }
@@ -930,6 +971,10 @@ function modelLogo(modelId: string, providerName = '', providerId = '') {
   if (haystack.includes('mistral') || haystack.includes('huggingface')) return modelIconMap.huggingface
   if (haystack.includes('minimax') || haystack.includes('hailuo')) return modelIconMap.minimax
   if (haystack.includes('mimo') || haystack.includes('xiaomi')) return modelIconMap.xiaomimimo
+  // StepFun's ids are `step-5-preview`, `step-3.7-flash`, `stepaudio-*` — the
+  // brand name itself rarely appears, so the `step-`/`stepaudio` prefixes carry
+  // the match. Placed after every other brand so a more specific one wins first.
+  if (haystack.includes('stepfun') || haystack.includes('阶跃') || haystack.includes('stepaudio') || haystack.includes('step-')) return modelIconMap.stepfun
   if (haystack.includes('gpt') || haystack.includes('openai')) return modelIconMap.openai
   // Ollama is a host, not a model brand — the provider name pollutes the
   // haystack, so match its mark only after every real model brand above.
@@ -986,8 +1031,14 @@ function addAttachmentFromFile(file: File) {
     if (res.status === 'ok') {
       attachmentError.value = null
       attachments.value.push(res.attachment)
+    } else if (res.status === 'unreadable') {
+      attachmentError.value = t('chat.attachmentUnreadable', { name: res.name })
     } else {
-      attachmentError.value = t('chat.videoTooLarge', { name: res.name, mb: res.limitMb })
+      // Video and audio are capped for different reasons, so each says its own.
+      attachmentError.value = t(
+        res.type === 'audio' ? 'chat.audioTooLarge' : 'chat.videoTooLarge',
+        { name: res.name, mb: res.limitMb },
+      )
     }
   })
   return true
@@ -1025,6 +1076,8 @@ function previewAttachment(att: Attachment) {
     previewImage.value = att.dataUrl
   } else if (att.type === 'video') {
     previewVideo.value = att.dataUrl
+  } else if (att.type === 'audio') {
+    previewAudio.value = att.dataUrl
   } else {
     previewPdf.value = att.dataUrl
   }
@@ -1034,6 +1087,7 @@ function closePreview() {
   previewImage.value = null
   previewPdf.value = null
   previewVideo.value = null
+  previewAudio.value = null
 }
 
 
@@ -1152,6 +1206,7 @@ async function regenerate(group: ChatNode, answer: AssistantAnswer) {
     ra.outputTokens = undefined
     ra.totalTokens = undefined
     ra.costUsd = undefined
+    ra.audioUrl = undefined
     ra.createdAt = nowIso()
   }
   persistConversationFor(slug, conv)
@@ -1231,12 +1286,7 @@ function stopAllStreaming() {
     const requestId = activeRequestIds.get(answerId)
     if (requestId) invoke('cancel_ai_request', { requestId }).catch(() => {})
     activeRequestIds.delete(answerId)
-    for (const suffix of ['', '-reasoning', '-context', '-usage', '-agent', '-confirm', '-confirm-close']) {
-      const key = `${answerId}${suffix}`
-      const off = unlisteners.get(key)
-      if (off) off()
-      unlisteners.delete(key)
-    }
+    detachAnswerListeners(answerId)
     const ra = findReactiveAnswer(answerId)
     if (ra?.streaming) {
       ra.streaming = false
@@ -1368,6 +1418,9 @@ async function streamAnswer(
     ra.totalTokens = undefined
     ra.costUsd = undefined
     ra.serverTools = undefined
+    // Otherwise a regenerated answer keeps playing the previous run's clip under
+    // new text — LibraryChat resets this in the same place.
+    ra.audioUrl = undefined
   }
 
   const unlisten = await listen<StreamPayload>(eventName, (event) => {
@@ -1386,6 +1439,13 @@ async function streamAnswer(
     if (reactiveAns) applyUsage(reactiveAns, event.payload)
   })
   unlisteners.set(`${answer.id}-usage`, unlistenUsage)
+
+  // A spoken reply from an end-to-end speech model. One event, after the text.
+  const unlistenAudio = await listen<{ audio?: string }>(`${eventName}-audio`, (event) => {
+    const reactiveAns = findReactiveAnswer(answer.id)
+    if (reactiveAns && event.payload?.audio) reactiveAns.audioUrl = event.payload.audio
+  })
+  unlisteners.set(`${answer.id}-audio`, unlistenAudio)
 
   // OpenRouter's server tools report what they consulted or drew. The agent
   // loop emits one of these per round, so they are merged rather than replaced.
@@ -1533,24 +1593,7 @@ async function streamAnswer(
       reactiveAns.endedAt = performance.now()
       flushStreamRender(reactiveAns)
     }
-    const off = unlisteners.get(answer.id)
-    if (off) off()
-    unlisteners.delete(answer.id)
-    const offR = unlisteners.get(`${answer.id}-reasoning`)
-    if (offR) offR()
-    unlisteners.delete(`${answer.id}-reasoning`)
-    const offAgent = unlisteners.get(`${answer.id}-agent`)
-    if (offAgent) offAgent()
-    unlisteners.delete(`${answer.id}-agent`)
-    const offUsage = unlisteners.get(`${answer.id}-usage`)
-    if (offUsage) offUsage()
-    unlisteners.delete(`${answer.id}-usage`)
-    const offConfirm = unlisteners.get(`${answer.id}-confirm`)
-    if (offConfirm) offConfirm()
-    unlisteners.delete(`${answer.id}-confirm`)
-    const offConfirmClose = unlisteners.get(`${answer.id}-confirm-close`)
-    if (offConfirmClose) offConfirmClose()
-    unlisteners.delete(`${answer.id}-confirm-close`)
+    detachAnswerListeners(answer.id)
     activeRequestIds.delete(answer.id)
     const visible = isAnswerVisible(answer.id)
     streamOwners.delete(answer.id)
@@ -1884,12 +1927,10 @@ function finaliseMetaAnswer(answerId: string) {
     ra.endedAt = performance.now()
     flushStreamRender(ra)
   }
-  const off = unlisteners.get(answerId)
-  off?.()
-  unlisteners.delete(answerId)
-  const offUsage = unlisteners.get(`${answerId}-usage`)
-  offUsage?.()
-  unlisteners.delete(`${answerId}-usage`)
+  // The metadata-extraction path registers only two of the channels, but tearing
+  // down the whole set is harmless (a missing key is a no-op) and keeps this site
+  // from drifting the way the other two had.
+  detachAnswerListeners(answerId)
   const visible = isAnswerVisible(answerId)
   const owner = streamOwners.get(answerId)
   streamOwners.delete(answerId)
@@ -2426,6 +2467,12 @@ onUnmounted(() => {
                   </template>
                   <MarkdownBody v-else :content="answer.content" />
                   <ServerToolTraceCard :trace="answer.serverTools" />
+                  <!-- An end-to-end speech model's spoken reply. The text above is
+                       its transcript, so this is an addition, not the answer. -->
+                  <div v-if="answer.audioUrl" class="answer-audio">
+                    <Icon icon="fluent:music-note-2-24-regular" width="13" height="13" />
+                    <audio :src="answer.audioUrl" controls preload="metadata"></audio>
+                  </div>
                 </div>
               </article>
 
@@ -2519,6 +2566,10 @@ onUnmounted(() => {
             <Icon icon="fluent:warning-24-regular" width="13" height="13" />
             <span>{{ attachmentError }}</span>
           </div>
+          <div v-if="audioUnsupported" class="attachment-warning">
+            <Icon icon="fluent:warning-24-regular" width="13" height="13" />
+            <span>{{ t('chat.audioUnsupported') }}</span>
+          </div>
           <div v-if="videoUnsupported" class="attachment-warning">
             <Icon icon="fluent:warning-24-regular" width="13" height="13" />
             <span>{{ t('chat.videoUnsupported') }}</span>
@@ -2532,11 +2583,12 @@ onUnmounted(() => {
               v-for="att in attachments"
               :key="att.id"
               class="attachment-chip"
-              :class="{ pdf: att.type === 'pdf', video: att.type === 'video' }"
+              :class="{ pdf: att.type === 'pdf', video: att.type === 'video', audio: att.type === 'audio' }"
               :title="att.name"
             >
               <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
               <Icon v-else-if="att.type === 'video'" icon="fluent:video-clip-24-regular" width="14" height="14" />
+              <Icon v-else-if="att.type === 'audio'" icon="fluent:music-note-2-24-regular" width="14" height="14" />
               <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
               <span class="attachment-name">{{ att.name }}</span>
               <button
@@ -2697,6 +2749,12 @@ onUnmounted(() => {
     </div>
     <div v-if="previewVideo" class="attachment-lightbox" @click.self="closePreview">
       <video :src="previewVideo" class="lightbox-video" controls autoplay></video>
+      <button class="lightbox-close" title="关闭" @click="closePreview">
+        <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
+      </button>
+    </div>
+    <div v-if="previewAudio" class="attachment-lightbox" @click.self="closePreview">
+      <audio :src="previewAudio" class="lightbox-audio" controls autoplay></audio>
       <button class="lightbox-close" title="关闭" @click="closePreview">
         <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
       </button>
@@ -3665,6 +3723,23 @@ onUnmounted(() => {
   border-color: #f0c0c0;
   color: #8b1e1e;
 }
+.answer-audio {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--text-secondary, #888);
+}
+
+.answer-audio audio {
+  height: 30px;
+  max-width: min(340px, 100%);
+}
+
+.attachment-chip.audio {
+  background: var(--accent-soft, rgba(80, 140, 255, 0.10));
+}
+
 .attachment-chip.video {
   background: #f2f0ff;
   border-color: #ccc4f0;
@@ -4340,6 +4415,10 @@ onUnmounted(() => {
 .lightbox-close:hover {
   background: rgba(0, 0, 0, 0.75);
 }
+.lightbox-audio {
+  width: min(520px, 90vw);
+}
+
 .lightbox-video {
   max-width: 86vw;
   max-height: 86vh;

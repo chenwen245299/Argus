@@ -2529,6 +2529,7 @@ async fn run_agent_loop(
             "library-agent",
             cancel.clone(),
             web_search,
+            rounds == 0,
         )
         .await;
         let turn = match turn {
@@ -2576,6 +2577,7 @@ async fn run_agent_loop(
                 "library-agent",
                 cancel.clone(),
                 web_search,
+                false,
             )
             .await;
             let final_turn = match final_turn {
@@ -2815,6 +2817,7 @@ mod agent_tests {
             base_url: "https://example.com/v1".into(),
             enabled: true,
             server_tools: Default::default(),
+            speech: Default::default(),
         created_at: String::new(),
             models: vec![serde_json::from_value(serde_json::json!({
                 "id": id,

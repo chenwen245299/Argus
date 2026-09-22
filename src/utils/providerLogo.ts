@@ -44,6 +44,8 @@ const LOGO_MAP: [string[], string][] = [
   [['microsoft', 'azure', 'openai.azure'], 'microsoft.svg'],
   [['mimo', 'xiaomimimo', 'xiaomi', 'micloud'], 'xiaomimimo.svg'],
   [['minimax', 'hailuo'], 'minimax.svg'],
+  // StepFun's host is api.stepfun.com, and its ids all start `step-`/`stepaudio`.
+  [['stepfun', '阶跃', 'stepaudio'], 'stepfun.svg'],
   [['mole', 'moleapi'], 'MoleAPI.svg'],
 ]
 

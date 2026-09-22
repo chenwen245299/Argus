@@ -11,6 +11,10 @@
 //!     *used*, in USD, and the remainder has to be subtracted out. That endpoint
 //!     wants a management key, so an ordinary inference key falls back to
 //!     `GET /key`, which reports the same figures from the key's point of view.
+//!   * StepFun: `GET /v1/accounts` returns the remaining balance plus the
+//!     topped-up and voucher totals it is made of. A `postpaid` account is the
+//!     odd one out — it is billed in arrears, so its `balance` is not a figure
+//!     that can run out, and the UI is told to show spend instead.
 //!   * MoleAPI: `GET /api/usage/token/` (beside `/v1`, not under it) reports the
 //!     *key's* quota — granted, used, remaining — as an integer in the gateway's
 //!     own unit, which `/api/status` says how to turn into dollars. A key can
@@ -25,7 +29,8 @@
 //! References:
 //! <https://api-docs.deepseek.com/zh-cn/api/get-user-balance>,
 //! <https://openrouter.ai/docs/api-reference/get-credits>,
-//! <https://docs.moleapi.com/zh-CN/docs/api/management/token-management/usage-token-get>
+//! <https://docs.moleapi.com/zh-CN/docs/api/management/token-management/usage-token-get>,
+//! <https://platform.stepfun.com/docs/zh/api-reference/accounts/get>
 
 use serde::{Deserialize, Serialize};
 
@@ -38,13 +43,14 @@ pub struct ProviderBalance {
     pub provider_id: String,
     /// What is left to spend, in `currency`.
     pub remaining: f64,
-    /// ISO code as the provider reports it — `CNY` for DeepSeek, `USD` for
-    /// OpenRouter and MoleAPI.
+    /// ISO code as the provider reports it — `CNY` for DeepSeek and StepFun,
+    /// `USD` for OpenRouter and MoleAPI.
     pub currency: String,
-    /// DeepSeek: the promotional part of `remaining`, which expires.
+    /// DeepSeek: the promotional part of `remaining`, which expires. StepFun:
+    /// the voucher (赠送) part.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub granted: Option<f64>,
-    /// DeepSeek: the paid-for part of `remaining`.
+    /// DeepSeek: the paid-for part of `remaining`. StepFun: the cash (充值) part.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topped_up: Option<f64>,
     /// OpenRouter: credits bought to date. MoleAPI: the quota the key was
@@ -91,6 +97,7 @@ pub fn supports_balance(provider: &AiProvider) -> bool {
     crate::llm::is_deepseek(provider)
         || is_openrouter(provider)
         || crate::moleapi::is_moleapi(provider)
+        || crate::stepfun::is_stepfun(provider)
 }
 
 fn is_openrouter(provider: &AiProvider) -> bool {
@@ -115,6 +122,9 @@ pub async fn fetch(
     }
     if crate::moleapi::is_moleapi(provider) {
         return fetch_moleapi(provider, api_key, access_token).await;
+    }
+    if crate::stepfun::is_stepfun(provider) {
+        return fetch_stepfun(provider, api_key).await;
     }
     Err(format!("{} does not publish an account balance.", provider.name))
 }
@@ -170,6 +180,49 @@ async fn fetch_deepseek(provider: &AiProvider, api_key: &str) -> Result<Provider
                 remaining: parse_amount(&info.total_balance),
             })
             .collect(),
+    })
+}
+
+// ── StepFun ──────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct StepFunAccount {
+    /// `prepaid` (paid up front, so `balance` is what is left) or `postpaid`
+    /// (billed in arrears, so there is nothing to run out of).
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    balance: f64,
+    #[serde(default)]
+    total_cash_balance: f64,
+    #[serde(default)]
+    total_voucher_balance: f64,
+}
+
+async fn fetch_stepfun(provider: &AiProvider, api_key: &str) -> Result<ProviderBalance, String> {
+    let url = format!("{}/accounts", provider.base_url.trim_end_matches('/'));
+    let body: StepFunAccount = get_json(&url, api_key).await?;
+
+    // A postpaid account is invoiced after the fact: its `balance` is not a
+    // ceiling, and rendering it as "what is left" would be a lie. `unlimited` is
+    // the flag the UI already reads for exactly that case.
+    let postpaid = body.r#type.eq_ignore_ascii_case("postpaid");
+
+    Ok(ProviderBalance {
+        provider_id: provider.id.clone(),
+        remaining: body.balance,
+        currency: "CNY".to_string(),
+        granted: Some(body.total_voucher_balance),
+        topped_up: Some(body.total_cash_balance),
+        total_credits: None,
+        total_usage: None,
+        unlimited: postpaid,
+        key_remaining: None,
+        expires_at: None,
+        // Prepaid and empty means the next call is refused — the same thing
+        // DeepSeek reports outright with its own `is_available`.
+        is_available: postpaid || body.balance > 0.0,
+        other_currencies: vec![],
     })
 }
 
@@ -411,6 +464,7 @@ mod tests {
             enabled: true,
             models: vec![],
             server_tools: Default::default(),
+            speech: Default::default(),
         created_at: "2026-01-01T00:00:00Z".into(),
         }
     }

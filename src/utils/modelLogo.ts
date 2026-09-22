@@ -45,6 +45,10 @@ export function modelLogo(model?: ModelOption | null, providerKind?: string): st
   // file is xiaomimimo.svg, which the haystack never spells out on its own.
   if (haystack.includes('minimax') || haystack.includes('hailuo')) return modelIconMap.minimax
   if (haystack.includes('mimo') || haystack.includes('xiaomi')) return modelIconMap.xiaomimimo
+  // StepFun's ids are `step-5-preview`, `step-3.7-flash`, `stepaudio-*` — the
+  // brand name itself rarely appears, so the `step-`/`stepaudio` prefixes carry
+  // the match. Placed after every other brand so a more specific one wins first.
+  if (haystack.includes('stepfun') || haystack.includes('阶跃') || haystack.includes('stepaudio') || haystack.includes('step-')) return modelIconMap.stepfun
   if (haystack.includes('openai') || haystack.includes('gpt')) return modelIconMap.openai
   // Ollama is a host, not a model brand — the provider name pollutes the
   // haystack, so match its mark only after every real model brand above.

@@ -229,6 +229,7 @@ pub fn to_info(root: &str, settings: &AiSettings) -> AiSettingsInfo {
                     })
                     .collect(),
                 server_tools: p.server_tools.clone(),
+                speech: p.speech.clone(),
             })
             .collect(),
         default_provider_id: settings.default_provider_id.clone(),
@@ -265,6 +266,7 @@ pub fn add_provider(
         enabled: input.enabled,
         models,
         server_tools: input.server_tools.unwrap_or_default(),
+        speech: input.speech.unwrap_or_default(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     if !api_key.is_empty() {
@@ -304,6 +306,9 @@ pub fn update_provider(
     // switches, and a rename must not reset them.
     if let Some(tools) = input.server_tools {
         p.server_tools = tools;
+    }
+    if let Some(speech) = input.speech {
+        p.speech = speech;
     }
     if let Some(key) = api_key {
         if !key.is_empty() {
@@ -506,6 +511,7 @@ mod tests {
             enabled,
             models: vec![],
             server_tools: Default::default(),
+            speech: Default::default(),
             created_at: String::new(),
         }
     }

@@ -186,6 +186,42 @@ impl ServerToolTrace {
             }
         }
 
+        // StepFun's built-in search: the platform answers its own call and hangs
+        // the pages it read off that call, as
+        // `tool_calls[{type:"web_search", function:{results:[{url,title,summary}]}}]`.
+        // Only a `web_search` entry is read here — a `function` call is the
+        // agent loop's to run, and has no `results` of its own.
+        if let Some(calls) = node.get("tool_calls").and_then(|c| c.as_array()) {
+            for call in calls {
+                if call.get("type").and_then(|t| t.as_str()) != Some("web_search") {
+                    continue;
+                }
+                let Some(results) = call
+                    .get("function")
+                    .and_then(|f| f.get("results"))
+                    .and_then(|r| r.as_array())
+                else {
+                    continue;
+                };
+                for result in results {
+                    let Some(url) = result.get("url").and_then(|u| u.as_str()) else {
+                        continue;
+                    };
+                    if url.is_empty() || self.citations.iter().any(|c| c.url == url) {
+                        continue;
+                    }
+                    self.citations.push(Citation {
+                        url: url.to_string(),
+                        title: result
+                            .get("title")
+                            .and_then(|t| t.as_str())
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string),
+                    });
+                }
+            }
+        }
+
         if let Some(images) = node.get("images").and_then(|i| i.as_array()) {
             for image in images {
                 // Either `{"image_url":{"url":…}}` or the bare URL.
@@ -202,6 +238,29 @@ impl ServerToolTrace {
                 }
             }
         }
+    }
+
+    /// Record a page a *client-side* search consulted.
+    ///
+    /// StepFun's flagship carries no built-in search tool, so Argus runs
+    /// `POST /v1/search` itself and writes the results into the prompt. Those
+    /// pages deserve the same citation strip as a server-run search, but they
+    /// never appear in the response, so they are added here instead of absorbed.
+    pub fn push_citation(&mut self, url: &str, title: Option<&str>) {
+        if url.is_empty() || self.citations.iter().any(|c| c.url == url) {
+            return;
+        }
+        self.citations.push(Citation {
+            url: url.to_string(),
+            title: title.filter(|t| !t.is_empty()).map(str::to_string),
+        });
+    }
+
+    /// Note that a client-side tool ran, so the UI can name it next to the
+    /// citations the way it does for a server-run one.
+    pub fn note_call(&mut self, tool: &str, count: u64) {
+        let entry = self.calls.entry(tool.to_string()).or_insert(0);
+        *entry = (*entry).max(count);
     }
 
     /// Read `usage.server_tool_use`, which counts what actually ran.
@@ -244,8 +303,64 @@ mod tests {
             enabled: true,
             models: vec![],
             server_tools: tools,
+            speech: Default::default(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }
+    }
+
+    /// StepFun answers its own search and reports the pages inside the tool call
+    /// it already ran. Nothing else in the response mentions them, so missing
+    /// this shape means paying for a search and showing no sources.
+    #[test]
+    fn stepfuns_self_answered_search_yields_citations() {
+        let mut trace = ServerToolTrace::default();
+        trace.absorb(&serde_json::json!({
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "web_search",
+                "function": {
+                    "name": "step_websearch",
+                    "arguments": "{\"keyword\": \"上海 最高的楼\"}",
+                    "results": [
+                        {"index": 0, "url": "https://a.test/1", "title": "上海中心大厦", "summary": "…"},
+                        {"index": 1, "url": "https://b.test/2", "title": "十大高楼", "summary": "…"}
+                    ]
+                }
+            }]
+        }));
+        let payload = trace.to_payload();
+        let cites = payload["citations"].as_array().unwrap();
+        assert_eq!(cites.len(), 2);
+        assert_eq!(cites[0]["url"], "https://a.test/1");
+        assert_eq!(cites[0]["title"], "上海中心大厦");
+    }
+
+    /// A `function` call is the agent loop's to run and carries no `results`;
+    /// reading one here would invent a citation out of a pending tool call.
+    #[test]
+    fn an_ordinary_function_call_is_not_a_citation() {
+        let mut trace = ServerToolTrace::default();
+        trace.absorb(&serde_json::json!({
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "view_paper_page", "arguments": "{}"}
+            }]
+        }));
+        assert!(trace.is_empty());
+    }
+
+    #[test]
+    fn a_client_side_search_can_be_credited_by_hand() {
+        let mut trace = ServerToolTrace::default();
+        trace.push_citation("https://a.test/1", Some("标题"));
+        // The same page twice is one citation.
+        trace.push_citation("https://a.test/1", Some("标题"));
+        trace.push_citation("", Some("空的"));
+        trace.note_call("web_search", 1);
+        let payload = trace.to_payload();
+        assert_eq!(payload["citations"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["calls"]["web_search"], 1);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod activity;
 mod ai_manager;
 mod ai_summary;
+mod annotations;
 mod arxiv;
 mod arxiv_scheduler;
 mod balance;
@@ -20,6 +21,7 @@ mod fsutil;
 mod library;
 mod llm;
 mod mcp;
+mod media;
 mod metadata;
 mod mimo;
 mod minimax;
@@ -38,6 +40,8 @@ mod sections;
 mod security_bookmark;
 mod settings;
 mod snippets;
+mod stepfun;
+mod stepfun_media;
 mod token_usage;
 mod url_import;
 mod watcher;
@@ -236,6 +240,15 @@ pub fn run() {
             commands::set_default_model,
             // ── DeepSeek Files API (vision attachments) ──
             commands::fetch_provider_balances,
+            commands::list_media_capabilities,
+            commands::open_media_studio_window,
+            commands::run_media_task,
+            commands::fetch_media_artifact,
+            commands::collect_annotations,
+            commands::export_annotations,
+            commands::export_annotations_to_folder,
+            commands::open_annotation_print_window,
+            commands::print_annotation_window,
             commands::deepseek_vision_limits,
             commands::deepseek_upload_file,
             commands::deepseek_list_files,

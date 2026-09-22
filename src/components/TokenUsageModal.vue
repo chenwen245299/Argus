@@ -116,6 +116,7 @@ const MODEL_ICON_RULES: [string[], string][] = [
   [['kling'], 'kling.svg'],
   [['minimax', 'hailuo'], 'minimax.svg'],
   [['mimo', 'xiaomimimo', 'xiaomi'], 'xiaomimimo.svg'],
+  [['stepfun', '阶跃', 'stepaudio', 'step-'], 'stepfun.svg'],
 ]
 
 function modelIconUrl(model: string, provider: string): string | null {

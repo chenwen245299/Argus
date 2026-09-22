@@ -318,7 +318,7 @@ export interface AiModel {
 export interface AiProviderInfo {
   id: string
   name: string
-  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'qwenai' | 'mimo' | 'zhipu' | 'minimax' | 'moleapi' | 'ollama' | string
+  kind: 'openai_compatible' | 'anthropic' | 'openrouter' | 'kimi' | 'qwenai' | 'mimo' | 'zhipu' | 'minimax' | 'moleapi' | 'stepfun' | 'ollama' | string
   base_url: string
   enabled: boolean
   has_key: boolean
@@ -326,6 +326,18 @@ export interface AiProviderInfo {
   has_access_token?: boolean
   models: AiModel[]
   server_tools: ServerTools
+  speech: SpeechOutput
+}
+
+/**
+ * Whether an end-to-end speech model should answer out loud, and in whose voice.
+ * Provider-level, like `ServerTools`, and off by default — only StepFun's
+ * `step-audio-*` / `step-1o-audio` models read it.
+ */
+export interface SpeechOutput {
+  enabled: boolean
+  /** Voice id; empty means the backend's default (`wenrounansheng`). */
+  voice: string
 }
 
 /**
@@ -376,6 +388,8 @@ export interface AiProviderInput {
   models: AiModel[]
   /** Omit to leave the stored tool configuration untouched. */
   server_tools?: ServerTools
+  /** Same "omit means unchanged" rule as `server_tools`. */
+  speech?: SpeechOutput
 }
 
 /**
@@ -389,12 +403,156 @@ export type ImageDetail = 'low' | 'high' | 'original' | 'auto'
 export type ChatContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string; detail?: ImageDetail } }
-  /** A video clip. Only MiniMax reads these on the chat path. */
+  /** A video clip. MiniMax and StepFun read these on the chat path. */
   | { type: 'video_url'; video_url: { url: string; detail?: string } }
+  /**
+   * A sound clip, for StepFun's end-to-end speech models. `data` is a full
+   * `data:audio/wav;base64,…` / `data:audio/mpeg;base64,…` URI — deliberately not
+   * OpenAI's `{data, format}` pair, since StepFun reads the container off the
+   * URI's media type and has no `format` field.
+   */
+  | { type: 'input_audio'; input_audio: { data: string } }
   /** An attachment sent inline (OpenRouter / Kimi accept base64 PDFs this way). */
   | { type: 'file'; file: { filename: string; file_data: string } }
   /** An attachment sent by reference to DeepSeek's Files API. */
   | { type: 'file'; file_id: string }
+
+// ── Annotation export ─────────────────────────────────────────────────────────
+//
+// Mirrors `src-tauri/src/annotations.rs`. Deliberately not the storage shapes:
+// an export drops highlight rects and internal ids, which mean nothing outside
+// the viewer, so this stays stable when the on-disk format changes.
+
+export interface ExportedHighlight {
+  /** PDF: 1-based page. Ebooks: 1-based chapter index. */
+  page: number
+  text: string
+  /** The comment attached to the highlight, if any. */
+  note?: string
+  color: string
+  style: string
+  createdAt: string
+}
+
+export interface ExportedNote {
+  title: string
+  /** The note's Markdown, verbatim. */
+  content: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ExportedPaper {
+  slug: string
+  title: string
+  authors?: string[]
+  year?: number
+  venue?: string
+  doi?: string
+  arxivId?: string
+  tags?: string[]
+  readingStatus: string
+  highlights: ExportedHighlight[]
+  notes: ExportedNote[]
+}
+
+export interface AnnotationExportFile {
+  /** Relative to the export root, `/`-separated; a single-file export has no directory in it. */
+  path: string
+  content: string
+}
+
+/** What a folder export reports back once the tree is on disk. */
+export interface AnnotationFolderExport {
+  /** Absolute path of the folder that was created. */
+  dir: string
+  /** Its name on its own, for a message the user reads. */
+  name: string
+  fileCount: number
+  noteCount: number
+}
+
+// ── Media generation (off the chat path) ──────────────────────────────────────
+//
+// Mirrors `src-tauri/src/media.rs`. Nothing here names a provider: the backend
+// describes each provider's tasks, models and knobs, and the studio renders its
+// form from that description.
+
+export type MediaKind =
+  | 'image_generate'
+  | 'image_edit'
+  | 'speech'
+  | 'transcribe'
+  | 'audio_generate'
+  | 'music'
+
+export type MediaFieldKind = 'text' | 'long_text' | 'select' | 'number' | 'toggle'
+
+export interface MediaFieldOption {
+  value: string
+  label: string
+}
+
+/** One control in the generated form. `key` is what its value is sent back under. */
+export interface MediaField {
+  key: string
+  label: string
+  kind: MediaFieldKind
+  options?: MediaFieldOption[]
+  default?: unknown
+  min?: number
+  max?: number
+  step?: number
+  note?: string
+}
+
+export interface MediaModelSpec {
+  id: string
+  displayName: string
+  note?: string
+  fields?: MediaField[]
+  /** Accepted input media types; empty means the task never takes one. */
+  accepts?: string[]
+  /**
+   * Whether the file is mandatory. Distinct from `accepts`: a model can take an
+   * optional reference file (music does) without it being required to run.
+   */
+  fileRequired?: boolean
+  promptRequired: boolean
+  promptPlaceholder?: string
+}
+
+export interface MediaCapability {
+  kind: MediaKind
+  label: string
+  note?: string
+  models: MediaModelSpec[]
+}
+
+export interface MediaProviderCapabilities {
+  providerId: string
+  providerName: string
+  baseUrl: string
+  capabilities: MediaCapability[]
+}
+
+export interface MediaArtifact {
+  mime: string
+  /** Bytes, as a data URI. */
+  dataUrl?: string
+  /** A URL the provider hosts instead of bytes — these expire. */
+  url?: string
+  /** Text output: a transcription, or a caption beside a clip. */
+  text?: string
+  filename?: string
+}
+
+export interface MediaResult {
+  kind: MediaKind
+  providerId: string
+  model: string
+  artifacts: MediaArtifact[]
+}
 
 // ── Provider account balance ──────────────────────────────────────────────────
 

@@ -404,6 +404,7 @@ mod tests {
             enabled: true,
             models: vec![],
             server_tools: Default::default(),
+            speech: Default::default(),
         created_at: String::new(),
         };
         assert!(publishes_prices(&provider("https://openrouter.ai/api/v1")));

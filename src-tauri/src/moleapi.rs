@@ -548,6 +548,7 @@ mod tests {
             enabled: true,
             models: vec![],
             server_tools: Default::default(),
+            speech: Default::default(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }
     }

@@ -19,6 +19,7 @@ import { buildChunks } from '../utils/chunker'
 import type { PaperVectorizeInput, ChunkInput } from '../types'
 import { isEbookFileType } from '../types'
 import StatusBadges from './StatusBadges.vue'
+import AnnotationExportModal from './AnnotationExportModal.vue'
 import CollectionCascadeMenu from './CollectionCascadeMenu.vue'
 import { titleInitialCaps } from '../utils/text'
 import { noteBadgeStyle } from '../utils/noteBadges'
@@ -759,6 +760,15 @@ async function openCtx(e: MouseEvent, item: PaperIndexEntry) {
   await positionContextMenu()
 }
 function closeCtx() { ctxMenu.value = null }
+
+// Papers whose highlights and notes the export dialog is open for; null = closed.
+const exportSlugs = ref<string[] | null>(null)
+
+function exportAnnotations(slugs: string[]) {
+  closeCtx()
+  if (!slugs.length) return
+  exportSlugs.value = slugs
+}
 
 // Papers the context-menu action applies to: the whole multi-selection when the
 // right-clicked row is part of it, otherwise just that row.
@@ -1777,6 +1787,10 @@ async function deleteBatch() {
             <button class="ctx-item" @click="vectorizeBatch">{{ t('batch.vectorize') }}</button>
           </template>
           <div class="ctx-sep" />
+          <button class="ctx-item" @click="exportAnnotations(ctxTargets.map(p => p.slug))">
+            {{ t('annotationExport.menu') }}
+          </button>
+          <div class="ctx-sep" />
           <button class="ctx-item danger" @click="deleteBatch">{{ t('paper.delete') }}</button>
         </template>
 
@@ -1928,11 +1942,21 @@ async function deleteBatch() {
           </button>
         </template>
         <div class="ctx-sep" />
+        <button class="ctx-item" @click="exportAnnotations([ctxMenu!.item.slug])">
+          {{ t('annotationExport.menu') }}
+        </button>
+        <div class="ctx-sep" />
         <button class="ctx-item danger" @click="deletePaper(ctxMenu!.item)">{{ t('paper.delete') }}</button>
         </template>
       </div>
     </Teleport>
   </div>
+
+  <AnnotationExportModal
+    v-if="exportSlugs"
+    :slugs="exportSlugs"
+    @close="exportSlugs = null"
+  />
 
   <!-- Drag ghost -->
   <Teleport to="body">

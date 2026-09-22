@@ -765,6 +765,11 @@ pub struct AiProvider {
     /// it is written out only when it differs from the default.
     #[serde(default, skip_serializing_if = "ServerTools::is_default")]
     pub server_tools: ServerTools,
+    /// Spoken replies from an end-to-end speech model (StepFun). Written out
+    /// only when switched on, so every other provider's settings file is byte
+    /// identical to before.
+    #[serde(default, skip_serializing_if = "SpeechOutput::is_default")]
+    pub speech: SpeechOutput,
     pub created_at: String,
 }
 
@@ -835,6 +840,34 @@ impl ServerTools {
     }
 }
 
+/// Whether an end-to-end speech model should answer out loud, and in whose
+/// voice.
+///
+/// Provider-level rather than per-message, for the same reason `ServerTools` is:
+/// it is a property of how this endpoint is set up, not a decision worth making
+/// on every turn. Off by default, so no existing conversation changes shape —
+/// and it is read only by the handful of StepFun models that can actually speak.
+/// Asking a model that cannot (`stepaudio-2.5-chat`) is a documented error, so
+/// the request builder checks the model before honouring this.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub struct SpeechOutput {
+    /// Ask for a spoken reply alongside the text.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Voice id. Empty means the provider module's default. StepFun's
+    /// `step-audio-2` family documents four by name; `step-1o-audio` and
+    /// `step-audio-r1.5` read theirs from `GET /v1/audio/voices`, so any string
+    /// is passed through rather than validated against a list.
+    #[serde(default)]
+    pub voice: String,
+}
+
+impl SpeechOutput {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AiSettings {
     #[serde(default)]
@@ -858,6 +891,18 @@ pub struct AiProviderInfo {
     pub models: Vec<AiModel>,
     #[serde(default)]
     pub server_tools: ServerTools,
+    #[serde(default)]
+    pub speech: SpeechOutput,
+}
+
+/// One provider's media abilities, as the studio lists them.
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaProviderCapabilities {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub base_url: String,
+    pub capabilities: Vec<crate::media::MediaCapability>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -880,6 +925,9 @@ pub struct AiProviderInput {
     /// renames the provider does not silently reset its tools.
     #[serde(default)]
     pub server_tools: Option<ServerTools>,
+    /// Same "absent means unchanged" rule as `server_tools`.
+    #[serde(default)]
+    pub speech: Option<SpeechOutput>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -937,6 +985,14 @@ pub enum ChatContentPart {
     /// offers the attachment for a model tagged `video`.
     #[serde(rename = "video_url")]
     VideoUrl { video_url: VideoUrlData },
+    /// A sound clip, spelled the way StepFun's end-to-end speech models read it.
+    ///
+    /// Deliberately *not* OpenAI's `{data, format}` shape: StepFun documents a
+    /// single `data` field holding a full data URI, and there is no `format`
+    /// sibling to tell it the container — the URI's media type is the only
+    /// signal. Only a model tagged `audio` is offered the attachment.
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudioData },
     /// An attachment carried either inline (`file`, OpenRouter/Kimi-style base64
     /// `file_data`) or by reference (`file_id`, DeepSeek's Files API handle).
     /// Both providers spell the block `{"type": "file", …}`, so the two payloads
@@ -967,6 +1023,14 @@ pub struct VideoUrlData {
     /// Sampling-fidelity hint, mirroring `image_url.detail`. Omitted unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InputAudioData {
+    /// A full `data:audio/wav;base64,…` / `data:audio/mpeg;base64,…` URI. The
+    /// platform accepts wav and mp3 only, and the prefix is how it tells them
+    /// apart, so a bare base64 payload will not do.
+    pub data: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1580,4 +1644,84 @@ pub struct NodePosition {
     pub node_id: String,
     pub x: f64,
     pub y: f64,
+}
+
+#[cfg(test)]
+mod provider_settings_tests {
+    use super::*;
+
+    /// Every existing `ai.json` predates the `speech` field. Adding a field that
+    /// is not `#[serde(default)]` would make the whole settings file fail to load
+    /// — every provider and every API key gone on first launch after an update.
+    #[test]
+    fn a_settings_file_written_before_speech_existed_still_loads() {
+        let json = r#"{
+            "id": "p1",
+            "name": "DeepSeek",
+            "kind": "openai_compatible",
+            "base_url": "https://api.deepseek.com/v1",
+            "enabled": true,
+            "models": [],
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let p: AiProvider = serde_json::from_str(json).expect("legacy provider must still parse");
+        assert_eq!(p.id, "p1");
+        assert!(!p.speech.enabled);
+        assert!(p.speech.voice.is_empty());
+        assert!(p.server_tools.is_default());
+    }
+
+    /// …and writing it back must not add noise to every other provider's entry.
+    /// `skip_serializing_if` is what keeps an untouched settings file byte-stable.
+    #[test]
+    fn an_untouched_provider_does_not_grow_a_speech_key() {
+        let p = AiProvider {
+            id: "p1".into(),
+            name: "DeepSeek".into(),
+            kind: "openai_compatible".into(),
+            base_url: "https://api.deepseek.com/v1".into(),
+            enabled: true,
+            models: vec![],
+            server_tools: ServerTools::default(),
+            speech: SpeechOutput::default(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let out = serde_json::to_string(&p).unwrap();
+        assert!(!out.contains("speech"), "{out}");
+        assert!(!out.contains("server_tools"), "{out}");
+    }
+
+    /// Once it is switched on it has to survive the round trip, or the toggle
+    /// would silently reset every time the settings are re-read.
+    #[test]
+    fn a_configured_voice_round_trips() {
+        let mut p: AiProvider = serde_json::from_str(
+            r#"{"id":"s","name":"StepFun","kind":"stepfun","base_url":"https://api.stepfun.com/v1",
+                "enabled":true,"models":[],"created_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        p.speech = SpeechOutput { enabled: true, voice: "qingchunshaonv".into() };
+        let out = serde_json::to_string(&p).unwrap();
+        assert!(out.contains("\"speech\""), "{out}");
+        let back: AiProvider = serde_json::from_str(&out).unwrap();
+        assert!(back.speech.enabled);
+        assert_eq!(back.speech.voice, "qingchunshaonv");
+    }
+
+    /// The audio content block is new; a conversation replayed from disk that
+    /// contains one must deserialize, and must serialize back in StepFun's shape
+    /// (a single `data` field holding a full data URI — not OpenAI's
+    /// `{data, format}` pair).
+    #[test]
+    fn the_audio_content_block_round_trips_in_stepfuns_shape() {
+        let raw = r#"{"type":"input_audio","input_audio":{"data":"data:audio/wav;base64,AAA"}}"#;
+        let part: ChatContentPart = serde_json::from_str(raw).unwrap();
+        match &part {
+            ChatContentPart::InputAudio { input_audio } => {
+                assert_eq!(input_audio.data, "data:audio/wav;base64,AAA");
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(serde_json::to_string(&part).unwrap(), raw);
+    }
 }

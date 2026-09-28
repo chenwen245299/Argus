@@ -286,9 +286,6 @@ pub fn run() {
             commands::cancel_batch_vectorize,
             commands::get_paper_vectorize_input,
             commands::embed_and_store_chunks,
-            // ── M7: Search ──
-            commands::search_paper_chunks,
-            commands::search_library_chunks,
             // ── M7: Library chat ──
             commands::chat_with_library,
             cancel::cancel_ai_request,
@@ -303,13 +300,6 @@ pub fn run() {
             // ── Embedding map ──
             commands::open_embedding_map_window,
             commands::get_embedding_map,
-            // ── Snippet RAG ──
-            commands::get_snippet_store_info,
-            commands::embed_all_snippets,
-            commands::get_library_embedded_count,
-            commands::embed_library_snippets,
-            commands::embed_all_snippets_force,
-            commands::delete_snippet_vector,
             // ── M8: arXiv window ──
             commands::open_arxiv_window,
             commands::save_arxiv_window_size,

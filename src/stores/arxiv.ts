@@ -2,7 +2,9 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { ArxivConfig, ArxivPaper, ArxivScheduleStatus } from '../types'
+import type {
+  ArxivAnalysisEvent, ArxivAnalysisRun, ArxivConfig, ArxivPaper, ArxivScheduleStatus,
+} from '../types'
 import { fetchArxivCategories } from '../utils/arxivFetch'
 import { fetchBiorxivAsArxivPapers } from '../utils/biorxivFetch'
 import { i18n } from '../i18n'
@@ -13,6 +15,39 @@ interface ImportOutcome { status: 'imported' | 'duplicate'; slug?: string; exist
 export type SortMode = 'score' | 'date' | 'status' | 'rating'
 export type SortOrder = 'desc' | 'asc'
 export type FilterMode = 'all' | 'unread' | 'pending_analysis'
+
+/** The provider is throttling: the whole bulk run is paused until `until` (ms epoch). */
+export interface AnalysisWaiting {
+  message: string
+  retryIn: number
+  concurrency: number
+  until: number
+}
+
+/** How the last bulk run ended, or why it could not start. Stays until dismissed or a new run starts. */
+export type AnalysisNotice =
+  | {
+      kind: 'finished'
+      total: number
+      succeeded: number
+      failed: number
+      filtered: number
+      reverted: number
+      /** Set when the run stopped early on a provider-wide error (quota, bad key, persistent overload). */
+      stoppedReason: string | null
+      cancelled: boolean
+      /** False when the backend predates the per-outcome counters. */
+      hasCounts: boolean
+    }
+  | { kind: 'error'; message: string }
+
+/** A single-paper analysis refused before anything was sent (disk untouched). */
+export interface SingleAnalysisError {
+  arxiv_id: string
+  message: string
+}
+
+const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 
 export const DEFAULT_ARXIV_ANALYSIS_PROMPT = `你是一名研究助理。根据以下论文元数据，评估其与这些主题的相关性：{topics}。
 
@@ -63,6 +98,44 @@ export const useArxivStore = defineStore('arxiv', () => {
   const fetchMessage = ref('')
   const analyzing = ref(false)
   const analyzeProgress = ref({ done: 0, total: 0 })
+  // How many previously-failed papers the current bulk run is retrying.
+  const analyzeRetryingFailed = ref(0)
+  const analyzeWaiting = ref<AnalysisWaiting | null>(null)
+  const analysisNotice = ref<AnalysisNotice | null>(null)
+  const lastSingleError = ref<SingleAnalysisError | null>(null)
+  // The run whose outcome has already been shown (or dismissed) here, so the
+  // status poll does not bring it back.
+  let lastRunSeenAt: number | null = null
+
+  // Results of the running batch, by paper; `null` = filtered out. The backend
+  // writes them to disk every couple of seconds, so an inbox read mid-run can
+  // lag the events already shown — this is laid over every such read.
+  const runOutcomes = new Map<string, Partial<ArxivPaper> | null>()
+
+  function withRunOutcomes(list: ArxivPaper[]): ArxivPaper[] {
+    if (runOutcomes.size === 0) return list
+    const out: ArxivPaper[] = []
+    for (const p of list) {
+      const o = runOutcomes.get(p.arxiv_id)
+      if (o === undefined) out.push(p)
+      else if (o !== null) out.push({ ...p, ...o })
+    }
+    return out
+  }
+
+  function noticeFromRun(r: ArxivAnalysisRun): AnalysisNotice {
+    return {
+      kind: 'finished',
+      total: num(r.total),
+      succeeded: num(r.succeeded),
+      failed: num(r.failed),
+      filtered: num(r.filtered),
+      reverted: num(r.reverted),
+      stoppedReason: r.stopped_reason ? String(r.stopped_reason) : null,
+      cancelled: r.cancelled === true,
+      hasCounts: true,
+    }
+  }
 
   // UI state
   const sortMode = ref<SortMode>('score')
@@ -81,7 +154,10 @@ export const useArxivStore = defineStore('arxiv', () => {
     if (filterMode.value === 'unread') {
       list = list.filter(p => !p.read)
     } else if (filterMode.value === 'pending_analysis') {
-      list = list.filter(p => p.analysis_status === 'pending' || p.analysis_status === 'failed')
+      // What "AI 分析全部" would pick up, plus papers in flight so a running batch
+      // does not make rows blink out of this view and back in on failure.
+      list = list.filter(p =>
+        p.analysis_status === 'pending' || p.analysis_status === 'failed' || p.analysis_status === 'analyzing')
     }
     if (sortMode.value === 'score') {
       list.sort((a, b) => (a.relevance_score ?? -1) - (b.relevance_score ?? -1))
@@ -119,10 +195,10 @@ export const useArxivStore = defineStore('arxiv', () => {
       // Preserve read=true from current frontend state to guard against in-flight
       // mark_paper_read calls being overtaken by a concurrent loadInbox.
       const knownRead = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
-      papers.value = inbox.papers.map(p => ({
+      papers.value = withRunOutcomes(inbox.papers.map(p => ({
         ...p,
         read: p.read || knownRead.has(p.arxiv_id),
-      }))
+      })))
     } catch { papers.value = [] }
   }
 
@@ -135,7 +211,26 @@ export const useArxivStore = defineStore('arxiv', () => {
         total: status.analyzed_count + status.total_pending,
       }
     } else if (analyzing.value) {
+      // Missed the 'finished' event — the run is over either way.
       analyzing.value = false
+      analyzeWaiting.value = null
+      runOutcomes.clear()
+    }
+    // A window opened mid-pause, or after a run ended while it was closed,
+    // missed the events: take both from the backend.
+    const w = status.analyzing ? status.waiting : null
+    if (w && !analyzeWaiting.value && w.until_ms - Date.now() > 1000) {
+      analyzeWaiting.value = {
+        message: w.message ?? '',
+        retryIn: Math.ceil((w.until_ms - Date.now()) / 1000),
+        concurrency: num(w.concurrency),
+        until: w.until_ms,
+      }
+    }
+    const run = status.analyzing ? null : status.last_run
+    if (run && run.finished_at_ms !== lastRunSeenAt) {
+      lastRunSeenAt = run.finished_at_ms
+      if (!analysisNotice.value) analysisNotice.value = noticeFromRun(run)
     }
   }
 
@@ -156,7 +251,7 @@ export const useArxivStore = defineStore('arxiv', () => {
     fetchMessage.value = ''
     try {
       const inbox = await invoke<{ papers: ArxivPaper[]; last_updated: string }>('refresh_arxiv_inbox')
-      papers.value = inbox.papers
+      papers.value = withRunOutcomes(inbox.papers)
       await loadScheduleStatus()
     } catch (e) {
       fetchMessage.value = String(e)
@@ -188,7 +283,7 @@ export const useArxivStore = defineStore('arxiv', () => {
       const fetched = [...arxivPapers, ...biorxivPapers]
       const result = await invoke<ArxivPaper[]>('store_arxiv_papers', { papers: fetched, updateLastFetch: true })
       const knownRead = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
-      papers.value = result.map(p => ({ ...p, read: p.read || knownRead.has(p.arxiv_id) }))
+      papers.value = withRunOutcomes(result.map(p => ({ ...p, read: p.read || knownRead.has(p.arxiv_id) })))
       await loadScheduleStatus()
       // arXiv 开着但缺分类：bioRxiv 已正常抓取，仍要提示 arXiv 被跳过，避免用户误以为 arXiv 生效了。
       if (config.value.fetch_arxiv && !arxivReady)
@@ -239,7 +334,7 @@ export const useArxivStore = defineStore('arxiv', () => {
       const fetched = [...arxivPapers, ...biorxivPapers]
       const result = await invoke<ArxivPaper[]>('store_arxiv_papers', { papers: fetched, updateLastFetch: true })
       const knownRead2 = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
-      papers.value = result.map(p => ({ ...p, read: p.read || knownRead2.has(p.arxiv_id) }))
+      papers.value = withRunOutcomes(result.map(p => ({ ...p, read: p.read || knownRead2.has(p.arxiv_id) })))
       await loadScheduleStatus()
       // 自动抓取同样不静默跳过：arXiv 开着但没选分类时给出可见提示。
       if (config.value.fetch_arxiv && !arxivReady)
@@ -254,10 +349,14 @@ export const useArxivStore = defineStore('arxiv', () => {
   async function startAnalysis() {
     analyzing.value = true
     analyzeProgress.value = { done: 0, total: 0 }
+    analyzeRetryingFailed.value = 0
+    analyzeWaiting.value = null
+    analysisNotice.value = null
     try {
       await invoke('start_arxiv_analysis')
     } catch (e) {
       analyzing.value = false
+      analysisNotice.value = { kind: 'error', message: String(e) }
       throw e
     }
   }
@@ -339,16 +438,12 @@ export const useArxivStore = defineStore('arxiv', () => {
         : null
     })
 
-    unlistenAnalysis = await listen<{
-      done: number; total: number; arxiv_id: string; status: string;
-      bulk?: boolean;
-      score?: number; reason?: string; message?: string; removed?: boolean;
-      key_contributions?: string[]; analysis_summary?: string | null; matched_topics?: string[]
-    }>('arxiv-analysis', (e) => {
+    unlistenAnalysis = await listen<ArxivAnalysisEvent>('arxiv-analysis', (e) => {
+      const ev = e.payload
       const {
-        done, total, arxiv_id, status, bulk, score, reason, removed,
+        done, total, arxiv_id, status, bulk, score, reason, removed, message,
         key_contributions, analysis_summary, matched_topics,
-      } = e.payload
+      } = ev
       const isBulk = total > 1 || bulk === true
 
       if (isBulk) {
@@ -356,12 +451,82 @@ export const useArxivStore = defineStore('arxiv', () => {
           analyzeProgress.value = { done, total }
         }
 
+        if (status === 'waiting') {
+          const retryIn = Math.max(0, num(ev.retry_in))
+          analyzeWaiting.value = {
+            message: message ?? '',
+            retryIn,
+            concurrency: num(ev.concurrency),
+            until: Date.now() + retryIn * 1000,
+          }
+        } else if (analyzeWaiting.value) {
+          // Requests already in flight when the pause began may still land
+          // (done/failed/filtered) during it; the batch is still paused, so keep
+          // the countdown up until it runs out. Anything else — a new request
+          // going out, the run ending — means the pause is over.
+          const inFlightResult = status === 'done' || status === 'failed' || status === 'filtered'
+          if (!inFlightResult || Date.now() >= analyzeWaiting.value.until) {
+            analyzeWaiting.value = null
+          }
+        }
+
+        if (status === 'started') {
+          analysisNotice.value = null
+          analyzeRetryingFailed.value = num(ev.retrying_failed)
+          runOutcomes.clear()
+        } else if (status === 'finished') {
+          if (typeof ev.finished_at_ms === 'number') lastRunSeenAt = ev.finished_at_ms
+          analysisNotice.value = {
+            kind: 'finished',
+            total: num(total),
+            succeeded: num(ev.succeeded),
+            failed: num(ev.failed),
+            filtered: num(ev.filtered),
+            reverted: num(ev.reverted),
+            stoppedReason: ev.stopped_reason ? String(ev.stopped_reason) : null,
+            cancelled: ev.cancelled === true,
+            hasCounts: typeof ev.succeeded === 'number' || typeof ev.failed === 'number'
+              || typeof ev.filtered === 'number',
+          }
+        } else if (status === 'error') {
+          analysisNotice.value = { kind: 'error', message: message || '未知错误' }
+        }
+
         if (status === 'finished' || status === 'error') {
           analyzing.value = false
+          analyzeWaiting.value = null
+          analyzeRetryingFailed.value = 0
+          // Everything is on disk before 'finished' is sent.
+          runOutcomes.clear()
           loadInbox().catch(() => {})
           loadScheduleStatus().catch(() => {})
         } else {
           analyzing.value = true
+        }
+      } else if (status === 'error' && arxiv_id) {
+        // Single-paper request refused before anything was sent; the view that
+        // flipped the paper to 'analyzing' puts it back.
+        lastSingleError.value = { arxiv_id, message: message || '未知错误' }
+      }
+
+      // Remember the batch's results until they are surely on disk (see runOutcomes).
+      if (arxiv_id && isBulk) {
+        if (removed) {
+          runOutcomes.set(arxiv_id, null)
+        } else if (status === 'done') {
+          runOutcomes.set(arxiv_id, {
+            analysis_status: 'done',
+            analysis_error: null,
+            relevance_score: score ?? null,
+            relevance_reason: reason ?? null,
+            key_contributions: key_contributions ?? [],
+            analysis_summary: analysis_summary ?? null,
+            matched_topics: matched_topics ?? [],
+          })
+        } else if (status === 'failed') {
+          runOutcomes.set(arxiv_id, message
+            ? { analysis_status: 'failed', analysis_error: message }
+            : { analysis_status: 'failed' })
         }
       }
 
@@ -373,10 +538,17 @@ export const useArxivStore = defineStore('arxiv', () => {
         }
         const p = papers.value.find(p => p.arxiv_id === arxiv_id)
         if (p) {
-          p.analysis_status = status === 'done' ? 'done'
-            : status === 'analyzing' ? 'analyzing'
-            : status === 'failed' ? 'failed'
-            : p.analysis_status
+          if (status === 'done') {
+            p.analysis_status = 'done'
+            p.analysis_error = null
+          } else if (status === 'analyzing') {
+            p.analysis_status = 'analyzing'
+          } else if (status === 'pending') {
+            p.analysis_status = 'pending'
+          } else if (status === 'failed') {
+            p.analysis_status = 'failed'
+            if (message) p.analysis_error = message
+          }
           if (score !== undefined) p.relevance_score = score
           if (reason !== undefined) p.relevance_reason = reason
           if (key_contributions !== undefined) p.key_contributions = key_contributions
@@ -404,6 +576,7 @@ export const useArxivStore = defineStore('arxiv', () => {
   return {
     papers, config, scheduleStatus, loaded,
     fetching, refreshing, fetchMessage, analyzing, analyzeProgress,
+    analyzeRetryingFailed, analyzeWaiting, analysisNotice, lastSingleError,
     sortMode, sortOrder, filterMode, newCount,
     sortedPapers,
     load, loadConfig, loadInbox, loadScheduleStatus,

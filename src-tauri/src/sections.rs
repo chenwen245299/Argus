@@ -243,8 +243,9 @@ pub async fn ai_split_sections(
     let context = truncate_chars(&fulltext, 80_000);
 
     // Provider/model and the system prompt are user-configurable in Settings →
-    // Extraction. Explicit call args (rare) take precedence; otherwise use the
-    // section-splitting settings, which themselves fall back to the global default.
+    // AI Copilot → Paper analysis. Explicit call args (rare) take precedence;
+    // otherwise use the section-splitting settings, which themselves fall back
+    // to the global default.
     let s = crate::settings::read_settings(root);
     let pid = provider_id.or(s.sections_ai_provider_id.as_deref());
     let mid = model_id.or(s.sections_ai_model_id.as_deref());

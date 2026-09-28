@@ -1,12 +1,17 @@
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use tauri::Emitter;
 
 use crate::models::{
-    ArxivConfig, ArxivInbox, ArxivPaper, ArxivScheduleStatus, ChatMessage, ImportResult, PaperMeta,
-    PaperStatus, DEFAULT_ARXIV_ANALYSIS_PROMPT,
+    ArxivAnalysisPause, ArxivAnalysisRun, ArxivConfig, ArxivInbox, ArxivPaper,
+    ArxivScheduleStatus, ChatMessage, ImportResult, PaperMeta, PaperStatus,
+    DEFAULT_ARXIV_ANALYSIS_PROMPT,
 };
 use crate::{ai_manager, collections, extraction, llm, paper, search, settings};
 
@@ -139,12 +144,15 @@ fn list_day_dates(root: &str) -> Vec<String> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            // Accept only YYYY-MM-DD.json (15 chars)
-            if name.ends_with(".json") && name.len() == 15 {
-                Some(name.chars().take(10).collect::<String>())
-            } else {
-                None
-            }
+            // Only YYYY-MM-DD.json. Checking the length alone let
+            // read_state.json and feed_cache.json (also 15 characters) pass
+            // as "dates", and save_inbox then deleted them as empty days —
+            // taking every read mark and rating with it.
+            let stem = name.strip_suffix(".json")?;
+            chrono::NaiveDate::parse_from_str(stem, "%Y-%m-%d")
+                .ok()
+                .filter(|_| stem.len() == 10)
+                .map(|_| stem.to_string())
         })
         .collect();
     dates.sort_by(|a, b| b.cmp(a));
@@ -177,7 +185,29 @@ fn migrate_old_inbox(root: &str) {
     let _ = std::fs::remove_file(&old_path);
 }
 
+/// A day file's papers: empty when the file does not exist, an error when it
+/// exists but cannot be read or parsed. `read_day_papers` reads both as empty,
+/// which is harmless for display but not before a write: writing that back —
+/// or deleting the "empty" day — destroys the file.
+fn read_day_papers_checked(root: &str, date: &str) -> Result<Vec<ArxivPaper>, String> {
+    let path = day_file(root, date);
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("inbox/{date}.json 读取失败：{e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("inbox/{date}.json 无法解析：{e}"))
+}
+
 // ── Read/rating state file (independent of paper data) ──────────────────────
+
+/// Serialises load→modify→save of read_state.json. Selecting a paper marks it
+/// read and a star click rates it, as two concurrent commands; each rewrote the
+/// whole file from its own copy, so one of the two changes was lost.
+fn read_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn read_state_path(root: &str) -> std::path::PathBuf {
     inbox_dir(root).join("read_state.json")
@@ -277,6 +307,7 @@ fn update_paper_in_day_files(
     arxiv_id: &str,
     updater: impl Fn(&mut ArxivPaper),
 ) -> bool {
+    let _guard = inbox_lock();
     for date in list_day_dates(root) {
         let mut papers = read_day_papers(root, &date);
         if let Some(p) = papers.iter_mut().find(|p| p.arxiv_id == arxiv_id) {
@@ -292,6 +323,16 @@ fn update_paper_in_day_files(
 /// Day files whose papers have all been removed (filtered) are deleted.
 fn save_inbox(root: &str, inbox: &ArxivInbox) -> Result<(), String> {
     let existing: std::collections::HashSet<String> = list_day_dates(root).into_iter().collect();
+
+    // `inbox` came from get_inbox, which reads an unreadable day file as empty.
+    // Re-bucketing would then delete that file as a day with no papers left.
+    for date in &existing {
+        if let Err(e) = read_day_papers_checked(root, date) {
+            return Err(format!(
+                "{e}。为免删掉其中的论文，这次没有改写收件箱；请检查或移走这个文件后重试。"
+            ));
+        }
+    }
 
     let mut buckets: std::collections::HashMap<String, Vec<ArxivPaper>> =
         std::collections::HashMap::new();
@@ -315,16 +356,18 @@ fn save_inbox(root: &str, inbox: &ArxivInbox) -> Result<(), String> {
 pub fn prune_low_relevance(root: &str) -> Result<ArxivInbox, String> {
     let config = get_arxiv_config(root);
     let threshold = config.ai_filter_threshold.clamp(0.0, 10.0);
-    let mut inbox = get_inbox(root);
-
-    inbox.papers.retain(|paper| {
-        paper
-            .relevance_score
-            .map(|score| score >= threshold)
-            .unwrap_or(true)
-    });
-
-    save_inbox(root, &inbox)?;
+    let mut inbox = {
+        let _guard = inbox_lock();
+        let mut inbox = get_inbox(root);
+        inbox.papers.retain(|paper| {
+            paper
+                .relevance_score
+                .map(|score| score >= threshold)
+                .unwrap_or(true)
+        });
+        save_inbox(root, &inbox)?;
+        inbox
+    };
     mark_in_library_statuses(root, &mut inbox.papers);
     Ok(inbox)
 }
@@ -332,8 +375,10 @@ pub fn prune_low_relevance(root: &str) -> Result<ArxivInbox, String> {
 /// Delete all papers fetched on a specific date (YYYY-MM-DD).
 /// Removes the day file and cleans up the read-state entries.
 pub fn delete_inbox_by_date(root: &str, date: &str) -> Result<ArxivInbox, String> {
+    let guard = inbox_lock();
     let papers = read_day_papers(root, date);
     if !papers.is_empty() {
+        let _states_guard = read_state_lock();
         let mut states = load_read_states(root);
         for p in &papers {
             states.remove(&p.arxiv_id);
@@ -342,6 +387,7 @@ pub fn delete_inbox_by_date(root: &str, date: &str) -> Result<ArxivInbox, String
     }
     // write_day_papers with empty slice removes the file
     write_day_papers(root, date, &[])?;
+    drop(guard);
     Ok(get_inbox(root))
 }
 
@@ -352,17 +398,23 @@ pub fn delete_inbox_papers(root: &str, arxiv_ids: &[String]) -> Result<ArxivInbo
     }
     let id_set: std::collections::HashSet<&String> = arxiv_ids.iter().collect();
     // Clean read states
-    let mut states = load_read_states(root);
-    for id in arxiv_ids {
-        states.remove(id);
+    {
+        let _guard = read_state_lock();
+        let mut states = load_read_states(root);
+        for id in arxiv_ids {
+            states.remove(id);
+        }
+        let _ = save_read_states(root, &states);
     }
-    let _ = save_read_states(root, &states);
     // Remove from each day file that contains any of the ids
-    for date in list_day_dates(root) {
-        let papers = read_day_papers(root, &date);
-        if papers.iter().any(|p| id_set.contains(&p.arxiv_id)) {
-            let kept: Vec<_> = papers.into_iter().filter(|p| !id_set.contains(&p.arxiv_id)).collect();
-            write_day_papers(root, &date, &kept)?;
+    {
+        let _guard = inbox_lock();
+        for date in list_day_dates(root) {
+            let papers = read_day_papers(root, &date);
+            if papers.iter().any(|p| id_set.contains(&p.arxiv_id)) {
+                let kept: Vec<_> = papers.into_iter().filter(|p| !id_set.contains(&p.arxiv_id)).collect();
+                write_day_papers(root, &date, &kept)?;
+            }
         }
     }
     Ok(get_inbox(root))
@@ -370,6 +422,7 @@ pub fn delete_inbox_papers(root: &str, arxiv_ids: &[String]) -> Result<ArxivInbo
 
 /// Mark a single paper as read in the dedicated state file.
 pub fn mark_paper_read(root: &str, arxiv_id: &str) -> Result<(), String> {
+    let _guard = read_state_lock();
     let mut states = load_read_states(root);
     let entry = states.entry(arxiv_id.to_string()).or_default();
     if entry.read {
@@ -382,6 +435,7 @@ pub fn mark_paper_read(root: &str, arxiv_id: &str) -> Result<(), String> {
 /// Set the user rating (0–5) for a paper in the dedicated state file.
 pub fn rate_paper(root: &str, arxiv_id: &str, rating: u8) -> Result<(), String> {
     let rating = rating.min(5);
+    let _guard = read_state_lock();
     let mut states = load_read_states(root);
     states.entry(arxiv_id.to_string()).or_default().rating = rating;
     save_read_states(root, &states)
@@ -586,12 +640,27 @@ pub fn find_duplicate(
 
 /// Merge new papers into per-day files (dedup against all existing day files).
 pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<ArxivInbox, String> {
+    let guard = inbox_lock();
     // Collect all existing papers grouped by their day file.
     let all_dates = list_day_dates(root);
-    let mut day_buckets: std::collections::HashMap<String, Vec<ArxivPaper>> = all_dates
-        .iter()
-        .map(|d| (d.clone(), read_day_papers(root, d)))
-        .collect();
+    // A day file that cannot be read stays out of the buckets, and is never
+    // written below: writing its bucket would replace every paper in it with
+    // just the newly fetched ones.
+    let mut unreadable: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut day_buckets: std::collections::HashMap<String, Vec<ArxivPaper>> =
+        std::collections::HashMap::new();
+    for d in &all_dates {
+        match read_day_papers_checked(root, d) {
+            Ok(papers) => {
+                day_buckets.insert(d.clone(), papers);
+            }
+            Err(e) => {
+                eprintln!("[arxiv] {e}");
+                unreadable.insert(d.clone(), e);
+            }
+        }
+    }
 
     // Build a lookup: arxiv_id → which date file it lives in.
     let mut id_to_date: std::collections::HashMap<String, String> =
@@ -627,6 +696,14 @@ pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<Arxiv
                     new_p.key_contributions = old_p.key_contributions;
                     new_p.analysis_summary = old_p.analysis_summary;
                     new_p.matched_topics = old_p.matched_topics;
+                    new_p.analysis_error = old_p.analysis_error;
+                    // The state file is the authority for these, but a copy
+                    // baked into the day file is all there is when that file
+                    // is gone — and a fresh fetch knows neither.
+                    new_p.read = new_p.read || old_p.read;
+                    if new_p.rating == 0 {
+                        new_p.rating = old_p.rating;
+                    }
                     // Only keep done/failed status; reset analyzing/pending to pending
                     new_p.analysis_status = if old_p.analysis_status == "done" || old_p.analysis_status == "failed" {
                         old_p.analysis_status
@@ -651,6 +728,12 @@ pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<Arxiv
         // If the paper is in library_ids, skip it silently (user already imported it).
     }
 
+    if let Some(e) = changed_dates.iter().find_map(|d| unreadable.get(d)) {
+        return Err(format!(
+            "{e}。为免覆盖其中的论文，这次抓取的结果没有写入；请检查或移走这个文件后重试。"
+        ));
+    }
+
     // Write only modified day files
     for date in &changed_dates {
         if let Some(papers) = day_buckets.get_mut(date) {
@@ -658,6 +741,7 @@ pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<Arxiv
             write_day_papers(root, date, papers)?;
         }
     }
+    drop(guard);
 
     Ok(get_inbox(root))
 }
@@ -742,20 +826,41 @@ fn parse_score(value: &serde_json::Value) -> Result<f32, String> {
     Err("relevance_score must be a number from 0 to 10".to_string())
 }
 
-fn parse_analysis_result(content: &str) -> Result<AnalysisResult, String> {
-    // Some providers wrap JSON in Markdown fences; keep only the outer JSON object.
-    let json_str = if let Some(start) = content.find('{') {
-        if let Some(end) = content.rfind('}') {
-            &content[start..=end]
-        } else {
-            content
+/// The analysis object in a model reply.
+///
+/// The whole reply is tried first. Failing that, every `{` is tried from the
+/// last one backwards, reading one JSON value and ignoring whatever follows it,
+/// and the first object carrying a `relevance_score` wins. That survives
+/// Markdown fences, prose after the JSON, and a leaked `<think>` draft that
+/// echoes the schema — a draft that the old first-`{`-to-last-`}` slice glued
+/// onto the real answer and then failed to parse. Scanning from the end picks
+/// the model's final answer over any draft before it.
+fn extract_analysis_json(content: &str) -> Result<RawAnalysisResult, String> {
+    let trimmed = content.trim();
+    let whole = serde_json::from_str::<RawAnalysisResult>(trimmed);
+    if let Ok(raw) = &whole {
+        if !raw.relevance_score.is_null() {
+            return whole.map_err(|e| e.to_string());
         }
-    } else {
-        content
-    };
+    }
+    let starts: Vec<usize> = trimmed.match_indices('{').map(|(i, _)| i).collect();
+    for i in starts.into_iter().rev() {
+        let mut values =
+            serde_json::Deserializer::from_str(&trimmed[i..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = values.next() {
+            if value.get("relevance_score").is_some_and(|v| !v.is_null()) {
+                if let Ok(raw) = serde_json::from_value::<RawAnalysisResult>(value) {
+                    return Ok(raw);
+                }
+            }
+        }
+    }
+    whole.map_err(|e| e.to_string())
+}
 
+fn parse_analysis_result(content: &str) -> Result<AnalysisResult, String> {
     let preview: String = content.chars().take(200).collect();
-    let raw: RawAnalysisResult = serde_json::from_str(json_str)
+    let raw = extract_analysis_json(content)
         .map_err(|e| format!("Parse AI JSON: {e}\nContent was: {preview}"))?;
     let relevance_score = parse_score(&raw.relevance_score)?;
     let relevance_reason = raw
@@ -772,6 +877,30 @@ fn parse_analysis_result(content: &str) -> Result<AnalysisResult, String> {
     })
 }
 
+/// Why one paper's analysis produced no result.
+enum CallError {
+    /// The request failed — sorted by [`llm::classify_error`].
+    Llm(String),
+    /// The provider answered, but not with the JSON asked for. Always this
+    /// paper's problem, whatever the text happens to contain.
+    Parse(String),
+}
+
+impl CallError {
+    fn message(&self) -> &str {
+        match self {
+            CallError::Llm(m) | CallError::Parse(m) => m,
+        }
+    }
+
+    fn class(&self) -> llm::ErrorClass {
+        match self {
+            CallError::Llm(m) => llm::classify_error(m),
+            CallError::Parse(_) => llm::ErrorClass::Request,
+        }
+    }
+}
+
 async fn call_ai_single(
     provider: &crate::models::AiProvider,
     api_key: &str,
@@ -780,34 +909,646 @@ async fn call_ai_single(
     focus: &str,
     prompt_template: &str,
     paper: &ArxivPaper,
-) -> Result<AnalysisResult, String> {
+) -> Result<AnalysisResult, CallError> {
     let (system, user) = build_analysis_messages(prompt_template, topics, focus, paper);
     let messages = vec![
         ChatMessage { role: "system".to_string(), content: system.into() },
         ChatMessage { role: "user".to_string(), content: user.into() },
     ];
 
-    let content = llm::chat_completion(provider, api_key, model, &messages, "arxiv").await?;
-    parse_analysis_result(&content)
+    let content = llm::chat_completion(provider, api_key, model, &messages, "arxiv")
+        .await
+        .map_err(CallError::Llm)?;
+    parse_analysis_result(&content).map_err(CallError::Parse)
+}
+
+// ── Inbox writes during analysis ──────────────────────────────────────────────
+
+/// Papers a single-paper analysis ("AI 分析" on one paper) has in flight.
+///
+/// A bulk run started meanwhile must leave them alone: it would read their
+/// "analyzing" as left over from a run that died, send them a second time, and
+/// whichever of the two finished last would overwrite the other's result.
+/// `analyze_single` registers *before* it checks for a bulk run and the claim
+/// reads this *after* the running flag is set, so one of them always sees the
+/// other.
+fn single_in_flight() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+struct SingleInFlight(String);
+
+impl SingleInFlight {
+    fn register(id: &str) -> Self {
+        locked(single_in_flight()).insert(id.to_string());
+        SingleInFlight(id.to_string())
+    }
+}
+
+impl Drop for SingleInFlight {
+    fn drop(&mut self) {
+        locked(single_in_flight()).remove(&self.0);
+    }
+}
+
+/// The pause a running batch is in, and how the last one ended — kept for
+/// `get_schedule_status`, since a window opened mid-run missed the events.
+fn analysis_pause() -> &'static Mutex<Option<ArxivAnalysisPause>> {
+    static PAUSE: OnceLock<Mutex<Option<ArxivAnalysisPause>>> = OnceLock::new();
+    PAUSE.get_or_init(Default::default)
+}
+
+fn last_analysis_run() -> &'static Mutex<Option<ArxivAnalysisRun>> {
+    static RUN: OnceLock<Mutex<Option<ArxivAnalysisRun>>> = OnceLock::new();
+    RUN.get_or_init(Default::default)
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Serialises read-modify-write passes over the inbox day files.
+///
+/// A fetch (`merge_into_inbox`), an import, a delete and the analysis batch all
+/// rewrite whole day files from a snapshot they read first. Unserialised,
+/// whichever wrote last silently undid the other — analysis results vanished,
+/// or papers stayed "analyzing" forever. The scheduled fetch fires at a fixed
+/// time of day, which is exactly when a user tends to start the analysis.
+///
+/// A plain `std` mutex, never held across an `.await`: every holder is a
+/// synchronous block of file I/O.
+fn inbox_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A day file's papers, or `None` when the file is missing or cannot be
+/// parsed. `read_day_papers` reads both as empty, and writing that back would
+/// wipe the file — so the analysis passes use this and skip such files.
+fn read_day_papers_strict(root: &str, date: &str) -> Option<Vec<ArxivPaper>> {
+    if !day_file(root, date).exists() {
+        return None;
+    }
+    match read_day_papers_checked(root, date) {
+        Ok(papers) => Some(papers),
+        Err(e) => {
+            eprintln!("[arxiv] skipping {e}");
+            None
+        }
+    }
+}
+
+/// The papers one click of "AI 分析全部" works on, after marking them
+/// "analyzing" on disk.
+struct Claimed {
+    /// Never-analyzed papers first (newest day first), then the ones that
+    /// failed before — so a retry of old failures never delays fresh papers.
+    papers: Vec<ArxivPaper>,
+    /// The status each paper had, restored for any paper the run does not
+    /// finish (stopped, cancelled). A stale "analyzing" from a run that died
+    /// counts as "pending".
+    original: HashMap<String, String>,
+    /// Every day file each paper was found in, so results are written where the
+    /// paper actually is rather than where its `fetched_at` says it should be.
+    dates: HashMap<String, Vec<String>>,
+    retrying_failed: usize,
+}
+
+fn claim_papers_for_analysis(root: &str) -> Claimed {
+    let _guard = inbox_lock();
+    let busy: HashSet<String> = locked(single_in_flight()).clone();
+    let mut pending = Vec::new();
+    let mut failed = Vec::new();
+    let mut original: HashMap<String, String> = HashMap::new();
+    let mut dates: HashMap<String, Vec<String>> = HashMap::new();
+
+    for date in list_day_dates(root) {
+        let Some(mut papers) = read_day_papers_strict(root, &date) else { continue };
+        let mut changed = false;
+        for p in papers.iter_mut() {
+            let was = match p.analysis_status.as_str() {
+                // No run is active (the caller holds the running flag), so an
+                // "analyzing" on disk is left over from one that never finished.
+                "pending" | "analyzing" => "pending",
+                "failed" => "failed",
+                _ => continue,
+            };
+            if busy.contains(&p.arxiv_id) {
+                continue;
+            }
+            dates.entry(p.arxiv_id.clone()).or_default().push(date.clone());
+            if !original.contains_key(&p.arxiv_id) {
+                original.insert(p.arxiv_id.clone(), was.to_string());
+                if was == "failed" {
+                    failed.push(p.clone());
+                } else {
+                    pending.push(p.clone());
+                }
+            }
+            p.analysis_status = "analyzing".to_string();
+            changed = true;
+        }
+        if changed {
+            if let Err(e) = write_day_papers(root, &date, &papers) {
+                eprintln!("[arxiv] mark analyzing in {date}: {e}");
+            }
+        }
+    }
+
+    let retrying_failed = failed.len();
+    pending.extend(failed);
+    Claimed { papers: pending, original, dates, retrying_failed }
+}
+
+/// What the batch decided for one paper, waiting to be written.
+enum PaperUpdate {
+    Done(AnalysisResult),
+    /// Scored below the filter threshold: dropped from the inbox.
+    Remove,
+    Failed(String),
+    /// Not finished in this run: back to the status it had before.
+    Revert(String),
+}
+
+/// Write a set of results in one pass per day file, under the inbox lock.
+///
+/// Each paper is looked for in the files it was claimed from; one that has
+/// moved since (a fetch during the run re-buckets papers it sees again) is
+/// looked for everywhere else. A paper found nowhere was imported or deleted
+/// meanwhile, and its update is dropped.
+fn apply_updates(
+    root: &str,
+    mut updates: HashMap<String, PaperUpdate>,
+    dates: &HashMap<String, Vec<String>>,
+) {
+    if updates.is_empty() {
+        return;
+    }
+    let _guard = inbox_lock();
+    let expected: BTreeSet<String> = updates
+        .keys()
+        .filter_map(|id| dates.get(id))
+        .flatten()
+        .cloned()
+        .collect();
+    let mut found: HashSet<String> = HashSet::new();
+    for date in &expected {
+        apply_updates_to_day(root, date, &updates, &mut found);
+    }
+    updates.retain(|id, _| !found.contains(id));
+    if !updates.is_empty() {
+        for date in list_day_dates(root) {
+            if !expected.contains(&date) {
+                apply_updates_to_day(root, &date, &updates, &mut found);
+            }
+        }
+    }
+}
+
+fn apply_updates_to_day(
+    root: &str,
+    date: &str,
+    updates: &HashMap<String, PaperUpdate>,
+    found: &mut HashSet<String>,
+) {
+    let Some(mut papers) = read_day_papers_strict(root, date) else { return };
+    let mut changed = false;
+    papers.retain_mut(|p| {
+        let Some(update) = updates.get(&p.arxiv_id) else { return true };
+        found.insert(p.arxiv_id.clone());
+        // A result lands only on the mark this run set, or on the "pending" a
+        // fetch during the run reset it to — never over a result someone else
+        // wrote since.
+        let ours = matches!(p.analysis_status.as_str(), "analyzing" | "pending");
+        if !ours && !matches!(update, PaperUpdate::Revert(_)) {
+            return true;
+        }
+        match update {
+            PaperUpdate::Remove => {
+                changed = true;
+                return false;
+            }
+            PaperUpdate::Done(r) => {
+                p.relevance_score = Some(r.relevance_score.clamp(0.0, 10.0));
+                p.relevance_reason = Some(r.relevance_reason.clone());
+                p.key_contributions = r.key_contributions.clone();
+                p.analysis_summary = r.summary.clone();
+                p.matched_topics = r.matched_topics.clone();
+                p.analysis_status = "done".to_string();
+                p.analysis_error = None;
+                changed = true;
+            }
+            PaperUpdate::Failed(message) => {
+                p.analysis_status = "failed".to_string();
+                p.analysis_error = Some(message.clone());
+                changed = true;
+            }
+            // Only undo our own mark: a fetch during the run may already have
+            // reset the paper, and that is not ours to overwrite.
+            PaperUpdate::Revert(status) => {
+                if p.analysis_status == "analyzing" {
+                    p.analysis_status = status.clone();
+                    changed = true;
+                }
+            }
+        }
+        true
+    });
+    if changed {
+        if let Err(e) = write_day_papers(root, date, &papers) {
+            eprintln!("[arxiv] write results to {date}: {e}");
+        }
+    }
+}
+
+// ── Batch runner ──────────────────────────────────────────────────────────────
+//
+// The batch used to send every paper as fast as the concurrency setting allowed
+// and mark any error "failed" for good. Against a subscription plan — MiniMax's
+// Token Plan answers `529 当前为整点高峰时段…请稍后重试 (2064)` around the top of
+// the hour — that turned a throttle of a minute or two into thousands of failed
+// papers within seconds, none of which the next click would retry. Errors are
+// now sorted by `llm::classify_error`:
+//
+//   * Transient (throttling, overload, timeouts, 5xx): the whole batch pauses —
+//     10 s, doubling up to 5 min — concurrency halves, and the paper goes back
+//     into the queue a little way down, so one paper that keeps failing can
+//     neither hold up the rest nor be pushed to the very end, where it would
+//     retry alone and could not be told apart from an outage. Concurrency
+//     creeps back up one step after each run of successes, so the batch
+//     settles at what the provider tolerates.
+//   * Fatal (bad key, empty balance, a used-up plan window): the batch stops at
+//     once — every further request would fail the same way.
+//   * Request (this paper's input or the reply to it): marked failed, with the
+//     reason, and retried on the next click.
+//
+// The batch also stops when the provider has answered nothing for 12 minutes,
+// or after a run of failures with no success in between. Whatever it did not
+// finish goes back to the status it had, so the next click picks it up.
+
+#[derive(Clone, Copy)]
+struct BatchTuning {
+    first_backoff: Duration,
+    max_backoff: Duration,
+    /// Stop after this long with no answer at all from the provider.
+    stall_limit: Duration,
+    /// Transient failures one paper may take — counting only those while other
+    /// requests got answers — before it is marked failed. A provider-wide
+    /// outage never counts, and is left to `stall_limit`.
+    max_attempts: u32,
+    /// Stop after this many request-level failures in a row.
+    failure_streak_limit: u32,
+    /// Successes in a row before concurrency is raised by one.
+    raise_after: u32,
+    /// How far down the queue a paper goes back in after a transient failure.
+    requeue_gap: usize,
+    poll: Duration,
+}
+
+const BATCH_TUNING: BatchTuning = BatchTuning {
+    first_backoff: Duration::from_secs(10),
+    max_backoff: Duration::from_secs(300),
+    stall_limit: Duration::from_secs(12 * 60),
+    max_attempts: 6,
+    failure_streak_limit: 12,
+    raise_after: 8,
+    requeue_gap: 20,
+    poll: Duration::from_millis(250),
+};
+
+/// Shared pacing state of one batch. Only ever locked briefly, never across
+/// an `.await`.
+struct Throttle {
+    max: usize,
+    /// Current concurrency: between 1 and `max`.
+    limit: usize,
+    in_flight: usize,
+    /// Consecutive pauses without a success in between; sets the backoff.
+    level: u32,
+    paused_until: Option<Instant>,
+    /// Last time the provider answered anything (a result or a per-paper error).
+    last_answer: Instant,
+    successes: u32,
+    failure_streak: u32,
+    /// Set once the batch must stop; the reason is shown to the user.
+    stop: Option<String>,
+}
+
+impl Throttle {
+    fn new(max: usize, now: Instant) -> Self {
+        let max = max.max(1);
+        Throttle {
+            max,
+            limit: max,
+            in_flight: 0,
+            level: 0,
+            paused_until: None,
+            last_answer: now,
+            successes: 0,
+            failure_streak: 0,
+            stop: None,
+        }
+    }
+
+    fn paused(&self, now: Instant) -> bool {
+        self.paused_until.is_some_and(|until| now < until)
+    }
+
+    /// A transient failure. Returns the pause to announce, or `None` when there
+    /// is nothing new to announce: the batch is already paused (this request
+    /// was in flight when the pause began — one overload, one pause), or it has
+    /// just been stopped because the provider stayed silent too long.
+    fn on_transient(&mut self, now: Instant, message: &str, t: &BatchTuning) -> Option<Duration> {
+        if self.stop.is_some() {
+            return None;
+        }
+        if now.saturating_duration_since(self.last_answer) >= t.stall_limit {
+            self.stop = Some(format!(
+                "服务商持续繁忙，{} 分钟内没有一次成功返回：{message}",
+                (t.stall_limit.as_secs() / 60).max(1)
+            ));
+            return None;
+        }
+        if self.paused(now) {
+            return None;
+        }
+        self.level = (self.level + 1).min(16);
+        let factor = 1u32 << (self.level - 1).min(10);
+        let wait = t.first_backoff.saturating_mul(factor).min(t.max_backoff);
+        self.paused_until = Some(now + wait);
+        self.limit = (self.limit / 2).max(1);
+        self.successes = 0;
+        Some(wait)
+    }
+
+    fn on_success(&mut self, now: Instant, t: &BatchTuning) {
+        self.last_answer = now;
+        self.level = 0;
+        self.failure_streak = 0;
+        self.successes += 1;
+        if self.limit < self.max && self.successes >= t.raise_after {
+            self.limit += 1;
+            self.successes = 0;
+        }
+    }
+
+    fn on_request_failure(&mut self, now: Instant, message: &str, t: &BatchTuning) {
+        // The provider answered: it is up, just not with a usable result.
+        self.last_answer = now;
+        self.failure_streak += 1;
+        if self.failure_streak >= t.failure_streak_limit && self.stop.is_none() {
+            self.stop = Some(format!(
+                "连续 {} 篇分析失败，已暂停以免继续消耗额度。最近一次：{message}",
+                self.failure_streak
+            ));
+        }
+    }
+
+    fn on_fatal(&mut self, message: &str) {
+        if self.stop.is_none() {
+            self.stop = Some(message.to_string());
+        }
+    }
+}
+
+/// How one paper left the batch.
+enum Outcome {
+    Done(AnalysisResult),
+    Failed(String),
+    /// Not analyzed in this run — stopped, cancelled, or lost with a worker
+    /// that panicked. It goes back to the status it had before.
+    Untouched,
+}
+
+enum BatchMsg {
+    /// A request for this paper is going out (sent again on every retry).
+    Sending(String),
+    Outcome(String, Outcome),
+    /// The batch paused on a transient error.
+    Waiting { message: String, retry_in: Duration, concurrency: usize },
+}
+
+type AnalyzeFn = Arc<
+    dyn Fn(ArxivPaper) -> Pin<Box<dyn Future<Output = Result<AnalysisResult, CallError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+struct Batch {
+    queue: Mutex<VecDeque<(ArxivPaper, u32)>>,
+    throttle: Mutex<Throttle>,
+    cancel: Arc<AtomicBool>,
+    tuning: BatchTuning,
+}
+
+fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One of the batch's concurrency slots. Given back on drop, so a worker that
+/// panics mid-request cannot shrink the batch for good — with the limit down
+/// to 1, a leaked slot would stall every other worker forever.
+struct Slot<'a>(&'a Mutex<Throttle>);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        let mut t = locked(self.0);
+        t.in_flight = t.in_flight.saturating_sub(1);
+    }
+}
+
+async fn wait_for_flag(flag: &AtomicBool, poll: Duration) {
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Start `max_concurrency` workers over `papers`. Progress arrives on the
+/// returned channel, which closes once every worker has exited; read
+/// `Batch::throttle.stop` afterwards for why it stopped early, if it did.
+fn spawn_batch(
+    papers: Vec<ArxivPaper>,
+    max_concurrency: usize,
+    cancel: Arc<AtomicBool>,
+    tuning: BatchTuning,
+    analyze: AnalyzeFn,
+) -> (Arc<Batch>, tokio::sync::mpsc::UnboundedReceiver<BatchMsg>) {
+    let max = max_concurrency.max(1);
+    let batch = Arc::new(Batch {
+        queue: Mutex::new(papers.into_iter().map(|p| (p, 0)).collect()),
+        throttle: Mutex::new(Throttle::new(max, Instant::now())),
+        cancel,
+        tuning,
+    });
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    for _ in 0..max {
+        tokio::spawn(batch_worker(batch.clone(), analyze.clone(), tx.clone()));
+    }
+    (batch, rx)
+}
+
+async fn batch_worker(
+    batch: Arc<Batch>,
+    analyze: AnalyzeFn,
+    tx: tokio::sync::mpsc::UnboundedSender<BatchMsg>,
+) {
+    let tuning = batch.tuning;
+    loop {
+        // Wait for a free slot while the batch is not paused. A worker that
+        // finds the queue empty is done: a paper still in flight elsewhere is
+        // retried by the worker holding it.
+        let (paper, attempts, slot) = loop {
+            if batch.cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            {
+                let mut t = locked(&batch.throttle);
+                if t.stop.is_some() {
+                    return;
+                }
+                let mut queue = locked(&batch.queue);
+                if queue.is_empty() {
+                    return;
+                }
+                if !t.paused(Instant::now()) && t.in_flight < t.limit {
+                    if let Some((paper, attempts)) = queue.pop_front() {
+                        t.in_flight += 1;
+                        drop(queue);
+                        drop(t);
+                        break (paper, attempts, Slot(&batch.throttle));
+                    }
+                }
+            }
+            tokio::time::sleep(tuning.poll).await;
+        };
+
+        let id = paper.arxiv_id.clone();
+        let _ = tx.send(BatchMsg::Sending(id.clone()));
+        let sent_at = Instant::now();
+        // Cancelling drops the in-flight request instead of waiting it out.
+        let result = tokio::select! {
+            r = analyze(paper.clone()) => Some(r),
+            _ = wait_for_flag(&batch.cancel, tuning.poll) => None,
+        };
+        drop(slot);
+
+        let now = Instant::now();
+        let outcome = match result {
+            None => Outcome::Untouched,
+            Some(Ok(r)) => {
+                locked(&batch.throttle).on_success(now, &tuning);
+                Outcome::Done(r)
+            }
+            Some(Err(e)) => {
+                let message = e.message().to_string();
+                match e.class() {
+                    llm::ErrorClass::Transient => {
+                        let (pause, stopped, limit, others_answered) = {
+                            let mut t = locked(&batch.throttle);
+                            // Did anything else get an answer while this was
+                            // out? Only then is the failure this paper's; in an
+                            // outage every paper fails alike and the stall
+                            // limit, which reverts rather than fails, decides.
+                            let others_answered = t.last_answer > sent_at;
+                            let pause = t.on_transient(now, &message, &tuning);
+                            (pause, t.stop.is_some(), t.limit, others_answered)
+                        };
+                        let attempts = attempts + u32::from(others_answered);
+                        if let Some(retry_in) = pause {
+                            let _ = tx.send(BatchMsg::Waiting {
+                                message: message.clone(),
+                                retry_in,
+                                concurrency: limit,
+                            });
+                        }
+                        if stopped {
+                            Outcome::Untouched
+                        } else if attempts >= tuning.max_attempts {
+                            Outcome::Failed(message)
+                        } else {
+                            let mut queue = locked(&batch.queue);
+                            let at = queue.len().min(tuning.requeue_gap);
+                            queue.insert(at, (paper, attempts));
+                            continue;
+                        }
+                    }
+                    llm::ErrorClass::Fatal => {
+                        locked(&batch.throttle).on_fatal(&message);
+                        Outcome::Untouched
+                    }
+                    llm::ErrorClass::Request => {
+                        locked(&batch.throttle).on_request_failure(now, &message, &tuning);
+                        Outcome::Failed(message)
+                    }
+                }
+            }
+        };
+        let _ = tx.send(BatchMsg::Outcome(id, outcome));
+    }
+}
+
+/// Clears the running flag on every exit path, a panic included — left set,
+/// every later click of "AI 分析全部" would return silently until a restart.
+struct RunningFlag;
+
+impl Drop for RunningFlag {
+    fn drop(&mut self) {
+        analysis_running().store(false, Ordering::SeqCst);
+    }
+}
+
+/// How often buffered results are written while a batch runs. Rewriting a
+/// multi-megabyte day file once per result, several times a second, is what a
+/// synced library folder turned into conflict copies ("2026-09-21 2.json").
+const FLUSH_EVERY: Duration = Duration::from_secs(2);
+const FLUSH_AT: usize = 25;
+
+async fn flush_updates(
+    root: &str,
+    updates: HashMap<String, PaperUpdate>,
+    dates: &Arc<HashMap<String, Vec<String>>>,
+) {
+    if updates.is_empty() {
+        return;
+    }
+    let root = root.to_string();
+    let dates = dates.clone();
+    let _ = tokio::task::spawn_blocking(move || apply_updates(&root, updates, &dates)).await;
 }
 
 /// Analyze a single paper by arxiv_id regardless of its current status.
 /// Skips the ai_analysis_enabled gate so users can manually trigger analysis.
+///
+/// Errors returned from here happened before anything was sent or written;
+/// once the request is out, a failure is recorded on the paper and reported as
+/// a `failed` event instead.
 pub async fn analyze_single(
     root: &str,
     arxiv_id: &str,
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
+    // Registered before the check, so a bulk run starting at this moment either
+    // makes this refuse or sees the paper as taken (see `single_in_flight`).
+    let _in_flight = SingleInFlight::register(arxiv_id);
+    // A bulk run owns every pending/failed paper and would write over this one.
+    if analysis_running().load(Ordering::SeqCst) {
+        return Err("批量分析正在进行中，请等它结束后再单独分析。".to_string());
+    }
+
     let config = get_arxiv_config(root);
 
     let provider_id = config
         .ai_provider_id
         .as_deref()
-        .ok_or("未配置 AI 提供商，请前往设置 → arXiv 配置")?;
+        .ok_or("未配置 AI 提供商，请在「设置 → AI 随航 → arXiv 爬取」中配置")?;
     let model_id = config
         .ai_model_id
         .as_deref()
-        .ok_or("未配置 AI 模型，请前往设置 → arXiv 配置")?;
+        .ok_or("未配置 AI 模型，请在「设置 → AI 随航 → arXiv 爬取」中配置")?;
 
     let (provider, api_key, model, _fallback) =
         ai_manager::resolve_provider_model_or_default(root, Some(provider_id), Some(model_id))?;
@@ -844,17 +1585,31 @@ pub async fn analyze_single(
         }),
     );
 
-    match call_ai_single(
-        &provider,
-        &api_key,
-        &model,
-        &keywords,
-        &config.ai_analysis_focus,
-        &prompt_template,
-        &paper,
-    )
-    .await
-    {
+    // A click deserves a couple of short retries on a throttle before it is
+    // reported; the long waits are the batch's business.
+    const RETRY_WAITS: [u64; 2] = [5, 15];
+    let mut retries = 0;
+    let outcome = loop {
+        let r = call_ai_single(
+            &provider,
+            &api_key,
+            &model,
+            &keywords,
+            &config.ai_analysis_focus,
+            &prompt_template,
+            &paper,
+        )
+        .await;
+        match r {
+            Err(e) if e.class() == llm::ErrorClass::Transient && retries < RETRY_WAITS.len() => {
+                tokio::time::sleep(Duration::from_secs(RETRY_WAITS[retries])).await;
+                retries += 1;
+            }
+            other => break other,
+        }
+    };
+
+    match outcome {
         Ok(result) => {
             let score = result.relevance_score.clamp(0.0, 10.0);
             let reason = result.relevance_reason.clone();
@@ -868,6 +1623,7 @@ pub async fn analyze_single(
                 p.analysis_summary = summary.clone();
                 p.matched_topics = topics.clone();
                 p.analysis_status = "done".to_string();
+                p.analysis_error = None;
             });
             let _ = app.emit(
                 "arxiv-analysis",
@@ -882,23 +1638,19 @@ pub async fn analyze_single(
             );
         }
         Err(e) => {
+            let message = e.message().to_string();
+            eprintln!("Analysis error for {}: {}", arxiv_id, message);
             update_paper_in_day_files(root, arxiv_id, |p| {
                 p.analysis_status = "failed".to_string();
+                p.analysis_error = Some(message.clone());
             });
             let _ = app.emit(
                 "arxiv-analysis",
                 serde_json::json!({
-                    "done": 0, "total": 1, "arxiv_id": arxiv_id, "status": "failed",
-                    "message": &e
+                    "done": 1, "total": 1, "arxiv_id": arxiv_id, "status": "failed",
+                    "message": &message
                 }),
             );
-            let _ = app.emit(
-                "arxiv-analysis",
-                serde_json::json!({
-                    "done": 1, "total": 1, "arxiv_id": "", "status": "finished"
-                }),
-            );
-            return Err(e);
         }
     }
 
@@ -915,17 +1667,17 @@ pub async fn analyze_single(
 pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), String> {
     let config = get_arxiv_config(root);
     if !config.ai_analysis_enabled {
-        return Err("AI analysis is not enabled in Settings → arXiv.".to_string());
+        return Err("AI analysis is not enabled in Settings → AI Copilot → arXiv crawler.".to_string());
     }
 
     let provider_id = config
         .ai_provider_id
         .as_deref()
-        .ok_or("No AI provider configured for arXiv analysis. Go to Settings → arXiv.")?;
+        .ok_or("No AI provider configured for arXiv analysis. Go to Settings → AI Copilot → arXiv crawler.")?;
     let model_id = config
         .ai_model_id
         .as_deref()
-        .ok_or("No AI model configured for arXiv analysis. Go to Settings → arXiv.")?;
+        .ok_or("No AI model configured for arXiv analysis. Go to Settings → AI Copilot → arXiv crawler.")?;
 
     let (provider, api_key, model, _fallback) =
         ai_manager::resolve_provider_model_or_default(root, Some(provider_id), Some(model_id))?;
@@ -946,42 +1698,43 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
     {
         return Ok(());
     }
+    let _running = RunningFlag;
+    *locked(analysis_pause()) = None;
     analysis_cancel().store(false, Ordering::SeqCst);
     analysis_progress_done().store(0, Ordering::SeqCst);
     analysis_progress_total().store(0, Ordering::SeqCst);
 
-    let mut inbox = get_inbox(root);
+    // Pending and previously failed papers alike: a failure is never final.
+    let claimed = {
+        let root = root.to_string();
+        tokio::task::spawn_blocking(move || claim_papers_for_analysis(&root))
+            .await
+            .map_err(|e| format!("Claim papers for analysis: {e}"))?
+    };
+    let Claimed { papers, original, dates, retrying_failed } = claimed;
+    let dates = Arc::new(dates);
 
-    // Reset papers stuck in "analyzing" from a previous interrupted run.
-    if inbox.papers.iter().any(|p| p.analysis_status == "analyzing") {
-        for p in inbox.papers.iter_mut() {
-            if p.analysis_status == "analyzing" {
-                p.analysis_status = "pending".to_string();
-            }
-        }
-        let _ = save_inbox(root, &inbox);
-    }
-
-    // Collect pending papers (with full data — each task captures its own copy).
-    let pending: Vec<ArxivPaper> = inbox
-        .papers
-        .iter()
-        .filter(|p| p.analysis_status == "pending")
-        .cloned()
-        .collect();
-
-    let total = pending.len() as u32;
+    let total = papers.len() as u32;
     if total == 0 {
-        analysis_running().store(false, Ordering::SeqCst);
-        let _ = app.emit("arxiv-analysis",
-            serde_json::json!({"done": 0, "total": 0, "arxiv_id": "", "status": "finished", "bulk": true}));
+        let finished_at_ms = epoch_ms();
+        *locked(last_analysis_run()) = Some(ArxivAnalysisRun {
+            finished_at_ms, total: 0, succeeded: 0, failed: 0, filtered: 0, reverted: 0,
+            stopped_reason: None, cancelled: false,
+        });
+        drop(_running);
+        let _ = app.emit("arxiv-analysis", serde_json::json!({
+            "done": 0, "total": 0, "arxiv_id": "", "status": "finished", "bulk": true,
+            "succeeded": 0, "failed": 0, "filtered": 0, "reverted": 0,
+            "stopped_reason": null, "cancelled": false, "finished_at_ms": finished_at_ms
+        }));
         return Ok(());
     }
 
     analysis_progress_total().store(total, Ordering::SeqCst);
 
     let _ = app.emit("arxiv-analysis", serde_json::json!({
-        "done": 0, "total": total, "arxiv_id": "", "status": "started", "bulk": true
+        "done": 0, "total": total, "arxiv_id": "", "status": "started", "bulk": true,
+        "retrying_failed": retrying_failed
     }));
 
     let prompt_template = if config.ai_analysis_prompt.trim().is_empty() {
@@ -992,175 +1745,144 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
     let filter_threshold = config.ai_filter_threshold.clamp(0.0, 10.0);
     let filter_enabled = config.ai_filter_enabled;
 
-    // Build arxiv_id → day-file-date map once (O(n)) so result writes are O(1).
-    let id_to_date: std::collections::HashMap<String, String> = pending
-        .iter()
-        .map(|p| (p.arxiv_id.clone(), date_from_fetched_at(&p.fetched_at)))
-        .collect();
+    let analyze: AnalyzeFn = {
+        let provider = Arc::new(provider);
+        let api_key = Arc::new(api_key);
+        let model = Arc::new(model);
+        let keywords = Arc::new(keywords);
+        let focus = Arc::new(config.ai_analysis_focus.clone());
+        let prompt_template = Arc::new(prompt_template);
+        Arc::new(move |paper: ArxivPaper| {
+            let (provider, api_key, model) = (provider.clone(), api_key.clone(), model.clone());
+            let (keywords, focus, tmpl) = (keywords.clone(), focus.clone(), prompt_template.clone());
+            Box::pin(async move {
+                call_ai_single(&provider, &api_key, &model, &keywords, &focus, &tmpl, &paper).await
+            })
+        })
+    };
 
-    // Bulk pre-mark: O(m) — read each day file ONCE, mark all pending papers in it.
-    // Previous approach was O(n × m): scanned all files for every single paper ID.
-    {
-        let pending_set: std::collections::HashSet<&str> =
-            pending.iter().map(|p| p.arxiv_id.as_str()).collect();
-        for date in list_day_dates(root) {
-            let mut day_papers = read_day_papers(root, &date);
-            let mut changed = false;
-            for p in day_papers.iter_mut() {
-                if pending_set.contains(p.arxiv_id.as_str()) {
-                    p.analysis_status = "analyzing".to_string();
-                    changed = true;
-                }
-            }
-            if changed {
-                let _ = write_day_papers(root, &date, &day_papers);
-            }
-        }
-    }
+    let (batch, mut rx) =
+        spawn_batch(papers, concurrency, analysis_cancel().clone(), BATCH_TUNING, analyze);
 
-    // Shared done counter — readable by spawned tasks for real-time progress events.
+    // Papers without a final result yet, with the status to restore if the
+    // run ends before they get one.
+    let mut outstanding = original;
+    let mut buffer: HashMap<String, PaperUpdate> = HashMap::new();
+    let mut last_flush = Instant::now();
+    let (mut succeeded, mut failed, mut filtered) = (0u32, 0u32, 0u32);
     let done_arc = analysis_progress_done().clone();
 
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let provider   = std::sync::Arc::new(provider);
-    let api_key    = std::sync::Arc::new(api_key);
-    let model      = std::sync::Arc::new(model);
-    let keywords   = std::sync::Arc::new(keywords);
-    let focus      = std::sync::Arc::new(config.ai_analysis_focus.clone());
-    let prompt_template = std::sync::Arc::new(prompt_template);
-
-    let mut join_set: tokio::task::JoinSet<(String, Result<AnalysisResult, String>)> =
-        tokio::task::JoinSet::new();
-
-    for paper in pending {
-        if analysis_cancel().load(Ordering::SeqCst) {
-            break;
-        }
-
-        let sem    = semaphore.clone();
-        let app_c  = app.clone();
-        let prov   = provider.clone();
-        let key    = api_key.clone();
-        let mdl    = model.clone();
-        let kws    = keywords.clone();
-        let fcs    = focus.clone();
-        let tmpl   = prompt_template.clone();
-        let done_c = done_arc.clone();
-        let id_c   = paper.arxiv_id.clone();
-
-        join_set.spawn(async move {
-            // Block here until a concurrency slot is free.
-            let _permit = sem.acquire_owned().await.ok();
-
-            if analysis_cancel().load(Ordering::SeqCst) {
-                return (id_c, Err("cancelled".to_string()));
+    loop {
+        let msg = match tokio::time::timeout(FLUSH_EVERY, rx.recv()).await {
+            Ok(Some(msg)) => Some(msg),
+            Ok(None) => break,
+            Err(_) => None,
+        };
+        match msg {
+            None => {}
+            Some(BatchMsg::Sending(id)) => {
+                *locked(analysis_pause()) = None;
+                let _ = app.emit("arxiv-analysis", serde_json::json!({
+                    "done": done_arc.load(Ordering::SeqCst), "total": total,
+                    "arxiv_id": &id, "status": "analyzing", "bulk": true
+                }));
             }
-
-            // Emit "analyzing" with the CURRENT done count and the real total
-            // so the frontend progress bar moves forward immediately.
-            let current_done = done_c.load(Ordering::SeqCst);
-            let _ = app_c.emit("arxiv-analysis", serde_json::json!({
-                "done": current_done,
-                "total": total,          // real total, not 0
-                "arxiv_id": &id_c,
-                "status": "analyzing",
-                "bulk": true
-            }));
-
-            // The actual slow part — call the AI provider.
-            let result = call_ai_single(&prov, &key, &mdl, &kws, &fcs, &tmpl, &paper).await;
-            (id_c, result)
-        });
-    }
-
-    // ── Collect results as they complete ─────────────────────────────────────
-    // File writes are serialized here (join_next is awaited one at a time).
-    // Each completed task immediately frees a semaphore slot → the next queued
-    // task starts its API call straight away, keeping N requests in-flight.
-    while let Some(task_result) = join_set.join_next().await {
-        let Ok((id, result)) = task_result else { continue };
-
-        // Increment BEFORE emitting so the event carries the post-completion count.
-        let done_val = done_arc.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Fast O(1) lookup: use the pre-built id→date map instead of scanning all files.
-        let date = id_to_date.get(&id).map(|s| s.as_str()).unwrap_or("");
-
-        match result {
-            Ok(result) => {
+            Some(BatchMsg::Waiting { message, retry_in, concurrency }) => {
+                eprintln!("[arxiv] provider busy, pausing {}s: {message}", retry_in.as_secs());
+                *locked(analysis_pause()) = Some(ArxivAnalysisPause {
+                    message: message.clone(),
+                    until_ms: epoch_ms() + retry_in.as_millis() as u64,
+                    concurrency,
+                });
+                let _ = app.emit("arxiv-analysis", serde_json::json!({
+                    "done": done_arc.load(Ordering::SeqCst), "total": total,
+                    "arxiv_id": "", "status": "waiting", "bulk": true,
+                    "message": message,
+                    "retry_in": retry_in.as_secs_f64().ceil() as u64,
+                    "concurrency": concurrency
+                }));
+            }
+            Some(BatchMsg::Outcome(_, Outcome::Untouched)) => {}
+            Some(BatchMsg::Outcome(id, Outcome::Done(result))) => {
+                outstanding.remove(&id);
+                let done_val = done_arc.fetch_add(1, Ordering::SeqCst) + 1;
                 let score = result.relevance_score.clamp(0.0, 10.0);
-
-                if filter_enabled && score < filter_threshold {
-                    // Remove from its specific day file — no full-inbox reload needed.
-                    if !date.is_empty() {
-                        let mut day_papers = read_day_papers(root, date);
-                        day_papers.retain(|p| p.arxiv_id != id);
-                        let _ = write_day_papers(root, date, &day_papers);
-                    }
-                    let _ = app.emit("arxiv-analysis", serde_json::json!({
-                        "done": done_val, "total": total,
-                        "arxiv_id": &id, "status": "filtered",
-                        "bulk": true, "removed": true,
-                        "score": score,
-                        "reason": &result.relevance_reason,
-                        "key_contributions": &result.key_contributions,
-                        "analysis_summary": &result.summary,
-                        "matched_topics": &result.matched_topics
-                    }));
+                let removed = filter_enabled && score < filter_threshold;
+                let _ = app.emit("arxiv-analysis", serde_json::json!({
+                    "done": done_val, "total": total,
+                    "arxiv_id": &id,
+                    "status": if removed { "filtered" } else { "done" },
+                    "bulk": true, "removed": removed,
+                    "score": score,
+                    "reason": &result.relevance_reason,
+                    "key_contributions": &result.key_contributions,
+                    "analysis_summary": &result.summary,
+                    "matched_topics": &result.matched_topics
+                }));
+                if removed {
+                    filtered += 1;
+                    buffer.insert(id, PaperUpdate::Remove);
                 } else {
-                    // Write result to the specific day file (O(1) lookup).
-                    if !date.is_empty() {
-                        let mut day_papers = read_day_papers(root, date);
-                        if let Some(p) = day_papers.iter_mut().find(|p| p.arxiv_id == id) {
-                            p.relevance_score    = Some(score);
-                            p.relevance_reason   = Some(result.relevance_reason.clone());
-                            p.key_contributions  = result.key_contributions.clone();
-                            p.analysis_summary   = result.summary.clone();
-                            p.matched_topics     = result.matched_topics.clone();
-                            p.analysis_status    = "done".to_string();
-                        }
-                        let _ = write_day_papers(root, date, &day_papers);
-                    }
-                    let _ = app.emit("arxiv-analysis", serde_json::json!({
-                        "done": done_val, "total": total,
-                        "arxiv_id": &id, "status": "done",
-                        "bulk": true,
-                        "score": score,
-                        "reason": &result.relevance_reason,
-                        "key_contributions": &result.key_contributions,
-                        "analysis_summary": &result.summary,
-                        "matched_topics": &result.matched_topics
-                    }));
+                    succeeded += 1;
+                    buffer.insert(id, PaperUpdate::Done(result));
                 }
             }
-            Err(e) => {
-                eprintln!("Analysis error for {}: {}", id, e);
-                if !date.is_empty() {
-                    let mut day_papers = read_day_papers(root, date);
-                    if let Some(p) = day_papers.iter_mut().find(|p| p.arxiv_id == id) {
-                        p.analysis_status = "failed".to_string();
-                    }
-                    let _ = write_day_papers(root, date, &day_papers);
-                }
+            Some(BatchMsg::Outcome(id, Outcome::Failed(message))) => {
+                outstanding.remove(&id);
+                failed += 1;
+                let done_val = done_arc.fetch_add(1, Ordering::SeqCst) + 1;
+                eprintln!("Analysis error for {}: {}", id, message);
                 let _ = app.emit("arxiv-analysis", serde_json::json!({
                     "done": done_val, "total": total,
                     "arxiv_id": &id, "status": "failed",
-                    "bulk": true, "message": e
+                    "bulk": true, "message": &message
                 }));
+                buffer.insert(id, PaperUpdate::Failed(message));
             }
         }
-
-        if analysis_cancel().load(Ordering::SeqCst) {
-            join_set.abort_all();
-            break;
+        if !buffer.is_empty() && (buffer.len() >= FLUSH_AT || last_flush.elapsed() >= FLUSH_EVERY) {
+            flush_updates(root, std::mem::take(&mut buffer), &dates).await;
+            last_flush = Instant::now();
         }
     }
 
+    // Every worker has exited. Anything still outstanding was not finished in
+    // this run: put it back as it was, so the next click picks it up again.
+    let reverted = outstanding.len() as u32;
+    for (id, status) in outstanding {
+        buffer.entry(id).or_insert(PaperUpdate::Revert(status));
+    }
+    flush_updates(root, buffer, &dates).await;
+
+    let stopped_reason = locked(&batch.throttle).stop.clone();
+    let cancelled = analysis_cancel().load(Ordering::SeqCst);
+    if let Some(reason) = &stopped_reason {
+        eprintln!("[arxiv] analysis stopped early ({reverted} left): {reason}");
+    }
     let final_done = done_arc.load(Ordering::SeqCst);
-    analysis_running().store(false, Ordering::SeqCst);
+    let finished_at_ms = epoch_ms();
+    *locked(analysis_pause()) = None;
+    *locked(last_analysis_run()) = Some(ArxivAnalysisRun {
+        finished_at_ms,
+        total,
+        succeeded,
+        failed,
+        filtered,
+        reverted,
+        stopped_reason: stopped_reason.clone(),
+        cancelled,
+    });
+    // Clear the flag before announcing the end, so a click prompted by the
+    // "finished" event is not turned away by a run that is already over.
+    drop(_running);
     let _ = app.emit("arxiv-analysis", serde_json::json!({
         "done": final_done, "total": total,
-        "arxiv_id": "", "status": "finished", "bulk": true
+        "arxiv_id": "", "status": "finished", "bulk": true,
+        "succeeded": succeeded, "failed": failed, "filtered": filtered,
+        "reverted": reverted,
+        "stopped_reason": stopped_reason,
+        "cancelled": cancelled,
+        "finished_at_ms": finished_at_ms
     }));
 
     Ok(())
@@ -1349,9 +2071,13 @@ pub async fn add_to_library(
     let _ = search::index_paper(root, &final_slug);
 
     // Once imported, remove the recommendation from the arXiv inbox.
-    let mut inbox = get_inbox(root);
-    inbox.papers.retain(|p| p.arxiv_id != arxiv_id);
-    let _ = save_inbox(root, &inbox);
+    let inbox = {
+        let _guard = inbox_lock();
+        let mut inbox = get_inbox(root);
+        inbox.papers.retain(|p| p.arxiv_id != arxiv_id);
+        let _ = save_inbox(root, &inbox);
+        inbox
+    };
     let _ = app.emit(
         "arxiv-new-recommendations",
         serde_json::json!({ "count": inbox.papers.iter().filter(|p| !p.in_library).count() }),
@@ -1499,19 +2225,28 @@ pub fn open_arxiv_window(app: &tauri::AppHandle) -> Result<(), String> {
 
 pub fn get_schedule_status(root: &str) -> ArxivScheduleStatus {
     let config = get_arxiv_config(root);
-    let inbox = get_inbox(root);
     let analyzing = analysis_running().load(Ordering::SeqCst);
 
-    let total_pending = inbox
-        .papers
-        .iter()
-        .filter(|p| p.analysis_status == "pending")
-        .count() as u32;
-    let analyzed = inbox
-        .papers
-        .iter()
-        .filter(|p| p.analysis_status == "done" || p.analysis_status == "failed")
-        .count() as u32;
+    // Outside a run: everything the next "AI 分析全部" would pick up is still to
+    // do — a failed paper is retried, and a stale "analyzing" is one a run never
+    // finished. During a run the live counters answer, so the whole inbox is
+    // not re-read on every poll.
+    let (analyzed, total_pending) = if analyzing {
+        (0, 0)
+    } else {
+        let inbox = get_inbox(root);
+        let to_do = inbox
+            .papers
+            .iter()
+            .filter(|p| matches!(p.analysis_status.as_str(), "pending" | "failed" | "analyzing"))
+            .count() as u32;
+        let done = inbox
+            .papers
+            .iter()
+            .filter(|p| p.analysis_status == "done")
+            .count() as u32;
+        (done, to_do)
+    };
 
     // Compute next scheduled time
     let next_scheduled = if config.auto_fetch_enabled {
@@ -1536,6 +2271,12 @@ pub fn get_schedule_status(root: &str) -> ArxivScheduleStatus {
         analyzing,
         analyzed_count,
         total_pending,
+        waiting: if analyzing {
+            locked(analysis_pause()).clone().filter(|p| p.until_ms > epoch_ms())
+        } else {
+            None
+        },
+        last_run: if analyzing { None } else { locked(last_analysis_run()).clone() },
     }
 }
 
@@ -1980,10 +2721,13 @@ pub async fn import_by_url(
     }
 
     // ── Mark in_library in inbox if paper was there ───────────────────────────
-    let mut inbox = get_inbox(root);
-    if let Some(p) = inbox.papers.iter_mut().find(|p| p.arxiv_id == arxiv_id) {
-        p.in_library = true;
-        let _ = save_inbox(root, &inbox);
+    {
+        let _guard = inbox_lock();
+        let mut inbox = get_inbox(root);
+        if let Some(p) = inbox.papers.iter_mut().find(|p| p.arxiv_id == arxiv_id) {
+            p.in_library = true;
+            let _ = save_inbox(root, &inbox);
+        }
     }
 
     // ── Best-effort fulltext extraction + FTS indexing ────────────────────────
@@ -2032,6 +2776,7 @@ mod tests {
             analysis_summary: None,
             matched_topics: vec![],
             analysis_status: "pending".to_string(),
+            analysis_error: None,
             in_library: false,
             fetched_at: String::new(),
             read: false,
@@ -2086,5 +2831,563 @@ mod tests {
     fn focus_placeholder_is_removed_when_focus_is_empty() {
         let (_, user) = build_analysis_messages("要求：{focus}|结束", "LLM", "", &paper());
         assert_eq!(user, "要求：|结束");
+    }
+
+    // ── Reply parsing ────────────────────────────────────────────────────────
+
+    const ANSWER: &str = r#"{"relevance_score": 7, "relevance_reason": "相关", "key_contributions": ["a"], "summary": "s", "matched_topics": ["AI for Biology"]}"#;
+
+    #[test]
+    fn a_plain_or_fenced_reply_parses() {
+        assert_eq!(parse_analysis_result(ANSWER).unwrap().relevance_score, 7.0);
+        let fenced = format!("```json\n{ANSWER}\n```");
+        assert_eq!(parse_analysis_result(&fenced).unwrap().relevance_score, 7.0);
+    }
+
+    #[test]
+    fn a_leaked_draft_that_echoes_the_schema_does_not_break_parsing() {
+        // The old first-`{`-to-last-`}` slice spanned the draft and the answer.
+        let reply = format!(
+            "<think>要输出 {{\"relevance_score\": 0, \"relevance_reason\": \"\"}} 这种格式</think>\n{ANSWER}"
+        );
+        let r = parse_analysis_result(&reply).unwrap();
+        assert_eq!(r.relevance_score, 7.0);
+        assert_eq!(r.relevance_reason, "相关");
+    }
+
+    #[test]
+    fn prose_with_braces_after_the_answer_is_ignored() {
+        let reply = format!("{ANSWER}\n注：分数按 {{0-10}} 计。");
+        assert_eq!(parse_analysis_result(&reply).unwrap().relevance_score, 7.0);
+    }
+
+    #[test]
+    fn a_reply_without_the_object_is_a_parse_error() {
+        let err = parse_analysis_result("抱歉，我无法完成。").err().unwrap();
+        assert!(err.starts_with("Parse AI JSON"), "{err}");
+        let err = parse_analysis_result(r#"{"relevance_reason": "x"}"#).err().unwrap();
+        assert!(err.contains("relevance_score"), "{err}");
+    }
+
+    // ── Throttle ─────────────────────────────────────────────────────────────
+
+    const FAST: BatchTuning = BatchTuning {
+        first_backoff: Duration::from_millis(20),
+        max_backoff: Duration::from_millis(80),
+        stall_limit: Duration::from_millis(400),
+        max_attempts: 50,
+        failure_streak_limit: 4,
+        raise_after: 2,
+        requeue_gap: 4,
+        poll: Duration::from_millis(2),
+    };
+
+    #[test]
+    fn one_overload_is_one_pause_and_concurrency_halves() {
+        let t0 = Instant::now();
+        let mut t = Throttle::new(8, t0);
+        assert_eq!(t.on_transient(t0, "busy", &FAST), Some(Duration::from_millis(20)));
+        assert_eq!(t.limit, 4);
+        // Requests that were already in flight fail too; that is still one pause.
+        assert_eq!(t.on_transient(t0 + Duration::from_millis(5), "busy", &FAST), None);
+        assert_eq!(t.limit, 4);
+        // Still busy after the pause: wait twice as long, halve again.
+        let t1 = t0 + Duration::from_millis(25);
+        assert_eq!(t.on_transient(t1, "busy", &FAST), Some(Duration::from_millis(40)));
+        assert_eq!(t.limit, 2);
+        let t2 = t1 + Duration::from_millis(45);
+        assert_eq!(t.on_transient(t2, "busy", &FAST), Some(Duration::from_millis(80)));
+        let t3 = t2 + Duration::from_millis(85);
+        assert_eq!(t.on_transient(t3, "busy", &FAST), Some(Duration::from_millis(80)), "capped");
+        assert_eq!(t.limit, 1, "never below one");
+        assert!(t.stop.is_none());
+    }
+
+    #[test]
+    fn successes_reset_the_backoff_and_raise_concurrency_step_by_step() {
+        let t0 = Instant::now();
+        let mut t = Throttle::new(4, t0);
+        t.on_transient(t0, "busy", &FAST);
+        assert_eq!(t.limit, 2);
+        let t1 = t0 + Duration::from_millis(30);
+        t.on_success(t1, &FAST);
+        assert_eq!(t.limit, 2);
+        t.on_success(t1, &FAST);
+        assert_eq!(t.limit, 3);
+        t.on_success(t1, &FAST);
+        t.on_success(t1, &FAST);
+        assert_eq!(t.limit, 4);
+        for _ in 0..10 {
+            t.on_success(t1, &FAST);
+        }
+        assert_eq!(t.limit, 4, "never above the setting");
+        assert_eq!(t.on_transient(t1, "busy", &FAST), Some(Duration::from_millis(20)), "backoff reset");
+    }
+
+    #[test]
+    fn silence_past_the_stall_limit_stops_the_batch() {
+        let t0 = Instant::now();
+        let mut t = Throttle::new(2, t0);
+        assert!(t.on_transient(t0 + Duration::from_millis(401), "busy (2064)", &FAST).is_none());
+        let reason = t.stop.clone().unwrap();
+        assert!(reason.contains("busy (2064)"), "{reason}");
+    }
+
+    #[test]
+    fn a_run_of_request_failures_stops_the_batch() {
+        let t0 = Instant::now();
+        let mut t = Throttle::new(2, t0);
+        for _ in 0..3 {
+            t.on_request_failure(t0, "bad", &FAST);
+        }
+        assert!(t.stop.is_none());
+        t.on_success(t0, &FAST);
+        for _ in 0..3 {
+            t.on_request_failure(t0, "bad", &FAST);
+        }
+        assert!(t.stop.is_none(), "a success in between resets the streak");
+        t.on_request_failure(t0, "bad", &FAST);
+        assert!(t.stop.is_some());
+    }
+
+    // ── Batch runner ─────────────────────────────────────────────────────────
+
+    fn papers(n: usize) -> Vec<ArxivPaper> {
+        (0..n)
+            .map(|i| ArxivPaper { arxiv_id: format!("p{i}"), ..paper() })
+            .collect()
+    }
+
+    fn ok_result() -> AnalysisResult {
+        AnalysisResult {
+            relevance_score: 7.0,
+            relevance_reason: "ok".into(),
+            key_contributions: vec![],
+            summary: None,
+            matched_topics: vec![],
+        }
+    }
+
+    /// A fake provider: `reply(call_number, paper_id)` decides each answer.
+    fn provider(
+        reply: impl Fn(usize, &str) -> Result<(), CallError> + Send + Sync + 'static,
+    ) -> (AnalyzeFn, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reply = Arc::new(reply);
+        let counter = calls.clone();
+        let f: AnalyzeFn = Arc::new(move |p: ArxivPaper| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let r = reply(n, &p.arxiv_id);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                r.map(|_| ok_result())
+            })
+        });
+        (f, calls)
+    }
+
+    #[derive(Default, Debug)]
+    struct Seen {
+        done: HashSet<String>,
+        failed: HashMap<String, String>,
+        untouched: HashSet<String>,
+        waits: Vec<(Duration, usize)>,
+    }
+
+    async fn run(papers: Vec<ArxivPaper>, max: usize, analyze: AnalyzeFn) -> (Seen, Option<String>) {
+        run_with(papers, max, analyze, Arc::new(AtomicBool::new(false)), FAST).await
+    }
+
+    async fn run_with(
+        papers: Vec<ArxivPaper>,
+        max: usize,
+        analyze: AnalyzeFn,
+        cancel: Arc<AtomicBool>,
+        tuning: BatchTuning,
+    ) -> (Seen, Option<String>) {
+        let (batch, mut rx) = spawn_batch(papers, max, cancel, tuning, analyze);
+        let mut seen = Seen::default();
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    BatchMsg::Sending(_) => {}
+                    BatchMsg::Waiting { retry_in, concurrency, .. } => {
+                        seen.waits.push((retry_in, concurrency))
+                    }
+                    BatchMsg::Outcome(id, Outcome::Done(_)) => {
+                        assert!(seen.done.insert(id), "a paper finished twice");
+                    }
+                    BatchMsg::Outcome(id, Outcome::Failed(m)) => {
+                        assert!(seen.failed.insert(id, m).is_none(), "a paper failed twice");
+                    }
+                    BatchMsg::Outcome(id, Outcome::Untouched) => {
+                        seen.untouched.insert(id);
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(drained.is_ok(), "the batch never finished");
+        let stop = locked(&batch.throttle).stop.clone();
+        (seen, stop)
+    }
+
+    const OVERLOAD: &str = "API error 529: 当前为整点高峰时段，服务器短暂繁忙，通常 1-5 分钟内恢复。请稍后重试 (2064)";
+
+    #[tokio::test]
+    async fn a_peak_hour_overload_is_waited_out_and_nothing_fails() {
+        let (analyze, _) = provider(|n, _| {
+            if n < 5 { Err(CallError::Llm(OVERLOAD.into())) } else { Ok(()) }
+        });
+        let (seen, stop) = run(papers(12), 4, analyze).await;
+        assert_eq!(stop, None);
+        assert_eq!(seen.done.len(), 12, "{seen:?}");
+        assert!(seen.failed.is_empty(), "{seen:?}");
+        assert!(!seen.waits.is_empty());
+        assert!(seen.waits[0].1 < 4, "concurrency was lowered");
+    }
+
+    #[tokio::test]
+    async fn a_used_up_plan_window_stops_the_batch_without_failing_anything() {
+        let (analyze, _) = provider(|n, _| {
+            if n < 3 {
+                Ok(())
+            } else {
+                Err(CallError::Llm(
+                    "Rate limited (429): usage limit exceeded, 5-hour usage limit reached for Token Plan Plus, resets at 2026-09-28T15:00:00Z (2056)".into(),
+                ))
+            }
+        });
+        let (seen, stop) = run(papers(20), 2, analyze).await;
+        assert!(stop.unwrap().contains("2056"));
+        assert!(seen.failed.is_empty(), "quota is not the papers' fault: {seen:?}");
+        assert!(seen.done.len() >= 3 && seen.done.len() < 20, "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_reply_fails_only_that_paper() {
+        let (analyze, _) = provider(|_, id| {
+            if id == "p2" { Err(CallError::Parse("Parse AI JSON: EOF".into())) } else { Ok(()) }
+        });
+        let (seen, stop) = run(papers(6), 3, analyze).await;
+        assert_eq!(stop, None);
+        assert_eq!(seen.failed.keys().collect::<Vec<_>>(), vec!["p2"]);
+        assert_eq!(seen.done.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_run_of_errors_stops_before_burning_through_the_inbox() {
+        let (analyze, calls) = provider(|_, _| Err(CallError::Llm("API error 400: bad".into())));
+        let (seen, stop) = run(papers(50), 2, analyze).await;
+        assert!(stop.is_some());
+        assert!(seen.failed.len() >= 4 && seen.failed.len() <= 5, "{seen:?}");
+        assert!(calls.load(Ordering::SeqCst) <= 5);
+        assert!(seen.done.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_never_recovers_stops_the_batch_without_failing_anything() {
+        let (analyze, _) = provider(|_, _| Err(CallError::Llm(OVERLOAD.into())));
+        let (seen, stop) = run(papers(10), 3, analyze).await;
+        assert!(stop.unwrap().contains("持续繁忙"));
+        assert!(seen.failed.is_empty(), "{seen:?}");
+        assert!(seen.done.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_paper_that_keeps_timing_out_while_others_succeed_is_marked_failed() {
+        // p0's request hangs until it times out; everyone else answers at once.
+        let analyze: AnalyzeFn = Arc::new(|p: ArxivPaper| {
+            Box::pin(async move {
+                if p.arxiv_id == "p0" {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    Err(CallError::Llm("请求超时（120 秒内未完成）".into()))
+                } else {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    Ok(ok_result())
+                }
+            })
+        });
+        // Re-queued a little way down, it keeps being retried alongside papers
+        // that get answers, so its failures count and it is failed rather than
+        // left to stall the batch; it never holds up the others either.
+        let tuning = BatchTuning { max_attempts: 3, ..FAST };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (seen, stop) = run_with(papers(60), 3, analyze, cancel, tuning).await;
+        assert_eq!(stop, None, "{seen:?}");
+        assert!(seen.failed["p0"].contains("请求超时"), "{seen:?}");
+        assert_eq!(seen.done.len(), 59);
+    }
+
+    #[tokio::test]
+    async fn cancelling_drops_the_requests_in_flight() {
+        let analyze: AnalyzeFn = Arc::new(|_p: ArxivPaper| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(ok_result())
+            })
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        let (seen, _) = run_with(papers(5), 2, analyze, cancel, FAST).await;
+        assert!(seen.done.is_empty() && seen.failed.is_empty());
+        assert_eq!(seen.untouched.len(), 2, "the two in flight: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_request_does_not_stall_the_other_workers() {
+        let analyze: AnalyzeFn = Arc::new(|p: ArxivPaper| {
+            Box::pin(async move {
+                if p.arxiv_id == "p0" {
+                    panic!("boom");
+                }
+                Ok(ok_result())
+            })
+        });
+        let (seen, stop) = run(papers(6), 2, analyze).await;
+        assert_eq!(stop, None);
+        assert_eq!(seen.done.len(), 5, "{seen:?}");
+        assert!(!seen.done.contains("p0"));
+    }
+
+    // ── Claim and write-back ─────────────────────────────────────────────────
+
+    fn temp_root() -> String {
+        let dir = std::env::temp_dir().join(format!("argus-arxiv-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("inbox")).unwrap();
+        dir.to_string_lossy().to_string()
+    }
+
+    fn with_status(id: &str, status: &str) -> ArxivPaper {
+        ArxivPaper {
+            arxiv_id: id.into(),
+            analysis_status: status.into(),
+            fetched_at: "2026-09-20T03:00:00Z".into(),
+            ..paper()
+        }
+    }
+
+    fn status_on_disk(root: &str, id: &str) -> Option<(String, Option<String>)> {
+        list_day_dates(root).into_iter().find_map(|d| {
+            read_day_papers(root, &d)
+                .into_iter()
+                .find(|p| p.arxiv_id == id)
+                .map(|p| (p.analysis_status, p.analysis_error))
+        })
+    }
+
+    #[test]
+    fn failed_papers_are_claimed_again_after_the_fresh_ones() {
+        let root = temp_root();
+        write_day_papers(&root, "2026-09-19", &[with_status("old-failed", "failed")]).unwrap();
+        write_day_papers(
+            &root,
+            "2026-09-20",
+            &[
+                with_status("failed", "failed"),
+                with_status("done", "done"),
+                with_status("new", "pending"),
+                with_status("stale", "analyzing"),
+            ],
+        )
+        .unwrap();
+
+        let claimed = claim_papers_for_analysis(&root);
+        let ids: Vec<&str> = claimed.papers.iter().map(|p| p.arxiv_id.as_str()).collect();
+        assert_eq!(ids, vec!["new", "stale", "failed", "old-failed"]);
+        assert_eq!(claimed.retrying_failed, 2);
+        assert_eq!(claimed.original["stale"], "pending");
+        assert_eq!(claimed.original["failed"], "failed");
+        assert_eq!(status_on_disk(&root, "new").unwrap().0, "analyzing");
+        assert_eq!(status_on_disk(&root, "done").unwrap().0, "done");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn results_and_reverts_land_where_the_paper_is_now() {
+        let root = temp_root();
+        write_day_papers(
+            &root,
+            "2026-09-20",
+            &[
+                with_status("a", "pending"),
+                with_status("b", "failed"),
+                with_status("c", "pending"),
+                with_status("d", "pending"),
+                with_status("moved", "pending"),
+            ],
+        )
+        .unwrap();
+        let claimed = claim_papers_for_analysis(&root);
+
+        // A fetch during the run moved one paper to another day file.
+        let mut day = read_day_papers(&root, "2026-09-20");
+        let moved: Vec<ArxivPaper> = day.iter().filter(|p| p.arxiv_id == "moved").cloned().collect();
+        day.retain(|p| p.arxiv_id != "moved");
+        write_day_papers(&root, "2026-09-20", &day).unwrap();
+        write_day_papers(&root, "2026-09-21", &moved).unwrap();
+
+        let mut updates = HashMap::new();
+        updates.insert("a".to_string(), PaperUpdate::Done(ok_result()));
+        updates.insert("b".to_string(), PaperUpdate::Revert(claimed.original["b"].clone()));
+        updates.insert("c".to_string(), PaperUpdate::Failed("API error 400: bad".into()));
+        updates.insert("d".to_string(), PaperUpdate::Remove);
+        updates.insert("moved".to_string(), PaperUpdate::Done(ok_result()));
+        apply_updates(&root, updates, &claimed.dates);
+
+        assert_eq!(status_on_disk(&root, "a"), Some(("done".into(), None)));
+        assert_eq!(status_on_disk(&root, "b"), Some(("failed".into(), None)), "back as it was");
+        assert_eq!(
+            status_on_disk(&root, "c"),
+            Some(("failed".into(), Some("API error 400: bad".into())))
+        );
+        assert_eq!(status_on_disk(&root, "d"), None, "filtered out");
+        assert_eq!(status_on_disk(&root, "moved").unwrap().0, "done");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_success_clears_the_old_failure_reason() {
+        let root = temp_root();
+        let mut p = with_status("a", "failed");
+        p.analysis_error = Some("API error 529".into());
+        write_day_papers(&root, "2026-09-20", &[p]).unwrap();
+        let claimed = claim_papers_for_analysis(&root);
+        let mut updates = HashMap::new();
+        updates.insert("a".to_string(), PaperUpdate::Done(ok_result()));
+        apply_updates(&root, updates, &claimed.dates);
+        assert_eq!(status_on_disk(&root, "a"), Some(("done".into(), None)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_day_file_is_left_alone() {
+        let root = temp_root();
+        let path = day_file(&root, "2026-09-20");
+        std::fs::write(&path, "{ not json").unwrap();
+        let claimed = claim_papers_for_analysis(&root);
+        assert!(claimed.papers.is_empty());
+        let mut dates = HashMap::new();
+        dates.insert("x".to_string(), vec!["2026-09-20".to_string()]);
+        let mut updates = HashMap::new();
+        updates.insert("x".to_string(), PaperUpdate::Revert("pending".into()));
+        apply_updates(&root, updates, &dates);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_paper_in_a_single_analysis_is_not_claimed_by_a_bulk_run() {
+        let root = temp_root();
+        write_day_papers(&root, "2026-09-20", &[with_status("busy", "analyzing"), with_status("free", "pending")])
+            .unwrap();
+        let guard = SingleInFlight::register("busy");
+        let claimed = claim_papers_for_analysis(&root);
+        drop(guard);
+        let ids: Vec<&str> = claimed.papers.iter().map(|p| p.arxiv_id.as_str()).collect();
+        assert_eq!(ids, vec!["free"]);
+        assert!(!claimed.original.contains_key("busy"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_result_never_overwrites_one_written_by_someone_else() {
+        let root = temp_root();
+        write_day_papers(&root, "2026-09-20", &[with_status("a", "pending")]).unwrap();
+        let claimed = claim_papers_for_analysis(&root);
+        // A single analysis (or another device) finished it in the meantime.
+        update_paper_in_day_files(&root, "a", |p| p.analysis_status = "done".into());
+        let mut updates = HashMap::new();
+        updates.insert("a".to_string(), PaperUpdate::Failed("API error 400: bad".into()));
+        apply_updates(&root, updates, &claimed.dates);
+        assert_eq!(status_on_disk(&root, "a"), Some(("done".into(), None)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_real_dates_are_day_files_and_the_read_state_survives_a_save() {
+        let root = temp_root();
+        write_day_papers(&root, "2026-09-20", &[with_status("a", "done")]).unwrap();
+        let inbox = inbox_dir(&root);
+        std::fs::write(inbox.join("read_state.json"), r#"{"a":{"read":true,"rating":4}}"#).unwrap();
+        std::fs::write(inbox.join("2026-09-21 2.json"), "[]").unwrap();
+        assert_eq!(list_day_dates(&root), vec!["2026-09-20".to_string()]);
+
+        let snapshot = get_inbox(&root);
+        assert_eq!(snapshot.last_updated, "2026-09-20");
+        save_inbox(&root, &snapshot).unwrap();
+        assert!(inbox.join("read_state.json").exists(), "read/rating state was deleted");
+        let a = get_inbox(&root).papers.into_iter().find(|p| p.arxiv_id == "a").unwrap();
+        assert!(a.read);
+        assert_eq!(a.rating, 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_day_file_is_neither_deleted_nor_overwritten() {
+        let root = temp_root();
+        write_day_papers(&root, "2026-09-19", &[with_status("ok", "done")]).unwrap();
+        let bad = day_file(&root, "2026-09-20");
+        std::fs::write(&bad, r#"[{"arxiv_id":"x","rating":"five"}]"#).unwrap();
+
+        // Refresh / import used to delete it as an empty day.
+        let err = save_inbox(&root, &get_inbox(&root)).unwrap_err();
+        assert!(err.contains("2026-09-20"), "{err}");
+        assert!(bad.exists());
+
+        // A fetch into that day used to replace it with only the new papers.
+        let mut fresh = with_status("new", "pending");
+        fresh.fetched_at = "2026-09-20T08:00:00Z".into();
+        assert!(merge_into_inbox(&root, vec![fresh]).is_err());
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), r#"[{"arxiv_id":"x","rating":"five"}]"#);
+
+        // A fetch into another day still works.
+        let mut other = with_status("other", "pending");
+        other.fetched_at = "2026-09-21T08:00:00Z".into();
+        assert!(merge_into_inbox(&root, vec![other]).is_ok());
+        assert_eq!(status_on_disk(&root, "other").unwrap().0, "pending");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_refetch_keeps_the_read_mark_and_rating_baked_into_the_day_file() {
+        let root = temp_root();
+        let mut old = with_status("a", "done");
+        old.read = true;
+        old.rating = 3;
+        write_day_papers(&root, "2026-09-20", &[old]).unwrap();
+        // No read_state.json (lost to the old bug); the fetch knows neither.
+        let mut again = with_status("a", "pending");
+        again.fetched_at = "2026-09-22T08:00:00Z".into();
+        merge_into_inbox(&root, vec![again]).unwrap();
+        let a = get_inbox(&root).papers.into_iter().find(|p| p.arxiv_id == "a").unwrap();
+        assert!(a.read);
+        assert_eq!(a.rating, 3);
+        assert_eq!(a.analysis_status, "done");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_last_paper_is_not_failed_by_an_outage_it_is_left_to_the_stall_limit() {
+        let (analyze, _) = provider(|_, _| Err(CallError::Llm(OVERLOAD.into())));
+        // A cap far below the number of tries an outage produces.
+        let tuning = BatchTuning { max_attempts: 2, ..FAST };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (seen, stop) = run_with(papers(1), 2, analyze, cancel, tuning).await;
+        assert!(stop.unwrap().contains("持续繁忙"));
+        assert!(seen.failed.is_empty(), "{seen:?}");
+    }
+
+    #[test]
+    fn old_inbox_entries_without_the_new_field_still_load() {
+        let old = r#"[{"arxiv_id":"1","title":"t","authors":[],"summary":"","categories":[],"published":"","updated":"","pdf_url":"","abs_url":"","relevance_score":null,"relevance_reason":null,"analysis_status":"failed","fetched_at":"2026-09-20T00:00:00Z"}]"#;
+        let papers: Vec<ArxivPaper> = serde_json::from_str(old).unwrap();
+        assert_eq!(papers[0].analysis_error, None);
+        // And a None error is not written back, so older builds see the same shape.
+        assert!(!serde_json::to_string(&papers[0]).unwrap().contains("analysis_error"));
     }
 }

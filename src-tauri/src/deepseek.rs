@@ -586,7 +586,7 @@ pub async fn prepare_chat_messages(
     }
     if !model_supports_vision(provider, model) {
         return Err(format!(
-            "模型「{model}」不支持图片输入。请在设置 → AI 服务中选择 DeepSeek 的视觉模型\
+            "模型「{model}」不支持图片输入。请在设置 → AI 供应商中选择 DeepSeek 的视觉模型\
              （如 deepseek-v4-flash-vision-exp），或移除附件后重试。"
         ));
     }

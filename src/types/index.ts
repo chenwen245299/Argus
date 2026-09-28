@@ -729,22 +729,6 @@ export interface ChunkInput {
   source_label: string | null
 }
 
-export interface RetrievedSnippet {
-  snippet_id: string
-  library_id: string
-  text: string
-  score: number
-  paper_id: string
-  paper_title: string
-  page: number
-  note: string
-  tags: string[]
-}
-
-export interface SnippetStoreInfo {
-  embedded_count: number
-}
-
 export interface RetrievedChunk {
   chunk_id: string
   paper_id: string
@@ -798,11 +782,48 @@ export interface ArxivPaper {
   analysis_summary: string | null
   matched_topics: string[]
   analysis_status: 'pending' | 'analyzing' | 'done' | 'failed' | string
+  /** Why the last AI analysis failed. Set with 'failed', cleared on 'done'; absent on old inbox files. */
+  analysis_error?: string | null
   in_library: boolean
   fetched_at: string
   read: boolean
   rating: number
   source?: string
+}
+
+/**
+ * Payload of the `arxiv-analysis` event. Bulk-run events carry `bulk: true`;
+ * single-paper ones carry `total: 1` (or `total: 0` for a refused request).
+ * Every field beyond the first four is optional — older backends omit them.
+ */
+export interface ArxivAnalysisEvent {
+  status: 'started' | 'analyzing' | 'done' | 'filtered' | 'failed' | 'pending'
+    | 'waiting' | 'finished' | 'error' | string
+  done: number
+  total: number
+  arxiv_id: string
+  bulk?: boolean
+  message?: string
+  // done / filtered
+  score?: number
+  reason?: string
+  key_contributions?: string[]
+  analysis_summary?: string | null
+  matched_topics?: string[]
+  removed?: boolean
+  // started
+  retrying_failed?: number
+  // waiting: the whole batch pauses `retry_in` seconds, then resumes at `concurrency`
+  retry_in?: number
+  concurrency?: number
+  // finished
+  succeeded?: number
+  failed?: number
+  filtered?: number
+  reverted?: number
+  stopped_reason?: string | null
+  cancelled?: boolean
+  finished_at_ms?: number
 }
 
 export interface ArxivInbox {
@@ -890,6 +911,29 @@ export interface ArxivScheduleStatus {
   analyzing: boolean
   analyzed_count: number
   total_pending: number
+  /** The pause a running batch is in (provider throttling), if any. */
+  waiting?: ArxivAnalysisPause | null
+  /** How the last batch of this app session ended; only outside a run. */
+  last_run?: ArxivAnalysisRun | null
+}
+
+export interface ArxivAnalysisPause {
+  message: string
+  /** Unix epoch milliseconds. */
+  until_ms: number
+  concurrency: number
+}
+
+export interface ArxivAnalysisRun {
+  /** Unix epoch milliseconds; identifies the run. */
+  finished_at_ms: number
+  total: number
+  succeeded: number
+  failed: number
+  filtered: number
+  reverted: number
+  stopped_reason: string | null
+  cancelled: boolean
 }
 
 

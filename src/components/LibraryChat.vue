@@ -8,7 +8,6 @@ import { modelHasVision, modelHasVideo, modelHasAudio, useAiStore, type ModelOpt
 import ProviderBalanceTag from './ProviderBalanceTag.vue'
 import ServerToolTraceCard from './ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../utils/serverToolTrace'
-import { useRagStore } from '../stores/rag'
 import { useSettingsStore } from '../stores/settings'
 import MarkdownBody from './MarkdownBody.vue'
 import WriteConfirmCard from './WriteConfirmCard.vue'
@@ -17,7 +16,6 @@ import WindowControls from './WindowControls.vue'
 import ChatPageImage from './ChatPageImage.vue'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
-import { buildChunks } from '../utils/chunker'
 import { sortPapersByRecentAccess } from '../utils/recentPapers'
 import { serveAddPapersToChat } from '../utils/chatPapers'
 import { estimateCostCny } from '../utils/modelPricing'
@@ -25,10 +23,10 @@ import { modelOffer, modelSizeLabel } from '../utils/modelOffers'
 import { modelLogo as logoFor, modelCapabilityText } from '../utils/modelLogo'
 import type {
   AgentWritePreview, ChatContentPart, ChatMessage, ImageDetail, ModelSelection,
-  RetrievedChunk, PaperIndexEntry, PaperVectorizeInput, ChunkInput, ServerToolTrace,
+  RetrievedChunk, PaperIndexEntry, ServerToolTrace,
 } from '../types'
 
-const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'rag' | 'agent'] }>()
+const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'agent'] }>()
 import {
   ATTACHMENT_ACCEPT, buildContentParts, readAttachmentFile, type Attachment,
 } from '../utils/attachments'
@@ -38,75 +36,57 @@ const { t } = useI18n()
 // gutter and render our own window controls (see WindowControls).
 const isWindows = navigator.userAgent.toLowerCase().includes('windows')
 const ai = useAiStore()
-const ragStore = useRagStore()
 const settingsStore = useSettingsStore()
 
-// ── RAG vectorization status ───────────────────────────────────────────────────
+// ── Paper list (for the pinned-papers picker) ─────────────────────────────────
+//
+// Vectorizing papers used to live in this window's header, next to the old
+// "文献库RAG" mode. Chat no longer reads the vector store at all: vectors only
+// feed the 向量图谱, and vectorizing is done from the paper list, a
+// collection's menu, or 设置 → AI 随航 → RAG / 向量化.
 const allPapers = ref<PaperIndexEntry[]>([])
-const syncingMissing = ref(false)
-const syncProgress = ref({ done: 0, total: 0, failed: 0 })
-const refreshingCounts = ref(false)
-let syncCancelRequested = false
+/** Whether `allPapers` has been read at least once for this library. Until then
+ *  an empty list means "not known yet", not "every pin is gone". */
+const paperListLoaded = ref(false)
 
-const vectorizedCount = computed(() => ragStore.storeInfo?.unique_papers ?? 0)
-const unvectorizedPapers = computed(() => allPapers.value.filter(p => !p.status.vectorized))
+// Concurrent refreshes (the picker opening, a library-updated burst, a pin
+// request with an unknown slug) share one read. A call that lands while a read
+// is in flight marks it dirty, so the shared promise resolves only after a read
+// that started after that call — callers that await it see a current list.
+let paperListLoad: Promise<void> | null = null
+let paperListDirty = false
 
-async function loadPaperCounts() {
-  try {
-    allPapers.value = await invoke<PaperIndexEntry[]>('list_papers')
-  } catch { /* no library open */ }
-}
-
-async function refreshCounts() {
-  if (refreshingCounts.value) return
-  refreshingCounts.value = true
-  const t0 = Date.now()
-  try {
-    await invoke('sync_vectorized_flags')
-    await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts(), loadSnippetStoreCounts()])
-  } finally {
-    const remaining = 700 - (Date.now() - t0)
-    if (remaining > 0) await new Promise(r => setTimeout(r, remaining))
-    refreshingCounts.value = false
+function loadPaperCounts(): Promise<void> {
+  if (paperListLoad) {
+    paperListDirty = true
+    return paperListLoad
   }
+  paperListLoad = (async () => {
+    try {
+      do {
+        paperListDirty = false
+        try {
+          allPapers.value = await invoke<PaperIndexEntry[]>('list_papers')
+          paperListLoaded.value = true
+        } catch { /* no library open */ }
+      } while (paperListDirty)
+    } finally {
+      paperListLoad = null
+    }
+  })()
+  return paperListLoad
 }
 
-async function syncMissing() {
-  if (syncingMissing.value || !ragStore.isConfigured) return
-  syncingMissing.value = true
-  syncCancelRequested = false
-  const papers = unvectorizedPapers.value.slice()
-  syncProgress.value = { done: 0, total: papers.length, failed: 0 }
-  emitTo('main', 'rag-embed-progress', { syncing: true, done: 0, total: papers.length }).catch(() => {})
-
-  const s = ragStore.settings
-  let done = 0, failed = 0
-  // Small worker pool — embedding API latency dominates, so a few papers
-  // in flight at once give a near-linear speedup.
-  const CONCURRENCY = 3
-  const queue = [...papers]
-  const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
-    while (!syncCancelRequested) {
-      const paper = queue.shift()
-      if (!paper) break
-      try {
-        const input = await invoke<PaperVectorizeInput>('get_paper_vectorize_input', { slug: paper.slug })
-        const chunks: ChunkInput[] = await buildChunks(input, s.chunk_size ?? 512, s.chunk_overlap ?? 50)
-        if (chunks.length === 0) { failed++; syncProgress.value = { done, total: papers.length, failed }; continue }
-        await invoke('embed_and_store_chunks', {
-          slug: paper.slug, paperId: input.paper_id, paperTitle: input.paper_title, chunks,
-        })
-        paper.status.vectorized = true
-        done++
-      } catch { failed++ }
-      syncProgress.value = { done, total: papers.length, failed }
-      emitTo('main', 'rag-embed-progress', { syncing: true, done, total: papers.length }).catch(() => {})
-    }
-  })
-  await Promise.all(workers)
-  syncingMissing.value = false
-  emitTo('main', 'rag-embed-progress', { syncing: false, done, total: papers.length }).catch(() => {})
-  await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts()])
+// Papers added from another window (URL import, arXiv) announce themselves with
+// `library-updated`, one event per paper — an arXiv batch sends a burst, so the
+// re-read waits for it to settle.
+let paperListRefreshTimer: ReturnType<typeof setTimeout> | null = null
+function schedulePaperListRefresh() {
+  if (paperListRefreshTimer) clearTimeout(paperListRefreshTimer)
+  paperListRefreshTimer = setTimeout(() => {
+    paperListRefreshTimer = null
+    void loadPaperCounts()
+  }, 400)
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -193,6 +173,9 @@ interface LibraryAnswerVariant {
    *  complete one — the model is asked to admit the gap, and routinely does
    *  not. */
   agentLimit?: { rounds: number; max: number }
+  /** Set when the agent could not take this question and it was answered
+   *  without tools instead — kept so the notice survives a reload. */
+  agentFallback?: AgentFallback
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
@@ -244,6 +227,9 @@ interface LibraryUiMessage {
    *  complete one — the model is asked to admit the gap, and routinely does
    *  not. */
   agentLimit?: { rounds: number; max: number }
+  /** Set when the agent could not take this question and it was answered
+   *  without tools instead — kept so the notice survives a reload. */
+  agentFallback?: AgentFallback
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
@@ -254,17 +240,38 @@ interface LibraryUiMessage {
   endedAt?: number
 }
 
+/**
+ * Why a question was answered without tools, and what it was answered from.
+ *
+ * `reason`: the model takes no tools (`no_tools`), the provider refused them
+ * on the first call (`rejected`), DeepSeek's web search was on (`web_search`),
+ * or a spoken reply was on (`speech`). `mode`: the pinned papers' text
+ * (`papers`) or nothing (`none`). `library` is legacy — the fallback used to
+ * retrieve passages from the vector store — and is never sent now, but
+ * conversations saved back then still carry it (and the passages it found, in
+ * `sources`), so it has to keep rendering.
+ */
+interface AgentFallback {
+  reason: 'no_tools' | 'rejected' | 'web_search' | 'speech'
+  mode: 'papers' | 'none' | 'library'
+  papers?: number
+  /** The provider's own words, when it refused the tools. */
+  detail?: string | null
+}
+
 interface LibraryConversation {
   id: string
   title: string
   messages: LibraryUiMessage[]
+  /** Papers pinned to this conversation. The field predates pins: it held the
+   *  old "文献库论文" mode's selection, which is exactly what a pin is now. */
   selectedPaperSlugs: string[]
   createdAt: string
   updatedAt: string
 }
 
 interface AgentEventPayload {
-  phase: 'thinking' | 'tool' | 'result' | 'answering' | 'limit' | 'servers' | 'evicted'
+  phase: 'thinking' | 'tool' | 'result' | 'answering' | 'limit' | 'servers' | 'evicted' | 'fallback'
   round?: number
   /** `limit` phase: rounds of tools actually run, and the budget they hit. */
   rounds?: number
@@ -287,6 +294,11 @@ interface AgentEventPayload {
   failed?: { name: string; error: string }[]
   /** `evicted` phase: how many old tool results were dropped this round. */
   dropped?: number
+  /** `fallback` phase: see `AgentFallback`. */
+  reason?: AgentFallback['reason']
+  mode?: AgentFallback['mode']
+  papers?: number
+  detail?: string | null
 }
 
 /** Expanded agent steps, keyed by `${answerId}:${index}`. Collapsed by default:
@@ -365,15 +377,23 @@ interface StreamUsagePayload {
 
 const STORAGE_KEY = 'argus.library-chats.v1'
 const LAST_MODEL_KEY = 'argus.library-chat.last-model'
-const KNOWLEDGE_SOURCE_KEY = 'argus.library-chat.knowledge-source.v2'
+// The old knowledge-source picker's choice. Nothing reads it any more; kept so
+// the value can be cleared rather than left behind in storage forever.
+const LEGACY_KNOWLEDGE_SOURCE_KEYS = [
+  'argus.library-chat.knowledge-source.v2',
+  'argus.library-chat.knowledge-source',
+]
 
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7)
 }
 
+/** The most papers one conversation can pin — the backend caps it the same. */
+const MAX_PINNED_PAPERS = 50
+
 function normalizeSelectedPaperSlugs(value: unknown): string[] {
   if (!Array.isArray(value)) return []
-  return [...new Set(value.filter((v): v is string => typeof v === 'string'))].slice(0, 50)
+  return [...new Set(value.filter((v): v is string => typeof v === 'string'))].slice(0, MAX_PINNED_PAPERS)
 }
 
 function normalizeConversations(parsed: unknown): LibraryConversation[] {
@@ -568,13 +588,53 @@ const selectedModel = ref<ModelSelection | null>(null)
 const modelMenuOpen = ref(false)
 const modelMenuRoot = ref<HTMLElement | null>(null)
 const expandedSources = ref<string[]>([])
-const sidebarOpen = ref(true)
 const editingMsgId = ref<string | null>(null)
 const editingText = ref('')
 const copiedMsgIds = ref(new Set<string>())
 const modelPickerMsgId = ref<string | null>(null)
 const modelPickerPos = ref<{ top: number; left: number }>({ top: 0, left: 0 })
 const expandedContextId = ref<string | null>(null)
+
+// ── Answers given without tools ──────────────────────────────────────────────
+//
+// All O(1): these run from the template, once per answer per render.
+
+const FALLBACK_REASON_TEXT: Record<AgentFallback['reason'], string> = {
+  no_tools: '当前模型不支持工具调用，这次按普通对话回答',
+  rejected: '服务商拒绝了工具调用参数，这次按普通对话回答',
+  web_search: 'DeepSeek 的联网搜索不能和文献库工具同时使用，这次先联网、按普通对话回答',
+  speech: '语音回复不能和文献库工具同时使用，这次按普通对话回答',
+}
+
+function fallbackText(a: LibraryAnswerVariant | LibraryUiMessage): string {
+  const f = a.agentFallback
+  if (!f) return ''
+  let tail: string
+  const legacyPassages = f.mode === 'library' ? (a.sources?.length ?? 0) : 0
+  if (f.mode === 'papers') {
+    tail = `，已把固定的 ${f.papers ?? 0} 篇文献发给模型`
+  } else if (legacyPassages > 0) {
+    // A conversation saved when the fallback still retrieved passages. Said
+    // from what it actually used — the passages are listed under the answer —
+    // and not as something this chat can still do.
+    tail = `，参考了文献库中的 ${legacyPassages} 段内容`
+  } else {
+    // `none`, and a legacy `library` answer that found nothing: either way the
+    // model answered from the conversation alone.
+    tail = '，没有查阅文献库'
+  }
+  return FALLBACK_REASON_TEXT[f.reason] + tail + '。'
+}
+
+function fallbackTitle(f: AgentFallback): string {
+  const switchModel = '换用支持工具调用的模型（如 DeepSeek、通义千问，或 OpenRouter 上的多数模型），它就能自己查文献库和素材库。'
+  switch (f.reason) {
+    case 'rejected': return [f.detail, '本次不再尝试工具调用，下次提问会重新尝试。', switchModel].filter(Boolean).join('\n')
+    case 'web_search': return '想让模型同时查文献库，关掉联网搜索即可。'
+    case 'speech': return '想让模型自己查文献库，可在 设置 → AI 供应商 里选中这个服务商，在「语音回复」下关掉「让模型开口说话」。'
+    default: return switchModel
+  }
+}
 
 // ── Agent write confirmations ────────────────────────────────────────────────
 //
@@ -608,20 +668,6 @@ const modelPickerMsg = computed(() =>
     : undefined
 )
 
-// ── Knowledge source picker ───────────────────────────────────────────────────
-/** 'none' = plain conversation, no library context at all. */
-type KnowledgeSource = 'paper-rag' | 'papers' | 'snippets' | 'agent' | 'none'
-
-function loadKnowledgeSource(): KnowledgeSource {
-  const saved = localStorage.getItem(KNOWLEDGE_SOURCE_KEY)
-  if (saved === 'papers' || saved === 'paper-rag' || saved === 'snippets' || saved === 'agent' || saved === 'none') return saved
-  return 'paper-rag'
-}
-
-const knowledgeSource = ref<KnowledgeSource>(loadKnowledgeSource())
-
-const sourcePickerOpen = ref(false)
-
 // Server-side web search: DeepSeek exposes it via its Responses API, Qwen via an
 // `enable_search` flag on the standard chat body, MiMo and GLM as a tool the
 // platform runs for itself. StepFun does both — a tool for most of its models,
@@ -647,6 +693,12 @@ const webSearchAvailable = computed(() => {
     || url.includes('stepfun')
 })
 watch(webSearchAvailable, (ok) => { if (!ok) useWebSearch.value = false })
+const webSearchTitle = computed(() => {
+  if (useWebSearch.value && isDeepSeekSelected.value) {
+    return '联网搜索：已开启。DeepSeek 联网时不能同时调用文献库工具，开启期间按普通对话 + 联网回答'
+  }
+  return useWebSearch.value ? '联网搜索：已开启' : '联网搜索：让模型在回答前检索网页'
+})
 /** Live server-side search phase while a turn is running. */
 const webSearchPhase = ref<string | null>(null)
 
@@ -696,7 +748,7 @@ const keepaliveTitle = computed(() => {
     `下次提问会命中缓存，按缓存价计费而不是重读整段对话。`,
     k.pings ? `已续期 ${k.pings} 次` : '尚未续期',
     left !== null ? `· 约 ${left} 分钟后自动停止` : '',
-    '关闭窗口或切换知识库来源也会停止。',
+    '关闭窗口也会停止。可在 设置 → AI 随航 → Agent 与工具 →「保持上下文缓存」里关闭。',
   ].filter(Boolean).join('\n')
 })
 
@@ -757,38 +809,6 @@ const selectedPaperSlugs = computed(() => {
   return conv?.selectedPaperSlugs ?? []
 })
 
-function setKnowledgeSource(src: KnowledgeSource) {
-  knowledgeSource.value = src
-  sourcePickerOpen.value = false
-  try { localStorage.setItem(KNOWLEDGE_SOURCE_KEY, src) } catch {}
-  // Only agent mode arms the prompt-cache keepalive, so leaving it should stop
-  // the spend now rather than after the backend's hour-long fallback.
-  if (src !== 'agent') {
-    keepalive.value = { active: false }
-    invoke('disarm_cache_keepalive').catch(() => {})
-  }
-}
-
-// "文献库论文" rather than plain "文献库" — next to "文献库RAG" in the picker the
-// shorter name read like the category the other option belonged to.
-const knowledgeSourceLabel = computed(() => {
-  switch (knowledgeSource.value) {
-    case 'snippets': return '素材库'
-    case 'paper-rag': return '文献库RAG'
-    case 'agent': return 'Agent 模式'
-    case 'none': return '不使用知识库'
-    default: return '文献库论文'
-  }
-})
-
-// RAG (an embedding provider + vector store) is only used by the two modes that
-// retrieve by similarity: 文献库RAG and 素材库. Agent mode reaches for tools,
-// 文献库论文 injects the papers you pick, and 不使用知识库 sends no context — none
-// of them touch RAG, so a "RAG 未配置" warning in those modes is just noise.
-const knowledgeSourceNeedsRag = computed(
-  () => knowledgeSource.value === 'paper-rag' || knowledgeSource.value === 'snippets'
-)
-
 function setActiveSelectedPaperSlugs(slugs: string[]) {
   const conv = conversations.value.find(c => c.id === activeConvId.value)
   if (!conv) return
@@ -800,6 +820,42 @@ const selectedPapers = computed(() => {
   const bySlug = new Map(allPapers.value.map(p => [p.slug, p]))
   return selectedPaperSlugs.value.map(slug => bySlug.get(slug)).filter((p): p is PaperIndexEntry => !!p)
 })
+/**
+ * Pins whose paper is no longer in the library (deleted, or renamed to a new
+ * slug). They stay in the stored conversation — the list may just be stale —
+ * but are never sent, and the picker offers to drop them.
+ */
+const stalePinCount = computed(() =>
+  paperListLoaded.value ? selectedPaperSlugs.value.length - selectedPapers.value.length : 0)
+
+/** Of these pins, the ones still in the library — what a question sends. */
+function livePinnedSlugs(slugs: string[]): string[] {
+  // Before the first read there is nothing to judge by; the backend drops
+  // unknown slugs itself, so sending them unfiltered is safe.
+  if (!paperListLoaded.value) return slugs
+  const known = new Set(allPapers.value.map(p => p.slug))
+  return slugs.filter(s => known.has(s))
+}
+
+/**
+ * The stored pins to extend by `adding` papers. A dead pin still holds a slot,
+ * so when the cap would turn a live paper away the dead ones make room first.
+ * Otherwise they are left where they are.
+ */
+function pinsToExtend(adding: number): string[] {
+  const current = selectedPaperSlugs.value
+  if (current.length + adding <= MAX_PINNED_PAPERS) return current
+  return livePinnedSlugs(current)
+}
+/**
+ * The cap is reached for one more paper — the same test `addSelectedPaper`
+ * makes (dead pins give up their slots first), so the picker can say so
+ * instead of a click on an unpinned paper doing nothing.
+ */
+const pinLimitReached = computed(() => pinsToExtend(1).length >= MAX_PINNED_PAPERS)
+const pinLimitNotice = `最多固定 ${MAX_PINNED_PAPERS} 篇，先取消一些再添加`
+/** Hover text for the pinned counter — computed so the template stays O(1). */
+const pinnedTitles = computed(() => selectedPapers.value.map(p => p.title).join('\n'))
 
 const pickerPapers = computed(() => {
   const q = paperPickerSearch.value.trim().toLowerCase()
@@ -814,16 +870,19 @@ const pickerPapers = computed(() => {
 
 function openPaperPicker() {
   paperPickerSearch.value = ''
-  // The dialog is "添加文献", so it opens on the list you add from.
+  // The dialog is "固定文献", so it opens on the list you pin from.
   pickerTab.value = 'available'
   paperPickerOpen.value = true
+  // Papers imported or deleted in the main window since this one opened.
+  void loadPaperCounts()
 }
 
 function addSelectedPaper(paper: PaperIndexEntry) {
-  // Adding a paper to the chat context isn't "reading" — don't touch recency.
-  if (!selectedPaperSlugs.value.includes(paper.slug)) {
-    setActiveSelectedPaperSlugs([...selectedPaperSlugs.value, paper.slug])
-  }
+  // Pinning a paper isn't "reading" it — don't touch recency.
+  if (selectedPaperSlugs.value.includes(paper.slug)) return
+  const base = pinsToExtend(1)
+  if (base.length >= MAX_PINNED_PAPERS) return
+  setActiveSelectedPaperSlugs([...base, paper.slug])
 }
 
 function removeSelectedPaper(slug: string) {
@@ -840,23 +899,45 @@ function toggleSelectedPaper(paper: PaperIndexEntry) {
   }
 }
 
+/** Clears the stored list itself, dead pins included. */
 function clearSelectedPapers() {
   setActiveSelectedPaperSlugs([])
 }
 
+/** Drops only the pins whose paper has left the library. */
+function removeStalePins() {
+  setActiveSelectedPaperSlugs(livePinnedSlugs(selectedPaperSlugs.value))
+}
+
 /**
- * Papers sent over from the relation graph's context menu. Declined (null) when
- * the chat isn't on the 文献库论文 source — adding them to a context that isn't
- * being used would look like it silently did nothing.
+ * Papers sent over from the relation graph's context menu, pinned to the open
+ * conversation. Always accepted now that pins are not a mode the chat has to be
+ * in; `null` (declined) remains part of the protocol for older senders.
+ *
+ * A slug this window does not know is usually a paper imported after the list
+ * was read, so the list is re-read once before giving up on it; what is still
+ * unknown after that is reported back as `unknown`, never pinned.
  */
-function applyPapersFromGraph(slugs: string[]) {
-  if (knowledgeSource.value !== 'papers') return null
-  const known = new Set(allPapers.value.map(p => p.slug))
+async function applyPapersFromGraph(slugs: string[]) {
+  const requested = [...new Set(slugs)]
+  let known = new Set(allPapers.value.map(p => p.slug))
+  if (requested.some(s => !known.has(s))) {
+    await loadPaperCounts()
+    known = new Set(allPapers.value.map(p => p.slug))
+  }
+  const incoming = requested.filter(s => known.has(s))
   const current = new Set(selectedPaperSlugs.value)
-  const incoming = slugs.filter(s => known.has(s))
-  const fresh = incoming.filter(s => !current.has(s))
-  if (fresh.length) setActiveSelectedPaperSlugs([...selectedPaperSlugs.value, ...fresh])
-  return { added: fresh.length, alreadyPresent: incoming.length - fresh.length }
+  const unpinned = incoming.filter(s => !current.has(s))
+  const base = pinsToExtend(unpinned.length)
+  const room = Math.max(0, MAX_PINNED_PAPERS - base.length)
+  const fresh = unpinned.slice(0, room)
+  if (fresh.length) setActiveSelectedPaperSlugs([...base, ...fresh])
+  return {
+    added: fresh.length,
+    alreadyPresent: incoming.length - unpinned.length,
+    overLimit: unpinned.length - fresh.length,
+    unknown: requested.length - incoming.length,
+  }
 }
 
 // The picker used to interleave chosen and unchosen papers, so finding what was
@@ -872,58 +953,6 @@ const pickerUnselectedPapers = computed(() =>
   pickerPapers.value.filter(p => !selectedPaperSlugs.value.includes(p.slug)))
 const pickerVisiblePapers = computed(() =>
   pickerTab.value === 'added' ? pickerSelectedPapers.value : pickerUnselectedPapers.value)
-
-// ── Snippet store state ───────────────────────────────────────────────────────
-const snippetEmbeddedCount  = ref(0)
-const snippetTotalCount     = ref(0)
-const snippetSyncing        = ref(false)
-const snippetSyncProgress   = ref({ done: 0, total: 0, failed: 0 })
-let   snippetSyncCancel     = false
-
-async function loadSnippetStoreCounts() {
-  try {
-    const [info, allLibs] = await Promise.all([
-      invoke<{ embedded_count: number }>('get_snippet_store_info'),
-      invoke<{ id: string }[]>('list_snippet_libraries'),
-    ])
-    snippetEmbeddedCount.value = info.embedded_count
-
-    // Count total snippets across all libraries
-    let total = 0
-    for (const lib of allLibs) {
-      const snips = await invoke<unknown[]>('get_snippets', { libraryId: lib.id })
-      total += snips.length
-    }
-    snippetTotalCount.value = total
-  } catch { /* no library open */ }
-}
-
-async function syncSnippets() {
-  if (snippetSyncing.value || !ragStore.isConfigured) return
-  snippetSyncing.value = true
-  snippetSyncCancel = false
-  snippetSyncProgress.value = { done: 0, total: snippetTotalCount.value - snippetEmbeddedCount.value, failed: 0 }
-  // Live progress from the backend while batches are embedded
-  const unlistenProgress = await listen<{ done: number; failed: number; total: number }>(
-    'snippet-embed-progress',
-    (ev) => {
-      snippetSyncProgress.value = {
-        done: ev.payload.done,
-        total: ev.payload.total,
-        failed: ev.payload.failed,
-      }
-    },
-  )
-  try {
-    const [done, failed] = await invoke<[number, number]>('embed_all_snippets')
-    snippetSyncProgress.value = { done, total: done + failed, failed }
-    await loadSnippetStoreCounts()
-  } catch { /* ignore */ }
-  finally {
-    unlistenProgress()
-    snippetSyncing.value = false
-  }
-}
 
 function openModelPicker(msgId: string, e: MouseEvent) {
   if (modelPickerMsgId.value === msgId) {
@@ -1149,8 +1178,7 @@ function clearNavHover() {
 const canSend = computed(() =>
   (input.value.trim().length > 0 || attachments.value.length > 0) &&
   !loading.value &&
-  ai.isConfigured &&
-  (knowledgeSource.value !== 'papers' || selectedPaperSlugs.value.length > 0)
+  ai.isConfigured
 )
 const conversationSubtitle = computed(() => {
   if (!activeConv.value) return ''
@@ -1619,7 +1647,6 @@ function resetNewConversationContext() {
   input.value = ''
   paperPickerOpen.value = false
   paperPickerSearch.value = ''
-  sourcePickerOpen.value = false
   modelPickerMsgId.value = null
   expandedSources.value = []
   expandedContextId.value = null
@@ -1855,6 +1882,7 @@ async function runAssistantRequest(
   target.agentServerErrors = undefined
   target.agentEvicted = undefined
   target.agentLimit = undefined
+  target.agentFallback = undefined
   target.inputTokens = undefined
   target.outputTokens = undefined
   target.totalTokens = undefined
@@ -1908,7 +1936,22 @@ async function runAssistantRequest(
       // A server the user configured but that would not start. Silence here
       // would look like the model simply chose not to use it.
       if (p.failed?.length) target.agentServerErrors = p.failed
+    } else if (p.phase === 'fallback') {
+      // This model cannot take the question through tools, so it is being
+      // answered the old way. Said on the answer, not in a toast: it explains
+      // why this reply has no tool trail and may not have read the library.
+      target.agentFallback = {
+        reason: p.reason ?? 'no_tools',
+        mode: p.mode ?? 'none',
+        papers: p.papers ?? 0,
+        detail: p.detail ?? null,
+      }
+      persistConvSoon(conv, streamEpoch)
     } else if (p.phase === 'tool') {
+      // A search the platform ran before the first round is over by the time
+      // the model reaches for a tool. Only DeepSeek reports its search phases;
+      // everyone else would otherwise show "searching" for the whole answer.
+      if (webSearchPhase.value) webSearchPhase.value = null
       target.agentSteps.push({
         tool: p.tool ?? '',
         server: p.server ?? undefined,
@@ -2001,15 +2044,19 @@ async function runAssistantRequest(
     if (stoppedTargetIds.has(target.id)) return
     const delta = e.payload.delta ?? ''
     if (!delta) return
+    // Text is arriving, so any search that preceded it has finished.
+    if (webSearchPhase.value) webSearchPhase.value = null
     target.content += delta
     // Throttle the heavy markdown render instead of re-rendering every token.
     scheduleStreamRender(target)
   }))
 
   try {
-    const requestPaperSlugs = knowledgeSource.value === 'papers'
-      ? normalizeSelectedPaperSlugs(conv.selectedPaperSlugs)
-      : []
+    // Pins travel with every question: the backend renders them into the
+    // stable block the model sees before the conversation. Only the ones still
+    // in the library go — a deleted paper's slug would make the tool-free
+    // fallback answer "selected papers not found". The stored list is untouched.
+    const requestPaperSlugs = livePinnedSlugs(normalizeSelectedPaperSlugs(conv.selectedPaperSlugs))
     // DeepSeek only exposes two levels; the backend maps 'medium'->high, 'high'->max.
     const provider = ai.settings.providers.find(p => p.id === sel?.providerId)
     const isDeepseek = !!provider?.base_url.toLowerCase().includes('deepseek')
@@ -2022,17 +2069,21 @@ async function runAssistantRequest(
       modelId: sel?.modelId ?? null,
       eventName,
       sourcesEventName,
-      knowledgeSource: knowledgeSource.value,
+      // The one mode: the model drives its own retrieval.
+      knowledgeSource: 'agent',
       selectedPaperSlugs: requestPaperSlugs,
       attachments: null,
       useReasoning: useReasoning.value,
       reasoningEffort: useReasoning.value ? effortToSend : null,
       requestId,
       webSearch: useWebSearch.value && webSearchAvailable.value,
-      // null = use the budget configured in 设置 → 智能问答. Passing it from here
+      // null = use the budget configured in 设置 → AI 随航 → Agent 与工具. Passing it from here
       // would pin the value read when this window opened.
       agentMaxRounds: null,
       conversationId: conv.id,
+      // A model that cannot take tools gets a tool-free answer and a notice,
+      // instead of an error on every question.
+      plainFallback: true,
     })
     // If the user pressed stop, don't refill content the backend produced anyway.
     if (!stoppedTargetIds.has(target.id)) {
@@ -2315,9 +2366,6 @@ function closeModelMenu(e: MouseEvent) {
   if (!target.closest('.msg-model-picker') && !target.closest('.msg-model-menu-teleport')) {
     modelPickerMsgId.value = null
   }
-  if (!target.closest('.ks-picker')) {
-    sourcePickerOpen.value = false
-  }
   if (!target.closest('.reasoning-picker')) {
     reasoningOpen.value = false
   }
@@ -2353,6 +2401,7 @@ async function refreshConversations() {
 }
 
 let unlistenLibraryChanged: UnlistenFn | null = null
+let unlistenLibraryUpdated: UnlistenFn | null = null
 let unlistenAddPapers: UnlistenFn | null = null
 let unlistenKeepalive: UnlistenFn | null = null
 
@@ -2362,8 +2411,10 @@ onMounted(async () => {
 
   if (!ai.loaded) await ai.load()
   restoreLastModel()
-  if (!ragStore.loaded) await ragStore.load()
-  await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts(), loadSnippetStoreCounts()])
+  await loadPaperCounts()
+  for (const key of LEGACY_KNOWLEDGE_SOURCE_KEYS) {
+    try { localStorage.removeItem(key) } catch { /* storage unavailable */ }
+  }
   document.addEventListener('mousedown', closeModelMenu)
 
   messagesEl.value?.addEventListener('copy-code', onCopyCode)
@@ -2379,11 +2430,15 @@ onMounted(async () => {
     stopAllStreaming()
     resetNewConversationContext()
     await ai.load()
-    await ragStore.load()
     restoreLastModel()
-    await Promise.all([ragStore.loadStoreInfo(), loadPaperCounts(), loadSnippetStoreCounts()])
+    // The old library's list says nothing about the new one's pins.
+    paperListLoaded.value = false
+    allPapers.value = []
+    await loadPaperCounts()
     await refreshConversations()
   })
+
+  unlistenLibraryUpdated = await listen('library-updated', schedulePaperListRefresh)
 
   unlistenAddPapers = await serveAddPapersToChat(applyPapersFromGraph)
 
@@ -2420,6 +2475,8 @@ onUnmounted(() => {
   }
   pendingPersists.clear()
   unlistenLibraryChanged?.()
+  unlistenLibraryUpdated?.()
+  if (paperListRefreshTimer) clearTimeout(paperListRefreshTimer)
   unlistenAddPapers?.()
   unlistenKeepalive?.()
   if (keepaliveClock) clearInterval(keepaliveClock)
@@ -2442,58 +2499,15 @@ onUnmounted(() => {
         </div>
         <div class="lc-titlebar-fill" data-tauri-drag-region />
         <div class="lc-titlebar-actions">
-          <!-- RAG not configured — only the RAG-backed modes (文献库RAG / 素材库). -->
-          <button v-if="knowledgeSourceNeedsRag && !ragStore.isConfigured" class="rag-badge inactive" title="点击配置 RAG" @click="emit('open-settings', 'rag')">
-            <Icon icon="fluent:database-24-regular" width="11" height="11" />
-            RAG
-          </button>
-          <template v-else-if="knowledgeSource === 'papers'">
-            <div class="paper-context-counter" :title="selectedPapers.map(p => p.title).join('\n') || '尚未添加文献'">
-              {{ selectedPapers.length }} 篇
+          <!-- Papers pinned to this conversation. Shown only when there are
+               some: the count is the reminder that they shape every answer. -->
+          <template v-if="selectedPapers.length">
+            <div class="paper-context-counter" :title="pinnedTitles">
+              <Icon icon="fluent:pin-24-regular" width="11" height="11" />
+              已固定 {{ selectedPapers.length }} 篇
             </div>
-            <button class="rag-refresh-btn" title="添加文献" @click="openPaperPicker">
-              <Icon icon="fluent:add-24-regular" width="15" height="15" />
-            </button>
-          </template>
-          <template v-else-if="knowledgeSource === 'snippets'">
-            <!-- Snippet RAG controls -->
-            <span v-if="snippetSyncing" class="rag-sync-progress">{{ snippetSyncProgress.done }}/{{ snippetSyncProgress.total }}</span>
-            <button class="rag-refresh-btn" :class="{ refreshing: snippetSyncing }" title="刷新素材库嵌入状态" :disabled="snippetSyncing" @click="loadSnippetStoreCounts">
-              <Icon icon="fluent:arrow-sync-24-regular" width="15" height="15" />
-            </button>
-            <div class="rag-counter" title="素材库：已嵌入素材 / 总素材数">
-              <Icon icon="fluent:database-24-regular" width="11" height="11" />
-              <span class="rag-counter-text">{{ snippetEmbeddedCount }}/{{ snippetTotalCount }}</span>
-            </div>
-            <button
-              class="rag-sync-btn"
-              :class="{ 'all-done': snippetEmbeddedCount >= snippetTotalCount && snippetTotalCount > 0 }"
-              :title="snippetEmbeddedCount < snippetTotalCount ? `嵌入 ${snippetTotalCount - snippetEmbeddedCount} 条未向量化的素材` : '所有素材已嵌入'"
-              :disabled="snippetSyncing || (snippetEmbeddedCount >= snippetTotalCount && snippetTotalCount > 0)"
-              @click="syncSnippets"
-            >
-              <Icon v-if="snippetEmbeddedCount < snippetTotalCount" icon="fluent:cloud-arrow-up-24-regular" width="11" height="11" />
-              <Icon v-else icon="fluent:checkmark-24-regular" width="11" height="11" />
-              {{ snippetSyncing ? '嵌入中…' : snippetEmbeddedCount < snippetTotalCount ? `嵌入 ${snippetTotalCount - snippetEmbeddedCount} 条` : '已全部嵌入' }}
-            </button>
-          </template>
-          <!-- Paper RAG controls -->
-          <template v-else-if="knowledgeSource === 'paper-rag'">
-            <span v-if="syncingMissing" class="rag-sync-progress">{{ syncProgress.done }}/{{ syncProgress.total }}</span>
-            <button class="rag-refresh-btn" :class="{ refreshing: refreshingCounts || syncingMissing }" title="刷新嵌入状态" :disabled="refreshingCounts || syncingMissing" @click="refreshCounts">
-              <Icon icon="fluent:arrow-sync-24-regular" width="15" height="15" />
-            </button>
-            <div class="rag-counter" title="向量库：已嵌入论文 / 总论文数">
-              <Icon icon="fluent:database-24-regular" width="11" height="11" />
-              <span class="rag-counter-text">{{ vectorizedCount }}/{{ allPapers.length }}</span>
-            </div>
-            <template v-if="syncingMissing">
-              <button class="rag-sync-cancel" @click="syncCancelRequested = true" title="取消同步"><Icon icon="fluent:dismiss-24-regular" width="11" height="11" /></button>
-            </template>
-            <button v-else class="rag-sync-btn" :class="{ 'all-done': unvectorizedPapers.length === 0 }" :title="unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇未向量化的论文` : '所有论文已嵌入'" :disabled="unvectorizedPapers.length === 0" @click="syncMissing">
-              <Icon v-if="unvectorizedPapers.length > 0" icon="fluent:cloud-arrow-up-24-regular" width="11" height="11" />
-              <Icon v-else icon="fluent:checkmark-24-regular" width="11" height="11" />
-              {{ unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇` : '已全部嵌入' }}
+            <button class="rag-refresh-btn" title="管理固定文献" @click="openPaperPicker">
+              <Icon icon="fluent:edit-24-regular" width="14" height="14" />
             </button>
           </template>
           <div ref="modelMenuRoot" class="lc-model-picker">
@@ -2604,140 +2618,6 @@ onUnmounted(() => {
       <!-- ── Main area ───────────────────────────────────────────────────────── -->
       <div class="lc-main">
 
-        <!-- REMOVED: chat-header moved to lc-titlebar -->
-        <div class="chat-header" style="display:none">
-          <div class="tl-space" data-tauri-drag-region />
-          <div class="header-left">
-            <button class="sidebar-toggle-btn" @click="sidebarOpen = !sidebarOpen" :title="sidebarOpen ? '收起' : '展开'">
-              <Icon icon="fluent:panel-left-24-regular" width="15" height="15" />
-            </button>
-            <div class="header-avatar">
-              <Icon icon="fluent:chat-24-regular" width="16" height="16" />
-            </div>
-            <div class="header-title-block">
-              <span class="header-conv-title">{{ activeConv?.title || t('libraryChat.untitled') }}</span>
-              <span class="header-subtitle">{{ conversationSubtitle }}</span>
-            </div>
-          </div>
-          <div class="header-right">
-            <!-- RAG not configured: show badge to open settings -->
-            <button
-              v-if="!ragStore.isConfigured"
-              class="rag-badge inactive"
-              title="点击配置 RAG"
-              @click="emit('open-settings', 'rag')"
-            >
-              <Icon icon="fluent:database-24-regular" width="11" height="11" />
-              RAG
-            </button>
-
-            <!-- RAG configured: show vectorization status + sync button -->
-            <template v-else>
-              <!-- Syncing progress (left of refresh button) -->
-              <span v-if="syncingMissing" class="rag-sync-progress">
-                {{ syncProgress.done }}/{{ syncProgress.total }}
-              </span>
-
-              <!-- Refresh button (moved to left) -->
-              <button
-                class="rag-refresh-btn"
-                :class="{ refreshing: refreshingCounts || syncingMissing }"
-                title="刷新嵌入状态"
-                :disabled="refreshingCounts || syncingMissing"
-                @click="refreshCounts"
-              >
-                <Icon icon="fluent:arrow-sync-24-regular" width="15" height="15" />
-              </button>
-
-              <div class="rag-counter" title="向量库：已嵌入论文 / 总论文数">
-                <Icon icon="fluent:database-24-regular" width="11" height="11" />
-                <span class="rag-counter-text">{{ vectorizedCount }}/{{ allPapers.length }}</span>
-              </div>
-
-              <!-- Syncing: cancel button -->
-              <template v-if="syncingMissing">
-                <button class="rag-sync-cancel" @click="syncCancelRequested = true" title="取消同步">
-                  <Icon icon="fluent:dismiss-24-regular" width="11" height="11" />
-                </button>
-              </template>
-
-              <!-- Sync missing / all-done button -->
-              <button
-                v-else
-                class="rag-sync-btn"
-                :class="{ 'all-done': unvectorizedPapers.length === 0 }"
-                :title="unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇未向量化的论文` : '所有论文已嵌入'"
-                :disabled="unvectorizedPapers.length === 0"
-                @click="syncMissing"
-              >
-                <Icon v-if="unvectorizedPapers.length > 0" icon="fluent:cloud-arrow-up-24-regular" width="11" height="11" />
-                <Icon v-else icon="fluent:checkmark-24-regular" width="11" height="11" />
-                {{ unvectorizedPapers.length > 0 ? `嵌入 ${unvectorizedPapers.length} 篇` : '已全部嵌入' }}
-              </button>
-            </template>
-
-            <div ref="modelMenuRoot" class="lc-model-picker">
-              <button class="lc-model-trigger" @click.stop="toggleModelMenu()">
-                <span class="lc-model-icon">
-                  <img
-                    v-if="modelLogo(selectedModelOption)"
-                    :src="modelLogo(selectedModelOption)"
-                    alt=""
-                  />
-                  <span v-else>{{ selectedModelLabel().charAt(0).toUpperCase() }}</span>
-                </span>
-                <span class="lc-model-label">{{ selectedModelLabel() }}</span>
-                <Icon class="chevron" :class="{ open: modelMenuOpen }" icon="fluent:chevron-down-24-regular" width="12" height="12" />
-              </button>
-
-              <div v-if="modelMenuOpen" class="lc-model-menu">
-                <div v-for="group in ai.groupedModels" :key="group.id" class="lc-model-group">
-                  <div class="lc-model-group-name">
-                  <span>{{ group.name }}</span>
-                  <ProviderBalanceTag :provider-id="group.id" />
-                </div>
-                  <button
-                    v-for="model in group.models"
-                    :key="selectionKey(model)"
-                    class="lc-model-row"
-                    :class="{ active: selectionKey(model) === selectionKey(effectiveModel()) }"
-                    @mousedown.prevent.stop="selectModel(model)"
-                    @click.stop="selectModel(model)"
-                  >
-                    <span class="lc-model-row-icon">
-                      <img v-if="modelLogo(model)" :src="modelLogo(model)" alt="" />
-                      <span v-else>{{ model.displayName.charAt(0).toUpperCase() }}</span>
-                    </span>
-                    <span class="lc-model-row-text">
-                      <span class="lc-model-row-name">
-                        {{ model.displayName }}
-                        <span
-                          v-if="offerOf(model)"
-                          class="offer-tag"
-                          :class="[offerOf(model)!.kind, { idle: !offerOf(model)!.activeNow }]"
-                          :title="offerOf(model)!.title"
-                        >{{ offerOf(model)!.label }}</span>
-                      </span>
-                      <span class="lc-model-row-meta"><span class="row-size" :class="{ assumed: !sizeOf(model).known }" :title="sizeOf(model).title">{{ sizeOf(model).text }}</span>{{ modelCapabilityText(model) || model.modelId }}</span>
-                    </span>
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- RAG hint banner — only in the modes that actually retrieve by
-             similarity. Agent / 文献库论文 / 不使用知识库 never use RAG, so the
-             "answering from general knowledge" warning would be misleading there. -->
-        <div v-if="ragStore.loaded && !ragStore.isConfigured && knowledgeSourceNeedsRag" class="rag-hint-bar">
-          <div class="rag-hint-icon">
-            <Icon icon="fluent:info-24-regular" width="13" height="13" />
-          </div>
-          <span class="rag-hint-text">{{ t('libraryChat.ragHint') }}</span>
-          <button class="rag-hint-action" @click="emit('open-settings', 'rag')">{{ t('libraryChat.ragHintAction') }}</button>
-        </div>
-
         <!-- Messages -->
         <div class="messages-wrap">
         <nav
@@ -2810,7 +2690,7 @@ onUnmounted(() => {
                   <div v-if="newlyAddedPapers(msg).length" class="context-banner user-context-banner">
                     <button
                       class="ctx-pills"
-                      :title="expandedContextId === msg.id ? '收起' : '查看发送给 AI 的文献'"
+                      :title="expandedContextId === msg.id ? '收起' : '查看这一轮发给模型的文献'"
                       @click="toggleContextPanel(msg.id)"
                     >
                       <span
@@ -2829,7 +2709,7 @@ onUnmounted(() => {
                       >
                         <div class="ctx-section-label">{{ label }}</div>
                         <pre v-if="turnPaperContent(msg, label)" class="ctx-preview-text">{{ turnPaperContent(msg, label) }}</pre>
-                        <div v-else class="ctx-preview-text ctx-preview-empty">全文预览不可用（重新打开对话后不再保留）。</div>
+                        <div v-else class="ctx-preview-text ctx-preview-empty">内容预览不可用（重新打开对话后不再保留）。</div>
                       </div>
                     </div>
                   </div>
@@ -2877,7 +2757,19 @@ onUnmounted(() => {
                     {{ webSearchPhase === 'in_progress' ? '正在发起联网搜索…' : '正在检索网页…' }}
                   </div>
                   <!-- Agent mode: the trail of tools the model consulted -->
-                  <div v-if="activeAnswer(msg).agentSteps?.length || activeAnswer(msg).agentServerErrors?.length" class="agent-trail">
+                  <div
+                    v-if="activeAnswer(msg).agentSteps?.length || activeAnswer(msg).agentServerErrors?.length || activeAnswer(msg).agentFallback"
+                    class="agent-trail"
+                  >
+                    <!-- Answered without tools: say so, and what it was answered from. -->
+                    <div
+                      v-if="activeAnswer(msg).agentFallback"
+                      class="agent-server-error agent-fallback"
+                      :title="fallbackTitle(activeAnswer(msg).agentFallback!)"
+                    >
+                      <Icon icon="fluent:info-24-regular" width="11" height="11" />
+                      <span>{{ fallbackText(activeAnswer(msg)) }}</span>
+                    </div>
                     <div
                       v-for="fail in activeAnswer(msg).agentServerErrors"
                       :key="fail.name"
@@ -2898,7 +2790,7 @@ onUnmounted(() => {
                     <div
                       v-if="activeAnswer(msg).agentLimit"
                       class="agent-server-error"
-                      title="模型用完了工具调用次数，被要求用手上已有的资料作答。可以在 设置 → 智能问答 → Agent 里提高上限。"
+                      title="模型用完了工具调用次数，被要求用手上已有的资料作答。可以在 设置 → AI 随航 → Agent 与工具 →「工具调用次数上限」里提高上限。"
                     >
                       <Icon icon="fluent:hourglass-24-regular" width="11" height="11" />
                       <span>
@@ -3246,12 +3138,13 @@ onUnmounted(() => {
                 >
                   <Icon icon="fluent:attach-24-regular" width="14" height="14" />
                 </button>
-                <!-- Server-side web search (DeepSeek only) -->
+                <!-- Server-side web search. DeepSeek's cannot run alongside the
+                     library tools, so for it the tooltip says what switching on costs. -->
                 <button
                   v-if="webSearchAvailable"
                   class="toolbar-btn"
                   :class="{ 'toolbar-btn-active': useWebSearch }"
-                  :title="useWebSearch ? '联网搜索：已开启' : '联网搜索：让模型在回答前检索网页'"
+                  :title="webSearchTitle"
                   @click="useWebSearch = !useWebSearch"
                 >
                   <Icon icon="fluent:globe-search-24-regular" width="15" height="15" />
@@ -3306,94 +3199,28 @@ onUnmounted(() => {
                     </div>
                   </Transition>
                 </div>
-                <!-- Knowledge source picker -->
-                <div class="ks-picker" @click.stop>
-                  <button
-                    class="ks-trigger"
-                    :class="{
-                      on: knowledgeSource === 'paper-rag' ? ragStore.isConfigured : knowledgeSource !== 'none',
-                      active: sourcePickerOpen,
-                    }"
-                    @click="sourcePickerOpen = !sourcePickerOpen"
-                  >
-                    <span
-                      class="ks-dot"
-                      :class="{ warm: isCacheWarm(activeConvId) }"
-                      :title="isCacheWarm(activeConvId) ? keepaliveTitle : ''"
-                    />
-                    {{ knowledgeSourceLabel }}
-                    <Icon class="ks-chevron" :class="{ open: sourcePickerOpen }" icon="fluent:chevron-down-24-regular" width="10" height="10" />
-                  </button>
-                  <div v-if="sourcePickerOpen" class="ks-menu">
-                    <button
-                      class="ks-option"
-                      :class="{ selected: knowledgeSource === 'paper-rag' }"
-                      @click="setKnowledgeSource('paper-rag')"
-                    >
-                      <Icon icon="fluent:book-24-regular" width="12" height="12" />
-                      <span class="ks-option-text">
-                        文献库RAG
-                        <span v-if="!ragStore.isConfigured" class="ks-option-hint">（RAG 未配置）</span>
-                      </span>
-                      <Icon v-if="knowledgeSource === 'paper-rag'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
-                    </button>
-                    <button
-                      class="ks-option"
-                      :class="{ selected: knowledgeSource === 'papers' }"
-                      @click="setKnowledgeSource('papers')"
-                    >
-                      <Icon icon="fluent:book-24-regular" width="12" height="12" />
-                      <span class="ks-option-text">文献库论文</span>
-                      <Icon v-if="knowledgeSource === 'papers'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
-                    </button>
-                    <button
-                      class="ks-option"
-                      :class="{ selected: knowledgeSource === 'snippets' }"
-                      @click="setKnowledgeSource('snippets')"
-                    >
-                      <Icon icon="fluent:document-text-24-regular" width="12" height="12" />
-                      <span class="ks-option-text">素材库</span>
-                      <Icon v-if="knowledgeSource === 'snippets'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
-                    </button>
-                    <div class="ks-sep" />
-                    <button
-                      class="ks-option"
-                      :class="{ selected: knowledgeSource === 'agent' }"
-                      @click="setKnowledgeSource('agent')"
-                    >
-                      <Icon icon="fluent:bot-sparkle-24-regular" width="12" height="12" />
-                      <span class="ks-option-text">Agent 模式</span>
-                      <Icon v-if="knowledgeSource === 'agent'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
-                    </button>
-                    <div class="ks-sep" />
-                    <button
-                      class="ks-option"
-                      :class="{ selected: knowledgeSource === 'none' }"
-                      @click="setKnowledgeSource('none')"
-                    >
-                      <Icon icon="fluent:chat-24-regular" width="12" height="12" />
-                      <span class="ks-option-text">不使用知识库</span>
-                      <Icon v-if="knowledgeSource === 'none'" class="ks-check" icon="fluent:checkmark-24-regular" width="11" height="11" />
-                    </button>
-                  </div>
-                </div>
+                <!-- Tool settings. Also where the prompt-cache keepalive shows
+                     itself: a breathing dot while this conversation is held warm. -->
                 <button
-                  v-if="knowledgeSource === 'agent'"
                   class="agent-rounds"
-                  title="配置工具调用次数上限，以及要接入哪些 MCP 服务器"
+                  :title="isCacheWarm(activeConvId) ? keepaliveTitle : '配置工具调用次数上限，以及要接入哪些 MCP 服务器'"
                   @click="emit('open-settings', 'agent')"
                 >
-                  <Icon icon="fluent:options-24-regular" width="12" height="12" />
+                  <span v-if="isCacheWarm(activeConvId)" class="ks-dot warm" />
+                  <Icon v-else icon="fluent:options-24-regular" width="12" height="12" />
                   <span class="agent-rounds-label">工具设置</span>
                 </button>
+                <!-- Pin papers to this conversation. The model then treats every
+                     question as being about them and reads them itself. -->
                 <button
-                  v-if="knowledgeSource === 'papers'"
                   class="add-paper-context-btn"
                   :class="{ 'has-count': selectedPapers.length > 0 }"
-                  :title="selectedPapers.length > 0 ? `已选 ${selectedPapers.length} 篇文献` : '添加文献'"
+                  :title="selectedPapers.length > 0
+                    ? `已固定 ${selectedPapers.length} 篇文献，模型会围绕它们回答`
+                    : '固定文献：让这个对话围绕选定的论文'"
                   @click="openPaperPicker"
                 >
-                  <Icon icon="fluent:add-24-regular" width="13" height="13" />
+                  <Icon icon="fluent:pin-24-regular" width="13" height="13" />
                   <span v-if="selectedPapers.length > 0" class="paper-count">{{ selectedPapers.length }}</span>
                 </button>
               </div>
@@ -3452,7 +3279,7 @@ onUnmounted(() => {
     <div v-if="paperPickerOpen" class="paper-picker-overlay" @click.self="paperPickerOpen = false">
       <div class="paper-picker-dialog">
         <div class="paper-picker-header">
-          <span class="paper-picker-title">添加文献</span>
+          <span class="paper-picker-title">固定文献</span>
           <button class="paper-picker-close" @click="paperPickerOpen = false">
             <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
           </button>
@@ -3464,7 +3291,7 @@ onUnmounted(() => {
             :class="{ active: pickerTab === 'available' }"
             @click="pickerTab = 'available'"
           >
-            未添加
+            未固定
             <span class="paper-picker-tab-count">{{ pickerUnselectedPapers.length }}</span>
           </button>
           <button
@@ -3472,24 +3299,40 @@ onUnmounted(() => {
             :class="{ active: pickerTab === 'added' }"
             @click="pickerTab = 'added'"
           >
-            已添加
+            已固定
             <span class="paper-picker-tab-count">{{ pickerSelectedPapers.length }}</span>
           </button>
+          <!-- Keyed on the stored list, not the visible one: pins whose paper
+               is gone are invisible here and must still be clearable. -->
           <button
-            v-if="pickerTab === 'added' && pickerSelectedPapers.length"
+            v-if="pickerTab === 'added' && selectedPaperSlugs.length"
             class="paper-picker-clear"
             @click="clearSelectedPapers"
-          >全部移除</button>
+          >全部取消</button>
         </div>
 
         <div class="paper-picker-list">
-          <div v-if="pickerVisiblePapers.length === 0" class="paper-picker-empty">
-            {{ pickerTab === 'added' ? '还没有添加任何文献' : '暂无匹配文献' }}
+          <div v-if="pickerTab === 'available' && pinLimitReached" class="paper-picker-limit">
+            {{ pinLimitNotice }}
+          </div>
+          <div v-if="pickerTab === 'added' && stalePinCount > 0" class="paper-picker-stale">
+            <!-- 「另有」 only reads right with live pins listed below it. -->
+            <span>{{ pickerSelectedPapers.length ? '另有' : '有' }} {{ stalePinCount }} 篇固定的文献已不在文献库里（可能被删除或改名），提问时不会发给模型。</span>
+            <button class="paper-picker-stale-btn" @click="removeStalePins">移除这 {{ stalePinCount }} 篇</button>
+          </div>
+          <div
+            v-if="pickerVisiblePapers.length === 0 && !(pickerTab === 'added' && stalePinCount > 0 && !selectedPapers.length)"
+            class="paper-picker-empty"
+          >
+            {{ pickerTab === 'added' && !selectedPapers.length ? '还没有固定任何文献' : '暂无匹配文献' }}
           </div>
           <button
             v-for="paper in pickerVisiblePapers"
             :key="paper.slug"
             class="paper-picker-item"
+            :class="{ 'is-capped': pickerTab === 'available' && pinLimitReached }"
+            :aria-disabled="pickerTab === 'available' && pinLimitReached ? 'true' : undefined"
+            :title="pickerTab === 'available' && pinLimitReached ? pinLimitNotice : undefined"
             @click="toggleSelectedPaper(paper)"
           >
             <span class="paper-picker-item-title">{{ paper.title }}</span>
@@ -3497,7 +3340,7 @@ onUnmounted(() => {
               {{ paper.authors.slice(0, 2).join(', ') }}{{ paper.authors.length > 2 ? ' 等' : '' }}
               <template v-if="paper.year"> · {{ paper.year }}</template>
             </span>
-            <span v-if="pickerTab === 'added'" class="paper-picker-badge">点击移除</span>
+            <span v-if="pickerTab === 'added'" class="paper-picker-badge">点击取消</span>
           </button>
         </div>
       </div>
@@ -3794,30 +3637,6 @@ onUnmounted(() => {
 
 /* ── Header ──────────────────────────────────────────────────────────────── */
 
-/* .chat-header is now hidden (content moved to lc-titlebar) */
-.chat-header { display: none !important; }
-
-.header-left {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  flex: 1;
-}
-
-.sidebar-toggle-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: var(--radius-sm);
-  color: var(--text-tertiary);
-  flex-shrink: 0;
-}
-
-.sidebar-toggle-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
-
 .header-avatar {
   display: inline-flex;
   align-items: center;
@@ -3851,13 +3670,6 @@ onUnmounted(() => {
   padding: 2px 8px;
   border-radius: var(--radius-pill);
   white-space: nowrap;
-  flex-shrink: 0;
-}
-
-.header-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
   flex-shrink: 0;
 }
 
@@ -4047,75 +3859,6 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-.rag-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 32px;
-  padding: 0 11px;
-  border-radius: var(--radius-md);
-  font-size: 12px;
-  font-weight: 650;
-  letter-spacing: 0;
-  cursor: pointer;
-  transition: background 0.12s, border-color 0.12s, color 0.12s;
-  flex-shrink: 0;
-}
-.rag-badge.inactive {
-  background: var(--bg-tertiary);
-  color: var(--text-tertiary);
-  border: 1px solid var(--border-subtle);
-}
-.rag-badge.inactive:hover { background: var(--bg-hover); }
-
-/* Vectorized count display */
-.rag-counter {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 2px 8px;
-  border-radius: var(--radius-pill);
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  flex-shrink: 0;
-  user-select: none;
-}
-.rag-counter-text { letter-spacing: 0.2px; }
-
-/* Sync missing button */
-.rag-sync-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 10px;
-  border-radius: var(--radius-md);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background 0.12s, color 0.12s;
-}
-.rag-sync-btn:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-
-/* All-done state for sync button */
-.rag-sync-btn.all-done {
-  color: var(--text-tertiary);
-  border-color: var(--border-subtle);
-  cursor: default;
-  opacity: 0.7;
-}
-.rag-sync-btn.all-done:disabled {
-  opacity: 0.7;
-  cursor: default;
-}
-
-/* Refresh button */
 .rag-refresh-btn {
   display: inline-flex;
   align-items: center;
@@ -4152,70 +3895,6 @@ onUnmounted(() => {
 }
 
 /* Syncing progress */
-.rag-sync-progress {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--accent);
-  min-width: 36px;
-  text-align: center;
-}
-.rag-sync-cancel {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: var(--radius-sm);
-  color: var(--text-tertiary);
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.rag-sync-cancel:hover { background: var(--bg-hover); color: var(--text-primary); }
-
-/* ── RAG hint bar ────────────────────────────────────────────────────────── */
-
-.rag-hint-bar {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  min-height: 40px;
-  padding: 0 22px;
-  font-size: 12px;
-  color: var(--text-secondary);
-  background: color-mix(in srgb, #f59e0b 6%, var(--bg-primary));
-  border-bottom: 1px solid color-mix(in srgb, #f59e0b 18%, var(--border-subtle));
-  flex-shrink: 0;
-}
-
-.rag-hint-icon {
-  width: 22px;
-  height: 22px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--radius-pill);
-  color: #d88a00;
-  background: color-mix(in srgb, #f59e0b 12%, transparent);
-  flex-shrink: 0;
-}
-
-.rag-hint-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.rag-hint-action {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--accent);
-  white-space: nowrap;
-  flex-shrink: 0;
-  margin-left: auto;
-}
-
-.rag-hint-action:hover { text-decoration: underline; }
 
 /* ── Messages ────────────────────────────────────────────────────────────── */
 
@@ -5516,7 +5195,7 @@ onUnmounted(() => {
 }
 .agent-rounds:hover { background: var(--bg-hover); color: var(--text-primary); }
 
-/* The conversation-list counterpart of the breathing mode dot, so the user can see which conversation
+/* The conversation-list counterpart of the breathing keepalive dot, so the user can see which conversation
    is being held warm without opening it. Green rather than the accent: this is
    "ready", not "working". */
 .conv-cache-dot {
@@ -5573,37 +5252,6 @@ onUnmounted(() => {
   line-height: 1;
 }
 
-/* Knowledge source picker */
-.ks-picker {
-  margin-left: 6px;
-  position: relative;
-}
-
-.ks-trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 26px;
-  padding: 0 8px;
-  border-radius: 8px;
-  background: transparent;
-  border: none;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-tertiary);
-  cursor: pointer;
-  transition: background 0.12s ease, color 0.12s ease;
-  white-space: nowrap;
-}
-.ks-trigger:hover,
-.ks-trigger.active {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-.ks-trigger.on {
-  color: var(--accent);
-}
-
 .ks-dot {
   width: 6px;
   height: 6px;
@@ -5611,12 +5259,15 @@ onUnmounted(() => {
   background: var(--text-tertiary);
   flex-shrink: 0;
 }
-.ks-trigger.on .ks-dot { background: var(--accent); }
-/* The same dot breathes while this conversation's prompt cache is being held
-   open — the state belongs to the mode, so it belongs on the mode's indicator
-   rather than in a second pill saying the same thing. Slower than the agent's
-   working pulse: this is idle upkeep, not work in flight. */
-.ks-dot.warm { animation: ks-dot-breathe 2.4s ease-in-out infinite; }
+/* Breathes on the tool-settings button while this conversation's prompt cache
+   is being held open, in place of the button's icon. Only rendered while warm,
+   so it carries the accent itself. Slower than the agent's working pulse: this
+   is idle upkeep, not work in flight. */
+.ks-dot.warm {
+  background: var(--accent);
+  margin: 0 3px;
+  animation: ks-dot-breathe 2.4s ease-in-out infinite;
+}
 @keyframes ks-dot-breathe {
   0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
   50% { opacity: 0.35; box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
@@ -5733,60 +5384,6 @@ onUnmounted(() => {
 .reasoning-drop-enter-from,
 .reasoning-drop-leave-to { opacity: 0; transform: translateY(4px); }
 
-.ks-chevron {
-  flex-shrink: 0;
-  color: var(--text-tertiary);
-  transition: transform 0.15s;
-}
-.ks-chevron.open { transform: rotate(180deg); }
-
-.ks-menu {
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 0;
-  background: var(--bg-primary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-md);
-  padding: 4px;
-  min-width: 150px;
-  z-index: 200;
-}
-
-.ks-sep {
-  height: 1px;
-  margin: 4px 6px;
-  background: var(--border-subtle);
-}
-.ks-option {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
-  font-size: 12px;
-  color: var(--text-primary);
-  text-align: left;
-  transition: background 0.08s;
-}
-.ks-option:hover { background: var(--bg-hover); }
-.ks-option.selected { color: var(--accent); }
-.ks-option svg { flex-shrink: 0; color: var(--text-tertiary); }
-.ks-option.selected svg:first-child { color: var(--accent); }
-
-.ks-option-text {
-  flex: 1;
-  min-width: 0;
-}
-.ks-option-hint {
-  font-size: 10px;
-  color: var(--text-tertiary);
-  font-weight: 400;
-  margin-left: 4px;
-}
-.ks-check { flex-shrink: 0; color: var(--accent); }
-
 .enter-hint {
   font-size: 11px;
   color: var(--text-tertiary);
@@ -5820,6 +5417,7 @@ onUnmounted(() => {
   height: 24px;
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   padding: 0 8px;
   border-radius: var(--radius-pill);
   border: 1px solid var(--border-default);
@@ -5950,6 +5548,29 @@ onUnmounted(() => {
   cursor: pointer;
 }
 .paper-picker-clear:hover { color: #dc2626; }
+.paper-picker-stale {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 2px 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.paper-picker-stale span { flex: 1; min-width: 0; }
+.paper-picker-stale-btn {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+}
+.paper-picker-stale-btn:hover { text-decoration: underline; }
 .paper-picker-item {
   position: relative;
   display: flex;
@@ -5962,6 +5583,20 @@ onUnmounted(() => {
   color: var(--text-primary);
 }
 .paper-picker-item:hover { background: var(--bg-hover); }
+/* At the pin cap the 未固定 rows cannot be pinned. They stay readable (see
+   below); the cursor, and the notice above the list, say why a click does
+   nothing. */
+.paper-picker-item.is-capped { cursor: not-allowed; }
+.paper-picker-item.is-capped:hover { background: none; }
+.paper-picker-limit {
+  margin: 4px 2px 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
 /* No dimmed "already added" state any more — the 已添加 tab is what says so, and
    greying a whole tab's worth of rows only made them hard to read. */
 .paper-picker-item-title {

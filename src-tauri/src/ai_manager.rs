@@ -384,12 +384,12 @@ pub fn resolve_provider_model(
                 .default_provider_id
                 .clone()
                 .filter(|s| !s.is_empty())
-                .ok_or("尚未配置 AI 服务商，请在「设置 → AI 服务」中添加。")?;
+                .ok_or("尚未配置 AI 服务商，请在「设置 → AI 供应商」中添加。")?;
             let m = settings
                 .default_model_id
                 .clone()
                 .filter(|s| !s.is_empty())
-                .ok_or("尚未设置默认模型，请在「设置 → AI 服务」中把某个模型设为默认。")?;
+                .ok_or("尚未设置默认模型，请在「设置 → AI 供应商」中把某个模型设为默认。")?;
             (p, m)
         }
     };
@@ -401,7 +401,7 @@ pub fn resolve_provider_model(
         .cloned()
         .ok_or_else(|| {
             provider_unavailable_reason(&settings, &pid)
-                + "请在「设置 → AI 服务」中重新选择或重新启用后再试。"
+                + "请在「设置 → AI 供应商」中重新选择或重新启用后再试。"
         })?;
 
     // Ollama runs locally and is normally keyless, so an empty key is valid.
@@ -409,7 +409,7 @@ pub fn resolve_provider_model(
         .or_else(|| (provider.kind == "ollama").then(String::new))
         .ok_or_else(|| {
             format!(
-                "尚未为「{}」配置 API Key，请在「设置 → AI 服务」中填写。",
+                "尚未为「{}」配置 API Key，请在「设置 → AI 供应商」中填写。",
                 provider.name
             )
         })?;

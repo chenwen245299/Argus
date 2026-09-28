@@ -695,23 +695,17 @@ let unlistenArxivWinClose: UnlistenFn | null = null
 let statusPollTimer: ReturnType<typeof setInterval> | null = null
 
 // RAG embed progress state
-const ragEmbedSyncing = ref(false)
-const ragEmbedProgress = ref({ done: 0, total: 0 })
-let unlistenRagEmbed: UnlistenFn | null = null
 
 const arxivBusy = computed(() => arxivAnalyzing.value || arxivFetching.value)
 
 // AI hub button: flips between its name and the active task's progress
-const aiBusy = computed(() => arxivBusy.value || ragEmbedSyncing.value)
+const aiBusy = computed(() => arxivBusy.value)
 const aiLabelMode = ref<'name' | 'progress'>('name')
 let aiLabelToggleTimer: ReturnType<typeof setInterval> | null = null
 
 const aiProgressText = computed(() => {
   if (arxivAnalyzing.value && arxivProgress.value.total > 0) {
     return t('toolbar.arxivProgress', { done: arxivProgress.value.done, total: arxivProgress.value.total })
-  }
-  if (ragEmbedSyncing.value && ragEmbedProgress.value.total > 0) {
-    return t('toolbar.ragProgress', { done: ragEmbedProgress.value.done, total: ragEmbedProgress.value.total })
   }
   return ''
 })
@@ -776,6 +770,10 @@ onMounted(async () => {
     const isBulk = total > 1 || e.payload.bulk === true
     if (!isBulk) return
 
+    // 'waiting' (provider throttling, the batch auto-resumes) carries the live
+    // done/total and counts as progress; only finished/error end the indicator.
+    // Extra fields on 'finished' (succeeded/failed/stopped_reason…) are the
+    // arXiv window's business and are ignored here.
     if (total > 0 || status === 'started' || status === 'finished') {
       arxivProgress.value = { done, total }
     }
@@ -791,10 +789,6 @@ onMounted(async () => {
   })
   paperTasks.startListening()
   document.addEventListener('pointerdown', onDocClick, true)
-  unlistenRagEmbed = await listen<{ syncing: boolean; done: number; total: number }>('rag-embed-progress', (e) => {
-    ragEmbedSyncing.value = e.payload.syncing
-    ragEmbedProgress.value = { done: e.payload.done, total: e.payload.total }
-  })
   unlistenArxivWinOpen = await listen('arxiv-window-opened', () => {
     arxivWindowOpen.value = true
   })
@@ -816,7 +810,6 @@ onUnmounted(() => {
   if (unlistenArxiv) unlistenArxiv()
   if (unlistenArxivAnalysis) unlistenArxivAnalysis()
   if (unlistenArxivFetch) unlistenArxivFetch()
-  if (unlistenRagEmbed) unlistenRagEmbed()
   if (unlistenArxivWinOpen) unlistenArxivWinOpen()
   if (unlistenArxivWinClose) unlistenArxivWinClose()
   if (aiLabelToggleTimer) { clearInterval(aiLabelToggleTimer); aiLabelToggleTimer = null }
@@ -1158,7 +1151,6 @@ onUnmounted(() => {
           <button class="import-menu-item" :title="t('toolbar.libraryChatTitle')" @click="chooseLibraryChat">
             <Icon icon="fluent:chat-24-regular" width="15" height="15" />
             {{ t('toolbar.libraryChat') }}
-            <span v-if="ragEmbedSyncing && ragEmbedProgress.total > 0" class="menu-meta">{{ ragEmbedProgress.done }}/{{ ragEmbedProgress.total }}</span>
           </button>
           <button class="import-menu-item" :title="t('toolbar.embeddingMapTitle')" @click="chooseEmbeddingMap">
             <Icon icon="fluent:data-scatter-24-regular" width="15" height="15" />

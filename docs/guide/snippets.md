@@ -1,17 +1,20 @@
 # Snippet Library
 
 The snippet library is a collection box separate from your papers — a place to save
-excerpts you come across while reading, for later use. It has its **own vector store**, so
-you can semantically search everything you've collected, making it easy to find and cite
-material while writing.
+excerpts you come across while reading, for later use. You can search your snippets by
+keyword, and the AI in [Ask Library](/guide/rag) can look through them too, making it easy
+to find and cite material while writing.
 
-<Media src="/media/snippets.mp4" caption="Collect snippets and search them semantically" />
+<Media src="/media/snippets.mp4" caption="Collect snippets and find them again" />
 
 ## What it does
 
 - **Collect on the fly** — save useful quotes, excerpts, and ideas to the snippet library.
-- **Semantic search** — a dedicated vector store lets you search by meaning, not just
-  keywords.
+- **Find them fast** — search your snippets by keyword in the snippet library; when you
+  ask in [Ask Library](/guide/rag), the AI searches the snippet library itself too.
+- **No vectorizing needed** — snippets are not embedded, and need no RAG setup. The AI in
+  Ask Library finds them with the `search_snippets` tool, a keyword match over each
+  snippet's text, note, source-paper title, and tags.
 - **Separate from papers** — the snippet library and your paper library stay out of each
   other's way, dedicated to writing, citing, and gathering inspiration.
 

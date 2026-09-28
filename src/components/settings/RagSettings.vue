@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
-import { useRagStore } from '../../stores/rag'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { useRagStore, sameRagSettings, type VectorRebuildMode } from '../../stores/rag'
 import { useAiStore } from '../../stores/ai'
-import type { RagSettings, PaperIndexEntry, PaperVectorizeInput, ChunkInput, AiModel } from '../../types'
-import { buildChunks } from '../../utils/chunker'
+import type { RagSettings, AiModel } from '../../types'
 
 const { t } = useI18n()
 const ragStore = useRagStore()
@@ -14,16 +14,27 @@ const aiStore = useAiStore()
 const form = ref<RagSettings>({ ...ragStore.settings })
 const saving = ref(false)
 const saveMsg = ref('')
-const rebuilding = ref(false)
-const rebuildMsg = ref('')
-const rebuildProgress = ref({ done: 0, total: 0, failed: 0 })
-const rebuildCurrentPaper = ref('')
-let cancelRequested = false
 let formReady = false
 let skipAutoSave = false
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null
+let unlistenRagSettings: UnlistenFn | null = null
+let unmounted = false
 
 onMounted(async () => {
+  // A save from another window (or this one) is broadcast as
+  // `rag-settings-changed`. The main window reloads its store on it, but the
+  // chat and embedding-map windows only have this panel to do it. The reload
+  // cannot start a save loop: `load()` keeps the store's object when nothing
+  // changed (so neither watcher fires), and when something did, the form takes
+  // the new values and its watcher finds them equal to the store and returns.
+  void listen('rag-settings-changed', () => {
+    void ragStore.load()
+    void ragStore.loadStoreInfo()
+  }).then((off) => {
+    if (unmounted) off()
+    else unlistenRagSettings = off
+  }).catch(() => {})
+
   await ragStore.load()
   await ragStore.loadStoreInfo()
   await aiStore.load()
@@ -32,15 +43,32 @@ onMounted(async () => {
   formReady = true
 })
 
+// No cancel here: the vector run lives in the store and carries on. A pending
+// auto-save is left to fire too, so an edit made just before closing is kept.
+onUnmounted(() => {
+  unmounted = true
+  unlistenRagSettings?.()
+  unlistenRagSettings = null
+})
+
 watch(() => ragStore.settings, (s) => {
   if (!skipAutoSave) form.value = { ...s }
 }, { deep: true })
 
 watch(form, () => {
   if (!formReady || skipAutoSave) return
-  if (autoSaveTimer) clearTimeout(autoSaveTimer)
-  autoSaveTimer = setTimeout(() => save(), 600)
+  if (autoSaveTimer) { clearTimeout(autoSaveTimer); autoSaveTimer = null }
+  // A form that only caught up with the store (a reload, or a save made in
+  // another window) has nothing to write. Saving it anyway would broadcast
+  // `rag-settings-changed` for a change that is not one.
+  if (sameRagSettings(form.value, ragStore.settings)) return
+  scheduleAutoSave()
 }, { deep: true })
+
+function scheduleAutoSave() {
+  if (autoSaveTimer) clearTimeout(autoSaveTimer)
+  autoSaveTimer = setTimeout(() => { autoSaveTimer = null; void save() }, 600)
+}
 
 type EmbeddingModelOption = {
   providerId: string
@@ -135,96 +163,65 @@ async function save() {
   if (autoSaveTimer) { clearTimeout(autoSaveTimer); autoSaveTimer = null }
   saving.value = true
   saveMsg.value = ''
+  let saved = false
   try {
     skipAutoSave = true
     await ragStore.save(form.value)
+    // Let the store watcher run while it is still skipped, so the stored copy
+    // does not overwrite an edit made during the write.
     await nextTick()
-    skipAutoSave = false
+    saved = true
     saveMsg.value = t('ragSettings.saved')
     setTimeout(() => saveMsg.value = '', 2000)
   } catch (e) {
     saveMsg.value = String(e)
   } finally {
+    // Always, or one failed save would leave auto-save off for the session.
+    skipAutoSave = false
     saving.value = false
   }
+  // An edit made while the write was in flight was skipped by the form
+  // watcher, and the store only recorded what was written: save it now.
+  // Not after a failure — that would retry on a loop; the next edit retries.
+  if (saved && !sameRagSettings(form.value, ragStore.settings)) scheduleAutoSave()
 }
 
+// The 同步缺失 / 完整重建 run itself lives in the RAG store, so it survives
+// this panel being closed or switched away from; the panel only drives it and
+// shows the store's progress, reattaching when it is mounted again.
 // mode='full' — embed every paper regardless of vectorized status
 // mode='missing' — only embed papers not yet vectorized (断点续建 & 增量同步)
-async function rebuild(mode: 'full' | 'missing') {
-  rebuilding.value = true
-  cancelRequested = false
-  rebuildMsg.value = ''
-  rebuildCurrentPaper.value = ''
-  rebuildProgress.value = { done: 0, total: 0, failed: 0 }
-
-  try {
-    const allPapers = await invoke<PaperIndexEntry[]>('list_papers')
-    const papers = mode === 'missing'
-      ? allPapers.filter(p => !p.status.vectorized)
-      : allPapers
-
-    const total = papers.length
-    let done = 0, failed = 0
-    rebuildProgress.value = { done, total, failed }
-
-    if (total === 0) {
-      rebuildMsg.value = mode === 'missing' ? t('ragSettings.allSynced') : t('ragSettings.noPapers')
-      return
-    }
-
-    const chunkSize: number = form.value.chunk_size || 800
-    const chunkOverlap: number = form.value.chunk_overlap || 100
-
-    // Small worker pool: the embedding API call dominates each paper's wall
-    // time, so a few in-flight papers give a near-linear speedup.
-    const CONCURRENCY = 3
-    const queue = [...papers]
-    const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
-      while (!cancelRequested) {
-        const paper = queue.shift()
-        if (!paper) break
-        rebuildCurrentPaper.value = paper.title
-
-        try {
-          const input = await invoke<PaperVectorizeInput>('get_paper_vectorize_input', { slug: paper.slug })
-          const chunks: ChunkInput[] = await buildChunks(input, chunkSize, chunkOverlap)
-          if (chunks.length === 0) { failed++; rebuildProgress.value = { done, total, failed }; continue }
-          await invoke('embed_and_store_chunks', {
-            slug: paper.slug,
-            paperId: input.paper_id,
-            paperTitle: input.paper_title,
-            chunks,
-          })
-          done++
-        } catch {
-          failed++
-        }
-
-        rebuildProgress.value = { done, total, failed }
-      }
-    })
-    await Promise.all(workers)
-
-    if (cancelRequested) {
-      rebuildMsg.value = t('ragSettings.rebuildPaused', { done, total })
-    } else {
-      rebuildMsg.value = failed > 0
-        ? t('ragSettings.rebuildDoneWithFailed', { done, total, failed })
-        : t('ragSettings.rebuildDoneCount', { done, total })
-    }
-    await ragStore.loadStoreInfo()
-  } catch (e) {
-    rebuildMsg.value = String(e)
-  } finally {
-    rebuilding.value = false
-    rebuildCurrentPaper.value = ''
-  }
+function rebuild(mode: VectorRebuildMode) {
+  if (ragStore.rebuilding) return
+  deleteMsg.value = ''
+  void ragStore.rebuildVectors(mode, form.value.chunk_size, form.value.chunk_overlap)
 }
 
 function cancelRebuild() {
-  cancelRequested = true
+  ragStore.cancelRebuild()
 }
+
+/** A model-deletion error, shown on the run's message line until the next run. */
+const deleteMsg = ref('')
+
+const rebuildMsg = computed(() => {
+  if (deleteMsg.value) return deleteMsg.value
+  const outcome = ragStore.rebuildOutcome
+  if (!outcome) return ''
+  switch (outcome.kind) {
+    case 'nothing':
+      return outcome.mode === 'missing' ? t('ragSettings.allSynced') : t('ragSettings.noPapers')
+    case 'paused':
+      return t('ragSettings.rebuildPaused', { done: outcome.done, total: outcome.total })
+    case 'done':
+      return outcome.failed > 0
+        ? t('ragSettings.rebuildDoneWithFailed', { done: outcome.done, total: outcome.total, failed: outcome.failed })
+        : t('ragSettings.rebuildDoneCount', { done: outcome.done, total: outcome.total })
+    case 'error':
+      return outcome.message
+  }
+  return ''
+})
 
 // Per-model deletion: drops one model's whole partition, leaving others intact.
 const deletingModel = ref('')
@@ -236,7 +233,7 @@ async function deleteModelEmbeddings(model: string) {
     await invoke('delete_model_embeddings', { model })
     await ragStore.loadStoreInfo()
   } catch (e) {
-    rebuildMsg.value = String(e)
+    deleteMsg.value = String(e)
   } finally {
     deletingModel.value = ''
   }
@@ -294,11 +291,9 @@ async function deleteModelEmbeddings(model: string) {
       <input class="field-input sm" type="number" v-model.number="form.chunk_overlap" min="0" max="512" step="32" :disabled="!form.enabled" />
     </div>
 
-    <!-- Top K -->
-    <div class="field-row">
-      <label class="field-label">{{ t('ragSettings.topK') }}</label>
-      <input class="field-input sm" type="number" v-model.number="form.top_k" min="1" max="20" :disabled="!form.enabled" />
-    </div>
+    <!-- No top-k field: it sized chat retrieval, and chat no longer retrieves.
+         `form.top_k` is still round-tripped untouched, so the saved setting
+         survives for anything that reads it. -->
 
     <!-- Save button -->
     <div class="action-row">
@@ -351,29 +346,29 @@ async function deleteModelEmbeddings(model: string) {
       <h3 class="store-title">{{ t('ragSettings.storeManage') }}</h3>
       <p class="field-hint">{{ t('ragSettings.storeManageHint') }}</p>
       <div class="rebuild-controls">
-        <button class="btn-primary sm" @click="rebuild('missing')" :disabled="rebuilding || !form.enabled">
+        <button class="btn-primary sm" @click="rebuild('missing')" :disabled="ragStore.rebuilding || !form.enabled">
           {{ t('ragSettings.syncMissing') }}
         </button>
-        <button class="btn-danger sm" @click="rebuild('full')" :disabled="rebuilding || !form.enabled">
+        <button class="btn-danger sm" @click="rebuild('full')" :disabled="ragStore.rebuilding || !form.enabled">
           {{ t('ragSettings.fullRebuild') }}
         </button>
-        <button v-if="rebuilding" class="btn-ghost sm" @click="cancelRebuild">
+        <button v-if="ragStore.rebuilding" class="btn-ghost sm" @click="cancelRebuild">
           {{ t('ragSettings.cancelBtn') }}
         </button>
       </div>
-      <div v-if="rebuilding && rebuildProgress.total > 0" class="progress-wrap">
+      <div v-if="ragStore.rebuilding && ragStore.rebuildProgress.total > 0" class="progress-wrap">
         <div class="progress-bar-wrap">
           <div
             class="progress-bar"
-            :style="{ width: (rebuildProgress.done / rebuildProgress.total * 100) + '%' }"
+            :style="{ width: (ragStore.rebuildProgress.done / ragStore.rebuildProgress.total * 100) + '%' }"
           />
         </div>
         <div class="progress-meta">
-          <span class="progress-count">{{ rebuildProgress.done }}/{{ rebuildProgress.total }}
-            <template v-if="rebuildProgress.failed > 0">{{ t('ragSettings.failedCount', { n: rebuildProgress.failed }) }}</template>
+          <span class="progress-count">{{ ragStore.rebuildProgress.done }}/{{ ragStore.rebuildProgress.total }}
+            <template v-if="ragStore.rebuildProgress.failed > 0">{{ t('ragSettings.failedCount', { n: ragStore.rebuildProgress.failed }) }}</template>
           </span>
-          <span v-if="rebuildCurrentPaper" class="progress-paper" :title="rebuildCurrentPaper">
-            {{ rebuildCurrentPaper }}
+          <span v-if="ragStore.rebuildCurrentPaper" class="progress-paper" :title="ragStore.rebuildCurrentPaper">
+            {{ ragStore.rebuildCurrentPaper }}
           </span>
         </div>
       </div>

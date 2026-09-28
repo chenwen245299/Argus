@@ -12,8 +12,8 @@ Argus可以把文献库的embedding投影到二维图上，让用户**看见**�
 
 ## 前置条件
 
-向量图谱基于RAG的向量索引。使用前请先在 [RAG问答](/zh/guide/rag) 里为文献库构建embedding索引（配置好embedding模型并建库）。
+向量图谱基于RAG的向量索引。使用前请先按 [RAG 与全库问答](/zh/guide/rag) 里的步骤为文献库构建embedding索引（配置好embedding模型并建库）。
 
 ## 相关
 
-- [RAG问答](/zh/guide/rag)
+- [RAG 与全库问答](/zh/guide/rag)

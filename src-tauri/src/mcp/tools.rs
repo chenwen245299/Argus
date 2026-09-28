@@ -400,6 +400,11 @@ pub struct SnippetEntry {
     pub tags: Vec<String>,
     /// Title of the paper the excerpt came from.
     pub paper_title: String,
+    /// Slug of that paper, when the excerpt still knows it, so a caller can go
+    /// on to read around the excerpt with `get_paper_fulltext`. Absent for
+    /// excerpts saved without a source paper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper_slug: Option<String>,
     pub page: u32,
     pub created_at: String,
 }
@@ -1341,6 +1346,9 @@ pub fn search_snippets(
                 note: s.note,
                 tags: s.tags,
                 paper_title: s.paper_title,
+                // A snippet's `paper_id` holds the source paper's slug (the
+                // readers save it that way), not the paper's meta id.
+                paper_slug: Some(s.paper_id).filter(|id| !id.trim().is_empty()),
                 page: s.page,
                 created_at: s.created_at,
             });

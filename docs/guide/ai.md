@@ -19,7 +19,7 @@ detail view.
 
 <Media src="/media/1783333658458.png" caption="Choose the matching API format in AI provider settings" />
 
-You can assign different models to different tasks (Settings → Paper Analysis), and
+You can assign different models to different tasks (Settings → AI Copilot → Paper analysis), and
 customize each task's prompt to better fit your needs:
 
 <Media src="/media/1783333738705.png" caption="Argus lets you assign different models to different tasks" />
@@ -38,8 +38,8 @@ built-in parser can't find it.
 
 ### Paper analysis
 
-Generate a summary analysis of a paper. Configure the prompt and model in Settings to tune
-the analysis to your field and workflow.
+Generate a summary analysis of a paper. Configure the prompt and model in Settings → AI
+Copilot → Paper analysis to tune the analysis to your field and workflow.
 
 ### Per-paper chat
 

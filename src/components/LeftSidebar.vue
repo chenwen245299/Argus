@@ -3,7 +3,6 @@ import { computed, ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useLibraryStore } from '../stores/library'
 import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
@@ -568,10 +567,6 @@ const snippetRenamingId = ref<string | null>(null)
 const snippetRenameValue = ref('')
 const snippetCtxMenu = ref<{ x: number; y: number; id: string; name: string } | null>(null)
 const activeSnippetLibraryId = ref<string | null>(null)
-// Per-library embed progress, keyed by snippet library id (mirrors the
-// collection embed badge). Only one snippet embed job runs at a time.
-type SnippetEmbedJob = { done: number; total: number; failed: number; status: 'running' | 'done' }
-const snippetEmbedJobs = ref<Record<string, SnippetEmbedJob>>({})
 
 function loadSnippetPanelHeight() {
   try {
@@ -647,37 +642,6 @@ async function openSnippetLibInFinder() {
     await invoke('open_in_finder', { path })
   } catch (e) {
     console.error('Open snippets in finder failed:', e)
-  }
-}
-
-function removeSnippetEmbedJob(id: string) {
-  const { [id]: _removed, ...rest } = snippetEmbedJobs.value
-  snippetEmbedJobs.value = rest
-}
-
-// Embed this library's not-yet-vectorized snippets. Progress shows in the
-// library row's badge, driven by the store-wide `snippet-embed-progress` event
-// (the backend embeds one library at a time, so a single job is unambiguous).
-async function buildSnippetEmbeddings(id: string) {
-  if (snippetEmbedJobs.value[id]?.status === 'running' || !ragStore.isConfigured) return
-  snippetEmbedJobs.value = { ...snippetEmbedJobs.value, [id]: { done: 0, total: 0, failed: 0, status: 'running' } }
-  let unlisten: UnlistenFn | null = null
-  try {
-    unlisten = await listen<{ done: number; failed: number; total: number }>('snippet-embed-progress', (ev) => {
-      const prev = snippetEmbedJobs.value[id]
-      if (!prev || prev.status !== 'running') return
-      snippetEmbedJobs.value = {
-        ...snippetEmbedJobs.value,
-        [id]: { ...prev, done: ev.payload.done, total: ev.payload.total, failed: ev.payload.failed },
-      }
-    })
-    const [done, failed] = await invoke<[number, number]>('embed_library_snippets', { libraryId: id })
-    snippetEmbedJobs.value = { ...snippetEmbedJobs.value, [id]: { done, total: done + failed, failed, status: 'done' } }
-    setTimeout(() => removeSnippetEmbedJob(id), failed > 0 ? 5000 : 2500)
-  } catch {
-    removeSnippetEmbedJob(id)
-  } finally {
-    unlisten?.()
   }
 }
 
@@ -1390,16 +1354,7 @@ onUnmounted(() => {
               <span v-if="lib.emoji" style="font-size:12px">{{ lib.emoji }}</span>
               <Icon v-else icon="fluent:folder-24-regular" width="13" height="13" />
               <span class="canvas-name-text">{{ lib.name }}</span>
-              <span
-                v-if="snippetEmbedJobs[lib.id]"
-                class="badge embed-badge"
-                :class="{ done: snippetEmbedJobs[lib.id].status === 'done' }"
-              >
-                <template v-if="snippetEmbedJobs[lib.id].status === 'running'">{{ snippetEmbedJobs[lib.id].total > 0 ? `${snippetEmbedJobs[lib.id].done + snippetEmbedJobs[lib.id].failed}/${snippetEmbedJobs[lib.id].total}` : '…' }}</template>
-                <template v-else-if="snippetEmbedJobs[lib.id].failed > 0">{{ t('collections.embedFailedCount', { n: snippetEmbedJobs[lib.id].failed }) }}</template>
-                <template v-else>✓</template>
-              </span>
-              <span v-else-if="snippetCountFor(lib.id) > 0" class="badge">{{ snippetCountFor(lib.id) }}</span>
+              <span v-if="snippetCountFor(lib.id) > 0" class="badge">{{ snippetCountFor(lib.id) }}</span>
             </template>
           </div>
         </div>
@@ -1658,16 +1613,6 @@ onUnmounted(() => {
         <button class="ctx-item" @click="openSnippetLibInFinder(); closeSnippetCtx()">
           {{ t('collections.openInFinder') }}
         </button>
-        <template v-if="ragStore.isConfigured">
-          <div class="ctx-sep" />
-          <button
-            class="ctx-item"
-            :disabled="snippetEmbedJobs[snippetCtxMenu!.id]?.status === 'running'"
-            @click="buildSnippetEmbeddings(snippetCtxMenu!.id); closeSnippetCtx()"
-          >
-            {{ snippetEmbedJobs[snippetCtxMenu!.id]?.status === 'running' ? t('collections.buildEmbeddingsRunning') : t('collections.buildEmbeddings') }}
-          </button>
-        </template>
         <div class="ctx-sep" />
         <button class="ctx-item danger" @click="handleDeleteSnippetLib(snippetCtxMenu!.id, snippetCtxMenu!.name)">
           删除
@@ -2012,21 +1957,6 @@ onUnmounted(() => {
 }
 .nav-item.active .badge {
   background: rgba(255, 255, 255, 0.22);
-  color: #fff;
-}
-
-.nav-item .badge.embed-badge {
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-  color: var(--accent);
-  min-width: 34px;
-  font-variant-numeric: tabular-nums;
-}
-.nav-item .badge.embed-badge.done {
-  background: color-mix(in srgb, #34a853 16%, transparent);
-  color: #34a853;
-}
-.nav-item.active .badge.embed-badge {
-  background: rgba(255, 255, 255, 0.28);
   color: #fff;
 }
 

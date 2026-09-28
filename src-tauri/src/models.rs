@@ -1201,26 +1201,6 @@ pub struct EmbeddingMapData {
     pub available_models: Vec<EmbeddingModelStat>,
 }
 
-// ── Snippet retrieval result ──────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RetrievedSnippet {
-    pub snippet_id: String,
-    pub library_id: String,
-    pub text: String,
-    pub score: f32,
-    pub paper_id: String,
-    pub paper_title: String,
-    pub page: u32,
-    pub note: String,
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SnippetStoreInfo {
-    pub embedded_count: usize,
-}
-
 // ── Vectorize pipeline (frontend-orchestrated) ───────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1378,18 +1358,31 @@ impl Default for ArxivConfig {
     }
 }
 
+// Everything but the id defaults, so one odd entry (an older build's file, a
+// hand edit, a half-synced copy) cannot make its whole day file unreadable —
+// an unreadable day file used to read back as empty and be rewritten as such.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ArxivPaper {
     pub arxiv_id: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub authors: Vec<String>,
+    #[serde(default)]
     pub summary: String,
+    #[serde(default)]
     pub categories: Vec<String>,
+    #[serde(default)]
     pub published: String,
+    #[serde(default)]
     pub updated: String,
+    #[serde(default)]
     pub pdf_url: String,
+    #[serde(default)]
     pub abs_url: String,
+    #[serde(default)]
     pub relevance_score: Option<f32>,
+    #[serde(default)]
     pub relevance_reason: Option<String>,
     #[serde(default)]
     pub key_contributions: Vec<String>,
@@ -1399,8 +1392,13 @@ pub struct ArxivPaper {
     pub matched_topics: Vec<String>,
     #[serde(default = "default_analysis_status")]
     pub analysis_status: String,
+    /// Why the last analysis failed, shown next to the 失败 tag. Set with
+    /// `analysis_status = "failed"`, cleared when an analysis succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_error: Option<String>,
     #[serde(default)]
     pub in_library: bool,
+    #[serde(default)]
     pub fetched_at: String,
     #[serde(default)]
     pub read: bool,
@@ -1424,6 +1422,35 @@ pub struct ArxivScheduleStatus {
     pub analyzing: bool,
     pub analyzed_count: u32,
     pub total_pending: u32,
+    /// The pause a running batch is sitting in, so a window opened mid-pause
+    /// can show the countdown instead of a progress bar that looks hung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<ArxivAnalysisPause>,
+    /// How the last batch of this session ended — above all why it stopped
+    /// early — for a window that was closed when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<ArxivAnalysisRun>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ArxivAnalysisPause {
+    pub message: String,
+    /// Unix epoch milliseconds.
+    pub until_ms: u64,
+    pub concurrency: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ArxivAnalysisRun {
+    /// Unix epoch milliseconds; also identifies the run to the frontend.
+    pub finished_at_ms: u64,
+    pub total: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub filtered: u32,
+    pub reverted: u32,
+    pub stopped_reason: Option<String>,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

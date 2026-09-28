@@ -6,11 +6,12 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalSize } from '@tauri-apps/api/dpi'
 import { emitTo, type UnlistenFn } from '@tauri-apps/api/event'
-import { useArxivStore } from '../stores/arxiv'
+import { useArxivStore, type SortMode } from '../stores/arxiv'
 import { useAiStore } from '../stores/ai'
 import { useCollectionsStore } from '../stores/collections'
 import type { ArxivPaper, Collection } from '../types'
 import WindowControls from '../components/WindowControls.vue'
+import ArxivWaitBadge from '../components/ArxivWaitBadge.vue'
 
 // On Windows the native decorations are off, so we drop the macOS traffic-light
 // gutter and render our own window controls (see WindowControls).
@@ -76,34 +77,158 @@ async function watchWindowSize() {
 // Single-paper analysis
 const analyzingId = ref<string | null>(null)
 const analyzeError = ref('')
+// Which paper analyzeError belongs to, so it doesn't follow the selection around.
+const analyzeErrorId = ref<string | null>(null)
+// Status the paper had before the optimistic 'analyzing' flip, restored when the
+// request is refused before anything is sent.
+let analyzePrevStatus: string | null = null
 
 async function analyzeSingle(paper: ArxivPaper) {
-  if (analyzingId.value) return
+  if (analyzingId.value || store.analyzing) return
   // Optimistically flip the paper to the non-terminal 'analyzing' state before
   // wiring up the watch. Re-analyzing an already-'done'/'failed' paper would
   // otherwise let the watch read the stale terminal status and clear analyzingId
   // immediately, flashing the loading state off. Now analyzingId is only cleared
   // once the store event transitions it back to a terminal state.
   const target = store.papers.find(p => p.arxiv_id === paper.arxiv_id)
+  analyzePrevStatus = target?.analysis_status ?? null
   if (target) target.analysis_status = 'analyzing'
   analyzingId.value = paper.arxiv_id
   analyzeError.value = ''
+  analyzeErrorId.value = null
   try {
     await invoke('analyze_arxiv_paper', { arxivId: paper.arxiv_id })
     // Result comes back via the arxiv-analysis event listener in the store
   } catch (e) {
-    analyzeError.value = String(e)
-    analyzingId.value = null
+    abortSingleAnalysis(paper.arxiv_id, String(e))
   }
 }
 
-// Clear analyzingId when the store's event marks this paper done/failed
+// Nothing was sent: undo the optimistic flip and say why.
+function abortSingleAnalysis(arxivId: string, message: string) {
+  const p = store.papers.find(p => p.arxiv_id === arxivId)
+  if (p && p.analysis_status === 'analyzing' && analyzePrevStatus !== null) {
+    p.analysis_status = analyzePrevStatus
+  }
+  analyzePrevStatus = null
+  if (analyzingId.value === arxivId) analyzingId.value = null
+  analyzeError.value = message
+  analyzeErrorId.value = arxivId
+}
+
+// Clear analyzingId when the store's event marks this paper done/failed, or the
+// paper leaves the list (filtered below the threshold and removed).
 watch(() => {
   const p = store.papers.find(p => p.arxiv_id === analyzingId.value)
   return p?.analysis_status
 }, (status) => {
-  if (status === 'done' || status === 'failed') {
+  if (!analyzingId.value) return
+  if (status === 'done' || status === 'failed' || status === undefined) {
     analyzingId.value = null
+    analyzePrevStatus = null
+  }
+})
+
+// Refused before anything was sent (not configured, bulk run going, paper gone).
+watch(() => store.lastSingleError, (err) => {
+  if (err && err.arxiv_id === analyzingId.value) abortSingleAnalysis(err.arxiv_id, err.message)
+})
+
+// A refusal such as "bulk run in progress" goes stale once a bulk run starts or ends.
+watch(() => store.analyzing, () => {
+  if (analyzingId.value) return
+  analyzeError.value = ''
+  analyzeErrorId.value = null
+})
+
+// The selected paper is being analyzed — by this view, or by a running bulk batch.
+const selectedIsAnalyzing = computed(() => {
+  const p = selectedPaper.value
+  if (!p) return false
+  return analyzingId.value === p.arxiv_id || (store.analyzing && p.analysis_status === 'analyzing')
+})
+
+// ── Bulk analysis ─────────────────────────────────────────────────────────────
+
+// What "AI 分析全部" will pick up: pending, then failed. Outside a run any
+// 'analyzing' paper is left over from an interrupted one and is re-queued too.
+const bulkAnalyzeCounts = computed(() => {
+  let pending = 0
+  let failed = 0
+  for (const p of store.papers) {
+    if (p.analysis_status === 'pending') pending++
+    else if (p.analysis_status === 'failed') failed++
+    else if (p.analysis_status === 'analyzing' && p.arxiv_id !== analyzingId.value) pending++
+  }
+  return { pending, failed, total: pending + failed }
+})
+
+const bulkAnalyzeTitle = computed(() => {
+  const { pending, failed, total } = bulkAnalyzeCounts.value
+  if (total === 0) return '没有待分析或分析失败的论文'
+  if (failed === 0) return `分析 ${total} 篇待分析的论文`
+  return `分析 ${total} 篇：待分析 ${pending} 篇，重试之前失败的 ${failed} 篇`
+})
+
+function startBulkAnalysis() {
+  // The batch would claim the paper a single analysis has in flight; the
+  // backend skips it, but the button should not offer it in the first place.
+  if (analyzingId.value) return
+  // The store records a start failure in analysisNotice.
+  store.startAnalysis().catch(() => {})
+}
+
+// Outcome of the last bulk run, shown in the status bar until dismissed.
+type NoticeTone = 'ok' | 'warn' | 'muted' | 'error'
+interface NoticeView { tone: NoticeTone; icon: string; text: string; autoHide: boolean }
+
+function trimEndPunct(s: string): string {
+  return s.trim().replace(/[。．.！!\s]+$/u, '')
+}
+
+const analysisNoticeView = computed<NoticeView | null>(() => {
+  const n = store.analysisNotice
+  if (!n) return null
+  if (n.kind === 'error') {
+    return { tone: 'error', icon: 'fluent:error-circle-24-regular', text: `AI 分析未能开始：${n.message}`, autoHide: false }
+  }
+  if (n.stoppedReason) {
+    return {
+      tone: 'warn', icon: 'fluent:pause-circle-24-regular', autoHide: false,
+      text: `已暂停：${trimEndPunct(n.stoppedReason)}。剩余 ${n.reverted} 篇保持未分析，处理好后再点「AI 分析全部」会从这里继续。`,
+    }
+  }
+  if (n.cancelled) {
+    return { tone: 'muted', icon: 'fluent:dismiss-circle-24-regular', text: `已取消，${n.reverted} 篇未分析的保持原状态。`, autoHide: false }
+  }
+  if (n.failed > 0) {
+    return {
+      tone: 'warn', icon: 'fluent:warning-24-regular', autoHide: false,
+      text: `分析完成：成功 ${n.succeeded}，未达阈值已过滤 ${n.filtered}，失败 ${n.failed}（再点「AI 分析全部」会重试失败的）`,
+    }
+  }
+  if (n.total === 0) {
+    return { tone: 'muted', icon: 'fluent:info-24-regular', text: '没有待分析的论文', autoHide: true }
+  }
+  if (!n.hasCounts) {
+    return { tone: 'ok', icon: 'fluent:checkmark-circle-24-regular', text: '分析完成', autoHide: true }
+  }
+  return {
+    tone: 'ok', icon: 'fluent:checkmark-circle-24-regular', autoHide: true,
+    text: n.filtered > 0
+      ? `分析完成：成功 ${n.succeeded}，未达阈值已过滤 ${n.filtered}`
+      : `分析完成：成功 ${n.succeeded}`,
+  }
+})
+
+let noticeHideTimer: ReturnType<typeof setTimeout> | null = null
+watch(() => store.analysisNotice, (n) => {
+  if (noticeHideTimer) { clearTimeout(noticeHideTimer); noticeHideTimer = null }
+  if (n && analysisNoticeView.value?.autoHide) {
+    noticeHideTimer = setTimeout(() => {
+      if (store.analysisNotice === n) store.analysisNotice = null
+      noticeHideTimer = null
+    }, 6000)
   }
 })
 
@@ -197,6 +322,7 @@ onUnmounted(() => {
   ;(store as any).unsubscribeEvents()
   if (windowResizeTimer) clearTimeout(windowResizeTimer)
   if (addMsgTimer) clearTimeout(addMsgTimer)
+  if (noticeHideTimer) { clearTimeout(noticeHideTimer); noticeHideTimer = null }
   window.removeEventListener('resize', saveWindowSizeToStorage)
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('mousedown', onGlobalMousedown)
@@ -253,7 +379,7 @@ function toggleSortMenu() {
   showSortMenu.value = !showSortMenu.value
 }
 
-function setSortMode(mode: 'score' | 'date' | 'rating') {
+function setSortMode(mode: SortMode) {
   store.sortMode = mode
 }
 
@@ -351,6 +477,7 @@ function setAddMessage(message: string, timeoutMs = 0) {
 function dismissStatusBar() {
   setAddMessage('')
   if (!store.fetching) store.fetchMessage = ''
+  store.analysisNotice = null
 }
 
 const TAG_PALETTES = [
@@ -728,10 +855,15 @@ function jumpToDate(dateStr: string) {
         <span v-if="store.loaded" class="paper-count-pill" data-tauri-drag-region>{{ store.papers.length }} 篇</span>
         <div v-if="store.analyzing" class="topbar-analysis-status" data-tauri-drag-region>
           <span class="spinner" data-tauri-drag-region />
-          <span class="analysis-progress-text" data-tauri-drag-region>AI 分析中 {{ store.analyzeProgress.done }}/{{ store.analyzeProgress.total }}</span>
+          <span
+            class="analysis-progress-text"
+            :title="store.analyzeRetryingFailed > 0 ? `其中 ${store.analyzeRetryingFailed} 篇是在重试之前失败的论文` : undefined"
+            data-tauri-drag-region
+          >AI 分析中 {{ store.analyzeProgress.done }}/{{ store.analyzeProgress.total }}</span>
           <div class="progress-track" data-tauri-drag-region>
             <div class="progress-fill" :style="{ width: store.analyzeProgress.total > 0 ? (store.analyzeProgress.done / store.analyzeProgress.total * 100) + '%' : '0%' }" data-tauri-drag-region />
           </div>
+          <ArxivWaitBadge v-if="store.analyzeWaiting" :waiting="store.analyzeWaiting" />
           <button class="cancel-btn" @click="store.cancelAnalysis()">取消</button>
         </div>
       </div>
@@ -746,10 +878,12 @@ function jumpToDate(dateStr: string) {
         <button
           v-if="store.config.ai_analysis_enabled && !store.analyzing"
           class="tb-btn"
-          @click="store.startAnalysis()"
+          :disabled="!!analyzingId"
+          :title="analyzingId ? '单篇分析进行中，结束后可分析全部' : bulkAnalyzeTitle"
+          @click="startBulkAnalysis"
         >
           <Icon icon="fluent:weather-sunny-24-regular" width="14" height="14" />
-          AI 分析全部
+          AI 分析全部<template v-if="bulkAnalyzeCounts.total > 0"> ({{ bulkAnalyzeCounts.total }})</template>
         </button>
         <button class="tb-btn topbar-fetch-btn" :disabled="store.fetching" @click="doFetch">
           <Icon icon="fluent:arrow-sync-24-regular" width="14" height="14" :class="{ spin: store.fetching }" />
@@ -765,7 +899,7 @@ function jumpToDate(dateStr: string) {
 
     <!-- Status bar (progress / errors) -->
     <Transition name="status-slide">
-      <div v-if="store.fetching || store.fetchMessage || addMsg" class="status-bar">
+      <div v-if="store.fetching || store.fetchMessage || addMsg || analysisNoticeView" class="status-bar">
         <div class="status-content">
           <div v-if="store.fetching" class="status-row">
             <span class="spinner" />
@@ -773,9 +907,13 @@ function jumpToDate(dateStr: string) {
           </div>
           <span v-if="store.fetchMessage && !store.fetching" class="status-error">{{ store.fetchMessage }}</span>
           <span v-if="addMsg" class="status-ok">{{ addMsg }}</span>
+          <span v-if="analysisNoticeView" class="status-notice" :class="`tone-${analysisNoticeView.tone}`">
+            <Icon :icon="analysisNoticeView.icon" width="13" height="13" class="status-notice-icon" />
+            <span class="status-notice-text">{{ analysisNoticeView.text }}</span>
+          </span>
         </div>
         <button
-          v-if="!store.fetching"
+          v-if="!store.fetching || analysisNoticeView"
           class="status-close-btn"
           title="关闭提示"
           aria-label="关闭提示"
@@ -805,6 +943,15 @@ function jumpToDate(dateStr: string) {
               @click="store.filterMode = store.filterMode === 'unread' ? 'all' : 'unread'"
             >
               <Icon icon="fluent:record-24-regular" width="15" height="15" />
+            </button>
+            <!-- Pending / failed analysis filter toggle -->
+            <button
+              class="list-tool-btn"
+              :class="{ active: store.filterMode === 'pending_analysis' }"
+              title="只显示待分析和分析失败的"
+              @click="store.filterMode = store.filterMode === 'pending_analysis' ? 'all' : 'pending_analysis'"
+            >
+              <Icon icon="fluent:hourglass-half-24-regular" width="14" height="14" />
             </button>
             <!-- Tag (topic) filter -->
             <button
@@ -865,6 +1012,10 @@ function jumpToDate(dateStr: string) {
               <button class="sort-menu-item" :class="{ selected: store.sortMode === 'rating' }" @click="setSortMode('rating')">
                 <span class="sort-check">{{ store.sortMode === 'rating' ? '✓' : '' }}</span>
                 <span>我的评分</span>
+              </button>
+              <button class="sort-menu-item" :class="{ selected: store.sortMode === 'status' }" @click="setSortMode('status')">
+                <span class="sort-check">{{ store.sortMode === 'status' ? '✓' : '' }}</span>
+                <span>分析状态</span>
               </button>
               <div class="sort-menu-divider" />
               <div class="sort-section-title">排序方式</div>
@@ -1043,7 +1194,11 @@ function jumpToDate(dateStr: string) {
                     <div class="item-footer">
                       <div class="item-meta" v-if="paper.in_library || paper.analysis_status === 'failed'">
                         <span v-if="paper.in_library" class="item-state in-library">已入库</span>
-                        <span v-else-if="paper.analysis_status === 'failed'" class="item-state failed">失败</span>
+                        <span
+                          v-else-if="paper.analysis_status === 'failed'"
+                          class="item-state failed"
+                          :title="paper.analysis_error ? `分析失败：${paper.analysis_error}` : '分析失败'"
+                        >失败</span>
                       </div>
                       <div class="item-tags">
                         <span v-if="paper.source === 'biorxiv'" class="tag-biorxiv">bioRxiv</span>
@@ -1202,15 +1357,16 @@ function jumpToDate(dateStr: string) {
             <div class="analysis-trigger">
               <button
                 class="btn-analyze"
-                :class="{ analyzing: analyzingId === selectedPaper.arxiv_id }"
-                :disabled="!!analyzingId || selectedPaper.analysis_status === 'done'"
+                :class="{ analyzing: selectedIsAnalyzing }"
+                :disabled="!!analyzingId || store.analyzing || selectedPaper.analysis_status === 'done'"
+                :title="store.analyzing && !selectedIsAnalyzing && selectedPaper.analysis_status !== 'done'
+                  ? '批量分析进行中，结束后可单独分析' : undefined"
                 @click="analyzeSingle(selectedPaper)"
               >
-                <Icon icon="fluent:weather-sunny-24-regular" width="13" height="13" :class="{ spin: analyzingId === selectedPaper.arxiv_id }" />
-                {{ analyzingId === selectedPaper.arxiv_id ? 'AI 分析中...' : selectedPaper.analysis_status === 'done' ? '已分析' : 'AI 分析' }}
+                <Icon icon="fluent:weather-sunny-24-regular" width="13" height="13" :class="{ spin: selectedIsAnalyzing }" />
+                {{ selectedIsAnalyzing ? 'AI 分析中...' : selectedPaper.analysis_status === 'done' ? '已分析' : 'AI 分析' }}
               </button>
               <span v-if="selectedPaper.analysis_status === 'failed'" class="analysis-status-tag failed">分析失败</span>
-              <span v-if="analyzeError && analyzingId === null" class="analysis-error">{{ analyzeError }}</span>
             </div>
             <button class="btn-arxiv" :class="{ 'btn-biorxiv-link': selectedPaper.source === 'biorxiv' }" @click="openUrl(selectedPaper.abs_url)">
               {{ selectedPaper.source === 'biorxiv' ? 'bioRxiv' : 'arXiv' }}
@@ -1224,6 +1380,14 @@ function jumpToDate(dateStr: string) {
               <Icon icon="fluent:delete-24-regular" width="12" height="12" />
               移除
             </button>
+            <div
+              v-if="(selectedPaper.analysis_status === 'failed' && selectedPaper.analysis_error)
+                || (analyzeError && analyzingId === null && analyzeErrorId === selectedPaper.arxiv_id)"
+              class="analysis-feedback"
+            >
+              <p v-if="selectedPaper.analysis_status === 'failed' && selectedPaper.analysis_error" class="analysis-error-reason">{{ selectedPaper.analysis_error }}</p>
+              <p v-if="analyzeError && analyzingId === null && analyzeErrorId === selectedPaper.arxiv_id" class="analysis-error">{{ analyzeError }}</p>
+            </div>
           </div>
 
           <!-- AI Summary -->
@@ -1398,6 +1562,10 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   background: transparent;
   font-size: 11px;
 }
+/* Only the throttling reason gives way when the bar runs out of room. */
+.topbar-analysis-status { min-width: 0; }
+.topbar-analysis-status .progress-track { flex: 0 1 88px; min-width: 40px; }
+.topbar-analysis-status .cancel-btn { flex-shrink: 0; }
 
 .tb-btn {
   display: flex; align-items: center; gap: 5px;
@@ -1459,6 +1627,28 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 }
 .status-error { color: #ef4444; }
 .status-ok { color: var(--accent); }
+/* Bulk-analysis outcome: wraps rather than truncates, and can be copied. */
+.status-notice {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.status-notice-icon { flex-shrink: 0; margin-top: 2px; }
+.status-notice-text {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+.status-notice.tone-ok { color: var(--accent); }
+.status-notice.tone-error { color: #ef4444; }
+.status-notice.tone-warn .status-notice-icon { color: #f59e0b; }
+.status-notice.tone-muted .status-notice-icon { color: var(--text-tertiary); }
 .status-close-btn {
   width: 24px;
   height: 24px;
@@ -2141,6 +2331,24 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 .analysis-status-tag.failed { background: rgba(239,68,68,0.1); color: #ef4444; }
 .analysis-status-tag.pending { background: var(--bg-tertiary); color: var(--text-tertiary); }
 .analysis-error { font-size: 11px; color: #ef4444; }
+/* Failure reason / refusal under the action row: its own line, wraps, selectable. */
+.analysis-feedback {
+  flex-basis: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.analysis-feedback p {
+  margin: 0;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+.analysis-error-reason { font-size: 11.5px; color: var(--text-secondary); }
 
 /* Sections */
 .detail-section { margin-bottom: 20px; }

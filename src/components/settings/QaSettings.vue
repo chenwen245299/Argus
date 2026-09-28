@@ -2,12 +2,12 @@
 /**
  * The AI 随航 settings section.
  *
- * Everything the AI does with the library lives here as a sub-tab: the two ways
- * a question gets answered (agent mode, where the model calls tools itself, and
- * RAG, where chunks are retrieved for it), the per-task analysis models, and the
- * arXiv crawler. They used to be four separate top-level sections, which made
- * settings read as a list of unrelated features rather than one place where the
- * AI is configured.
+ * Everything the AI does with the library lives here as a sub-tab: agent mode
+ * (how 智能问答 answers — the model calls tools itself), RAG / vectorizing
+ * (the embedding model and vector store behind the 向量图谱; chat does not read
+ * it), the per-task analysis models, and the arXiv crawler. They used to be four
+ * separate top-level sections, which made settings read as a list of unrelated
+ * features rather than one place where the AI is configured.
  */
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -35,9 +35,9 @@ function asTab(value: string | undefined): Tab | null {
 
 const activeTab = ref<Tab>(asTab(props.initialTab) ?? 'agent')
 
-// Opening settings straight at a tab (the chat's "configure RAG" prompt, an
-// arXiv or analysis entry point) has to land there even when this component is
-// already mounted.
+// Opening settings straight at a tab (the embedding map's "configure RAG"
+// button, an arXiv or analysis entry point) has to land there even when this
+// component is already mounted.
 watch(() => props.initialTab, (tab) => {
   const next = asTab(tab)
   if (next) activeTab.value = next

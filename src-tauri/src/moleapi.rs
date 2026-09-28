@@ -487,7 +487,7 @@ pub async fn fetch_account(provider: &AiProvider, access_token: &str) -> Result<
         // here.
         return Err(
             "MoleAPI rejected the access token (系统访问令牌). Generate a new one in the \
-             console's Security page and paste it in Settings → AI Services."
+             console's Security page and paste it in Settings → AI Providers."
                 .to_string(),
         );
     }

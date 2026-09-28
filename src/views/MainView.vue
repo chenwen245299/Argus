@@ -501,11 +501,6 @@ function openSettingsOnAi() {
   showSettings.value = true
 }
 
-function openSettingsSection(section?: 'rag') {
-  settingsSection.value = section
-  showSettings.value = true
-}
-
 // ── First-run onboarding ────────────────────────────────────────────────────────
 // Guides the user through configuring the two things needed for full
 // functionality: a default AI model and a Semantic Scholar key. Shown on every
@@ -622,6 +617,7 @@ const dragDropSubtitle = computed(() => {
 let unlistenDragDrop: (() => void) | null = null
 let unlistenOpenPaper: UnlistenFn | null = null
 let unlistenLibraryPaperAdded: UnlistenFn | null = null
+let unlistenRagSettingsChanged: UnlistenFn | null = null
 let mainFocusRetryTimer: number | null = null
 
 async function focusMainWindowNow() {
@@ -677,6 +673,17 @@ onMounted(async () => {
     // import so they end up with equivalent metadata coverage.
     const slug = event.payload?.slug
     if (slug) importStore.processAddedPaper(slug, event.payload?.title)
+  })
+
+  // RAG settings can be saved from another window (the embedding map opens its
+  // own settings modal). Without a reload this window keeps the old settings —
+  // `isConfigured` stays false and the vectorize menu items stay hidden until
+  // a restart. A save from this window lands here too; the settings reload
+  // changes nothing then, since the store keeps its object when nothing did.
+  unlistenRagSettingsChanged = await listen('rag-settings-changed', () => {
+    if (!libraryStore.currentPath) return
+    void ragStore.load()
+    void ragStore.loadStoreInfo()
   })
 
   unlistenOpenPaper = await listen<{ slug: string; title?: string }>('argus-open-paper', (event) => {
@@ -752,6 +759,7 @@ onUnmounted(() => {
   unlistenOpenPaper?.()
   unlistenDragDrop?.()
   unlistenLibraryPaperAdded?.()
+  unlistenRagSettingsChanged?.()
 })
 
 // ── Resizable columns ─────────────────────────────────────────────────────────
@@ -1051,7 +1059,6 @@ watch(
             :library-id="activeSnippetLibraryId"
             class="center-fill"
             @open-paper="onSnippetOpenPaper"
-            @open-settings="openSettingsSection"
           />
           <div v-else-if="showSnippetLibrary" class="center-fill workspace-empty">
             <Icon icon="fluent:folder-24-regular" width="44" height="44" />

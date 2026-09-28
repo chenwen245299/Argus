@@ -7,12 +7,12 @@ This file is written for AI coding agents. It assumes you know nothing about the
 
 ## Project overview
 
-**Argus** is a local-first desktop research workspace for academic papers. It bundles PDF reading, note-taking, metadata extraction, arXiv tracking, paper relationship maps, library-wide RAG search, embedding-space visualization, and AI-assisted reading into one application.
+**Argus** is a local-first desktop research workspace for academic papers. It bundles PDF reading, note-taking, metadata extraction, arXiv tracking, paper relationship maps, library-wide agent Q&A, embedding-space visualization, and AI-assisted reading into one application.
 
 - **Frontend:** Vue 3 + TypeScript + Vite + Pinia + vue-i18n.
 - **Desktop shell:** Tauri v2 (Rust backend, WebKit-based WebView frontend).
 - **Target platforms:** macOS (primary) and Windows. Linux is not currently released.
-- **Data model:** Everything is stored locally in a user-chosen library folder. The app uses a hybrid of plain JSON/text files, SQLite FTS5 for full-text search, and SQLite vector tables for RAG.
+- **Data model:** Everything is stored locally in a user-chosen library folder. The app uses a hybrid of plain JSON/text files, SQLite FTS5 for full-text search, and SQLite vector tables for the embedding map.
 
 > [!CAUTION]
 > Most of this project was generated or heavily assisted by AI. The app is experimental and under active debugging. Keep backups of any real literature library.
@@ -128,7 +128,7 @@ npm run tauri build
 ```bash
 npm run preview      # Preview the built dist/ bundle
 npm run tauri        # Proxy to the Tauri CLI
-cargo test -p argus  # Run the few Rust unit tests
+cd src-tauri && cargo test --lib  # Run the Rust unit tests (~450)
 ```
 
 ### Upgrading Tauri
@@ -173,7 +173,7 @@ The app uses multiple Tauri windows rather than browser-style routing. `src/App.
 | `main` | `MainView` | Primary 3-column workspace |
 | `arxiv` | `ArxivView` | arXiv / bioRxiv recommendation inbox |
 | `canvas` | `CanvasView` | Paper relationship canvas (Vue Flow) |
-| `library-chat` | `LibraryChatView` | Library-wide RAG chat |
+| `library-chat` | `LibraryChatView` | Library-wide 智能问答 (agent chat) |
 | `paper-ai` | `PaperAiView` | Per-paper AI chat |
 | `embedding-map` | `EmbeddingMapView` | 2-D visualization of the vector embedding space |
 | `note-window-*` | `NoteWindowView` | Standalone note editor |
@@ -194,7 +194,7 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `paperTasks.ts` | In-progress AI tasks per paper and progress events |
 | `ai.ts` | AI provider/model settings |
 | `settings.ts` | App settings (theme, prompts, extraction defaults) |
-| `rag.ts` | RAG provider, embedding model, vector store status |
+| `rag.ts` | RAG provider, embedding model, vector store status, collection embed jobs, and the library-wide 同步缺失 / 完整重建 run (kept here so it outlives the settings modal). `MainView` reloads it on the backend's `rag-settings-changed` event, since the embedding map window saves RAG settings through its own settings modal; a mounted `RagSettings.vue` reloads on the same event |
 | `arxiv.ts` | arXiv inbox, config, schedule status, analysis |
 | `canvas.ts` | Canvas list, current canvas, auto-save |
 
@@ -213,14 +213,14 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `ocr.rs` | OCR via macOS Vision, tesseract, pdftoppm |
 | `collections.rs` | Collection CRUD and nested moves |
 | `search.rs` | SQLite FTS5 full-text index |
-| `rag.rs` | Vector store, embedding storage, cosine similarity search |
+| `rag.rs` | Vector store and embedding storage behind the embedding map (chat does not read it) |
 | `ai_manager.rs` | AI provider CRUD and AES-256-GCM API key encryption |
 | `llm.rs` | OpenAI-compatible / Anthropic chat, embeddings, OpenRouter, token usage |
 | `ai_summary.rs` | Generate AI paper summaries and abstract extraction |
 | `copilot.rs` | Per-paper and library-wide chat, chat history persistence |
 | `arxiv.rs` / `arxiv_scheduler.rs` | arXiv/bioRxiv fetching, inbox storage, scheduled catch-up |
 | `canvas.rs` / `canvas_enhance.rs` | Canvas CRUD, edge suggestions, auto-layout, export |
-| `snippets.rs` | Snippet library CRUD |
+| `snippets.rs` | Snippet library CRUD. Snippets are not embedded: the agent finds them with `search_snippets` (`mcp/tools.rs`), a substring match over text, note, source-paper title and tags |
 | `token_usage.rs` | Token and USD cost tracking |
 | `url_import.rs` | Import from ACL Anthology, OpenReview, arXiv, direct PDF |
 | `settings.rs` | `config.json` settings I/O |
@@ -240,7 +240,7 @@ external agents (Claude Code, Claude Desktop, Codex).
 | `mcp/mod.rs` | The on/off setting, library resolution, client config snippets, the stdio entry point |
 | `mcp/server.rs` | `rmcp` tool declarations (names, JSON schemas, descriptions) |
 | `mcp/tools.rs` | The read implementations — **and the security boundary** |
-| `mcp/agent.rs` | The same tools in-process, for the app's own agent mode |
+| `mcp/agent.rs` | The same tools in-process, for the app's own agent mode, plus app-only declarations kept out of `tools()` and the server (`canvas_edit_tool`) |
 | `mcp/client.rs` | The *other* direction: Argus as an MCP client of other servers |
 
 **Transport is stdio.** The client launches `Argus --mcp-stdio` as a subprocess
@@ -275,7 +275,7 @@ is skipped — it mirrors the active conversation, so exposing it would duplicat
 `get_library_stats` is the intended entry point for an agent meeting a library
 for the first time: one incremental index scan yields counts by reading status,
 year, file type and tag, plus the pipeline flags already carried in
-`PaperIndexEntry::status`, so it costs about the same as one `list_papers` call
+`PaperIndexEntry::status`, so it costs about the same as one `find_papers` call
 and replaces a series of filtered probes. `list_collections` reports both the
 direct `paper_count` and the deduplicated `total_paper_count` across
 descendants, along with a readable `path`.
@@ -302,36 +302,107 @@ shown to the user:
 `knowledge_source: "agent"` on the `chat_with_library` command routes to
 `copilot::chat_with_library_agent`, which hands the model the same tool surface
 the MCP server exposes and lets it drive its own retrieval instead of receiving
-a pre-built RAG context.
+a pre-built context. It is the only mode now: `LibraryChat.vue` has no
+knowledge-source selector and always sends `knowledgeSource: "agent"`,
+`plainFallback: true`, and `selectedPaperSlugs` (the conversation's pins).
 
 - `mcp::agent::tools()` / `mcp::agent::call()` expose the tools in-process. The
   dispatch in `mcp/agent.rs` is written by hand because invoking a `ToolRoute`
   needs a `RequestContext<RoleServer>` that only exists inside a live service;
   two tests keep it in sync with the declarations in both directions.
 - `llm::stream_with_tools` is OpenAI-compatible only (DeepSeek, OpenRouter,
-  Kimi, custom endpoints). `llm::supports_tool_calling` gates it so
-  Anthropic/Ollama users get a clear message rather than a 400. It streams
-  content deltas live *and* accumulates the `delta.tool_calls[i]` fragments,
-  whose `function.arguments` arrive split across chunks and must be concatenated
-  by `index` before they parse.
+  Kimi, custom endpoints). `llm::supports_tool_calling` gates it (Anthropic
+  protocol, Kimi Code included, and Ollama are out): the library chat answers
+  those without tools (see *Plain fallback*), everyone else gets a clear
+  message rather than a 400. It streams content deltas live *and* accumulates
+  the `delta.tool_calls[i]` fragments, whose `function.arguments` arrive split
+  across chunks and must be concatenated by `index` before they parse. Kimi K2
+  gets the same fixed thinking/sampling params here as on the plain chat path,
+  and its `reasoning_content` is replayed on assistant turns that carried tool
+  calls (`llm::replays_reasoning_with_tool_calls` — Kimi K2 only; DeepSeek's
+  reasoner has rejected the field on input).
 - `chat_with_library_agent` connects the external servers, then runs
   `run_agent_loop`; the split exists so the child processes are torn down on
   every exit path, cancellation included.
-- The system prompt is user-editable (设置 → 智能问答 → Agent, key
+- **Plain fallback.** With `plain_fallback`, `commands::chat_with_library`
+  checks `copilot::plain_fallback_reason` *before* connecting any MCP server:
+  `no_tools` (`supports_tool_calling` false, or `llm::model_declares_no_tools`
+  — only StepFun's and OpenRouter's catalogues are trusted for that),
+  `web_search` (DeepSeek's search cannot run inside the tool loop), `speech`
+  (StepFun spoken reply on a speaking model). A hit goes to
+  `copilot::chat_with_library_fallback`, which emits `{event}-agent` phase
+  `fallback` (`reason` / `mode` / `papers` / `detail`) for the notice line, then
+  runs the tool-free `copilot::chat_with_library` in mode `papers` (the pins'
+  full text, also emitted to `{event}-sources`) or `none` (a plain answer) —
+  `copilot::fallback_mode`. There is no retrieval mode: the old `library` mode
+  (RAG over the vector store) is never sent, though saved conversations still
+  carry it and `LibraryChat.vue` renders it neutrally. If `stream_with_tools`
+  fails on the *first* round with an error prefixed `llm::TOOLS_REJECTED_PREFIX`,
+  the command retries the question as a fallback with reason `rejected` and the
+  provider's text as `detail`. The prefix is set only by the deliberately narrow
+  `llm::looks_like_tools_rejected` (400/404/422, about tools, *and* saying
+  unsupported); later rounds strip it. Nothing is remembered across questions.
+  The paper AI panel and canvas chat do not opt in and still fail loudly. The
+  fallback is now the only way into the non-agent `copilot::chat_with_library`,
+  which knows only `papers` and `none`: the retrieval sources older builds sent
+  (`paper-rag`, `paper-rag-loose`, `snippets`) are gone, and a caller still
+  naming one is answered as `none` rather than refused (`tool_free_source`).
+- **No RAG in chat.** Nothing on the chat path — library chat, paper AI panel,
+  canvas chat, the plain fallback — reads the vector store or calls an embedding
+  model. The old `semantic_search` tool is gone (the agent tool list and
+  `agent_list_builtin_tools` never carry it), and `find_papers`'s `content` is a
+  keyword match. Vectors exist for the embedding map only — a deliberate
+  decision, so don't wire them back into answers.
+- **Pins.** `copilot::pinned_papers_block` renders the pinned slugs (deduped,
+  capped at `MAX_PINNED_PAPERS` = 50, missing papers skipped) from the library
+  index, never `get_paper` (which reads each full text), and leaves out anything
+  that moves while the user works, since it is cached prefix. `join_blocks`
+  puts it in the same stable system block as `paper_context_block`, and it is
+  also emitted as `{event}-context` with mode `"pinned"` for the sent-context
+  banner. `selectedPaperSlugs` on saved conversations predates pins (it held the
+  old 文献库论文 selection), so old conversations load it as pins.
+  A pin can outlive its paper (deleted, or renamed to a new slug). The stored
+  list is never rewritten behind the user's back; instead `LibraryChat.vue`
+  sends only the pins still in its paper list (`livePinnedSlugs`), and
+  `chat_with_library_fallback` resolves the slugs against the index again
+  before picking its mode. The picker's 已固定 tab reports the dead pins and
+  can clear them. Its paper list is re-read when the picker opens, on
+  `library-updated` (debounced), and when a canvas sends an unknown slug.
+- **Pinning from a canvas** (`src/utils/chatPapers.ts`) is a request/response
+  over the event bus: the chat acks at once (`argus-chat-add-papers-ack`), then
+  replies with `added` / `alreadyPresent` / `overLimit` / `unknown`. The 700 ms
+  timeout only covers the ack — it is what tells "chat not open" apart — so the
+  chat may re-read its paper list before answering.
+- The system prompt is user-editable (设置 → AI 随航 → Agent 与工具, key
   `agent_system_prompt`); blank falls back to `DEFAULT_AGENT_SYSTEM_PROMPT`.
   That default's substantive instruction is **collection-first retrieval**: walk
-  `list_collections` → `list_papers(collection_id)` → narrow, and treat a
-  whole-library keyword `list_papers` as the last resort. Left to itself a model
-  reaches for the keyword sweep, which matches titles and ignores the structure
-  the user built by hand. It also tells the model that `list_papers` /
-  `search_papers` take `abstract_detail` (`preview` default / `full` / `none`),
-  so how much abstract text comes back is the model's call, not a hardcoded cut.
+  `list_collections` → `find_papers(collection_id)` → narrow (`query`, `tag`,
+  years, `venue`, `min_citations`, sorting), and treat a whole-library keyword
+  `find_papers` as the last resort. Left to itself a model reaches for the
+  keyword sweep, which matches titles and ignores the structure the user built
+  by hand. `find_papers`'s `content` argument is the keyword full-text search
+  for questions about what is *inside* papers. The prompt also tells the model
+  that `find_papers` omits abstracts unless it passes `abstract_detail: "full"`
+  (`tools::AbstractDetail`: `"full"` or none — the default, and what any other
+  value means), so whether abstracts come back is the model's call. Snippets
+  are found with `search_snippets`, a plain substring match.
   `agent_system_prompt` is shared with the keepalive —
   the two must send byte-identical system messages or the warmed prefix is not
   the one the next question sends.
 - The loop is bounded by `MAX_AGENT_ROUNDS` (500); on hitting it the model gets
-  one final tool-less turn to answer with what it has. Tool results are capped at
-  `MAX_TOOL_RESULT_CHARS` and the truncation is told to the model so it pages.
+  one final tool-less turn to answer with what it has.
+- **Tool output is budgeted in tokens, from the model's window.**
+  `ContextBudget::for_model` (`copilot.rs`) reads the model's `context_length`
+  (`ASSUMED_CONTEXT_TOKENS` = 128k when unset) and derives two caps: one result
+  may be `tokens / 4` (`single_result`, floor `MIN_RESULT_TOKENS` = 2 000), all
+  results together `tokens / 2` (`transcript`, floor twice that). Tokens are
+  estimated per script (`estimate_tokens`: ASCII at four characters to the
+  token, anything else at one), so a Chinese result is not under-counted
+  fourfold. `truncate_tool_result` cuts an oversized result and appends a note
+  telling the model it was cut, so it narrows or pages with `offset`/`limit`;
+  `evict_old_tool_results` then replaces the oldest earlier-round results with a
+  stub that says to call the tool again (a stub, not a deletion, which would
+  orphan its `tool_calls` entry), and the loop emits phase `evicted`.
 - A failing tool is fed back as an error string rather than aborting, so the
   model can correct a bad slug or section name on the next round.
 - **Usage is summed, not emitted per round.** `stream_with_tools` returns a
@@ -339,21 +410,25 @@ a pre-built RAG context.
   `llm::emit_usage` once at the end. Emitting per round both showed a cost strip
   during the first tool call and reported only that round's figures.
 - Progress is emitted on `{event_name}-agent`, phases `servers` / `thinking` /
-  `tool` / `result` / `answering` / `limit`.
+  `tool` / `result` / `evicted` / `answering` / `limit`, plus `fallback` from the
+  fallback path.
 
 **Prompt-cache keepalive (`cache_keepalive.rs`).** An agent turn sends a large
-prefix (system prompt + 17 tool schemas + the conversation), and providers with
-automatic prefix caching bill a repeat of it at roughly a tenth of the normal
-rate — but only while the entry is warm; DeepSeek's expires after ~10 minutes
-idle. After each agent answer, `chat_with_library_agent` arms a loop that
+prefix (the system prompt, every tool schema — external servers' too — and the
+conversation), and providers with automatic prefix caching bill a repeat of it
+at roughly a tenth of the normal rate — but only while the entry is warm;
+DeepSeek's expires after ~10 minutes idle. After each agent answer, `chat_with_library_agent` arms a loop that
 re-sends the same prefix every 5 minutes with `max_tokens: 1`.
 
 - The warmed prefix is *not* the loop's internal transcript. It is what the next
-  question will send: system + the clean user/assistant history + the answer
-  just given. The loop's `tool` messages never reappear in a later request, so
-  warming them would refresh a prefix nothing asks for. The `tools` array is
-  snapshotted verbatim from the turn (external servers included) for the same
-  reason — `agent_tool_defs` is shared so the two cannot drift.
+  question will send: system + the paper-card/pins block + the clean
+  user/assistant history + the answer just given. The loop's `tool` messages
+  never reappear in a later request, so warming them would refresh a prefix
+  nothing asks for. The `tools` array is snapshotted verbatim from the turn
+  (external servers included) for the same reason —
+  `agent_tool_defs(bridge, vision, canvas_edit)` is shared, and the
+  loop and the keepalive must pass it identical flags or they warm a different
+  tools block.
 - Gated by `is_worthwhile`: DeepSeek always (documented caching, and turn 1 has
   no hit to observe yet), everyone else only once a turn has actually reported
   `cache_hit_tokens > 0`. Against a provider with no cache the ping would be a
@@ -363,11 +438,12 @@ re-sends the same prefix every 5 minutes with `max_tokens: 1`.
   since the last question, or two consecutive failures.
 - Recorded in the usage ledger under source `cache-keepalive`, so this
   background spend is visible rather than folded into the user's own turns.
-- User-switchable in 设置 → 智能问答 → Agent (`agent_keep_cache_warm`, default on).
+- User-switchable in 设置 → AI 随航 → Agent 与工具 →「保持上下文缓存」
+  (`agent_keep_cache_warm`, default on).
 - Status reaches the chat window on the `cache-keepalive` event (`{active, model,
   pings, stopsAtMs, intervalSeconds}` / `{active: false, reason}`), which drives
-  the breathing dot on the 知识来源 pill (and its counterpart in the conversation
-  list). The status carries a `conversationId` the backend treats as opaque, so
+  the breathing dot on the 工具设置 button under the composer (and its
+  counterpart in the conversation list). The status carries a `conversationId` the backend treats as opaque, so
   the indicator lands on the one conversation whose prefix is actually held. `disarm` is silent — `arm` calls it to
   replace its predecessor, and announcing there would blink the badge between
   every question; explicit stops go through `disarm_and_announce`.
@@ -375,13 +451,14 @@ re-sends the same prefix every 5 minutes with `max_tokens: 1`.
 **External MCP servers (`mcp/client.rs`).** Users can point agent mode at other
 MCP servers, which Argus launches as stdio subprocesses exactly the way Claude
 Desktop launches Argus. Configuration lives in the app-data store
-(`mcp_external_servers`, `agent_max_rounds`) and is edited in 设置 → 智能问答.
+(`mcp_external_servers`, `agent_max_rounds`) and is edited in 设置 → AI 随航 →
+Agent 与工具.
 
 - Connections last one answer. Holding them open would leave node processes
   running for a chat window the user stopped using.
 - Tools reach the model as `prefix__tool`, sanitized to `[A-Za-z0-9_-]{1,64}` by
   `namespaced`. A name the provider rejects fails the *whole* request, and the
-  prefix is also what stops an external `search_papers` from shadowing ours.
+  prefix is also what stops an external `find_papers` from shadowing ours.
 - A server that fails to start is reported in the answer's trail, not swallowed;
   the other servers still load.
 - The child gets a widened `PATH` (`augmented_path`): an app launched from the
@@ -393,6 +470,34 @@ Desktop launches Argus. Configuration lives in the app-data store
 When a client silently shows no tools, `claude --debug-file <path> -p hi` prints
 the actual validation errors with the offending tool index. Claude Desktop's own
 logs report only a bare `result` and reveal nothing.
+
+### arXiv batch analysis (`arxiv.rs`)
+
+"AI 分析全部" (`start_analysis`) claims every `pending` *and* `failed` paper
+(pending first; a stale `analyzing` counts as pending), runs them through a
+worker pool, and puts anything it did not finish back to the status it had.
+Built for subscription plans that throttle hard — MiniMax's Token Plan answers
+`529 … 整点高峰 … (2064)` around the top of the hour:
+
+- Errors are sorted by `llm::classify_error` into Transient (pause the whole
+  batch, 10 s doubling to 5 min, halve concurrency, re-queue the paper a few
+  places down), Fatal (bad key, no balance, used-up plan window such as
+  MiniMax `2056`: stop at once) and Request (this paper only: `failed`, with
+  the reason in `analysis_error`). The batch also stops after 12 minutes with
+  no answer or 12 request failures in a row.
+- **`classify_error` reads markers in the message text** — a MiniMax
+  `(NNNN)` code, quota wording, the HTTP status as `(429)` / `API error 529`,
+  network wording. When changing `friendly_error` or any error string in
+  `llm.rs`, keep those markers; `error_class_tests` guards them.
+- Results are buffered and written every 2 s under `inbox_lock`, which every
+  inbox read-modify-write takes. Day files that cannot be parsed are never
+  written or deleted (`read_day_papers_checked`), and only real
+  `YYYY-MM-DD.json` names count as day files — `read_state.json` used to be
+  deleted as an "empty day".
+- A single-paper analysis registers in `single_in_flight` so a bulk run started
+  meanwhile skips that paper; a bulk run refuses single analyses.
+- `get_arxiv_schedule_status` carries the current pause and the last run's
+  outcome, for a window opened after the events went out.
 
 ### Data persistence
 
@@ -406,7 +511,7 @@ The library root contains:
 │   ├── index.json           # Rebuildable paper index cache
 │   ├── search.db            # SQLite FTS5 full-text index
 │   ├── search.version       # Index version marker
-│   ├── vectors.sqlite       # RAG vector store
+│   ├── vectors.sqlite       # Paper chunk vectors behind the embedding map (a legacy `snippet_chunks` table may linger; nothing reads or writes it)
 │   ├── vectors_meta.json    # Vector store metadata
 │   ├── ai_providers.json    # AI provider configs
 │   ├── api_keys.json        # Encrypted API keys
@@ -426,7 +531,7 @@ The library root contains:
 │   └── ai_conversations.json
 ├── canvases/                # Canvas JSON files
 ├── inbox/                   # arXiv/bioRxiv daily inbox JSON
-└── snippets/                # Snippet library JSON
+└── snippets/                # Snippet library JSON (never embedded)
 ```
 
 Global app state (last library path, window sizes, security bookmarks) is stored via `tauri-plugin-store` in `settings.json` inside the app data directory.
@@ -489,19 +594,17 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
 
 ## Testing instructions
 
-Testing is minimal.
-
-- **Frontend:** No test runner or test files.
-- **Backend:** A small number of Rust unit tests exist in `src-tauri/src/path_guard.rs` and `src-tauri/src/collections.rs`.
+- **Frontend:** No test runner or test files. `vue-tsc --noEmit` (part of `npm run build`) is the only check.
+- **Backend:** Unit tests live in `#[cfg(test)]` modules inside the files they test — 43 of the 61 files under `src-tauri/src/`, about 450 tests (444 run by default; 4 more are `#[ignore]`d — a live MCP probe, a scan timing and two sample dumps, run by hand with `-- --ignored`). The heavier suites guard behavior described elsewhere in this file: `llm.rs` (`error_class_tests`, `provider_error_tests`), `copilot.rs` (context budget, eviction, fallback), `mcp/server.rs` + `mcp/agent.rs` (tool list, schema rules, dispatch sync), `arxiv.rs` (batch analysis).
 - **CI:** The release workflow does not run tests.
 
-To run the existing Rust tests locally:
+To run the Rust tests locally:
 
 ```bash
-cargo test -p argus
+cd src-tauri && cargo test --lib
 ```
 
-When adding significant backend logic, prefer adding `#[cfg(test)]` modules in the relevant Rust file.
+When adding significant backend logic, add a `#[cfg(test)]` module in the relevant Rust file.
 
 ---
 
@@ -569,10 +672,10 @@ xattr -cr /Applications/Argus.app
 |------|------------|
 | Add a Tauri command | `src-tauri/src/commands.rs` + register in `src-tauri/src/lib.rs` |
 | Add a frontend store | `src/stores/` following Composition API style |
-| Add a settings section | `src/components/SettingsModal.vue` + `src/components/settings/`. 智能问答 is a container (`QaSettings.vue`) with Agent and RAG sub-tabs; `initialSection: 'rag'` still routes there |
+| Add a settings section | `src/components/SettingsModal.vue` + `src/components/settings/`. The nav is 常规 / 主题 / AI 供应商 / AI 随航 / MCP 接口 / 关于. AI 随航 (section `agent`) is a container (`QaSettings.vue`) with Agent 与工具 / RAG / 向量化 / 论文分析 / arXiv 爬取 sub-tabs; `initialSection: 'rag'` (the embedding map's button), `'extraction'` and `'arxiv'` still route there |
 | Add a sidebar tab | `src/components/RightSidebar.vue` + `src/components/tabs/` |
 | Change PDF rendering | `src/components/PdfViewer.vue` |
-| Change RAG behavior | `src-tauri/src/rag.rs`, `src/stores/rag.ts`, `src/components/LibraryChat.vue` |
+| Change RAG / vectorizing | `src-tauri/src/rag.rs`, `src/stores/rag.ts`, `settings/RagSettings.vue`; vectorizing is papers only and is started from `PaperList.vue` / `LeftSidebar.vue` (collection menu) / 设置 → AI 随航 → RAG / 向量化, not the chat window. Snippets are not vectorized. The vectors serve the embedding map only — chat (agent loop and plain fallback) does not use RAG. The 同步缺失 / 完整重建 run lives in `stores/rag.ts`, not the panel, so it keeps going after the settings modal is closed; `RagSettings.vue` only starts it and shows its progress |
 | Change model badges (FREE / 折扣) | `src-tauri/src/llm.rs` (`quotes_free`, `parse_time_discount`, `fetch_openrouter_discount`) → `AiModel` → `stores/ai.ts` → `utils/modelOffers.ts`, rendered in `LibraryChat.vue`, `tabs/AiTab.vue`, `settings/AiSettings.vue`; refreshed by `offer_sync.rs` |
 
 **Where OpenRouter hides its prices.** Three different signals in two different
@@ -607,14 +710,14 @@ concurrency 8, ~8s for 414 models) to fold the rest in and re-sort. The result
 is cached in `utils/modelOffers.ts` at *module* scope, since the settings modal
 is rebuilt on every open.
 | Change AI chat | `src-tauri/src/copilot.rs`, `src-tauri/src/llm.rs`, `src/components/tabs/AiTab.vue` |
-| Change canvas | `src/views/CanvasView.vue`, `src/components/canvas/`, `src-tauri/src/canvas*.rs` |
+| Change canvas | `src/views/CanvasView.vue`, `src/components/CanvasPanel.vue`, `src/components/canvas/`, `src-tauri/src/canvas*.rs`. Edges are polylines only, never curves: `AdjustableEdge.vue` draws smooth-step until the user places control points, then the orthogonal route from `src/utils/orthogonalRoute.ts`; both hosts set the drag-to-connect line to smooth-step too |
 | Change import pipeline | `src/stores/import.ts`, `src-tauri/src/metadata.rs`, `src-tauri/src/url_import.rs` |
 | Change themes | `src/assets/themes.css` (palettes), `src/utils/themes.ts` (registry), `src/components/settings/ThemeSettings.vue` (marketplace tab), `src/stores/settings.ts` (apply/preview) |
 | Change arXiv inbox | `src/views/ArxivView.vue`, `src/stores/arxiv.ts`, `src-tauri/src/arxiv*.rs` |
 | Add an MCP tool | `src-tauri/src/mcp/tools.rs` (the read) + `mcp/server.rs` (declaration + `EXPECTED_TOOLS`) + a dispatch arm in `mcp/agent.rs` |
-| Change agent mode | `src-tauri/src/copilot.rs` (the loop), `mcp/client.rs` (external servers), `src/components/settings/AgentSettings.vue`, `src/components/LibraryChat.vue` (the trail) |
+| Change agent mode | `src-tauri/src/copilot.rs` (the loop), `mcp/client.rs` (external servers), `src/components/settings/AgentSettings.vue`, `src/components/LibraryChat.vue` (the trail, pins, fallback notice) |
 | Change embedding map | `src/views/EmbeddingMapView.vue`, `src-tauri/src/rag.rs` |
 
 ---
 
-*Last updated: 2026-06-24. Keep this file in sync with major architectural changes.*
+*Last updated: 2026-09-29. Keep this file in sync with major architectural changes.*

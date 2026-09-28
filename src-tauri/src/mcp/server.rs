@@ -656,7 +656,7 @@ impl ArgusMcpServer {
     /// Saved excerpts (plus the list of snippet libraries), optionally filtered.
     #[tool(
         name = "search_snippets",
-        description = "Search the excerpts the user saved to their snippet libraries — with the note, tags and source paper — and get the list of their snippet libraries alongside (in `libraries`). Omit `query` to list all excerpts; pass `library_id` (an id from `libraries`) to restrict to one library.",
+        description = "Search the excerpts the user saved to their snippet libraries (素材库) — with the note, tags and source paper — and get the list of their snippet libraries alongside (in `libraries`). `query` is a plain substring match; omit it to list all excerpts, and pass `library_id` (an id from `libraries`) to restrict to one library.",
         annotations(title = "Search snippets", read_only_hint = true)
     )]
     async fn search_snippets(

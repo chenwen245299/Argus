@@ -19,9 +19,9 @@ type Section = 'general' | 'themes' | 'ai' | 'about' | 'agent' | 'mcp'
 
 // Everything the AI does now lives under AI 随航 as a sub-tab: RAG, paper
 // analysis and the arXiv crawler used to be top-level sections, and callers
-// still ask for them by their old names — the chat's "configure RAG" prompt,
-// the snippet library, the analysis entry points. Those names are mapped to the
-// tab rather than dropped, so no existing link goes nowhere.
+// still ask for them by their old names — the embedding map's "configure RAG"
+// button, the analysis entry points. Those names are mapped to the tab rather
+// than dropped, so no existing link goes nowhere.
 const QA_TABS = ['agent', 'rag', 'extraction', 'arxiv'] as const
 const requested = props.initialSection
 const isQaTab = (QA_TABS as readonly string[]).includes(requested ?? '')

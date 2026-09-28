@@ -3,7 +3,7 @@
 **Argus** is a lightweight, AI-native, **local-first** literature reader for reading,
 analyzing, searching, and chatting with your academic papers — all from one desktop app.
 It brings PDF and ebook reading, AI features, note-taking, arXiv tracking, paper
-relationship maps, a snippet library, and library-wide RAG search and paper analysis
+relationship maps, a snippet library, and library-wide Q&A and paper analysis
 together, so your whole research reading workflow lives in one place and blends seamlessly
 with AI.
 
@@ -32,10 +32,10 @@ with AI.
 | [Reading & Notes](/guide/reading) | Read PDFs in tabs, highlight and annotate, and write rich notes with an OCR-backed full-text pipeline. |
 | [AI Workflows](/guide/ai) | Bring any provider and model to extract metadata and abstracts, generate configurable analysis, and chat with any paper. |
 | [Canvas](/guide/canvas) | Arrange papers as nodes, connect related work, trace how a field developed, and export relationship maps. |
-| [Snippet Library](/guide/snippets) | Collect excerpts as you read and search them semantically — handy for finding and citing while writing. |
+| [Snippet Library](/guide/snippets) | Collect excerpts as you read and find them again by keyword or through the AI — handy for finding and citing while writing. |
 | [Embedding Map](/guide/embedding-map) | Project your library's embeddings onto a 2-D map to visualize clusters and discover connections. |
 | [arXiv & bioRxiv Tracking](/guide/arxiv) | Auto-fetch preprints on a schedule, filter by AI relevance, triage from a daily inbox. |
-| [RAG & Library Q&A](/guide/rag) | Build a local vector index and ask questions across your whole library — with sources. |
+| [RAG & Library Q&A](/guide/rag) | Ask questions across your whole library — the AI looks up papers, notes, and snippets itself and shows each lookup; a local vector index of your papers draws the embedding map. |
 
 ## Who it's for
 

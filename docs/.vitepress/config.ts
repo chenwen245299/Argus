@@ -132,7 +132,7 @@ export default defineConfig({
                 { text: '素材库', link: '/zh/guide/snippets' },
                 { text: '向量图谱', link: '/zh/guide/embedding-map' },
                 { text: 'arXiv / bioRxiv 追踪', link: '/zh/guide/arxiv' },
-                { text: 'RAG问答', link: '/zh/guide/rag' },
+                { text: 'RAG 与全库问答', link: '/zh/guide/rag' },
               ],
             },
           ],

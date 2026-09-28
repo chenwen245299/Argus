@@ -10,6 +10,7 @@ import {
   useVueFlow,
   MarkerType,
   ConnectionMode,
+  ConnectionLineType,
   type Node as VfNode,
   type Edge as VfEdge,
   type Connection,
@@ -34,6 +35,7 @@ import { toDisplayMarkdown } from '../utils/noteAssets'
 import { requestAddPapersToChat } from '../utils/chatPapers'
 import PaperNode from './canvas/PaperNode.vue'
 import AdjustableEdge from './canvas/AdjustableEdge.vue'
+import { edgeHasControlPoints } from '../utils/orthogonalRoute'
 import TextNode from './canvas/TextNode.vue'
 import ShapeNode from './canvas/ShapeNode.vue'
 import LineNode from './canvas/LineNode.vue'
@@ -67,6 +69,8 @@ const isActiveCanvas = computed(() =>
 
 const nodeTypes = markRaw({ paper: PaperNode, text: TextNode, shape: ShapeNode, line: LineNode, image: ImageNode })
 const edgeTypes = markRaw({ adjustable: AdjustableEdge })
+// The line drawn while dragging out a new connection is a step too — the canvas has no curves.
+const connectionLineOptions = { type: ConnectionLineType.SmoothStep }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const nodes = ref<any[]>([])
@@ -1918,18 +1922,35 @@ async function ctxAddPapersToChat() {
 
   const outcome = await requestAddPapersToChat(slugs)
   if (outcome.status === 'unavailable') {
-    showChatNotice('请先打开「智能问答」窗口，并把知识来源切换到「文献库论文」')
+    showChatNotice('请先打开「智能问答」窗口')
+    return
+  }
+  if (outcome.status === 'timeout') {
+    // The chat acknowledged the request, so it is open — it is just slow to
+    // answer (re-reading the paper list) and may still pin the papers.
+    showChatNotice('「智能问答」还在处理，请稍后到「固定文献」里查看')
     return
   }
   if (outcome.status === 'declined') {
-    showChatNotice('「智能问答」当前的知识来源不是「文献库论文」，请先切换后再添加')
+    // Only an older chat window still declines; the current one always pins.
+    showChatNotice('「智能问答」暂时无法固定这些文献，请重新打开它后再试')
     return
   }
   const skipped = outcome.alreadyPresent
+  const full = outcome.overLimit
+  // Papers the chat could not find even after re-reading the library (deleted
+  // or renamed since this canvas loaded them). They were not pinned, so they
+  // must not be counted as "already pinned".
+  const missing = outcome.unknown
+  const missingNote = missing ? `，${missing} 篇在文献库里找不到（可能已删除或改名）` : ''
   showChatNotice(
     outcome.added > 0
-      ? `已添加 ${outcome.added} 篇到智能问答${skipped ? `（${skipped} 篇已在其中）` : ''}`
-      : '选中的论文都已经在智能问答里了'
+      ? `已把 ${outcome.added} 篇固定到智能问答的当前对话${skipped ? `（${skipped} 篇已固定）` : ''}${full ? `，另有 ${full} 篇超出 50 篇上限` : ''}${missingNote}`
+      : full
+        ? `智能问答的当前对话已固定满 50 篇文献${missingNote}`
+        : missing
+          ? `选中的论文里有 ${missing} 篇在文献库里找不到（可能已删除或改名），没有固定${skipped ? `；其余 ${skipped} 篇已固定在智能问答的当前对话里` : ''}`
+          : '选中的论文都已固定在智能问答的当前对话里'
   )
 }
 
@@ -1947,6 +1968,20 @@ function ctxRemoveEdge() {
   const edgeId = ctxMenu.value.edgeId
   if (!edgeId) return
   removeEdges([edgeId])
+  closeCtxMenu()
+  triggerSave()
+  recordHistory()
+}
+
+function ctxResetEdgeRoute() {
+  const edgeId = ctxMenu.value.edgeId
+  if (!edgeId) return
+  edges.value = edges.value.map(e => (
+    e.id === edgeId
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ? { ...e, data: { ...(e.data as any), controlPoints: [], controlX: undefined, controlY: undefined } }
+      : e
+  ))
   closeCtxMenu()
   triggerSave()
   recordHistory()
@@ -2059,7 +2094,7 @@ function ctxToggleTextItalic() {
 
 const ctxCurrentEdgeData = computed(() => {
   const id = ctxMenu.value.edgeId
-  if (!id) return { color: undefined as string | undefined, strokeWidth: 1.8 }
+  if (!id) return { color: undefined as string | undefined, strokeWidth: 1.8, hasRoute: false }
   const edge = edges.value.find(e => e.id === id)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const data = edge?.data as any
@@ -2068,6 +2103,7 @@ const ctxCurrentEdgeData = computed(() => {
   return {
     color: (data?.edgeColor ?? style?.stroke) as string | undefined,
     strokeWidth: Number(data?.edgeStrokeWidth ?? style?.strokeWidth ?? 1.8),
+    hasRoute: edgeHasControlPoints(data),
   }
 })
 
@@ -2373,6 +2409,7 @@ watch(() => library.papers, () => {
           :edge-types="edgeTypes"
           :connection-mode="ConnectionMode.Loose"
           :default-edge-options="{ type: 'adjustable', markerEnd: MarkerType.ArrowClosed }"
+          :connection-line-options="connectionLineOptions"
           :snap-to-grid="false"
           :min-zoom="0.05"
           :max-zoom="4"
@@ -2480,7 +2517,7 @@ watch(() => library.papers, () => {
           </button>
         </div>
 
-        <!-- Result of "添加到智能问答" -->
+        <!-- Result of "固定到智能问答" -->
         <Transition name="chat-notice">
           <div v-if="chatNotice" class="chat-notice" @click="chatNotice = ''">{{ chatNotice }}</div>
         </Transition>
@@ -2668,7 +2705,7 @@ watch(() => library.papers, () => {
             </button>
             <button class="ctx-item" @click="ctxAddPapersToChat">
               <Icon icon="fluent:chat-24-regular" width="12" height="12" />
-              添加到智能问答<template v-if="ctxPaperTargetCount > 1">（{{ ctxPaperTargetCount }} 篇）</template>
+              固定到智能问答<template v-if="ctxPaperTargetCount > 1">（{{ ctxPaperTargetCount }} 篇）</template>
             </button>
 
             <div class="ctx-divider" />
@@ -2686,7 +2723,7 @@ watch(() => library.papers, () => {
             @click="ctxAddPapersToChat"
           >
             <Icon icon="fluent:chat-24-regular" width="12" height="12" />
-            添加到智能问答<template v-if="ctxPaperTargetCount"> （{{ ctxPaperTargetCount }} 篇）</template>
+            固定到智能问答<template v-if="ctxPaperTargetCount"> （{{ ctxPaperTargetCount }} 篇）</template>
           </button>
           <div class="ctx-divider" />
           <button class="ctx-item ctx-item--danger" @click="ctxRemoveSelection">
@@ -2732,6 +2769,10 @@ watch(() => library.papers, () => {
           <button class="ctx-item" @click="ctxEditEdgeLabel">
             <Icon icon="fluent:edit-24-regular" width="12" height="12" />
             {{ t('canvas.edgeLabelEdit') }}
+          </button>
+          <button v-if="ctxCurrentEdgeData.hasRoute" class="ctx-item" @click="ctxResetEdgeRoute">
+            <Icon icon="fluent:arrow-reset-24-regular" width="12" height="12" />
+            {{ t('canvas.resetEdgeRoute') }}
           </button>
           <div class="ctx-divider" />
           <button class="ctx-item ctx-item--danger" @click="ctxRemoveEdge">

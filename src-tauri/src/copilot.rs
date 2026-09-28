@@ -6,7 +6,7 @@ use crate::models::{
     AgentMessage, AiProvider, ChatContent, ChatContentPart, ChatMessage, FileData, PaperMeta,
     RetrievedChunk,
 };
-use crate::{ai_manager, ai_summary, extraction, llm, paper, rag};
+use crate::{ai_manager, ai_summary, extraction, llm, paper};
 
 // ── Chat history persistence ──────────────────────────────────────────────────
 
@@ -634,8 +634,7 @@ mod conversation_store_tests {
 // ── Copilot chat ──────────────────────────────────────────────────────────────
 
 /// Build the paper context for injection into the LLM system prompt.
-/// M5: uses fulltext (truncated to fit model context).
-/// M7 hook: replace `get_fulltext_context` with RAG retrieval.
+/// Uses the full text (truncated to fit model context); chat does not use RAG.
 pub async fn chat_with_paper(
     root: &str,
     slug: &str,
@@ -835,6 +834,15 @@ pub async fn chat_with_paper_on_event(
 }
 
 // ── Library chat ──────────────────────────────────────────────────────────────
+//
+// The tool-free library chat. No window asks for it by name any more: the
+// library chat runs the agent, and this path now serves only the turns the
+// agent cannot take (see `chat_with_library_fallback`) — a model without tool
+// calling, DeepSeek's web search, a spoken reply.
+//
+// It answers from one of two things: the pinned papers ("papers"), or nothing
+// but the model's own knowledge ("none"). Chat does not retrieve from the
+// vector store in any mode — embeddings serve the embedding map, not answers.
 
 #[derive(Clone, serde::Serialize)]
 struct LibrarySentContextSection {
@@ -853,6 +861,20 @@ fn provider_supports_inline_pdf(provider: &crate::models::AiProvider) -> bool {
     // Only OpenRouter reliably supports OpenAI-compatible inline `file`
     // content parts for PDFs.
     provider.kind == "openrouter" || provider.base_url.to_lowercase().contains("openrouter")
+}
+
+/// Which context a tool-free answer is built from: `"papers"` (the pinned
+/// papers' full text) or `"none"` (a plain answer).
+///
+/// Everything else — no source at all, or one of the retrieval sources older
+/// builds sent (`"paper-rag"`, `"paper-rag-loose"`, `"snippets"`) — is answered
+/// plainly. Those modes are gone, and an old caller still naming one should get
+/// an answer, not an error.
+fn tool_free_source(knowledge_source: Option<&str>) -> &'static str {
+    match knowledge_source {
+        Some("papers") => "papers",
+        _ => "none",
+    }
 }
 
 pub async fn chat_with_library(
@@ -876,12 +898,7 @@ pub async fn chat_with_library(
     let (provider, api_key, model, _fallback) =
         ai_manager::resolve_provider_model_or_default(root, provider_id, model_id)?;
 
-    let use_snippets = knowledge_source.map_or(false, |s| s == "snippets");
-    let use_selected_papers = knowledge_source.map_or(false, |s| s == "papers");
-    // "none" = plain conversation: no retrieval, no library context, no source
-    // citations demanded of the model. Anything unrecognised still falls through
-    // to the RAG default, so older callers behave as before.
-    let use_no_source = knowledge_source.map_or(false, |s| s == "none");
+    let use_selected_papers = tool_free_source(knowledge_source) == "papers";
 
     let system;
 
@@ -924,83 +941,11 @@ pub async fn chat_with_library(
             },
         );
         system = selected_system;
-    } else if use_no_source {
-        // Clear any sources the previous turn left on screen.
+    } else {
+        // Plain conversation: no library context, no source citations demanded
+        // of the model. Clear any sources the previous turn left on screen.
         let _ = app.emit(sources_event_name, Vec::<crate::models::RetrievedChunk>::new());
         system = build_plain_system_prompt();
-    } else if use_snippets {
-        let query_text = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| match &m.content {
-                ChatContent::Text(s) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        let settings = rag::get_rag_settings(root);
-        let retrieved = if settings.is_configured() && !query_text.is_empty() {
-            match rag::embed_query(root, &query_text, &settings).await {
-                Ok(vec) => rag::search_snippet_chunks_with_vec(root, vec, 12).await.unwrap_or_default(),
-                Err(_) => vec![],
-            }
-        } else {
-            vec![]
-        };
-
-        // Surface the retrieved snippets as sources, reusing the library-chat
-        // `RetrievedChunk` shape so the same UI renders them. A snippet's
-        // `paper_id` stores the source paper's slug, so it doubles as `slug`
-        // for click-to-open.
-        let snippet_sources: Vec<crate::models::RetrievedChunk> = retrieved
-            .iter()
-            .map(|s| crate::models::RetrievedChunk {
-                chunk_id: s.snippet_id.clone(),
-                paper_id: s.paper_id.clone(),
-                slug: s.paper_id.clone(),
-                chunk_index: 0,
-                text: s.text.clone(),
-                score: s.score,
-                paper_title: s.paper_title.clone(),
-                source_type: "snippet".to_string(),
-                source_id: Some(s.snippet_id.clone()),
-                source_label: None,
-            })
-            .collect();
-        let _ = app.emit(sources_event_name, snippet_sources);
-        system = build_snippet_system_prompt(&retrieved);
-    } else {
-        let settings = rag::get_rag_settings(root);
-        let rag_chunks = if settings.is_configured() {
-            let query_text = messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "user")
-                .and_then(|m| match &m.content {
-                    ChatContent::Text(s) => Some(s.clone()),
-                    _ => None,
-                });
-            if let Some(q) = query_text {
-                if let Ok(vec) = rag::embed_query(root, &q, &settings).await {
-                    rag::search_library_chunks_with_vec(root, vec, settings.top_k * 2)
-                        .await
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let _ = app.emit(
-            sources_event_name,
-            rag_chunks.as_deref().unwrap_or(&[]).to_vec(),
-        );
-        system = build_library_system_prompt(rag_chunks.as_deref());
     }
 
     let mut messages = messages;
@@ -1042,46 +987,6 @@ pub async fn chat_with_library(
         web_search,
     )
     .await
-}
-
-fn build_snippet_system_prompt(snippets: &[crate::models::RetrievedSnippet]) -> String {
-    let mut prompt = String::from(
-        "You are a research assistant helping the user explore their snippet library — \
-         a personal collection of text excerpts saved from academic papers.\n\
-         Rules:\n\
-         1. Answer ONLY from the snippets provided below — do not hallucinate.\n\
-         2. Respond in the same language the user uses (Chinese if asked in Chinese).\n\
-         3. When citing a snippet, reference the source paper title and page:\n\
-            《论文标题》第 N 页\n\
-         4. If multiple snippets are relevant, synthesize them.\n\n",
-    );
-
-    if snippets.is_empty() {
-        prompt.push_str("[未找到相关素材。请先在「素材库」中嵌入素材（设置 → RAG 配置向量化）。]\n");
-        return prompt;
-    }
-
-    prompt.push_str("--- 检索到的相关素材 ---\n\n");
-    for (i, s) in snippets.iter().enumerate() {
-        let tags = if s.tags.is_empty() {
-            String::new()
-        } else {
-            format!(" | 标签: {}", s.tags.join(", "))
-        };
-        let note = if s.note.trim().is_empty() {
-            String::new()
-        } else {
-            format!(" | 笔记: {}", s.note.trim())
-        };
-        prompt.push_str(&format!(
-            "[素材 {n} | 来源: 《{title}》第 {page} 页{tags}{note}]\n{text}\n\n",
-            n = i + 1,
-            title = s.paper_title,
-            page = s.page,
-            text = s.text,
-        ));
-    }
-    prompt
 }
 
 // ── Library chat window ──────────────────────────────────────────────────────
@@ -1388,60 +1293,6 @@ fn build_plain_system_prompt() -> String {
          attached to this conversation, so do not claim to be citing them; if a \
          question needs a specific paper the user has not provided, say so.",
     )
-}
-
-fn build_library_system_prompt(chunks: Option<&[RetrievedChunk]>) -> String {
-    let mut prompt = String::from(
-        "You are a research assistant managing a personal academic library.\n\
-         Rules:\n\
-         1. Answer ONLY from the retrieved context below — do not hallucinate.\n\
-         2. Respond in the same language the user uses (Chinese if asked in Chinese).\n\
-         3. For every key claim, cite the source paper using this format:\n\
-            **论文标题** (`slug`) — 来源: 类型\n\
-            Example: **Attention Is All You Need** (`vaswani2017attention`) — 来源: PDF正文\n\
-         4. When a metadata chunk directly answers the question (venue, authors, year), \
-            lead with that information.\n\
-         5. If multiple papers are relevant, list each separately with its citation.\n\n",
-    );
-
-    match chunks {
-        Some(c) if !c.is_empty() => {
-            prompt.push_str("--- 检索到的相关内容 ---\n\n");
-            for (i, chunk) in c.iter().enumerate() {
-                let type_label = match chunk.source_type.as_str() {
-                    "metadata" => "元数据".to_string(),
-                    "highlight" => chunk
-                        .source_label
-                        .clone()
-                        .unwrap_or_else(|| "批注".to_string()),
-                    "note" => chunk
-                        .source_label
-                        .clone()
-                        .unwrap_or_else(|| "笔记".to_string()),
-                    _ => "PDF正文".to_string(),
-                };
-                let paper_display = if chunk.paper_title.is_empty() {
-                    format!("`{}`", chunk.slug)
-                } else {
-                    format!("**{}** (`{}`)", chunk.paper_title, chunk.slug)
-                };
-                prompt.push_str(&format!(
-                    "[片段 {i_1} | 论文: {paper} | 类型: {src}]\n{text}\n\n",
-                    i_1 = i + 1,
-                    paper = paper_display,
-                    src = type_label,
-                    text = chunk.text,
-                ));
-            }
-        }
-        Some(_) => {
-            prompt.push_str("[未找到相关内容。请先向量化文献库（设置 → RAG）。]\n");
-        }
-        None => {
-            prompt.push_str("[RAG 未配置，将基于通用知识回答，无法引用具体文献。]\n");
-        }
-    }
-    prompt
 }
 
 fn selected_papers_context_budget(
@@ -1873,7 +1724,7 @@ impl ContextBudget {
 /// hand — their grouping encodes intent that a keyword cannot recover.
 pub const DEFAULT_AGENT_SYSTEM_PROMPT: &str = r#"You are a research assistant with direct read access to the user's literature library through MCP tools.
 
-Answer by looking things up. Anything you say about what is or is not in this library must come from a tool call, never from memory.
+Answer questions about the library by looking things up. Anything you say about what is or is not in this library must come from a tool call, never from memory. A question that has nothing to do with the library — general knowledge, writing, translation, code — needs no tool call: answer it directly.
 
 ## Find papers by walking the user's own structure
 
@@ -1896,6 +1747,10 @@ A bare `find_papers` keyword sweep across the whole library is the last resort, 
 - `get_paper_fulltext` to read the extracted text, paged with `offset` — pull the slices you need rather than the whole paper at once.
 - `get_note` and `get_highlights` for what the user wrote or marked themselves. Often the best answer to "what did I think about this".
 
+## The snippet collection
+
+- `search_snippets` searches the user's snippet collection (素材库): excerpts they saved from papers, with their own notes and tags. It is a plain substring match.
+
 ## Writing a note
 
 `create_paper_note` is the only tool here that changes anything. It adds a new note to a paper; it cannot edit, overwrite or delete a note that already exists, so everything you want kept goes in `content`.
@@ -1904,7 +1759,7 @@ Do not reach for it on your own initiative. Offer the note in your reply, and ca
 
 ## Answering
 
-Cite the papers you used by title. If the library does not contain the answer, say so plainly instead of filling the gap from memory. Keep tool calls purposeful: each one costs the user time and money.
+Cite the papers you used by title. If a question about the library cannot be answered from it, say so plainly instead of filling the gap from memory. Keep tool calls purposeful: each one costs the user time and money.
 
 Reply in the language the user wrote in."#;
 
@@ -1953,6 +1808,275 @@ fn resolve_system_prompt(configured: String) -> String {
     } else {
         configured
     }
+}
+
+// ── Pinned papers ─────────────────────────────────────────────────────────────
+//
+// The library chat used to have a "selected papers" mode that pasted the chosen
+// papers' full text into the prompt. The agent reads papers itself, so what
+// survives is the part a tool cannot supply: the user's statement that *this*
+// conversation is about *these* papers.
+
+/// The most papers one conversation can pin. The picker enforces the same cap.
+pub const MAX_PINNED_PAPERS: usize = 50;
+
+/// One pinned paper as the model sees it: slug first, since that is what every
+/// tool takes, then enough to recognise the paper by.
+fn pinned_paper_line(e: &crate::models::PaperIndexEntry) -> String {
+    let mut who: Vec<String> = e.authors.iter().take(3).cloned().collect();
+    if e.authors.len() > 3 {
+        who.push("et al.".to_string());
+    }
+    let mut bits: Vec<String> = Vec::new();
+    if !who.is_empty() {
+        bits.push(who.join(", "));
+    }
+    if let Some(y) = e.year {
+        bits.push(y.to_string());
+    }
+    if let Some(v) = e.venue.as_ref().filter(|v| !v.trim().is_empty()) {
+        bits.push(v.trim().to_string());
+    }
+    let mut line = format!("- `{}` — {}", e.slug, e.title.trim());
+    if !bits.is_empty() {
+        line.push_str(&format!(" ({})", bits.join(", ")));
+    }
+    // PDF is the norm; only an ebook is worth pointing out, because
+    // `view_paper_page` cannot render one.
+    if let Some(kind) = e.file_type.as_ref().filter(|k| !k.is_empty() && k.as_str() != "pdf") {
+        line.push_str(&format!(" [{kind}]"));
+    }
+    line
+}
+
+/// The pinned papers, rendered as a system message.
+///
+/// Built from the library index, never from `get_paper`: that tool reads each
+/// paper's whole extracted text just to count it, and fifty pins would mean
+/// fifty full-text reads before every question. It also leaves out everything
+/// that moves while the user works — note lists, highlight counts, text length
+/// after a re-extraction — because this block is part of the cached prefix,
+/// and a pin that changed bytes every time the user took a note would bust the
+/// cache on every question.
+///
+/// `entries` are in the order the user pinned them, and the output is a pure
+/// function of them, so the same pins always produce the same bytes.
+fn format_pinned_block(entries: &[&crate::models::PaperIndexEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = entries.iter().map(|e| pinned_paper_line(e)).collect();
+    Some(format!(
+        "The user has pinned these papers to this conversation. Treat each question as being \
+         about them unless the user clearly asks about something else, and read them before \
+         answering: `get_paper_fulltext` for the text, `view_paper_page` for figures and tables, \
+         `get_note` and `get_highlights` for what the user wrote. Bring in other papers from the \
+         library only when the user asks for that.\n\n{}",
+        lines.join("\n")
+    ))
+}
+
+/// The pins that still point at a paper, in the order the user pinned them.
+///
+/// Slugs are trimmed, blanks dropped, duplicates collapsed to the first
+/// occurrence and the list capped at [`MAX_PINNED_PAPERS`]; then anything not
+/// in `index` — a paper deleted or renamed since it was pinned — is skipped
+/// silently. A pin on a paper that is gone should cost the conversation
+/// nothing. Pure, so both the agent's pinned block and the plain fallback
+/// resolve pins the same way.
+fn live_pinned_entries<'a>(
+    slugs: &[String],
+    index: &'a [crate::models::PaperIndexEntry],
+) -> Vec<&'a crate::models::PaperIndexEntry> {
+    let wanted: Vec<&str> = {
+        let mut seen = std::collections::HashSet::new();
+        slugs
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && seen.insert(*s))
+            .take(MAX_PINNED_PAPERS)
+            .collect()
+    };
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let by_slug: std::collections::HashMap<&str, &crate::models::PaperIndexEntry> =
+        index.iter().map(|e| (e.slug.as_str(), e)).collect();
+    wanted.iter().filter_map(|s| by_slug.get(s).copied()).collect()
+}
+
+/// Look the pinned slugs up in the library index and render them.
+///
+/// Returns the block plus one section per paper for the "sent to the model"
+/// banner. Resolution is [`live_pinned_entries`].
+fn pinned_papers_block(
+    root: &str,
+    slugs: &[String],
+) -> Option<(String, Vec<LibrarySentContextSection>)> {
+    if slugs.iter().all(|s| s.trim().is_empty()) {
+        return None;
+    }
+    let index = crate::library::load_library_cache(root);
+    let entries = live_pinned_entries(slugs, &index);
+    let block = format_pinned_block(&entries)?;
+    let sections = entries
+        .iter()
+        .map(|e| LibrarySentContextSection {
+            kind: "paper".to_string(),
+            label: e.title.clone(),
+            content: pinned_paper_line(e),
+        })
+        .collect();
+    Some((block, sections))
+}
+
+/// Two optional system blocks as one, so the loop and the keepalive place a
+/// single message and cannot disagree about where the second one goes. With
+/// only one present the result is that block unchanged, which is what keeps
+/// the paper AI panel's prefix byte-identical to what it was before pins.
+fn join_blocks(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (a, b) => a.or(b),
+    }
+}
+
+// ── Answering without tools ───────────────────────────────────────────────────
+//
+// The library chat has one mode now: the model drives its own retrieval. Some
+// models cannot — the provider speaks a protocol the agent does not, the model
+// takes no `tools`, or a feature the user switched on only exists outside the
+// tool loop. Rather than failing the question, those turns are answered the old
+// way, with a notice saying so.
+
+/// Why this question has to be answered without tools, if it does.
+///
+/// Checked before anything is connected or sent, so a turn that is going to
+/// fall back does not first start the user's MCP servers.
+pub fn plain_fallback_reason(
+    provider: &crate::models::AiProvider,
+    model: &str,
+    web_search: bool,
+) -> Option<&'static str> {
+    if !llm::supports_tool_calling(provider) || llm::model_declares_no_tools(provider, model) {
+        return Some("no_tools");
+    }
+    // DeepSeek's search lives on its Responses API, which the tool loop does
+    // not speak; the button would otherwise do nothing while the UI said
+    // "searching".
+    if web_search && llm::is_deepseek(provider) {
+        return Some("web_search");
+    }
+    // A spoken reply is one clip for one answer; the tool loop is several
+    // rounds, and asking each to speak would bill audio nobody hears. The user
+    // switched speech on, so they keep it.
+    if crate::stepfun::is_stepfun(provider)
+        && provider.speech.enabled
+        && crate::stepfun::supports_audio_output(model)
+    {
+        return Some("speech");
+    }
+    None
+}
+
+/// Which context a tool-free answer gets: the pinned papers when there are
+/// any, since the user said this conversation is about them; otherwise none,
+/// and the model answers from what it knows. Chat never retrieves from the
+/// vector store, so there is no third, retrieval-based mode.
+fn fallback_mode(has_pins: bool) -> &'static str {
+    if has_pins {
+        "papers"
+    } else {
+        "none"
+    }
+}
+
+/// The pins a tool-free answer may use, and the mode they put it in.
+///
+/// Resolved against the library index *before* the mode is chosen, the same
+/// way the agent's pinned block resolves them: a conversation whose only pins
+/// point at deleted or renamed papers is answered plainly (`"none"`), not in
+/// `"papers"` mode with nothing to read — which is what used to produce a
+/// "selected papers not found" answer.
+fn resolve_fallback_pins(
+    slugs: &[String],
+    index: &[crate::models::PaperIndexEntry],
+) -> (Vec<String>, &'static str) {
+    let live: Vec<String> = live_pinned_entries(slugs, index)
+        .into_iter()
+        .map(|e| e.slug.clone())
+        .collect();
+    let mode = fallback_mode(!live.is_empty());
+    (live, mode)
+}
+
+/// Answer a library question without tools, after telling the UI why.
+///
+/// `detail` is the provider's own words when it refused the tools, so the user
+/// can see what was actually said rather than only Argus's reading of it.
+#[allow(clippy::too_many_arguments)]
+pub async fn chat_with_library_fallback(
+    root: &str,
+    messages: &[AgentMessage],
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    event_name: &str,
+    sources_event_name: &str,
+    selected_paper_slugs: &[String],
+    reason: &str,
+    detail: Option<&str>,
+    use_reasoning: bool,
+    reasoning_effort: Option<&str>,
+    app: &tauri::AppHandle,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    web_search: bool,
+) -> Result<String, String> {
+    use tauri::Emitter;
+
+    // Only pins that still resolve count, for both the mode and the notice.
+    let (live_pins, mode) = if selected_paper_slugs.iter().all(|s| s.trim().is_empty()) {
+        (Vec::new(), fallback_mode(false))
+    } else {
+        let index = crate::library::load_library_cache(root);
+        resolve_fallback_pins(selected_paper_slugs, &index)
+    };
+    let _ = app.emit(
+        format!("{event_name}-agent").as_str(),
+        serde_json::json!({
+            "phase": "fallback",
+            "reason": reason,
+            "mode": mode,
+            "papers": live_pins.len(),
+            "detail": detail,
+        }),
+    );
+
+    // No tool loop here: drop any replayed tool exchange — the `tool` results
+    // and the assistant turns that carried the calls — leaving the plain turns
+    // this path expects. An orphaned `tool` message is a 400 on most providers.
+    let plain: Vec<ChatMessage> = messages
+        .iter()
+        .filter(|m| m.role != "tool" && m.tool_calls.is_none())
+        .map(AgentMessage::to_chat_message)
+        .collect();
+    chat_with_library(
+        root,
+        plain,
+        provider_id,
+        model_id,
+        event_name,
+        sources_event_name,
+        // The fallback's modes are the tool-free path's source names.
+        Some(mode),
+        Some(&live_pins),
+        None,
+        use_reasoning,
+        reasoning_effort,
+        app,
+        cancel,
+        web_search,
+    )
+    .await
 }
 
 /// Trim a tool result to what one message may contribute.
@@ -2053,7 +2177,7 @@ fn evict_old_tool_results(
 /// Connects any external MCP servers the user configured, runs the loop, and
 /// tears the connections down on every exit path — including cancellation, which
 /// is why the loop lives in its own function.
-#[allow(clippy::too_many_arguments)]
+///
 /// One incoming agent message as the provider-facing JSON. Preserves an
 /// OpenAI-style tool exchange when the frontend replayed a prior turn's tool
 /// activity: an assistant turn's `tool_calls`, a `tool` result's `tool_call_id`,
@@ -2097,6 +2221,7 @@ fn append_current_page_hint(msg: &mut serde_json::Value, page: u32) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_with_library_agent(
     root: &str,
     messages: Vec<AgentMessage>,
@@ -2120,6 +2245,9 @@ pub async fn chat_with_library_agent(
     // The canvas this conversation is about, when it is (the "问画布" chat). Its
     // presence is what unlocks the `edit_canvas` tool, and nothing else does.
     canvas_id: Option<&str>,
+    // Papers the user pinned to this conversation (the library chat). Rendered
+    // into the stable system block next to `paper_slug`'s card.
+    selected_paper_slugs: &[String],
     // Label of the window this answer was asked from. The cache keepalive stops
     // when that window goes away, so it must be the window the user is actually
     // looking at — not a hardcoded one.
@@ -2148,8 +2276,33 @@ pub async fn chat_with_library_agent(
     }
 
     // Built once and shared with the keepalive: the warmed prefix has to be the
-    // one the next question sends, byte for byte.
-    let paper_block = paper_slug.and_then(|slug| paper_context_block(root, slug));
+    // one the next question sends, byte for byte. The index read behind the
+    // pinned block is file I/O, so it stays off the runtime carrying requests.
+    let pinned = {
+        let root_owned = root.to_string();
+        let slugs = selected_paper_slugs.to_vec();
+        tokio::task::spawn_blocking(move || pinned_papers_block(&root_owned, &slugs))
+            .await
+            .ok()
+            .flatten()
+    };
+    if let Some((_, sections)) = &pinned {
+        // What the model was told, for the banner above the user's turn.
+        let _ = app.emit(
+            format!("{event_name}-context").as_str(),
+            LibrarySentContextPayload {
+                mode: "pinned".to_string(),
+                sections: sections.clone(),
+            },
+        );
+    }
+    let paper_block = join_blocks(
+        paper_slug.and_then(|slug| paper_context_block(root, slug)),
+        pinned.map(|(block, _)| block),
+    );
+    // A page only means something with an open paper. Pins are not an open
+    // paper — "this page" of fifty papers is no page at all.
+    let current_page = current_page.filter(|_| paper_slug.is_some());
 
     let warm_from = messages.clone();
     let outcome = run_agent_loop(
@@ -2460,6 +2613,8 @@ async fn run_agent_loop(
     // Tool declarations in OpenAI-compatible form, built once per answer: the
     // library's own tools first, then whatever the configured servers offer.
     let tool_defs = agent_tool_defs(bridge, model_sees_images, canvas_id.is_some());
+    // Kimi's thinking models need their reasoning back on each tool-call turn.
+    let replay_reasoning = llm::replays_reasoning_with_tool_calls(&provider, &model);
 
     let mut convo: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
@@ -2476,8 +2631,9 @@ async fn run_agent_loop(
     // that block is the warm cache prefix and has to stay byte-stable, but the
     // page changes with every scroll. This only mutates `convo`, so the
     // `messages` the keepalive re-warms are untouched and the next turn still
-    // hits. Gated on `paper_block` — no paper open, no page to speak of.
-    if let (Some(page), true) = (current_page, paper_block.is_some()) {
+    // hits. The caller only passes a page when a paper is open — `paper_block`
+    // is no longer the test, since pinned papers live in it too.
+    if let Some(page) = current_page {
         if let Some(msg) = convo.iter_mut().rev().find(|m| m["role"] == "user") {
             append_current_page_hint(msg, page);
         }
@@ -2534,7 +2690,12 @@ async fn run_agent_loop(
         .await;
         let turn = match turn {
             Ok(t) => t,
-            Err(e) => break 'rounds Err(e),
+            // "This model takes no tools" is only actionable before anything
+            // was said: the caller can then answer the question another way.
+            // Later, a round has already streamed text and run tools, so the
+            // marker is dropped and it is an ordinary failure.
+            Err(e) if rounds == 0 => break 'rounds Err(e),
+            Err(e) => break 'rounds Err(llm::strip_tools_rejected(&e).to_string()),
         };
         rounds += 1;
         usage.add(&turn.usage);
@@ -2596,7 +2757,7 @@ async fn run_agent_loop(
 
         // Record the model's own turn verbatim; providers reject a `tool`
         // message whose id has no matching `tool_calls` entry before it.
-        convo.push(serde_json::json!({
+        let mut assistant_turn = serde_json::json!({
             "role": "assistant",
             "content": turn.content,
             "tool_calls": turn.tool_calls.iter().map(|c| serde_json::json!({
@@ -2604,7 +2765,11 @@ async fn run_agent_loop(
                 "type": "function",
                 "function": { "name": c.name, "arguments": c.arguments.to_string() }
             })).collect::<Vec<_>>(),
-        }));
+        });
+        if replay_reasoning && !turn.reasoning.is_empty() {
+            assistant_turn["reasoning_content"] = serde_json::json!(turn.reasoning);
+        }
+        convo.push(assistant_turn);
 
         tool_rounds += 1;
         // Where this round's results begin, so eviction can leave them alone.
@@ -2879,6 +3044,202 @@ mod agent_tests {
         assert!(paper_context_block(&root, "no-such-paper").is_none());
     }
 
+    fn index_entry(slug: &str, title: &str, authors: &[&str]) -> crate::models::PaperIndexEntry {
+        serde_json::from_value(serde_json::json!({
+            "slug": slug,
+            "id": format!("id-{slug}"),
+            "title": title,
+            "authors": authors,
+            "year": 2024,
+            "venue": "NeurIPS",
+            "tags": [],
+            "status": crate::models::PaperStatus::default(),
+            "added_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("PaperIndexEntry fixture")
+    }
+
+    /// The pinned block is part of the cached prefix: same pins, same bytes,
+    /// in the order the user pinned them.
+    #[test]
+    fn the_pinned_block_is_stable_and_keeps_the_users_order() {
+        let a = index_entry("attn", "Attention Is All You Need", &["A", "B", "C", "D"]);
+        let b = index_entry("bert", "BERT", &["E"]);
+        assert!(format_pinned_block(&[]).is_none());
+
+        let block = format_pinned_block(&[&b, &a]).unwrap();
+        assert_eq!(Some(block.clone()), format_pinned_block(&[&b, &a]));
+        let bert = block.find("`bert`").unwrap();
+        let attn = block.find("`attn`").unwrap();
+        assert!(bert < attn, "pin order must be kept:\n{block}");
+        // Long author lists are cut; the reader only needs to recognise it.
+        assert!(block.contains("A, B, C, et al., 2024, NeurIPS"), "{block}");
+        assert!(block.contains("get_paper_fulltext"), "{block}");
+    }
+
+    /// Nothing that moves while the user works may be in the block, or taking
+    /// a note would bust the cache on every question.
+    #[test]
+    fn the_pinned_block_leaves_out_what_the_user_keeps_editing() {
+        let a = index_entry("attn", "Attention", &["A"]);
+        let block = format_pinned_block(&[&a]).unwrap();
+        // The instructions name the tools; the per-paper lines are what must
+        // carry nothing volatile.
+        let lines = block.split_once("\n\n").map(|(_, l)| l).unwrap_or("");
+        assert_eq!(lines, "- `attn` — Attention (A, 2024, NeurIPS)");
+        assert!(!block.contains("fulltext_chars"), "{block}");
+    }
+
+    #[test]
+    fn pins_resolve_through_the_index_and_skip_what_is_gone() {
+        let root = std::env::temp_dir()
+            .join(format!("argus-pins-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(root.join(".argus")).unwrap();
+        std::fs::write(
+            root.join(".argus").join("index.json"),
+            serde_json::json!({
+                "papers": [
+                    serde_json::to_value(index_entry("attn", "Attention", &["A"])).unwrap(),
+                    serde_json::to_value(index_entry("bert", "BERT", &["E"])).unwrap(),
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let root = root.to_string_lossy().to_string();
+
+        let slugs: Vec<String> = ["bert", "gone", "bert", " attn "]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (block, sections) = pinned_papers_block(&root, &slugs).expect("two real pins");
+        // Deduplicated, trimmed, the missing one skipped, order kept.
+        assert_eq!(
+            sections.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
+            vec!["BERT", "Attention"]
+        );
+        assert!(!block.contains("gone"));
+        assert!(pinned_papers_block(&root, &[]).is_none());
+        assert!(pinned_papers_block(&root, &["gone".to_string()]).is_none());
+    }
+
+    /// With no pins, the paper AI panel's block must come through untouched —
+    /// its cached prefix predates pins.
+    #[test]
+    fn joining_blocks_leaves_a_lone_block_untouched() {
+        assert_eq!(join_blocks(Some("card".into()), None), Some("card".into()));
+        assert_eq!(join_blocks(None, Some("pins".into())), Some("pins".into()));
+        assert_eq!(join_blocks(None, None), None);
+        assert_eq!(join_blocks(Some("a".into()), Some("b".into())), Some("a\n\nb".into()));
+    }
+
+    /// Chat does not search embeddings in any form: no combination of flags
+    /// puts an embedding search in front of the model, whichever surface asks.
+    #[test]
+    fn no_chat_surface_is_offered_an_embedding_search() {
+        let bridge = crate::mcp::client::ToolBridge::none();
+        for vision in [true, false] {
+            for canvas_edit in [true, false] {
+                let names: Vec<String> = agent_tool_defs(&bridge, vision, canvas_edit)
+                    .into_iter()
+                    .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+                    .collect();
+                assert!(
+                    !names.iter().any(|n| n == "semantic_search"),
+                    "vision={vision} canvas_edit={canvas_edit}: {names:?}"
+                );
+            }
+        }
+    }
+
+    fn provider_like(kind: &str, base_url: &str) -> AiProvider {
+        AiProvider {
+            kind: kind.into(),
+            base_url: base_url.into(),
+            ..model("m", None)
+        }
+    }
+
+    #[test]
+    fn questions_the_agent_cannot_take_are_named_before_anything_is_sent() {
+        let anthropic = provider_like("anthropic", "https://api.anthropic.com");
+        let ollama = provider_like("ollama", "http://localhost:11434");
+        let kimi_code = provider_like("openai_compatible", "https://api.kimi.com/coding/v1");
+        for p in [&anthropic, &ollama, &kimi_code] {
+            assert_eq!(plain_fallback_reason(p, "m", false), Some("no_tools"), "{}", p.base_url);
+        }
+
+        let deepseek = provider_like("openai_compatible", "https://api.deepseek.com");
+        assert_eq!(plain_fallback_reason(&deepseek, "deepseek-chat", true), Some("web_search"));
+        assert_eq!(plain_fallback_reason(&deepseek, "deepseek-chat", false), None);
+
+        let mut stepfun = provider_like("stepfun", "https://api.stepfun.com/v1");
+        assert_eq!(plain_fallback_reason(&stepfun, "step-audio-r1.5", false), Some("no_tools"));
+        assert_eq!(plain_fallback_reason(&stepfun, "step-audio-2", false), None);
+        stepfun.speech.enabled = true;
+        assert_eq!(plain_fallback_reason(&stepfun, "step-audio-2", false), Some("speech"));
+        // Speech on, but a model that cannot speak: nothing to keep, stay agent.
+        assert_eq!(plain_fallback_reason(&stepfun, "step-3", false), None);
+
+        let qwen = provider_like("qwenai", "https://dashscope.aliyuncs.com/compatible-mode/v1");
+        assert_eq!(plain_fallback_reason(&qwen, "qwen-max", true), None, "Qwen searches inside the loop");
+    }
+
+    #[test]
+    fn a_fallback_uses_pins_or_nothing() {
+        assert_eq!(fallback_mode(true), "papers");
+        assert_eq!(fallback_mode(false), "none");
+    }
+
+    /// A conversation whose pins all point at papers that are gone (deleted or
+    /// renamed) must answer plainly, not ask for "papers" mode with nothing to
+    /// read. Live pins are passed on deduped, trimmed and in pin order.
+    #[test]
+    fn fallback_pins_are_resolved_against_the_index_before_the_mode() {
+        let index = vec![
+            index_entry("attn", "Attention", &["A"]),
+            index_entry("bert", "BERT", &["E"]),
+        ];
+        let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let (live, mode) = resolve_fallback_pins(&owned(&["gone", "old-slug"]), &index);
+        assert!(live.is_empty());
+        assert_eq!(mode, "none", "stale pins alone must not select papers mode");
+
+        let (live, mode) = resolve_fallback_pins(&owned(&[]), &index);
+        assert!(live.is_empty());
+        assert_eq!(mode, "none");
+
+        let (live, mode) =
+            resolve_fallback_pins(&owned(&["bert", "gone", " bert ", " attn "]), &index);
+        assert_eq!(live, vec!["bert".to_string(), "attn".to_string()]);
+        assert_eq!(mode, "papers");
+
+        // An empty index (no index.json yet) resolves nothing.
+        let (live, mode) = resolve_fallback_pins(&owned(&["attn"]), &[]);
+        assert!(live.is_empty());
+        assert_eq!(mode, "none");
+
+        // The cap applies to what is passed on.
+        let many: Vec<crate::models::PaperIndexEntry> = (0..MAX_PINNED_PAPERS + 5)
+            .map(|i| index_entry(&format!("p{i}"), "T", &["A"]))
+            .collect();
+        let slugs: Vec<String> = many.iter().map(|e| e.slug.clone()).collect();
+        let (live, mode) = resolve_fallback_pins(&slugs, &many);
+        assert_eq!(live.len(), MAX_PINNED_PAPERS);
+        assert_eq!(mode, "papers");
+    }
+
+    /// The retrieval sources are gone. An old caller still naming one gets a
+    /// plain answer, never an error and never a vector-store query.
+    #[test]
+    fn retired_knowledge_sources_are_answered_plainly() {
+        assert_eq!(tool_free_source(Some("papers")), "papers");
+        for old in [None, Some("none"), Some("paper-rag"), Some("paper-rag-loose"), Some("snippets"), Some("")] {
+            assert_eq!(tool_free_source(old), "none", "{old:?}");
+        }
+    }
+
     #[test]
     fn vision_capability_is_read_from_the_model() {
         assert!(model_sees_images(&vision_model("m", true), "m"));
@@ -3114,5 +3475,10 @@ mod agent_tests {
             p.contains("last resort"),
             "must demote the whole-library keyword sweep"
         );
+        // The library chat has no "don't use the library" mode any more, so the
+        // prompt itself has to let an unrelated question go without tools.
+        assert!(p.contains("needs no tool call"), "must allow answering unrelated questions directly");
+        assert!(p.contains("search_snippets") && p.contains("素材库"), "must name the snippet collection");
+        assert!(!p.contains("semantic_search"), "chat has no embedding search to point the model at");
     }
 }

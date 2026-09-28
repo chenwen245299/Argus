@@ -324,7 +324,7 @@ pub async fn test_connection(provider: &AiProvider, api_key: &str) -> Result<Str
             req = req.header("Authorization", format!("Bearer {api_key}"));
         }
         let resp = req.send().await.map_err(|e| {
-            format!("Network error: {e}. Is Ollama running at {}?", ollama_root(provider))
+            format!("{}. Is Ollama running at {}?", describe_reqwest_error(&e), ollama_root(provider))
         })?;
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
@@ -410,14 +410,23 @@ pub async fn test_connection(provider: &AiProvider, api_key: &str) -> Result<Str
         // Pretend to be a whitelisted coding agent so ordinary API keys work.
         req = req.header("User-Agent", "KimiCLI/1.5");
     }
-    let resp = req.json(&body).send().await.map_err(|e| format!("Network error: {e}"))?;
+    let resp = req.json(&body).send().await.map_err(|e| describe_stream_error(&e))?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
-    if status >= 400 {
+    // A 200 can still be a refusal: MiniMax reports a bad key or a used-up
+    // Token Plan window in `base_resp`, and "Connected" would be the wrong verdict.
+    let failure = if status >= 400 {
+        Some(friendly_error(status, &text))
+    } else {
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|json| provider_error_in_body(&json))
+    };
+    if let Some(failure) = failure {
         return Err(format!(
             "{} [kind={}, base_url={}, model={}]",
-            friendly_error(status, &text),
+            failure,
             provider.kind,
             provider.base_url,
             model
@@ -477,7 +486,7 @@ async fn embed_openai_compat(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| describe_reqwest_error(&e))?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -544,7 +553,7 @@ async fn embed_openrouter(
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| format!("Network error: {e}"))?;
+                .map_err(|e| describe_reqwest_error(&e))?;
 
             let status = resp.status().as_u16();
             let resp_text = resp.text().await.unwrap_or_default();
@@ -786,7 +795,11 @@ async fn stream_with_pdf_injected(
         // a gzipped SSE stream, so ask for identity encoding to keep it plain text.
         req = req.header("Accept-Encoding", "identity");
     }
-    let resp = req.json(&body).send().await.map_err(|e| format!("Network error: {e}"))?;
+    let resp = req
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| describe_stream_error(&e))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -798,6 +811,8 @@ async fn stream_with_pdf_injected(
     let mut stream = resp.bytes_stream();
     let mut byte_buf: Vec<u8> = Vec::new();
     let mut buf = String::new();
+    // Non-SSE lines, kept in case the "stream" is a plain JSON error body.
+    let mut stray = String::new();
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
@@ -806,7 +821,7 @@ async fn stream_with_pdf_injected(
     let mut usage_emitted = false;
     let mut trace = crate::openrouter::ServerToolTrace::default();
 
-    while let Some(chunk) = stream.next().await {
+    'stream: while let Some(chunk) = stream.next().await {
         // Backend cancellation: if the user pressed stop, break out of the loop.
         // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
         // provider stops generating (and billing). Return the partial text.
@@ -815,7 +830,7 @@ async fn stream_with_pdf_injected(
                 break;
             }
         }
-        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let bytes = chunk.map_err(|e| format!("Stream read error: {}", describe_stream_error(&e)))?;
         byte_buf.extend_from_slice(&bytes);
         // Decode only up to the last complete UTF-8 boundary; keep the trailing
         // incomplete bytes (a multi-byte char split across chunks) for next round.
@@ -864,6 +879,17 @@ async fn stream_with_pdf_injected(
                             return Ok(accumulated);
                         }
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                            // Same as `stream_openai_compat`: an error sent as an
+                            // event must not end the stream as an empty success.
+                            if let Some(err) = provider_error_in_body(&json) {
+                                if accumulated.is_empty() {
+                                    return Err(err);
+                                }
+                                let notice = interrupted_notice(&err);
+                                let _ = app.emit(event_name, serde_json::json!({"delta": &notice, "done": false}));
+                                accumulated.push_str(&notice);
+                                break 'stream;
+                            }
                             if let Some(usage) = json.get("usage").filter(|v| !v.is_null()) {
                                 if let Some(v) = usage["prompt_tokens"].as_u64() {
                                     input_tokens = v;
@@ -933,9 +959,18 @@ async fn stream_with_pdf_injected(
                                 );
                             }
                         }
+                    } else {
+                        keep_stray_line(&mut stray, &line);
                     }
                 }
             }
+        }
+    }
+
+    let cancelled = cancel.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+    if accumulated.is_empty() && !cancelled {
+        if let Some(err) = stray_body_error(&stray, &buf) {
+            return Err(err);
         }
     }
 
@@ -1049,15 +1084,32 @@ async fn chat_openai_compat(
     if is_kimi_coding_endpoint {
         req = req.header("User-Agent", "KimiCLI/1.5");
     }
-    let resp = req.json(&body).send().await.map_err(|e| format!("Network error: {e}"))?;
+    let resp = req
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| describe_reqwest_error(&e))?;
 
     let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
+    let text = match resp.text().await {
+        Ok(text) => text,
+        // The status alone is still the error, and says more than the read.
+        Err(_) if status >= 400 => String::new(),
+        // A body cut off by the timeout used to become an empty string here,
+        // and then a misleading "Invalid JSON from API: EOF…" below.
+        Err(e) => return Err(format!("读取响应失败: {}", describe_reqwest_error(&e))),
+    };
     if status >= 400 {
         return Err(friendly_error(status, &text));
     }
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from API: {e}"))?;
+    // MiniMax answers business errors — a used-up Token Plan window, a
+    // throttle — with a 200 and a `base_resp`; gateways do the same with an
+    // `error` object. Read them before anything goes looking for `choices`.
+    if let Some(err) = provider_error_in_body(&json) {
+        return Err(err);
+    }
 
     let input_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
     let output_tokens = json["usage"]["completion_tokens"].as_u64().unwrap_or(0);
@@ -1081,10 +1133,26 @@ async fn chat_openai_compat(
         cache_hit_tokens,
     );
 
-    json["choices"][0]["message"]["content"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "Unexpected response format from API".to_string())
+    let message = &json["choices"][0]["message"];
+    let content = strip_leading_think(message["content"].as_str().unwrap_or(""));
+    if !content.trim().is_empty() {
+        return Ok(content.to_string());
+    }
+    // A thought-only reply counts as reasoning, whether the provider split it
+    // out or inlined it in `<think>` tags that were just stripped.
+    let mut reasoning = reply_reasoning(message);
+    if reasoning.is_empty() {
+        let raw = message["content"].as_str().unwrap_or("");
+        if raw.trim_start().starts_with("<think>") {
+            reasoning = raw.to_string();
+        }
+    }
+    // kimi-for-coding answers in `reasoning_content` by default; the streaming
+    // paths already treat that as the answer, so this one does too.
+    if is_kimi_for_coding && !reasoning.trim().is_empty() {
+        return Ok(reasoning);
+    }
+    Err(empty_reply_error(&json, &text, &reasoning))
 }
 
 async fn stream_openai_compat(
@@ -1301,7 +1369,11 @@ async fn stream_openai_compat(
         // Kimi Code may return a gzipped SSE stream; ask for identity to keep it plain text.
         req = req.header("Accept-Encoding", "identity");
     }
-    let resp = req.json(&body).send().await.map_err(|e| format!("Network error: {e}"))?;
+    let resp = req
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| describe_stream_error(&e))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -1313,6 +1385,8 @@ async fn stream_openai_compat(
     let mut stream = resp.bytes_stream();
     let mut byte_buf: Vec<u8> = Vec::new();
     let mut buf = String::new();
+    // Non-SSE lines, kept in case the "stream" is a plain JSON error body.
+    let mut stray = String::new();
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
@@ -1333,7 +1407,7 @@ async fn stream_openai_compat(
     // provider, and for StepFun with speech switched off.
     let mut audio_pcm: Vec<u8> = Vec::new();
 
-    while let Some(chunk) = stream.next().await {
+    'stream: while let Some(chunk) = stream.next().await {
         // Backend cancellation: if the user pressed stop, break out of the loop.
         // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
         // provider stops generating (and billing). Return the partial text.
@@ -1342,7 +1416,7 @@ async fn stream_openai_compat(
                 break;
             }
         }
-        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let bytes = chunk.map_err(|e| format!("Stream read error: {}", describe_stream_error(&e)))?;
         byte_buf.extend_from_slice(&bytes);
         // Decode only up to the last complete UTF-8 boundary; keep the trailing
         // incomplete bytes (a multi-byte char split across chunks) for next round.
@@ -1390,6 +1464,20 @@ async fn stream_openai_compat(
                             return Ok(accumulated);
                         }
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                            // An error sent as an event — MiniMax's `base_resp`,
+                            // OpenRouter's mid-stream `error` — used to be read
+                            // as a chunk with no delta and end the stream "fine".
+                            // Before anything is shown it is the call's error;
+                            // after, see `interrupted_notice`.
+                            if let Some(err) = provider_error_in_body(&json) {
+                                if accumulated.is_empty() && audio_pcm.is_empty() {
+                                    return Err(err);
+                                }
+                                let notice = interrupted_notice(&err);
+                                let _ = app.emit(event_name, serde_json::json!({"delta": &notice, "done": false}));
+                                accumulated.push_str(&notice);
+                                break 'stream;
+                            }
                             // Capture usage from the final usage chunk
                             if let Some(usage) = json.get("usage").filter(|v| !v.is_null()) {
                                 if let Some(v) = usage["prompt_tokens"].as_u64() {
@@ -1498,9 +1586,20 @@ async fn stream_openai_compat(
                                 }
                             }
                         }
+                    } else {
+                        keep_stray_line(&mut stray, &line);
                     }
                 }
             }
+        }
+    }
+
+    // A 200 whose body was a plain JSON error rather than events ends here with
+    // nothing produced; say what it was instead of returning an empty answer.
+    let cancelled = cancel.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+    if accumulated.is_empty() && audio_pcm.is_empty() && !cancelled {
+        if let Some(err) = stray_body_error(&stray, &buf) {
+            return Err(err);
         }
     }
 
@@ -1609,7 +1708,7 @@ async fn stream_deepseek_responses(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| describe_stream_error(&e))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -1635,7 +1734,7 @@ async fn stream_deepseek_responses(
                 break;
             }
         }
-        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let bytes = chunk.map_err(|e| format!("Stream read error: {}", describe_stream_error(&e)))?;
         byte_buf.extend_from_slice(&bytes);
         let valid_up_to = match std::str::from_utf8(&byte_buf) {
             Ok(s) => s.len(),
@@ -1823,7 +1922,7 @@ async fn chat_ollama(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}. Is Ollama running at {}?", ollama_root(provider)))?;
+        .map_err(|e| format!("{}. Is Ollama running at {}?", describe_reqwest_error(&e), ollama_root(provider)))?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -1885,7 +1984,7 @@ async fn stream_ollama(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}. Is Ollama running at {}?", ollama_root(provider)))?;
+        .map_err(|e| format!("{}. Is Ollama running at {}?", describe_stream_error(&e), ollama_root(provider)))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -1909,7 +2008,7 @@ async fn stream_ollama(
                 break;
             }
         }
-        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let bytes = chunk.map_err(|e| format!("Stream read error: {}", describe_stream_error(&e)))?;
         byte_buf.extend_from_slice(&bytes);
         // Decode up to the last complete UTF-8 boundary; keep trailing partial
         // bytes (a multi-byte char split across chunks) for the next round.
@@ -1998,7 +2097,7 @@ async fn embed_ollama(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}. Is Ollama running at {}?", ollama_root(provider)))?;
+        .map_err(|e| format!("{}. Is Ollama running at {}?", describe_reqwest_error(&e), ollama_root(provider)))?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -2044,7 +2143,7 @@ async fn fetch_ollama_models(provider: &AiProvider, api_key: &str) -> Result<Vec
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}. Is Ollama running at {root}?"))?;
+        .map_err(|e| format!("{}. Is Ollama running at {root}?", describe_reqwest_error(&e)))?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -2192,7 +2291,7 @@ async fn chat_anthropic(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| describe_reqwest_error(&e))?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -2201,6 +2300,9 @@ async fn chat_anthropic(
     }
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from Anthropic: {e}"))?;
+    if let Some(err) = provider_error_in_body(&json) {
+        return Err(err);
+    }
 
     let base_input = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
     let cache_read = json["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0);
@@ -2281,7 +2383,7 @@ async fn stream_anthropic(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| describe_stream_error(&e))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -2293,13 +2395,15 @@ async fn stream_anthropic(
     let mut stream = resp.bytes_stream();
     let mut byte_buf: Vec<u8> = Vec::new();
     let mut buf = String::new();
+    // Non-SSE lines, kept in case the "stream" is a plain JSON error body.
+    let mut stray = String::new();
     let mut accumulated = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
     // Anthropic reports cache hits separately from `input_tokens`.
     let mut cache_read: u64 = 0;
 
-    while let Some(chunk) = stream.next().await {
+    'stream: while let Some(chunk) = stream.next().await {
         // Backend cancellation: if the user pressed stop, break out of the loop.
         // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
         // provider stops generating (and billing). Return the partial text.
@@ -2308,7 +2412,7 @@ async fn stream_anthropic(
                 break;
             }
         }
-        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let bytes = chunk.map_err(|e| format!("Stream read error: {}", describe_stream_error(&e)))?;
         byte_buf.extend_from_slice(&bytes);
         // Decode only up to the last complete UTF-8 boundary; keep the trailing
         // incomplete bytes (a multi-byte char split across chunks) for next round.
@@ -2331,6 +2435,18 @@ async fn stream_anthropic(
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim_start();
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                            // `event: error` — Anthropic's mid-stream overload,
+                            // for one — used to fall through to `_ => {}` and
+                            // end the stream as an empty success.
+                            if let Some(err) = provider_error_in_body(&json) {
+                                if accumulated.is_empty() {
+                                    return Err(err);
+                                }
+                                let notice = interrupted_notice(&err);
+                                let _ = app.emit(event_name, serde_json::json!({"delta": &notice, "done": false}));
+                                accumulated.push_str(&notice);
+                                break 'stream;
+                            }
                             match json["type"].as_str() {
                                 Some("message_start") => {
                                     let u = &json["message"]["usage"];
@@ -2398,9 +2514,18 @@ async fn stream_anthropic(
                                 _ => {}
                             }
                         }
+                    } else {
+                        keep_stray_line(&mut stray, &line);
                     }
                 }
             }
+        }
+    }
+
+    let cancelled = cancel.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+    if accumulated.is_empty() && !cancelled {
+        if let Some(err) = stray_body_error(&stray, &buf) {
+            return Err(err);
         }
     }
 
@@ -2497,7 +2622,7 @@ async fn fetch_openai_models(provider: &AiProvider, api_key: &str) -> Result<Vec
     let resp = openai_auth(req, provider, api_key)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| describe_reqwest_error(&e))?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -3165,6 +3290,10 @@ fn anthropic_known_models() -> Vec<AiModel> {
 /// connect timeout: their body legitimately takes as long as the generation
 /// (reasoning models regularly exceed 2 minutes).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the shared client waits for a TCP + TLS connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the shared client waits between two reads of a response body.
+const READ_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Process-wide shared client: reuses the connection pool (TCP + TLS sessions)
 /// across requests instead of paying a fresh handshake per AI call, which
@@ -3175,11 +3304,11 @@ pub(crate) fn build_client() -> Result<reqwest::Client, String> {
         return Ok(client.clone());
     }
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
+        .connect_timeout(CONNECT_TIMEOUT)
         // Per-read idle timeout: kills silently stalled connections without
         // capping total stream duration (long generations stay alive as long
         // as tokens keep arriving).
-        .read_timeout(Duration::from_secs(180))
+        .read_timeout(READ_TIMEOUT)
         .user_agent("Argus/0.1")
         // Some providers (notably Kimi Code's /coding endpoint) send SSE streams
         // that behave more reliably over HTTP/1.1.
@@ -3305,27 +3434,1117 @@ fn char_prefix(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Turn an HTTP error response into the message the user sees.
+///
+/// The headline is picked by status; the rest is what the provider said. When
+/// the body is JSON with a message in it (`error.message`, a bare `error`
+/// string, MiniMax's `base_resp.status_msg`, a top-level `message`), that
+/// message is shown instead of a raw preview — it is far more readable — and a
+/// MiniMax-coded body goes through [`crate::minimax::describe_code`], so the
+/// code is explained in words and kept as ` (NNNN)` for [`classify_error`].
+/// A raw 300-character preview is kept only when nothing could be extracted.
+///
+/// Every headline keeps its status in a form [`http_status_in`] reads.
 pub(crate) fn friendly_error(status: u16, body: &str) -> String {
-    let preview = char_prefix(body, 300);
+    let json = serde_json::from_str::<serde_json::Value>(body.trim()).ok();
+    let message = json.as_ref().and_then(error_message_in);
+    let code = json.as_ref().and_then(|j| minimax_code_in(j, message.as_deref()));
+    let detail = match (&message, code) {
+        (_, Some(code)) => crate::minimax::describe_code(code, message.as_deref().unwrap_or("")),
+        (Some(m), None) => m.clone(),
+        (None, None) => char_prefix(body, 300),
+    };
+    let extracted = message.is_some() || code.is_some();
+    // A relay can wrap a permanent error in a 5xx — new-api answers "no channel
+    // serves this model" as 503 `model_not_found`. The body's own name wins, so
+    // it reads (and classifies) as the 404 it is rather than a busy server.
+    let status = match json
+        .as_ref()
+        .and_then(|j| j.get("error")?.as_object())
+        .and_then(embedded_status)
+    {
+        Some(named) if (500..=599).contains(&status) && (400..=499).contains(&named) => named,
+        _ => status,
+    };
     match status {
-        401 => "Authentication failed (401). Check your API key in Settings → AI Services.".to_string(),
-        403 => format!("Access denied (403). Your key may lack permission for this model. Response: {preview}"),
-        404 => format!("Endpoint or model not found (404). Verify your API address and model ID. Response: {preview}"),
+        // No preview of an unreadable body here: a 401 is self-explanatory, and
+        // a raw page would only bury the advice.
+        401 if extracted => format!(
+            "Authentication failed (401). Check your API key in Settings → AI Providers. Response: {detail}"
+        ),
+        401 => "Authentication failed (401). Check your API key in Settings → AI Providers.".to_string(),
+        // OpenRouter's moderated models refuse a flagged input with a 403. The
+        // key is fine and the next request may pass, so it is worded — and
+        // classified — as this one request's problem, not a permission error.
+        403 if is_moderation_refusal(json.as_ref(), body) => format!(
+            "内容被安全审核拦截（403）：这条输入被该模型的审核标记，可换用其它模型或跳过。Response: {detail}"
+        ),
+        403 => format!("Access denied (403). Your key may lack permission for this model. Response: {detail}"),
+        404 => format!("Endpoint or model not found (404). Verify your API address and model ID. Response: {detail}"),
         // StepFun returns 402 when the account is out of credit. "Try again"
         // would be wrong advice, so it is named rather than left to the catch-all.
-        402 => format!("余额不足（402）。请先充值或更换服务商。Response: {preview}"),
+        402 => format!("余额不足（402）。请先充值或更换服务商。Response: {detail}"),
         // Two different 429s share the status and only the error identifier tells
         // them apart: an ordinary rate limit clears in seconds, while a credit cap
         // resets on the 1st of the month. Telling the user to wait a moment is
         // actively misleading for the second, so the body decides the wording.
         429 if body.contains("credit_limit_exceeded") => format!(
-            "配额已用尽（429）。该项目的额度要到下个计费周期才会恢复，请调整额度或更换服务商。Response: {preview}"
+            "配额已用尽（429）。该项目的额度要到下个计费周期才会恢复，请调整额度或更换服务商。Response: {detail}"
         ),
-        429 => "Rate limited (429). Please wait a moment and try again.".to_string(),
+        // MiniMax sends its throttles *and* its used-up Token Plan windows as a
+        // 429; the code — already put into words in `detail` — is what says
+        // which, so the headline stays neutral rather than saying "wait".
+        429 if code.is_some() => format!("请求被拒绝（429）：{detail}"),
+        429 if mentions_quota(&detail)
+            || body.contains("insufficient_quota")
+            || body.contains("exceeded_current_quota") =>
+        {
+            format!("额度已用尽（429），稍后重试无效，请充值、调整额度或更换服务商。Response: {detail}")
+        }
+        429 => format!("Rate limited (429). Please wait a moment and try again. Response: {detail}"),
         // StepFun's content-moderation refusal, on the request or the response.
         // Most OpenAI-compatible clients have no mapping for it.
-        451 => format!("内容被安全策略拦截（451）。请调整提问或附件后重试。Response: {preview}"),
-        _ => format!("API error {status}: {preview}"),
+        451 => format!("内容被安全策略拦截（451）。请调整提问或附件后重试。Response: {detail}"),
+        // Overload (MiniMax's peak-hour 529, Anthropic's 529) and gateway
+        // trouble: worth one more try a little later.
+        502..=504 | 520..=529 => format!("服务端繁忙（{status}），通常稍后重试即可：{detail}"),
+        // A plain server fault may or may not clear (Ollama answers 500 when a
+        // model does not fit in memory), so no promise either way.
+        500..=599 => format!("服务端出错（{status}）：{detail}"),
+        _ => format!("API error {status}: {detail}"),
+    }
+}
+
+/// A 403 that is a moderation refusal of this input rather than a key without
+/// permission: OpenRouter's "… requires moderation … Your input was flagged".
+fn is_moderation_refusal(json: Option<&serde_json::Value>, body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("requires moderation")
+        || lower.contains("was flagged")
+        || json.is_some_and(|j| {
+            let meta = &j["error"]["metadata"];
+            meta["reasons"].is_array() || meta["flagged_input"].is_string()
+        })
+}
+
+/// Wording that means an account, key or plan has run out — not a throttle.
+/// Shared by [`classify_error`] and the 429 headline in [`friendly_error`].
+const QUOTA_WORDING: &[&str] = &[
+    "usage limit exceeded",
+    "用量上限",
+    "额度已用尽",
+    "配额已用尽",
+    "余额不足",
+    "credit_limit_exceeded",
+    "insufficient_quota",
+    "insufficient balance",
+];
+
+fn mentions_quota(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    QUOTA_WORDING.iter().any(|k| lower.contains(k))
+}
+
+/// The provider's own words in a JSON error body, from wherever it put them:
+/// `error.message` (OpenAI, Anthropic, MiniMax's HTTP envelope), a bare
+/// `error` string (Ollama), `base_resp.status_msg` (MiniMax on a 200), or a
+/// top-level `message` / `msg` / `detail`.
+///
+/// Capped at 500 characters: a validator that echoes a whole schema back
+/// should not fill the screen. A MiniMax code cut off the end by the cap is
+/// not lost — [`minimax_code_in`] reads it from the raw field, and
+/// [`crate::minimax::describe_code`] puts it back.
+fn error_message_in(json: &serde_json::Value) -> Option<String> {
+    let text = |v: &serde_json::Value| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| char_prefix(s, 500))
+    };
+    let err = &json["error"];
+    if let Some(msg) = text(&err["message"]) {
+        // OpenRouter reports an upstream refusal as "Provider returned error"
+        // and puts the upstream's actual reason in `metadata.raw`.
+        if let Some(raw) = text(&err["metadata"]["raw"]) {
+            let who = text(&err["metadata"]["provider_name"]).unwrap_or_else(|| "upstream".into());
+            return Some(format!("{msg} — {who}: {}", char_prefix(&raw, 300)));
+        }
+        return Some(msg);
+    }
+    if let Some(msg) = text(err) {
+        return Some(msg);
+    }
+    if let Some((_, msg)) = crate::minimax::base_resp_error(json) {
+        if !msg.is_empty() {
+            return Some(msg);
+        }
+    }
+    ["message", "msg", "detail"]
+        .iter()
+        .find_map(|k| text(&json[*k]))
+}
+
+/// The MiniMax business code a JSON body carries: `base_resp.status_code`, or
+/// the `(NNNN)` MiniMax ends its `error.message` with.
+fn minimax_code_in(json: &serde_json::Value, message: Option<&str>) -> Option<u32> {
+    if let Some((code, _)) = crate::minimax::base_resp_error(json) {
+        return u32::try_from(code).ok();
+    }
+    json["error"]["message"]
+        .as_str()
+        .and_then(crate::minimax::trailing_code)
+        .or_else(|| message.and_then(crate::minimax::trailing_code))
+}
+
+/// An error a provider reported *inside* a body that otherwise arrived as a
+/// success — a non-streaming reply with HTTP 200, or one SSE chunk of a stream.
+///
+/// Two shapes are recognised:
+///   * MiniMax's `base_resp` with a non-zero `status_code` (a number or a
+///     numeric string) — it answers business errors that way with a 200 and no
+///     `choices`, and `status_code: 0` rides every successful response;
+///   * a top-level `error` *object* with a non-empty string `message` — the
+///     OpenAI / Anthropic / OpenRouter shape, including MiniMax's
+///     `{type:"error", error:{…}}` envelope. `"error": null`, an empty object
+///     and a non-object are all ignored, so ordinary chunks never trip it.
+///
+/// The message keeps the markers [`classify_error`] reads: MiniMax's `(NNNN)`,
+/// and the HTTP status when the error object names one (`code: 429`,
+/// `http_code: "529"`, or an Anthropic-style `type` such as `overloaded_error`),
+/// in which case it is worded exactly as [`friendly_error`] would word that
+/// status.
+pub(crate) fn provider_error_in_body(json: &serde_json::Value) -> Option<String> {
+    body_error(json).map(|(_, msg)| msg)
+}
+
+/// [`provider_error_in_body`], plus the HTTP status the body itself names, for
+/// the one caller that needs it ([`looks_like_tools_rejected`] in
+/// [`stream_with_tools`]).
+fn body_error(json: &serde_json::Value) -> Option<(Option<u16>, String)> {
+    if let Some((code, msg)) = crate::minimax::base_resp_error(json) {
+        let text = match u32::try_from(code) {
+            Ok(code) => crate::minimax::describe_code(code, &msg),
+            Err(_) => format!("服务商返回错误（错误码 {code}）：{msg}"),
+        };
+        return Some((None, text));
+    }
+    let err = json.get("error")?.as_object()?;
+    let message = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())?;
+    let status = embedded_status(err);
+    let text = match status {
+        Some(status) => friendly_error(status, &json.to_string()),
+        None => match crate::minimax::trailing_code(message) {
+            Some(code) => crate::minimax::describe_code(code, &char_prefix(message, 500)),
+            None => format!(
+                "服务商返回错误：{}",
+                error_message_in(json).unwrap_or_else(|| message.to_string())
+            ),
+        },
+    };
+    Some((status, text))
+}
+
+/// The HTTP status an in-body error object names, if any: a numeric
+/// `http_code` / `status` / `code` in the 4xx–5xx range (as a number or a
+/// numeric string), else a well-known error `type` / `code` name.
+fn embedded_status(err: &serde_json::Map<String, serde_json::Value>) -> Option<u16> {
+    for key in ["http_code", "status", "code"] {
+        let Some(v) = err.get(key) else { continue };
+        let n = v
+            .as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+        if let Some(n) = n.filter(|n| (400..=599).contains(n)) {
+            return Some(n as u16);
+        }
+    }
+    for key in ["type", "code"] {
+        let Some(name) = err.get(key).and_then(|v| v.as_str()) else { continue };
+        let status = match name {
+            // Anthropic, OpenAI and Moonshot (Kimi) spellings.
+            "overloaded_error" => 529,
+            "api_error" | "server_error" | "internal_error" | "internal_server_error" => 500,
+            "rate_limit_error"
+            | "rate_limit_exceeded"
+            | "rate_limit_reached_error"
+            | "engine_overloaded_error"
+            | "insufficient_quota"
+            | "exceeded_current_quota_error" => 429,
+            "authentication_error" | "invalid_api_key" | "invalid_authentication_error" => 401,
+            "permission_error" | "permission_denied_error" => 403,
+            "not_found_error" | "model_not_found" | "resource_not_found_error" => 404,
+            "request_too_large" => 413,
+            "invalid_request_error" => 400,
+            _ => continue,
+        };
+        return Some(status);
+    }
+    None
+}
+
+/// A failed `send()` or body read, in words.
+///
+/// For requests sent with [`REQUEST_TIMEOUT`]; streaming requests, which have
+/// no total timeout, use [`describe_stream_error`]. Timeouts read `请求超时`
+/// and everything else `Network error:`, both of which [`classify_error`]
+/// treats as transient, and the error's source chain is spelled out — the
+/// top-level text alone ("error sending request for url (…)") never says
+/// whether it was DNS, TLS or a refused connection.
+pub(crate) fn describe_reqwest_error(e: &reqwest::Error) -> String {
+    describe_reqwest_error_within(e, Some(REQUEST_TIMEOUT))
+}
+
+/// [`describe_reqwest_error`] for requests with no total timeout (streams, and
+/// the few one-shot calls sent without one): the only timeouts that can fire
+/// are the client's connect and between-reads limits.
+fn describe_stream_error(e: &reqwest::Error) -> String {
+    describe_reqwest_error_within(e, None)
+}
+
+fn describe_reqwest_error_within(e: &reqwest::Error, total: Option<Duration>) -> String {
+    let chain = error_chain(e);
+    // Never left the machine: a malformed API address, or a key with a
+    // character a header cannot carry. Not a network fault, and no retry will
+    // fix it, so it is not worded as one.
+    if e.is_builder() {
+        return format!("请求无法发出，请检查 API 地址和密钥是否填写正确: {chain}");
+    }
+    if e.is_timeout() {
+        if e.is_connect() {
+            return format!(
+                "请求超时（{} 秒内未能连上服务器）: {chain}",
+                CONNECT_TIMEOUT.as_secs()
+            );
+        }
+        return match total {
+            Some(total) => format!("请求超时（{} 秒内未完成）: {chain}", total.as_secs()),
+            None => format!(
+                "请求超时（{} 秒内没有收到任何数据）: {chain}",
+                READ_TIMEOUT.as_secs()
+            ),
+        };
+    }
+    if e.is_connect() {
+        return format!("Network error: 无法连接到服务器 — {chain}");
+    }
+    format!("Network error: {chain}")
+}
+
+/// An error and its `source()` chain, joined with `: `, skipping a link whose
+/// text the chain already contains (hyper and std often repeat each other).
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(inner) = source {
+        let text = inner.to_string();
+        if !text.is_empty() && !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = inner.source();
+    }
+    out
+}
+
+/// Drop a leading `<think>…</think>` block (after optional whitespace) from a
+/// reply, along with the whitespace that follows it.
+///
+/// For the one-shot callers — the arXiv digest, translation, titles, section
+/// outlines, canvas edge suggestions — none of which wants the chain of
+/// thought: a model that inlines it (MiniMax without `reasoning_split`, many
+/// open-weight models behind a generic gateway) would otherwise put it at the
+/// top of a summary or into a parsed JSON reply. An opening tag with no close
+/// is left alone rather than returning nothing: that is either a reply cut off
+/// mid-thought or a literal `<think>` the answer talks about.
+fn strip_leading_think(s: &str) -> &str {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let Some(rest) = s.trim_start().strip_prefix(OPEN) else {
+        return s;
+    };
+    match rest.find(CLOSE) {
+        Some(end) => rest[end + CLOSE.len()..].trim_start(),
+        None => s,
+    }
+}
+
+/// Why a successful non-streaming reply carried no text, as an error message.
+///
+/// Every message here is per-request ([`ErrorClass::Request`]): none contains
+/// a status, a vendor code, or quota / network wording.
+fn empty_reply_error(json: &serde_json::Value, text: &str, reasoning: &str) -> String {
+    let choice = &json["choices"][0];
+    let finish = choice["finish_reason"].as_str().unwrap_or("");
+    if finish == "length" {
+        let why = if reasoning.trim().is_empty() {
+            ""
+        } else {
+            "（思考过程占满了输出长度）"
+        };
+        return format!(
+            "输出被截断（finish_reason=length）：模型在写出正文之前就达到了输出长度上限{why}。可换用不思考的模型、缩短输入或调高输出长度后重试"
+        );
+    }
+    let flagged = |v: &serde_json::Value| v.as_bool() == Some(true);
+    if matches!(finish, "content_filter" | "content_filtered" | "sensitive")
+        || flagged(&json["input_sensitive"])
+        || flagged(&json["output_sensitive"])
+    {
+        let why = if finish.is_empty() {
+            "输入/输出涉敏".to_string()
+        } else {
+            format!("finish_reason={finish}")
+        };
+        return format!("内容被安全策略拦截（{why}），模型没有返回正文。请调整输入后重试");
+    }
+    if !reasoning.trim().is_empty() {
+        return "模型只返回了思考过程、没有正文。可换用不思考的模型或调高输出长度后重试".to_string();
+    }
+    format!("Unexpected response format from API: {}", char_prefix(text, 200))
+}
+
+/// What a non-streaming reply's message reasoned, under whichever field the
+/// provider uses: `reasoning_content` (DeepSeek, Kimi, MiMo…), `reasoning`
+/// (OpenRouter), `thinking`, or MiniMax's `reasoning_details[].text`.
+fn reply_reasoning(message: &serde_json::Value) -> String {
+    if let Some(r) = message["reasoning_content"]
+        .as_str()
+        .or_else(|| message["reasoning"].as_str())
+        .or_else(|| message["thinking"].as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return r.to_string();
+    }
+    message["reasoning_details"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// What is appended to a streamed answer the provider broke off with an error
+/// event. Once text is on screen, failing the call would make the chat replace
+/// the partial answer with the error; ending normally keeps it, still records
+/// the usage that was billed, and says why it stops short.
+fn interrupted_notice(err: &str) -> String {
+    format!("\n\n（回答中断：{err}）")
+}
+
+/// Upper bound on the non-SSE text a stream keeps for [`stray_body_error`].
+const STRAY_BODY_CAP: usize = 64 * 1024;
+
+/// Keep a body line that is not an SSE field, in case the whole response turns
+/// out to be a plain JSON error sent with a 200 instead of an event stream.
+/// Bounded, and a no-op for every line a real event stream sends.
+fn keep_stray_line(stray: &mut String, line: &str) {
+    let t = line.trim();
+    if t.is_empty() || stray.len() >= STRAY_BODY_CAP || t.starts_with(':') {
+        return;
+    }
+    if ["data:", "event:", "id:", "retry:"].iter().any(|f| t.starts_with(f)) {
+        return;
+    }
+    stray.push_str(line);
+    stray.push('\n');
+}
+
+/// The error in a stream that ended without producing anything, when what it
+/// sent was a JSON body rather than events: the kept stray lines plus whatever
+/// was left unterminated in the buffer (also tried on its own, minus a
+/// `data:` prefix, for a last event that never got its newline).
+fn stray_body_error(stray: &str, tail: &str) -> Option<String> {
+    let tail = tail.trim();
+    let whole = format!("{stray}{tail}");
+    let last_event = tail.strip_prefix("data:").unwrap_or("");
+    // Bound to a local so the iterator is dropped before `whole` is.
+    let found = [whole.as_str(), last_event].into_iter().find_map(|candidate| {
+        let candidate = candidate.trim();
+        if !candidate.starts_with('{') {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(candidate)
+            .ok()
+            .and_then(|json| provider_error_in_body(&json))
+    });
+    found
+}
+
+/// How a caller that can wait and send the request again should treat a failed
+/// LLM call. Only batch jobs act on it (the arXiv digest); interactive callers
+/// keep showing the message as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// Throttling, overload, timeouts, 5xx, dropped connections: the same
+    /// request is likely to succeed if it is sent again a little later.
+    Transient,
+    /// Provider-wide and not going to clear by retrying soon: a bad key, an
+    /// empty balance, a plan whose quota window is used up, a missing model.
+    /// Every further request would fail the same way, so a batch should stop.
+    Fatal,
+    /// Specific to this one request: bad input, moderation, a malformed reply.
+    Request,
+}
+
+/// Classify an error string produced by this module.
+///
+/// The messages are ours — [`friendly_error`], the network and body checks in
+/// the request functions — so the markers read here are the ones they write:
+/// a vendor code in parentheses (MiniMax appends one to every message, e.g.
+/// `…请稍后重试 (2064)`), quota wording, the HTTP status, then network wording.
+/// The order matters: a 429 that is a used-up plan window must be `Fatal`, not
+/// the `Transient` an ordinary 429 is.
+pub fn classify_error(msg: &str) -> ErrorClass {
+    if let Some(class) = parenthesized_numbers(msg, 4)
+        .into_iter()
+        .rev()
+        .find_map(crate::minimax::code_class)
+    {
+        return class;
+    }
+
+    let lower = msg.to_lowercase();
+    if mentions_quota(msg) {
+        return ErrorClass::Fatal;
+    }
+
+    // A moderation refusal is about this input, whatever status carried it
+    // (StepFun's 451, OpenRouter's 403).
+    if msg.contains("内容被安全") || lower.contains("requires moderation") {
+        return ErrorClass::Request;
+    }
+
+    if let Some(status) = http_status_in(msg) {
+        return match status {
+            401..=404 => ErrorClass::Fatal,
+            408 | 409 | 425 | 429 => ErrorClass::Transient,
+            400..=499 => ErrorClass::Request,
+            // "Not implemented" / "version not supported" will not change.
+            501 | 505 => ErrorClass::Request,
+            _ => ErrorClass::Transient,
+        };
+    }
+
+    const TRANSIENT: &[&str] = &[
+        "network error",
+        "请求超时",
+        "timed out",
+        "overloaded",
+        "rate limit",
+        "服务器繁忙",
+        "服务繁忙",
+        "temporarily unavailable",
+    ];
+    if TRANSIENT.iter().any(|k| lower.contains(k)) {
+        return ErrorClass::Transient;
+    }
+    ErrorClass::Request
+}
+
+/// Every run of exactly `digits` ASCII digits enclosed in `(…)` or `（…）`.
+fn parenthesized_numbers(msg: &str, digits: usize) -> Vec<u32> {
+    let chars: Vec<char> = msg.chars().collect();
+    let mut out = Vec::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '(' && c != '（' {
+            continue;
+        }
+        let run: String = chars[i + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let close = chars.get(i + 1 + run.len());
+        if run.len() == digits && matches!(close, Some(')') | Some('）')) {
+            if let Ok(n) = run.parse() {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+/// The HTTP status a message from [`friendly_error`] carries: `(429)`,
+/// `（402）`, or `API error 529:`.
+fn http_status_in(msg: &str) -> Option<u16> {
+    let in_status_range = |n: u32| (400..=599).contains(&n);
+    if let Some(n) = parenthesized_numbers(msg, 3).into_iter().find(|n| in_status_range(*n)) {
+        return Some(n as u16);
+    }
+    for marker in ["API error ", "HTTP "] {
+        if let Some(pos) = msg.find(marker) {
+            let digits: String = msg[pos + marker.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                if digits.len() == 3 && in_status_range(n) {
+                    return Some(n as u16);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod error_class_tests {
+    use super::{classify_error, friendly_error, ErrorClass};
+
+    #[test]
+    fn the_minimax_peak_hour_529_is_transient() {
+        let body = r#"{"type":"error","error":{"type":"overloaded_error","message":"当前为整点高峰时段，服务器短暂繁忙，通常 1-5 分钟内恢复。请稍后重试 (2064)","http_code":"529"}}"#;
+        assert_eq!(classify_error(&friendly_error(529, body)), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn a_used_up_token_plan_window_is_fatal_even_as_a_429() {
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"usage limit exceeded, 5-hour usage limit reached for Token Plan Plus (0/0 used), resets at 2026-05-15T15:00:00Z (2056)"}}"#;
+        assert_eq!(classify_error(&friendly_error(429, body)), ErrorClass::Fatal);
+        assert_eq!(
+            classify_error("已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。(2056)"),
+            ErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn statuses_map_to_the_expected_class() {
+        for (status, class) in [
+            (401, ErrorClass::Fatal),
+            (402, ErrorClass::Fatal),
+            (403, ErrorClass::Fatal),
+            (404, ErrorClass::Fatal),
+            (408, ErrorClass::Transient),
+            (429, ErrorClass::Transient),
+            (400, ErrorClass::Request),
+            (422, ErrorClass::Request),
+            (451, ErrorClass::Request),
+            (500, ErrorClass::Transient),
+            (502, ErrorClass::Transient),
+            (503, ErrorClass::Transient),
+            (504, ErrorClass::Transient),
+            (529, ErrorClass::Transient),
+        ] {
+            assert_eq!(
+                classify_error(&friendly_error(status, "{}")),
+                class,
+                "status {status}: {}",
+                friendly_error(status, "{}")
+            );
+        }
+        assert_eq!(
+            classify_error(&friendly_error(429, r#"{"error":{"code":"credit_limit_exceeded"}}"#)),
+            ErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn minimax_codes_decide_before_anything_else() {
+        assert_eq!(classify_error("请求频率超限 (1002)"), ErrorClass::Transient);
+        assert_eq!(classify_error("已达到 Token Plan 速率限制 (2062)"), ErrorClass::Transient);
+        assert_eq!(classify_error("invalid api key (2049)"), ErrorClass::Fatal);
+        assert_eq!(classify_error("余额不足 (1008)"), ErrorClass::Fatal);
+        assert_eq!(classify_error("input new_sensitive (1026)"), ErrorClass::Request);
+        assert_eq!(classify_error("invalid params (2013)"), ErrorClass::Request);
+        // A year in parentheses is not a code, and does not hide the status.
+        assert_eq!(classify_error("Rate limited (429) since (2026)"), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn a_relay_wrapping_model_not_found_in_a_503_is_fatal() {
+        let body = r#"{"error":{"message":"分组 default 下模型 x 无可用渠道（distributor）","type":"new_api_error","code":"model_not_found"}}"#;
+        let msg = friendly_error(503, body);
+        assert!(msg.contains("(404)"), "{msg}");
+        assert_eq!(classify_error(&msg), ErrorClass::Fatal);
+        // A real overload keeps its own status.
+        let overload = r#"{"type":"error","error":{"type":"overloaded_error","message":"busy","http_code":"529"}}"#;
+        assert_eq!(classify_error(&friendly_error(529, overload)), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn a_plain_server_fault_promises_nothing_and_not_implemented_is_per_request() {
+        let msg = friendly_error(500, r#"{"error":"model requires more system memory (5.5 GiB) than is available"}"#);
+        assert!(msg.starts_with("服务端出错（500）"), "{msg}");
+        assert!(!msg.contains("重试即可"), "{msg}");
+        assert_eq!(classify_error(&friendly_error(501, "{}")), ErrorClass::Request);
+    }
+
+    #[test]
+    fn a_moderation_403_fails_only_that_request() {
+        let body = r#"{"error":{"code":403,"message":"openai/gpt-5 requires moderation on OpenAI. Your input was flagged for \"violence\". No credits were charged.","metadata":{"reasons":["violence"],"flagged_input":"..."}}}"#;
+        let msg = friendly_error(403, body);
+        assert!(msg.starts_with("内容被安全审核拦截（403）"), "{msg}");
+        assert_eq!(classify_error(&msg), ErrorClass::Request);
+        // A genuine permission 403 still stops a batch.
+        assert_eq!(classify_error(&friendly_error(403, r#"{"error":{"message":"no access"}}"#)), ErrorClass::Fatal);
+    }
+
+    #[test]
+    fn network_failures_are_transient_and_the_rest_is_per_request() {
+        assert_eq!(
+            classify_error("Network error: error sending request for url (https://x/v1)"),
+            ErrorClass::Transient
+        );
+        assert_eq!(classify_error("请求超时（120 秒内未完成）"), ErrorClass::Transient);
+        assert_eq!(classify_error("Unexpected response format from API"), ErrorClass::Request);
+        assert_eq!(classify_error("Invalid JSON from API: expected value"), ErrorClass::Request);
+    }
+}
+
+#[cfg(test)]
+mod provider_error_tests {
+    use super::*;
+    use serde_json::json;
+
+    const PEAK_529: &str = r#"{"type":"error","error":{"type":"overloaded_error","message":"当前为整点高峰时段，服务器短暂繁忙，通常 1-5 分钟内恢复。请稍后重试 (2064)","http_code":"529"},"request_id":"abc"}"#;
+    const WINDOW_429: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"usage limit exceeded, 5-hour usage limit reached for Token Plan Plus (0/0 used), resets at 2026-05-15T15:00:00Z (2056)"}}"#;
+
+    // ── provider_error_in_body ──────────────────────────────────────────────
+
+    #[test]
+    fn a_base_resp_with_a_numeric_code_is_an_error() {
+        let body = json!({
+            "id": "x", "choices": null,
+            "base_resp": {"status_code": 2056, "status_msg": "usage limit exceeded, resets at 2026-05-15T15:00:00Z"}
+        });
+        let err = provider_error_in_body(&body).expect("base_resp error");
+        assert!(err.contains("usage limit exceeded"), "{err}");
+        assert!(err.ends_with("(2056)"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Fatal);
+    }
+
+    #[test]
+    fn a_base_resp_code_may_be_a_string_and_is_not_repeated() {
+        let body = json!({"base_resp": {"status_code": "2064", "status_msg": "服务器繁忙，请稍后重试 (2064)"}});
+        let err = provider_error_in_body(&body).expect("base_resp error");
+        assert_eq!(err.matches("(2064)").count(), 1, "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Transient);
+
+        let body = json!({"base_resp": {"status_code": "1002", "status_msg": "rate limit exceeded(RPM)"}});
+        let err = provider_error_in_body(&body).unwrap();
+        assert!(err.contains("(1002)"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn a_successful_base_resp_is_ignored() {
+        for code in [json!(0), json!("0")] {
+            let body = json!({
+                "choices": [{"message": {"content": "hi"}}],
+                "base_resp": {"status_code": code, "status_msg": ""}
+            });
+            assert_eq!(provider_error_in_body(&body), None);
+        }
+        // Not a number at all: not something to act on.
+        assert_eq!(provider_error_in_body(&json!({"base_resp": {"status_code": "ok"}})), None);
+    }
+
+    #[test]
+    fn an_error_object_with_a_message_is_an_error() {
+        // OpenRouter's mid-stream shape: numeric code, a chunk around it.
+        let chunk = json!({
+            "id": "gen-1", "object": "chat.completion.chunk", "provider": "X",
+            "error": {"code": 502, "message": "Provider disconnected"},
+            "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}]
+        });
+        let err = provider_error_in_body(&chunk).expect("error object");
+        assert!(err.contains("（502）") && err.contains("Provider disconnected"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Transient);
+
+        // Anthropic's `event: error`: no number, but the type names the status.
+        let event = json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}});
+        let err = provider_error_in_body(&event).unwrap();
+        assert!(err.contains("（529）"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Transient);
+
+        // MiniMax's envelope on a 200.
+        let err = provider_error_in_body(&serde_json::from_str(PEAK_529).unwrap()).unwrap();
+        assert_eq!(classify_error(&err), ErrorClass::Transient);
+        let err = provider_error_in_body(&serde_json::from_str(WINDOW_429).unwrap()).unwrap();
+        assert_eq!(classify_error(&err), ErrorClass::Fatal);
+
+        // Nothing to go on but the words: shown as is, per-request.
+        let err = provider_error_in_body(&json!({"error": {"message": "something odd"}})).unwrap();
+        assert!(err.contains("something odd"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Request);
+    }
+
+    #[test]
+    fn ordinary_chunks_are_not_errors() {
+        for body in [
+            json!({"id": "c", "choices": [{"delta": {"content": "hi"}}], "error": null}),
+            json!({"error": {}}),
+            json!({"error": {"message": "   "}}),
+            json!({"error": "a bare string is not the in-body shape"}),
+            json!({"id": "gen-1", "provider": "OpenAI", "choices": [{"delta": {"content": "x"}}],
+                   "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0}}),
+            json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}}),
+            json!([1, 2, 3]),
+        ] {
+            assert_eq!(provider_error_in_body(&body), None, "{body}");
+        }
+    }
+
+    // ── friendly_error ──────────────────────────────────────────────────────
+
+    #[test]
+    fn the_peak_hour_529_reads_as_a_busy_server_in_minimaxs_words() {
+        let msg = friendly_error(529, PEAK_529);
+        assert!(msg.starts_with("服务端繁忙（529），通常稍后重试即可："), "{msg}");
+        assert!(msg.contains("当前为整点高峰时段"), "{msg}");
+        assert_eq!(msg.matches("(2064)").count(), 1, "{msg}");
+        // The provider's message replaces the raw JSON preview.
+        assert!(!msg.contains("request_id"), "{msg}");
+        assert_eq!(classify_error(&msg), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn a_used_up_window_is_not_told_to_wait_a_moment() {
+        let msg = friendly_error(429, WINDOW_429);
+        assert!(msg.contains("（429）"), "{msg}");
+        assert!(msg.contains("Token Plan 额度已用尽"), "{msg}");
+        assert!(msg.contains("resets at 2026-05-15T15:00:00Z"), "{msg}");
+        assert!(!msg.contains("Rate limited"), "{msg}");
+        assert_eq!(msg.matches("(2056)").count(), 1, "{msg}");
+        assert_eq!(classify_error(&msg), ErrorClass::Fatal);
+
+        // A Token Plan throttle on the same status stays transient.
+        let throttle = r#"{"type":"error","error":{"type":"rate_limit_error","message":"已达到 Token Plan 速率限制 (2062)"}}"#;
+        let msg = friendly_error(429, throttle);
+        assert!(msg.contains("限流"), "{msg}");
+        assert_eq!(classify_error(&msg), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn a_plain_503_is_a_busy_server() {
+        let msg = friendly_error(503, "Service Unavailable");
+        assert_eq!(msg, "服务端繁忙（503），通常稍后重试即可：Service Unavailable");
+        assert_eq!(classify_error(&msg), ErrorClass::Transient);
+        for status in [500, 502, 504, 520] {
+            let msg = friendly_error(status, "<html>bad gateway</html>");
+            assert!(msg.contains(&format!("（{status}）")), "{msg}");
+            assert_eq!(classify_error(&msg), ErrorClass::Transient);
+        }
+    }
+
+    #[test]
+    fn existing_headlines_and_their_markers_survive() {
+        let m = friendly_error(401, "bad key");
+        assert_eq!(m, "Authentication failed (401). Check your API key in Settings → AI Providers.");
+        let m = friendly_error(401, r#"{"error":{"message":"invalid api key (2049)"}}"#);
+        assert!(m.starts_with("Authentication failed (401)."), "{m}");
+        assert!(m.contains("invalid api key"), "{m}");
+        assert!(friendly_error(403, "x").contains("(403)"));
+        assert!(friendly_error(404, "x").contains("(404)"));
+        assert!(friendly_error(402, "x").contains("余额不足（402）"));
+        assert!(friendly_error(451, "x").contains("（451）"));
+        assert!(friendly_error(429, r#"{"error":{"code":"credit_limit_exceeded"}}"#)
+            .starts_with("配额已用尽（429）"));
+        let m = friendly_error(429, r#"{"error":{"message":"Rate limit reached for requests"}}"#);
+        assert!(m.starts_with("Rate limited (429)."), "{m}");
+        assert!(m.ends_with("Response: Rate limit reached for requests"), "{m}");
+        assert_eq!(friendly_error(418, "teapot"), "API error 418: teapot");
+    }
+
+    #[test]
+    fn the_providers_message_replaces_the_raw_preview() {
+        let body = r#"{"error":{"message":"The model `x` does not exist","type":"invalid_request_error","param":null}}"#;
+        assert_eq!(
+            friendly_error(404, body),
+            "Endpoint or model not found (404). Verify your API address and model ID. Response: The model `x` does not exist"
+        );
+        // A bare `error` string (Ollama) and a top-level `message` are read too.
+        assert!(friendly_error(400, r#"{"error":"model not found"}"#).ends_with(": model not found"));
+        assert!(friendly_error(400, r#"{"code":"x","message":"bad things"}"#).ends_with(": bad things"));
+        // OpenRouter's upstream reason is kept alongside its generic wrapper.
+        let body = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"context too long","provider_name":"Foo"}}}"#;
+        assert!(friendly_error(400, body).contains("Provider returned error — Foo: context too long"));
+        // OpenAI's out-of-credit 429 is not a throttle.
+        let body = r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+        let m = friendly_error(429, body);
+        assert!(m.starts_with("额度已用尽（429）"), "{m}");
+        assert_eq!(classify_error(&m), ErrorClass::Fatal);
+    }
+
+    // ── MiniMax codes through the whole chain ───────────────────────────────
+
+    #[test]
+    fn minimax_codes_keep_their_class_once_described() {
+        for (code, class) in [
+            (2064, ErrorClass::Transient),
+            (2062, ErrorClass::Transient),
+            (1002, ErrorClass::Transient),
+            (2056, ErrorClass::Fatal),
+            (1008, ErrorClass::Fatal),
+            (2049, ErrorClass::Fatal),
+            (1026, ErrorClass::Request),
+            (1027, ErrorClass::Request),
+            (2013, ErrorClass::Request),
+        ] {
+            let body = json!({"base_resp": {"status_code": code, "status_msg": "x"}});
+            let err = provider_error_in_body(&body).unwrap();
+            assert_eq!(classify_error(&err), class, "{code}: {err}");
+            // And as an HTTP error body, under a status that would say otherwise.
+            let http = friendly_error(400, &body.to_string());
+            assert_eq!(classify_error(&http), class, "{code}: {http}");
+        }
+    }
+
+    // ── empty replies and <think> ───────────────────────────────────────────
+
+    #[test]
+    fn a_leading_think_block_is_stripped() {
+        assert_eq!(strip_leading_think("<think>plan</think>\n\nAnswer"), "Answer");
+        assert_eq!(strip_leading_think("  \n<think>a\nb</think>Answer"), "Answer");
+        assert_eq!(strip_leading_think("Answer"), "Answer");
+        // Not leading: part of the answer.
+        assert_eq!(strip_leading_think("See <think>x</think>"), "See <think>x</think>");
+        // Unterminated: left alone rather than emptied.
+        assert_eq!(strip_leading_think("<think>cut off"), "<think>cut off");
+        // Only a thought: nothing left, which the caller reports.
+        assert_eq!(strip_leading_think("<think>only</think>  "), "");
+    }
+
+    #[test]
+    fn empty_replies_explain_themselves_and_are_per_request() {
+        let length = json!({"choices": [{"message": {"content": null, "reasoning_content": "long"}, "finish_reason": "length"}]});
+        let filter = json!({"choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}]});
+        let sensitive = json!({"choices": [{"message": {"content": ""}, "finish_reason": "stop"}], "output_sensitive": true});
+        let thought = json!({"choices": [{"message": {"content": "", "reasoning_content": "hmm"}, "finish_reason": "stop"}]});
+        let odd = json!({"choices": [], "object": "chat.completion"});
+
+        let cases = [
+            (empty_reply_error(&length, &length.to_string(), "long"), "finish_reason=length"),
+            (empty_reply_error(&filter, &filter.to_string(), ""), "安全策略"),
+            (empty_reply_error(&sensitive, &sensitive.to_string(), ""), "安全策略"),
+            (empty_reply_error(&thought, &thought.to_string(), "hmm"), "只返回了思考过程"),
+            (empty_reply_error(&odd, &odd.to_string(), ""), "Unexpected response format from API: "),
+        ];
+        for (msg, needle) in cases {
+            assert!(msg.contains(needle), "{msg}");
+            assert_eq!(classify_error(&msg), ErrorClass::Request, "{msg}");
+        }
+    }
+
+    #[test]
+    fn reasoning_is_read_from_every_field_providers_use() {
+        assert_eq!(reply_reasoning(&json!({"reasoning_content": "a"})), "a");
+        assert_eq!(reply_reasoning(&json!({"reasoning": "b"})), "b");
+        assert_eq!(
+            reply_reasoning(&json!({"reasoning_details": [{"type": "reasoning.text", "text": "c"}, {"text": "d"}]})),
+            "cd"
+        );
+        assert_eq!(reply_reasoning(&json!({"content": "x"})), "");
+    }
+
+    // ── network failures ────────────────────────────────────────────────────
+
+    #[test]
+    fn our_network_wordings_are_transient() {
+        for msg in [
+            "请求超时（120 秒内未完成）: error sending request for url (https://api.minimax.cn/v1/chat/completions)",
+            "请求超时（30 秒内未能连上服务器）: error sending request for url (https://x/v1)",
+            "请求超时（180 秒内没有收到任何数据）: error decoding response body",
+            "Network error: 无法连接到服务器 — error sending request: tcp connect error: Connection refused (os error 61)",
+            "读取响应失败: Network error: error decoding response body",
+            "Stream read error: Network error: error decoding response body",
+        ] {
+            assert_eq!(classify_error(msg), ErrorClass::Transient, "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_request_is_described_as_a_timeout() {
+        // Accepts the connection and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let e = client.get(format!("http://{addr}/")).send().await.unwrap_err();
+        let msg = describe_reqwest_error(&e);
+        assert!(msg.starts_with("请求超时（120 秒内未完成）"), "{msg}");
+        assert_eq!(classify_error(&msg), ErrorClass::Transient);
+        hold.abort();
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_described_as_one() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let e = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        let msg = describe_reqwest_error(&e);
+        assert!(msg.starts_with("Network error: 无法连接到服务器 — "), "{msg}");
+        // The chain says why, not only "error sending request".
+        assert!(msg.matches(": ").count() >= 1, "{msg}");
+        assert_eq!(classify_error(&msg), ErrorClass::Transient);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_address_is_not_a_network_fault() {
+        let e = reqwest::Client::new().get("not a url").send().await.unwrap_err();
+        let msg = describe_reqwest_error(&e);
+        assert!(msg.starts_with("请求无法发出"), "{msg}");
+        assert_eq!(classify_error(&msg), ErrorClass::Request);
+    }
+
+    // ── chat_openai_compat end to end, against a canned server ──────────────
+
+    /// Serve one canned HTTP response on a loopback port and return the base
+    /// URL. `declared_len` overrides Content-Length, to simulate a body cut off.
+    async fn serve_once(status: &str, body: &str, declared_len: Option<usize>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            declared_len.unwrap_or(body.len())
+        );
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read the whole request first, so closing never resets a send.
+            let mut req = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&req);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let len = text[..head_end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= head_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn minimax_at(base_url: &str) -> AiProvider {
+        serde_json::from_value(json!({
+            "id": "mm", "name": "MiniMax", "kind": "minimax",
+            "base_url": base_url, "created_at": ""
+        }))
+        .unwrap()
+    }
+
+    async fn ask(base_url: &str) -> Result<String, String> {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: ChatContent::Text("hi".into()),
+        }];
+        chat_openai_compat(&minimax_at(base_url), "k", "MiniMax-M2.7", &messages, "test").await
+    }
+
+    #[tokio::test]
+    async fn a_base_resp_error_on_a_200_fails_the_call() {
+        let body = r#"{"id":"1","choices":null,"base_resp":{"status_code":2056,"status_msg":"usage limit exceeded, 5-hour usage limit reached"}}"#;
+        let err = ask(&serve_once("200 OK", body, None).await).await.unwrap_err();
+        assert!(err.contains("(2056)"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Fatal);
+    }
+
+    #[tokio::test]
+    async fn the_529_envelope_fails_the_call_as_transient() {
+        let err = ask(&serve_once("529 Site Overloaded", PEAK_529, None).await).await.unwrap_err();
+        assert!(err.starts_with("服务端繁忙（529）"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Transient);
+    }
+
+    #[tokio::test]
+    async fn an_inlined_chain_of_thought_is_dropped() {
+        let body = json!({
+            "choices": [{"message": {"content": "<think>let me see</think>\n\n{\"score\": 3}"}, "finish_reason": "stop"}],
+            "base_resp": {"status_code": 0, "status_msg": ""}
+        })
+        .to_string();
+        let answer = ask(&serve_once("200 OK", &body, None).await).await.unwrap();
+        assert_eq!(answer, "{\"score\": 3}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_is_an_error_not_an_empty_string() {
+        let body = json!({"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}).to_string();
+        let err = ask(&serve_once("200 OK", &body, None).await).await.unwrap_err();
+        assert!(err.contains("finish_reason=length"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Request);
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_off_is_a_network_failure_not_invalid_json() {
+        let body = r#"{"choices":[{"message":{"content":"par"#;
+        let err = ask(&serve_once("200 OK", body, Some(body.len() + 500)).await)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("读取响应失败: "), "{err}");
+        assert!(!err.contains("Invalid JSON"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Transient);
+    }
+
+    // ── streams that were not streams ───────────────────────────────────────
+
+    #[test]
+    fn a_plain_json_error_body_is_found_after_a_stream_ends() {
+        let mut stray = String::new();
+        let body = "{\n  \"base_resp\": {\n    \"status_code\": 2062,\n    \"status_msg\": \"rate limit\"\n  }\n}";
+        let mut lines: Vec<&str> = body.split('\n').collect();
+        let tail = lines.pop().unwrap(); // the last line never got its newline
+        for line in lines {
+            keep_stray_line(&mut stray, line);
+        }
+        let err = stray_body_error(&stray, tail).expect("error body");
+        assert!(err.contains("(2062)"), "{err}");
+        assert_eq!(classify_error(&err), ErrorClass::Transient);
+
+        // A final event that never got its newline.
+        let err = stray_body_error("", r#"data: {"error":{"message":"Overloaded","type":"overloaded_error"}}"#);
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn a_real_event_stream_leaves_nothing_stray() {
+        let mut stray = String::new();
+        for line in [
+            ": OPENROUTER PROCESSING",
+            "event: message",
+            "id: 7",
+            "retry: 1000",
+            r#"data: {"choices":[{"delta":{"content":"x"}}]}"#,
+            "",
+        ] {
+            keep_stray_line(&mut stray, line);
+        }
+        assert!(stray.is_empty(), "{stray:?}");
+        assert_eq!(stray_body_error(&stray, ""), None);
+        // A successful plain JSON reply is not an error.
+        assert_eq!(stray_body_error(r#"{"choices":[{"message":{"content":"x"}}]}"#, ""), None);
     }
 }
 
@@ -3378,6 +4597,9 @@ impl TurnUsage {
 pub struct ToolTurn {
     /// Prose the model emitted alongside its tool calls, if any.
     pub content: String,
+    /// What the model streamed as reasoning this round. Only replayed to the
+    /// providers that ask for it — see [`replays_reasoning_with_tool_calls`].
+    pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: TurnUsage,
 }
@@ -3407,6 +4629,91 @@ pub fn supports_tool_calling(provider: &AiProvider) -> bool {
     // DeepSeek, OpenRouter, Kimi and any custom OpenAI-compatible endpoint.
     // Anthropic and Ollama use different shapes and are not wired up here yet.
     !is_anthropic_protocol(provider) && !is_ollama(provider)
+}
+
+/// Whether a catalogue Argus can trust says this model takes no `tools`.
+///
+/// Only two catalogues are believed, because only two actually state it:
+/// StepFun's, which Argus writes itself from the docs (`stepfun_capabilities`),
+/// and OpenRouter's, derived from each model's `supported_parameters`. Every
+/// other provider's capability list is a partial description — DeepSeek's says
+/// `reasoning` and nothing about tools, yet every DeepSeek chat model calls
+/// them — so reading a missing `tool_calling` there as "cannot" would lock
+/// working models out of the agent.
+///
+/// An OpenRouter model with no capabilities recorded (added by hand, or before
+/// the catalogue was enriched) is unknown, not incapable, and gets the benefit
+/// of the doubt. If it really cannot, the provider says so on the first call and
+/// [`looks_like_tools_rejected`] catches that.
+pub fn model_declares_no_tools(provider: &AiProvider, model: &str) -> bool {
+    if crate::stepfun::is_stepfun(provider) {
+        return !crate::stepfun::stepfun_capabilities(model)
+            .iter()
+            .any(|c| c == "tool_calling");
+    }
+    if provider.kind == "openrouter" || provider.base_url.to_lowercase().contains("openrouter") {
+        return !crate::openrouter::model_accepts_server_tools(provider, model);
+    }
+    false
+}
+
+/// Marks an error as "this model does not take tools", so a caller that has a
+/// tool-free way to answer can tell it from every other failure.
+///
+/// A prefix on the message rather than an error type because the agent path
+/// hands `String` errors through three layers already; the one caller that
+/// cares strips it, and [`strip_tools_rejected`] keeps it from ever reaching
+/// the screen.
+pub const TOOLS_REJECTED_PREFIX: &str = "\u{1}tools-rejected\u{1}";
+
+/// The message without the [`TOOLS_REJECTED_PREFIX`] marker, if it had one.
+pub fn strip_tools_rejected(err: &str) -> &str {
+    err.strip_prefix(TOOLS_REJECTED_PREFIX).unwrap_or(err)
+}
+
+/// Whether an error response is the provider refusing the `tools` field itself.
+///
+/// Deliberately narrow. Plenty of 400s mention tools without meaning "this
+/// model cannot use them" — a replayed `tool` message with no matching
+/// `tool_calls`, an external MCP server's malformed schema, a thinking model
+/// missing its `reasoning_content`. Treating those as "no tools" would quietly
+/// downgrade a working model and hide the real bug, so both halves are
+/// required: something about tools, *and* something saying it is unsupported.
+fn looks_like_tools_rejected(status: u16, body: &str) -> bool {
+    if !matches!(status, 400 | 404 | 422) {
+        return false;
+    }
+    let b = body.to_lowercase();
+    let about_tools = b.contains("tool") || b.contains("function");
+    let unsupported = [
+        "not support",
+        "unsupported",
+        "does not support",
+        "doesn't support",
+        "no endpoints found that support",
+        "enable-auto-tool-choice",
+    ]
+    .iter()
+    .any(|k| b.contains(k));
+    about_tools && unsupported
+}
+
+/// Whether this model's own reasoning must be sent back with its tool calls.
+///
+/// Kimi's thinking models reason across a multi-step tool exchange and expect
+/// to see what they thought in the previous step; the docs require
+/// `reasoning_content` to stay on each assistant turn that carried calls. Only
+/// Kimi K2 is listed: other providers either ignore the field or, in
+/// DeepSeek's reasoner's case, have rejected it on input, so it is not sent
+/// anywhere it has not been asked for.
+pub fn replays_reasoning_with_tool_calls(provider: &AiProvider, model: &str) -> bool {
+    is_kimi_provider(provider) && model.starts_with("kimi-k2")
+}
+
+fn is_kimi_provider(provider: &AiProvider) -> bool {
+    provider.kind == "kimi"
+        || provider.base_url.to_lowercase().contains("moonshot.cn")
+        || provider.base_url.to_lowercase().contains("api.kimi.com")
 }
 
 /// Whether a streamed `delta.tool_calls[]` entry is a call this loop must run.
@@ -3491,7 +4798,7 @@ pub async fn touch_prompt_cache(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| describe_stream_error(&e))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -3503,6 +4810,10 @@ pub async fn touch_prompt_cache(
         .json()
         .await
         .map_err(|e| format!("Invalid response: {e}"))?;
+    // A refusal sent with a 200 is a failed ping, not a zero-hit one.
+    if let Some(err) = provider_error_in_body(&json) {
+        return Err(err);
+    }
     let usage = &json["usage"];
     let input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
     let output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
@@ -3571,9 +4882,8 @@ pub async fn stream_with_tools(
         provider.base_url.trim_end_matches('/')
     );
     let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
-    let is_kimi = provider.kind == "kimi"
-        || provider.base_url.to_lowercase().contains("moonshot.cn")
-        || provider.base_url.to_lowercase().contains("api.kimi.com");
+    let is_kimi = is_kimi_provider(provider);
+    let is_kimi_k2 = is_kimi && model.starts_with("kimi-k2");
 
     let is_zhipu = crate::zhipu::is_zhipu(provider);
     let is_minimax = crate::minimax::is_minimax(provider);
@@ -3722,6 +5032,18 @@ pub async fn stream_with_tools(
             body["reasoning_effort"] = serde_json::json!(reasoning_effort.unwrap_or("high"));
         }
     }
+    // Kimi K2.5 and later run only with thinking on and a fixed set of sampling
+    // parameters, whether or not the user asked to see the reasoning. The
+    // plain-chat path has always sent them; this one did not, so K2 was being
+    // asked to run out of spec exactly where it was also being handed tools.
+    if is_kimi_k2 {
+        body["thinking"] = serde_json::json!({"type": "enabled"});
+        body["temperature"] = serde_json::json!(1.0);
+        body["top_p"] = serde_json::json!(0.95);
+        body["n"] = serde_json::json!(1);
+        body["presence_penalty"] = serde_json::json!(0.0);
+        body["frequency_penalty"] = serde_json::json!(0.0);
+    }
     // GLM thinks unless told otherwise, so both directions are written here
     // rather than only inside the block above. See `zhipu::apply_thinking`.
     if is_zhipu {
@@ -3753,11 +5075,16 @@ pub async fn stream_with_tools(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| describe_stream_error(&e))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
         let text = resp.text().await.unwrap_or_default();
+        // Only a request that actually offered functions can have been refused
+        // for them; the tool-free final turn of a spent budget never is.
+        if !tools.is_empty() && looks_like_tools_rejected(status, &text) {
+            return Err(format!("{TOOLS_REJECTED_PREFIX}{}", friendly_error(status, &text)));
+        }
         return Err(friendly_error(status, &text));
     }
 
@@ -3765,7 +5092,10 @@ pub async fn stream_with_tools(
     let mut stream = resp.bytes_stream();
     let mut byte_buf: Vec<u8> = Vec::new();
     let mut buf = String::new();
+    // Non-SSE lines, kept in case the "stream" is a plain JSON error body.
+    let mut stray = String::new();
     let mut accumulated = String::new();
+    let mut reasoning_text = String::new();
     // Tool calls keyed by the `index` the provider assigns, since fragments for
     // several concurrent calls interleave in the stream.
     let mut partial: std::collections::BTreeMap<u64, (String, String, String)> =
@@ -3790,7 +5120,7 @@ pub async fn stream_with_tools(
                 break;
             }
         }
-        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let bytes = chunk.map_err(|e| format!("Stream read error: {}", describe_stream_error(&e)))?;
         byte_buf.extend_from_slice(&bytes);
         let valid_up_to = match std::str::from_utf8(&byte_buf) {
             Ok(s) => s.len(),
@@ -3806,6 +5136,7 @@ pub async fn stream_with_tools(
             buf.drain(..pos + 1);
 
             let Some(data) = line.strip_prefix("data:") else {
+                keep_stray_line(&mut stray, &line);
                 continue;
             };
             let data = data.trim_start();
@@ -3815,6 +5146,28 @@ pub async fn stream_with_tools(
             let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue;
             };
+            // An error sent as an event (MiniMax's `base_resp`, OpenRouter's
+            // mid-stream `error`) used to read as an empty round, which the
+            // agent loop took for a finished answer with nothing in it. The
+            // tools-rejected marker is applied under the same narrow test as
+            // for an HTTP error, using the status the body itself names.
+            if let Some((embedded, err)) = body_error(&json) {
+                if !accumulated.is_empty() {
+                    // Commentary already on screen: keep it and end the round as
+                    // an answer. A tool call cut off mid-arguments is unusable.
+                    let notice = interrupted_notice(&err);
+                    let _ = app.emit(event_name, serde_json::json!({"delta": &notice, "done": false}));
+                    accumulated.push_str(&notice);
+                    partial.clear();
+                    break 'outer;
+                }
+                if !tools.is_empty()
+                    && embedded.is_some_and(|s| looks_like_tools_rejected(s, data))
+                {
+                    return Err(format!("{TOOLS_REJECTED_PREFIX}{err}"));
+                }
+                return Err(err);
+            }
 
             if let Some(usage) = json.get("usage").filter(|v| !v.is_null()) {
                 if let Some(v) = usage["prompt_tokens"].as_u64() {
@@ -3864,6 +5217,7 @@ pub async fn stream_with_tools(
                 .or_else(|| delta["thinking"].as_str())
                 .filter(|s| !s.is_empty())
             {
+                reasoning_text.push_str(r);
                 let _ = app.emit(
                     &reasoning_event,
                     serde_json::json!({"delta": r, "done": false}),
@@ -3888,6 +5242,15 @@ pub async fn stream_with_tools(
                     }
                 }
             }
+        }
+    }
+
+    // A 200 whose body was a plain JSON error rather than events: nothing was
+    // produced, and "no content, no calls" would read as a finished answer.
+    let cancelled = cancel.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+    if accumulated.is_empty() && partial.is_empty() && !cancelled {
+        if let Some(err) = stray_body_error(&stray, &buf) {
+            return Err(err);
         }
     }
 
@@ -3922,6 +5285,7 @@ pub async fn stream_with_tools(
 
     Ok(ToolTurn {
         content: accumulated,
+        reasoning: reasoning_text,
         tool_calls,
         usage: TurnUsage {
             input_tokens,
@@ -4153,6 +5517,88 @@ mod offer_tests {
 #[cfg(test)]
 mod tool_call_tests {
     use super::*;
+
+    fn provider_of(kind: &str, base_url: &str, models: serde_json::Value) -> AiProvider {
+        AiProvider {
+            id: "p".into(),
+            name: "P".into(),
+            kind: kind.into(),
+            base_url: base_url.into(),
+            enabled: true,
+            server_tools: Default::default(),
+            speech: Default::default(),
+            created_at: String::new(),
+            models: serde_json::from_value(models).expect("AiModel fixtures"),
+        }
+    }
+
+    /// Only the two catalogues that actually state tool support are believed.
+    #[test]
+    fn only_trusted_catalogues_can_say_a_model_takes_no_tools() {
+        // StepFun: R1.5 is the documented exception; everything else calls tools.
+        let stepfun = provider_of("stepfun", "https://api.stepfun.com/v1", serde_json::json!([]));
+        assert!(model_declares_no_tools(&stepfun, "step-audio-r1.5"));
+        assert!(!model_declares_no_tools(&stepfun, "step-3"));
+        assert!(!model_declares_no_tools(&stepfun, "step-audio-2"));
+
+        // OpenRouter: a recorded capability list without tools means no tools...
+        let or = provider_of("openrouter", "https://openrouter.ai/api/v1", serde_json::json!([
+            {"id": "text-only", "display_name": "t", "capabilities": ["vision"]},
+            {"id": "tooly", "display_name": "t", "capabilities": ["tool_calling"]},
+            {"id": "unknown", "display_name": "t", "capabilities": []},
+        ]));
+        assert!(model_declares_no_tools(&or, "text-only"));
+        assert!(!model_declares_no_tools(&or, "tooly"));
+        // ...but an empty list is unknown, not incapable.
+        assert!(!model_declares_no_tools(&or, "unknown"));
+        assert!(!model_declares_no_tools(&or, "not-in-catalogue"));
+
+        // DeepSeek's list says nothing about tools, and every model calls them.
+        let ds = provider_of("openai_compatible", "https://api.deepseek.com", serde_json::json!([
+            {"id": "deepseek-chat", "display_name": "d", "capabilities": ["reasoning"]},
+        ]));
+        assert!(!model_declares_no_tools(&ds, "deepseek-chat"));
+    }
+
+    /// A refusal of the `tools` field is told apart from every other 400 that
+    /// happens to mention tools — misreading one of those would quietly strip a
+    /// working model of its tools and hide the real bug.
+    #[test]
+    fn a_tools_refusal_is_told_apart_from_other_tool_errors() {
+        assert!(looks_like_tools_rejected(400, "tools is not supported with this model"));
+        assert!(looks_like_tools_rejected(400, r#"{"error":"registry.ollama.ai/library/gemma does not support tools"}"#));
+        assert!(looks_like_tools_rejected(404, "No endpoints found that support tool use."));
+        assert!(looks_like_tools_rejected(400, r#""auto" tool choice requires --enable-auto-tool-choice"#));
+        assert!(looks_like_tools_rejected(422, "Function calling is unsupported for this model"));
+
+        // Broken history, not a refusal.
+        assert!(!looks_like_tools_rejected(
+            400,
+            "messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
+        ));
+        // An external server's bad schema, not a refusal.
+        assert!(!looks_like_tools_rejected(400, "Invalid 'tools[3].function.name': string too long"));
+        assert!(!looks_like_tools_rejected(400, "invalid api key"));
+        // A server error is never a statement about the model.
+        assert!(!looks_like_tools_rejected(500, "tool calling is not supported right now"));
+    }
+
+    #[test]
+    fn the_refusal_marker_never_reaches_the_screen() {
+        let marked = format!("{TOOLS_REJECTED_PREFIX}请求被拒绝");
+        assert_eq!(strip_tools_rejected(&marked), "请求被拒绝");
+        assert_eq!(strip_tools_rejected("普通错误"), "普通错误");
+    }
+
+    /// Reasoning goes back only where it was asked for.
+    #[test]
+    fn only_kimi_k2_gets_its_reasoning_replayed() {
+        let kimi = provider_of("kimi", "https://api.moonshot.cn/v1", serde_json::json!([]));
+        assert!(replays_reasoning_with_tool_calls(&kimi, "kimi-k2.6"));
+        assert!(!replays_reasoning_with_tool_calls(&kimi, "moonshot-v1-8k"));
+        let ds = provider_of("openai_compatible", "https://api.deepseek.com", serde_json::json!([]));
+        assert!(!replays_reasoning_with_tool_calls(&ds, "deepseek-reasoner"));
+    }
 
     /// The shapes the OpenAI-compatible providers actually stream. Dropping any
     /// of these would break tool calling for every provider, not just the new one.

@@ -106,7 +106,7 @@ impl LibrarySource for StoredLibrary {
         // full read access to the library until it happened to disconnect.
         if !enabled_on_disk() {
             return Err("The Argus MCP server has been switched off. \
-                        Turn it back on in Argus → Settings → MCP."
+                        Turn it back on in Argus → Settings → MCP Endpoint."
                 .to_string());
         }
         // The env var is an escape hatch for pointing a second agent at a
@@ -286,7 +286,7 @@ pub fn run_stdio() -> i32 {
             "Argus MCP server (stdio).\n\n\
              This is launched by an MCP client, not run directly. Add it with:\n\n  \
              {}\n\n\
-             or see Argus → Settings → MCP for the Claude Desktop config.",
+             or see Argus → Settings → MCP Endpoint for the Claude Desktop config.",
             client_config().claude_code
         );
         return 2;
@@ -309,7 +309,7 @@ pub fn run_stdio() -> i32 {
             // startup failure, and the message says how to fix it.
             eprintln!(
                 "[mcp] The Argus MCP server is switched off. Enable it in \
-                 Argus → Settings → MCP."
+                 Argus → Settings → MCP Endpoint."
             );
             return 1;
         }

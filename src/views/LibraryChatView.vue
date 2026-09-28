@@ -7,7 +7,7 @@ import UpdatePrompt from '../components/UpdatePrompt.vue'
 const showSettings = ref(false)
 const settingsSection = ref('ai')
 
-function openSettings(section: 'ai' | 'rag' | 'agent' = 'ai') {
+function openSettings(section: 'ai' | 'agent' = 'ai') {
   settingsSection.value = section
   showSettings.value = true
 }

@@ -5,10 +5,11 @@ triaging them so you spend your time reading the right papers instead of hunting
 
 ## Configuration
 
-Before using arXiv / bioRxiv tracking, configure it in Settings: the categories to crawl,
-keywords you care about, crawl frequency, crawl time, look-back days, whether to enable
-automatic AI analysis, and the model and prompt for that analysis. Once configured, Argus
-fetches new papers from arXiv / bioRxiv on schedule and drops them into a daily inbox.
+Before using arXiv / bioRxiv tracking, configure it in **Settings → AI Copilot → arXiv
+crawler**: the categories to crawl, keywords you care about, crawl frequency, crawl time,
+look-back days, whether to enable automatic AI analysis, and the model and prompt for that
+analysis. Once configured, Argus fetches new papers from arXiv / bioRxiv on schedule and
+drops them into a daily inbox.
 
 <Media src="/media/1783338672276.png" caption="The daily inbox with AI relevance scores and one-click import" />
 

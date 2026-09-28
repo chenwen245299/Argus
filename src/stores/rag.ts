@@ -16,6 +16,35 @@ export interface CollectionEmbedJob {
 // jobs overlap (a paper can be assigned to several collections).
 const inFlightSlugs = new Set<string>()
 
+/** 同步缺失 embeds only papers not yet vectorized; 完整重建 embeds every paper. */
+export type VectorRebuildMode = 'full' | 'missing'
+
+export interface VectorRebuildProgress {
+  done: number
+  total: number
+  failed: number
+}
+
+/**
+ * How the last 同步缺失 / 完整重建 run ended. Kept as data rather than a
+ * translated string, so the settings panel words it in the current locale.
+ */
+export type VectorRebuildOutcome =
+  | { kind: 'nothing'; mode: VectorRebuildMode }   // no papers to embed
+  | { kind: 'paused'; done: number; total: number } // cancelled by the user
+  | { kind: 'done'; done: number; total: number; failed: number }
+  | { kind: 'error'; message: string }
+
+/** Field-by-field, so key order and object identity do not count as a change. */
+export function sameRagSettings(a: RagSettings, b: RagSettings): boolean {
+  return (a.provider_id ?? null) === (b.provider_id ?? null)
+    && (a.embedding_model ?? null) === (b.embedding_model ?? null)
+    && a.chunk_size === b.chunk_size
+    && a.chunk_overlap === b.chunk_overlap
+    && a.top_k === b.top_k
+    && a.enabled === b.enabled
+}
+
 export const useRagStore = defineStore('rag', () => {
   const settings = ref<RagSettings>({
     provider_id: null,
@@ -31,6 +60,16 @@ export const useRagStore = defineStore('rag', () => {
   /** Per-collection embed progress, keyed by collection id. */
   const collectionEmbedJobs = ref<Record<string, CollectionEmbedJob>>({})
 
+  // The settings panel's 同步缺失 / 完整重建 run. It lives here, not in the
+  // panel, so closing the settings modal or switching its tab neither stops it
+  // nor loses sight of it: a remounted panel reads the same state and shows
+  // the progress and the 取消 button again. One run at a time, per window.
+  const rebuilding = ref(false)
+  const rebuildProgress = ref<VectorRebuildProgress>({ done: 0, total: 0, failed: 0 })
+  const rebuildCurrentPaper = ref('')
+  const rebuildOutcome = ref<VectorRebuildOutcome | null>(null)
+  let rebuildCancelRequested = false
+
   const isConfigured = computed(
     () =>
       settings.value.enabled &&
@@ -42,14 +81,24 @@ export const useRagStore = defineStore('rag', () => {
 
   async function load() {
     try {
-      settings.value = await invoke<RagSettings>('get_rag_settings')
+      const next = await invoke<RagSettings>('get_rag_settings')
+      // A reload that finds nothing new keeps the current object: the settings
+      // form copies every change of `settings` and auto-saves it, so a no-op
+      // reload (another window saved, `rag-settings-changed`) must not look
+      // like an edit.
+      if (!loaded.value || !sameRagSettings(next, settings.value)) settings.value = next
       loaded.value = true
     } catch { /* no library open */ }
   }
 
   async function save(s: RagSettings) {
-    await invoke('save_rag_settings', { settings: s })
-    settings.value = s
+    // Snapshot before the await: what is written is what gets recorded as
+    // saved. Copying `s` afterwards would also take in an edit made to the
+    // form while the write was in flight, marking it saved when it was not.
+    // Being a copy, it also keeps the form object and the store from aliasing.
+    const snapshot: RagSettings = { ...s }
+    await invoke('save_rag_settings', { settings: snapshot })
+    settings.value = snapshot
   }
 
   async function loadStoreInfo() {
@@ -167,15 +216,123 @@ export const useRagStore = defineStore('rag', () => {
     }
   }
 
+  /**
+   * Run 同步缺失 (`missing`: only papers not yet vectorized — resumes a paused
+   * run and catches up new imports) or 完整重建 (`full`: every paper). Chunk
+   * sizes are the panel form's, so an edit not auto-saved yet still applies.
+   * Ignored while a run is in progress; state is in `rebuilding`,
+   * `rebuildProgress`, `rebuildCurrentPaper` and `rebuildOutcome`.
+   */
+  async function rebuildVectors(
+    mode: VectorRebuildMode,
+    formChunkSize?: number | null,
+    formChunkOverlap?: number | null,
+  ) {
+    // Claimed before any await, so a double click cannot start two runs.
+    if (rebuilding.value) return
+    rebuilding.value = true
+    rebuildCancelRequested = false
+    rebuildOutcome.value = null
+    rebuildCurrentPaper.value = ''
+    rebuildProgress.value = { done: 0, total: 0, failed: 0 }
+
+    // The run now outlives the settings panel, so the library can be switched
+    // under it (the collection jobs above guard the same way): the remaining
+    // slugs belong to the old library and must not hit the new one.
+    const library = useLibraryStore()
+    const startPath = library.currentPath
+    const libraryChanged = () => library.currentPath !== startPath
+
+    try {
+      // Re-derive each paper's `vectorized` flag from the vector store first: it
+      // drifts (a model switch, a partition deleted), and "missing" trusts it. The
+      // chat window used to do this before its own sync button; that button is
+      // gone, so this is where it happens now.
+      if (mode === 'missing') await invoke('sync_vectorized_flags').catch(() => {})
+      const allPapers = await invoke<PaperIndexEntry[]>('list_papers')
+      const papers = mode === 'missing'
+        ? allPapers.filter(p => !p.status.vectorized)
+        : allPapers
+
+      const total = papers.length
+      let done = 0, failed = 0
+      rebuildProgress.value = { done, total, failed }
+
+      if (total === 0) {
+        rebuildOutcome.value = { kind: 'nothing', mode }
+        return
+      }
+
+      const chunkSize: number = formChunkSize || 800
+      const chunkOverlap: number = formChunkOverlap || 100
+
+      // Small worker pool: the embedding API call dominates each paper's wall
+      // time, so a few in-flight papers give a near-linear speedup.
+      const CONCURRENCY = 3
+      const queue = [...papers]
+      const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+        while (!rebuildCancelRequested && !libraryChanged()) {
+          const paper = queue.shift()
+          if (!paper) break
+          rebuildCurrentPaper.value = paper.title
+
+          try {
+            const input = await invoke<PaperVectorizeInput>('get_paper_vectorize_input', { slug: paper.slug })
+            const chunks: ChunkInput[] = await buildChunks(input, chunkSize, chunkOverlap)
+            if (chunks.length === 0) { failed++; rebuildProgress.value = { done, total, failed }; continue }
+            await invoke('embed_and_store_chunks', {
+              slug: paper.slug,
+              paperId: input.paper_id,
+              paperTitle: input.paper_title,
+              chunks,
+            })
+            done++
+          } catch {
+            failed++
+          }
+
+          rebuildProgress.value = { done, total, failed }
+        }
+      })
+      await Promise.all(workers)
+
+      // Counts from the old library mean nothing in the new one.
+      if (libraryChanged()) return
+
+      if (rebuildCancelRequested) {
+        rebuildOutcome.value = { kind: 'paused', done, total }
+      } else {
+        rebuildOutcome.value = { kind: 'done', done, total, failed }
+      }
+      await loadStoreInfo()
+    } catch (e) {
+      rebuildOutcome.value = { kind: 'error', message: String(e) }
+    } finally {
+      rebuilding.value = false
+      rebuildCurrentPaper.value = ''
+    }
+  }
+
+  /** Each worker finishes the paper it is on and stops; nothing is half-written. */
+  function cancelRebuild() {
+    if (rebuilding.value) rebuildCancelRequested = true
+  }
+
   return {
     settings,
     storeInfo,
     loaded,
     isConfigured,
     collectionEmbedJobs,
+    rebuilding,
+    rebuildProgress,
+    rebuildCurrentPaper,
+    rebuildOutcome,
     load,
     save,
     loadStoreInfo,
     embedCollection,
+    rebuildVectors,
+    cancelRebuild,
   }
 })

@@ -29,7 +29,7 @@
   <img src="./docs/public/main.png" width="900" alt="Argus 截图" />
 </p>
 
-Argus 是一款轻量、AI 原生、**本地优先**的文献阅读软件，用于阅读、分析、检索你的学术论文，并与论文对话 —— 一切都在一个桌面应用里完成。它把 PDF 与电子书阅读、AI 功能、笔记、arXiv 追踪、论文关系图谱、素材库，以及全库 RAG 检索与论文分析整合到一处，让你的整个科研阅读流程集中在同一个地方，并能无缝融合 AI。
+Argus 是一款轻量、AI 原生、**本地优先**的文献阅读软件，用于阅读、分析、检索你的学术论文，并与论文对话 —— 一切都在一个桌面应用里完成。它把 PDF 与电子书阅读、AI 功能、笔记、arXiv 追踪、论文关系图谱、素材库，以及全库智能问答与论文分析整合到一处，让你的整个科研阅读流程集中在同一个地方，并能无缝融合 AI。
 
 > 📖 完整文档、截图与演示视频： https://chenwen245299.github.io/Argus/zh/guide/introduction
 
@@ -47,10 +47,10 @@ Argus 是一款轻量、AI 原生、**本地优先**的文献阅读软件，用�
 | [阅读与笔记](https://chenwen245299.github.io/Argus/zh/guide/reading) | 标签页阅读 PDF、高亮批注，并用带 OCR 兜底的全文提取撰写富文本笔记。 |
 | [AI 工作流](https://chenwen245299.github.io/Argus/zh/guide/ai) | 配置任意提供商与模型，提取元数据与摘要、生成可配置分析，并与任意论文对话。 |
 | [画布](https://chenwen245299.github.io/Argus/zh/guide/canvas) | 把论文作为节点排布、连接相关工作，梳理发展脉络，并导出关系图谱。 |
-| [素材库](https://chenwen245299.github.io/Argus/zh/guide/snippets) | 收集阅读时的摘录，基于独立向量库做语义检索，方便写作时查找与引用。 |
+| [素材库](https://chenwen245299.github.io/Argus/zh/guide/snippets) | 收集阅读时的摘录，按关键词搜索，AI 问答时也能查阅，方便写作时查找与引用。 |
 | [向量图谱](https://chenwen245299.github.io/Argus/zh/guide/embedding-map) | 把文献库的 embedding 投影到二维图，可视化论文聚类、发现潜在关联。 |
 | [arXiv / bioRxiv 追踪](https://chenwen245299.github.io/Argus/zh/guide/arxiv) | 定时抓取预印本、按 AI 相关性过滤，在每日收件箱集中处理。 |
-| [RAG 问答](https://chenwen245299.github.io/Argus/zh/guide/rag) | 构建本地向量索引，带来源地对整个文献库提问与检索。 |
+| [RAG 与全库问答](https://chenwen245299.github.io/Argus/zh/guide/rag) | 对整个文献库提问，AI 自己查阅论文、笔记和素材，每一步查了什么都随回答显示；论文的本地向量索引用来绘制向量图谱。 |
 
 ## 安装（macOS）
 

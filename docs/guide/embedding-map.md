@@ -18,8 +18,8 @@ two distinct clusters.
 ## Prerequisite
 
 The embedding map is built on the RAG vector index. Before using it, build the embedding
-index for your library on the [RAG & Library Q&A](/guide/rag) page (configure an embedding
-model and index your library).
+index for your library as described on the [RAG & Library Q&A](/guide/rag) page (configure
+an embedding model and index your library).
 
 ## Related
 

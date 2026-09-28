@@ -6,7 +6,7 @@ use crate::models::{
     ArxivPaper, ArxivScheduleStatus, Canvas, CanvasIndexEntry, CanvasSettings, ChatMessage,
     Collection, CollectionsFile, Highlight, ImportResult, LibraryConfig, NodePosition, Note,
     PaperIndexEntry, PaperMeta, PaperStatus,
-    RagSettings, ReadingState, RetrievedChunk, SearchHit, SuggestedEdge, VectorStoreInfo,
+    RagSettings, ReadingState, SearchHit, SuggestedEdge, VectorStoreInfo,
 };
 use crate::LibraryRoot;
 use crate::{
@@ -2547,13 +2547,23 @@ pub async fn get_rag_settings(state: State<'_, LibraryRoot>) -> Result<RagSettin
     Ok(rag::get_rag_settings(&root))
 }
 
+/// Every window holds its own copy of the RAG store, and the settings modal can
+/// be opened from more than one of them (the embedding map has its own), so a
+/// save is broadcast as `rag-settings-changed` (payload `{}`). Two listeners
+/// reload on it: the main window's RAG store, which gates the vectorize menus
+/// in the paper list and the collection menu, and any mounted RAG settings
+/// panel (`RagSettings.vue`), in whatever window it is open. Emitted only after
+/// the write succeeded.
 #[tauri::command]
 pub async fn save_rag_settings(
     settings: RagSettings,
     state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
-    rag::save_rag_settings(&root, &settings)
+    rag::save_rag_settings(&root, &settings)?;
+    let _ = app.emit("rag-settings-changed", serde_json::json!({}));
+    Ok(())
 }
 
 #[tauri::command]
@@ -2640,36 +2650,24 @@ pub async fn embed_and_store_chunks(
     rag::embed_and_store_chunks(&root, &slug, &paper_id, &paper_title, chunks, &app).await
 }
 
-// ── M7: Search ────────────────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn search_paper_chunks(
-    slug: String,
-    query: String,
-    top_k: usize,
-    state: State<'_, LibraryRoot>,
-) -> Result<Vec<RetrievedChunk>, String> {
-    let root = get_root(&state)?;
-    rag::search_paper_chunks(&root, &slug, &query, top_k).await
-}
-
-#[tauri::command]
-pub async fn search_library_chunks(
-    query: String,
-    top_k: usize,
-    state: State<'_, LibraryRoot>,
-) -> Result<Vec<RetrievedChunk>, String> {
-    let root = get_root(&state)?;
-    rag::search_library_chunks(&root, &query, top_k).await
-}
-
 // ── M7: Library chat ─────────────────────────────────────────────────────────
+//
+// Every chat surface in the app sends `knowledge_source: "agent"` now. The
+// library chat also sends `plain_fallback`, which lets a question the agent
+// cannot take (no tool calling, DeepSeek web search, a spoken reply) be
+// answered without tools instead of failing. The non-agent branch at the bottom
+// is what those fallback turns run on; no window reaches it directly any more.
+// It knows only "papers" (pinned papers' full text) and "none" (a plain
+// answer); an older caller still naming a retrieval source ("paper-rag",
+// "snippets", …) gets a plain answer rather than an error. Chat does not use
+// the vector store at all — that serves the embedding map.
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_with_library(
     // Agent-capable: an assistant turn may carry `tool_calls` and a `tool`
     // message its `tool_call_id`, so a follow-up turn can replay what earlier
-    // turns already looked up. The RAG path converts these down to plain
+    // turns already looked up. The tool-free path converts these down to plain
     // role/content messages, which is all it uses.
     messages: Vec<AgentMessage>,
     provider_id: Option<String>,
@@ -2700,6 +2698,11 @@ pub async fn chat_with_library(
     // Its presence is what lets the model reach the `edit_canvas` tool, and it is
     // the only canvas any edit can touch — the model never names one itself.
     canvas_id: Option<String>,
+    // Agent mode only: answer without tools, with a notice, when the agent
+    // cannot take this question. Only the library chat opts in — the paper AI
+    // panel and the canvas chat keep failing loudly, since the canvas chat's
+    // whole point is a tool.
+    plain_fallback: Option<bool>,
     state: State<'_, LibraryRoot>,
     // Which window asked. The cache keepalive runs until this window closes,
     // and agent mode is reachable from the main window (paper AI panel, canvas
@@ -2709,6 +2712,8 @@ pub async fn chat_with_library(
 ) -> Result<String, String> {
     let root = get_root(&state)?;
     let event_name = event_name.unwrap_or_else(|| "library-chat".to_string());
+    // Where the tool-free path (a fallback turn, or an old non-agent caller)
+    // sends the papers it answered from. The agent loop itself emits no sources.
     let sources_event_name =
         sources_event_name.unwrap_or_else(|| "library-chat-sources".to_string());
     // Register a cancel flag; the guard unregisters it on every exit path.
@@ -2716,7 +2721,47 @@ pub async fn chat_with_library(
     // Agent mode drives its own retrieval through the MCP tools instead of
     // taking a pre-built context, so it takes a different path entirely.
     if knowledge_source.as_deref() == Some("agent") {
-        return copilot::chat_with_library_agent(
+        let pins = selected_paper_slugs.unwrap_or_default();
+        let web_search = web_search.unwrap_or(false);
+        let fallback_allowed = plain_fallback == Some(true);
+
+        // Decided before any MCP server is started: a question that is going
+        // to be answered without tools should not pay for connecting them.
+        if fallback_allowed {
+            let reason = crate::ai_manager::resolve_provider_model_or_default(
+                &root,
+                provider_id.as_deref(),
+                model_id.as_deref(),
+            )
+            .ok()
+            .and_then(|(provider, _, model, _)| {
+                copilot::plain_fallback_reason(&provider, &model, web_search)
+            });
+            if let Some(reason) = reason {
+                return copilot::chat_with_library_fallback(
+                    &root,
+                    &messages,
+                    provider_id.as_deref(),
+                    model_id.as_deref(),
+                    &event_name,
+                    &sources_event_name,
+                    &pins,
+                    reason,
+                    None,
+                    use_reasoning.unwrap_or(false),
+                    reasoning_effort.as_deref(),
+                    &app,
+                    cancel,
+                    web_search,
+                )
+                .await;
+            }
+        }
+
+        // Kept only when a refusal could still be answered another way; the
+        // agent consumes its own copy.
+        let retry_with = fallback_allowed.then(|| messages.clone());
+        let outcome = copilot::chat_with_library_agent(
             &root,
             messages,
             provider_id.as_deref(),
@@ -2729,17 +2774,52 @@ pub async fn chat_with_library(
             paper_slug.as_deref(),
             current_page,
             canvas_id.as_deref(),
+            &pins,
             window.label(),
             &app,
-            cancel,
-            web_search.unwrap_or(false),
+            cancel.clone(),
+            web_search,
         )
         .await;
+
+        return match outcome {
+            // The provider refused the `tools` field on the very first call, so
+            // nothing has been streamed or run yet. Nothing is remembered: the
+            // next question tries the agent again, which costs one refused
+            // request but can never leave a working model stuck without tools
+            // because of one misread error.
+            Err(e) if e.starts_with(crate::llm::TOOLS_REJECTED_PREFIX) => {
+                let detail = crate::llm::strip_tools_rejected(&e).to_string();
+                match retry_with {
+                    Some(msgs) => {
+                        copilot::chat_with_library_fallback(
+                            &root,
+                            &msgs,
+                            provider_id.as_deref(),
+                            model_id.as_deref(),
+                            &event_name,
+                            &sources_event_name,
+                            &pins,
+                            "rejected",
+                            Some(&detail),
+                            use_reasoning.unwrap_or(false),
+                            reasoning_effort.as_deref(),
+                            &app,
+                            cancel,
+                            web_search,
+                        )
+                        .await
+                    }
+                    None => Err(detail),
+                }
+            }
+            other => other,
+        };
     }
 
     copilot::chat_with_library(
         &root,
-        // RAG has no tool loop: drop any replayed tool exchange (the `tool`
+        // No tool loop here: drop any replayed tool exchange (the `tool`
         // results and the empty assistant turn that carried the `tool_calls`),
         // leaving the plain user/assistant/system messages it expects.
         messages
@@ -3113,74 +3193,6 @@ pub async fn save_paper_ai_window_size(
 ) -> Result<(), String> {
     copilot::save_paper_ai_window_size(&app, width, height);
     Ok(())
-}
-
-// ── Snippet RAG ───────────────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_snippet_store_info(
-    state: State<'_, LibraryRoot>,
-) -> Result<crate::models::SnippetStoreInfo, String> {
-    let root = get_root(&state)?;
-    rag::get_snippet_store_info(&root).await
-}
-
-#[tauri::command]
-pub async fn embed_all_snippets(
-    state: State<'_, LibraryRoot>,
-    app: tauri::AppHandle,
-) -> Result<(usize, usize), String> {
-    let root = get_root(&state)?;
-    let snippets = rag::get_unembedded_snippets(&root)?;
-    rag::embed_and_store_snippets(&root, snippets, &app).await
-}
-
-#[tauri::command]
-pub async fn get_library_embedded_count(
-    library_id: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<usize, String> {
-    let root = get_root(&state)?;
-    rag::get_library_embedded_count(&root, &library_id).await
-}
-
-#[tauri::command]
-pub async fn embed_library_snippets(
-    library_id: String,
-    state: State<'_, LibraryRoot>,
-    app: tauri::AppHandle,
-) -> Result<(usize, usize), String> {
-    let root = get_root(&state)?;
-    // Reuse the store-wide "unembedded" scan, then keep only this library's.
-    let snippets: Vec<_> = rag::get_unembedded_snippets(&root)?
-        .into_iter()
-        .filter(|s| s.library_id == library_id)
-        .collect();
-    rag::embed_and_store_snippets(&root, snippets, &app).await
-}
-
-#[tauri::command]
-pub async fn embed_all_snippets_force(
-    state: State<'_, LibraryRoot>,
-    app: tauri::AppHandle,
-) -> Result<(usize, usize), String> {
-    let root = get_root(&state)?;
-    // Collect all snippets regardless of embedding status
-    let libs = snippets::list_snippet_libraries(&root)?;
-    let mut all = vec![];
-    for lib in &libs {
-        all.extend(snippets::get_snippets(&root, &lib.id).unwrap_or_default());
-    }
-    rag::embed_and_store_snippets(&root, all, &app).await
-}
-
-#[tauri::command]
-pub async fn delete_snippet_vector(
-    snippet_id: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<(), String> {
-    let root = get_root(&state)?;
-    rag::delete_snippet_chunk(&root, &snippet_id).await
 }
 
 // ── M8: arXiv window ─────────────────────────────────────────────────────────
@@ -4035,15 +4047,13 @@ pub fn delete_snippet(
 }
 
 #[tauri::command]
-pub async fn move_snippet(
+pub fn move_snippet(
     state: State<'_, LibraryRoot>,
     id: String,
     target_library_id: String,
 ) -> Result<crate::models::Snippet, String> {
     let root = get_root(&state)?;
-    let snippet = snippets::move_snippet(&root, &id, &target_library_id)?;
-    let _ = crate::rag::update_snippet_library_id(&root, &id, &target_library_id).await;
-    Ok(snippet)
+    snippets::move_snippet(&root, &id, &target_library_id)
 }
 
 // ── File export ───────────────────────────────────────────────────────────────
@@ -4188,7 +4198,7 @@ pub async fn agent_list_builtin_tools() -> Result<Vec<crate::mcp::agent::AgentTo
 
 /// Stop holding the last agent conversation's prompt cache open.
 ///
-/// Called when the chat window closes or leaves agent mode. The keepalive also
+/// Called when the chat window closes. The keepalive also
 /// checks for the window itself before every ping, so this is the fast path
 /// rather than the guarantee.
 #[tauri::command]

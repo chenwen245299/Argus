@@ -43,11 +43,13 @@ pub fn is_minimax(provider: &AiProvider) -> bool {
     provider.kind == "minimax" || url.contains("minimax")
 }
 
-/// Whether a model id belongs to the M2.x line, which always reasons: its
-/// `thinking.type` refuses `disabled`.
+/// Whether a model always reasons, so thinking must not be switched off: the
+/// M2.x line accepts `disabled` but ignores it, and MiniMax-M3.1-Flash-Preview
+/// (a Token Plan model) rejects it outright with a 400 — "requires adaptive
+/// thinking … (2013)". Leaving the field out means `adaptive` for both.
 fn thinking_is_mandatory(model_id: &str) -> bool {
     let id = model_id.to_lowercase();
-    id.starts_with("minimax-m2") || id.starts_with("abab")
+    id.starts_with("minimax-m2") || id.starts_with("abab") || id.starts_with("minimax-m3.1-flash")
 }
 
 /// Capabilities inferred from a MiniMax model id.
@@ -212,15 +214,129 @@ pub fn apply_thinking(body: &mut serde_json::Value, model_id: &str, use_reasonin
     if use_reasoning {
         body["thinking"] = serde_json::json!({"type": "adaptive"});
     } else if thinking_is_mandatory(model_id) {
-        // The M2.x line always reasons. Sending `disabled` is a 400, so the
-        // honest thing is to send nothing and let it think — the answer pane
-        // still separates the reasoning out, thanks to the split above.
+        // The M2.x line always reasons. Per MiniMax's docs it accepts
+        // `disabled` and simply ignores it (the documented 400 for `disabled`
+        // is MiniMax-M3.1-Flash-Preview's, not M2.x's), so sending it would
+        // only pretend to turn thinking off. The honest thing is to send
+        // nothing and let it think — the answer pane still separates the
+        // reasoning out, thanks to the split above.
         if let Some(obj) = body.as_object_mut() {
             obj.remove("thinking");
         }
     } else {
         body["thinking"] = serde_json::json!({"type": "disabled"});
     }
+}
+
+/// What a MiniMax business code means for a caller that could retry.
+///
+/// MiniMax appends its code to every error message in parentheses —
+/// `…请稍后重试 (2064)` — on the HTTP error envelope and in `base_resp` alike,
+/// and the code is the only thing that tells a one-minute throttle from a
+/// five-hour quota window. `None` for codes not listed here (and for anything
+/// that is not a MiniMax code at all), so the caller falls back to the status.
+///
+/// Reference: <https://platform.minimax.cn/docs/api-reference/errorcode>
+pub fn code_class(code: u32) -> Option<crate::llm::ErrorClass> {
+    use crate::llm::ErrorClass::*;
+    Some(match code {
+        // Unknown / timeout / RPM-TPM limit / internal / system error /
+        // connection limit / rate-growth limit / Token Plan rate limit /
+        // peak-hour overload ("通常 1-5 分钟内恢复").
+        1000 | 1001 | 1002 | 1013 | 1024 | 1033 | 1041 | 2045 | 2062 | 2064 => Transient,
+        // Not authorised / insufficient balance / quota exhausted / invalid key /
+        // Token Plan window used up / model not on this plan.
+        1004 | 1008 | 1028 | 1030 | 2049 | 2056 | 2061 => Fatal,
+        // Sensitive input or output / token limit / invisible characters /
+        // invalid parameters.
+        1026 | 1027 | 1039 | 1042 | 2013 => Request,
+        _ => return None,
+    })
+}
+
+/// The provider's message for a MiniMax business code, led by what it means in
+/// plain words.
+///
+/// MiniMax's own text is kept — it carries the specifics, such as when a Token
+/// Plan window resets — and the code stays on the end as ` (NNNN)`, which is
+/// the marker `llm::classify_error` reads. Nothing in the added wording may
+/// carry a marker of its own: the code has to be what decides.
+pub fn describe_code(code: u32, msg: &str) -> String {
+    let msg = msg.trim();
+    let label = match code {
+        2056 => Some("Token Plan 额度已用尽，需等当前用量窗口（5 小时 / 每周）重置，或升级套餐"),
+        2062 => Some("Token Plan 请求过于频繁，已被限流，请稍后重试"),
+        1002 => Some("请求过于频繁（RPM/TPM 超限），已被限流，请稍后重试"),
+        2045 => Some("请求量增长过快，已被限流，请稍后重试"),
+        1041 => Some("连接数超限，已被限流，请稍后重试"),
+        2064 => Some("整点高峰时段服务器繁忙"),
+        1008 => Some("账户余额不足，请充值"),
+        1004 | 2049 => Some("API Key 无效或未授权，请在 设置 → AI 供应商 中检查密钥"),
+        1026 => Some("输入内容涉敏，被安全策略拦截"),
+        1027 => Some("输出内容涉敏，被安全策略拦截"),
+        2013 => Some("请求参数错误"),
+        _ => None,
+    };
+    // MiniMax already ends most messages with the code; say it once.
+    let suffix = if msg.contains(&format!("({code})")) || msg.contains(&format!("（{code}）")) {
+        String::new()
+    } else {
+        format!(" ({code})")
+    };
+    match (label, msg.is_empty()) {
+        (Some(label), false) => format!("{label}：{msg}{suffix}"),
+        (Some(label), true) => format!("{label}{suffix}"),
+        (None, false) => format!("{msg}{suffix}"),
+        (None, true) => format!("MiniMax 返回错误{suffix}"),
+    }
+}
+
+/// The MiniMax code a message ends with — `…请稍后重试 (2064)` — when it is one
+/// [`code_class`] knows. Only a *trailing* code counts, which is where MiniMax
+/// writes it; a four-digit number in parentheses mid-sentence (a year, say) in
+/// another provider's message is left alone.
+pub fn trailing_code(msg: &str) -> Option<u32> {
+    let t = msg.trim_end();
+    let (body, close) = if let Some(b) = t.strip_suffix(')') {
+        (b, ')')
+    } else {
+        (t.strip_suffix('）')?, '）')
+    };
+    let open = body.rfind(['(', '（'])?;
+    let open_char = body[open..].chars().next()?;
+    // `( … ）` mixes are not MiniMax's; insist on a matching pair.
+    if (open_char == '(') != (close == ')') {
+        return None;
+    }
+    let digits = &body[open + open_char.len_utf8()..];
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let code: u32 = digits.parse().ok()?;
+    code_class(code).map(|_| code)
+}
+
+/// A business error in MiniMax's `base_resp` envelope — which it can send with
+/// an HTTP 200 and no `choices` — as `(code, status_msg)`. `None` for
+/// `status_code: 0` (success, which rides every normal response), for a missing
+/// envelope, and for a code that is not a number. The code may be spelled as a
+/// number or as a numeric string.
+pub fn base_resp_error(json: &serde_json::Value) -> Option<(i64, String)> {
+    let resp = json.get("base_resp")?.as_object()?;
+    let raw = resp.get("status_code")?;
+    let code = raw
+        .as_i64()
+        .or_else(|| raw.as_str().and_then(|s| s.trim().parse().ok()))?;
+    if code == 0 {
+        return None;
+    }
+    let msg = resp
+        .get("status_msg")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some((code, msg))
 }
 
 #[cfg(test)]
@@ -282,10 +398,67 @@ mod tests {
     }
 
     #[test]
+    fn thinking_is_never_disabled_on_the_flash_preview() {
+        let mut body = serde_json::json!({"thinking": {"type": "disabled"}});
+        apply_thinking(&mut body, "MiniMax-M3.1-Flash-Preview", false);
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["reasoning_split"], true);
+    }
+
+    #[test]
     fn a_stray_reasoning_effort_never_reaches_minimax() {
         let mut body = serde_json::json!({"reasoning_effort": "high"});
         apply_thinking(&mut body, "MiniMax-M3", true);
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn a_code_is_explained_and_kept_once_on_the_end() {
+        let m = describe_code(2064, "当前为整点高峰时段，服务器短暂繁忙。请稍后重试 (2064)");
+        assert!(m.starts_with("整点高峰时段服务器繁忙："), "{m}");
+        assert_eq!(m.matches("2064").count(), 1, "{m}");
+
+        let m = describe_code(2056, "usage limit exceeded");
+        assert!(m.contains("Token Plan 额度已用尽"), "{m}");
+        assert!(m.ends_with("usage limit exceeded (2056)"), "{m}");
+
+        // Full-width parentheses count as already carrying the code.
+        assert_eq!(describe_code(9999, "奇怪的错误（9999）"), "奇怪的错误（9999）");
+        // Unknown code: MiniMax's words, code appended.
+        assert_eq!(describe_code(9999, "odd"), "odd (9999)");
+        // No words at all still says something.
+        assert_eq!(describe_code(1008, ""), "账户余额不足，请充值 (1008)");
+        assert_eq!(describe_code(9999, " "), "MiniMax 返回错误 (9999)");
+    }
+
+    #[test]
+    fn only_a_trailing_known_code_is_read() {
+        assert_eq!(trailing_code("请稍后重试 (2064)"), Some(2064));
+        assert_eq!(trailing_code("已达到 Token Plan 用量上限。(2056)  "), Some(2056));
+        assert_eq!(trailing_code("限流（2062）"), Some(2062));
+        // Not at the end, not four digits, not a code MiniMax documents, or
+        // a mismatched pair.
+        assert_eq!(trailing_code("(2064) then more"), None);
+        assert_eq!(trailing_code("status (429)"), None);
+        assert_eq!(trailing_code("published (2026)"), None);
+        assert_eq!(trailing_code("mixed (2064）"), None);
+        assert_eq!(trailing_code(""), None);
+    }
+
+    #[test]
+    fn base_resp_is_an_error_only_when_its_code_is_not_zero() {
+        let err = serde_json::json!({"base_resp": {"status_code": 1002, "status_msg": " rpm "}});
+        assert_eq!(base_resp_error(&err), Some((1002, "rpm".to_string())));
+        let err = serde_json::json!({"base_resp": {"status_code": "2056"}});
+        assert_eq!(base_resp_error(&err), Some((2056, String::new())));
+        for ok in [
+            serde_json::json!({"base_resp": {"status_code": 0, "status_msg": "success"}}),
+            serde_json::json!({"base_resp": {"status_code": "0"}}),
+            serde_json::json!({"base_resp": null}),
+            serde_json::json!({"choices": []}),
+        ] {
+            assert_eq!(base_resp_error(&ok), None, "{ok}");
+        }
     }
 
     #[test]

@@ -1,9 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, onUnmounted, watch, Teleport } from 'vue'
+import { ref, computed, nextTick, Teleport } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
-import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   libraries,
   snippets,
@@ -12,73 +10,14 @@ import {
   moveSnippet,
   type Snippet,
 } from '../stores/snippetLibrary'
-import { useRagStore } from '../stores/rag'
 
 const props = defineProps<{ libraryId: string }>()
 const emit = defineEmits<{
   'open-paper': [slug: string, page: number, title: string]
-  'open-settings': [section?: 'rag']
 }>()
 const { t } = useI18n()
-const ragStore = useRagStore()
 
 const searchQuery = ref('')
-
-// ── Snippet embedding (RAG vectorization) ───────────────────────────────────────
-// Scoped to the current library: the counter shows this library's embedded/total
-// and the button embeds only this library's unembedded snippets via
-// `embed_library_snippets`.
-const embeddedCount = ref(0)
-const syncing = ref(false)
-const syncProgress = ref({ done: 0, total: 0, failed: 0 })
-const totalCount = computed(() => snippets.value.filter(s => s.libraryId === props.libraryId).length)
-const unembeddedCount = computed(() => Math.max(0, totalCount.value - embeddedCount.value))
-
-async function loadEmbeddedCount() {
-  try {
-    embeddedCount.value = await invoke<number>('get_library_embedded_count', { libraryId: props.libraryId })
-  } catch {
-    embeddedCount.value = 0
-  }
-}
-
-let unlistenEmbedProgress: UnlistenFn | null = null
-
-async function syncEmbeddings() {
-  if (syncing.value || !ragStore.isConfigured || unembeddedCount.value === 0) return
-  syncing.value = true
-  syncProgress.value = { done: 0, total: unembeddedCount.value, failed: 0 }
-  unlistenEmbedProgress = await listen<{ done: number; failed: number; total: number }>(
-    'snippet-embed-progress',
-    (ev) => {
-      syncProgress.value = { done: ev.payload.done, total: ev.payload.total, failed: ev.payload.failed }
-    },
-  )
-  try {
-    const [done, failed] = await invoke<[number, number]>('embed_library_snippets', { libraryId: props.libraryId })
-    syncProgress.value = { done, total: done + failed, failed }
-    await loadEmbeddedCount()
-  } catch {
-    /* surfaced to the user via the counter staying unchanged */
-  } finally {
-    unlistenEmbedProgress?.()
-    unlistenEmbedProgress = null
-    syncing.value = false
-  }
-}
-
-onMounted(() => {
-  if (!ragStore.loaded) ragStore.load()
-  loadEmbeddedCount()
-})
-
-// The component instance is reused across libraries (no :key), so reload the
-// embedded count whenever the active library changes.
-watch(() => props.libraryId, () => { loadEmbeddedCount() })
-
-onUnmounted(() => {
-  unlistenEmbedProgress?.()
-})
 
 const library = computed(() => libraries.value.find(l => l.id === props.libraryId))
 
@@ -305,46 +244,6 @@ async function commitTags(s: Snippet) {
         <span class="item-count">{{ items.length }}</span>
       </div>
 
-      <!-- Embedding (RAG vectorization) control -->
-      <div class="embed-control">
-        <button
-          v-if="!ragStore.isConfigured"
-          class="embed-config-btn"
-          :title="t('snippetLibrary.embedConfigTip')"
-          @click="emit('open-settings', 'rag')"
-        >
-          <Icon icon="fluent:database-24-regular" width="12" height="12" />
-          {{ t('snippetLibrary.embedConfig') }}
-        </button>
-        <template v-else>
-          <span v-if="syncing" class="embed-progress">{{ syncProgress.done }}/{{ syncProgress.total }}</span>
-          <button
-            class="embed-refresh-btn"
-            :class="{ refreshing: syncing }"
-            :title="t('snippetLibrary.embedRefreshTip')"
-            :disabled="syncing"
-            @click="loadEmbeddedCount"
-          >
-            <Icon icon="fluent:arrow-sync-24-regular" width="15" height="15" />
-          </button>
-          <div class="embed-counter" :title="t('snippetLibrary.embedCounterTip')">
-            <Icon icon="fluent:database-24-regular" width="11" height="11" />
-            <span>{{ embeddedCount }}/{{ totalCount }}</span>
-          </div>
-          <button
-            class="embed-sync-btn"
-            :class="{ 'all-done': unembeddedCount === 0 && totalCount > 0 }"
-            :title="unembeddedCount > 0 ? t('snippetLibrary.embedNTip', { n: unembeddedCount }) : t('snippetLibrary.embedDone')"
-            :disabled="syncing || unembeddedCount === 0"
-            @click="syncEmbeddings"
-          >
-            <Icon v-if="unembeddedCount > 0" icon="fluent:cloud-arrow-up-24-regular" width="11" height="11" />
-            <Icon v-else icon="fluent:checkmark-24-regular" width="11" height="11" />
-            {{ syncing ? t('snippetLibrary.embedding') : unembeddedCount > 0 ? t('snippetLibrary.embedN', { n: unembeddedCount }) : (totalCount > 0 ? t('snippetLibrary.embedDone') : t('snippetLibrary.embedNone')) }}
-          </button>
-        </template>
-      </div>
-
       <div class="search-wrap">
         <Icon class="search-icon" icon="fluent:search-24-regular" width="13" height="13" />
         <input v-model="searchQuery" class="search-input" :placeholder="t('snippets.search')" />
@@ -545,105 +444,6 @@ async function commitTags(s: Snippet) {
   width: 160px;
 }
 .search-input::placeholder { color: var(--text-tertiary); }
-
-/* Embedding (RAG vectorization) control */
-.embed-control {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-  flex-shrink: 0;
-}
-
-.embed-config-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 30px;
-  padding: 0 11px;
-  border-radius: var(--radius-md);
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-tertiary);
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-subtle);
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s;
-}
-.embed-config-btn:hover { background: var(--bg-hover); color: var(--text-secondary); }
-
-.embed-progress {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--accent);
-  min-width: 36px;
-  text-align: center;
-}
-
-.embed-refresh-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  min-width: 30px;
-  height: 30px;
-  padding: 0;
-  line-height: 0;
-  border-radius: var(--radius-md);
-  color: var(--text-secondary);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background 0.12s, color 0.12s;
-}
-.embed-refresh-btn svg { display: block; }
-.embed-refresh-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
-.embed-refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.embed-refresh-btn.refreshing svg { animation: embed-spin 0.7s linear infinite; }
-
-@keyframes embed-spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-.embed-counter {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
-  border-radius: var(--radius-pill);
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  flex-shrink: 0;
-  user-select: none;
-}
-
-.embed-sync-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 6px 11px;
-  border-radius: var(--radius-md);
-  font-size: 12px;
-  font-weight: 600;
-  color: #fff;
-  background: var(--accent);
-  border: none;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background 0.12s, color 0.12s, opacity 0.12s;
-}
-.embed-sync-btn:hover:not(:disabled) { background: var(--accent-hover); }
-.embed-sync-btn.all-done,
-.embed-sync-btn:disabled {
-  color: var(--text-tertiary);
-  background: var(--bg-secondary);
-  cursor: default;
-  opacity: 0.75;
-}
 
 /* Empty state */
 .empty-state {

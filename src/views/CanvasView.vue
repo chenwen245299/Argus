@@ -12,6 +12,7 @@ import {
   useVueFlow,
   MarkerType,
   ConnectionMode,
+  ConnectionLineType,
   type Node as VfNode,
   type Edge as VfEdge,
   type Connection,
@@ -33,6 +34,7 @@ import { sortPapersByRecentAccess } from '../utils/recentPapers'
 import { toDisplayMarkdown } from '../utils/noteAssets'
 import PaperNode from '../components/canvas/PaperNode.vue'
 import AdjustableEdge from '../components/canvas/AdjustableEdge.vue'
+import { edgeHasControlPoints } from '../utils/orthogonalRoute'
 import TextNode from '../components/canvas/TextNode.vue'
 import ShapeNode from '../components/canvas/ShapeNode.vue'
 import LineNode from '../components/canvas/LineNode.vue'
@@ -79,6 +81,8 @@ async function watchWindowSize() {
 
 const nodeTypes = markRaw({ paper: PaperNode, text: TextNode, shape: ShapeNode, line: LineNode, image: ImageNode })
 const edgeTypes = markRaw({ adjustable: AdjustableEdge })
+// The line drawn while dragging out a new connection is a step too — the canvas has no curves.
+const connectionLineOptions = { type: ConnectionLineType.SmoothStep }
 const PAN_ON_DRAG_BUTTONS = [1, 2]
 const PASTED_IMAGE_MAX_WIDTH = 420
 const PASTED_IMAGE_MAX_HEIGHT = 320
@@ -989,6 +993,20 @@ function ctxRemoveEdge() {
   recordHistory()
 }
 
+function ctxResetEdgeRoute() {
+  const edgeId = ctxMenu.value.edgeId
+  if (!edgeId) return
+  edges.value = edges.value.map(e => (
+    e.id === edgeId
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ? { ...e, data: { ...(e.data as any), controlPoints: [], controlX: undefined, controlY: undefined } }
+      : e
+  ))
+  closeCtxMenu()
+  triggerSave()
+  recordHistory()
+}
+
 function ctxEditEdgeLabel() {
   const edgeId = ctxMenu.value.edgeId
   if (!edgeId) return
@@ -1030,11 +1048,11 @@ const EDGE_WIDTHS = [
 
 const ctxCurrentEdgeData = computed(() => {
   const id = ctxMenu.value.edgeId
-  if (!id) return { color: undefined as string | undefined, strokeWidth: 1.8 }
+  if (!id) return { color: undefined as string | undefined, strokeWidth: 1.8, hasRoute: false }
   const edge = edges.value.find(e => e.id === id)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const d = edge?.data as any
-  return { color: d?.edgeColor as string | undefined, strokeWidth: d?.edgeStrokeWidth ?? 1.8 }
+  return { color: d?.edgeColor as string | undefined, strokeWidth: d?.edgeStrokeWidth ?? 1.8, hasRoute: edgeHasControlPoints(d) }
 })
 
 function ctxSetEdgeColor(color: string | undefined) {
@@ -1521,6 +1539,7 @@ watch(() => library.papers, () => {
           :edge-types="edgeTypes"
           :connection-mode="ConnectionMode.Loose"
           :default-edge-options="{ type: 'adjustable', markerEnd: MarkerType.ArrowClosed }"
+          :connection-line-options="connectionLineOptions"
           :snap-to-grid="false"
           :pan-on-drag="PAN_ON_DRAG_BUTTONS"
           :selection-key-code="true"
@@ -1690,6 +1709,10 @@ watch(() => library.papers, () => {
           <button class="ctx-item" @click="ctxEditEdgeLabel">
             <Icon icon="fluent:edit-24-regular" width="12" height="12" />
             编辑标签
+          </button>
+          <button v-if="ctxCurrentEdgeData.hasRoute" class="ctx-item" @click="ctxResetEdgeRoute">
+            <Icon icon="fluent:arrow-reset-24-regular" width="12" height="12" />
+            {{ t('canvas.resetEdgeRoute') }}
           </button>
           <div class="ctx-divider" />
           <button class="ctx-item ctx-item--danger" @click="ctxRemoveEdge">

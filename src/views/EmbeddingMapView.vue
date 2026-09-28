@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { emitTo } from '@tauri-apps/api/event'
 import type { EmbeddingMapData, EmbeddingMapPaper } from '../types'
+import SettingsModal from '../components/SettingsModal.vue'
 
 const { t } = useI18n()
 
@@ -786,9 +787,10 @@ async function openInMain(p: EmbeddingMapPaper) {
   window.setTimeout(() => { invoke('focus_main_window').catch(() => {}) }, 120)
 }
 
-async function openLibraryChat() {
-  try { await invoke('open_library_chat_window') } catch { /* ignore */ }
-}
+// Vectorizing used to be a button in the library chat's header, so the empty
+// map sent people there. It lives in 设置 → AI 随航 → RAG / 向量化 now, opened
+// right here.
+const showRagSettings = ref(false)
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 let resizeObserver: ResizeObserver | null = null
@@ -995,11 +997,16 @@ onUnmounted(() => {
         <p class="em-empty-title">{{ t('embedMap.empty') }}</p>
         <p class="em-empty-hint">{{ t('embedMap.emptyHint') }}</p>
         <div class="em-empty-actions">
-          <button class="em-accent-btn" @click="openLibraryChat">{{ t('embedMap.openChat') }}</button>
+          <button class="em-accent-btn" @click="showRagSettings = true">{{ t('embedMap.openRagSettings') }}</button>
           <button class="em-mini-btn" @click="load">{{ t('embedMap.refresh') }}</button>
         </div>
       </div>
     </div>
+    <SettingsModal
+      v-if="showRagSettings"
+      initial-section="rag"
+      @close="showRagSettings = false; load()"
+    />
   </div>
 </template>
 

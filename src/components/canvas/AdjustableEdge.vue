@@ -1,123 +1,71 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue'
 import { BaseEdge, getSmoothStepPath, useVueFlow, type EdgeProps } from '@vue-flow/core'
+import {
+  EDGE_CORNER_RADIUS,
+  EDGE_HANDLE_OFFSET,
+  JOG,
+  closestPointOnLine,
+  insertControlPoint,
+  placeControlPoint,
+  planImplicitDrag,
+  polylineMidpoint,
+  polylinePath,
+  readControlPoints,
+  routeOrthogonal,
+  smoothStepVertices,
+  type DragPlan,
+  type EdgeEnds,
+  type RoutePoint,
+} from '../../utils/orthogonalRoute'
 
-interface EdgeControlPoint {
-  x: number
-  y: number
-}
+// Every edge is a polyline, never a curve: the smooth-step default until the user
+// places a control point, then an orthogonal route through the points they placed
+// (see utils/orthogonalRoute). Control points saved while edges were still drawn
+// as curves are kept and simply routed this way.
 
 interface AdjustableEdgeData {
   edgeColor?: string
   edgeStrokeWidth?: number
   controlX?: number
   controlY?: number
-  controlPoints?: EdgeControlPoint[]
+  controlPoints?: RoutePoint[]
 }
 
 const props = defineProps<EdgeProps<AdjustableEdgeData>>()
 
-const { screenToFlowCoordinate, updateEdgeData } = useVueFlow()
+const { screenToFlowCoordinate, updateEdgeData, viewport } = useVueFlow()
+
+/** Screen pixels a press must travel before it drags, so a click or double-click doesn't nudge the point. */
+const DRAG_THRESHOLD_PX = 3
+/** Screen pixels within which a dragged point snaps onto a neighbour's row or column. */
+const SNAP_PX = 6
+/** Two presses on the same point within this many ms, without a drag, remove it. */
+const DOUBLE_PRESS_MS = 350
+
+interface ActiveDrag extends DragPlan {
+  /** Where the grabbed point started; the points in `follow` move by its offset from here. */
+  start: RoutePoint
+  /** The settled points either side of it (null for a handle), which it snaps to. */
+  prev: RoutePoint | null
+  next: RoutePoint | null
+}
 
 const draggingIndex = ref<number | null>(null)
+let drag: ActiveDrag | null = null
+let grabOffset: RoutePoint = { x: 0, y: 0 }
+let pressStart = { x: 0, y: 0 }
+let dragStarted = false
+let lastPress: { index: number; at: number } | null = null
 
-function isValidPoint(point: unknown): point is EdgeControlPoint {
-  if (!point || typeof point !== 'object') return false
-  const maybe = point as Partial<EdgeControlPoint>
-  return typeof maybe.x === 'number' && Number.isFinite(maybe.x) &&
-    typeof maybe.y === 'number' && Number.isFinite(maybe.y)
-}
+const savedControlPoints = computed<RoutePoint[]>(() => readControlPoints(props.data))
 
-const savedControlPoints = computed<EdgeControlPoint[]>(() => {
-  if (Array.isArray(props.data?.controlPoints)) {
-    return props.data.controlPoints.filter(isValidPoint)
-  }
-
-  const x = props.data?.controlX
-  const y = props.data?.controlY
-  if (typeof x === 'number' && Number.isFinite(x) && typeof y === 'number' && Number.isFinite(y)) {
-    return [{ x, y }]
-  }
-
-  return []
-})
-
-const displayedControlPoints = computed<EdgeControlPoint[]>(() => {
-  if (savedControlPoints.value.length > 0) return savedControlPoints.value
-  const [, x, y] = defaultSmoothStepPath.value
-  return [{
-    x,
-    y,
-  }]
-})
-
-const pathPoints = computed<EdgeControlPoint[]>(() => [
-  { x: props.sourceX, y: props.sourceY },
-  ...displayedControlPoints.value,
-  { x: props.targetX, y: props.targetY },
-])
-
-function catmullRomPath(points: EdgeControlPoint[]) {
-  if (points.length === 0) return ''
-  if (points.length === 1) return `M ${points[0].x},${points[0].y}`
-
-  let path = `M ${points[0].x},${points[0].y}`
-  for (let i = 0; i < points.length - 1; i += 1) {
-    const p0 = points[i - 1] ?? points[i]
-    const p1 = points[i]
-    const p2 = points[i + 1]
-    const p3 = points[i + 2] ?? p2
-    const cp1 = {
-      x: p1.x + (p2.x - p0.x) / 6,
-      y: p1.y + (p2.y - p0.y) / 6,
-    }
-    const cp2 = {
-      x: p2.x - (p3.x - p1.x) / 6,
-      y: p2.y - (p3.y - p1.y) / 6,
-    }
-    path += ` C ${cp1.x},${cp1.y} ${cp2.x},${cp2.y} ${p2.x},${p2.y}`
-  }
-  return path
-}
-
-function distanceToSegment(point: EdgeControlPoint, start: EdgeControlPoint, end: EdgeControlPoint) {
-  const dx = end.x - start.x
-  const dy = end.y - start.y
-  const lengthSq = dx * dx + dy * dy
-  if (lengthSq === 0) return Math.hypot(point.x - start.x, point.y - start.y)
-
-  const t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSq))
-  const projection = { x: start.x + t * dx, y: start.y + t * dy }
-  return Math.hypot(point.x - projection.x, point.y - projection.y)
-}
-
-function nearestInsertIndex(point: EdgeControlPoint) {
-  const points = [
-    { x: props.sourceX, y: props.sourceY },
-    ...savedControlPoints.value,
-    { x: props.targetX, y: props.targetY },
-  ]
-  let bestSegment = 0
-  let bestDistance = Number.POSITIVE_INFINITY
-
-  for (let i = 0; i < points.length - 1; i += 1) {
-    const distance = distanceToSegment(point, points[i], points[i + 1])
-    if (distance < bestDistance) {
-      bestDistance = distance
-      bestSegment = i
-    }
-  }
-
-  return bestSegment
-}
-
-function saveControlPoints(points: EdgeControlPoint[]) {
-  updateEdgeData<AdjustableEdgeData>(props.id, {
-    controlPoints: points,
-    controlX: undefined,
-    controlY: undefined,
-  })
-}
+const ends = computed<EdgeEnds>(() => ({
+  source: { x: props.sourceX, y: props.sourceY },
+  sourceSide: props.sourcePosition,
+  target: { x: props.targetX, y: props.targetY },
+  targetSide: props.targetPosition,
+}))
 
 const defaultSmoothStepPath = computed(() => getSmoothStepPath({
   sourceX: props.sourceX,
@@ -126,33 +74,102 @@ const defaultSmoothStepPath = computed(() => getSmoothStepPath({
   targetX: props.targetX,
   targetY: props.targetY,
   targetPosition: props.targetPosition,
+  borderRadius: EDGE_CORNER_RADIUS,
+  offset: EDGE_HANDLE_OFFSET,
 }))
 
-const edgePath = computed(() => {
-  if (savedControlPoints.value.length === 0) return defaultSmoothStepPath.value[0]
-  return catmullRomPath(pathPoints.value)
+/** The vertices of the default path, which editing an edge without control points starts from. */
+const defaultLine = computed(() => smoothStepVertices(defaultSmoothStepPath.value[0]))
+
+/** The routed line once the user has placed control points; null while the default path is drawn. */
+const route = computed(() => (
+  savedControlPoints.value.length > 0
+    ? routeOrthogonal({ ...ends.value, waypoints: savedControlPoints.value })
+    : null
+))
+
+/**
+ * Handles sit on the line: at each control point as routed, or — with none
+ * saved — one in the middle of the default path, ready to drag.
+ */
+const displayedControlPoints = computed<RoutePoint[]>(() => {
+  const current = route.value
+  if (current) return current.waypoints.map(point => closestPointOnLine(current.points, point))
+  const [, x, y] = defaultSmoothStepPath.value
+  return [{ x, y }]
 })
 
-const labelX = computed(() => {
-  if (savedControlPoints.value.length === 0) return defaultSmoothStepPath.value[1]
-  const points = pathPoints.value
-  return points.reduce((sum, point) => sum + point.x, 0) / points.length
+const edgePath = computed(() => (
+  route.value ? polylinePath(route.value.points) : defaultSmoothStepPath.value[0]
+))
+
+const labelPoint = computed<RoutePoint>(() => {
+  if (route.value) return polylineMidpoint(route.value.points)
+  const [, x, y] = defaultSmoothStepPath.value
+  return { x, y }
 })
 
-const labelY = computed(() => {
-  if (savedControlPoints.value.length === 0) return defaultSmoothStepPath.value[2]
-  const points = pathPoints.value
-  return points.reduce((sum, point) => sum + point.y, 0) / points.length
-})
+function saveControlPoints(points: RoutePoint[]) {
+  updateEdgeData<AdjustableEdgeData>(props.id, {
+    controlPoints: points,
+    controlX: undefined,
+    controlY: undefined,
+  })
+}
+
+function announceChange() {
+  window.dispatchEvent(new CustomEvent('argus-canvas-edge-control-changed', {
+    detail: { edgeId: props.id },
+  }))
+}
 
 function pointFromEvent(event: MouseEvent | PointerEvent) {
   return screenToFlowCoordinate({ x: event.clientX, y: event.clientY })
 }
 
-function setControlFromEvent(index: number, event: PointerEvent) {
-  const points = [...savedControlPoints.value]
-  points[index] = pointFromEvent(event)
-  saveControlPoints(points)
+function planDrag(index: number): ActiveDrag {
+  const current = route.value
+  if (current) {
+    // The points as routed, so what's saved is what's drawn.
+    return {
+      points: [...current.waypoints],
+      index,
+      follow: [],
+      across: null,
+      slide: null,
+      start: displayedControlPoints.value[index],
+      prev: current.waypoints[index - 1] ?? null,
+      next: current.waypoints[index + 1] ?? null,
+    }
+  }
+  // Grabbing the default path's handle: turn it into control points that draw
+  // the same line, and snap it against the nearest ones that don't move with it.
+  const plan = planImplicitDrag(ends.value, defaultLine.value, displayedControlPoints.value[0])
+  const still = (i: number) => !plan.follow.includes(i)
+  const before = plan.points.slice(0, plan.index).reverse().find((_, k) => still(plan.index - 1 - k))
+  const after = plan.points.slice(plan.index + 1).find((_, k) => still(plan.index + 1 + k))
+  return { ...plan, start: plan.points[plan.index], prev: before ?? null, next: after ?? null }
+}
+
+function moveControlTo(event: PointerEvent) {
+  if (!drag) return
+  const { index, start, across, follow, slide } = drag
+  const pointer = pointFromEvent(event)
+  const raw = { x: pointer.x + grabOffset.x, y: pointer.y + grabOffset.y }
+  // At least JOG, so a dragged point always lands exactly where routing would settle it.
+  const tolerance = Math.max(SNAP_PX / (viewport.value.zoom || 1), JOG)
+  const placed = placeControlPoint(raw, drag.prev, drag.next, ends.value, tolerance)
+  // A point whose run ends are pinned stays on its run, or the line would double back.
+  if (slide) placed[slide.axis] = Math.min(Math.max(placed[slide.axis], slide.min), slide.max)
+  saveControlPoints(drag.points.map((point, i) => {
+    if (i === index) return placed
+    if (across && follow.includes(i)) {
+      return across === 'x'
+        ? { x: point.x + placed.x - start.x, y: point.y }
+        : { x: point.x, y: point.y + placed.y - start.y }
+    }
+    return point
+  }))
 }
 
 function cleanupDragListeners() {
@@ -163,29 +180,54 @@ function cleanupDragListeners() {
 function onPointerMove(event: PointerEvent) {
   if (draggingIndex.value === null) return
   event.preventDefault()
-  setControlFromEvent(draggingIndex.value, event)
+  if (!dragStarted) {
+    const travelled = Math.hypot(event.clientX - pressStart.x, event.clientY - pressStart.y)
+    if (travelled < DRAG_THRESHOLD_PX) return
+    dragStarted = true
+    drag = planDrag(draggingIndex.value)
+  }
+  moveControlTo(event)
 }
 
 function onPointerUp(event: PointerEvent) {
-  if (draggingIndex.value === null) return
+  const index = draggingIndex.value
+  if (index === null) return
   event.preventDefault()
-  setControlFromEvent(draggingIndex.value, event)
   draggingIndex.value = null
   cleanupDragListeners()
-  window.dispatchEvent(new CustomEvent('argus-canvas-edge-control-changed', {
-    detail: { edgeId: props.id },
-  }))
+  if (dragStarted) {
+    moveControlTo(event)
+    drag = null
+    lastPress = null
+    announceChange()
+    return
+  }
+  // A press that never became a drag: the second of two in quick succession on
+  // a point the user placed removes it (the default path's handle has nothing to remove).
+  const now = event.timeStamp
+  if (lastPress && lastPress.index === index && now - lastPress.at < DOUBLE_PRESS_MS) {
+    lastPress = null
+    if (savedControlPoints.value.length > 0) {
+      saveControlPoints(savedControlPoints.value.filter((_, i) => i !== index))
+      announceChange()
+    }
+    return
+  }
+  lastPress = { index, at: now }
 }
 
 function onControlPointerDown(index: number, event: PointerEvent) {
   if (event.button !== 0) return
   event.preventDefault()
   event.stopPropagation()
-  if (savedControlPoints.value.length === 0) {
-    saveControlPoints([...displayedControlPoints.value])
-  }
+  const start = displayedControlPoints.value[index]
+  const pointer = pointFromEvent(event)
+  // Drag by the grab offset, so pressing near the edge of the hit circle doesn't jump the point.
+  grabOffset = { x: start.x - pointer.x, y: start.y - pointer.y }
+  pressStart = { x: event.clientX, y: event.clientY }
+  dragStarted = false
+  drag = null
   draggingIndex.value = index
-  setControlFromEvent(index, event)
   window.addEventListener('pointermove', onPointerMove)
   window.addEventListener('pointerup', onPointerUp)
 }
@@ -193,13 +235,13 @@ function onControlPointerDown(index: number, event: PointerEvent) {
 function onEdgeDblClick(event: MouseEvent) {
   event.preventDefault()
   event.stopPropagation()
-  const point = pointFromEvent(event)
-  const points = [...savedControlPoints.value]
-  points.splice(nearestInsertIndex(point), 0, point)
-  saveControlPoints(points)
-  window.dispatchEvent(new CustomEvent('argus-canvas-edge-control-changed', {
-    detail: { edgeId: props.id },
-  }))
+  saveControlPoints(insertControlPoint(
+    ends.value,
+    savedControlPoints.value,
+    defaultLine.value,
+    pointFromEvent(event),
+  ))
+  announceChange()
 }
 
 onUnmounted(cleanupDragListeners)
@@ -215,8 +257,8 @@ onUnmounted(cleanupDragListeners)
       :id="props.id"
       :path="edgePath"
       :label="props.label"
-      :label-x="labelX"
-      :label-y="labelY"
+      :label-x="labelPoint.x"
+      :label-y="labelPoint.y"
       :label-style="props.labelStyle"
       :label-show-bg="props.labelShowBg"
       :label-bg-style="props.labelBgStyle"
@@ -234,6 +276,7 @@ onUnmounted(cleanupDragListeners)
       :class="{ 'adjustable-edge-control--implicit': savedControlPoints.length === 0 }"
       :transform="`translate(${point.x} ${point.y})`"
       @pointerdown="onControlPointerDown(index, $event)"
+      @dblclick.stop.prevent
     >
       <circle class="adjustable-edge-control-hit" r="12" />
       <circle class="adjustable-edge-control-dot" r="5" />

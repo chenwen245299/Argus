@@ -3,7 +3,8 @@ import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
-  ArxivAnalysisEvent, ArxivAnalysisRun, ArxivConfig, ArxivPaper, ArxivScheduleStatus,
+  ArxivAnalysisEvent, ArxivAnalysisRun, ArxivConfig, ArxivFilteredPaper, ArxivPaper,
+  ArxivRunCounts, ArxivScheduleStatus,
 } from '../types'
 import { fetchArxivCategories } from '../utils/arxivFetch'
 import { fetchBiorxivAsArxivPapers } from '../utils/biorxivFetch'
@@ -101,7 +102,16 @@ export const useArxivStore = defineStore('arxiv', () => {
   // How many previously-failed papers the current bulk run is retrying.
   const analyzeRetryingFailed = ref(0)
   const analyzeWaiting = ref<AnalysisWaiting | null>(null)
+  // Outcomes of the running batch so far. Without them a fast model that
+  // filtered most papers out looked exactly like one failing them all: rows
+  // vanished several a second and nothing said why.
+  const analyzeCounts = ref<ArxivRunCounts>({ succeeded: 0, filtered: 0, failed: 0 })
   const analysisNotice = ref<AnalysisNotice | null>(null)
+  // Papers the analysis moved out of the inbox, newest first (inbox/filtered.json).
+  const filteredPapers = ref<ArxivFilteredPaper[]>([])
+  // Requests the running batch keeps in flight, and why it is fewer than the
+  // setting when it is (MiniMax Token Plan).
+  const analyzeConcurrency = ref<{ limit: number; note: string | null } | null>(null)
   const lastSingleError = ref<SingleAnalysisError | null>(null)
   // The run whose outcome has already been shown (or dismissed) here, so the
   // status poll does not bring it back.
@@ -121,6 +131,21 @@ export const useArxivStore = defineStore('arxiv', () => {
       else if (o !== null) out.push({ ...p, ...o })
     }
     return out
+  }
+
+  function resetCounts() {
+    analyzeCounts.value = { succeeded: 0, filtered: 0, failed: 0 }
+  }
+
+  // Counts only grow during a run, and the status poll can answer with figures
+  // older than the last event: never let it take them back.
+  function mergeCounts(c: Partial<ArxivRunCounts>) {
+    const cur = analyzeCounts.value
+    analyzeCounts.value = {
+      succeeded: Math.max(cur.succeeded, num(c.succeeded)),
+      filtered: Math.max(cur.filtered, num(c.filtered)),
+      failed: Math.max(cur.failed, num(c.failed)),
+    }
   }
 
   function noticeFromRun(r: ArxivAnalysisRun): AnalysisNotice {
@@ -210,10 +235,12 @@ export const useArxivStore = defineStore('arxiv', () => {
         done: status.analyzed_count,
         total: status.analyzed_count + status.total_pending,
       }
+      if (status.run_counts) mergeCounts(status.run_counts)
     } else if (analyzing.value) {
       // Missed the 'finished' event — the run is over either way.
       analyzing.value = false
       analyzeWaiting.value = null
+      resetCounts()
       runOutcomes.clear()
     }
     // A window opened mid-pause, or after a run ended while it was closed,
@@ -351,6 +378,8 @@ export const useArxivStore = defineStore('arxiv', () => {
     analyzeProgress.value = { done: 0, total: 0 }
     analyzeRetryingFailed.value = 0
     analyzeWaiting.value = null
+    analyzeConcurrency.value = null
+    resetCounts()
     analysisNotice.value = null
     try {
       await invoke('start_arxiv_analysis')
@@ -363,6 +392,34 @@ export const useArxivStore = defineStore('arxiv', () => {
 
   async function cancelAnalysis() {
     await invoke('cancel_arxiv_analysis')
+  }
+
+  async function loadFiltered() {
+    try {
+      filteredPapers.value = await invoke<ArxivFilteredPaper[]>('get_arxiv_filtered')
+    } catch { filteredPapers.value = [] }
+  }
+
+  /** Put filtered papers back into the inbox, analysis and all. */
+  async function restoreFiltered(arxivIds: string[]) {
+    if (arxivIds.length === 0) return
+    const inbox = await invoke<{ papers: ArxivPaper[]; last_updated: string }>(
+      'restore_arxiv_filtered', { arxivIds })
+    // A paper filtered in this very run is remembered as gone (see runOutcomes);
+    // it is back now.
+    for (const id of arxivIds) runOutcomes.delete(id)
+    const knownRead = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
+    papers.value = withRunOutcomes(inbox.papers.map(p => ({
+      ...p,
+      read: p.read || knownRead.has(p.arxiv_id),
+    })))
+    const back = new Set(arxivIds)
+    filteredPapers.value = filteredPapers.value.filter(p => !back.has(p.arxiv_id))
+  }
+
+  async function clearFiltered() {
+    await invoke('clear_arxiv_filtered')
+    filteredPapers.value = []
   }
 
   async function setAutoFetch(enabled: boolean) {
@@ -470,9 +527,17 @@ export const useArxivStore = defineStore('arxiv', () => {
           }
         }
 
+        if (status === 'done' || status === 'filtered' || status === 'failed') {
+          if (typeof ev.succeeded === 'number') mergeCounts(ev)
+        }
+
         if (status === 'started') {
           analysisNotice.value = null
           analyzeRetryingFailed.value = num(ev.retrying_failed)
+          analyzeConcurrency.value = typeof ev.concurrency === 'number'
+            ? { limit: ev.concurrency, note: ev.concurrency_note ? String(ev.concurrency_note) : null }
+            : null
+          resetCounts()
           runOutcomes.clear()
         } else if (status === 'finished') {
           if (typeof ev.finished_at_ms === 'number') lastRunSeenAt = ev.finished_at_ms
@@ -496,6 +561,8 @@ export const useArxivStore = defineStore('arxiv', () => {
           analyzing.value = false
           analyzeWaiting.value = null
           analyzeRetryingFailed.value = 0
+          analyzeConcurrency.value = null
+          resetCounts()
           // Everything is on disk before 'finished' is sent.
           runOutcomes.clear()
           loadInbox().catch(() => {})
@@ -576,12 +643,14 @@ export const useArxivStore = defineStore('arxiv', () => {
   return {
     papers, config, scheduleStatus, loaded,
     fetching, refreshing, fetchMessage, analyzing, analyzeProgress,
-    analyzeRetryingFailed, analyzeWaiting, analysisNotice, lastSingleError,
+    analyzeRetryingFailed, analyzeWaiting, analyzeCounts, analyzeConcurrency, analysisNotice,
+    lastSingleError, filteredPapers,
     sortMode, sortOrder, filterMode, newCount,
     sortedPapers,
     load, loadConfig, loadInbox, loadScheduleStatus,
     saveConfig, refreshInbox, fetchManual, fetchCatchUp,
     startAnalysis, cancelAnalysis, setAutoFetch,
+    loadFiltered, restoreFiltered, clearFiltered,
     markRead, ratePaper, addToLibrary,
     subscribeEvents, unsubscribeEvents,
   }

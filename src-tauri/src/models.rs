@@ -1407,6 +1407,10 @@ pub struct ArxivPaper {
     /// "biorxiv" for bioRxiv papers; None / missing = arXiv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Put back by the user after scoring below the filter threshold, so the
+    /// threshold never takes it out again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kept: bool,
 }
 
 fn default_analysis_status() -> String {
@@ -1430,6 +1434,33 @@ pub struct ArxivScheduleStatus {
     /// early — for a window that was closed when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<ArxivAnalysisRun>,
+    /// What the running batch has done so far, for a window opened mid-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_counts: Option<ArxivRunCounts>,
+}
+
+/// Outcomes of a batch so far: kept in the inbox, dropped for scoring below
+/// the filter threshold, failed.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq)]
+pub struct ArxivRunCounts {
+    pub succeeded: u32,
+    pub filtered: u32,
+    pub failed: u32,
+}
+
+/// A paper that left the inbox for scoring below the filter threshold, kept in
+/// `inbox/filtered.json` so it can be looked at and put back.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ArxivFilteredPaper {
+    /// As it was when it left, analysis included.
+    #[serde(flatten)]
+    pub paper: ArxivPaper,
+    /// When it left, RFC 3339.
+    #[serde(default)]
+    pub filtered_at: String,
+    /// The threshold it scored below.
+    #[serde(default)]
+    pub filter_threshold: f32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

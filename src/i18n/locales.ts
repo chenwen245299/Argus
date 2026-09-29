@@ -1450,6 +1450,7 @@ export const zh = {
     fetchBiorxivHint: '按日期全量抓取生命科学预印本，与 arXiv 合并显示',
     concurrency: '同时请求数',
     concurrencyHint: '同时向 AI 发送的并发请求数量（默认 5），数值越大分析速度越快，但可能触发 API 限流',
+    minimaxPacingHint: 'MiniMax 会自动限速以免触发限流：Token Plan 套餐 Key（sk-cp- 开头）最多同时 4 个请求（官方：高峰时 Plus 约 3–4 个、Max 约 4–5 个）；所有 Key 都会拉开请求间隔，保持在模型官方每分钟请求上限的 75% 以内。遇到限流时整批自动暂停重试，不会把论文标为失败。',
   },
   // AI Token usage modal
   tokenUsage: {
@@ -2960,6 +2961,7 @@ export const en: typeof zh = {
     fetchBiorxivHint: 'Fetch all life-science preprints by date, merged with arXiv',
     concurrency: 'Concurrent Requests',
     concurrencyHint: 'Number of concurrent requests sent to the AI (default 5). Higher values speed up analysis but may trigger API rate limits.',
+    minimaxPacingHint: 'MiniMax is paced automatically to stay clear of its rate limits: a Token Plan key (sk-cp-…) runs at most 4 requests at once (MiniMax: about 3–4 on Plus and 4–5 on Max at peak hours), and every key spaces its requests to stay within 75% of the model\'s published requests per minute. A throttle pauses and retries the whole batch; it never marks a paper as failed.',
   },
   tokenUsage: {
     title: 'AI Token Usage',

@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use tauri::Emitter;
 
 use crate::models::{
-    ArxivAnalysisPause, ArxivAnalysisRun, ArxivConfig, ArxivInbox, ArxivPaper,
-    ArxivScheduleStatus, ChatMessage, ImportResult, PaperMeta, PaperStatus,
-    DEFAULT_ARXIV_ANALYSIS_PROMPT,
+    ArxivAnalysisPause, ArxivAnalysisRun, ArxivConfig, ArxivFilteredPaper, ArxivInbox,
+    ArxivPaper, ArxivRunCounts, ArxivScheduleStatus, ChatMessage, ImportResult, PaperMeta,
+    PaperStatus, DEFAULT_ARXIV_ANALYSIS_PROMPT,
 };
 use crate::{ai_manager, collections, extraction, llm, paper, search, settings};
 
@@ -359,13 +359,20 @@ pub fn prune_low_relevance(root: &str) -> Result<ArxivInbox, String> {
     let mut inbox = {
         let _guard = inbox_lock();
         let mut inbox = get_inbox(root);
-        inbox.papers.retain(|paper| {
-            paper
-                .relevance_score
-                .map(|score| score >= threshold)
-                .unwrap_or(true)
-        });
+        let (kept, dropped): (Vec<_>, Vec<_>) =
+            inbox.papers.into_iter().partition(|paper| {
+                paper.kept
+                    || paper
+                        .relevance_score
+                        .map(|score| score >= threshold)
+                        .unwrap_or(true)
+            });
+        inbox.papers = kept;
         save_inbox(root, &inbox)?;
+        record_filtered(
+            root,
+            dropped.into_iter().map(|p| filtered_entry(p, threshold)).collect(),
+        );
         inbox
     };
     mark_in_library_statuses(root, &mut inbox.papers);
@@ -418,6 +425,121 @@ pub fn delete_inbox_papers(root: &str, arxiv_ids: &[String]) -> Result<ArxivInbo
         }
     }
     Ok(get_inbox(root))
+}
+
+// ── Recently filtered (inbox/filtered.json) ─────────────────────────────────
+//
+// A paper scored below the filter threshold leaves the inbox. It used to be
+// deleted outright, which with a strict model looked exactly like a failure:
+// MiniMax-M3 gave 0–3 to papers other models scored 6–7, answered in two
+// seconds, and a batch emptied the inbox several papers a second with nothing
+// left to show what had happened or why. The latest ones are now kept here —
+// analysis included — to be looked through and put back.
+
+const FILTERED_FILE: &str = "filtered.json";
+/// Newest first, capped: a look back at recent runs, not an archive.
+const FILTERED_KEEP: usize = 500;
+
+fn filtered_path(root: &str) -> PathBuf {
+    inbox_dir(root).join(FILTERED_FILE)
+}
+
+fn read_filtered(root: &str) -> Vec<ArxivFilteredPaper> {
+    std::fs::read_to_string(filtered_path(root))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_filtered(root: &str, list: &[ArxivFilteredPaper]) -> Result<(), String> {
+    let path = filtered_path(root);
+    if list.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| format!("Remove {FILTERED_FILE}: {e}"))?;
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(inbox_dir(root)).map_err(|e| format!("Create inbox dir: {e}"))?;
+    // Compact, unlike the day files: it is rewritten on every flush of a batch
+    // that is dropping papers, and nobody reads it by hand.
+    let content =
+        serde_json::to_string(list).map_err(|e| format!("Serialize {FILTERED_FILE}: {e}"))?;
+    crate::fsutil::atomic_write_str(&path, &content)
+        .map_err(|e| format!("Write {FILTERED_FILE}: {e}"))
+}
+
+fn filtered_entry(paper: ArxivPaper, threshold: f32) -> ArxivFilteredPaper {
+    ArxivFilteredPaper {
+        paper,
+        filtered_at: chrono::Local::now().to_rfc3339(),
+        filter_threshold: threshold,
+    }
+}
+
+/// Put papers at the front of the record, replacing older entries for the same
+/// ids. The caller holds `inbox_lock`. A failure to write is logged rather than
+/// returned: the inbox itself is already written, and the record is a courtesy.
+fn record_filtered(root: &str, mut entries: Vec<ArxivFilteredPaper>) {
+    if entries.is_empty() {
+        return;
+    }
+    // A paper can sit in two day files, and so be dropped twice in one pass.
+    let mut seen: HashSet<String> = HashSet::new();
+    entries.extend(read_filtered(root));
+    entries.retain(|e| seen.insert(e.paper.arxiv_id.clone()));
+    entries.truncate(FILTERED_KEEP);
+    if let Err(e) = write_filtered(root, &entries) {
+        eprintln!("[arxiv] record filtered papers: {e}");
+    }
+}
+
+pub fn get_filtered(root: &str) -> Vec<ArxivFilteredPaper> {
+    read_filtered(root)
+}
+
+/// Put filtered papers back into the inbox, analysis and all, and drop them
+/// from the record. One that is in the inbox again already — fetched again
+/// since — or was imported meanwhile is only dropped from the record.
+pub fn restore_filtered(root: &str, arxiv_ids: &[String]) -> Result<ArxivInbox, String> {
+    let guard = inbox_lock();
+    let wanted: HashSet<&str> = arxiv_ids.iter().map(String::as_str).collect();
+    let (back, keep): (Vec<_>, Vec<_>) = read_filtered(root)
+        .into_iter()
+        .partition(|e| wanted.contains(e.paper.arxiv_id.as_str()));
+    if !back.is_empty() {
+        let mut present = collect_library_arxiv_ids(root);
+        for date in list_day_dates(root) {
+            present.extend(read_day_papers(root, &date).into_iter().map(|p| p.arxiv_id));
+        }
+        let mut by_date: HashMap<String, Vec<ArxivPaper>> = HashMap::new();
+        for entry in back {
+            let mut p = entry.paper;
+            if present.contains(&p.arxiv_id) {
+                continue;
+            }
+            p.analysis_status = "done".to_string();
+            p.analysis_error = None;
+            p.kept = true;
+            by_date.entry(date_from_fetched_at(&p.fetched_at)).or_default().push(p);
+        }
+        for (date, papers) in by_date {
+            // An unreadable day file is never written over; the record keeps
+            // every paper that could not go back.
+            let mut day = read_day_papers_checked(root, &date)
+                .map_err(|e| format!("{e}。这篇论文没有恢复，请检查或移走这个文件后重试。"))?;
+            day.extend(papers);
+            mark_in_library_statuses(root, &mut day);
+            write_day_papers(root, &date, &day)?;
+        }
+        write_filtered(root, &keep)?;
+    }
+    drop(guard);
+    Ok(get_inbox(root))
+}
+
+pub fn clear_filtered(root: &str) -> Result<(), String> {
+    let _guard = inbox_lock();
+    write_filtered(root, &[])
 }
 
 /// Mark a single paper as read in the dedicated state file.
@@ -697,6 +819,7 @@ pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<Arxiv
                     new_p.analysis_summary = old_p.analysis_summary;
                     new_p.matched_topics = old_p.matched_topics;
                     new_p.analysis_error = old_p.analysis_error;
+                    new_p.kept = old_p.kept;
                     // The state file is the authority for these, but a copy
                     // baked into the day file is all there is when that file
                     // is gone — and a fresh fetch knows neither.
@@ -748,6 +871,7 @@ pub fn merge_into_inbox(root: &str, new_papers: Vec<ArxivPaper>) -> Result<Arxiv
 
 // ── AI Analysis ───────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct AnalysisResult {
     relevance_score: f32,
     relevance_reason: String,
@@ -756,19 +880,11 @@ struct AnalysisResult {
     matched_topics: Vec<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct RawAnalysisResult {
-    #[serde(default)]
-    relevance_score: serde_json::Value,
-    #[serde(default)]
-    relevance_reason: Option<String>,
-    #[serde(default)]
-    key_contributions: Option<Vec<String>>,
-    #[serde(default, rename = "summary")]
-    summary: Option<String>,
-    #[serde(default)]
-    matched_topics: Option<Vec<String>>,
-}
+/// The analysis object in a model reply, every field still the JSON value the
+/// model sent. Typing it at this stage made one mismatched field — a list where
+/// a string was asked for — fail the whole paper; the fields are converted
+/// leniently in [`parse_analysis_result`] instead.
+type RawAnalysis = serde_json::Map<String, serde_json::Value>;
 
 const ANALYSIS_SYSTEM_PROMPT: &str =
     "你是一名严谨的研究助理。请只输出用户要求的有效 JSON，不要添加 Markdown 或解释。";
@@ -813,17 +929,145 @@ fn build_analysis_messages(
     (system, user)
 }
 
+/// The score as a number. A string is read up to its first non-numeric
+/// character, so `"7"`, `"7分"` and `"7/10"` all count as 7.
 fn parse_score(value: &serde_json::Value) -> Result<f32, String> {
+    const MESSAGE: &str = "relevance_score must be a number from 0 to 10";
     if let Some(n) = value.as_f64() {
         return Ok(n as f32);
     }
-    if let Some(s) = value.as_str() {
-        return s
-            .trim()
-            .parse::<f32>()
-            .map_err(|_| "relevance_score must be a number from 0 to 10".to_string());
+    let s = value.as_str().ok_or_else(|| MESSAGE.to_string())?.trim();
+    let end = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    s[..end].parse::<f32>().map_err(|_| MESSAGE.to_string())
+}
+
+/// A text field: a string, or a list where one string was asked for, joined.
+/// `None` when there is nothing in it.
+fn json_text(value: &serde_json::Value) -> Option<String> {
+    let text = match value {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(items) => {
+            let mut out = String::new();
+            for piece in items.iter().filter_map(json_text) {
+                match out.chars().last() {
+                    None => {}
+                    Some('。' | '！' | '？' | '；') => {}
+                    Some('.' | '!' | '?' | ';') => out.push(' '),
+                    Some(_) => out.push('；'),
+                }
+                out.push_str(&piece);
+            }
+            out
+        }
+        _ => String::new(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// A list field: a list, or one string where a list was asked for — one item
+/// per line, and for `tags` also per comma, with list markers dropped.
+fn json_list(value: &serde_json::Value, tags: bool) -> Vec<String> {
+    match value {
+        serde_json::Value::Array(items) => items.iter().filter_map(json_text).collect(),
+        serde_json::Value::String(s) => s
+            .split(|c: char| c == '\n' || (tags && matches!(c, ',' | '，' | '、' | ';' | '；')))
+            .map(|item| strip_list_marker(item).to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+        _ => Vec::new(),
     }
-    Err("relevance_score must be a number from 0 to 10".to_string())
+}
+
+/// `- a`, `• a`, `1. a`, `1、a`, `1) a` → `a`. A number that is the text
+/// itself — `3D 重建`, `1.5 倍加速` — is left alone.
+fn strip_list_marker(item: &str) -> &str {
+    let item = item.trim();
+    if let Some(rest) = item.strip_prefix(['-', '*', '•', '·']) {
+        return rest.trim_start();
+    }
+    let digits = item.find(|c: char| !c.is_ascii_digit()).unwrap_or(item.len());
+    if digits > 0 {
+        if let Some(rest) = item[digits..].strip_prefix(['.', '、', ')', '）']) {
+            if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+                return rest.trim_start();
+            }
+        }
+    }
+    item
+}
+
+/// The first JSON value at the start of `text`, if it is an object carrying a
+/// `relevance_score`. Whatever follows the value is ignored.
+fn object_with_score(text: &str) -> Option<RawAnalysis> {
+    let mut values = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
+    match values.next() {
+        Some(Ok(serde_json::Value::Object(obj)))
+            if obj.get("relevance_score").is_some_and(|v| !v.is_null()) =>
+        {
+            Some(obj)
+        }
+        _ => None,
+    }
+}
+
+/// Escape what makes a reply's strings invalid JSON: raw line breaks and other
+/// control characters, and double quotes left unescaped inside a value —
+/// `"提出了一种"先高亮后摘要"的方法"`, which is how MiniMax writes a Chinese
+/// quotation, and which failed that paper on every retry.
+///
+/// A `"` inside a string closes it only when what follows could follow a
+/// string in JSON (see [`closes_string`]); any other is taken as part of the
+/// text. `text` must start outside a string. Only ever applied to a reply that
+/// has already failed to parse as it is, so valid JSON is never rewritten.
+fn repair_json_strings(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 16);
+    let (mut in_string, mut escaped) = (false, false);
+    for (i, &c) in chars.iter().enumerate() {
+        if !in_string {
+            in_string = c == '"';
+            out.push(c);
+        } else if escaped {
+            escaped = false;
+            out.push(c);
+        } else {
+            match c {
+                '\\' => {
+                    escaped = true;
+                    out.push(c);
+                }
+                '"' if closes_string(&chars[i + 1..]) => {
+                    in_string = false;
+                    out.push(c);
+                }
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+    }
+    out
+}
+
+/// Whether a `"` followed by `rest` can be the end of a JSON string: next comes
+/// `:` (it was a key), the end of an object or list, the end of the text, or a
+/// comma leading into another key or element.
+fn closes_string(rest: &[char]) -> bool {
+    let mut next = rest.iter().copied().filter(|c| !c.is_whitespace());
+    match next.next() {
+        None | Some(':' | '}' | ']') => true,
+        Some(',') => matches!(
+            next.next(),
+            None | Some('"' | '{' | '[' | '}' | ']' | '-' | '0'..='9')
+        ),
+        Some(_) => false,
+    }
 }
 
 /// The analysis object in a model reply.
@@ -835,45 +1079,53 @@ fn parse_score(value: &serde_json::Value) -> Result<f32, String> {
 /// echoes the schema — a draft that the old first-`{`-to-last-`}` slice glued
 /// onto the real answer and then failed to parse. Scanning from the end picks
 /// the model's final answer over any draft before it.
-fn extract_analysis_json(content: &str) -> Result<RawAnalysisResult, String> {
+///
+/// A candidate that does not parse is tried once more through
+/// [`repair_json_strings`] before the scan moves on, so an answer with a stray
+/// quote in it still wins over a valid draft earlier in the reply.
+fn extract_analysis_json(content: &str) -> Result<RawAnalysis, String> {
     let trimmed = content.trim();
-    let whole = serde_json::from_str::<RawAnalysisResult>(trimmed);
-    if let Ok(raw) = &whole {
-        if !raw.relevance_score.is_null() {
-            return whole.map_err(|e| e.to_string());
+    let whole = serde_json::from_str::<serde_json::Value>(trimmed);
+    if let Ok(serde_json::Value::Object(obj)) = &whole {
+        if obj.get("relevance_score").is_some_and(|v| !v.is_null()) {
+            return Ok(obj.clone());
         }
     }
-    let starts: Vec<usize> = trimmed.match_indices('{').map(|(i, _)| i).collect();
-    for i in starts.into_iter().rev() {
-        let mut values =
-            serde_json::Deserializer::from_str(&trimmed[i..]).into_iter::<serde_json::Value>();
-        if let Some(Ok(value)) = values.next() {
-            if value.get("relevance_score").is_some_and(|v| !v.is_null()) {
-                if let Ok(raw) = serde_json::from_value::<RawAnalysisResult>(value) {
-                    return Ok(raw);
-                }
+    for (i, _) in trimmed.rmatch_indices('{') {
+        let tail = &trimmed[i..];
+        if let Some(obj) = object_with_score(tail) {
+            return Ok(obj);
+        }
+        let repaired = repair_json_strings(tail);
+        if repaired != tail {
+            if let Some(obj) = object_with_score(&repaired) {
+                return Ok(obj);
             }
         }
     }
-    whole.map_err(|e| e.to_string())
+    match whole {
+        // Valid JSON without a score: `parse_score` says what is missing.
+        Ok(serde_json::Value::Object(obj)) => Ok(obj),
+        Ok(_) => Err("the reply is not a JSON object".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn parse_analysis_result(content: &str) -> Result<AnalysisResult, String> {
     let preview: String = content.chars().take(200).collect();
     let raw = extract_analysis_json(content)
         .map_err(|e| format!("Parse AI JSON: {e}\nContent was: {preview}"))?;
-    let relevance_score = parse_score(&raw.relevance_score)?;
-    let relevance_reason = raw
-        .relevance_reason
-        .filter(|s| !s.trim().is_empty())
+    let field = |key: &str| raw.get(key).unwrap_or(&serde_json::Value::Null);
+    let relevance_score = parse_score(field("relevance_score"))?;
+    let relevance_reason = json_text(field("relevance_reason"))
         .ok_or_else(|| "AI response missing relevance_reason".to_string())?;
 
     Ok(AnalysisResult {
         relevance_score,
         relevance_reason,
-        key_contributions: raw.key_contributions.unwrap_or_default(),
-        summary: raw.summary.filter(|s| !s.trim().is_empty()),
-        matched_topics: raw.matched_topics.unwrap_or_default(),
+        key_contributions: json_list(field("key_contributions"), false),
+        summary: json_text(field("summary")),
+        matched_topics: json_list(field("matched_topics"), true),
     })
 }
 
@@ -962,6 +1214,12 @@ fn analysis_pause() -> &'static Mutex<Option<ArxivAnalysisPause>> {
 fn last_analysis_run() -> &'static Mutex<Option<ArxivAnalysisRun>> {
     static RUN: OnceLock<Mutex<Option<ArxivAnalysisRun>>> = OnceLock::new();
     RUN.get_or_init(Default::default)
+}
+
+/// Outcomes of the running batch so far — for `get_schedule_status` too.
+fn run_counts() -> &'static Mutex<ArxivRunCounts> {
+    static COUNTS: OnceLock<Mutex<ArxivRunCounts>> = OnceLock::new();
+    COUNTS.get_or_init(Default::default)
 }
 
 fn epoch_ms() -> u64 {
@@ -1067,8 +1325,9 @@ fn claim_papers_for_analysis(root: &str) -> Claimed {
 /// What the batch decided for one paper, waiting to be written.
 enum PaperUpdate {
     Done(AnalysisResult),
-    /// Scored below the filter threshold: dropped from the inbox.
-    Remove,
+    /// Scored below the filter threshold (the second field): out of the inbox
+    /// and into the filtered record.
+    Remove(AnalysisResult, f32),
     Failed(String),
     /// Not finished in this run: back to the status it had before.
     Revert(String),
@@ -1096,17 +1355,29 @@ fn apply_updates(
         .cloned()
         .collect();
     let mut found: HashSet<String> = HashSet::new();
+    let mut dropped: Vec<ArxivFilteredPaper> = Vec::new();
     for date in &expected {
-        apply_updates_to_day(root, date, &updates, &mut found);
+        apply_updates_to_day(root, date, &updates, &mut found, &mut dropped);
     }
     updates.retain(|id, _| !found.contains(id));
     if !updates.is_empty() {
         for date in list_day_dates(root) {
             if !expected.contains(&date) {
-                apply_updates_to_day(root, &date, &updates, &mut found);
+                apply_updates_to_day(root, &date, &updates, &mut found, &mut dropped);
             }
         }
     }
+    record_filtered(root, dropped);
+}
+
+fn apply_result(p: &mut ArxivPaper, r: &AnalysisResult) {
+    p.relevance_score = Some(r.relevance_score.clamp(0.0, 10.0));
+    p.relevance_reason = Some(r.relevance_reason.clone());
+    p.key_contributions = r.key_contributions.clone();
+    p.analysis_summary = r.summary.clone();
+    p.matched_topics = r.matched_topics.clone();
+    p.analysis_status = "done".to_string();
+    p.analysis_error = None;
 }
 
 fn apply_updates_to_day(
@@ -1114,6 +1385,7 @@ fn apply_updates_to_day(
     date: &str,
     updates: &HashMap<String, PaperUpdate>,
     found: &mut HashSet<String>,
+    dropped: &mut Vec<ArxivFilteredPaper>,
 ) {
     let Some(mut papers) = read_day_papers_strict(root, date) else { return };
     let mut changed = false;
@@ -1128,18 +1400,14 @@ fn apply_updates_to_day(
             return true;
         }
         match update {
-            PaperUpdate::Remove => {
+            PaperUpdate::Remove(r, threshold) => {
+                apply_result(p, r);
+                dropped.push(filtered_entry(p.clone(), *threshold));
                 changed = true;
                 return false;
             }
             PaperUpdate::Done(r) => {
-                p.relevance_score = Some(r.relevance_score.clamp(0.0, 10.0));
-                p.relevance_reason = Some(r.relevance_reason.clone());
-                p.key_contributions = r.key_contributions.clone();
-                p.analysis_summary = r.summary.clone();
-                p.matched_topics = r.matched_topics.clone();
-                p.analysis_status = "done".to_string();
-                p.analysis_error = None;
+                apply_result(p, r);
                 changed = true;
             }
             PaperUpdate::Failed(message) => {
@@ -1206,6 +1474,11 @@ struct BatchTuning {
     raise_after: u32,
     /// How far down the queue a paper goes back in after a transient failure.
     requeue_gap: usize,
+    /// Least time between two request starts; zero for none. Set from the
+    /// provider's published limits (`minimax::batch_pacing`), so a batch — and
+    /// every resume after a pause — ramps up instead of firing all its workers
+    /// in the same instant.
+    min_interval: Duration,
     poll: Duration,
 }
 
@@ -1217,6 +1490,7 @@ const BATCH_TUNING: BatchTuning = BatchTuning {
     failure_streak_limit: 12,
     raise_after: 8,
     requeue_gap: 20,
+    min_interval: Duration::ZERO,
     poll: Duration::from_millis(250),
 };
 
@@ -1232,6 +1506,8 @@ struct Throttle {
     paused_until: Option<Instant>,
     /// Last time the provider answered anything (a result or a per-paper error).
     last_answer: Instant,
+    /// When the next request may go out (see `BatchTuning::min_interval`).
+    next_start: Instant,
     successes: u32,
     failure_streak: u32,
     /// Set once the batch must stop; the reason is shown to the user.
@@ -1248,6 +1524,7 @@ impl Throttle {
             level: 0,
             paused_until: None,
             last_answer: now,
+            next_start: now,
             successes: 0,
             failure_streak: 0,
             stop: None,
@@ -1405,6 +1682,7 @@ async fn batch_worker(
             if batch.cancel.load(Ordering::SeqCst) {
                 return;
             }
+            let mut wait = tuning.poll;
             {
                 let mut t = locked(&batch.throttle);
                 if t.stop.is_some() {
@@ -1414,16 +1692,21 @@ async fn batch_worker(
                 if queue.is_empty() {
                     return;
                 }
-                if !t.paused(Instant::now()) && t.in_flight < t.limit {
-                    if let Some((paper, attempts)) = queue.pop_front() {
+                let now = Instant::now();
+                if !t.paused(now) && t.in_flight < t.limit {
+                    if now < t.next_start {
+                        // Paced: come back when the next start is due.
+                        wait = wait.min(t.next_start - now);
+                    } else if let Some((paper, attempts)) = queue.pop_front() {
                         t.in_flight += 1;
+                        t.next_start = now + tuning.min_interval;
                         drop(queue);
                         drop(t);
                         break (paper, attempts, Slot(&batch.throttle));
                     }
                 }
             }
-            tokio::time::sleep(tuning.poll).await;
+            tokio::time::sleep(wait).await;
         };
 
         let id = paper.arxiv_id.clone();
@@ -1457,7 +1740,13 @@ async fn batch_worker(
                             let pause = t.on_transient(now, &message, &tuning);
                             (pause, t.stop.is_some(), t.limit, others_answered)
                         };
-                        let attempts = attempts + u32::from(others_answered);
+                        // A throttle lands on whichever paper happened to be
+                        // next — never that paper's fault — so only the other
+                        // transient errors (a timeout, a 5xx) count towards
+                        // giving up on it. Throttling that never lets up is
+                        // the stall limit's business, which reverts.
+                        let counts = others_answered && !llm::is_throttle(&message);
+                        let attempts = attempts + u32::from(counts);
                         if let Some(retry_in) = pause {
                             let _ = tx.send(BatchMsg::Waiting {
                                 message: message.clone(),
@@ -1688,7 +1977,22 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
         config.keywords.join(", ")
     };
 
-    let concurrency = config.ai_analysis_concurrency.clamp(1, 10) as usize;
+    let mut concurrency = config.ai_analysis_concurrency.clamp(1, 10) as usize;
+    // MiniMax publishes its limits, so the batch keeps under them rather than
+    // finding them by being throttled: fewer in flight on a Token Plan key,
+    // and request starts spaced to the model's RPM on every key.
+    let mut tuning = BATCH_TUNING;
+    let mut concurrency_note: Option<String> = None;
+    if crate::minimax::is_minimax(&provider) {
+        let pacing = crate::minimax::batch_pacing(&api_key, &model);
+        tuning.min_interval = pacing.min_interval;
+        if let Some(cap) = pacing.max_in_flight.filter(|cap| concurrency > *cap) {
+            concurrency = cap;
+            concurrency_note = Some(format!(
+                "MiniMax Token Plan 最多同时 {cap} 个请求（官方：高峰时 Plus 约 3–4 个）"
+            ));
+        }
+    }
 
     // Atomically claim the "running" flag: only the caller that flips it from
     // false→true proceeds; concurrent callers see it already set and bail out.
@@ -1700,6 +2004,7 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
     }
     let _running = RunningFlag;
     *locked(analysis_pause()) = None;
+    *locked(run_counts()) = ArxivRunCounts::default();
     analysis_cancel().store(false, Ordering::SeqCst);
     analysis_progress_done().store(0, Ordering::SeqCst);
     analysis_progress_total().store(0, Ordering::SeqCst);
@@ -1734,7 +2039,8 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
 
     let _ = app.emit("arxiv-analysis", serde_json::json!({
         "done": 0, "total": total, "arxiv_id": "", "status": "started", "bulk": true,
-        "retrying_failed": retrying_failed
+        "retrying_failed": retrying_failed,
+        "concurrency": concurrency, "concurrency_note": concurrency_note
     }));
 
     let prompt_template = if config.ai_analysis_prompt.trim().is_empty() {
@@ -1762,14 +2068,17 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
     };
 
     let (batch, mut rx) =
-        spawn_batch(papers, concurrency, analysis_cancel().clone(), BATCH_TUNING, analyze);
+        spawn_batch(papers, concurrency, analysis_cancel().clone(), tuning, analyze);
 
     // Papers without a final result yet, with the status to restore if the
     // run ends before they get one.
     let mut outstanding = original;
     let mut buffer: HashMap<String, PaperUpdate> = HashMap::new();
     let mut last_flush = Instant::now();
-    let (mut succeeded, mut failed, mut filtered) = (0u32, 0u32, 0u32);
+    // Sent with every result, so the window can say how many were kept and
+    // how many left the inbox as they go — without it, a fast model filtering
+    // most papers out looked like one failing them all.
+    let mut counts = ArxivRunCounts::default();
     let done_arc = analysis_progress_done().clone();
 
     loop {
@@ -1808,6 +2117,12 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
                 let done_val = done_arc.fetch_add(1, Ordering::SeqCst) + 1;
                 let score = result.relevance_score.clamp(0.0, 10.0);
                 let removed = filter_enabled && score < filter_threshold;
+                if removed {
+                    counts.filtered += 1;
+                } else {
+                    counts.succeeded += 1;
+                }
+                *locked(run_counts()) = counts;
                 let _ = app.emit("arxiv-analysis", serde_json::json!({
                     "done": done_val, "total": total,
                     "arxiv_id": &id,
@@ -1817,25 +2132,31 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
                     "reason": &result.relevance_reason,
                     "key_contributions": &result.key_contributions,
                     "analysis_summary": &result.summary,
-                    "matched_topics": &result.matched_topics
+                    "matched_topics": &result.matched_topics,
+                    "succeeded": counts.succeeded, "filtered": counts.filtered,
+                    "failed": counts.failed
                 }));
-                if removed {
-                    filtered += 1;
-                    buffer.insert(id, PaperUpdate::Remove);
-                } else {
-                    succeeded += 1;
-                    buffer.insert(id, PaperUpdate::Done(result));
-                }
+                buffer.insert(
+                    id,
+                    if removed {
+                        PaperUpdate::Remove(result, filter_threshold)
+                    } else {
+                        PaperUpdate::Done(result)
+                    },
+                );
             }
             Some(BatchMsg::Outcome(id, Outcome::Failed(message))) => {
                 outstanding.remove(&id);
-                failed += 1;
+                counts.failed += 1;
+                *locked(run_counts()) = counts;
                 let done_val = done_arc.fetch_add(1, Ordering::SeqCst) + 1;
                 eprintln!("Analysis error for {}: {}", id, message);
                 let _ = app.emit("arxiv-analysis", serde_json::json!({
                     "done": done_val, "total": total,
                     "arxiv_id": &id, "status": "failed",
-                    "bulk": true, "message": &message
+                    "bulk": true, "message": &message,
+                    "succeeded": counts.succeeded, "filtered": counts.filtered,
+                    "failed": counts.failed
                 }));
                 buffer.insert(id, PaperUpdate::Failed(message));
             }
@@ -1854,6 +2175,7 @@ pub async fn start_analysis(root: &str, app: &tauri::AppHandle) -> Result<(), St
     }
     flush_updates(root, buffer, &dates).await;
 
+    let ArxivRunCounts { succeeded, filtered, failed } = counts;
     let stopped_reason = locked(&batch.throttle).stop.clone();
     let cancelled = analysis_cancel().load(Ordering::SeqCst);
     if let Some(reason) = &stopped_reason {
@@ -2277,6 +2599,7 @@ pub fn get_schedule_status(root: &str) -> ArxivScheduleStatus {
             None
         },
         last_run: if analyzing { None } else { locked(last_analysis_run()).clone() },
+        run_counts: if analyzing { Some(*locked(run_counts())) } else { None },
     }
 }
 
@@ -2782,6 +3105,7 @@ mod tests {
             read: false,
             rating: 0,
             source: None,
+            kept: false,
         }
     }
 
@@ -2869,6 +3193,70 @@ mod tests {
         assert!(err.contains("relevance_score"), "{err}");
     }
 
+    #[test]
+    fn unescaped_quotes_inside_a_chinese_value_are_read_as_text() {
+        // MiniMax-M3's reply for 2609.31382, verbatim in shape: it failed with
+        // "expected `,` or `}`" on every retry.
+        let reply = r#"{"relevance_score": 2, "relevance_reason": "与所列主题均无关。", "key_contributions": ["提出H2S范式"], "summary": "这篇论文提出了一种"先高亮后摘要"的方法，让模型先找出"关键证据"。", "matched_topics": []}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(reply).is_err());
+        let r = parse_analysis_result(reply).unwrap();
+        assert_eq!(r.relevance_score, 2.0);
+        assert_eq!(
+            r.summary.as_deref(),
+            Some(r#"这篇论文提出了一种"先高亮后摘要"的方法，让模型先找出"关键证据"。"#)
+        );
+        assert_eq!(r.key_contributions, vec!["提出H2S范式"]);
+
+        // Before a closing brace, a comma into the next key, or a quote that
+        // ends a list element, the quote is the real end of the string.
+        let reply = "{\"relevance_score\": 6, \"relevance_reason\": \"称为\"X\"\", \"matched_topics\": [\"A\", \"B\"]}";
+        let r = parse_analysis_result(reply).unwrap();
+        assert_eq!(r.relevance_reason, "称为\"X\"");
+        assert_eq!(r.matched_topics, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn raw_line_breaks_inside_a_value_are_escaped() {
+        let reply = "{\"relevance_score\": 7, \"relevance_reason\": \"第一行\n第二行\", \"summary\": \"s\"}";
+        assert_eq!(parse_analysis_result(reply).unwrap().relevance_reason, "第一行\n第二行");
+    }
+
+    #[test]
+    fn a_repaired_answer_still_wins_over_a_valid_draft_before_it() {
+        let reply = concat!(
+            r#"草稿：{"relevance_score": 0, "relevance_reason": "占位"}"#,
+            "\n",
+            r#"{"relevance_score": 8, "relevance_reason": "提出"组合泛化"基准", "summary": "s"}"#
+        );
+        let r = parse_analysis_result(reply).unwrap();
+        assert_eq!(r.relevance_score, 8.0);
+        assert_eq!(r.relevance_reason, r#"提出"组合泛化"基准"#);
+    }
+
+    #[test]
+    fn valid_json_is_never_rewritten() {
+        // An escaped quote and a backslash survive exactly as sent.
+        let reply = r#"{"relevance_score": 5, "relevance_reason": "称为\"X\"，路径 C:\\data", "summary": "s"}"#;
+        assert_eq!(parse_analysis_result(reply).unwrap().relevance_reason, r#"称为"X"，路径 C:\data"#);
+    }
+
+    #[test]
+    fn a_list_where_a_string_was_asked_for_and_the_other_way_round() {
+        // "invalid type: sequence, expected a string" used to fail the paper.
+        let reply = r#"{"relevance_score": "7分", "relevance_reason": ["与组合泛化相关。", "方法新颖"], "key_contributions": "1. 提出A\n2. 提出B\n- 3D 重建", "summary": ["第一句。", "第二句。"], "matched_topics": "AI for Biology，Compositional Generalization"}"#;
+        let r = parse_analysis_result(reply).unwrap();
+        assert_eq!(r.relevance_score, 7.0);
+        assert_eq!(r.relevance_reason, "与组合泛化相关。方法新颖");
+        assert_eq!(r.key_contributions, vec!["提出A", "提出B", "3D 重建"]);
+        assert_eq!(r.summary.as_deref(), Some("第一句。第二句。"));
+        assert_eq!(r.matched_topics, vec!["AI for Biology", "Compositional Generalization"]);
+
+        assert_eq!(parse_score(&serde_json::json!("7/10")).unwrap(), 7.0);
+        assert_eq!(parse_score(&serde_json::json!(" 6.5 ")).unwrap(), 6.5);
+        assert!(parse_score(&serde_json::json!("高")).is_err());
+        assert_eq!(strip_list_marker("1.5 倍加速"), "1.5 倍加速");
+    }
+
     // ── Throttle ─────────────────────────────────────────────────────────────
 
     const FAST: BatchTuning = BatchTuning {
@@ -2879,6 +3267,7 @@ mod tests {
         failure_streak_limit: 4,
         raise_after: 2,
         requeue_gap: 4,
+        min_interval: Duration::ZERO,
         poll: Duration::from_millis(2),
     };
 
@@ -3120,6 +3509,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_throttled_paper_is_never_failed_while_others_get_through() {
+        // p0 is throttled on each of its first eight tries — more than
+        // max_attempts — while everyone else is answered. Which paper a
+        // throttle lands on is chance: p0 waits its turn and is analysed.
+        let p0_tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tries = p0_tries.clone();
+        let analyze: AnalyzeFn = Arc::new(move |p: ArxivPaper| {
+            let throttled = p.arxiv_id == "p0" && tries.fetch_add(1, Ordering::SeqCst) < 8;
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                if throttled {
+                    Err(CallError::Llm(
+                        "Token Plan 请求过于频繁，已被限流，请稍后重试：已达到 Token Plan 速率限制 (2062)".into(),
+                    ))
+                } else {
+                    Ok(ok_result())
+                }
+            })
+        });
+        let tuning = BatchTuning { max_attempts: 3, ..FAST };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (seen, stop) = run_with(papers(60), 3, analyze, cancel, tuning).await;
+        assert_eq!(stop, None, "{seen:?}");
+        assert!(seen.failed.is_empty(), "{seen:?}");
+        assert_eq!(seen.done.len(), 60);
+        assert!(p0_tries.load(Ordering::SeqCst) > 8);
+    }
+
+    #[tokio::test]
+    async fn request_starts_are_spaced_by_the_pacing_interval() {
+        let starts = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let log = starts.clone();
+        let analyze: AnalyzeFn = Arc::new(move |_p: ArxivPaper| {
+            locked(&log).push(Instant::now());
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok(ok_result())
+            })
+        });
+        let gap = Duration::from_millis(25);
+        let tuning = BatchTuning { min_interval: gap, ..FAST };
+        // Eight workers for six papers: only the pacing holds them back.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (seen, stop) = run_with(papers(6), 8, analyze, cancel, tuning).await;
+        assert_eq!((seen.done.len(), stop), (6, None));
+        let starts = locked(&starts).clone();
+        assert_eq!(starts.len(), 6);
+        for pair in starts.windows(2) {
+            // The mark is set a moment before the call is logged.
+            let apart = pair[1] - pair[0];
+            assert!(apart >= gap - Duration::from_millis(3), "{apart:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn cancelling_drops_the_requests_in_flight() {
         let analyze: AnalyzeFn = Arc::new(|_p: ArxivPaper| {
             Box::pin(async {
@@ -3235,7 +3679,8 @@ mod tests {
         updates.insert("a".to_string(), PaperUpdate::Done(ok_result()));
         updates.insert("b".to_string(), PaperUpdate::Revert(claimed.original["b"].clone()));
         updates.insert("c".to_string(), PaperUpdate::Failed("API error 400: bad".into()));
-        updates.insert("d".to_string(), PaperUpdate::Remove);
+        let low = AnalysisResult { relevance_score: 2.0, relevance_reason: "无关".into(), ..ok_result() };
+        updates.insert("d".to_string(), PaperUpdate::Remove(low, 6.0));
         updates.insert("moved".to_string(), PaperUpdate::Done(ok_result()));
         apply_updates(&root, updates, &claimed.dates);
 
@@ -3247,6 +3692,110 @@ mod tests {
         );
         assert_eq!(status_on_disk(&root, "d"), None, "filtered out");
         assert_eq!(status_on_disk(&root, "moved").unwrap().0, "done");
+        // ...and into the record, with the analysis that put it there.
+        let record = get_filtered(&root);
+        assert_eq!(record.len(), 1);
+        assert_eq!(record[0].paper.arxiv_id, "d");
+        assert_eq!(record[0].paper.relevance_score, Some(2.0));
+        assert_eq!(record[0].paper.relevance_reason.as_deref(), Some("无关"));
+        assert_eq!(record[0].paper.analysis_status, "done");
+        assert_eq!(record[0].filter_threshold, 6.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn scored(id: &str, score: f32) -> ArxivPaper {
+        ArxivPaper {
+            relevance_score: Some(score),
+            relevance_reason: Some("r".into()),
+            ..with_status(id, "done")
+        }
+    }
+
+    #[test]
+    fn the_record_is_newest_first_without_repeats_and_capped() {
+        let root = temp_root();
+        let _guard = inbox_lock();
+        record_filtered(&root, vec![filtered_entry(scored("a", 1.0), 6.0)]);
+        record_filtered(&root, vec![filtered_entry(scored("b", 2.0), 6.0)]);
+        // "a" filtered again, twice in one pass (it sat in two day files).
+        record_filtered(
+            &root,
+            vec![filtered_entry(scored("a", 3.0), 6.0), filtered_entry(scored("a", 3.0), 6.0)],
+        );
+        let ids: Vec<String> = read_filtered(&root).into_iter().map(|e| e.paper.arxiv_id).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(read_filtered(&root)[0].paper.relevance_score, Some(3.0));
+
+        let many = (0..FILTERED_KEEP + 7).map(|i| filtered_entry(scored(&format!("p{i}"), 1.0), 6.0));
+        record_filtered(&root, many.collect());
+        let record = read_filtered(&root);
+        assert_eq!(record.len(), FILTERED_KEEP);
+        assert_eq!(record[0].paper.arxiv_id, "p0");
+        // The record is not a day file, whatever else lives in the folder.
+        assert!(list_day_dates(&root).is_empty());
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_restored_paper_comes_back_analysed_and_the_threshold_leaves_it_alone() {
+        let root = temp_root();
+        {
+            let _guard = inbox_lock();
+            record_filtered(
+                &root,
+                vec![
+                    filtered_entry(scored("low", 3.0), 6.0),
+                    filtered_entry(scored("again", 2.0), 6.0),
+                    filtered_entry(scored("other", 1.0), 6.0),
+                ],
+            );
+        }
+        // "again" was fetched again since, and is waiting for analysis.
+        write_day_papers(&root, "2026-09-20", &[with_status("again", "pending")]).unwrap();
+
+        let inbox = restore_filtered(&root, &["low".into(), "again".into()]).unwrap();
+        let low = inbox.papers.iter().find(|p| p.arxiv_id == "low").unwrap();
+        assert_eq!(low.analysis_status, "done");
+        assert_eq!(low.relevance_score, Some(3.0));
+        assert!(low.kept);
+        let again: Vec<_> = inbox.papers.iter().filter(|p| p.arxiv_id == "again").collect();
+        assert_eq!(again.len(), 1, "not added a second time");
+        assert_eq!(again[0].analysis_status, "pending", "the fresh copy is left as it is");
+        let left: Vec<String> = get_filtered(&root).into_iter().map(|e| e.paper.arxiv_id).collect();
+        assert_eq!(left, vec!["other"]);
+
+        // The refresh button prunes below the threshold — but not what the
+        // user put back, while what it does prune goes into the record.
+        write_day_papers(
+            &root,
+            "2026-09-21",
+            &[ArxivPaper { fetched_at: "2026-09-21T03:00:00Z".into(), ..scored("stale", 1.0) }],
+        )
+        .unwrap();
+        let pruned = prune_low_relevance(&root).unwrap();
+        assert!(pruned.papers.iter().any(|p| p.arxiv_id == "low"));
+        assert!(!pruned.papers.iter().any(|p| p.arxiv_id == "stale"));
+        assert_eq!(get_filtered(&root)[0].paper.arxiv_id, "stale");
+
+        // A re-fetch keeps the mark.
+        let refetched = ArxivPaper { kept: false, ..with_status("low", "pending") };
+        let inbox = merge_into_inbox(&root, vec![refetched]).unwrap();
+        assert!(inbox.papers.iter().find(|p| p.arxiv_id == "low").unwrap().kept);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_restore_never_writes_over_an_unreadable_day_file() {
+        let root = temp_root();
+        {
+            let _guard = inbox_lock();
+            record_filtered(&root, vec![filtered_entry(scored("a", 3.0), 6.0)]);
+        }
+        std::fs::write(day_file(&root, "2026-09-20"), "{ not json").unwrap();
+        assert!(restore_filtered(&root, &["a".into()]).is_err());
+        assert_eq!(std::fs::read_to_string(day_file(&root, "2026-09-20")).unwrap(), "{ not json");
+        assert_eq!(get_filtered(&root).len(), 1, "still in the record");
         let _ = std::fs::remove_dir_all(&root);
     }
 

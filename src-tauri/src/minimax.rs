@@ -254,6 +254,66 @@ pub fn code_class(code: u32) -> Option<crate::llm::ErrorClass> {
     })
 }
 
+/// Whether a MiniMax code means "slow down": an RPM/TPM or connection limit, a
+/// rate-growth limit, the Token Plan's rate limit, the peak-hour overload. None
+/// of these is ever the request's own fault — unlike the other transient codes
+/// (unknown, timeout, internal and system errors), which might be.
+pub fn is_throttle_code(code: u32) -> bool {
+    matches!(code, 1002 | 1041 | 2045 | 2062 | 2064)
+}
+
+// ── Pacing a batch ────────────────────────────────────────────────────────────
+//
+// The arXiv analysis sends hundreds of small requests back to back, which is
+// exactly the burst MiniMax throttles. Two published limits apply:
+//
+//   * A Token Plan subscription key is limited by how much runs at once: the
+//     plan's FAQ puts peak-hour capacity at "约 3-4 个 Agent" on Plus, 4–5 on
+//     Max and 6–7 on Ultra, and says a throttle "通常约 1 分钟恢复". Four in
+//     flight fits even Plus.
+//   * Every key is held to the model's requests per minute — 200 for M3, 500
+//     for the M2 line. Ten requests in flight at about three seconds each is
+//     already 200 a minute on M3.
+//
+// References: <https://platform.minimax.cn/docs/token-plan/faq>,
+// <https://platform.minimax.io/docs/guides/rate-limits>
+
+/// Most requests a batch keeps in flight on a Token Plan key.
+pub const PLAN_MAX_IN_FLIGHT: usize = 4;
+
+/// A Token Plan subscription key (`sk-cp-…`), as opposed to a pay-as-you-go
+/// one. MiniMax keeps the two apart; neither works in the other's place.
+pub fn is_plan_key(api_key: &str) -> bool {
+    api_key.trim().starts_with("sk-cp-")
+}
+
+/// A model's published requests-per-minute limit. Ids the table does not list
+/// — M3 and anything newer — get M3's, the stricter of the two.
+fn published_rpm(model_id: &str) -> u64 {
+    if model_id.to_lowercase().starts_with("minimax-m2") {
+        500
+    } else {
+        200
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchPacing {
+    /// Most requests in flight at once; `None` leaves the user's setting alone.
+    pub max_in_flight: Option<usize>,
+    /// Least time between two request starts: the published RPM with a quarter
+    /// kept back for whatever else is using the key meanwhile.
+    pub min_interval: std::time::Duration,
+}
+
+pub fn batch_pacing(api_key: &str, model_id: &str) -> BatchPacing {
+    let per_minute = published_rpm(model_id) * 3 / 4;
+    BatchPacing {
+        max_in_flight: is_plan_key(api_key).then_some(PLAN_MAX_IN_FLIGHT),
+        min_interval: std::time::Duration::from_millis(60_000 / per_minute),
+    }
+}
+
 /// The provider's message for a MiniMax business code, led by what it means in
 /// plain words.
 ///
@@ -443,6 +503,37 @@ mod tests {
         assert_eq!(trailing_code("published (2026)"), None);
         assert_eq!(trailing_code("mixed (2064）"), None);
         assert_eq!(trailing_code(""), None);
+    }
+
+    #[test]
+    fn only_slow_down_codes_are_throttles() {
+        for code in [1002, 1041, 2045, 2062, 2064] {
+            assert!(is_throttle_code(code), "{code}");
+            assert_eq!(code_class(code), Some(crate::llm::ErrorClass::Transient), "{code}");
+        }
+        // A used-up plan window, a timeout, an internal error, no balance.
+        for code in [2056, 1001, 1013, 1008] {
+            assert!(!is_throttle_code(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_plan_key_is_held_to_four_in_flight_and_every_key_to_the_models_rpm() {
+        use std::time::Duration;
+        let plan = batch_pacing(" sk-cp-abc", "MiniMax-M3");
+        assert_eq!(plan.max_in_flight, Some(PLAN_MAX_IN_FLIGHT));
+        // 200 RPM, three quarters of it: 150 a minute.
+        assert_eq!(plan.min_interval, Duration::from_millis(400));
+
+        let pay_as_you_go = batch_pacing("sk-api-abc", "MiniMax-M2.7-highspeed");
+        assert_eq!(pay_as_you_go.max_in_flight, None);
+        assert_eq!(pay_as_you_go.min_interval, Duration::from_millis(160));
+
+        // An id the published table does not list gets the stricter limit.
+        assert_eq!(
+            batch_pacing("sk-api-abc", "MiniMax-M3.1-Flash-Preview").min_interval,
+            Duration::from_millis(400)
+        );
     }
 
     #[test]

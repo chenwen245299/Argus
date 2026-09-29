@@ -3328,6 +3328,49 @@ pub async fn delete_arxiv_papers(
     Ok(inbox)
 }
 
+// ── M8: arXiv recently filtered ──────────────────────────────────────────────
+
+/// Papers the analysis took out of the inbox for scoring below the threshold,
+/// newest first.
+#[tauri::command]
+pub async fn get_arxiv_filtered(
+    state: State<'_, LibraryRoot>,
+) -> Result<Vec<crate::models::ArxivFilteredPaper>, String> {
+    let root = get_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || arxiv::get_filtered(&root))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn restore_arxiv_filtered(
+    arxiv_ids: Vec<String>,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<ArxivInbox, String> {
+    let root = get_root(&state)?;
+    let inbox = tauri::async_runtime::spawn_blocking(move || -> Result<ArxivInbox, String> {
+        let mut inbox = arxiv::restore_filtered(&root, &arxiv_ids)?;
+        arxiv::mark_in_library_statuses(&root, &mut inbox.papers);
+        Ok(inbox)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let _ = app.emit(
+        "arxiv-new-recommendations",
+        serde_json::json!({ "count": inbox.papers.iter().filter(|p| !p.in_library).count() }),
+    );
+    Ok(inbox)
+}
+
+#[tauri::command]
+pub async fn clear_arxiv_filtered(state: State<'_, LibraryRoot>) -> Result<(), String> {
+    let root = get_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || arxiv::clear_filtered(&root))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 // ── M8: arXiv read status & rating ───────────────────────────────────────────
 
 #[tauri::command]

@@ -3949,6 +3949,33 @@ pub fn classify_error(msg: &str) -> ErrorClass {
 }
 
 /// Every run of exactly `digits` ASCII digits enclosed in `(…)` or `（…）`.
+/// Whether an error says "slow down" — a rate limit or an overloaded provider —
+/// rather than that something went wrong with this particular request.
+///
+/// A batch keeps retrying such an error instead of counting it towards giving
+/// up on that one item: which item a throttle lands on is chance, never the
+/// item's fault. It reads the same markers as [`classify_error`], so keep them
+/// when changing any error wording.
+pub fn is_throttle(msg: &str) -> bool {
+    if let Some(code) = parenthesized_numbers(msg, 4)
+        .into_iter()
+        .rev()
+        .find(|c| crate::minimax::code_class(*c).is_some())
+    {
+        return crate::minimax::is_throttle_code(code);
+    }
+    if mentions_quota(msg) {
+        return false;
+    }
+    if let Some(status) = http_status_in(msg) {
+        return matches!(status, 429 | 503 | 529);
+    }
+    let lower = msg.to_lowercase();
+    ["rate limit", "too many requests", "overloaded", "服务器繁忙", "服务繁忙", "限流", "请求过于频繁"]
+        .iter()
+        .any(|k| lower.contains(k))
+}
+
 fn parenthesized_numbers(msg: &str, digits: usize) -> Vec<u32> {
     let chars: Vec<char> = msg.chars().collect();
     let mut out = Vec::new();
@@ -3995,7 +4022,36 @@ fn http_status_in(msg: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod error_class_tests {
-    use super::{classify_error, friendly_error, ErrorClass};
+    use super::{classify_error, friendly_error, is_throttle, ErrorClass};
+
+    #[test]
+    fn throttles_are_told_apart_from_other_transient_errors() {
+        let peak = r#"{"type":"error","error":{"type":"overloaded_error","message":"当前为整点高峰时段，服务器短暂繁忙，通常 1-5 分钟内恢复。请稍后重试 (2064)","http_code":"529"}}"#;
+        let plan_rate = r#"{"type":"error","error":{"type":"rate_limit_error","message":"已达到 Token Plan 速率限制 (2062)"}}"#;
+        for msg in [
+            friendly_error(529, peak),
+            friendly_error(429, plan_rate),
+            friendly_error(429, r#"{"error":{"message":"Rate limit reached for requests"}}"#),
+            friendly_error(503, ""),
+            "请求过于频繁（RPM/TPM 超限），已被限流，请稍后重试：rpm (1002)".to_string(),
+        ] {
+            assert!(is_throttle(&msg), "{msg}");
+            assert_eq!(classify_error(&msg), ErrorClass::Transient, "{msg}");
+        }
+        // Transient too, but possibly this request's own doing.
+        for msg in [
+            "请求超时（120 秒内未完成）: operation timed out".to_string(),
+            "请求超时（30 秒内没有收到任何数据）: error decoding response body".to_string(),
+            friendly_error(500, r#"{"error":{"message":"internal error"}}"#),
+            "MiniMax 返回错误 (1001)".to_string(),
+        ] {
+            assert!(!is_throttle(&msg), "{msg}");
+        }
+        // A used-up plan window arrives as a 429 but is no throttle: it is fatal.
+        let window = r#"{"type":"error","error":{"type":"rate_limit_error","message":"usage limit exceeded, 5-hour usage limit reached for Token Plan Plus (0/0 used), resets at 2026-05-15T15:00:00Z (2056)"}}"#;
+        assert!(!is_throttle(&friendly_error(429, window)));
+        assert!(!is_throttle("rate limited (429): 余额不足"));
+    }
 
     #[test]
     fn the_minimax_peak_hour_529_is_transient() {

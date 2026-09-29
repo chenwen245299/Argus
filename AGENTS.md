@@ -485,6 +485,18 @@ Built for subscription plans that throttle hard — MiniMax's Token Plan answers
   MiniMax `2056`: stop at once) and Request (this paper only: `failed`, with
   the reason in `analysis_error`). The batch also stops after 12 minutes with
   no answer or 12 request failures in a row.
+- **Throttles never fail a paper.** `llm::is_throttle` (429 / 503 / 529,
+  MiniMax `1002` `1041` `2045` `2062` `2064`, rate-limit wording) marks the
+  transient errors that only say "slow down"; they never count towards a
+  paper's `max_attempts` — only timeouts and 5xx do. Throttling that never lets
+  up is left to the stall limit, which reverts rather than fails.
+- **MiniMax is paced before it throttles** (`minimax::batch_pacing`): a Token
+  Plan key (`sk-cp-…`) keeps at most `PLAN_MAX_IN_FLIGHT` = 4 requests in
+  flight (the plan FAQ: about 3–4 agents on Plus, 4–5 on Max, 6–7 on Ultra at
+  peak hours), and every MiniMax key spaces request starts
+  (`BatchTuning::min_interval`) to 75% of the model's published RPM — 200 for
+  M3, 500 for the M2 line. The `started` event carries the effective
+  `concurrency` and a `concurrency_note` when it was capped.
 - **`classify_error` reads markers in the message text** — a MiniMax
   `(NNNN)` code, quota wording, the HTTP status as `(429)` / `API error 529`,
   network wording. When changing `friendly_error` or any error string in
@@ -496,8 +508,26 @@ Built for subscription plans that throttle hard — MiniMax's Token Plan answers
   deleted as an "empty day".
 - A single-paper analysis registers in `single_in_flight` so a bulk run started
   meanwhile skips that paper; a bulk run refuses single analyses.
-- `get_arxiv_schedule_status` carries the current pause and the last run's
-  outcome, for a window opened after the events went out.
+- `get_arxiv_schedule_status` carries the current pause, the running batch's
+  `run_counts` and the last run's outcome, for a window opened after the
+  events went out.
+- **A paper scored below the threshold leaves the inbox but is not lost.** It
+  goes into `inbox/filtered.json` (newest first, capped at `FILTERED_KEEP` =
+  500, analysis included — written in the same `inbox_lock` pass that removes
+  it), and so does whatever the list's 刷新 button prunes. The 最近过滤 panel
+  (`ArxivFilteredPanel.vue`) reads it; `restore_arxiv_filtered` puts a paper
+  back as `done` with `kept: true`, which the threshold never removes again.
+  Before this a strict model looked broken: MiniMax-M3 scored 0–3 what others
+  scored 6–7, answered in about two seconds, and the batch deleted papers
+  several a second with nothing on screen saying why. Every per-paper event
+  now carries the run's `succeeded` / `filtered` / `failed` so far, shown next
+  to the progress bar and in the cancel/stop notices.
+- **Replies are parsed leniently** (`parse_analysis_result`): fields are read
+  from a raw JSON map, so a list where a string was asked for (or the other
+  way round) is converted rather than failing the paper, and a candidate that
+  does not parse goes through `repair_json_strings` once — MiniMax writes
+  Chinese quotations with bare ASCII `"` inside the value, which failed that
+  paper on every retry. Valid JSON is never rewritten.
 
 ### Data persistence
 
@@ -530,7 +560,7 @@ The library root contains:
 │   ├── chat.json
 │   └── ai_conversations.json
 ├── canvases/                # Canvas JSON files
-├── inbox/                   # arXiv/bioRxiv daily inbox JSON
+├── inbox/                   # arXiv/bioRxiv daily inbox JSON (YYYY-MM-DD.json), read_state.json, filtered.json (papers filtered out, restorable)
 └── snippets/                # Snippet library JSON (never embedded)
 ```
 

@@ -789,6 +789,15 @@ export interface ArxivPaper {
   read: boolean
   rating: number
   source?: string
+  /** Put back by the user after scoring below the filter threshold; the threshold never removes it again. */
+  kept?: boolean
+}
+
+/** A paper the analysis took out of the inbox for scoring below the filter threshold (inbox/filtered.json). */
+export interface ArxivFilteredPaper extends ArxivPaper {
+  /** RFC 3339. */
+  filtered_at: string
+  filter_threshold: number
 }
 
 /**
@@ -813,13 +822,17 @@ export interface ArxivAnalysisEvent {
   removed?: boolean
   // started
   retrying_failed?: number
-  // waiting: the whole batch pauses `retry_in` seconds, then resumes at `concurrency`
+  /** Started: why `concurrency` is below the user's setting (MiniMax Token Plan). */
+  concurrency_note?: string | null
+  // started: requests in flight at most; waiting: the whole batch pauses
+  // `retry_in` seconds, then resumes at `concurrency`
   retry_in?: number
   concurrency?: number
-  // finished
+  // the run so far: on done / filtered / failed, and the totals on finished
   succeeded?: number
   failed?: number
   filtered?: number
+  // finished
   reverted?: number
   stopped_reason?: string | null
   cancelled?: boolean
@@ -915,6 +928,16 @@ export interface ArxivScheduleStatus {
   waiting?: ArxivAnalysisPause | null
   /** How the last batch of this app session ended; only outside a run. */
   last_run?: ArxivAnalysisRun | null
+  /** Outcomes of the running batch so far; only during a run. */
+  run_counts?: ArxivRunCounts | null
+}
+
+export interface ArxivRunCounts {
+  /** Analysed and kept in the inbox. */
+  succeeded: number
+  /** Scored below the threshold and moved out of the inbox. */
+  filtered: number
+  failed: number
 }
 
 export interface ArxivAnalysisPause {

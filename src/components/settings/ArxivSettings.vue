@@ -56,6 +56,13 @@ const selectedProvider = computed(() =>
 
 const availableModels = computed(() => selectedProvider.value?.models ?? [])
 
+// MiniMax is paced by the backend (minimax::batch_pacing); say so where the
+// concurrency is set, since a Token Plan key runs fewer than the slider says.
+const selectedIsMinimax = computed(() => {
+  const p = selectedProvider.value as { kind?: string; base_url?: string } | undefined
+  return !!p && (p.kind === 'minimax' || (p.base_url ?? '').toLowerCase().includes('minimax'))
+})
+
 const keywordsDraft = ref('')
 
 function syncKeywordsDraftFromForm() {
@@ -374,6 +381,7 @@ const arxivNeedsCategories = computed(() => form.value.fetch_arxiv && form.value
           <span class="concurrency-value">{{ form.ai_analysis_concurrency }}</span>
         </div>
         <p class="field-hint">{{ t('arxivSettings.concurrencyHint') }}</p>
+        <p v-if="selectedIsMinimax" class="field-hint">{{ t('arxivSettings.minimaxPacingHint') }}</p>
       </div>
     </template>
 

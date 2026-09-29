@@ -315,6 +315,9 @@ pub fn run() {
             // ── M8: arXiv batch delete ──
             commands::delete_arxiv_inbox_by_date,
             commands::delete_arxiv_papers,
+            commands::get_arxiv_filtered,
+            commands::restore_arxiv_filtered,
+            commands::clear_arxiv_filtered,
             // ── M8: read status & rating ──
             commands::mark_arxiv_paper_read,
             commands::rate_arxiv_paper,

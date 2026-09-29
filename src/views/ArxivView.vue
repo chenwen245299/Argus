@@ -12,6 +12,7 @@ import { useCollectionsStore } from '../stores/collections'
 import type { ArxivPaper, Collection } from '../types'
 import WindowControls from '../components/WindowControls.vue'
 import ArxivWaitBadge from '../components/ArxivWaitBadge.vue'
+import ArxivFilteredPanel from '../components/ArxivFilteredPanel.vue'
 
 // On Windows the native decorations are off, so we drop the macOS traffic-light
 // gutter and render our own window controls (see WindowControls).
@@ -180,46 +181,91 @@ function startBulkAnalysis() {
 
 // Outcome of the last bulk run, shown in the status bar until dismissed.
 type NoticeTone = 'ok' | 'warn' | 'muted' | 'error'
-interface NoticeView { tone: NoticeTone; icon: string; text: string; autoHide: boolean }
+interface NoticeView {
+  tone: NoticeTone
+  icon: string
+  text: string
+  autoHide: boolean
+  /** Papers the run moved out of the inbox: offers「查看」. */
+  filtered: number
+}
 
 function trimEndPunct(s: string): string {
   return s.trim().replace(/[。．.！!\s]+$/u, '')
+}
+
+const filterThresholdLabel = computed(() => {
+  const t = Number(store.config.ai_filter_threshold)
+  return Number.isFinite(t) ? (Number.isInteger(t) ? String(t) : t.toFixed(1)) : '阈值'
+})
+
+// With the filter on, a success is a paper that stayed in the inbox.
+const keptLabel = computed(() => (store.config.ai_filter_enabled ? '保留' : '成功'))
+
+// "保留 3，低于 6 分已过滤 45，失败 1" — what a run did before it ended. A
+// cancelled or stopped run used to say only how many were left, so papers
+// that had meanwhile left the inbox for scoring low went unmentioned.
+function runBreakdown(n: { succeeded: number; filtered: number; failed: number }): string {
+  const parts = [`${keptLabel.value} ${n.succeeded}`]
+  if (n.filtered > 0) parts.push(`低于 ${filterThresholdLabel.value} 分已过滤 ${n.filtered}`)
+  if (n.failed > 0) parts.push(`失败 ${n.failed}`)
+  return parts.join('，')
 }
 
 const analysisNoticeView = computed<NoticeView | null>(() => {
   const n = store.analysisNotice
   if (!n) return null
   if (n.kind === 'error') {
-    return { tone: 'error', icon: 'fluent:error-circle-24-regular', text: `AI 分析未能开始：${n.message}`, autoHide: false }
+    return { tone: 'error', icon: 'fluent:error-circle-24-regular', text: `AI 分析未能开始：${n.message}`, autoHide: false, filtered: 0 }
   }
+  const analysed = n.succeeded + n.filtered + n.failed
+  const soFar = n.hasCounts && analysed > 0 ? `本次已分析 ${analysed} 篇（${runBreakdown(n)}），` : ''
   if (n.stoppedReason) {
     return {
-      tone: 'warn', icon: 'fluent:pause-circle-24-regular', autoHide: false,
-      text: `已暂停：${trimEndPunct(n.stoppedReason)}。剩余 ${n.reverted} 篇保持未分析，处理好后再点「AI 分析全部」会从这里继续。`,
+      tone: 'warn', icon: 'fluent:pause-circle-24-regular', autoHide: false, filtered: n.filtered,
+      text: `已暂停：${trimEndPunct(n.stoppedReason)}。${soFar}剩余 ${n.reverted} 篇保持未分析，处理好后再点「AI 分析全部」会从这里继续。`,
     }
   }
   if (n.cancelled) {
-    return { tone: 'muted', icon: 'fluent:dismiss-circle-24-regular', text: `已取消，${n.reverted} 篇未分析的保持原状态。`, autoHide: false }
+    return {
+      tone: 'muted', icon: 'fluent:dismiss-circle-24-regular', autoHide: false, filtered: n.filtered,
+      text: `已取消：${soFar}${n.reverted} 篇未分析的保持原状态。`,
+    }
   }
   if (n.failed > 0) {
     return {
-      tone: 'warn', icon: 'fluent:warning-24-regular', autoHide: false,
-      text: `分析完成：成功 ${n.succeeded}，未达阈值已过滤 ${n.filtered}，失败 ${n.failed}（再点「AI 分析全部」会重试失败的）`,
+      tone: 'warn', icon: 'fluent:warning-24-regular', autoHide: false, filtered: n.filtered,
+      text: `分析完成：${runBreakdown(n)}（再点「AI 分析全部」会重试失败的）`,
     }
   }
   if (n.total === 0) {
-    return { tone: 'muted', icon: 'fluent:info-24-regular', text: '没有待分析的论文', autoHide: true }
+    return { tone: 'muted', icon: 'fluent:info-24-regular', text: '没有待分析的论文', autoHide: true, filtered: 0 }
   }
   if (!n.hasCounts) {
-    return { tone: 'ok', icon: 'fluent:checkmark-circle-24-regular', text: '分析完成', autoHide: true }
+    return { tone: 'ok', icon: 'fluent:checkmark-circle-24-regular', text: '分析完成', autoHide: true, filtered: 0 }
   }
   return {
-    tone: 'ok', icon: 'fluent:checkmark-circle-24-regular', autoHide: true,
-    text: n.filtered > 0
-      ? `分析完成：成功 ${n.succeeded}，未达阈值已过滤 ${n.filtered}`
-      : `分析完成：成功 ${n.succeeded}`,
+    // Stays up when papers left the inbox: that is the part worth reading.
+    tone: 'ok', icon: 'fluent:checkmark-circle-24-regular', autoHide: n.filtered === 0, filtered: n.filtered,
+    text: `分析完成：${runBreakdown(n)}`,
   }
 })
+
+// Hover text of "AI 分析中 x/y": how many requests run at once, and why it is
+// fewer than the setting when it is — MiniMax's Token Plan caps it.
+const analysisProgressTitle = computed(() => {
+  const lines: string[] = []
+  const c = store.analyzeConcurrency
+  if (c) lines.push(c.note ? `已限速：${c.note}` : `同时 ${c.limit} 个请求`)
+  if (store.analyzeRetryingFailed > 0) lines.push(`其中 ${store.analyzeRetryingFailed} 篇是在重试之前失败的论文`)
+  return lines.length > 0 ? lines.join('\n') : undefined
+})
+
+// 「最近过滤」 panel.
+const showFiltered = ref(false)
+function openFilteredPanel() {
+  showFiltered.value = true
+}
 
 let noticeHideTimer: ReturnType<typeof setTimeout> | null = null
 watch(() => store.analysisNotice, (n) => {
@@ -333,6 +379,7 @@ function onKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') {
     if (arxivCtxMenu.value) { closeArxivCtx(); return }
     if (deletingSelectedConfirm.value) { deletingSelectedConfirm.value = false; return }
+    if (showFiltered.value) { showFiltered.value = false; return }
     if (hasSelection.value || activeSelectionDates.size > 0) { clearSelection(); return }
     if (deletingDate.value) { deletingDate.value = null; return }
     showSettings.value = false
@@ -857,12 +904,34 @@ function jumpToDate(dateStr: string) {
           <span class="spinner" data-tauri-drag-region />
           <span
             class="analysis-progress-text"
-            :title="store.analyzeRetryingFailed > 0 ? `其中 ${store.analyzeRetryingFailed} 篇是在重试之前失败的论文` : undefined"
+            :title="analysisProgressTitle"
             data-tauri-drag-region
           >AI 分析中 {{ store.analyzeProgress.done }}/{{ store.analyzeProgress.total }}</span>
           <div class="progress-track" data-tauri-drag-region>
             <div class="progress-fill" :style="{ width: store.analyzeProgress.total > 0 ? (store.analyzeProgress.done / store.analyzeProgress.total * 100) + '%' : '0%' }" data-tauri-drag-region />
           </div>
+          <span
+            v-if="store.analyzeCounts.succeeded + store.analyzeCounts.filtered + store.analyzeCounts.failed > 0"
+            class="analysis-counts"
+            data-tauri-drag-region
+          >
+            <span
+              :title="store.config.ai_filter_enabled ? '相关度达到阈值，留在收件箱' : '分析完成'"
+              data-tauri-drag-region
+            >{{ keptLabel }} {{ store.analyzeCounts.succeeded }}</span>
+            <button
+              v-if="store.analyzeCounts.filtered > 0"
+              class="analysis-count-btn"
+              :title="`相关度低于 ${filterThresholdLabel} 分，已移出收件箱。点击查看或恢复`"
+              @click="openFilteredPanel"
+            >已过滤 {{ store.analyzeCounts.filtered }}</button>
+            <span
+              v-if="store.analyzeCounts.failed > 0"
+              class="analysis-count-failed"
+              title="分析失败的论文会标「失败」，再点「AI 分析全部」会重试"
+              data-tauri-drag-region
+            >失败 {{ store.analyzeCounts.failed }}</span>
+          </span>
           <ArxivWaitBadge v-if="store.analyzeWaiting" :waiting="store.analyzeWaiting" />
           <button class="cancel-btn" @click="store.cancelAnalysis()">取消</button>
         </div>
@@ -910,6 +979,11 @@ function jumpToDate(dateStr: string) {
           <span v-if="analysisNoticeView" class="status-notice" :class="`tone-${analysisNoticeView.tone}`">
             <Icon :icon="analysisNoticeView.icon" width="13" height="13" class="status-notice-icon" />
             <span class="status-notice-text">{{ analysisNoticeView.text }}</span>
+            <button
+              v-if="analysisNoticeView.filtered > 0"
+              class="status-notice-action"
+              @click="openFilteredPanel"
+            >查看已过滤</button>
           </span>
         </div>
         <button
@@ -952,6 +1026,15 @@ function jumpToDate(dateStr: string) {
               @click="store.filterMode = store.filterMode === 'pending_analysis' ? 'all' : 'pending_analysis'"
             >
               <Icon icon="fluent:hourglass-half-24-regular" width="14" height="14" />
+            </button>
+            <!-- Recently filtered: papers moved out of the inbox for scoring below the threshold -->
+            <button
+              class="list-tool-btn"
+              :class="{ active: showFiltered }"
+              title="最近过滤：相关度低于阈值、已移出收件箱的论文，可恢复"
+              @click="openFilteredPanel"
+            >
+              <Icon icon="fluent:filter-dismiss-24-regular" width="14" height="14" />
             </button>
             <!-- Tag (topic) filter -->
             <button
@@ -1430,6 +1513,17 @@ function jumpToDate(dateStr: string) {
       </div>
     </Teleport>
 
+    <!-- Recently filtered -->
+    <Teleport to="body">
+      <div v-if="showFiltered" class="modal-overlay" @click.self="showFiltered = false">
+        <Transition name="modal-pop" appear>
+          <div v-if="showFiltered" class="modal-box filtered-modal-box">
+            <ArxivFilteredPanel @close="showFiltered = false" />
+          </div>
+        </Transition>
+      </div>
+    </Teleport>
+
     <!-- List item right-click menu -->
     <Teleport to="body">
       <div
@@ -1562,6 +1656,24 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   background: transparent;
   font-size: 11px;
 }
+/* Kept / filtered out / failed so far. */
+.analysis-counts {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.analysis-count-btn {
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+}
+.analysis-count-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.analysis-count-failed { color: #ef4444; }
 /* Only the throttling reason gives way when the bar runs out of room. */
 .topbar-analysis-status { min-width: 0; }
 .topbar-analysis-status .progress-track { flex: 0 1 88px; min-width: 40px; }
@@ -1645,6 +1757,16 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   -webkit-user-select: text;
   cursor: text;
 }
+.status-notice-action {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.status-notice-action:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
 .status-notice.tone-ok { color: var(--accent); }
 .status-notice.tone-error { color: #ef4444; }
 .status-notice.tone-warn .status-notice-icon { color: #f59e0b; }
@@ -2398,6 +2520,10 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   width: min(560px, 92vw);
   max-height: min(680px, 88vh);
   display: flex; flex-direction: column; overflow: hidden;
+}
+.filtered-modal-box {
+  width: min(640px, 92vw);
+  height: min(640px, 86vh);
 }
 .confirm-modal-box {
   width: min(360px, calc(100vw - 40px));

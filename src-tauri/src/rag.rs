@@ -481,15 +481,13 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
     } else {
         "页"
     };
-    for h in paper::read_highlights(root, slug) {
-        if h.text.trim().is_empty() {
-            continue;
-        }
-        let mut text = format!("高亮文本 (第{}{unit}): {}", h.page, h.text.trim());
+    // One chunk per selection, not per stored record — see `highlight_inputs`,
+    // which this shares with `get_paper_vectorize_input` so the two builders
+    // cannot drift apart.
+    for h in highlight_inputs(root, slug) {
+        let mut text = format!("高亮文本 (第{}{unit}): {}", h.page, h.text);
         if let Some(ref note) = h.note {
-            if !note.trim().is_empty() {
-                text.push_str(&format!("\n用户批注: {}", note.trim()));
-            }
+            text.push_str(&format!("\n用户批注: {}", note.trim()));
         }
         pending.push(PendingChunk {
             text,
@@ -641,13 +639,39 @@ pub async fn vectorize_paper(root: &str, slug: &str, app: &tauri::AppHandle) -> 
 
 // ── Frontend-orchestrated vectorize pipeline ─────────────────────────────────
 
+/// The highlights worth embedding, one per selection, each as its display text
+/// (merged lines, unless the user keeps the breaks).
+///
+/// A selection across a page break is stored as a record per page, each holding
+/// the whole text; embedding every record would put the same passage on the map
+/// twice. The entry keeps the canonical (lowest-page) record's id, so a chunk id
+/// (`{paper}-hl-{id}`) is what it always was. Both paths that turn highlights
+/// into chunks — `vectorize_paper` here and the frontend's `chunker.ts` via
+/// `get_paper_vectorize_input` — read this one list.
+fn highlight_inputs(root: &str, slug: &str) -> Vec<crate::models::HighlightInput> {
+    crate::highlight_groups::read_grouped(root, slug)
+        .into_iter()
+        // The text as it reads — one paragraph, not a fragment per printed line —
+        // so a chunk (and its embedding) is not cut at every wrap. Emptiness is
+        // judged on that text, not the captured one.
+        .map(|g| (g.display_text(), g.rep))
+        .filter(|(text, _)| !text.trim().is_empty())
+        .map(|(text, h)| crate::models::HighlightInput {
+            id: h.id,
+            page: h.page,
+            text: text.trim().to_string(),
+            note: h.note.filter(|n| !n.trim().is_empty()),
+        })
+        .collect()
+}
+
 /// Returns all raw content for a paper so the frontend can chunk it with
 /// LlamaIndex SentenceSplitter before sending chunks back via embed_and_store_chunks.
 pub fn get_paper_vectorize_input(
     root: &str,
     slug: &str,
 ) -> Result<crate::models::PaperVectorizeInput, String> {
-    use crate::models::{HighlightInput, NoteInput, PaperVectorizeInput};
+    use crate::models::{NoteInput, PaperVectorizeInput};
 
     let meta = paper::read_meta(root, slug).map_err(|e| format!("Read meta: {e}"))?;
 
@@ -672,16 +696,9 @@ pub fn get_paper_vectorize_input(
         meta_parts.push(format!("arXiv: {arxiv}"));
     }
 
-    let highlights = paper::read_highlights(root, slug)
-        .into_iter()
-        .filter(|h| !h.text.trim().is_empty())
-        .map(|h| HighlightInput {
-            id: h.id,
-            page: h.page,
-            text: h.text.trim().to_string(),
-            note: h.note.filter(|n| !n.trim().is_empty()),
-        })
-        .collect();
+    // The same entries `vectorize_paper` writes chunks for, so the frontend
+    // chunker (one chunk per input) needs no change.
+    let highlights = highlight_inputs(root, slug);
 
     let notes = paper::list_notes(root, slug)
         .into_iter()
@@ -1363,4 +1380,102 @@ pub async fn get_embedding_map(
     })
     .await
     .map_err(|e| format!("Spawn blocking: {e}"))?
+}
+
+#[cfg(test)]
+mod highlight_chunk_tests {
+    use super::*;
+    use crate::highlight_groups::fixtures;
+
+    /// The embedding map got every cross-page selection twice: once per stored
+    /// record. It must get one, under the canonical record's id.
+    #[test]
+    fn a_selection_across_a_page_break_is_embedded_once() {
+        let mut stored = fixtures::cross_page_pair(10);
+        stored[1].note = Some("我的想法".into());
+        let lib = fixtures::library_with("a-paper", &stored);
+
+        let input = get_paper_vectorize_input(lib.root(), "a-paper").unwrap();
+        assert_eq!(input.highlights.len(), 1, "{:?}", input.highlights);
+        let h = &input.highlights[0];
+        assert_eq!((h.id.as_str(), h.page), ("hl-10", 10));
+        assert_eq!(h.text, fixtures::PAIR_TEXT);
+        assert_eq!(h.note.as_deref(), Some("我的想法"));
+
+        // `vectorize_paper` reads the same list, so its chunks agree with what
+        // the frontend chunker is handed.
+        assert_eq!(highlight_inputs(lib.root(), "a-paper").len(), 1);
+    }
+
+    /// Ordinary highlights pass through exactly as before: trimmed text, blank
+    /// notes dropped, blank highlights skipped, file order kept.
+    #[test]
+    fn ordinary_highlights_are_unchanged() {
+        let mut a = fixtures::record("a", 2, "  padded  ", "2026-03-01T00:00:00.000Z");
+        a.note = Some("   ".into());
+        let mut b = fixtures::record("b", 5, "second", "2026-03-01T00:00:01.000Z");
+        b.note = Some(" a note ".into());
+        let blank = fixtures::record("c", 6, "   ", "2026-03-01T00:00:02.000Z");
+        let lib = fixtures::library_with("a-paper", &[a, b, blank]);
+
+        let hs = highlight_inputs(lib.root(), "a-paper");
+        assert_eq!(hs.len(), 2);
+        assert_eq!((hs[0].id.as_str(), hs[0].text.as_str(), hs[0].note.as_deref()), ("a", "padded", None));
+        assert_eq!((hs[1].id.as_str(), hs[1].page), ("b", 5));
+        assert_eq!(hs[1].note.as_deref(), Some(" a note "));
+    }
+
+    /// A PDF selection carries a line break at every printed wrap; embedding that
+    /// would cut one sentence into shards. The chunk gets the merged paragraph,
+    /// on both vectorize paths (they share `highlight_inputs`).
+    #[test]
+    fn wrapped_highlights_are_embedded_as_one_paragraph() {
+        const WRAPPED: &str = "the quick brown\nfox jumps over\nthe lazy dog";
+        let at = "2026-03-01T00:00:00.000Z";
+
+        let wrapped = fixtures::record("a", 1, WRAPPED, at);
+        let mut kept = fixtures::record("b", 2, WRAPPED, "2026-03-01T00:00:01.000Z");
+        kept.keep_line_breaks = Some(true);
+        kept.text = format!("\n{WRAPPED}\n");
+        let mut ebook = fixtures::record("c", 3, "para one\npara two", "2026-03-01T00:00:02.000Z");
+        ebook.start_offset = Some(0);
+        ebook.end_offset = Some(17);
+        let single = fixtures::record("d", 4, "already one line", "2026-03-01T00:00:03.000Z");
+        // Nothing but blank lines: empty once merged, so it is skipped.
+        let blank = fixtures::record("e", 5, " \n \n", "2026-03-01T00:00:04.000Z");
+        let lib = fixtures::library_with("a-paper", &[wrapped, kept, ebook, single, blank]);
+
+        let hs = highlight_inputs(lib.root(), "a-paper");
+        let texts: Vec<(&str, &str)> = hs.iter().map(|h| (h.id.as_str(), h.text.as_str())).collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("a", "the quick brown fox jumps over the lazy dog"),
+                // Kept breaks survive, trimmed at the ends as every chunk is.
+                ("b", WRAPPED),
+                ("c", "para one\npara two"),
+                ("d", "already one line"),
+            ]
+        );
+
+        // The frontend path reads the very same list.
+        let input = get_paper_vectorize_input(lib.root(), "a-paper").unwrap();
+        let via_input: Vec<&str> = input.highlights.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(via_input, texts.iter().map(|(_, t)| *t).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_wrapped_selection_across_a_page_break_is_one_merged_chunk() {
+        const WRAPPED: &str = "a passage that\nruns over the\npage break";
+        let created = "2026-03-01T10:00:00.000Z";
+        let pair = [
+            fixtures::record("hl-10", 10, WRAPPED, created),
+            fixtures::record("hl-11", 11, WRAPPED, created),
+        ];
+        let lib = fixtures::library_with("a-paper", &pair);
+        let hs = highlight_inputs(lib.root(), "a-paper");
+        assert_eq!(hs.len(), 1);
+        assert_eq!((hs[0].id.as_str(), hs[0].page), ("hl-10", 10));
+        assert_eq!(hs[0].text, "a passage that runs over the page break");
+    }
 }

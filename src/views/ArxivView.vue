@@ -894,7 +894,7 @@ function jumpToDate(dateStr: string) {
 <template>
   <div class="arxiv-view">
     <!-- Top bar -->
-    <div class="arxiv-topbar" :class="{ 'win-titlebar': isWindows }" data-tauri-drag-region>
+    <div class="arxiv-topbar" :class="{ 'win-titlebar': isWindows, analyzing: store.analyzing }" data-tauri-drag-region>
       <div class="tl-space" data-tauri-drag-region />
       <div class="topbar-left" data-tauri-drag-region>
         <Icon icon="fluent:layer-24-regular" class="topbar-icon" width="16" height="16" data-tauri-drag-region />
@@ -916,32 +916,44 @@ function jumpToDate(dateStr: string) {
             data-tauri-drag-region
           >
             <span
+              class="analysis-count-kept"
               :title="store.config.ai_filter_enabled ? '相关度达到阈值，留在收件箱' : '分析完成'"
               data-tauri-drag-region
-            >{{ keptLabel }} {{ store.analyzeCounts.succeeded }}</span>
+            ><span class="count-label" data-tauri-drag-region>{{ keptLabel }}</span>{{ store.analyzeCounts.succeeded }}</span>
             <button
               v-if="store.analyzeCounts.filtered > 0"
               class="analysis-count-btn"
               :title="`相关度低于 ${filterThresholdLabel} 分，已移出收件箱。点击查看或恢复`"
               @click="openFilteredPanel"
-            >已过滤 {{ store.analyzeCounts.filtered }}</button>
+            ><span class="count-label">已过滤</span>{{ store.analyzeCounts.filtered }}</button>
             <span
               v-if="store.analyzeCounts.failed > 0"
               class="analysis-count-failed"
               title="分析失败的论文会标「失败」，再点「AI 分析全部」会重试"
               data-tauri-drag-region
-            >失败 {{ store.analyzeCounts.failed }}</span>
+            ><span class="count-label" data-tauri-drag-region>失败</span>{{ store.analyzeCounts.failed }}</span>
           </span>
           <ArxivWaitBadge v-if="store.analyzeWaiting" :waiting="store.analyzeWaiting" />
           <button class="cancel-btn" @click="store.cancelAnalysis()">取消</button>
         </div>
       </div>
       <div class="topbar-right" data-tauri-drag-region>
-        <span v-if="store.scheduleStatus?.auto_fetch_enabled" class="auto-badge" data-tauri-drag-region>
-          <span class="auto-dot" />
-          自动抓取已开启
+        <span
+          v-if="store.scheduleStatus?.auto_fetch_enabled"
+          class="auto-badge"
+          :title="store.scheduleStatus?.next_scheduled ? `下次计划: ${store.scheduleStatus.next_scheduled}` : undefined"
+          data-tauri-drag-region
+        >
+          <span class="auto-dot" data-tauri-drag-region />
+          <span class="auto-badge-text" data-tauri-drag-region>自动抓取已开启</span>
         </span>
-        <span v-if="store.scheduleStatus?.next_scheduled && store.scheduleStatus?.auto_fetch_enabled" class="next-label" data-tauri-drag-region>
+        <!-- During a run the schedule makes room for the run's own figures;
+             it stays on the badge's tooltip. -->
+        <span
+          v-if="store.scheduleStatus?.next_scheduled && store.scheduleStatus?.auto_fetch_enabled && !store.analyzing"
+          class="next-label"
+          data-tauri-drag-region
+        >
           下次计划: {{ store.scheduleStatus.next_scheduled }}
         </span>
         <button
@@ -1673,7 +1685,32 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
   background: var(--bg-tertiary);
 }
 .analysis-count-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+/* The same green as the list's 已入库 tag; the text leans towards the theme's
+   own text colour, so it stays legible on dark palettes too. */
+.analysis-count-kept {
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  color: color-mix(in srgb, #22c55e 70%, var(--text-primary));
+  background: rgba(34, 197, 94, 0.12);
+}
 .analysis-count-failed { color: #ef4444; }
+/* Spacing in CSS, not in the template: a trailing space after an
+   interpolation is dropped when the template compiles. */
+.count-label { margin-right: 0.3em; }
+/* A narrow window: rather than let the run's status spill over the buttons on
+   the right, the least useful text gives way first — the counts keep their
+   colour and tooltip, the auto-fetch badge its dot and tooltip. */
+@media (max-width: 1040px) {
+  .analysis-counts .count-label { display: none; }
+}
+@media (max-width: 920px) {
+  .arxiv-topbar.analyzing .auto-badge-text { display: none; }
+}
+/* The window's minimum width: the progress already says how many there are. */
+@media (max-width: 840px) {
+  .arxiv-topbar.analyzing .paper-count-pill { display: none; }
+}
 /* Only the throttling reason gives way when the bar runs out of room. */
 .topbar-analysis-status { min-width: 0; }
 .topbar-analysis-status .progress-track { flex: 0 1 88px; min-width: 40px; }

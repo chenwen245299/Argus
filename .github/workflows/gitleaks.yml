@@ -1,0 +1,35 @@
+name: Secret scan
+
+# Backstop for the local hooks in .githooks/: those can be skipped (--no-verify),
+# and a fresh clone only has them after `npm install`. This scans every push and
+# every pull request with the same rules (.gitleaks.toml).
+#
+# The gitleaks-action is free for repositories owned by a personal account. If the
+# repository ever moves into an organisation it needs a GITLEAKS_LICENSE secret;
+# until then the run fails with a licence message, not with findings.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history: a secret that was committed and later deleted is
+          # still public.
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Findings are redacted in the log either way; commenting on a PR would
+          # need a write permission this job does not otherwise have.
+          GITLEAKS_ENABLE_COMMENTS: 'false'

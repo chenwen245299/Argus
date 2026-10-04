@@ -34,8 +34,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Highlight, Note, PaperMeta};
-use crate::{canvas, collections, ebook, extraction, library, metadata, paper, search, snippets};
+use crate::models::{Note, PaperMeta};
+use crate::{
+    canvas, collections, ebook, extraction, highlight_groups, library, metadata, paper, search,
+    snippets,
+};
 
 /// Library artifacts that must never be reachable through an MCP tool.
 ///
@@ -272,6 +275,10 @@ pub struct HighlightEntry {
     /// The user's annotation on this highlight; empty when they only marked it.
     pub note: String,
     pub created_at: String,
+    /// Last page of a selection that runs across a page break (`page` is its
+    /// first). Absent for a highlight that stays on one page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_end: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -849,7 +856,9 @@ pub fn get_paper(root: &str, slug: &str) -> Result<PaperDetail, String> {
         file_type: file_type_of(&meta),
         related,
         notes,
-        highlight_count: paper::read_highlights(root, slug).len(),
+        // One per selection: a highlight across a page break is stored as a
+        // record per page but is one highlight to the reader.
+        highlight_count: highlight_groups::read_grouped(root, slug).len(),
         fulltext_chars: extraction::read_fulltext(root, slug).chars().count(),
     })
 }
@@ -1006,14 +1015,21 @@ pub fn get_note(root: &str, slug: &str, note_id: Option<&str>) -> Result<NoteCon
 
 pub fn get_highlights(root: &str, slug: &str) -> Result<Vec<HighlightEntry>, String> {
     paper::read_meta(root, slug)?;
-    Ok(paper::read_highlights(root, slug)
+    Ok(highlight_groups::read_grouped(root, slug)
         .into_iter()
-        .map(|h: Highlight| HighlightEntry {
-            id: h.id,
-            page: h.page,
-            text: h.text,
-            note: h.note.unwrap_or_default(),
-            created_at: h.created_at,
+        .map(|g| {
+            // One paragraph, not a fragment per printed line — unless the user
+            // chose to keep the line breaks. The stored text is never changed.
+            let text = g.display_text();
+            HighlightEntry {
+                // The canonical member's id, so a selection keeps one stable id.
+                id: g.rep.id,
+                page: g.rep.page,
+                text,
+                note: g.rep.note.unwrap_or_default(),
+                created_at: g.rep.created_at,
+                page_end: g.page_end,
+            }
         })
         .collect())
 }
@@ -2042,5 +2058,73 @@ mod tests {
     #[test]
     fn case_folded_reports_a_miss() {
         assert_eq!(CaseFolded::new("İ中文").find("nothing"), None);
+    }
+
+    /// A selection across a page break is stored as a record per page. The agent
+    /// must see it once — in the listing and in the count `get_paper` reports.
+    #[test]
+    fn a_selection_across_a_page_break_is_one_highlight() {
+        use crate::highlight_groups::fixtures;
+
+        let mut stored = fixtures::cross_page_pair(10);
+        stored[0].note = Some("first half".into());
+        stored[1].note = Some("second half".into());
+        stored.push(fixtures::record("hl-3", 3, "an ordinary one", "2026-03-01T09:00:00.000Z"));
+        let lib = fixtures::library_with("a-paper", &stored);
+
+        let listed = get_highlights(lib.root(), "a-paper").unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        let sel = &listed[0];
+        // The canonical (lowest-page) record's id, page and text.
+        assert_eq!((sel.id.as_str(), sel.page, sel.page_end), ("hl-10", 10, Some(11)));
+        assert_eq!(sel.text, fixtures::PAIR_TEXT);
+        assert_eq!(sel.note, "first half\n\nsecond half");
+        assert_eq!((listed[1].id.as_str(), listed[1].page, listed[1].page_end), ("hl-3", 3, None));
+
+        assert_eq!(get_paper(lib.root(), "a-paper").unwrap().highlight_count, 2);
+
+        // `page_end` is additive: an ordinary highlight serializes as before.
+        let json = serde_json::to_value(&listed).unwrap();
+        assert_eq!(json[0]["page_end"], 11);
+        assert!(json[1].get("page_end").is_none(), "{}", json[1]);
+    }
+
+    /// A PDF selection arrives with a line break at every printed wrap. The agent
+    /// reads it as one paragraph — unless the user chose to keep the breaks —
+    /// and the stored text is never the thing that changes.
+    #[test]
+    fn get_highlights_returns_the_merged_paragraph() {
+        use crate::highlight_groups::fixtures;
+
+        const WRAPPED: &str = "the quick brown\nfox jumps over\nthe lazy dog";
+        let at = "2026-03-01T09:00:00.000Z";
+
+        let plain = fixtures::record("a", 1, WRAPPED, at);
+        let mut kept = fixtures::record("b", 2, WRAPPED, "2026-03-01T09:00:01.000Z");
+        kept.keep_line_breaks = Some(true);
+        let mut ebook = fixtures::record("c", 3, "para one\npara two", "2026-03-01T09:00:02.000Z");
+        ebook.start_offset = Some(0);
+        ebook.end_offset = Some(17);
+        let single = fixtures::record("d", 4, "already one line", "2026-03-01T09:00:03.000Z");
+        let lib = fixtures::library_with("a-paper", &[plain, kept, ebook, single]);
+
+        let listed = get_highlights(lib.root(), "a-paper").unwrap();
+        let by_id = |id: &str| listed.iter().find(|h| h.id == id).unwrap();
+        assert_eq!(by_id("a").text, "the quick brown fox jumps over the lazy dog");
+        assert_eq!(by_id("b").text, WRAPPED);
+        assert_eq!(by_id("c").text, "para one\npara two");
+        assert_eq!(by_id("d").text, "already one line");
+
+        // A selection across a page break: one entry, merged, same canonical id.
+        let created = "2026-03-01T10:00:00.000Z";
+        let pair = [
+            fixtures::record("hl-10", 10, WRAPPED, created),
+            fixtures::record("hl-11", 11, WRAPPED, created),
+        ];
+        let lib = fixtures::library_with("a-paper", &pair);
+        let listed = get_highlights(lib.root(), "a-paper").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "hl-10");
+        assert_eq!(listed[0].text, "the quick brown fox jumps over the lazy dog");
     }
 }

@@ -1,0 +1,108 @@
+# gitleaks configuration — keeps API keys, tokens and signing keys out of the repo.
+#
+# Used by three things, all reading this one file:
+#   * .githooks/pre-commit  scans what is staged, before the commit exists
+#   * .githooks/pre-push    scans the commits about to leave the machine
+#   * .github/workflows/gitleaks.yml  scans every push and pull request
+#
+# A false positive is handled in this order of preference:
+#   1. an inline `gitleaks:allow` comment on the line,
+#   2. the finding's fingerprint in .gitleaksignore,
+#   3. a narrow entry in the allowlist below.
+# Never loosen a rule to make one finding go away.
+
+title = "Argus"
+
+[extend]
+# The upstream ruleset: OpenAI/Anthropic/GitHub/AWS/Google/... keys, private-key
+# PEM blocks, and the entropy-based generic-api-key rule.
+useDefault = true
+
+# ── Rules specific to this app ───────────────────────────────────────────────
+# Argus talks to many AI providers and most of them issue a bare random string
+# with no recognisable shape. The upstream generic rule only fires when the key
+# sits next to a name like `apiKey =`; these catch the formats that do have a
+# fingerprint, wherever they appear (a test fixture, a log line, a curl example
+# pasted into a doc).
+
+[[rules]]
+id = "tauri-updater-private-key"
+description = "Tauri updater signing key (TAURI_SIGNING_PRIVATE_KEY). Anyone holding it can ship an update that every installed copy of the app will trust."
+# The key file is two lines, the first being "untrusted comment: rsign encrypted
+# secret key" (or minisign). CI secrets and .env files hold it base64-encoded, so
+# the base64 of that same header is matched too. The PUBLIC key in tauri.conf.json
+# starts "untrusted comment: minisign public key", whose base64 differs after the
+# 24th character, so it is not caught.
+regex = '''(?:dW50cnVzdGVkIGNvbW1lbnQ6I(?:HJzaWdu|G1pbmlzaWdu)IGVuY3J5cHRlZCBzZWNyZXQga2V5[A-Za-z0-9+/=]*|untrusted comment: (?:rsign|minisign) encrypted secret key)'''
+keywords = ["dw50cnvzdgvkigNvbw1lbnq6", "untrusted comment"]
+
+[[rules]]
+id = "minimax-token-plan-key"
+description = "MiniMax Token Plan subscription key (sk-cp-…)"
+regex = '''\b(sk-cp-[A-Za-z0-9_\-]{20,})'''
+secretGroup = 1
+keywords = ["sk-cp-"]
+
+[[rules]]
+id = "qwen-token-plan-key"
+description = "Qwen / Bailian Token Plan key (sk-sp-…)"
+regex = '''\b(sk-sp-[A-Za-z0-9_\-]{20,})'''
+secretGroup = 1
+keywords = ["sk-sp-"]
+
+[[rules]]
+id = "openrouter-api-key"
+description = "OpenRouter API key"
+regex = '''\b(sk-or-v1-[A-Za-z0-9]{32,})'''
+secretGroup = 1
+keywords = ["sk-or-v1-"]
+
+[[rules]]
+id = "zhipu-api-key"
+description = "Zhipu / BigModel API key (<32 hex>.<16 chars>)"
+# Needs the platform's id.secret shape AND a nearby mention of the provider or a
+# key-ish name, because a bare 32-hex-dot-16 string also matches hashes with an
+# extension.
+regex = '''(?i)(?:zhipu|bigmodel|glm|api[_-]?key|token|secret)[\w\s"'.:=-]{0,40}?\b([0-9a-f]{32}\.[A-Za-z0-9]{16})\b'''
+secretGroup = 1
+keywords = ["zhipu", "bigmodel", "glm", "key", "token", "secret"]
+
+[[rules]]
+id = "sk-prefixed-api-key"
+description = "A long sk-… secret (DeepSeek, Moonshot, StepFun relays, new-api/MoleAPI and many OpenAI-compatible providers use this shape)"
+# No hyphen or underscore in the body, on purpose: long hyphenated identifiers also
+# start with "sk-" (CSS classes like sk-circle-spinner-…, i18n keys) and their
+# letter statistics are indistinguishable from a random key's, so entropy alone
+# cannot tell them apart. The keys that DO carry hyphens (sk-proj-, sk-ant-,
+# sk-or-v1-, sk-cp-, sk-sp-) have rules of their own, upstream or above. The low
+# entropy floor keeps a 32-hex key (DeepSeek: at most 4 bits per character, about
+# 3.6 typical) from slipping under it.
+regex = '''\b(sk-[A-Za-z0-9]{32,})'''
+secretGroup = 1
+entropy = 3.0
+keywords = ["sk-"]
+
+[rules.allowlist]
+description = "obvious placeholders in docs and form hints"
+stopwords = ["example", "your-api-key", "your_api_key", "xxxxxxxx", "placeholder", "dummy", "redacted"]
+
+[[rules]]
+id = "argus-key-store-committed"
+description = "Argus's own key store. api_keys.json holds the encrypted provider keys and .keymaster the master key that decrypts them; neither belongs in a repository."
+path = '''(?i)(^|/)(api_keys\.json|\.keymaster)$'''
+
+# ── Allowlist ────────────────────────────────────────────────────────────────
+# Build output and vendored bundles. They are git-ignored, so the hooks and the CI
+# scan never see them; the entry exists for a manual `gitleaks dir .`, which does
+# not read .gitignore and otherwise drowns in minified-bundle noise.
+[allowlist]
+description = "build output and vendored bundles"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)src-tauri/target/''',
+  '''(^|/)src-tauri/gen/''',
+  '''(^|/)src-tauri/lib/''',
+  '''(^|/)public/(pdfjs|vditor)/''',
+  '''(^|/)docs/\.vitepress/(cache|dist)/''',
+]

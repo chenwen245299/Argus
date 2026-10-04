@@ -1,0 +1,57 @@
+#!/bin/sh
+# Last check before commits leave this machine: scans every commit about to be
+# pushed. pre-commit already looks at what is staged; this one also catches a
+# secret that got in with `--no-verify`, from a tool that skips hooks, or inside
+# a commit message — and it is the last point at which nothing is public yet.
+# Rules live in .gitleaks.toml; see .githooks/pre-commit for how to handle a
+# false positive.
+
+PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/go/bin:$HOME/.local/bin"
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+
+  ✖ 没有找到 gitleaks，这次 push 已被拦下（push 之后密钥就公开了，所以这里不放行）。
+
+    安装：  brew install gitleaks      （Windows: winget install gitleaks 或 scoop install gitleaks）
+    装好后重新 push 即可。确实要跳过：git push --no-verify。
+
+EOF
+  exit 1
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+remote="$1"
+zero=0000000000000000000000000000000000000000
+status=0
+
+# stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per ref pushed.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # Deleting a branch or tag sends nothing.
+  [ "$local_sha" = "$zero" ] && continue
+
+  # "Reachable from what is being pushed, but from no branch of the remote we
+  # already know" is exactly the set of new commits — for an existing branch and
+  # for a brand-new one alike (no need to special-case the all-zero remote sha).
+  if ! gitleaks git --redact --no-banner --verbose \
+      --log-opts="$local_sha --not --remotes=$remote" .; then
+    status=1
+  fi
+done
+
+if [ "$status" -ne 0 ]; then
+  cat >&2 <<'EOF'
+
+  ✖ 要推送的提交里发现了疑似密钥，push 已取消（上面是脱敏后的位置）。
+
+    如果它在已经提交的历史里：先去服务商那边作废这把密钥并重新生成（它在你本机的
+    历史里，但还没公开，所以现在改还来得及），然后从提交里清掉它再 push：
+      · 最近一次提交：改文件后 git commit --amend
+      · 更早的提交：git rebase -i 改写那个提交
+    如果不是密钥（测试数据、占位符）：在该行加注释 gitleaks:allow，
+    或把上面的 Fingerprint 追加到 .gitleaksignore。
+
+EOF
+  exit 1
+fi

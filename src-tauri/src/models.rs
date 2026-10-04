@@ -219,6 +219,15 @@ pub struct Highlight {
     pub anchor_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_suffix: Option<String>,
+    /// The user chose to keep this highlight's line breaks as captured. A PDF has
+    /// no paragraphs, only printed lines, so `text` carries a line break at every
+    /// wrap; everything that shows or exports a highlight joins those lines back
+    /// into one paragraph (see `highlight_text::display_text`) unless this is
+    /// `Some(true)`. `text` itself is never rewritten. Absent = merged, so every
+    /// legacy highlight is fixed without a migration, and an older build that
+    /// drops the field merely merges again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_line_breaks: Option<bool>,
 }
 
 fn default_highlight_style() -> String {
@@ -423,10 +432,54 @@ pub struct AppSettings {
     /// Automatically check for app updates (daily at 9am + shortly after launch).
     #[serde(default = "default_auto_check_updates")]
     pub auto_check_updates: bool,
+    /// AI provider whose speech model reads text aloud (设置 → AI 随航 → 朗读).
+    /// `None` means read-aloud is not configured, which is how the 朗读 button
+    /// knows to send the user to the settings instead of calling a provider.
+    #[serde(default)]
+    pub speech_provider_id: Option<String>,
+    /// The speech model on that provider — an id from the `MediaModelSpec`s that
+    /// `media::capabilities` lists for a `MediaKind::Speech` task.
+    #[serde(default)]
+    pub speech_model_id: Option<String>,
+    /// Values of that model's `MediaField`s, keyed by `MediaField::key` and sent
+    /// as `MediaRequest::options` on every read. Untyped on purpose, like the
+    /// request: only the adapter that declared a field understands its value.
+    /// Read leniently — see [`lenient_object`].
+    #[serde(default, deserialize_with = "lenient_object")]
+    pub speech_options: serde_json::Map<String, serde_json::Value>,
+    /// Leave in-text citation markers out of what is read aloud (what counts as
+    /// one is `src/utils/speechText.ts`'s call; the backend never sees them). On
+    /// by default: nobody wants "open bracket twelve close bracket" in the middle
+    /// of a sentence.
+    #[serde(default = "default_speech_skip_citations")]
+    pub speech_skip_citations: bool,
 }
 
 pub fn default_usd_to_cny_rate() -> f64 {
     7.20
+}
+
+pub fn default_speech_skip_citations() -> bool {
+    true
+}
+
+/// Deserialize a JSON object field, reading anything that is not an object
+/// (`null`, a stray array) as empty.
+///
+/// `AppSettings` is read with `unwrap_or_default()`, so one field that fails to
+/// parse does not just lose itself — it resets *every* setting in the file. An
+/// option bag the frontend writes and the user may hand-edit is exactly the kind
+/// of field that must not be able to do that.
+fn lenient_object<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Map<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    })
 }
 
 pub fn default_auto_check_updates() -> bool {
@@ -661,6 +714,10 @@ impl Default for AppSettings {
             sections_ai_model_id: None,
             sections_ai_prompt: default_sections_ai_prompt(),
             auto_check_updates: default_auto_check_updates(),
+            speech_provider_id: None,
+            speech_model_id: None,
+            speech_options: serde_json::Map::new(),
+            speech_skip_citations: default_speech_skip_citations(),
         }
     }
 }
@@ -1781,5 +1838,81 @@ mod provider_settings_tests {
             _ => panic!("wrong variant"),
         }
         assert_eq!(serde_json::to_string(&part).unwrap(), raw);
+    }
+}
+
+#[cfg(test)]
+mod speech_settings_tests {
+    use super::*;
+
+    /// A `config.json` written before read-aloud existed has none of the four
+    /// speech keys. It is read with `unwrap_or_default()`, so a missing
+    /// `#[serde(default)]` would not fail one field — it would reset every
+    /// setting the user has.
+    #[test]
+    fn a_config_written_before_read_aloud_loads_with_speech_defaults() {
+        let json = r#"{
+            "appearance": "dark",
+            "extraction_default": "lopdf",
+            "translate_ai_provider_id": "p-translate"
+        }"#;
+        let s: AppSettings = serde_json::from_str(json).expect("old config must still parse");
+        // What was there is kept…
+        assert_eq!(s.appearance, "dark");
+        assert_eq!(s.translate_ai_provider_id.as_deref(), Some("p-translate"));
+        // …and read-aloud starts unconfigured, with citations skipped.
+        assert_eq!(s.speech_provider_id, None);
+        assert_eq!(s.speech_model_id, None);
+        assert!(s.speech_options.is_empty());
+        assert!(s.speech_skip_citations);
+    }
+
+    #[test]
+    fn the_default_settings_agree_with_the_serde_defaults() {
+        let d = AppSettings::default();
+        assert!(d.speech_skip_citations);
+        assert!(d.speech_provider_id.is_none() && d.speech_model_id.is_none());
+        assert!(d.speech_options.is_empty());
+    }
+
+    /// The whole point of storing the options untyped: whatever the adapter's
+    /// form produced survives a save and a reload unchanged, including the
+    /// types (a number stays a number, a toggle stays a bool).
+    #[test]
+    fn speech_settings_round_trip() {
+        let mut s = AppSettings::default();
+        s.speech_provider_id = Some("mm".into());
+        s.speech_model_id = Some("speech-2.8-turbo".into());
+        s.speech_options = serde_json::json!({
+            "voice": "English_Graceful_Lady", "speed": 1.2, "text_normalization": true
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        s.speech_skip_citations = false;
+
+        let back: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.speech_provider_id.as_deref(), Some("mm"));
+        assert_eq!(back.speech_model_id.as_deref(), Some("speech-2.8-turbo"));
+        assert_eq!(back.speech_options["voice"], "English_Graceful_Lady");
+        assert_eq!(back.speech_options["speed"], 1.2);
+        assert_eq!(back.speech_options["text_normalization"], true);
+        assert!(!back.speech_skip_citations);
+    }
+
+    /// The option bag is written by the frontend and can be hand-edited. A
+    /// `null` or a stray array in it must cost the bag, not the whole file.
+    #[test]
+    fn a_malformed_option_bag_does_not_reset_the_other_settings() {
+        for bad in ["null", "[1,2]", "\"x\"", "7"] {
+            let json = format!(
+                r#"{{"appearance": "warm", "extraction_default": "lopdf", "speech_options": {bad}}}"#
+            );
+            let s: AppSettings = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("speech_options {bad} must not fail the file: {e}"));
+            assert_eq!(s.appearance, "warm", "{bad}");
+            assert!(s.speech_options.is_empty(), "{bad}");
+        }
     }
 }

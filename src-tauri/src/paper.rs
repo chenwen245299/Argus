@@ -587,6 +587,7 @@ mod highlight_tests {
             end_offset: None,
             anchor_prefix: None,
             anchor_suffix: None,
+            keep_line_breaks: None,
         }
     }
 

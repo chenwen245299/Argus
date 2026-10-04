@@ -1,4 +1,5 @@
 import type { AiModel } from '../types'
+import { beijingParts, holidayNameOn, isCnMakeupWorkday } from './cnHolidays'
 
 // One place for "what did this call cost". The paper chat, the library chat and
 // the usage dashboard each used to carry their own copy of this arithmetic, and
@@ -8,13 +9,55 @@ import type { AiModel } from '../types'
 export const DEFAULT_USD_TO_CNY_RATE = 7.2
 
 /**
- * DeepSeek-style peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00.
- * Computed from UTC so it is correct regardless of the user's own timezone.
+ * DeepSeek's peak window, the ONE implementation of it (the toolbar chip and
+ * every cost estimate go through here). The official wording, from the pricing
+ * page https://api-docs.deepseek.com/zh-cn/quick_start/pricing:
+ *
+ *   北京时间周一至周五（不含中国法定节假日）9:00 - 12:00、14:00 - 18:00 为高峰时段；
+ *   其余时段，包括周末及中国法定节假日全天均为空闲时段。
+ *
+ * So peak = a Beijing-time Monday–Friday that is not an official day off, and
+ * then 09:00 <= t < 12:00 or 14:00 <= t < 18:00. A weekend is off-peak even when
+ * it is an official make-up WORKING day (调休上班): that is the literal reading
+ * (it is not Monday–Friday), and DeepSeek's 2026-09-19 "API 峰谷时间说明", as the
+ * press quotes it (IT之家, 凤凰网), says the same: 调休上班的周末、中国法定节假日
+ * 全天均按空闲时段计费. A weekday that is an official day off — including the
+ * bridge days of a long holiday — is a holiday. Everything is read off the
+ * BEIJING wall clock and calendar date, so it does not depend on the user's own
+ * timezone. Holiday data: ./cnHolidays.
  */
+export type PeakReason = 'peak-hours' | 'weekday-offpeak-hours' | 'weekend' | 'holiday'
+
+export interface PeakPeriod {
+  peak: boolean
+  reason: PeakReason
+  /** Set when `reason` is `holiday`, e.g. `国庆节`. */
+  holidayName?: string
+  /** Set on a weekend that is an official make-up working day (调休上班); still off-peak. */
+  makeupWorkday?: boolean
+}
+
+/** Peak or off-peak at `date`, and why. An invalid Date is reported as plain off-peak. */
+export function describePeakPeriod(date: Date): PeakPeriod {
+  const b = beijingParts(date)
+  if (!b) return { peak: false, reason: 'weekday-offpeak-hours' }
+  // A holiday wins over a weekend, so a Saturday that is also National Day says
+  // "国庆节" rather than just "周末".
+  const holidayName = holidayNameOn(b.year, b.month, b.day)
+  if (holidayName !== null) return { peak: false, reason: 'holiday', holidayName }
+  if (b.weekday === 0 || b.weekday === 6) {
+    return isCnMakeupWorkday(b.year, b.month, b.day)
+      ? { peak: false, reason: 'weekend', makeupWorkday: true }
+      : { peak: false, reason: 'weekend' }
+  }
+  const m = b.minutes
+  return (m >= 9 * 60 && m < 12 * 60) || (m >= 14 * 60 && m < 18 * 60)
+    ? { peak: true, reason: 'peak-hours' }
+    : { peak: false, reason: 'weekday-offpeak-hours' }
+}
+
 export function isPeakHour(date: Date): boolean {
-  const minutes = ((date.getUTCHours() + 8) % 24) * 60 + date.getUTCMinutes()
-  const h = minutes / 60
-  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+  return describePeakPeriod(date).peak
 }
 
 export interface UsageForPricing {

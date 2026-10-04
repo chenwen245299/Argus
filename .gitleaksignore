@@ -1,0 +1,4 @@
+# Fingerprints of gitleaks findings that were reviewed and are NOT secrets.
+# One per line, exactly as gitleaks prints them ("Fingerprint: …"). Prefer a
+# `gitleaks:allow` comment on the offending line when the file allows comments;
+# use this for JSON/binary fixtures that cannot carry one. Say why above each entry.

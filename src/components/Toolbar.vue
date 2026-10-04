@@ -14,6 +14,8 @@ import { useCollectionsStore } from '../stores/collections'
 import { useRagStore } from '../stores/rag'
 import { useAiStore } from '../stores/ai'
 import { titleInitialCaps } from '../utils/text'
+import { describePeakPeriod, type PeakPeriod } from '../utils/modelPricing'
+import { subscribeCnHolidays } from '../utils/cnHolidays'
 import type { SearchHit, Note, PaperStatus } from '../types'
 import TokenUsageModal from './TokenUsageModal.vue'
 import ActivityLogModal from './ActivityLogModal.vue'
@@ -37,20 +39,65 @@ function viewDuplicatePaper() {
 }
 
 // ── DeepSeek-style peak/off-peak price indicator ────────────────────────────
-// Peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00; else off-peak.
+// The rule lives in utils/modelPricing.ts (describePeakPeriod): peak only on a
+// Beijing-time Mon–Fri that is not a Chinese public holiday, 09:00–12:00 and
+// 14:00–18:00. Weekends and public holidays are off-peak all day.
 const priceClockTs = ref(Date.now())
 let priceClockTimer: ReturnType<typeof setInterval> | null = null
+let unsubscribeHolidays: (() => void) | null = null
 
 const hasPeakModel = computed(() =>
   (ai.settings?.providers ?? []).some(p => p.models.some(m => m.peak_pricing)),
 )
 
-const isPeakPriceNow = computed(() => {
-  const d = new Date(priceClockTs.value)
-  const minutes = ((d.getUTCHours() + 8) % 24) * 60 + d.getUTCMinutes()
-  const h = minutes / 60
-  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+// Bumped when the holiday calendar changes, so the chip re-evaluates even if
+// the clock reading happens to be identical.
+const holidayRev = ref(0)
+const peakPeriod = computed<PeakPeriod>(() => {
+  void holidayRev.value
+  return describePeakPeriod(new Date(priceClockTs.value))
 })
+const isPeakPriceNow = computed(() => peakPeriod.value.peak)
+
+/**
+ * The calendar data names holidays in Chinese (`国庆节`); the English UI needs its
+ * own wording, so a name it knows maps to a locale key and one it does not is shown
+ * as it came — a new holiday never leaves the tooltip blank.
+ */
+const HOLIDAY_KEYS: Record<string, string> = {
+  '元旦': 'newYear',
+  '春节': 'springFestival',
+  '清明节': 'qingming',
+  '劳动节': 'labourDay',
+  '端午节': 'dragonBoat',
+  '中秋节': 'midAutumn',
+  '国庆节': 'nationalDay',
+  '国庆节、中秋节': 'nationalMidAutumn',
+}
+
+/** Why the chip says what it says, in words. */
+const peakTooltip = computed(() => {
+  const p = peakPeriod.value
+  switch (p.reason) {
+    case 'holiday': {
+      // 节假日 is the calendar's own placeholder when a feed gives no name.
+      if (!p.holidayName || p.holidayName === '节假日') return t('toolbar.peak.holidayGeneric')
+      const key = HOLIDAY_KEYS[p.holidayName]
+      return t('toolbar.peak.holiday', { name: key ? t(`toolbar.peak.holidays.${key}`) : p.holidayName })
+    }
+    case 'weekend':
+      return t(p.makeupWorkday ? 'toolbar.peak.weekendMakeup' : 'toolbar.peak.weekend')
+    case 'peak-hours':
+      return t('toolbar.peak.peakHours')
+    default:
+      return t('toolbar.peak.offPeakHours')
+  }
+})
+
+// A window that was hidden or asleep misses ticks (timers are throttled), so
+// re-read the clock the moment it is looked at again.
+function refreshPriceClock() { priceClockTs.value = Date.now() }
+function onPriceClockVisibility() { if (!document.hidden) refreshPriceClock() }
 
 // Aggregate embed-vector progress across all running collection jobs so the
 // toolbar shows a single status chip while embeddings are being built.
@@ -803,7 +850,11 @@ onMounted(async () => {
   // Load AI settings so we know whether any model uses peak pricing, and tick
   // the price clock every 30 s so the peak/off-peak chip flips on time.
   if (!ai.loaded) ai.load().catch(() => {})
-  priceClockTimer = setInterval(() => { priceClockTs.value = Date.now() }, 30_000)
+  priceClockTimer = setInterval(refreshPriceClock, 30_000)
+  document.addEventListener('visibilitychange', onPriceClockVisibility)
+  window.addEventListener('focus', refreshPriceClock)
+  // A background refresh of the holiday calendar can change today's answer.
+  unsubscribeHolidays = subscribeCnHolidays(() => { holidayRev.value++; refreshPriceClock() })
 })
 
 onUnmounted(() => {
@@ -815,6 +866,9 @@ onUnmounted(() => {
   if (aiLabelToggleTimer) { clearInterval(aiLabelToggleTimer); aiLabelToggleTimer = null }
   if (statusPollTimer) { clearInterval(statusPollTimer); statusPollTimer = null }
   if (priceClockTimer) { clearInterval(priceClockTimer); priceClockTimer = null }
+  document.removeEventListener('visibilitychange', onPriceClockVisibility)
+  window.removeEventListener('focus', refreshPriceClock)
+  if (unsubscribeHolidays) { unsubscribeHolidays(); unsubscribeHolidays = null }
   if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
   document.removeEventListener('pointerdown', onDocClick, true)
 })
@@ -1037,16 +1091,14 @@ onUnmounted(() => {
       v-if="library.currentPath && hasPeakModel"
       class="dpsk-price-chip"
       :class="isPeakPriceNow ? 'is-peak' : 'is-offpeak'"
-      :title="isPeakPriceNow
-        ? '当前为波峰时段（价格较高）：北京时间 09:00–12:00、14:00–18:00'
-        : '当前为波谷时段（价格较低）：北京时间波峰以外的时间'"
+      :title="peakTooltip"
     >
       <img :src="dpskIconUrl" class="dpsk-logo" alt="" />
       <span class="dpsk-provider">DeepSeek</span>
       <span class="dpsk-sep" />
       <Icon v-if="isPeakPriceNow" icon="fluent:arrow-trending-24-regular" class="dpsk-trend" width="14" height="14" />
       <Icon v-else icon="fluent:arrow-trending-down-24-regular" class="dpsk-trend" width="14" height="14" />
-      <span class="dpsk-price-label">{{ isPeakPriceNow ? '波峰' : '波谷' }}</span>
+      <span class="dpsk-price-label">{{ isPeakPriceNow ? t('toolbar.peak.peak') : t('toolbar.peak.offpeak') }}</span>
     </div>
 
     <div v-if="library.currentPath && hasPeakModel" class="tb-sep" />

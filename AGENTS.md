@@ -129,6 +129,7 @@ npm run tauri build
 npm run preview      # Preview the built dist/ bundle
 npm run tauri        # Proxy to the Tauri CLI
 cd src-tauri && cargo test --lib  # Run the Rust unit tests (~450)
+npm run scan:secrets # gitleaks over the whole git history (needs `brew install gitleaks`)
 ```
 
 ### Upgrading Tauri
@@ -197,6 +198,7 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `rag.ts` | RAG provider, embedding model, vector store status, collection embed jobs, and the library-wide 同步缺失 / 完整重建 run (kept here so it outlives the settings modal). `MainView` reloads it on the backend's `rag-settings-changed` event, since the embedding map window saves RAG settings through its own settings modal; a mounted `RagSettings.vue` reloads on the same event |
 | `arxiv.ts` | arXiv inbox, config, schedule status, analysis |
 | `canvas.ts` | Canvas list, current canvas, auto-save |
+| `speech.ts` | Read-aloud: configured speech provider/model/options, the speech capabilities from `list_media_capabilities`, `read()` and its state — see *Media generation and read-aloud* |
 
 `snippetLibrary.ts`, `translationHistory.ts`, and `update.ts` are reactive helper modules, not Pinia stores.
 
@@ -216,6 +218,9 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `rag.rs` | Vector store and embedding storage behind the embedding map (chat does not read it) |
 | `ai_manager.rs` | AI provider CRUD and AES-256-GCM API key encryption |
 | `llm.rs` | OpenAI-compatible / Anthropic chat, embeddings, OpenRouter, token usage |
+| `render.rs` | Rasterises one PDF page to PNG through the bundled PDFium (the reader's path for PDFs with Type 3 fonts, `view_paper_page` for the agent). One dedicated `argus-pdfium` thread owns the binding and a small document cache (4 docs, keyed by path + mtime + size + file identity, released after 60 s idle); PNG is encoded off that thread with the fast lossless encoder. `render_page_image` returns raw PNG bytes (`tauri::ipc::Response`), `render_page_png` is the older base64 twin. Pixels must stay identical across encoder/cache changes — compare decoded pixels, never PNG bytes |
+| `media.rs` | The provider-agnostic contract for everything that is not a conversation (image, speech, transcription, sound, music): task kinds, form-as-data (`MediaField` / `MediaModelSpec`), request/result types, dispatch to the adapters, and the "How to add a provider" checklist — see *Media generation and read-aloud* |
+| `stepfun_media.rs` / `minimax_media.rs` | The media adapters: StepFun (all six kinds) and MiniMax (speech only). One file per provider; nothing else changes when one is added |
 | `ai_summary.rs` | Generate AI paper summaries and abstract extraction |
 | `copilot.rs` | Per-paper and library-wide chat, chat history persistence |
 | `arxiv.rs` / `arxiv_scheduler.rs` | arXiv/bioRxiv fetching, inbox storage, scheduled catch-up |
@@ -226,6 +231,9 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `settings.rs` | `config.json` settings I/O |
 | `mcp/` | Read-only MCP server for external agents, run as a stdio subprocess — see below |
 | `offer_sync.rs` | Background re-read of model prices on launch, so a withdrawn free tier stops advertising itself |
+| `holidays.rs` | China public-holiday calendar (holiday-cn) refreshed in the background into an app-local cache; `get_cn_holidays` + the `cn-holidays-updated` event feed `src/utils/cnHolidays.ts`, which decides DeepSeek's peak window — see the model-badge notes below |
+| `highlight_groups.rs` | Derived view that stitches the per-page records of one cross-page PDF selection back into a single highlight (same `created_at` + `text`, >= 2 pages). Read-only consumers (export, MCP, vectorize) call `read_grouped`; the raw read / save path must stay uncollapsed. TS twin: `src/utils/highlightGroups.ts` |
+| `highlight_text.rs` | A highlight's display text: the PDF's per-line breaks merged into one paragraph unless `keep_line_breaks` is set (ebook records untouched). `Highlight.text` itself is never rewritten. TS twin: `src/utils/highlightText.ts` — the two must stay identical |
 | `path_guard.rs` | Path-segment validation against traversal attacks |
 | `security_bookmark.rs` | macOS security-scoped bookmark persistence |
 | `fsutil.rs` | Shared filesystem helpers |
@@ -491,9 +499,10 @@ Built for subscription plans that throttle hard — MiniMax's Token Plan answers
   paper's `max_attempts` — only timeouts and 5xx do. Throttling that never lets
   up is left to the stall limit, which reverts rather than fails.
 - **MiniMax is paced before it throttles** (`minimax::batch_pacing`): a Token
-  Plan key (`sk-cp-…`) keeps at most `PLAN_MAX_IN_FLIGHT` = 4 requests in
+  Plan key (`sk-cp-…`) keeps at most `PLAN_MAX_IN_FLIGHT` = 3 requests in
   flight (the plan FAQ: about 3–4 agents on Plus, 4–5 on Max, 6–7 on Ultra at
-  peak hours), and every MiniMax key spaces request starts
+  peak hours; measured, a batch at 4 plus one more request was throttled
+  off-peak, so 3 leaves room for the user's chats), and every MiniMax key spaces request starts
   (`BatchTuning::min_interval`) to 75% of the model's published RPM — 200 for
   M3, 500 for the M2 line. The `started` event carries the effective
   `concurrency` and a `concurrency_note` when it was capped.
@@ -527,7 +536,189 @@ Built for subscription plans that throttle hard — MiniMax's Token Plan answers
   way round) is converted rather than failing the paper, and a candidate that
   does not parse goes through `repair_json_strings` once — MiniMax writes
   Chinese quotations with bare ASCII `"` inside the value, which failed that
-  paper on every retry. Valid JSON is never rewritten.
+  paper on every retry. Valid JSON is never rewritten. Field names go through
+  `canonical_field` (any case or separators, a few aliases, up to two typos:
+  MiniMax-M3 writes `relevence_score`), and a reply that still does not parse
+  is read field by field by `salvage_fields`, from each name to the next — M3
+  also closes a summary with `"…"]`. Between them these two were 40 of 41
+  failures in one run. A parse error that remains carries the text around
+  where it broke (`excerpt_at`), not just the reply's first 200 characters.
+
+### PDF page rendering
+
+Two engines draw a page, and **a page's bitmap is always derived from its CSS box**: `cssW = round(viewport.width)`, `pxW = round(cssW × devicePixelRatio)`, pdf.js gets the output transform `[pxW/vp.width,0,0,pxH/vp.height,0,0]`, PDFium gets exactly `pxW × pxH` (never a whole-number DPI), and `(scale, dpr)` is the staleness key. Show a bitmap whose size differs from CSS box × dpr and the browser resamples the whole page — that was the blurry-text bug. A PDF whose bytes contain `/Type3` is drawn by PDFium (`render_page_image`, see `render.rs`) because pdf.js renders those glyphs blank; everything else is a pdf.js canvas. The text, highlight, annotation and link layers are pdf.js's in both cases.
+
+*What gets rendered, and when* is decided by the pure module `src/utils/pageRenderPolicy.ts` (unit-testable without a browser); `PdfViewer.vue` carries the plan out. It replaced an IntersectionObserver with a fixed 600 px margin, which had three real problems: a hidden tab (`v-show` → `display:none`) made every page report "out of view" and **wiped the whole tab**, so each switch back re-rendered everything from white; 600 px is less than one page at 189 % so pages started rendering only when about to be seen; and the same threshold evicted, so pages flapped.
+
+- The render zone is measured in viewports and leans in the direction of travel; a wider keep zone plus a pixel budget (100 MP for the visible viewer, 64 MP for all background tabs together) decides eviction. Pages are rendered by priority (visible, then ahead, then behind) through a queue of two, work that has not started is dropped when its page leaves the zone, running pdf.js tasks are cancelled outside the keep zone, and **a page whose render is in flight is never evicted** (it would finish into an empty wrapper and be marked fresh).
+- A hidden viewer plans nothing and keeps its canvases. On show it restores the scroll position first, then re-checks every mounted page against `(scale, dpr)` (a zoom while hidden leaves a stretched stale bitmap otherwise) and renders only what is missing. A tab that finishes loading while hidden defers `fitWidth` / `restorePosition` until it is shown (`scrollTop` cannot be set on a `display:none` box).
+- `renderingPages`, `inflightRenders` and the generation counter keep their meaning; never clear `renderingPages`.
+- `PDF_ENABLE_HWA` (next to `getDocument`) makes pdf.js use accelerated canvases: far less main-thread compositing per page, text pixel-identical, vector line art antialiased slightly differently. Set it to `false` for bit-identical output with the old software canvases.
+- `reader.persistReadingState(rs, slug)` takes the viewer's own slug: the deactivation watcher runs after `activeSlug` has already changed, so defaulting to it saved a tab's position into the next tab.
+- Measured with the real viewer in a WKWebView harness: a tab switch used to cost 33–450 ms of white and 3 renders per switch, now 0 and 0.
+
+### Page furniture in cross-page highlights
+
+Dragging from the foot of one page into the next also selects, in DOM order, the footnotes and page number of the first page, its arXiv margin stamp, the running head of the next and any figure or table set at its top, so the highlight painted the page number yellow and stored "…composition. 2In contrast…". `src/utils/pageFurniture.ts` (pure, no dependencies) labels spans as `pageNumber` / `header` / `footer` / `footnote` / `margin` / `float` from their geometry and text, and `planFurnitureDropReport` applies the policy: **only a selection that really crosses a page boundary loses anything**, and only on the sides that face the break (or, on the outer pages, furniture that sits on the wrong side of the user's own start/end because of DOM order — foot page numbers listed first in ACL/EMNLP PDFs); never a side the user started or ended in, never when it would empty the selection. Floats are the exception to "sides": every figure / table the selection runs through goes, on any of its pages, except the one the user's own start or end lies in. A false positive silently drops text that cannot be recovered, so every rule needs several independent signals and answers "not furniture" when unsure.
+
+**Floats** (`classifyFloats`) are found from their caption: `captionHead` wants a label, a number and a delimiter ("Figure 3:", "Fig. 2.", "TABLE IV" over its title, "Algorithm 1 Training" with the label in its own span, "图 3："), and the block must not continue the paragraph above it. The float's text is then walked outwards inside the caption's column — a figure's labels above it (past the picture's white band only small type within its width), a table's rows on the side that holds cells, an algorithm's numbered steps — and every walk stops at running text, a heading, a numbered display, another caption or furniture. Traps found in the corpus: a wrapfigure's caption runs together with the text beside it (continuation lines must be aligned and no wider); the next column's text is not a "piece" of a caption line; a paragraph can open a column with "Figure 1. At the top level, …" (a caption in the text's size must show its float — labels, rows, a picture band ≥ 2.5 em — or be ≤ 4 lines set off from what follows); pdf.js reports CJK faces as monospace (CJK is never "code"); "Table7.Obviously" / "Figures 4a–4d present" are prose.
+
+`planSelectionFurniture` in `PdfViewer.vue` runs at mouse-up, while the selection exists: `popup.text` / `popup.pages` hold the trimmed selection and `popup.full` the whole one (its text rebuilt from the text layers). There is **no toggle** to put the skipped spans back — the user asked for the popup's "已跳过…" button to go (2026-10-04) — so the skipped spans get `.sel-skip` (their `::selection` is transparent) and the page shows what a highlight will take; ⌘C copies the trimmed text (`onCopySelection`); a selection that starts or ends inside furniture of a side, or inside a float, keeps it. A drag released over the previous selection's popup is a new selection, not a click on the popup (`pressInPopup`). Rules for anyone touching it:
+
+- **Geometry comes from pdf.js text content**, not from the DOM: WebKit measures text-layer span widths differently from Chrome, which broke footnote detection in the real WKWebView. `renderPage` keeps `{content, view, rotate}` per rendered page (`pageTextSources`) and `preferContentGeometry` swaps it in when span counts and texts match one to one; the DOM supplies only element identity and line ends.
+- **Fail safe**: the text rebuilt from the spans *without* dropping anything must equal `selection.toString()` **ignoring whitespace**, otherwise nothing is trimmed. Never compare line breaks: the app shell is `user-select: none` with only `.textLayer` opting back in (App.vue), so WebKit's `toString()` puts no line break between two pages ("…composition.\n2In contrast") and an exact comparison failed on every cross-page selection — the feature was a silent no-op in the app for that reason while every harness without App.vue's CSS passed. Every selection across pages therefore takes the rebuilt text (`planSelectionFurniture` → `popup.full`), which also fixes words running together across a page break. Test this path only with App.vue's selection rules applied. Records of one highlight must keep sharing the same trimmed `text` and `created_at` (`highlightGroups` groups on that pair).
+- The report (`items`, `counts`) describes only spans that are in the selection (nothing in the popup shows it now; keep it that way for any notice that comes back).
+- Verified on 6977 pages of 310 PDFs (precision first: no false positive found in the audits; recall roughly 83–95 % depending on the kind). Known misses fail towards the old behaviour. Scanned/OCR pages and `/Rotate` pages are a no-op by design. Floats were audited on the same corpus (7101 pages, ~4100 floats): body text next to a float, tables at body size and every first-page float were checked by hand; simulated cross-page selections (6011 page pairs) drop a float on 1503 of them. Single-page selections are untouched, floats included.
+
+### Media generation and read-aloud
+
+Image generation and editing, speech, transcription, sound design and music are
+not chat, and no two providers spell them alike, so they sit behind one
+provider-agnostic contract in `media.rs`. **The form is data, not code:** each
+adapter *describes* its models and their knobs (`MediaField`: select / number /
+toggle / text, with defaults, ranges and notes) and the frontend renders the
+form from that — the media studio (`MediaStudioView.vue`) and the read-aloud
+settings alike. Adding a provider is one adapter file plus two dispatch lines;
+no `.vue` changes.
+
+- **Dispatch.** `media::capabilities(provider)` and `media::run(provider, key,
+  req)` pick the adapter with `is_stepfun` / `is_minimax` (by `kind` or base
+  URL, like the chat side). `list_media_capabilities` lists only providers that
+  are enabled, have an adapter *and* have an API key on file; `run_media_task`
+  takes a `MediaRequest` (`providerId`, `kind`, `model`, `prompt`, `inputs`,
+  untyped `options` keyed by `MediaField::key`) and returns artifacts as a data
+  URI, a hosted URL (these expire) or text. It can be long (music polls for
+  minutes). All calls go out from Rust (`reqwest`), so no capability entry.
+- **Adapters.** `stepfun_media.rs`: all six kinds; its speech is JSON to
+  `/v1/audio/speech` answering with *raw bytes and no envelope*, 1000 characters
+  per request. `minimax_media.rs`: speech only, `POST {base_url}/t2a_v2`; see the
+  gotchas below.
+- **Adding a speech provider** (the same checklist is the module doc of
+  `media.rs`): (1) `<provider>_media.rs` with `capabilities()` and `run()`, and
+  a `mod` line in `lib.rs`; (2) describe every knob as a `MediaField`, each
+  `default` being exactly what `run` does when the key is absent, offering a
+  knob only for the models that take it; (3) declare `max_prompt_chars` and
+  enforce the same number in `run`, counted in characters; (4) one `is_<provider>`
+  arm in `media::capabilities` and one in `media::run`; (5) HTTP errors through
+  `llm::friendly_error`, and body-level errors worded so the vendor code stays
+  on the end in parentheses (`llm::classify_error` reads it); never log or echo
+  the key; (6) tests, including one row in `adapters()` in the `media.rs` test
+  module, which holds every adapter to the same form rules (unique keys, a
+  select's default is one of its options, a number's default is in range, every
+  speech model declares `max_prompt_chars`, no headerless PCM).
+
+**What read-aloud relies on** — the three contracts between backend and
+frontend, deliberately small:
+
+1. `MediaModelSpec.max_prompt_chars` (wire: `maxPromptChars`, optional) is the
+   provider's *hard* limit on `prompt`, in characters. The player chunks by it
+   and may choose smaller chunks, never larger. StepFun speech declares 1000,
+   MiniMax 9 999.
+2. `AppSettings` gains `speech_provider_id`, `speech_model_id`,
+   `speech_options` (keys are the selected model's `MediaField::key`; untyped
+   like `MediaRequest::options`) and `speech_skip_citations` (default **true**).
+   They live in `.argus/config.json` with the rest of `AppSettings`, so they are
+   per library, and `save_settings` writes the whole struct — a frontend path
+   that builds settings from anything but the loaded object blanks them. Every
+   field is `#[serde(default)]`, so an old file loads unchanged (test), and
+   `speech_options` is read leniently (`models::lenient_object`: a `null` or a
+   stray array there empties the bag instead of failing the file, which
+   `read_settings` would answer by resetting *every* setting). A blank id is
+   normalised to `None` in `settings.rs`; `None` is what "not configured" means.
+3. Synthesis is `run_media_task` with `kind: "speech"`, `model`, `prompt` = one
+   chunk and `options` = `speech_options`; the result is `artifacts[0]` =
+   `{mime, dataUrl, filename}`. There is no read-aloud command: it would only
+   duplicate the dispatch and the key lookup.
+
+**Read-aloud flow (frontend).** The selection popup's 朗读 button calls
+`useSpeechStore().read(text, { source })` synchronously from the click, before
+any `await`: the first thing it does is `engine.unlock()`, which starts a silent
+clip on the engine's one persistent `Audio` element (insurance for WebViews that
+want a user gesture for sound; see the comment on `SILENT_WAV`). Calling it again
+with the same text while it is being read stops it, so the button is a toggle.
+
+- `stores/speech.ts` — the configuration (`speech_*` in the app settings, checked
+  against `list_media_capabilities`: `isConfigured` / `notConfiguredReason` =
+  `unset` | `provider-missing` | `no-providers`), `read` / `stop` / `pause` /
+  `resume` / `preview`, and the state (`idle` | `loading` | `playing` | `paused` |
+  `error`, `progress`, `errorMessage`, `setupPrompt`, and `isReadingText(text,
+  source)` for a popup's stop/read label). `select()` reseeds the
+  options from the chosen model's defaults (the adapters' keys differ, see
+  *Saved options go stale*); `setOption()` edits one key. Every read freezes its
+  provider/model/options (`scopeConfigs`) so a retry or prefetch of an older read
+  keeps its voice after the user changes it.
+- `utils/speechText.ts` — pure. `prepareSpeechText` merges PDF line breaks
+  (`mergeWrappedLines`, the highlight rule) and, when `speech_skip_citations`,
+  drops `[12]` / `[1, 2]` / `[3-5]` and author-year (`[Hinton, 2002; LeCun et al.,
+  2006]`, `(Du and Mordatch, 2019)`) — and nothing else: the grammar is
+  deliberately narrow (a whole bracket must parse as a citation list) and leaves
+  `[CLS]`, `(Figure 2)`, `(a)`, `x[1]`, `[0, 1]`, `(Epoch 1500)`, `(CVPR 2019)`
+  alone. `chunkForSpeech` cuts at sentence boundaries (never inside `et al.`,
+  `Fig.`, decimals, initials), first chunk about 200 characters so audio starts
+  fast, later ones up to `min(maxPromptChars, 900)` — deliberately far below
+  MiniMax's 9 999, which the docs advise against anyway — counted in code points.
+- `utils/speechEngine.ts` — pure, I/O injected, tested under Node with fakes. One
+  chunk of lookahead (chunk *i+1* is synthesised while *i* plays, never further),
+  a generation token so `stop()` or a new read invalidates everything in flight,
+  an LRU cache keyed by `speechCacheKey(scope, text)` (20 chunks / 48 M
+  characters; TTS is billed per character, so a replay or a double click costs
+  nothing), and one retry for transient errors only (`classifySpeechError`, which
+  reads the same markers as `llm::classify_error`: balance, key, length and
+  unrecognised errors are fatal and shown with the provider's own words).
+- `components/SpeechHost.vue`, mounted once in `MainView.vue` — the floating
+  mini-player (z-index 900, under the selection popup at 1000; only the pill takes
+  pointer events) and the *not configured* prompt. Its button dispatches
+  `argus-open-settings` with `{ section: 'speech' }` (or `'ai'` when no provider
+  can speak at all); `SettingsModal.vue` also listens for that event while open,
+  because `MainView` only turns it into "show the modal".
+- `components/settings/SpeechSettings.vue` (+ `MediaFieldInput.vue`) — 设置 → AI
+  随航 → 朗读 (section id `speech`): provider chips, model, one control per
+  `MediaField`, the citations toggle and a 试听 button that says it is billed.
+
+If no speech provider/model is set — or the provider has since been deleted,
+disabled or lost its key, so it no longer appears in `list_media_capabilities` —
+`read()` opens the prompt that points at that settings tab and calls nothing.
+Chunking is client-side because the cut points are sentence boundaries of what
+the user selected, playback overlaps synthesis, and Stop must be able to cancel
+between requests; an adapter handles exactly one request, statelessly, and
+enforces the hard limit only as a backstop.
+
+**Gotchas learned the hard way.**
+
+- **MiniMax answers failures with HTTP 200.** The verdict is
+  `base_resp.status_code` (0 = fine) and `data` may be `null`;
+  `minimax::base_resp_error` reads the envelope and `speech_error` words it.
+  Code **1039** is the TPM rate limit on this route but "token limit" in the
+  shared error table (right for chat's `max_tokens`), so the speech wording is
+  local to `minimax_media.rs` and `minimax::code_class` is untouched. A 1042
+  (more than 10 % invisible/illegal characters) is usually text copied out of a
+  PDF.
+- **MiniMax audio is hex text** in `data.audio`, not base64 (decoded by a small
+  tested helper — no new dependency). `output_format: "url"` would give a link
+  that expires in 24 h, so bytes are always requested. Only `mp3` / `wav` /
+  `flac` are offered: `pcm` and `pcmu_*` are headerless or 8 kHz telephony, and
+  `opus` is Ogg, which WebKit's `<audio>` does not reliably play.
+- **Limits are characters, not bytes, and billing counts differently.** MiniMax
+  takes "less than 10 000" (so 9 999) characters, recommends streaming past
+  3 000 (this adapter does not stream, so keep chunks small), and *bills* one
+  Chinese character as two. StepFun is 1000 characters.
+- **Saved options go stale.** Both adapters call their dropdown `voice`, so
+  switching provider leaves the other's id in `speech_options`. The adapter
+  trusts nothing: a `voice` outside its list falls back to the default,
+  numbers are clamped (a read must not fail because a slider was dragged past
+  its end), `emotion` is sent only for models that document it (`fluent` /
+  `whisper` only on 2.6; the form's `auto` means *omit the field* and is never
+  sent), `language_boost` is checked against the options offered, and a
+  Cantonese voice under `auto` becomes `Chinese,Yue`.
+- MiniMax reads inline `(…)` in the text as a pronunciation override (and, on
+  2.8, `(laughs)`-style tags), so text preparation must not invent parentheses.
+- Every read bills per character; the first MiniMax model listed is the cheaper
+  Turbo. The default voice is English (`English_Graceful_Lady`) with
+  `language_boost: auto`, because the reader works mostly through English
+  papers.
+- Probing a live key: `ARGUS_MINIMAX_KEY=… cargo test --lib
+  minimax_media::tests::live_probe -- --ignored --nocapture` (optionally
+  `ARGUS_TTS_OUT=/path/out.mp3` to listen to it).
 
 ### Data persistence
 
@@ -646,6 +837,7 @@ When adding significant backend logic, add a `#[cfg(test)]` module in the releva
 - **CSP:** `tauri.conf.json` sets `"csp": null`. Be cautious when rendering untrusted HTML/markdown; the frontend already uses DOMPurify.
 - **HTTP permissions:** `src-tauri/capabilities/default.json` only allows `https://export.arxiv.org/**` and `https://api.biorxiv.org/**` for built-in fetch. Other HTTP calls go through `tauri-plugin-http` and must be declared in capabilities.
 - **URL opening:** `open_url` only permits `http://` and `https://` schemes.
+- **Secret scanning (gitleaks):** the repository is public, so a committed key is a leaked key. `.githooks/pre-commit` scans the staged diff and `.githooks/pre-push` every commit about to leave the machine; `.github/workflows/gitleaks.yml` scans each push and PR as the backstop for `--no-verify`. All three read `.gitleaks.toml` (upstream rules plus Argus-specific ones: MiniMax `sk-cp-`, Qwen `sk-sp-`, OpenRouter, Zhipu, a generic `sk-` rule, the Tauri updater private key, and a committed `api_keys.json`/`.keymaster`). `npm install` arms the hooks through `scripts/setup-git-hooks.js` (`core.hooksPath=.githooks`; a no-op in CI, outside a git checkout, or when the developer already set their own `hooksPath`), and the hooks refuse to run without `gitleaks` installed (`brew install gitleaks`) rather than silently passing. A finding that is not a secret gets an inline `gitleaks:allow` comment or its fingerprint in `.gitleaksignore` — never a looser rule. **If a real key was ever committed, rotating it at the provider is the fix; rewriting history does not un-leak it.** Never put real keys in tests or fixtures, and never paste one into a prompt or a doc.
 
 ---
 
@@ -702,9 +894,10 @@ xattr -cr /Applications/Argus.app
 |------|------------|
 | Add a Tauri command | `src-tauri/src/commands.rs` + register in `src-tauri/src/lib.rs` |
 | Add a frontend store | `src/stores/` following Composition API style |
-| Add a settings section | `src/components/SettingsModal.vue` + `src/components/settings/`. The nav is 常规 / 主题 / AI 供应商 / AI 随航 / MCP 接口 / 关于. AI 随航 (section `agent`) is a container (`QaSettings.vue`) with Agent 与工具 / RAG / 向量化 / 论文分析 / arXiv 爬取 sub-tabs; `initialSection: 'rag'` (the embedding map's button), `'extraction'` and `'arxiv'` still route there |
+| Add a settings section | `src/components/SettingsModal.vue` + `src/components/settings/`. The nav is 常规 / 主题 / AI 供应商 / AI 随航 / MCP 接口 / 关于. AI 随航 (section `agent`) is a container (`QaSettings.vue`) with Agent 与工具 / RAG / 向量化 / 论文分析 / arXiv 爬取 / 朗读 (`speech`) sub-tabs; `initialSection: 'rag'` (the embedding map's button), `'extraction'` and `'arxiv'` still route there |
 | Add a sidebar tab | `src/components/RightSidebar.vue` + `src/components/tabs/` |
-| Change PDF rendering | `src/components/PdfViewer.vue` |
+| Change PDF rendering | `src/components/PdfViewer.vue` + `src/utils/pageRenderPolicy.ts` — read *PDF page rendering* below first; the sharpness invariants are not negotiable |
+| Change cross-page highlights / page numbers, footnotes, figures and tables | `src/utils/pageFurniture.ts` (the classifier and the drop policy), `planSelectionFurniture` in `PdfViewer.vue` (the integration), `src/utils/highlightGroups.ts` + `src-tauri/src/highlight_groups.rs` (how the per-page records are shown as one) |
 | Change RAG / vectorizing | `src-tauri/src/rag.rs`, `src/stores/rag.ts`, `settings/RagSettings.vue`; vectorizing is papers only and is started from `PaperList.vue` / `LeftSidebar.vue` (collection menu) / 设置 → AI 随航 → RAG / 向量化, not the chat window. Snippets are not vectorized. The vectors serve the embedding map only — chat (agent loop and plain fallback) does not use RAG. The 同步缺失 / 完整重建 run lives in `stores/rag.ts`, not the panel, so it keeps going after the settings modal is closed; `RagSettings.vue` only starts it and shows its progress |
 | Change model badges (FREE / 折扣) | `src-tauri/src/llm.rs` (`quotes_free`, `parse_time_discount`, `fetch_openrouter_discount`) → `AiModel` → `stores/ai.ts` → `utils/modelOffers.ts`, rendered in `LibraryChat.vue`, `tabs/AiTab.vue`, `settings/AiSettings.vue`; refreshed by `offer_sync.rs` |
 
@@ -739,6 +932,35 @@ sorted by free tier immediately and calls `fetch_openrouter_discounts` (fan-out,
 concurrency 8, ~8s for 414 models) to fold the rest in and re-sort. The result
 is cached in `utils/modelOffers.ts` at *module* scope, since the settings modal
 is rebuilt on every open.
+
+**DeepSeek's peak window (波峰 / 波谷) has one implementation**: `isPeakHour` /
+`describePeakPeriod` in `src/utils/modelPricing.ts`. The toolbar chip, every
+`estimateCostCny` call and `TranslationHistoryTab.vue` use it; never write
+another copy of the 9/12/14/18 windows. The official wording (pricing page,
+footnote 2): 「北京时间周一至周五（不含中国法定节假日）9:00 - 12:00、14:00 - 18:00
+为高峰时段；其余时段，包括周末及中国法定节假日全天均为空闲时段」, off-peak
+priced at 0.5x. So peak = a *Beijing* Monday–Friday that is not an official day
+off, 09:00 <= t < 12:00 or 14:00 <= t < 18:00, read off the UTC+8 wall clock and
+date, never the user's timezone. A weekend is off-peak even on a 调休 working
+day (literal reading; DeepSeek's 2026-09-19 note, as the press quotes it, says
+the same); a weekday day off, bridge days included, is a holiday, and
+`reason: 'holiday'` wins over `'weekend'` (the chip's tooltip says why).
+Which days are holidays comes from `src/utils/cnHolidays.ts`, three layers: the
+runtime calendar (`holidays.rs` re-reads NateScarlet/holiday-cn, jsDelivr then
+raw.githubusercontent.com, for this and next year ~45 s after launch and at
+most every 3 days, validates it strictly, caches `cn_holidays.json` in the
+app-local data dir, serves it via `get_cn_holidays` and emits
+`cn-holidays-updated`), which replaces the embedded 2025/2026 State Council
+arrangements (国办发明电〔2024〕12号 / 〔2025〕7号, each date checked against
+gov.cn and holiday-cn), and for a year with neither, only the 13 statutory days
+(a lunar-date table, because `Intl`'s Chinese calendar differs between engines:
+Node 24's ICU is a day out for 春节 2027 and 2030; 清明 by formula) with a one-time `console.warn` — bridge days
+cannot be derived. Each Nov/Dec the State Council publishes next year's notice
+and holiday-cn follows within days, so the runtime refresh normally makes this a
+non-event; to also ship it offline, add the year's rows to `EMBEDDED_ROWS`
+(放假 dates `1`, 上班 dates `0`), compare with
+`https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/<year>.json`, and
+extend `LUNAR_HOLIDAYS` (HKO conversion tables) when it runs out.
 | Change AI chat | `src-tauri/src/copilot.rs`, `src-tauri/src/llm.rs`, `src/components/tabs/AiTab.vue` |
 | Change canvas | `src/views/CanvasView.vue`, `src/components/CanvasPanel.vue`, `src/components/canvas/`, `src-tauri/src/canvas*.rs`. Edges are polylines only, never curves: `AdjustableEdge.vue` draws smooth-step until the user places control points, then the orthogonal route from `src/utils/orthogonalRoute.ts`; both hosts set the drag-to-connect line to smooth-step too |
 | Change import pipeline | `src/stores/import.ts`, `src-tauri/src/metadata.rs`, `src-tauri/src/url_import.rs` |
@@ -747,7 +969,9 @@ is rebuilt on every open.
 | Add an MCP tool | `src-tauri/src/mcp/tools.rs` (the read) + `mcp/server.rs` (declaration + `EXPECTED_TOOLS`) + a dispatch arm in `mcp/agent.rs` |
 | Change agent mode | `src-tauri/src/copilot.rs` (the loop), `mcp/client.rs` (external servers), `src/components/settings/AgentSettings.vue`, `src/components/LibraryChat.vue` (the trail, pins, fallback notice) |
 | Change embedding map | `src/views/EmbeddingMapView.vue`, `src-tauri/src/rag.rs` |
+| Add a media / text-to-speech provider | A new `src-tauri/src/<provider>_media.rs` + two dispatch lines in `media.rs` + a row in the `adapters()` test helper there; follow the checklist in the `media.rs` module doc. No UI change: the studio and 设置 → AI 随航 → 朗读 render from the description |
+| Change read-aloud | `src/stores/speech.ts`, `src/utils/speechText.ts` (chunking), `src/utils/speechEngine.ts` (playback), `src/components/SpeechHost.vue`, `src/components/settings/SpeechSettings.vue`; backend side `src-tauri/src/minimax_media.rs` / `stepfun_media.rs` |
 
 ---
 
-*Last updated: 2026-09-29. Keep this file in sync with major architectural changes.*
+*Last updated: 2026-10-04. Keep this file in sync with major architectural changes.*

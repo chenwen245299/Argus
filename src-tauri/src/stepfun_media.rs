@@ -42,6 +42,11 @@ use crate::models::AiProvider;
 /// note so it is visible at the point of choosing one.
 const IMAGE_OFFLINE: &str = "2026-10-10 下线，届时文生图/图生图/改图接口一并停服";
 
+/// The longest text one `/v1/audio/speech` request takes, in characters. Declared
+/// as `max_prompt_chars` on every TTS model (the read-aloud player chunks by it)
+/// and enforced in [`synthesize`] — one constant, so the two cannot drift.
+const TTS_MAX_CHARS: u32 = 1000;
+
 fn base(provider: &AiProvider) -> String {
     provider.base_url.trim_end_matches('/').to_string()
 }
@@ -150,7 +155,8 @@ fn tts_model(id: &str, name: &str, note: &str) -> MediaModelSpec {
         accepts: vec![],
         file_required: false,
         prompt_required: true,
-        prompt_placeholder: Some("要合成的文本，最多 1000 字符".to_string()),
+        prompt_placeholder: Some(format!("要合成的文本，最多 {TTS_MAX_CHARS} 字符")),
+        max_prompt_chars: Some(TTS_MAX_CHARS),
     }
 }
 
@@ -208,6 +214,7 @@ pub fn capabilities() -> Vec<MediaCapability> {
                     file_required: false,
                     prompt_required: true,
                     prompt_placeholder: Some("描述想要的画面，最多 512 字符".to_string()),
+                    max_prompt_chars: Some(512),
                 },
                 MediaModelSpec {
                     id: "step-2x-large".to_string(),
@@ -218,6 +225,7 @@ pub fn capabilities() -> Vec<MediaCapability> {
                     file_required: false,
                     prompt_required: true,
                     prompt_placeholder: Some("描述想要的画面，最多 512 字符".to_string()),
+                    max_prompt_chars: Some(512),
                 },
             ],
         },
@@ -241,6 +249,7 @@ pub fn capabilities() -> Vec<MediaCapability> {
                 file_required: true,
                 prompt_required: true,
                 prompt_placeholder: Some("要怎么改这张图，最多 512 字符".to_string()),
+                max_prompt_chars: Some(512),
             }],
         },
         MediaCapability {
@@ -272,6 +281,7 @@ pub fn capabilities() -> Vec<MediaCapability> {
                     file_required: true,
                     prompt_required: false,
                     prompt_placeholder: Some("可留空；填入热词（逗号分隔）可提升专有名词识别".to_string()),
+                    max_prompt_chars: None,
                 },
                 MediaModelSpec {
                     id: "step-asr".to_string(),
@@ -286,6 +296,7 @@ pub fn capabilities() -> Vec<MediaCapability> {
                     file_required: true,
                     prompt_required: false,
                     prompt_placeholder: Some("可留空；填入热词（逗号分隔）可提升专有名词识别".to_string()),
+                    max_prompt_chars: None,
                 },
             ],
         },
@@ -307,6 +318,7 @@ pub fn capabilities() -> Vec<MediaCapability> {
                 file_required: false,
                 prompt_required: true,
                 prompt_placeholder: Some("整体描述：场景、氛围、音效与配乐，最多 500 字符".to_string()),
+                max_prompt_chars: Some(500),
             }],
         },
         MediaCapability {
@@ -340,6 +352,7 @@ pub fn capabilities() -> Vec<MediaCapability> {
                 file_required: false,
                 prompt_required: true,
                 prompt_placeholder: Some("曲风、情绪、乐器、节奏……".to_string()),
+                max_prompt_chars: None,
             }],
         },
     ]
@@ -586,9 +599,9 @@ async fn synthesize(
     }
     // Counted in characters rather than bytes, which is also how StepFun counts
     // (and bills) them. Refusing here beats a 400 after the text was typed.
-    if input.chars().count() > 1000 {
+    if input.chars().count() > TTS_MAX_CHARS as usize {
         return Err(format!(
-            "文本有 {} 个字符，超过了 1000 的上限。请分段合成。",
+            "文本有 {} 个字符，超过了 {TTS_MAX_CHARS} 的上限。请分段合成。",
             input.chars().count()
         ));
     }

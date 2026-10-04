@@ -34,6 +34,11 @@ pub struct ExportedHighlight {
     pub color: String,
     pub style: String,
     pub created_at: String,
+    /// Last page of a selection that crosses a page break (`page` is its first).
+    /// Present only for such a selection — one highlight the viewer stored as a
+    /// record per page — so every other highlight serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_end: Option<u32>,
 }
 
 /// One note document, as it appears in an export.
@@ -99,25 +104,10 @@ pub struct ExportFile {
 fn collect_one(root: &str, slug: &str) -> Option<ExportedPaper> {
     let meta: PaperMeta = crate::paper::read_meta(root, slug).ok()?;
 
-    let mut highlights: Vec<ExportedHighlight> = crate::paper::read_highlights(root, slug)
-        .into_iter()
-        .map(|h| ExportedHighlight {
-            page: h.page,
-            text: h.text,
-            note: h.note.filter(|n| !n.trim().is_empty()),
-            color: h.color,
-            style: h.style,
-            created_at: h.created_at,
-        })
-        .collect();
-    // Reading order, not creation order: an export is something you read top to
-    // bottom beside the paper, and the order highlights were made in is rarely
-    // the order they appear on the page.
-    highlights.sort_by(|a, b| {
-        a.page
-            .cmp(&b.page)
-            .then_with(|| a.created_at.cmp(&b.created_at))
-    });
+    // One entry per selection: a highlight that crosses a page break is stored as
+    // a record per page, and listing the raw records would export it twice (and
+    // count it twice). The grouping is a read-time view; nothing is rewritten.
+    let highlights = exported_highlights(crate::highlight_groups::read_grouped(root, slug));
 
     let notes = crate::paper::list_notes(root, slug)
         .into_iter()
@@ -142,6 +132,42 @@ fn collect_one(root: &str, slug: &str) -> Option<ExportedPaper> {
         highlights,
         notes,
     })
+}
+
+/// The highlights of one paper as the export lists them, in reading order.
+///
+/// Takes the collapsed view, so every count derived from the result — the
+/// Markdown headers, the combined document, the folder overview — counts a
+/// selection once.
+fn exported_highlights(groups: Vec<crate::highlight_groups::HighlightGroup>) -> Vec<ExportedHighlight> {
+    let mut highlights: Vec<ExportedHighlight> = groups
+        .into_iter()
+        .map(|g| ExportedHighlight {
+            page: g.rep.page,
+            // The merged paragraph, not one fragment per printed line: a PDF
+            // selection carries a line break at every wrap, which would export as
+            // `> line` × N. A highlight the user chose to keep line breaks for
+            // (and an ebook record) goes out as captured, into `blockquote`.
+            text: g.display_text(),
+            note: g.rep.note.filter(|n| !n.trim().is_empty()),
+            color: g.rep.color,
+            style: g.rep.style,
+            created_at: g.rep.created_at,
+            page_end: g.page_end.filter(|end| *end > g.rep.page),
+        })
+        .collect();
+    // Reading order, not creation order: an export is something you read top to
+    // bottom beside the paper, and the order highlights were made in is rarely
+    // the order they appear on the page. Within a page, a selection that runs on
+    // to the next page follows the ones that end on it, so each page's heading
+    // (see `page_label`) is written once.
+    highlights.sort_by(|a, b| {
+        a.page
+            .cmp(&b.page)
+            .then_with(|| a.page_end.unwrap_or(a.page).cmp(&b.page_end.unwrap_or(b.page)))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+    highlights
 }
 
 /// The notes worth writing out: an empty note is a note the user opened once
@@ -176,6 +202,15 @@ fn color_name(color: &str) -> &str {
         c if c.starts_with("f9a") || c.starts_with("ffb") || c.starts_with("fca") => "橙",
         c if c.starts_with("f8b") || c.starts_with("fbb") || c.starts_with("ffc") => "粉",
         _ => "",
+    }
+}
+
+/// The page heading a highlight sits under: `第 3 页`, or `第 10–11 页` for a
+/// selection that crosses a page break.
+fn page_label(h: &ExportedHighlight) -> String {
+    match h.page_end {
+        Some(end) if end > h.page => format!("第 {}–{} 页", h.page, end),
+        _ => format!("第 {} 页", h.page),
     }
 }
 
@@ -306,11 +341,12 @@ fn paper_markdown(p: &ExportedPaper, heading: &str, note_mode: Notes<'_>) -> Str
 
     if !p.highlights.is_empty() {
         out.push_str(&format!("{heading}# 批注（{}）\n\n", p.highlights.len()));
-        let mut last_page = None;
+        let mut last_label: Option<String> = None;
         for h in &p.highlights {
-            if last_page != Some(h.page) {
-                out.push_str(&format!("**第 {} 页**\n\n", h.page));
-                last_page = Some(h.page);
+            let label = page_label(h);
+            if last_label.as_deref() != Some(label.as_str()) {
+                out.push_str(&format!("**{label}**\n\n"));
+                last_label = Some(label);
             }
             let swatch = color_name(&h.color);
             if swatch.is_empty() {
@@ -725,6 +761,7 @@ mod tests {
             color: "#ffd400".into(),
             style: "highlight".into(),
             created_at: created.into(),
+            page_end: None,
         }
     }
 
@@ -846,6 +883,257 @@ mod tests {
             hs.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
             vec!["first on page 2", "second on page 2", "later page"]
         );
+    }
+
+    // ── A selection across a page break ──────────────────────────────────────
+    //
+    // The viewer stores such a selection as a record per page, each with the
+    // whole text and one shared `created_at`. The export lists it once.
+
+    use crate::highlight_groups::fixtures;
+
+    fn pair_library(note_on_second: Option<&str>) -> fixtures::TestLibrary {
+        let mut pair = fixtures::cross_page_pair(10);
+        pair[1].note = note_on_second.map(str::to_string);
+        // An ordinary highlight on an earlier page, so there is something to
+        // order against and to count.
+        pair.push(fixtures::record("hl-3", 3, "an ordinary one", "2026-03-01T09:00:00.000Z"));
+        fixtures::library_with("a-paper", &pair)
+    }
+
+    #[test]
+    fn a_selection_across_a_page_break_is_exported_once() {
+        let lib = pair_library(Some("我的想法"));
+        let papers = collect(lib.root(), &["a-paper".to_string()]);
+        assert_eq!(papers.len(), 1);
+        let hs = &papers[0].highlights;
+        // Two entries — the ordinary one and the selection — not three records.
+        assert_eq!(hs.len(), 2);
+        assert_eq!((hs[0].page, hs[0].page_end), (3, None));
+        let sel = &hs[1];
+        assert_eq!((sel.page, sel.page_end), (10, Some(11)));
+        assert_eq!(sel.text, fixtures::PAIR_TEXT);
+        // The note was typed on the second record only; it is still the
+        // selection's note.
+        assert_eq!(sel.note.as_deref(), Some("我的想法"));
+        assert_eq!(sel.created_at, fixtures::PAIR_CREATED_AT);
+    }
+
+    #[test]
+    fn every_count_in_the_export_counts_the_selection_once() {
+        let lib = pair_library(None);
+        let papers = collect(lib.root(), &["a-paper".to_string()]);
+
+        let combined = to_markdown_combined(&papers, "2026-09-22 14:00");
+        assert!(combined.contains("1 篇论文 · 2 条批注"), "{combined}");
+        assert!(combined.contains("### 批注（2）"), "{combined}");
+        assert_eq!(combined.matches(fixtures::PAIR_TEXT).count(), 1, "{combined}");
+
+        for format in ["markdown", "json"] {
+            let files = tree_of(&papers, format);
+            let overview = &files[0].content;
+            if format == "json" {
+                let index: serde_json::Value = serde_json::from_str(overview).unwrap();
+                assert_eq!(index["highlightCount"], 2);
+                assert_eq!(index["papers"][0]["highlights"], 2);
+            } else {
+                assert!(overview.contains("2 条批注"), "{overview}");
+                assert!(overview.contains("](<批注/A Paper.md>) | 2 | — |"), "{overview}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_markdown_shows_the_page_range() {
+        let lib = pair_library(None);
+        let papers = collect(lib.root(), &["a-paper".to_string()]);
+        let md = paper_markdown(&papers[0], "##", Notes::Inline);
+        assert!(md.contains("**第 3 页**"), "{md}");
+        assert!(md.contains("**第 10–11 页**"), "{md}");
+        // The plain page label is not also written for the selection's start.
+        assert!(!md.contains("**第 10 页**"), "{md}");
+    }
+
+    #[test]
+    fn the_json_carries_page_end_only_for_a_selection_across_pages() {
+        let lib = pair_library(None);
+        let papers = collect(lib.root(), &["a-paper".to_string()]);
+        let v = serde_json::to_value(&papers[0]).unwrap();
+        let hs = v["highlights"].as_array().unwrap();
+        // An ordinary highlight serializes exactly as it always did.
+        assert!(hs[0].get("pageEnd").is_none(), "{}", hs[0]);
+        assert_eq!(hs[1]["page"], 10);
+        assert_eq!(hs[1]["pageEnd"], 11);
+        assert_eq!(hs[1]["text"], fixtures::PAIR_TEXT);
+    }
+
+    #[test]
+    fn a_page_heading_is_written_once_even_when_a_selection_runs_on_from_it() {
+        use crate::highlight_groups::collapse_highlights;
+        // Created in this order: a selection 10→11, then an ordinary highlight on
+        // page 10. Sorted by time alone the second would follow the first and
+        // repeat the page-10 heading.
+        let mut list = fixtures::cross_page_pair(10);
+        list.push(fixtures::record("late", 10, "later on page ten", "2026-03-02T00:00:00.000Z"));
+        let hs = exported_highlights(collapse_highlights(list));
+        assert_eq!(
+            hs.iter().map(|h| (h.page, h.page_end)).collect::<Vec<_>>(),
+            vec![(10, None), (10, Some(11))]
+        );
+        let p = paper("T", hs, vec![]);
+        let md = paper_markdown(&p, "##", Notes::Inline);
+        assert_eq!(md.matches("**第 10 页**").count(), 1, "{md}");
+        assert_eq!(md.matches("**第 10–11 页**").count(), 1, "{md}");
+    }
+
+    #[test]
+    fn a_lone_survivor_exports_as_an_ordinary_highlight() {
+        // The other half was deleted: one record left, on the second page.
+        let lib = fixtures::library_with("a-paper", &fixtures::cross_page_pair(10)[1..]);
+        let papers = collect(lib.root(), &["a-paper".to_string()]);
+        let hs = &papers[0].highlights;
+        assert_eq!(hs.len(), 1);
+        assert_eq!((hs[0].page, hs[0].page_end), (11, None));
+    }
+
+    // ── Wrapped lines ────────────────────────────────────────────────────────
+    //
+    // A PDF selection carries a line break at every printed wrap. The export
+    // shows the merged paragraph — one quote line — unless the user chose to keep
+    // the breaks; the stored text is what the flag falls back to, untouched.
+
+    const WRAPPED: &str = "line one of the quote\nline two continues\nline three ends.";
+    const MERGED: &str = "line one of the quote line two continues line three ends.";
+
+    /// A one-paper library whose only highlight is `h`, read back through the
+    /// real export path.
+    fn exported_one(h: crate::models::Highlight) -> ExportedPaper {
+        let lib = fixtures::library_with("a-paper", &[h]);
+        collect(lib.root(), &["a-paper".to_string()]).remove(0)
+    }
+
+    fn wrapped_record() -> crate::models::Highlight {
+        fixtures::record("w", 4, WRAPPED, "2026-03-01T09:00:00.000Z")
+    }
+
+    /// The Markdown lines that belong to the highlight's quote block.
+    fn quote_lines(md: &str) -> Vec<&str> {
+        md.lines().filter(|l| l.starts_with("> ") && !l.starts_with("> — ")).collect()
+    }
+
+    #[test]
+    fn a_wrapped_highlight_exports_as_one_quote_line() {
+        let p = exported_one(wrapped_record());
+        // The export struct (and so the JSON and the print view) carries the merged text.
+        assert_eq!(p.highlights[0].text, MERGED);
+
+        let md = paper_markdown(&p, "##", Notes::Inline);
+        assert_eq!(quote_lines(&md), vec![format!("> {MERGED}")], "{md}");
+        assert!(md.contains(&format!("> {MERGED}\n>\n> — 黄\n")), "{md}");
+    }
+
+    #[test]
+    fn keeping_the_line_breaks_exports_them_as_captured() {
+        let mut h = wrapped_record();
+        h.keep_line_breaks = Some(true);
+        let p = exported_one(h);
+        assert_eq!(p.highlights[0].text, WRAPPED);
+
+        let md = paper_markdown(&p, "##", Notes::Inline);
+        assert_eq!(
+            quote_lines(&md),
+            vec!["> line one of the quote", "> line two continues", "> line three ends."],
+            "{md}"
+        );
+        // An explicit `false` is the same as no flag.
+        let mut h = wrapped_record();
+        h.keep_line_breaks = Some(false);
+        assert_eq!(exported_one(h).highlights[0].text, MERGED);
+    }
+
+    #[test]
+    fn an_ebook_highlight_keeps_its_paragraph_breaks() {
+        // Offsets mark an ebook record: a newline there is a real paragraph boundary.
+        let mut h = fixtures::record("e", 2, "first paragraph\nsecond paragraph\nthird", "2026-03-01T09:00:00.000Z");
+        h.start_offset = Some(10);
+        h.end_offset = Some(60);
+        let p = exported_one(h);
+        assert_eq!(p.highlights[0].text, "first paragraph\nsecond paragraph\nthird");
+        let md = paper_markdown(&p, "##", Notes::Inline);
+        assert_eq!(
+            quote_lines(&md),
+            vec!["> first paragraph", "> second paragraph", "> third"],
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_selection_across_a_page_break_exports_one_merged_entry() {
+        let created = "2026-03-01T10:00:00.000Z";
+        let pair = vec![
+            fixtures::record("hl-10", 10, WRAPPED, created),
+            fixtures::record("hl-11", 11, WRAPPED, created),
+        ];
+        let lib = fixtures::library_with("a-paper", &pair);
+        let papers = collect(lib.root(), &["a-paper".to_string()]);
+        let hs = &papers[0].highlights;
+        assert_eq!(hs.len(), 1);
+        assert_eq!((hs[0].page, hs[0].page_end), (10, Some(11)));
+        assert_eq!(hs[0].text, MERGED);
+        let md = paper_markdown(&papers[0], "##", Notes::Inline);
+        assert_eq!(quote_lines(&md), vec![format!("> {MERGED}")], "{md}");
+
+        // The flag set only on the member edited last decides for the whole group.
+        let mut newest = fixtures::record("hl-11", 11, WRAPPED, created);
+        newest.updated_at = Some("2026-03-02T00:00:00.000Z".into());
+        newest.keep_line_breaks = Some(true);
+        let pair = vec![fixtures::record("hl-10", 10, WRAPPED, created), newest];
+        let lib = fixtures::library_with("a-paper", &pair);
+        let papers = collect(lib.root(), &["a-paper".to_string()]);
+        assert_eq!(papers[0].highlights.len(), 1);
+        assert_eq!(papers[0].highlights[0].text, WRAPPED);
+        let md = paper_markdown(&papers[0], "##", Notes::Inline);
+        assert_eq!(quote_lines(&md).len(), 3, "{md}");
+    }
+
+    #[test]
+    fn an_ordinary_single_line_highlight_serializes_exactly_as_before() {
+        let lib = fixtures::library_with(
+            "a-paper",
+            &[fixtures::record("hl-3", 3, "an ordinary one", "2026-03-01T09:00:00.000Z")],
+        );
+        let papers = collect(lib.root(), &["a-paper".to_string()]);
+        assert_eq!(
+            serde_json::to_string(&papers[0].highlights[0]).unwrap(),
+            r##"{"page":3,"text":"an ordinary one","color":"#ffd400","style":"highlight","createdAt":"2026-03-01T09:00:00.000Z"}"##
+        );
+        // Internal spacing (two spaces) is left alone: only the wraps are joined.
+        let lib = fixtures::library_with(
+            "a-paper",
+            &[fixtures::record("hl-3", 3, "one  two", "2026-03-01T09:00:00.000Z")],
+        );
+        let papers = collect(lib.root(), &["a-paper".to_string()]);
+        assert_eq!(papers[0].highlights[0].text, "one  two");
+    }
+
+    #[test]
+    fn a_blank_highlight_still_renders_as_it_did() {
+        // Whitespace only: the merged text is empty, and `blockquote` of an empty
+        // string is empty — the same Markdown the raw whitespace produced (the
+        // quote was trimmed before it was quoted).
+        let via_library = exported_one(fixtures::record("b", 1, " \n  \n", "2026-03-01T09:00:00.000Z"));
+        assert_eq!(via_library.highlights.len(), 1);
+        assert_eq!(via_library.highlights[0].text, "");
+        let old_shape = paper(
+            "A Paper",
+            vec![hl(1, " \n  \n", None, "2026-03-01T09:00:00.000Z")],
+            vec![],
+        );
+        let md_new = paper_markdown(&via_library, "##", Notes::Inline);
+        let md_old = paper_markdown(&old_shape, "##", Notes::Inline);
+        // Same section, the only difference being the metadata of the two fixtures.
+        let tail = |md: &str| md[md.find("# 批注").unwrap()..].to_string();
+        assert_eq!(tail(&md_new), tail(&md_old));
     }
 
     #[test]

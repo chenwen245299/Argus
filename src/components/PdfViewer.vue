@@ -1,3 +1,51 @@
+<script lang="ts">
+// Module scope: evaluated once and shared by every PdfViewer in this window (one per open tab).
+import {
+  planPageRender, planHiddenBudget, hiddenKeepSet, ScrollTracker,
+  type PageGeometry, type HiddenLevel, type HiddenViewerState,
+} from '../utils/pageRenderPolicy'
+
+// Bitmap memory the on-screen viewer may hold (pixels, 4 bytes each); only ever trims pages
+// outside its render zone. A Letter page at 189 % on a 2x display is about 7 MP.
+const ACTIVE_BUDGET_PIXELS = 100_000_000
+// What all background tabs together may hold. A background tab keeps its canvases - switching
+// back must not re-render - so the pile of tabs needs a ceiling of its own.
+const HIDDEN_BUDGET_PIXELS = 64_000_000
+
+// Whether the backend has the binary `render_page_image` command. null = not asked yet. Learned
+// once per run and shared, so only the first Type 3 page of a stale build pays for the probe.
+let rasterBinaryAvailable: boolean | null = null
+// The first request is the probe; renders that start meanwhile wait for its answer instead of
+// each asking a backend that may not have the command.
+let rasterProbe: Promise<unknown> | null = null
+
+interface HiddenHandle {
+  hiddenSince: number
+  level: () => HiddenLevel
+  pixelsNow: () => number
+  pixelsAtLevel: () => [number, number, number]
+  trimTo: (level: HiddenLevel) => void
+}
+const hiddenViewers = new Map<symbol, HiddenHandle>()
+
+/** Shrink the longest-hidden tabs until the background tabs fit their shared budget. */
+function enforceHiddenBudget() {
+  const keys: symbol[] = []
+  const states: HiddenViewerState[] = []
+  for (const [key, h] of hiddenViewers) {
+    states.push({
+      id: String(keys.length), hiddenSince: h.hiddenSince, level: h.level(),
+      pixelsAtLevel: h.pixelsAtLevel(), pixelsNow: h.pixelsNow(),
+    })
+    keys.push(key)
+  }
+  for (const [id, level] of planHiddenBudget(states, HIDDEN_BUDGET_PIXELS)) {
+    const h = hiddenViewers.get(keys[Number(id)])
+    if (h && level > h.level()) h.trimTo(level)
+  }
+}
+</script>
+
 <script setup lang="ts">
 import { ref, shallowRef, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { Icon } from '@iconify/vue'
@@ -5,6 +53,12 @@ import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { runTranslation, triggerAskAi } from '../stores/translationHistory'
 import { openAddSnippetModal } from '../stores/snippetLibrary'
+import { useSpeechStore } from '../stores/speech'
+import {
+  spansFromTextLayer, selectedTextBySpan, planFurnitureDropReport, keptSelectionTextAcrossPages,
+  estimateBodyFontSize, furniturePageFromTextContent, preferContentGeometry,
+  type FurniturePage, type FurnitureDropReport, type SpanReading, type TextContentLike,
+} from '../utils/pageFurniture'
 import * as pdfjsLib from 'pdfjs-dist'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { EventBus, PDFLinkService } from 'pdfjs-dist/web/pdf_viewer.mjs'
@@ -13,7 +67,9 @@ import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import { computeSections } from '../utils/sections'
 import { renderMarkdown } from '../utils/renderMarkdown'
+import { groupHighlights, groupAppearance, indexGroups } from '../utils/highlightGroups'
 import { notePopupStyle, clampNotePopupPos, startNotePopupResize, forgetNotePopupSize } from '../utils/notePopup'
+import { popupShift } from '../utils/popupFit'
 import { fluentIconFor, fluentReady } from '../utils/fluentEmoji'
 import type { Highlight, Rect, PaperSections } from '../types'
 // The legacy build includes its own Promise.withResolvers polyfill, so the worker
@@ -31,6 +87,7 @@ const props = defineProps<{ slug: string }>()
 // ── Store & i18n ──────────────────────────────────────────────────────────────
 const reader = useReaderStore()
 const library = useLibraryStore()
+const speech = useSpeechStore()
 const { t } = useI18n()
 
 // True only while THIS tab is the one on screen — used to ignore global
@@ -204,13 +261,101 @@ const inflightRenders = new Map<number, Promise<void>>()
 // same question as "rendered at the current scale" — this is what tells them
 // apart and makes a stale page re-render.
 const pageRenderScales = new Map<number, number>()
+// The devicePixelRatio each page's bitmap was rendered for. Part of the cache key with
+// the scale: dragging the window between a Retina panel and an external monitor
+// changes the ratio without any zoom, and a page rendered for the old one is shown
+// stretched (soft) or needlessly downsampled until it is rendered again.
+const pageRenderDprs = new Map<number, number>()
 
-/** Track a render so the scale watcher can await/cancel in-flight work. */
-function requestRenderPage(idx: number): Promise<void> {
-  const p = renderPage(idx)
-  inflightRenders.set(idx, p)
-  p.finally(() => { if (inflightRenders.get(idx) === p) inflightRenders.delete(idx) })
-  return p
+// ── Render scheduling state ───────────────────────────────────────────────────
+// What to render and when is decided by utils/pageRenderPolicy from the scroll position;
+// the functions that carry it out are under "Render scheduling" further down.
+interface RenderCtl {
+  /** Set by abortRender: this render must stop and leave nothing behind. */
+  cancelled: boolean
+  /** Remove everything the render built (eviction / hiding) instead of keeping a committed canvas. */
+  discard: boolean
+}
+const renderCtls = new Map<number, RenderCtl>()
+// How a render ended, so the queue can tell a page that keeps failing from one that was cancelled.
+const renderOutcome = new Map<number, 'ok' | 'failed' | 'aborted'>()
+const failedRenders = new Map<number, number>()
+// Renders the queue has started and that have not settled yet (the policy's "in flight").
+const startedRenders = new Set<number>()
+// Pages still waiting for their turn, best first. Rebuilt from the policy's plan on every
+// reconcile, so a stale entry can never outlive the scroll position it was planned for.
+const wantQueue: number[] = []
+// Pages somebody explicitly asked for (jump target, search hit). Pinned pages are rendered first
+// and neither cancelled nor evicted until the pin runs out - a jump renders its target BEFORE it
+// scrolls there, so the target is by definition nowhere near the viewport yet.
+const pinnedUntil = new Map<number, number>()
+// Callers of requestRenderPage waiting for a page; a page somebody waits for is pinned for as long as they wait.
+const waiters = new Map<number, { promise: Promise<void>; resolve: () => void; giveUp: ReturnType<typeof setTimeout> }>()
+// Bitmap pixels each rendered page holds (feeds the memory budget).
+const pagePixelsHeld = new Map<number, number>()
+// Pages whose pdf.js operator list is still cached (see renderPage: kept while the page is near).
+const opListPages = new Set<number>()
+// The pdf.js text content of every rendered page, with the page box it was laid out on. The text layer
+// is built from it (so a re-render does not extract the page's text again) and the page-furniture
+// classifier takes its GEOMETRY from it rather than from the painted spans: a browser measures span
+// widths with its own font metrics (WebKit's run up to 5 % wider than Chrome's), which is what the
+// classifier must not depend on. See planSelectionFurniture.
+interface PageTextSource { content: TextContentLike; view: number[]; rotate: number }
+const pageTextSources = new Map<number, PageTextSource>()
+// Object URLs behind the <img> of rasterised pages; revoked when the image leaves the DOM.
+const pageObjectUrls = new Map<number, string>()
+const scrollTracker = new ScrollTracker()
+const viewerKey = Symbol('pdf-viewer')
+// scrollTop as last seen by a scroll event: the one value that survives display:none.
+let trackedScrollTop = 0
+// Height of the viewport when the viewer was last on screen (a hidden container reads 0).
+let lastViewportHeight = 0
+let reconcileRaf = 0
+let scrollIdleTimer: ReturnType<typeof setTimeout> | null = null
+let containerResizeObserver: ResizeObserver | null = null
+// How far a hidden viewer has been trimmed (0 = not at all).
+let hiddenLevel: HiddenLevel = 0
+let renderingTornDown = false
+
+/**
+ * Ask for a page explicitly and get a promise that settles once it has been rendered (or the
+ * attempt is over). Everything automatic goes through the policy; this is for the callers that
+ * wait on a page - jumps and search - so the page is pinned and jumps the queue.
+ */
+function requestRenderPage(idx: number, followRunning = true): Promise<void> {
+  // Nothing is rendered for a viewer that is not on screen (see reconcile) or one that is gone;
+  // the caller would only be left waiting for a page the queue will not start.
+  if (renderingTornDown || !isViewerShown()) return Promise.resolve()
+  pinPage(idx)
+  // A render already running for this page owns it. Wait on the running render: recording a
+  // turned-away call's instantly-settled promise over it hid the real render from the scale
+  // watcher, which then stopped waiting for it. That promise also settles when the render is
+  // ABORTED (a zoom superseded it, the scheduler cancelled it), with the page still blank, so
+  // the caller must not resume on it alone: when the page is not fresh afterwards, ask once more,
+  // this time through the waiter below, which only settles once the page really is rendered
+  // (or gives up). `followRunning` is what keeps that to a single extra round.
+  const running = inflightRenders.get(idx)
+  if (followRunning && running && renderingPages.has(idx)) {
+    return running.then(() => (isPageFresh(idx) ? undefined : requestRenderPage(idx, false)))
+  }
+  if (isPageFresh(idx)) return Promise.resolve()
+  let w = waiters.get(idx)
+  if (!w) {
+    let resolve!: () => void
+    const promise = new Promise<void>(r => { resolve = r })
+    // The caller is about to scroll to this page. If the page cannot be had (the viewer is hidden
+    // meanwhile, a render never ends) it must not be left hanging: it would resume - and move the
+    // viewport - at some later moment the reader no longer expects.
+    const giveUp = setTimeout(() => settleWaiter(idx), WAIT_GIVE_UP_MS)
+    w = { promise, resolve, giveUp }
+    waiters.set(idx, w)
+  }
+  const at = wantQueue.indexOf(idx)
+  if (at >= 0) wantQueue.splice(at, 1)
+  wantQueue.unshift(idx)
+  pumpRenderQueue()
+  scheduleReconcile()
+  return w.promise
 }
 
 const scale = ref(1.25)
@@ -279,11 +424,19 @@ const loading = ref(true)
 // rects/text stored at popup-open time so mousedown on color dot can't clear the selection
 // A selection can span multiple pages, so rects are grouped per page (each page
 // becomes its own highlight). `pages` is ordered by page index.
+// `text` / `pages` are what a highlight (or translate / ask-AI / read-aloud) will use. For a
+// selection across a page break the page furniture (page numbers, running heads, footnotes,
+// margin text) and the figures and tables it runs through are left out of them (`furniture`
+// says what was). `full` is the whole selection across pages, its text rebuilt from the text
+// layers (see planSelectionFurniture): ⌘C checks against it that the selection is still this one.
+interface SelectionVariant { text: string; pages: { pageIndex: number; rects: Rect[] }[] }
 const selectionPopup = ref<{
   x: number
   y: number
   text: string
   pages: { pageIndex: number; rects: Rect[] }[]
+  full?: SelectionVariant
+  furniture?: FurnitureDropReport
 } | null>(null)
 const activeColor = ref('#FFEB3B') // default yellow
 
@@ -295,11 +448,12 @@ function toggleHighlightStyle() {
   highlightStyle.value = highlightStyle.value === 'highlight' ? 'underline' : 'highlight'
   localStorage.setItem(HIGHLIGHT_STYLE_KEY, highlightStyle.value)
 }
-const hlNotePopup = ref<{ x: number; y: number; hlId: string } | null>(null)   // left-click: note view/edit
+// `ids` = every record of the highlight when the popup opened; see `resolveHighlightGroup`.
+const hlNotePopup = ref<{ x: number; y: number; hlId: string; ids: string[] } | null>(null)   // left-click: note view/edit
 const hlNoteText = ref('')
 const hlNoteEditing = ref(false)   // false = view mode, true = edit mode
 const noteTextareaRef = ref<HTMLTextAreaElement | null>(null)
-const hlColorPopup = ref<{ x: number; y: number; hlId: string } | null>(null)  // right-click: color + delete
+const hlColorPopup = ref<{ x: number; y: number; hlId: string; ids: string[] } | null>(null)  // right-click: color + delete
 
 // Notes are authored as markdown + $TeX$ and rendered on the view side, so a
 // formula reads as a formula instead of raw source (same deal as the notes tab).
@@ -311,8 +465,8 @@ const hlNotePopupStyle = computed(() => {
   return p ? notePopupStyle(p.x, p.y, p.hlId) : {}
 })
 
-function openNotePopup(x: number, y: number, hlId: string) {
-  hlNotePopup.value = { ...clampNotePopupPos(x, y, hlId), hlId }
+function openNotePopup(x: number, y: number, hlId: string, ids: string[]) {
+  hlNotePopup.value = { ...clampNotePopupPos(x, y, hlId), hlId, ids }
 }
 
 // Sizes are stored per-highlight, so the drag always names the highlight the
@@ -335,9 +489,6 @@ const COLORS = computed(() => [
 
 // Debounce timer for reading state
 let progressDebounce: ReturnType<typeof setTimeout> | null = null
-
-// IntersectionObserver for lazy rendering
-let observer: IntersectionObserver | null = null
 
 // ── In-document jump history ──────────────────────────────────────────────────
 // Following a cross-reference ("see Wu et al., 2021") throws away where you were
@@ -535,6 +686,95 @@ function pageHighlights(pageIndex: number): Highlight[] {
   return reader.highlightsFor(props.slug).filter(h => h.page === pageIndex + 1)
 }
 
+// A selection across a page break is stored as one record per page (each draws only
+// its own page's rects), but it is ONE highlight to the user: clicking either half
+// must open the same note, and colour / delete / copy must act on the whole thing.
+// `highlightGroupIndex` maps any record id to its group; the popups are keyed by the
+// group's canonical id so both halves share one popup (and one remembered size).
+const highlightGroupIndex = computed(() =>
+  indexGroups(groupHighlights(reader.highlightsFor(props.slug))))
+
+// The popups are keyed by the canonical id and stay open across a reload (window
+// focus and file-watch events replace the whole array). If that record is gone by
+// the time an action runs — an older build deleted the lowest-page half on another
+// machine — the key resolves to nothing although the other half is still there, and
+// the action would silently hit no record. So the popup also remembers every id the
+// highlight had when it opened, and the group is found through whichever is left.
+function resolveHighlightGroup(id: string) {
+  const known = hlColorPopup.value?.hlId === id ? hlColorPopup.value.ids
+    : hlNotePopup.value?.hlId === id ? hlNotePopup.value.ids : []
+  for (const k of [id, ...known]) {
+    const g = highlightGroupIndex.value.get(k)
+    if (g) return g
+  }
+  return undefined
+}
+
+/** Ids of every record of the highlight `id` belongs to (just `[id]` if it stands alone). */
+function highlightIdsOf(id: string): string[] {
+  return resolveHighlightGroup(id)?.ids ?? [id]
+}
+
+/** The highlight the right-click menu is open on (drives its line-break toggle). */
+const hlMenuGroup = computed(() =>
+  hlColorPopup.value ? resolveHighlightGroup(hlColorPopup.value.hlId) : undefined)
+
+function openHighlightNote(anchor: DOMRect, id: string) {
+  const g = highlightGroupIndex.value.get(id)
+  hlNoteText.value = g?.note ?? ''
+  hlNoteEditing.value = false
+  openNotePopup(anchor.left, anchor.bottom + 4, g?.id ?? id, g?.ids ?? [id])
+  hlColorPopup.value = null
+}
+
+const hlMenuRef = ref<HTMLElement | null>(null)
+
+async function openHighlightMenu(e: MouseEvent, id: string) {
+  const g = highlightGroupIndex.value.get(id)
+  hlColorPopup.value = { x: e.clientX, y: e.clientY + 4, hlId: g?.id ?? id, ids: g?.ids ?? [id] }
+  hlNotePopup.value = null
+  // The menu sits at the click point, and its width depends on the labels (longer in
+  // English, and wider still with the line-break toggle), so keep it inside the window
+  // once it is laid out rather than letting Translate / Delete run off the edge.
+  await nextTick()
+  const menu = hlMenuRef.value
+  const open = hlColorPopup.value
+  if (!menu || !open) return
+  const { width, height } = menu.getBoundingClientRect()
+  const x = Math.max(8, Math.min(open.x, window.innerWidth - width - 8))
+  const y = Math.max(8, Math.min(open.y, window.innerHeight - height - 8))
+  if (x !== open.x || y !== open.y) hlColorPopup.value = { ...open, x, y }
+}
+
+// The selection toolbar is placed at the mouse position, but its width varies (language, the
+// read-aloud button, the page-furniture toggle) so, like the menu above, it is measured once laid
+// out and pulled back inside the window. Only on open and when its own size changes - never on
+// scroll, where it follows its anchor instead (repositionAnchoredPopups).
+const selPopupRef = ref<HTMLElement | null>(null)
+let selPopupObserver: ResizeObserver | null = null
+
+function fitSelectionPopup() {
+  const el = selPopupRef.value
+  const open = selectionPopup.value
+  if (!el || !open) return
+  const { dx, dy } = popupShift(
+    el.getBoundingClientRect(),
+    { width: window.innerWidth, height: window.innerHeight },
+    // 12 px = the gap between the cursor and the toolbar (see onWindowMouseUp)
+    { margin: 8, flipGap: 12 },
+  )
+  if (dx || dy) selectionPopup.value = { ...open, x: open.x + dx, y: open.y + dy }
+}
+
+// The element exists only while a popup is open; a size change (the toggle's label differs between
+// its two states) must re-fit it as well.
+watch(selPopupRef, (el) => {
+  selPopupObserver?.disconnect()
+  if (!el || typeof ResizeObserver === 'undefined') return
+  selPopupObserver ??= new ResizeObserver(() => fitSelectionPopup())
+  selPopupObserver.observe(el)
+}, { flush: 'post' })
+
 // ── Lifecycle ──────────────────────────────────────────────────────────────────
 // Every open tab has a live viewer instance, but only the VISIBLE one may own the
 // global (window/document) listeners — otherwise every open viewer would react to
@@ -544,6 +784,7 @@ function addGlobalListeners() {
   window.addEventListener('mouseup', onWindowMouseUp)
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('mousedown', onWindowMouseDown)
+  document.addEventListener('copy', onCopySelection)
   window.addEventListener('argus-snippet-highlight', onSnippetHighlight)
   window.addEventListener('resize', updateScrollThumbs)
 }
@@ -553,15 +794,21 @@ function removeGlobalListeners() {
   window.removeEventListener('mouseup', onWindowMouseUp)
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('mousedown', onWindowMouseDown)
+  document.removeEventListener('copy', onCopySelection)
   window.removeEventListener('argus-snippet-highlight', onSnippetHighlight)
   window.removeEventListener('resize', updateScrollThumbs)
 }
 
 /** True while a drag that began inside the note popup is in flight. */
 let noteDragOrigin = false
+/** The current press began inside one of the popups (a colour dot, a button), not on the page. */
+let pressInPopup = false
 
 function onWindowMouseDown(e: MouseEvent) {
   noteDragOrigin = !!(e.target as HTMLElement).closest?.('.hl-note-popup')
+  pressInPopup = !!(e.target as HTMLElement).closest?.('.hl-note-popup, .hl-color-popup, .sel-popup')
+  // A press on the page starts over: the spans the last selection left out are plain text again.
+  if (!pressInPopup) clearSkippedSpans()
   // Mouse side buttons: 3 = back, 4 = forward.
   if (e.button !== 3 && e.button !== 4) return
   e.preventDefault()
@@ -570,41 +817,102 @@ function onWindowMouseDown(e: MouseEvent) {
 }
 
 onMounted(async () => {
+  watchDevicePixelRatio()
   await loadPdf()
 })
+
+// `resolution` media queries are the only change signal for devicePixelRatio: match the
+// current ratio exactly, and re-arm for the new one whenever it stops matching.
+let dprQuery: MediaQueryList | null = null
+function watchDevicePixelRatio() {
+  dprQuery?.removeEventListener('change', onDevicePixelRatioChange)
+  dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`)
+  dprQuery.addEventListener('change', onDevicePixelRatioChange)
+}
+function onDevicePixelRatioChange() {
+  watchDevicePixelRatio()
+  // The render cache is keyed on the ratio, so the plan sees every page drawn for the old
+  // one as stale and re-renders those in the render zone. A backgrounded viewer catches up
+  // when it is next shown (onViewerShown plans then).
+  failedRenders.clear()
+  if (!isActiveTab.value) return
+  scheduleReconcile()
+}
 
 // Backgrounded viewers are hidden with v-show (display:none), which can drop the
 // scroll position — stash it on hide and restore on show.
 let _savedScrollTop: number | null = null
+// The PDF finished loading while the tab was in the background: a hidden container cannot be
+// scrolled, so the reading position saved on disk is applied when the tab is first shown.
+let restorePending = false
 
 watch(isActiveTab, (active) => {
   if (active) {
     addGlobalListeners()
-    // Complete a first-open fit-to-width that was deferred because the tab was
-    // still backgrounded (0 width) when the PDF finished loading.
-    if (needsInitialFit.value) nextTick(() => fitWidth())
-    if (_savedScrollTop !== null) {
-      const top = _savedScrollTop
-      nextTick(() => { if (containerRef.value) containerRef.value.scrollTop = top })
-    }
+    void showViewer()
   } else {
-    if (containerRef.value) _savedScrollTop = containerRef.value.scrollTop
+    // Once display:none has landed, scrollTop reads 0 — trust the value tracked from the
+    // scroll events in that case.
+    const c = containerRef.value
+    if (c) {
+      _savedScrollTop = c.clientHeight === 0 ? trackedScrollTop : c.scrollTop
+      // A scroll the reader made in this very tick has not produced its event yet, and the event
+      // that does arrive once the container is hidden is ignored: this is the position.
+      trackedScrollTop = _savedScrollTop
+    }
     removeGlobalListeners()
     hideJumpHint() // don't let it reappear when this tab comes back
-    flushReadingState() // persist scroll position before this tab goes to the background
+    // Persist the scroll position before this tab goes to the background, and drop the pending
+    // save: it would fire with the container hidden (and the page it reports is whatever the
+    // tab hidden at, not where the reader is).
+    if (progressDebounce) { clearTimeout(progressDebounce); progressDebounce = null }
+    flushReadingState()
+    onViewerHidden()
   }
 }, { immediate: true })
+
+/**
+ * The tab came to the front. The parent's v-show is applied in the flush that triggered this, so
+ * wait for it; everything after that still runs before the browser paints (microtasks), so the
+ * first frame already shows the page the reader left, with the canvases it kept.
+ */
+async function showViewer() {
+  await nextTick()
+  const c = containerRef.value
+  // Still loading: loadPdf restores and plans for itself when it is done.
+  if (!c || !pdfDoc.value || renderingTornDown || !isActiveTab.value) return
+  // Complete a first-open fit-to-width that was deferred because the tab was still
+  // backgrounded (0 width) when the PDF finished loading. It changes the scale, so the page
+  // boxes only have their final size one flush later - and a position worked out before that
+  // would land on the wrong page.
+  if (needsInitialFit.value) {
+    fitWidth()
+    await nextTick()
+  }
+  if (restorePending) {
+    restorePending = false
+    restorePosition()
+  } else if (_savedScrollTop !== null) {
+    c.scrollTop = _savedScrollTop
+  }
+  // Restore the scroll position FIRST, then plan: nothing is rendered or evicted for a
+  // position the viewer is only about to leave.
+  onViewerShown()
+}
 
 // Fires when the tab is closed (removed from the open-tabs list) — the PDF is
 // fully released here.
 onUnmounted(() => {
   removeGlobalListeners()
-  observer?.disconnect()
+  teardownRenderScheduling()
+  dprQuery?.removeEventListener('change', onDevicePixelRatioChange)
   if (progressDebounce) clearTimeout(progressDebounce)
   if (scrollThumbHideTimer) clearTimeout(scrollThumbHideTimer)
   if (searchDebounce) clearTimeout(searchDebounce)
   clearJumpHintTimer()
+  selPopupObserver?.disconnect()
   pageTextCache.clear()
+  pageTextSources.clear()
   pdfDoc.value?.destroy()
   // This viewer is gone for good (tab closed or evicted from cache) — drop its
   // cached highlights/reading-state from the store.
@@ -626,6 +934,20 @@ function askAiWithSelection() {
   const { text } = selectionPopup.value
   selectionPopup.value = null
   triggerAskAi(text)
+}
+
+/** The popup's text is the one being read right now: the button then reads 停止朗读. */
+const readingSelection = computed(() =>
+  !!selectionPopup.value && speech.isReadingText(selectionPopup.value.text, 'pdf'))
+
+// Read aloud (朗读). `speech.read` must run in the click's own call stack — the audio
+// element is unlocked there, before any network wait (see stores/speech.ts) — so nothing
+// here awaits ahead of it. Not configured yet: it opens the "set up a voice" prompt instead.
+function readAloudSelection(source: 'pdf' | 'ebook') {
+  if (!selectionPopup.value) return
+  const { text } = selectionPopup.value
+  selectionPopup.value = null
+  void speech.read(text, { source })
 }
 
 const SNIPPET_HIGHLIGHT_COLOR = '#CE93D8'
@@ -665,12 +987,12 @@ function onSnippetHighlight(e: Event) {
 }
 
 function addHighlightToSnippetLibrary(hlId: string) {
-  const hl = reader.highlightsFor(props.slug).find(h => h.id === hlId)
+  const hl = resolveHighlightGroup(hlId)
   if (!hl) return
   hlColorPopup.value = null
   const paper = library.papers.find(p => p.slug === props.slug)
   openAddSnippetModal({
-    text: hl.text,
+    text: hl.displayText,
     paperId: props.slug,
     paperTitle: paper?.title ?? props.slug,
     page: hl.page,
@@ -869,8 +1191,7 @@ async function writeTextToClipboard(text: string) {
 }
 
 async function copyHighlightText(hlId: string) {
-  const hl = reader.highlightsFor(props.slug).find(h => h.id === hlId)
-  const text = hl?.text?.trim()
+  const text = resolveHighlightGroup(hlId)?.displayText?.trim()
   hlColorPopup.value = null
   if (!text) return
 
@@ -1009,9 +1330,26 @@ async function loadPdf() {
     const uint8 = new Uint8Array(bytes)
     // Type 3 fonts render blank in pdf.js; those PDFs use the PDFium raster path.
     rasterFallback.value = pdfUsesType3(uint8)
+    // ONE SWITCH. Set it to false to get exactly the pixels the previous release drew.
+    // true  = pdf.js keeps the page canvases GPU-backed (without it pdf.js asks for
+    //         `willReadFrequently`, i.e. software canvases, and putting a finished 7 MP page on
+    //         screen costs a 90-370 ms main-thread composite). Measured in WKWebView at
+    //         devicePixelRatio 2, real viewer, 10-12 page fling: frames over 33 ms went 20 -> 2
+    //         (plain text paper), 23 -> 2 and 26 -> 10 (figure-heavy), 15 -> 1 (text + figures);
+    //         p95 frame 43-55 ms -> 18-27 ms; the render itself is no faster. Peak memory during
+    //         the fling is about 220 MB higher (WebContent + GPU, golkar); at rest it is the same.
+    // false = software canvases: bit-identical to the previous release (0 differing pixels on all
+    //         12 pages compared, canvas size and 1:1 display unchanged either way).
+    // With true the bitmap is still cssW x dpr by cssH x dpr, shown 1:1, but the rasteriser is a
+    // different one, so anti-aliasing differs a little. Measured against false at 189 %, dpr 2:
+    // text-only pages differ in up to 0.4 % of pixels, by at most 2 of 255 levels; pages with
+    // figures or tables differ in 0.5-3.4 % of pixels, at the edges of vector lines and fills, by up
+    // to ~120 levels (glyph edges over a coloured fill by up to ~40-60).
+    const PDF_ENABLE_HWA = true
     const loadingTask = pdfjsLib.getDocument({
       data: uint8,
       isOffscreenCanvasSupported: false,
+      enableHWA: PDF_ENABLE_HWA,
       // Without these, non-embedded standard fonts (Helvetica/Times/Symbol — the
       // ones figure labels and diagrams commonly use) and CID fonts render as
       // BLANK: the shapes draw but their text is silently dropped, while embedded
@@ -1023,6 +1361,7 @@ async function loadPdf() {
     })
     const doc = await loadingTask.promise
     pdfDoc.value = doc
+    pageTextSources.clear() // text of a previous document must never feed this one's text layers
     reader.setPdfDoc(doc, slug)
     linkService.setDocument(doc)
     pageCount.value = doc.numPages
@@ -1050,7 +1389,7 @@ async function loadPdf() {
       fitWidth()
     }
 
-    setupObserver()
+    setupRenderScheduling()
     await restorePosition()
     triggerInitialRender()
     updateScrollThumbs()
@@ -1071,6 +1410,8 @@ async function loadPdf() {
     // Auto-detect chapter structure (embedded outline → heading heuristic).
     // The AI fallback is never triggered here — it stays a manual action.
     ensureSectionsComputed(doc, slug)
+    // Off the critical path: only a cross-page selection ever needs it.
+    window.setTimeout(() => { void prefetchBodyFontSize(doc) }, 1500)
 
     // Auto-update reading status: unread → reading when PDF is opened
     const entry = library.papers.find(p => p.slug === slug)
@@ -1088,52 +1429,386 @@ async function loadPdf() {
   }
 }
 
-// ── IntersectionObserver ──────────────────────────────────────────────────────
-function setupObserver() {
-  if (!containerRef.value) return
-  observer?.disconnect()
-  observer = new IntersectionObserver(
-    entries => {
-      entries.forEach(entry => {
-        const idx = Number((entry.target as HTMLElement).dataset.pageIndex)
-        if (entry.isIntersecting) {
-          requestRenderPage(idx)
-        } else if (!entry.isIntersecting && renderedPages.value.has(idx)) {
-          // Only evict pages that are far away (rootMargin keeps nearby pages alive)
-          unrenderPage(idx)
-        }
-      })
-    },
-    {
-      root: containerRef.value,
-      rootMargin: '600px 0px',
-      threshold: 0,
-    }
-  )
+// ── Render scheduling ─────────────────────────────────────────────────────────
+// utils/pageRenderPolicy decides what to render, in what order and what to throw away; this
+// section carries the plan out. There is deliberately no IntersectionObserver any more: it
+// reports every page of a hidden tab as "left the viewport" (which threw every rendered page
+// away on each tab switch, so each switch back started from white pages), says nothing about
+// direction, distance or priority, and its fixed 600 px margin - less than one page at 189 %
+// - could only start a page when it was about to be seen. The plan is computed from the scroll
+// position instead (as pdf.js's own viewer does), and a hidden viewer simply stops planning.
 
-  pageRefs.value.forEach((el, idx) => {
-    if (el) observer!.observe(el)
+const PAGE_GAP = 12 // `.pdf-pages` gap
+// pdf.js does its parsing on one worker and the PDFium backend renders one page at a time, and
+// each render paints on the main thread, which is what scrolling competes with. Measured with 1,
+// 2 and 3 in flight (summed blank time of a series of jumps, ms: golkar 644/667/670, feng
+// 450/466/548, soiffer 1334/1340/1361; 6000 px/s flings alike): no real difference, so 2 stays -
+// it lets a cheap page overtake a heavy one.
+const MAX_CONCURRENT_RENDERS = 2
+// A page that has just been asked for stays protected from eviction this long (the jump has
+// landed on it by then); a page somebody still WAITS for is protected for as long as they wait.
+const PIN_MS = 4000
+const WAIT_GIVE_UP_MS = 20_000
+
+/** Every page wrapper's box in scroll-content coordinates, mirroring the CSS (3 px padding, 12 px gap, rounded heights). */
+const pageGeometry = computed<PageGeometry>(() => {
+  const s = scale.value
+  const sizes = pageSizes.value
+  const tops = new Float64Array(sizes.length)
+  const heights = new Float64Array(sizes.length)
+  let y = PDF_PAGE_MARGIN
+  for (let i = 0; i < sizes.length; i++) {
+    const h = Math.round(sizes[i].height * s)
+    tops[i] = y
+    heights[i] = h
+    y += h + PAGE_GAP
+  }
+  return { tops, heights }
+})
+
+/** Is the page's DOM built for the current scale and devicePixelRatio? */
+function isPageFresh(idx: number): boolean {
+  return renderedPages.value.has(idx) && pageRenderScales.get(idx) === scale.value
+    && pageRenderDprs.get(idx) === (window.devicePixelRatio || 1)
+}
+
+/** On screen: the viewer is the active tab AND actually has a box (an ancestor may be display:none). */
+function isViewerShown(): boolean {
+  const c = containerRef.value
+  return !!c && isActiveTab.value && c.clientHeight > 0
+}
+
+/** Bitmap pixels a page holds once rendered at the current scale and display density. */
+function pagePixelsFor(idx: number): number {
+  const held = pagePixelsHeld.get(idx)
+  if (held !== undefined) return held
+  const sz = pageSizes.value[idx]
+  if (!sz) return 0
+  const dpr = window.devicePixelRatio || 1
+  const w = Math.max(1, Math.round(Math.round(sz.width * scale.value) * dpr))
+  const h = Math.max(1, Math.round(Math.round(sz.height * scale.value) * dpr))
+  return w * h
+}
+
+function pinPage(idx: number) {
+  pinnedUntil.set(idx, performance.now() + PIN_MS)
+}
+
+function isPinned(idx: number, now: number): boolean {
+  return waiters.has(idx) || (pinnedUntil.get(idx) ?? 0) > now
+}
+
+function activePins(now: number): Set<number> {
+  const out = new Set<number>(waiters.keys())
+  for (const [i, until] of pinnedUntil) {
+    if (until > now) out.add(i)
+    else pinnedUntil.delete(i)
+  }
+  return out
+}
+
+function setupRenderScheduling() {
+  const c = containerRef.value
+  if (!c) return
+  containerResizeObserver?.disconnect()
+  // A resize changes the viewport (and so the zone); the 0 -> N resize of a tab being shown
+  // is the other thing it catches, and plans for it.
+  containerResizeObserver = new ResizeObserver(() => scheduleReconcile())
+  containerResizeObserver.observe(c)
+  trackedScrollTop = c.scrollTop
+}
+
+function teardownRenderScheduling() {
+  renderingTornDown = true
+  containerResizeObserver?.disconnect()
+  containerResizeObserver = null
+  if (reconcileRaf) cancelAnimationFrame(reconcileRaf)
+  reconcileRaf = 0
+  if (scrollIdleTimer) clearTimeout(scrollIdleTimer)
+  scrollIdleTimer = null
+  wantQueue.length = 0
+  for (const idx of [...startedRenders]) abortRender(idx, true)
+  pageRenderTasks.forEach((task) => { try { task.cancel() } catch { /* already done */ } })
+  pageRenderTasks.clear()
+  hiddenViewers.delete(viewerKey)
+  for (const url of pageObjectUrls.values()) URL.revokeObjectURL(url)
+  pageObjectUrls.clear()
+  settleAllWaiters()
+}
+
+/** Called for every scroll event: feeds the direction / speed estimate and asks for a plan. */
+function noteScroll() {
+  const c = containerRef.value
+  // A hidden container reports scrollTop 0; that is not where the reader is.
+  if (!c || c.clientHeight === 0) return
+  trackedScrollTop = c.scrollTop
+  if (!isActiveTab.value) return
+  scrollTracker.update(c.scrollTop, performance.now(), c.clientHeight)
+  scheduleReconcile()
+  // Once the scroll has been still for a moment the speed is 0 and the zone settles; plan again.
+  if (scrollIdleTimer) clearTimeout(scrollIdleTimer)
+  scrollIdleTimer = setTimeout(() => { scrollIdleTimer = null; scheduleReconcile() }, 180)
+}
+
+/** Plan at most once per frame, after the frame's scroll events and before it paints. */
+function scheduleReconcile() {
+  if (reconcileRaf || renderingTornDown) return
+  reconcileRaf = requestAnimationFrame(() => { reconcileRaf = 0; reconcile() })
+}
+
+function reconcile() {
+  const c = containerRef.value
+  if (!c || !pdfDoc.value || pageSizes.value.length === 0 || renderingTornDown) return
+  // A hidden viewer plans nothing: its pages are exactly what the reader will come back to.
+  if (!isViewerShown()) return
+  const now = performance.now()
+  lastViewportHeight = c.clientHeight
+  const stale = new Set<number>()
+  for (const i of renderedPages.value) if (!isPageFresh(i)) stale.add(i)
+  const plan = planPageRender({
+    geometry: pageGeometry.value,
+    scrollTop: c.scrollTop,
+    viewportHeight: c.clientHeight,
+    direction: scrollTracker.direction,
+    speed: scrollTracker.speed(now),
+    rendered: renderedPages.value,
+    stale,
+    inFlight: startedRenders,
+    queued: new Set(wantQueue),
+    pinned: activePins(now),
+    pagePixels: pagePixelsFor,
+    budgetPixels: ACTIVE_BUDGET_PIXELS,
   })
+  // Running work first (so a page both cancelled and evicted is torn down once), then the
+  // pages to throw away. Queued work that left the render zone is dropped by rebuilding the
+  // queue from the plan below.
+  for (const i of plan.cancelInFlight) abortRender(i, true)
+  for (const i of plan.evict) {
+    // The policy keeps running renders out of `evict`. Were one to slip through, emptying its
+    // wrapper now would let the render finish into it and mark a blank page fresh: stop it
+    // instead (it takes its own page down when it unwinds, or the next plan evicts it).
+    if (renderingPages.has(i)) { abortRender(i, true); continue }
+    unrenderPage(i)
+  }
+  // A page that failed twice is left alone while it stays near; scrolling away from it earns it
+  // a fresh start (the old observer retried every time a page re-entered its margin).
+  const z = plan.zone
+  for (const i of [...failedRenders.keys()]) if (!z || i < z.first || i > z.last) failedRenders.delete(i)
+  wantQueue.length = 0
+  for (const i of plan.render) if ((failedRenders.get(i) ?? 0) < 2) wantQueue.push(i)
+  // The parsed pages (and their decoded images) are kept for the pages on screen and their
+  // neighbours only: that is what a zoom re-renders first. Keeping them at all costs about
+  // 130 MB of peak memory in a 12-page fling of a figure-heavy paper (measured), so nothing is
+  // held for pages nobody is waiting on.
+  const vis = plan.visible
+  releaseOpListsOutside(vis.length ? { first: vis[0] - 1, last: vis[vis.length - 1] + 1 } : null)
+  pumpRenderQueue()
+}
+
+function pumpRenderQueue() {
+  if (renderingTornDown || !pdfDoc.value || !isViewerShown()) return
+  while (wantQueue.length) {
+    const idx = wantQueue[0]
+    // A page somebody waits on may take one slot more than the cap, so it never queues
+    // behind prefetching.
+    const cap = MAX_CONCURRENT_RENDERS + (isPinned(idx, performance.now()) ? 1 : 0)
+    if (startedRenders.size >= cap) break
+    wantQueue.shift()
+    // Already up to date (settle whoever waited), or an earlier render of it is still unwinding
+    // (its settling replans, and this page is wanted again).
+    if (isPageFresh(idx)) { settleWaiter(idx); continue }
+    if (startedRenders.has(idx) || renderingPages.has(idx)) continue
+    startRender(idx)
+  }
+}
+
+function settleWaiter(idx: number) {
+  const w = waiters.get(idx)
+  if (!w) return
+  clearTimeout(w.giveUp)
+  waiters.delete(idx)
+  w.resolve()
+}
+
+function settleAllWaiters() {
+  for (const idx of [...waiters.keys()]) settleWaiter(idx)
+}
+
+function startRender(idx: number) {
+  startedRenders.add(idx)
+  const p = renderPage(idx)
+  inflightRenders.set(idx, p)
+  void p.finally(() => {
+    if (inflightRenders.get(idx) === p) inflightRenders.delete(idx)
+    startedRenders.delete(idx)
+    const outcome = renderOutcome.get(idx)
+    renderOutcome.delete(idx)
+    // A page that keeps failing is left alone instead of being retried every frame; a cancelled
+    // one is simply wanted again if the plan still wants it.
+    if (outcome === 'ok') failedRenders.delete(idx)
+    else if (outcome !== 'aborted') failedRenders.set(idx, (failedRenders.get(idx) ?? 0) + 1)
+    if (isPageFresh(idx) || (failedRenders.get(idx) ?? 0) >= 2 || renderingTornDown) settleWaiter(idx)
+    pumpRenderQueue()
+    scheduleReconcile()
+  })
+}
+
+/** Stop a render that is queued or running. `discard` also removes what it already put on the page. */
+function abortRender(idx: number, discard: boolean) {
+  const ctl = renderCtls.get(idx)
+  if (!ctl) return
+  ctl.cancelled = true
+  if (discard) ctl.discard = true
+  try { pageRenderTasks.get(idx)?.cancel() } catch { /* already done */ }
+}
+
+/** pdf.js keeps a page's parsed operator list until told to let go; free it for pages that are not near. */
+function releaseOpList(idx: number) {
+  if (!opListPages.delete(idx)) return
+  const doc = pdfDoc.value
+  if (!doc) return
+  void doc.getPage(idx + 1).then(p => p.cleanup()).catch(() => { /* document went away */ })
+}
+
+function releaseOpListsOutside(zone: { first: number; last: number } | null) {
+  for (const i of [...opListPages]) if (!zone || i < zone.first || i > zone.last) releaseOpList(i)
+}
+
+function releasePageObjectUrl(idx: number) {
+  const url = pageObjectUrls.get(idx)
+  if (url) { URL.revokeObjectURL(url); pageObjectUrls.delete(idx) }
+}
+
+// ── Showing and hiding ────────────────────────────────────────────────────────
+// A background tab is display:none. That must not cost it a single rendered page: what it
+// holds is exactly what the reader sees again on return. So hiding pauses planning (and cancels
+// the few renders still running - their text-layer geometry cannot be measured while hidden),
+// and showing plans again from the restored scroll position, which finds every page that is
+// still rendered at the current scale and density already done.
+
+function onViewerHidden() {
+  if (!pdfDoc.value || renderingTornDown) return
+  if (reconcileRaf) { cancelAnimationFrame(reconcileRaf); reconcileRaf = 0 }
+  if (scrollIdleTimer) { clearTimeout(scrollIdleTimer); scrollIdleTimer = null }
+  wantQueue.length = 0
+  pinnedUntil.clear()
+  // Whoever waited for a page was going to scroll this viewer; it is not on screen any more.
+  settleAllWaiters()
+  for (const idx of [...startedRenders]) abortRender(idx, true)
+  hiddenViewers.set(viewerKey, {
+    hiddenSince: performance.now(),
+    level: () => hiddenLevel,
+    pixelsNow: () => heldPixels(null),
+    pixelsAtLevel: () => [1, 2, 3].map(l => heldPixels(hiddenKeepFor(l as HiddenLevel))) as [number, number, number],
+    trimTo: trimHidden,
+  })
+  trimHidden(1)
+  enforceHiddenBudget()
+}
+
+function onViewerShown() {
+  const c = containerRef.value
+  if (!c || !pdfDoc.value || renderingTornDown) return
+  hiddenViewers.delete(viewerKey)
+  hiddenLevel = 0
+  trackedScrollTop = c.scrollTop
+  scrollTracker.rebase()
+  reconcile()
+}
+
+function hiddenKeepFor(level: HiddenLevel): Set<number> {
+  return hiddenKeepSet(pageGeometry.value, _savedScrollTop ?? trackedScrollTop, lastViewportHeight, level)
+}
+
+/** Bitmap pixels held by the rendered pages in `keep` (all of them when null). */
+function heldPixels(keep: Set<number> | null): number {
+  let sum = 0
+  for (const i of renderedPages.value) if (!keep || keep.has(i)) sum += pagePixelsFor(i)
+  return sum
+}
+
+function trimHidden(level: HiddenLevel) {
+  hiddenLevel = level
+  // A background tab keeps bitmaps (they are what makes switching back instant), not parsed pages.
+  releaseOpListsOutside(null)
+  const keep = hiddenKeepFor(level)
+  for (const i of [...renderedPages.value]) if (!keep.has(i)) unrenderPage(i)
 }
 
 function observePage(el: HTMLDivElement | null, idx: number) {
   pageRefs.value[idx] = el
-  if (el && observer) observer.observe(el)
 }
 
 // ── Render / Unrender pages ────────────────────────────────────────────────────
+
+/** The PNG's bytes from whatever the `render_page_image` command handed back (an ArrayBuffer in Tauri v2). */
+function rasterBytes(raw: unknown): BlobPart | null {
+  if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) return raw as BlobPart
+  if (Array.isArray(raw)) return new Uint8Array(raw)
+  return null
+}
+
+/** Did the invoke fail because the backend does not have that command (a build older than the frontend)? */
+function isCommandMissing(e: unknown, command: string): boolean {
+  const msg = String(e)
+  return msg.includes(command) && /not found|unknown command|no such command/i.test(msg)
+}
+
+/**
+ * One page rasterised by the backend's PDFium, at EXACTLY `pxW` x `pxH` pixels (the page's box x
+ * devicePixelRatio, so the browser never resamples it). The PNG comes back as raw bytes and is shown
+ * through an object URL; the old command base64-encoded it, which cost a third more to move and a
+ * large string to build and parse at each end. A backend that does not have the binary command
+ * yet is noticed once and the base64 one used from then on.
+ */
+async function fetchRasterPage(
+  idx: number, scenScale: number, dpr: number, pxW: number, pxH: number,
+): Promise<{ src: string; objectUrl: string | null }> {
+  if (rasterBinaryAvailable === null && rasterProbe) await rasterProbe
+  if (rasterBinaryAvailable !== false) {
+    try {
+      const call = invoke<unknown>('render_page_image', { slug: props.slug, page: idx + 1, width: pxW, height: pxH })
+      if (rasterBinaryAvailable === null && !rasterProbe) {
+        rasterProbe = call.then(() => undefined, () => undefined).finally(() => { rasterProbe = null })
+      }
+      const raw = await call
+      const bytes = rasterBytes(raw)
+      if (bytes) {
+        rasterBinaryAvailable = true
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }))
+        return { src: url, objectUrl: url }
+      }
+      rasterBinaryAvailable = false // a payload nobody can use: stop asking
+    } catch (e) {
+      if (!isCommandMissing(e, 'render_page_image')) throw e
+      rasterBinaryAvailable = false
+    }
+  }
+  // Exact pixel size, not a DPI: a whole-number DPI can't hit the box exactly.
+  const b64 = await invoke<string>('render_page_png', {
+    slug: props.slug, page: idx + 1, dpi: Math.round(72 * scenScale * dpr),
+    width: pxW, height: pxH,
+  })
+  return { src: `data:image/png;base64,${b64}`, objectUrl: null }
+}
+
 async function renderPage(idx: number) {
-  if (!pdfDoc.value) return
+  if (!pdfDoc.value) { renderOutcome.set(idx, 'aborted'); return }
   // Already up to date? Content rendered at a different scale is still on screen
   // but stale, so it has to fall through and re-render.
-  if (renderedPages.value.has(idx) && pageRenderScales.get(idx) === scale.value) return
-  if (renderingPages.has(idx)) return
+  if (isPageFresh(idx)) { renderOutcome.set(idx, 'ok'); return }
+  if (renderingPages.has(idx)) { renderOutcome.set(idx, 'aborted'); return }
   renderingPages.add(idx)
 
   const el = pageRefs.value[idx]
-  if (!el) { renderingPages.delete(idx); return }
+  if (!el) { renderingPages.delete(idx); renderOutcome.set(idx, 'failed'); return }
 
   const myGen = renderGeneration
+  const ctl: RenderCtl = { cancelled: false, discard: false }
+  renderCtls.set(idx, ctl)
+  // A newer zoom owns the page, or the scheduler cancelled this render (the page left the
+  // keep zone, the tab was hidden or closed).
+  const superseded = () => myGen !== renderGeneration || ctl.cancelled
   const scenScale = scale.value
   // Content from a previous scale. It stays on screen until the new canvas is
   // painted — swapping only at that point is what removes the white flash.
@@ -1145,18 +1820,33 @@ async function renderPage(idx: number) {
   // superseded — tearing it down too would leave a genuinely blank page, which
   // is the very thing this rework exists to prevent. It stays, gets resized to
   // whatever scale is now current, and the next render replaces it properly.
+  // (A render the scheduler discards takes even that down: the page is being evicted.)
   let committedCanvas: HTMLElement | null = null
+  // The object URL of a rasterised page's image, until the image is in the DOM and owns it.
+  let newObjectUrl: string | null = null
   const cleanupAppended = () => {
-    appended.forEach(n => { if (n !== committedCanvas) n.remove() })
-    if (committedCanvas) rescalePageDom(idx, scale.value)
+    appended.forEach(n => { if (n !== committedCanvas || ctl.discard) n.remove() })
+    if (newObjectUrl) { URL.revokeObjectURL(newObjectUrl); newObjectUrl = null }
+    if (committedCanvas && !ctl.discard) rescalePageDom(idx, scale.value)
   }
+  const bail = () => { cleanupAppended(); renderOutcome.set(idx, 'aborted') }
   try {
     const page: PDFPageProxy = await pdfDoc.value.getPage(idx + 1)
     // Scale changed while we were fetching the page — abandon.
-    if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
+    if (superseded()) { bail(); return }
     const dpr = window.devicePixelRatio || 1
     // Logical viewport for CSS layout / text layer / highlights
     const logicalVp = page.getViewport({ scale: scenScale })
+    // The page's box on screen in CSS px — the same rounding as the page wrapper in
+    // the template — and the bitmap that has to cover it pixel for pixel. The bitmap
+    // is derived FROM the box: rounding `width × dpr` on its own (and asking PDFium
+    // for a whole-number DPI) left it a pixel or a few off the box at almost every
+    // zoom, and the browser then resampled the entire page to fit, smearing every
+    // glyph edge across two device pixels — a uniformly soft page.
+    const cssW = Math.round(logicalVp.width)
+    const cssH = Math.round(logicalVp.height)
+    const pxW = Math.max(1, Math.round(cssW * dpr))
+    const pxH = Math.max(1, Math.round(cssH * dpr))
 
     // The page's visual layer. Normally pdf.js renders vector-crisp to a canvas.
     // But some PDFs use fonts pdf.js can't render (Type 3 figure fonts → the text
@@ -1167,19 +1857,19 @@ async function renderPage(idx: number) {
     let contentEl: HTMLElement | null = null
     if (rasterFallback.value) {
       try {
-        const b64 = await invoke<string>('render_page_png', {
-          slug: props.slug, page: idx + 1, dpi: Math.round(72 * scenScale * dpr),
-        })
-        if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
+        const { src, objectUrl } = await fetchRasterPage(idx, scenScale, dpr, pxW, pxH)
+        newObjectUrl = objectUrl
+        if (superseded()) { bail(); return }
         const img = new Image()
         img.className = 'pdf-canvas'
-        img.src = `data:image/png;base64,${b64}`
+        img.src = src
         try { await img.decode() } catch { /* show it anyway */ }
-        img.style.width = `${Math.round(logicalVp.width)}px`
-        img.style.height = `${Math.round(logicalVp.height)}px`
+        img.style.width = `${cssW}px`
+        img.style.height = `${cssH}px`
         contentEl = img
       } catch (e) {
         console.error(`render_page_png(${idx}) failed; falling back to pdf.js:`, e)
+        if (newObjectUrl) { URL.revokeObjectURL(newObjectUrl); newObjectUrl = null }
         // fall through to the pdf.js canvas path below
       }
     }
@@ -1188,15 +1878,27 @@ async function renderPage(idx: number) {
       // DETACHED: an empty canvas in the page would cover the old content with a
       // white rectangle for the whole render (the flash we're avoiding). It joins
       // the DOM only once it actually has the page on it.
-      const physicalVp = page.getViewport({ scale: scenScale * dpr })
+      //
+      // (Showing a fresh page's canvas while pdf.js is still painting it, so text appears before
+      // the figures, was tried and dropped. Measured in WKWebView (jumps to unrendered pages, three
+      // runs each) it shortened the mean blank by 24 ms on one figure-heavy paper (111 against 135
+      // ms) and 38 ms on another (59 against 97 ms), and nothing for an ordinary 20-100 ms page. It
+      // costs a half-painted canvas that must be removed whenever the render is cancelled, and a
+      // page that shows text it cannot select yet.)
       const canvas = document.createElement('canvas')
       canvas.className = 'pdf-canvas'
-      canvas.width = Math.round(physicalVp.width)
-      canvas.height = Math.round(physicalVp.height)
-      canvas.style.width = `${Math.round(logicalVp.width)}px`
-      canvas.style.height = `${Math.round(logicalVp.height)}px`
+      canvas.width = pxW
+      canvas.height = pxH
+      canvas.style.width = `${cssW}px`
+      canvas.style.height = `${cssH}px`
 
-      const task = page.render({ canvas, viewport: physicalVp })
+      // Draw the page to fill the bitmap exactly — what pdf.js's own viewer does: the
+      // logical viewport plus an output transform with a separate factor per axis.
+      const task = page.render({
+        canvas,
+        viewport: logicalVp,
+        transform: [pxW / logicalVp.width, 0, 0, pxH / logicalVp.height, 0, 0],
+      })
       pageRenderTasks.set(idx, task)
       await task.promise
       pageRenderTasks.delete(idx)
@@ -1205,13 +1907,16 @@ async function renderPage(idx: number) {
 
     // Scale changed during render — a newer generation owns the page now, so
     // bail without touching what's on screen.
-    if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
+    if (superseded()) { bail(); return }
 
     // The swap: new content in, previous scale's content out, same frame.
     el.appendChild(contentEl)
     appended.push(contentEl)
     committedCanvas = contentEl
     stale.forEach(n => n.remove())
+    // The previous image (if any) is gone from the DOM, so its object URL can go too.
+    releasePageObjectUrl(idx)
+    if (newObjectUrl) { pageObjectUrls.set(idx, newObjectUrl); newObjectUrl = null }
 
     // Text layer at logical scale so CSS positions match layout
     const textLayerDiv = document.createElement('div')
@@ -1221,9 +1926,20 @@ async function renderPage(idx: number) {
     el.appendChild(textLayerDiv)
     appended.push(textLayerDiv)
 
+    // Kept across re-renders: the text does not depend on the scale.
+    let textSource = pageTextSources.get(idx) ?? null
     try {
+      if (!textSource) {
+        // A TextContent object rather than page.streamTextContent(): the TextLayer accepts either
+        // and builds the same spans, but the object is also what the furniture planner reads.
+        textSource = {
+          content: (await page.getTextContent()) as unknown as TextContentLike,
+          view: Array.from(page.view),
+          rotate: page.rotate,
+        }
+      }
       const textLayer = new pdfjsLib.TextLayer({
-        textContentSource: page.streamTextContent(),
+        textContentSource: textSource.content as unknown as ConstructorParameters<typeof pdfjsLib.TextLayer>[0]['textContentSource'],
         container: textLayerDiv,
         viewport: logicalVp,
       })
@@ -1233,13 +1949,13 @@ async function renderPage(idx: number) {
     } catch (e) {
       console.warn('TextLayer render failed:', e)
     }
-    if (myGen !== renderGeneration) { cleanupAppended(); page.cleanup(); return }
+    if (superseded()) { bail(); return }
 
     // Highlight overlay at logical scale
     const hlDiv = document.createElement('div')
     hlDiv.className = 'highlight-overlay'
-    hlDiv.style.width = `${Math.round(logicalVp.width)}px`
-    hlDiv.style.height = `${Math.round(logicalVp.height)}px`
+    hlDiv.style.width = `${cssW}px`
+    hlDiv.style.height = `${cssH}px`
     el.appendChild(hlDiv)
     appended.push(hlDiv)
 
@@ -1277,14 +1993,17 @@ async function renderPage(idx: number) {
     } catch (e) {
       console.warn('AnnotationLayer render failed:', e)
     }
+    // Linkify below measures the text layer's boxes, which only exist while the page is laid
+    // out: a tab hidden since the checks above would get overlays of zero size.
+    if (superseded()) { bail(); return }
 
     annotationLayerDiv.addEventListener('click', onAnnotationLayerClick)
 
     // Linkify plain-text URLs in the text layer (many PDFs render URLs as text)
     const linkifyDiv = document.createElement('div')
     linkifyDiv.className = 'linkify-overlay'
-    linkifyDiv.style.width = `${Math.round(logicalVp.width)}px`
-    linkifyDiv.style.height = `${Math.round(logicalVp.height)}px`
+    linkifyDiv.style.width = `${cssW}px`
+    linkifyDiv.style.height = `${cssH}px`
     el.appendChild(linkifyDiv)
     appended.push(linkifyDiv)
     try {
@@ -1293,15 +2012,36 @@ async function renderPage(idx: number) {
       console.warn('Linkify text layer failed:', e)
     }
 
+    if (textSource) pageTextSources.set(idx, textSource)
     renderedPages.value = new Set(renderedPages.value).add(idx)
     pageRenderScales.set(idx, scenScale)
-    page.cleanup()
+    pageRenderDprs.set(idx, dpr)
+    pagePixelsHeld.set(idx, pxW * pxH)
+    // pdf.js keeps the parsed operator list (and decoded images) of a page until cleanup(). It used
+    // to be dropped here, so every re-render - a zoom, a display change - parsed the page again.
+    // Measured in WKWebView, re-rendering the two visible pages after one zoom step took 10-20 ms
+    // a page instead of 78-91 ms on two figure-heavy papers (golkar 20 against 91 ms, hero 10
+    // against 78 ms; feng 97 against 129 ms).
+    // It is kept while the page is on screen or next to it and released by releaseOpListsOutside /
+    // unrenderPage once it is not.
+    opListPages.add(idx)
+    renderOutcome.set(idx, 'ok')
+    // The window moved to another display while this page was rendering: the plan sees the page
+    // as stale now and asks for it again.
+    if (dpr !== (window.devicePixelRatio || 1)) scheduleReconcile()
   } catch (e) {
     // RenderingCancelledException is expected when a zoom cancels in-flight work.
     if ((e as { name?: string })?.name !== 'RenderingCancelledException') {
       console.error(`renderPage(${idx}) failed:`, e)
+      renderOutcome.set(idx, 'failed')
+    } else {
+      renderOutcome.set(idx, 'aborted')
     }
   } finally {
+    if (newObjectUrl) URL.revokeObjectURL(newObjectUrl)
+    // The scheduler discarded this render after it had already replaced the page's content.
+    if (ctl.discard && committedCanvas) unrenderPage(idx)
+    if (renderCtls.get(idx) === ctl) renderCtls.delete(idx)
     pageRenderTasks.delete(idx)
     renderingPages.delete(idx)
   }
@@ -1312,7 +2052,12 @@ function unrenderPage(idx: number) {
   if (!el) return
   // Keep the placeholder size — only remove rendered children
   while (el.firstChild) el.removeChild(el.firstChild)
+  releasePageObjectUrl(idx)
   pageRenderScales.delete(idx)
+  pageRenderDprs.delete(idx)
+  pagePixelsHeld.delete(idx)
+  pageTextSources.delete(idx)
+  releaseOpList(idx)
   const next = new Set(renderedPages.value)
   next.delete(idx)
   renderedPages.value = next
@@ -1351,6 +2096,9 @@ watch(scale, async (newScale) => {
   renderGeneration++
   pageRenderTasks.forEach((task) => { try { task.cancel() } catch { /* already done */ } })
   pageRenderTasks.clear()
+  // Whatever was queued was planned for the old scale; the plan after the wait below redoes it.
+  wantQueue.length = 0
+  failedRenders.clear()
 
   // Resize what's already on screen RIGHT NOW. The page wrappers resize
   // reactively with `scale`, so without this their content would sit at the old
@@ -1361,20 +2109,19 @@ watch(scale, async (newScale) => {
 
   // Wait for the cancelled/stale renders to unwind so their page locks free up
   // before we re-render — otherwise a re-render could be blocked or doubled.
+  // Each render releases its own lock when it settles (renderPage's `finally`), so
+  // nothing is cleared here: clearing the set also dropped the lock of a render that
+  // had started DURING this wait (the observer, a display change) at the new scale,
+  // and the trigger below then rendered the same page a second time beside it —
+  // every layer of that page doubled, highlights drawn twice as dark.
   await Promise.allSettled([...inflightRenders.values()])
-  // Cancelled renders leave nothing behind; anything mid-flight bailed on the
-  // generation check without touching the DOM.
-  renderingPages.clear()
 
   await nextTick()
   updateScrollThumbs()
-  // Re-render the currently visible pages at the new scale. `pageRenderScales`
-  // is deliberately left alone: it still records the OLD scale, which is what
-  // makes renderPage treat these pages as stale and rebuild them.
-  if (observer && containerRef.value) {
-    observer.disconnect()
-    pageRefs.value.forEach((el) => { if (el) observer!.observe(el) })
-  }
+  // Re-render the pages in the render zone at the new scale. `pageRenderScales` is
+  // deliberately left alone: it still records the OLD scale, which is what makes the plan
+  // treat these pages as stale (re-render those in the zone, drop the rest) and
+  // renderPage rebuild them.
   triggerInitialRender()
 })
 
@@ -1400,17 +2147,12 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
         div.dataset.hlId = hl.id
         div.addEventListener('click', (e) => {
           e.stopPropagation()
-          const bounding = div.getBoundingClientRect()
-          hlNoteText.value = reader.highlightsFor(props.slug).find(h => h.id === hl.id)?.note ?? ''
-          hlNoteEditing.value = false
-          openNotePopup(bounding.left, bounding.bottom + 4, hl.id)
-          hlColorPopup.value = null
+          openHighlightNote(div.getBoundingClientRect(), hl.id)
         })
         div.addEventListener('contextmenu', (e) => {
           e.preventDefault()
           e.stopPropagation()
-          hlColorPopup.value = { x: e.clientX, y: e.clientY + 4, hlId: hl.id }
-          hlNotePopup.value = null
+          openHighlightMenu(e, hl.id)
         })
         container.appendChild(div)
       })
@@ -1437,17 +2179,12 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
         r.style.cursor = 'pointer'
         r.addEventListener('click', (e) => {
           e.stopPropagation()
-          const bounding = r.getBoundingClientRect()
-          hlNoteText.value = reader.highlightsFor(props.slug).find(h => h.id === hl.id)?.note ?? ''
-          hlNoteEditing.value = false
-          openNotePopup(bounding.left, bounding.bottom + 4, hl.id)
-          hlColorPopup.value = null
+          openHighlightNote(r.getBoundingClientRect(), hl.id)
         })
         r.addEventListener('contextmenu', (e) => {
           e.preventDefault()
           e.stopPropagation()
-          hlColorPopup.value = { x: e.clientX, y: e.clientY + 4, hlId: hl.id }
-          hlNotePopup.value = null
+          openHighlightMenu(e, hl.id)
         })
         g.appendChild(r)
       })
@@ -1488,15 +2225,19 @@ watch(() => reader.scrollToHighlightId, async (id) => {
   const hl = reader.highlightsFor(props.slug).find(h => h.id === id)
   if (!hl) return
   reader.scrollToHighlightId = null
-  const pageIndex = hl.page - 1
+  // Land on where the highlight starts; a cross-page one flashes on every page of
+  // it that is rendered (the later pages may be off-screen and not rendered yet).
+  const members = highlightGroupIndex.value.get(id)?.members ?? [hl]
+  const first = members[0]
+  const pageIndex = first.page - 1
   await ensurePageRendered(pageIndex)
-  scrollToPageIndex(pageIndex, hl.rects[0]?.y ?? 0)
+  scrollToPageIndex(pageIndex, first.rects[0]?.y ?? 0)
   // Flash the highlight
   setTimeout(() => {
-    const el = pageRefs.value[pageIndex]
-    if (!el) return
-    const hlEl = el.querySelector(`[data-hl-id="${id}"]`) as HTMLDivElement | null
-    if (hlEl) {
+    for (const m of members) {
+      const el = pageRefs.value[m.page - 1]
+      const hlEl = el?.querySelector(`[data-hl-id="${m.id}"]`) as HTMLDivElement | null
+      if (!hlEl) continue
       hlEl.classList.add('hl-flash')
       setTimeout(() => hlEl.classList.remove('hl-flash'), 1000)
     }
@@ -1511,6 +2252,10 @@ async function ensurePageRendered(pageIndex: number) {
 
 // ── Progress tracking ─────────────────────────────────────────────────────────
 function onScroll() {
+  // The scroll event of a tab that has just been hidden arrives after display:none, where
+  // scrollTop reads 0: acting on it would show page 1 in the toolbar and save it as the position.
+  if (!containerRef.value || containerRef.value.clientHeight === 0) return
+  noteScroll()
   updateDisplayPage()
   showScrollThumbs()
   repositionAnchoredPopups()
@@ -1647,19 +2392,23 @@ function updateDisplayPage() {
 }
 
 function flushReadingState() {
-  if (!containerRef.value || pageSizes.value.length === 0) return
-  const scrollTop = containerRef.value.scrollTop
+  const c = containerRef.value
+  if (!c || pageSizes.value.length === 0) return
+  // A hidden container reads scrollTop 0, which would be saved as "back on page 1": the one
+  // value that survives display:none is the one the scroll events tracked.
+  const scrollTop = c.clientHeight > 0 ? c.scrollTop : trackedScrollTop
   const gap = 12
   let cumY = 0
   for (let i = 0; i < pageSizes.value.length; i++) {
     const pageH = pageSizes.value[i].height * scale.value + gap
     if (cumY + pageH > scrollTop + 10 || i === pageSizes.value.length - 1) {
       const ratio = Math.max(0, Math.min(1, (scrollTop - cumY) / pageH))
+      // This viewer's own slug: when it is being backgrounded the active tab is already another one.
       reader.persistReadingState({
         page: i + 1,
         scroll_ratio: ratio,
         updated_at: new Date().toISOString(),
-      })
+      }, props.slug)
       return
     }
     cumY += pageH
@@ -1680,6 +2429,10 @@ async function restorePosition() {
     cumY += rs.scroll_ratio * pageH
   }
   containerRef.value.scrollTop = cumY
+  trackedScrollTop = cumY
+  // Opened while backgrounded: a hidden container has no scroll offset to set, so the position
+  // is applied when the tab is first shown (showViewer, after its fit-to-width).
+  if (!isActiveTab.value) restorePending = true
   displayPage.value = rs.page
   pageInputValue.value = String(rs.page)
 }
@@ -2083,7 +2836,8 @@ function onGestureEnd(e: Event) {
 // containers, canvases, overlays), which are full-page-sized and would highlight
 // an entire page. Instead we walk only the text nodes the range touches and take
 // rects from a per-text-node sub-range — those are always tight line boxes.
-function collectSelectionRectsByPage(range: Range): { pageIndex: number; rects: Rect[] }[] {
+// `skip` holds text-layer spans to leave out (page furniture, see planSelectionFurniture).
+function collectSelectionRectsByPage(range: Range, skip?: ReadonlySet<HTMLElement>): { pageIndex: number; rects: Rect[] }[] {
   const rootNode = range.commonAncestorContainer
   const rootEl = (rootNode.nodeType === Node.ELEMENT_NODE ? rootNode : rootNode.parentNode) as HTMLElement | null
   if (!rootEl) return []
@@ -2102,6 +2856,7 @@ function collectSelectionRectsByPage(range: Range): { pageIndex: number; rects: 
     const parent = node.parentElement
     // Only text inside a page's PDF text layer counts.
     if (!parent?.closest('.textLayer')) continue
+    if (skip?.has(parent)) continue
     const pageEl = parent.closest('[data-page-index]') as HTMLElement | null
     if (!pageEl) continue
     const pageIndex = Number(pageEl.dataset.pageIndex)
@@ -2136,13 +2891,182 @@ function collectSelectionRectsByPage(range: Range): { pageIndex: number; rects: 
   return pages
 }
 
+// ── Page furniture in a cross-page selection ────────────────────────────────
+// Dragging from the foot of one page into the next also selects whatever lies between the two
+// text runs in DOM order: the footnotes and the page number at the foot of the first page, the
+// arXiv stamp in its margin, the running head of the next and the figure set at its top. The
+// highlight would paint a "2" yellow and store "…composition. 2In contrast…". utils/pageFurniture.ts
+// labels those spans from their geometry; this drops the ones that face the page break, and every
+// figure / table the selection runs through. It only ever applies to a selection that really
+// crosses a page boundary, and it fails SAFE: anything unexpected returns null and the selection is
+// left exactly as the browser made it (a skipped footnote cannot be recovered afterwards, a kept
+// one can be deleted by hand). There is no "include them" toggle — the user asked for it to go —
+// so the skipped spans are shown as not selected (showSkippedSpans): the page itself says what was
+// left out, and a selection that starts or ends inside it keeps it.
+
+// The document's "normal" type size, from its first pages. Two selected pages alone get it
+// wrong on ~5 % of pages, always towards flagging less, so the document-wide figure is used
+// once it has arrived (a few ms of work, started shortly after the PDF loaded).
+let docBodyFontSize: number | null = null
+
+async function prefetchBodyFontSize(doc: PDFDocumentProxy) {
+  try {
+    const pages: FurniturePage[] = []
+    for (let i = 1; i <= Math.min(8, doc.numPages); i++) {
+      if (pdfDoc.value !== doc) return // closed meanwhile
+      const page = await doc.getPage(i)
+      const fp = furniturePageFromTextContent((await page.getTextContent()) as unknown as TextContentLike, page.view, page.rotate)
+      if (fp) pages.push(fp)
+    }
+    docBodyFontSize = estimateBodyFontSize(pages)
+  } catch {
+    // An improvement, not a requirement: without it the selected pages' own mode is used.
+  }
+}
+
+/** A rendered page's text layer as furniture input, or null while it is not rendered. */
+function renderedFurniturePage(pageIndex: number): FurniturePage | null {
+  const pageEl = pageRefs.value[pageIndex]
+  const layer = pageEl?.querySelector<HTMLElement>('.textLayer')
+  return pageEl && layer ? furnitureReading(pageIndex, layer, pageEl).page : null
+}
+
+/**
+ * A rendered page's spans for the classifier: the painted spans give the identity (which element is
+ * which span, where each line ends), pdf.js's text content gives the geometry whenever it describes
+ * the same spans. The painted widths are the browser's own (WebKit's differ from Chrome's by up to
+ * 5 %), which is enough to close the gutter between two columns and hide a page's footnotes; the
+ * content geometry is the same in every engine and is what the classifier was tuned on.
+ * `preferContentGeometry` falls back to the painted geometry unless the two list the very same
+ * texts, so this can only ever be as good as the plain reading, never worse.
+ */
+function furnitureReading(pageIndex: number, layer: HTMLElement, pageEl: HTMLElement): SpanReading {
+  const reading = spansFromTextLayer(layer, pageEl, scale.value)
+  const src = pageTextSources.get(pageIndex)
+  const content = src ? furniturePageFromTextContent(src.content, src.view, src.rotate) : null
+  return { ...reading, page: preferContentGeometry(reading.page, content) }
+}
+
+/** The same text, spaces and line breaks aside. */
+function sameText(a: string, b: string): boolean {
+  return a.replace(/\s+/g, '') === b.replace(/\s+/g, '')
+}
+
+/**
+ * A selection that spans pages, read back from the text layers. `text` is the selection's text with a
+ * line break at every page boundary — the browser's own has none there: the app shell is
+ * `user-select: none` and only the text layers opt back in (App.vue), so WebKit's `toString()` runs
+ * the last line of one page into the first of the next ("…composition. 2In contrast"). `furniture` is
+ * the trimmed variant when the policy leaves anything out. Null for a single page, and whenever the
+ * text layers do not rebuild the browser's text — spaces and line breaks aside, which is all the
+ * engines disagree on.
+ */
+function planSelectionFurniture(
+  range: Range,
+  all: { pageIndex: number; rects: Rect[] }[],
+  plain: string,
+): { text: string; furniture: { report: FurnitureDropReport; trimmed: SelectionVariant; skip: Set<HTMLElement> } | null } | null {
+  try {
+    const idx = all.map(p => p.pageIndex)
+    // Consecutive pages only: a gap is a page that is not rendered, which cannot be judged.
+    if (idx.length < 2 || idx.some((v, i) => i > 0 && v !== idx[i - 1] + 1)) return null
+
+    const readings: SpanReading[] = []
+    for (const i of idx) {
+      const pageEl = pageRefs.value[i]
+      const layer = pageEl?.querySelector<HTMLElement>('.textLayer')
+      if (!pageEl || !layer) return null
+      readings.push(furnitureReading(i, layer, pageEl))
+    }
+    const selected = readings.map(r => selectedTextBySpan(range, r.elements))
+
+    // Self-check: rebuilt WITHOUT dropping anything, the text must be what the browser gave, but
+    // for whitespace. If the text layer is not what the module was verified against (spans nested
+    // by an overlay, injected text, a layout it misreads) this fails and nothing is trimmed. Line
+    // breaks are not compared: WebKit leaves out the one between two pages (see above).
+    const asIs = keptSelectionTextAcrossPages(readings.map((r, k) => ({ selected: selected[k], eolAfter: r.eolAfter })))
+    if (!sameText(asIs, plain)) {
+      const a = asIs.replace(/\s+/g, '')
+      const b = plain.replace(/\s+/g, '')
+      let at = 0
+      while (at < b.length && a[at] === b[at]) at++
+      console.debug('page furniture: the text layer does not rebuild the selection; leaving it as is', {
+        at, layer: a.slice(Math.max(0, at - 30), at + 30), selection: b.slice(Math.max(0, at - 30), at + 30),
+      })
+      return null
+    }
+
+    // The pages around the selection vouch for repeating running heads (87 % -> 95 % found).
+    const neighbours = [idx[0] - 2, idx[0] - 1, idx[idx.length - 1] + 1, idx[idx.length - 1] + 2]
+      .filter(i => i >= 0 && i < pageCount.value)
+      .map(renderedFurniturePage)
+      .filter((p): p is FurniturePage => p !== null)
+    const report = planFurnitureDropReport(
+      readings.map((r, k) => ({ page: r.page, selected: selected[k] })),
+      { bodyFontSize: docBodyFontSize ?? undefined, neighbours },
+    )
+    if (report.items.length === 0) return { text: asIs, furniture: null } // nothing to skip
+
+    const skip = new Set<HTMLElement>()
+    report.drop.forEach((set, k) => set.forEach(i => skip.add(readings[k].elements[i])))
+    const pages = collectSelectionRectsByPage(range, skip)
+    const text = keptSelectionTextAcrossPages(readings.map((r, k) => ({
+      selected: selected[k], eolAfter: r.eolAfter, dropped: report.drop[k],
+    }))).trim()
+    // Nothing would remain: keep what the user selected.
+    if (pages.length === 0 || text === '') return { text: asIs, furniture: null }
+    return { text: asIs, furniture: { report, trimmed: { text, pages }, skip } }
+  } catch (e) {
+    console.warn('page furniture detection failed; keeping the plain selection:', e)
+    return null
+  }
+}
+
+// The text-layer spans the trimmed selection leaves out. While its popup is up they are painted as NOT
+// selected (`.sel-skip`, see the styles), so the page shows exactly what a highlight, a translation or a
+// copy will take — the browser's own selection still runs through them in DOM order.
+let skippedSpansShown: HTMLElement[] = []
+
+function showSkippedSpans(spans: readonly HTMLElement[]) {
+  clearSkippedSpans()
+  for (const el of spans) {
+    if (!el.isConnected) continue
+    el.classList.add('sel-skip')
+    skippedSpansShown.push(el)
+  }
+}
+
+function clearSkippedSpans() {
+  for (const el of skippedSpansShown) el.classList.remove('sel-skip')
+  skippedSpansShown = []
+}
+
+// Whatever closes the popup (or replaces it with one that skips nothing) ends the marking.
+watch(selectionPopup, p => { if (!p?.furniture) clearSkippedSpans() })
+
+/** ⌘C copies what the popup holds for a selection across pages: the text with a line break between the
+ *  pages, without the spans shown as not selected. */
+function onCopySelection(e: ClipboardEvent) {
+  const p = selectionPopup.value
+  if (!p?.full || !e.clipboardData) return
+  // Only the selection the popup was built from (a later one, or one in a note, copies as it is).
+  const sel = window.getSelection()
+  if (!sel || sel.isCollapsed || !sameText(sel.toString(), p.full.text)) return
+  e.clipboardData.setData('text/plain', p.text)
+  e.preventDefault()
+}
+
 function onWindowMouseUp(e: MouseEvent) {
   // A drag that STARTED in the note popup is a text selection inside it — the
   // release often lands outside, and dismissing there would tear down the very
   // text the user is selecting (and with it the selection they meant to copy).
   if (noteDragOrigin) { noteDragOrigin = false; return }
-  // Dismiss popups on outside click
-  if ((e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup')) return
+  // A click inside a popup (a colour, a button) belongs to it. But a drag that began on the page
+  // and ends over the selection popup — it sits right under the last selection's end, so a second
+  // drag across the same lines lands on it — is a new selection: it must replace the popup, not
+  // leave the previous selection's text and actions under the new one.
+  const overPopup = (e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup')
+  if (overPopup && (pressInPopup || !overPopup.classList.contains('sel-popup'))) return
   hlNotePopup.value = null
   // Right-click releases the contextmenu that just opened hlColorPopup — don't dismiss it
   if (e.button !== 2) hlColorPopup.value = null
@@ -2155,18 +3079,31 @@ function onWindowMouseUp(e: MouseEvent) {
 
   // Pre-compute rects NOW while the selection is still active — reading them
   // later (after a mousedown on a color dot) would find it already cleared.
-  const pages = collectSelectionRectsByPage(sel.getRangeAt(0))
+  const range = sel.getRangeAt(0)
+  const pages = collectSelectionRectsByPage(range)
   const text = sel.toString().trim()
   if (pages.length === 0) { selectionPopup.value = null; return }
 
+  // Across a page break the text is rebuilt from the text layers (the browser's own runs the two
+  // pages together), and the drag also swept up the page number, running head, footnotes, margin
+  // stamp and figures / tables that sit between the two text runs: those are left out, while the
+  // selection still exists (null = a single page, or a text layer that does not rebuild the
+  // selection: the browser's text, unchanged).
+  const plan = planSelectionFurniture(range, pages, text)
+  const furniture = plan?.furniture ?? null
+
   // Anchor the toolbar to where the mouse was released rather than the bottom
   // of the selection — feels more direct and stays near the cursor.
-  selectionPopup.value = {
-    x: e.clientX,
-    y: e.clientY + 12,
-    text,
-    pages,
-  }
+  const at = { x: e.clientX, y: e.clientY + 12 }
+  selectionPopup.value = furniture && plan
+    ? { ...at, text: furniture.trimmed.text, pages: furniture.trimmed.pages, full: { text: plan.text, pages }, furniture: furniture.report }
+    : plan
+      ? { ...at, text: plan.text, pages, full: { text: plan.text, pages } }
+      : { ...at, text, pages }
+  if (furniture) showSkippedSpans([...furniture.skip])
+  // A popup that is already open keeps its element (and so its size), so the observer will not
+  // fire for the new position: fit it explicitly.
+  void nextTick(fitSelectionPopup)
 }
 
 function createHighlight(color?: string) {
@@ -2175,45 +3112,65 @@ function createHighlight(color?: string) {
 
   const c = color ?? activeColor.value
   const created_at = new Date().toISOString()
-  // One highlight per page the selection covers, each with only that page's rects.
-  for (const { pageIndex, rects } of popup.pages) {
-    reader.addHighlight({
-      id: crypto.randomUUID(),
-      page: pageIndex + 1,
-      rects,
-      text: popup.text,
-      color: c,
-      created_at,
-      style: highlightStyle.value,
-    })
-  }
+  // One record per page the selection covers, each with only that page's rects.
+  // The records keep the WHOLE selection text and this one shared `created_at` —
+  // that pair is what utils/highlightGroups uses to show them as a single highlight,
+  // and it is the only marker an older build (which strips fields it does not know)
+  // leaves intact. Saved in one batch so no half of a selection is ever on disk.
+  reader.addHighlights(popup.pages.map(({ pageIndex, rects }): Highlight => ({
+    id: crypto.randomUUID(),
+    page: pageIndex + 1,
+    rects,
+    text: popup.text,
+    color: c,
+    created_at,
+    style: highlightStyle.value,
+  })))
   window.getSelection()?.removeAllRanges()
   selectionPopup.value = null
 }
 
 // ── Highlight popup actions ───────────────────────────────────────────────────
 async function translateHighlight(hlId: string) {
-  const hl = reader.highlightsFor(props.slug).find(h => h.id === hlId)
+  const hl = resolveHighlightGroup(hlId)
   if (!hl) return
   hlColorPopup.value = null
-  await runTranslation(hl.text)
+  await runTranslation(hl.displayText)
 }
 
+// Delete / recolour / note write to every record of the highlight, in one save.
+// Touching only the clicked half would leave its twin behind (and the cross-machine
+// merge's last-edit-wins would then bring the half-deleted or half-recoloured one back).
 function deleteHighlight(id: string) {
-  reader.removeHighlight(id)
-  forgetNotePopupSize(id)
+  const ids = highlightIdsOf(id)
+  reader.removeHighlights(ids)
+  ids.forEach(forgetNotePopupSize)
   hlColorPopup.value = null
   hlNotePopup.value = null
 }
 
+// A PDF has only printed lines, so a highlight reads as one merged paragraph unless the
+// user keeps the original breaks (list, code, equation). Per-highlight, group-wide.
+function toggleHighlightLineBreaks(id: string) {
+  const g = resolveHighlightGroup(id)
+  if (!g) return
+  reader.updateHighlights(g.ids, { ...groupAppearance(g), keep_line_breaks: g.keepLineBreaks ? undefined : true })
+  hlColorPopup.value = null
+}
+
 function changeHighlightColor(id: string, color: string) {
-  reader.updateHighlight(id, { color })
+  reader.updateHighlights(highlightIdsOf(id), { color })
   hlColorPopup.value = null
 }
 
 function saveNote() {
   if (!hlNotePopup.value) return
-  reader.updateHighlight(hlNotePopup.value.hlId, { note: hlNoteText.value || undefined })
+  const { hlId } = hlNotePopup.value
+  const next = hlNoteText.value || undefined
+  // Nothing changed (blur without typing): don't stamp every record as edited.
+  const g = resolveHighlightGroup(hlId)
+  if ((g?.note || undefined) === next) return
+  reader.updateHighlights(g?.ids ?? [hlId], { ...(g ? groupAppearance(g) : {}), note: next })
   // Popup stays open; caller switches back to view mode
 }
 
@@ -2223,24 +3180,13 @@ async function startNoteEdit() {
   noteTextareaRef.value?.focus()
 }
 
-// ── Fallback initial render ───────────────────────────────────────────────────
-// IntersectionObserver is async — explicitly kick-start pages near the viewport
-// in case the callback hasn't fired yet after setup.
+// ── Plan now ──────────────────────────────────────────────────────────────────
+// Scroll events and resizes plan on the next frame; these moments (the PDF finished loading, the
+// zoom settled) plan straight away. The viewport has moved without a scroll event, so the
+// speed estimate starts over.
 function triggerInitialRender() {
-  if (!containerRef.value) return
-  const scrollTop = containerRef.value.scrollTop
-  const containerH = containerRef.value.clientHeight || 800
-  const margin = 800
-  const gap = 12
-  let cumY = 0
-  for (let i = 0; i < pageSizes.value.length; i++) {
-    const pageH = pageSizes.value[i].height * scale.value + gap
-    if (cumY + pageH > scrollTop - margin && cumY < scrollTop + containerH + margin) {
-      requestRenderPage(i)
-    }
-    if (cumY > scrollTop + containerH + margin) break
-    cumY += pageH
-  }
+  scrollTracker.rebase()
+  reconcile()
 }
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
@@ -2393,6 +3339,7 @@ function triggerInitialRender() {
     <!-- Selection popup: click a color to immediately highlight -->
     <div
       v-if="selectionPopup"
+      ref="selPopupRef"
       class="sel-popup"
       :style="{ left: `${selectionPopup.x}px`, top: `${selectionPopup.y}px` }"
     >
@@ -2425,6 +3372,16 @@ function triggerInitialRender() {
       <button class="sel-translate-btn" @click="translateSelection">
         <Icon icon="argus:translate" width="13" height="13" />
         <span class="sel-translate-label">{{ t('pdf.translate') }}</span>
+      </button>
+      <div class="sel-sep" />
+      <button
+        class="sel-translate-btn"
+        :class="{ active: readingSelection }"
+        @click="readAloudSelection('pdf')"
+        :title="readingSelection ? t('pdf.readAloudStop') : t('pdf.readAloud')"
+      >
+        <Icon :icon="readingSelection ? 'fluent:speaker-off-24-regular' : 'fluent:speaker-2-24-regular'" width="13" height="13" />
+        <span class="sel-translate-label">{{ readingSelection ? t('pdf.readAloudStop') : t('pdf.readAloud') }}</span>
       </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="askAiWithSelection" :title="t('pdf.askAi')">
@@ -2462,6 +3419,7 @@ function triggerInitialRender() {
     <!-- Highlight context popup: right-click → change color + delete -->
     <div
       v-if="hlColorPopup"
+      ref="hlMenuRef"
       class="hl-color-popup"
       :style="{ left: `${hlColorPopup.x}px`, top: `${hlColorPopup.y}px` }"
       @click.stop
@@ -2478,6 +3436,12 @@ function triggerInitialRender() {
       </div>
       <div class="hl-popup-divider" />
       <button class="hl-action-btn" @click="copyHighlightText(hlColorPopup!.hlId)">{{ t('pdf.copy') }}</button>
+      <button
+        v-if="hlMenuGroup?.hasLineBreaks"
+        class="hl-action-btn"
+        :title="hlMenuGroup.keepLineBreaks ? t('hl.mergeLinesHint') : t('hl.keepLinesHint')"
+        @click="toggleHighlightLineBreaks(hlColorPopup!.hlId)"
+      >{{ hlMenuGroup.keepLineBreaks ? t('hl.mergeLines') : t('hl.keepLines') }}</button>
       <button class="hl-action-btn" @click="addHighlightToSnippetLibrary(hlColorPopup!.hlId)">{{ t('pdf.snippet') }}</button>
       <button class="hl-action-btn" @click="translateHighlight(hlColorPopup!.hlId)">{{ t('pdf.translate') }}</button>
       <button class="hl-action-btn danger" @click="deleteHighlight(hlColorPopup!.hlId)">{{ t('pdf.delete') }}</button>
@@ -2921,6 +3885,13 @@ function triggerInitialRender() {
   background: rgba(0, 100, 255, 0.25);
 }
 
+/* Spans a cross-page selection leaves out (page numbers, running heads, footnotes, margin text,
+   figures and tables — planSelectionFurniture): shown as not selected while the popup skips them. */
+:deep(.textLayer .sel-skip::selection),
+:deep(.textLayer .sel-skip *::selection) {
+  background: transparent;
+}
+
 /* endOfContent anchor: sits below the layer by default, expands to cover it
    while selecting so drag-into-whitespace stays anchored in reading order. */
 :deep(.textLayer .endOfContent) {
@@ -3022,6 +3993,12 @@ function triggerInitialRender() {
   display: flex;
   align-items: center;
   gap: 4px;
+  /* Natural width whatever `left` is: a fixed box is otherwise sized to the room to its right,
+     which would squash the toolbar before fitSelectionPopup() could measure it. Wider than the
+     window (very narrow windows, long labels) wraps instead of running off the edge. */
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  flex-wrap: wrap;
 }
 
 .sel-colors, .hl-popup-colors {
@@ -3059,7 +4036,7 @@ function triggerInitialRender() {
   flex-shrink: 0;
 }
 .sel-style-btn:hover { background: var(--bg-hover); color: var(--accent); }
-.sel-style-btn.active { color: var(--accent); background: var(--bg-hover); }
+.sel-style-btn.active, .sel-translate-btn.active { color: var(--accent); background: var(--bg-hover); }
 
 .sel-translate-btn {
   display: flex;
@@ -3207,6 +4184,12 @@ function triggerInitialRender() {
 
 .hl-color-popup {
   position: fixed;
+  /* Natural width whatever the click position (a fixed box near the right edge would
+     otherwise shrink to the room left of it), and wrap only if even that is wider
+     than the window (narrow split, long labels). */
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  flex-wrap: wrap;
   z-index: 1001;
   background: var(--bg-primary);
   border: 1px solid var(--border-default);

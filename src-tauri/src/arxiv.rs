@@ -999,18 +999,247 @@ fn strip_list_marker(item: &str) -> &str {
     item
 }
 
+/// The fields the analysis prompt asks for.
+const ANALYSIS_FIELDS: [&str; 5] =
+    ["relevance_score", "relevance_reason", "key_contributions", "summary", "matched_topics"];
+
+/// Other names a model has given a field.
+const FIELD_ALIASES: [(&str, &str); 5] = [
+    ("score", "relevance_score"),
+    ("reason", "relevance_reason"),
+    ("contributions", "key_contributions"),
+    ("analysis_summary", "summary"),
+    ("topics", "matched_topics"),
+];
+
+fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != cb)).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The field a key in a reply stands for: its own name in any case or
+/// spelling of separators, a known alias, or the name with a slip or two in
+/// it. MiniMax-M3 writes `relevence_score` often enough to fail one paper in
+/// twenty. No two field names are within two edits of each other.
+fn canonical_field(key: &str) -> Option<&'static str> {
+    let key = normalize_key(key);
+    if key.is_empty() {
+        return None;
+    }
+    ANALYSIS_FIELDS
+        .iter()
+        .copied()
+        .find(|f| normalize_key(f) == key)
+        .or_else(|| {
+            FIELD_ALIASES
+                .iter()
+                .find(|(alias, _)| normalize_key(alias) == key)
+                .map(|(_, field)| *field)
+        })
+        .or_else(|| {
+            ANALYSIS_FIELDS.iter().copied().find(|f| {
+                let name = normalize_key(f);
+                name.len() >= 7 && edit_distance(&key, &name) <= 2
+            })
+        })
+}
+
+/// A reply's object with every key replaced by the field it stands for; keys
+/// that stand for none are dropped, and an exact name wins over a misspelt one.
+fn canonicalize(obj: serde_json::Map<String, serde_json::Value>) -> RawAnalysis {
+    let mut out = RawAnalysis::new();
+    for (key, value) in obj {
+        let Some(field) = canonical_field(&key) else { continue };
+        if key == field || !out.contains_key(field) {
+            out.insert(field.to_string(), value);
+        }
+    }
+    out
+}
+
+fn has_score(obj: &RawAnalysis) -> bool {
+    obj.get("relevance_score").is_some_and(|v| !v.is_null())
+}
+
 /// The first JSON value at the start of `text`, if it is an object carrying a
-/// `relevance_score`. Whatever follows the value is ignored.
+/// `relevance_score` (under any name `canonical_field` reads as one).
+/// Whatever follows the value is ignored.
 fn object_with_score(text: &str) -> Option<RawAnalysis> {
     let mut values = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
     match values.next() {
-        Some(Ok(serde_json::Value::Object(obj)))
-            if obj.get("relevance_score").is_some_and(|v| !v.is_null()) =>
-        {
-            Some(obj)
-        }
+        Some(Ok(serde_json::Value::Object(obj))) => Some(canonicalize(obj)).filter(has_score),
         _ => None,
     }
+}
+
+/// Every `"name":` in `text`, as (where its opening quote is, where its value
+/// starts, the name). A name is ASCII letters, digits, `_`, `-` or spaces.
+fn key_positions(text: &str) -> Vec<(usize, usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(off) = text[i..].find('"') {
+        let open = i + off;
+        let start = open + 1;
+        let len = bytes[start..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b' '))
+            .count();
+        let close = start + len;
+        if (1..=40).contains(&len) && bytes.get(close) == Some(&b'"') {
+            let mut j = close + 1;
+            while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b':') {
+                out.push((open, j + 1, &text[start..close]));
+                i = j + 1;
+                continue;
+            }
+        }
+        i = start;
+    }
+    out
+}
+
+/// `\"`, `\n` and the other escapes of a JSON string, undone.
+fn unescape_json_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => {}
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    out.push(ch);
+                }
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// The items of a list's inside: `"a", "b"` → a, b. It splits only where a
+/// quote, a comma and a quote meet, so a stray quote inside an item stays in
+/// the item. An unquoted list splits on commas.
+fn salvage_items(inner: &str) -> Vec<serde_json::Value> {
+    let inner = inner.trim();
+    let Some(body) = inner.strip_prefix('"') else {
+        return inner
+            .split([',', '，'])
+            .map(|item| item.trim().trim_matches('"').trim().to_string())
+            .filter(|item| !item.is_empty())
+            .map(serde_json::Value::String)
+            .collect();
+    };
+    let body = body.strip_suffix('"').unwrap_or(body);
+    let bytes = body.as_bytes();
+    let mut items = Vec::new();
+    let (mut from, mut i) = (0, 0);
+    while let Some(off) = body[i..].find('"') {
+        let quote = i + off;
+        let mut j = quote + 1;
+        while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+            j += 1;
+        }
+        if bytes.get(j) == Some(&b',') {
+            j += 1;
+            while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'"') {
+                items.push(&body[from..quote]);
+                from = j + 1;
+                i = j + 1;
+                continue;
+            }
+        }
+        i = quote + 1;
+    }
+    items.push(&body[from..]);
+    items
+        .into_iter()
+        .map(|item| unescape_json_text(item).trim().to_string())
+        .filter(|item| !item.is_empty())
+        .map(serde_json::Value::String)
+        .collect()
+}
+
+/// One field's value, read from the text between its name and the next name:
+/// a list, a string (up to the last quote, so a bracket or brace stuck after
+/// it is dropped), or a bare number.
+fn salvage_value(span: &str) -> serde_json::Value {
+    let s = span
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, ',' | '}' | '`') || c.is_whitespace());
+    if let Some(inner) = s.strip_prefix('[') {
+        let inner = inner.trim_end_matches(|c: char| matches!(c, ']' | ',') || c.is_whitespace());
+        return serde_json::Value::Array(salvage_items(inner));
+    }
+    if let Some(body) = s.strip_prefix('"') {
+        let body = body.rfind('"').map_or(body, |end| &body[..end]);
+        return serde_json::Value::String(unescape_json_text(body));
+    }
+    serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
+}
+
+/// The last resort, for a reply that is not JSON even after
+/// `repair_json_strings`: each field is read on its own, from its name up to
+/// the next name. So a stray bracket — MiniMax-M3 has closed a summary with
+/// `"…"]` — a missing comma or bracket, or a quote the repair misread costs
+/// nothing as long as the names are there. Of a name that appears twice (a
+/// draft, then the answer) the last one counts.
+fn salvage_fields(text: &str) -> Option<RawAnalysis> {
+    let keys = key_positions(text);
+    let mut out = RawAnalysis::new();
+    for (n, (_, value_start, name)) in keys.iter().enumerate() {
+        let Some(field) = canonical_field(name) else { continue };
+        let end = keys.get(n + 1).map_or(text.len(), |next| next.0);
+        out.insert(field.to_string(), salvage_value(&text[*value_start..end]));
+    }
+    Some(out).filter(has_score)
+}
+
+/// About forty characters either side of where a parse failed, with the spot
+/// marked. serde's column counts bytes on its line.
+fn excerpt_at(text: &str, line: usize, column: usize) -> String {
+    let line_start: usize = text
+        .split_inclusive('\n')
+        .take(line.saturating_sub(1))
+        .map(str::len)
+        .sum();
+    let mut at = (line_start + column.saturating_sub(1)).min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let before: Vec<char> = text[..at].chars().rev().take(40).collect();
+    let before: String = before.into_iter().rev().collect();
+    let after: String = text[at..].chars().take(40).collect();
+    format!("…{before}【此处】{after}…")
 }
 
 /// Escape what makes a reply's strings invalid JSON: raw line breaks and other
@@ -1082,13 +1311,16 @@ fn closes_string(rest: &[char]) -> bool {
 ///
 /// A candidate that does not parse is tried once more through
 /// [`repair_json_strings`] before the scan moves on, so an answer with a stray
-/// quote in it still wins over a valid draft earlier in the reply.
+/// quote in it still wins over a valid draft earlier in the reply. When no
+/// candidate parses, [`salvage_fields`] reads the fields one by one. Field
+/// names go through [`canonical_field`] throughout.
 fn extract_analysis_json(content: &str) -> Result<RawAnalysis, String> {
     let trimmed = content.trim();
     let whole = serde_json::from_str::<serde_json::Value>(trimmed);
     if let Ok(serde_json::Value::Object(obj)) = &whole {
-        if obj.get("relevance_score").is_some_and(|v| !v.is_null()) {
-            return Ok(obj.clone());
+        let obj = canonicalize(obj.clone());
+        if has_score(&obj) {
+            return Ok(obj);
         }
     }
     for (i, _) in trimmed.rmatch_indices('{') {
@@ -1103,11 +1335,16 @@ fn extract_analysis_json(content: &str) -> Result<RawAnalysis, String> {
             }
         }
     }
+    if let Some(obj) = salvage_fields(trimmed) {
+        return Ok(obj);
+    }
     match whole {
         // Valid JSON without a score: `parse_score` says what is missing.
-        Ok(serde_json::Value::Object(obj)) => Ok(obj),
+        Ok(serde_json::Value::Object(obj)) => Ok(canonicalize(obj)),
         Ok(_) => Err("the reply is not a JSON object".to_string()),
-        Err(e) => Err(e.to_string()),
+        // Where it broke, not only how the reply began: the break is usually
+        // several hundred characters in, past any preview.
+        Err(e) => Err(format!("{e}\n出错位置附近：{}", excerpt_at(trimmed, e.line(), e.column()))),
     }
 }
 
@@ -3213,6 +3450,89 @@ mod tests {
         let r = parse_analysis_result(reply).unwrap();
         assert_eq!(r.relevance_reason, "称为\"X\"");
         assert_eq!(r.matched_topics, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn a_misspelt_field_name_is_read_as_the_field() {
+        // MiniMax-M3's reply for 2609.23529, verbatim but shortened: valid
+        // JSON, with the score under `relevence_score`. 22 papers of one run
+        // failed as "relevance_score must be a number".
+        let reply = r#"{"relevence_score": 1, "relevance_reason": "本文研究神经网络算子的分布外泛化能力，与所列主题均无直接关联。", "key_contributions": ["提出了一种结构保持框架"], "summary": "本文针对神经网络算子在分布偏移下可靠性难以评估的问题。", "matched_topics": []}"#;
+        let r = parse_analysis_result(reply).unwrap();
+        assert_eq!(r.relevance_score, 1.0);
+        assert!(r.relevance_reason.starts_with("本文研究"));
+
+        for (key, field) in [
+            ("relevance_score", Some("relevance_score")),
+            ("Relevance Score", Some("relevance_score")),
+            ("relevanceScore", Some("relevance_score")),
+            ("relevence_reason", Some("relevance_reason")),
+            ("key_contribution", Some("key_contributions")),
+            ("Summary", Some("summary")),
+            ("summery", Some("summary")),
+            ("matched topics", Some("matched_topics")),
+            ("score", Some("relevance_score")),
+            ("title", None),
+            ("", None),
+        ] {
+            assert_eq!(canonical_field(key), field, "{key}");
+        }
+        // No field is within reach of another's name.
+        for a in ANALYSIS_FIELDS {
+            for b in ANALYSIS_FIELDS {
+                if a != b {
+                    assert!(edit_distance(&normalize_key(a), &normalize_key(b)) > 2, "{a} / {b}");
+                }
+            }
+        }
+        // An exact name beats a misspelt duplicate, in either order.
+        let r = parse_analysis_result(
+            r#"{"relevence_score": 2, "relevance_score": 8, "relevance_reason": "r"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.relevance_score, 8.0);
+    }
+
+    #[test]
+    fn a_stray_bracket_after_the_summary_is_salvaged() {
+        // MiniMax-M3's reply for 2609.23880, verbatim but shortened: the
+        // summary string is closed with `"]`, as if it were a list. 18 papers
+        // of one run failed as "expected `,` or `}`".
+        let reply = r#"{"relevance_score": 1, "relevance_reason": "该论文专注于时间信息检索的重排序框架，与所列方向完全不相关。", "key_contributions": ["提出了一种轻量级重排序框架Q-TIE", "实验证明Q-TIE优于现有方法"], "summary": "本文提出了Q-TIE重排序框架。该框架轻量且易于集成到RAG系统中。"], "matched_topics": []}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(reply).is_err());
+        let r = parse_analysis_result(reply).unwrap();
+        assert_eq!(r.relevance_score, 1.0);
+        assert_eq!(r.summary.as_deref(), Some("本文提出了Q-TIE重排序框架。该框架轻量且易于集成到RAG系统中。"));
+        assert_eq!(r.key_contributions, vec!["提出了一种轻量级重排序框架Q-TIE", "实验证明Q-TIE优于现有方法"]);
+        assert!(r.matched_topics.is_empty());
+    }
+
+    #[test]
+    fn missing_commas_and_brackets_are_salvaged_field_by_field() {
+        // No `]` after the list, no comma before `summary`, a quote the
+        // repair would misread (`"A", "B"` inside the reason), a fence.
+        let reply = "```json\n{\"relevance_score\": 7, \"relevance_reason\": \"比较了\"A\", \"B\"两种组合泛化设定\", \"key_contributions\": [\"提出\"X\"基准\", \"分析了失败模式\", \"summary\": \"讨论组合泛化。\" \"matched_topics\": [\"Compositional Generalization\"]}\n```";
+        let r = parse_analysis_result(reply).unwrap();
+        assert_eq!(r.relevance_score, 7.0);
+        assert_eq!(r.relevance_reason, r#"比较了"A", "B"两种组合泛化设定"#);
+        assert_eq!(r.key_contributions, vec![r#"提出"X"基准"#, "分析了失败模式"]);
+        assert_eq!(r.summary.as_deref(), Some("讨论组合泛化。"));
+        assert_eq!(r.matched_topics, vec!["Compositional Generalization"]);
+
+        // Salvaging, the answer after a draft wins field by field.
+        let reply = r#"草稿 "relevance_score": 0, "relevance_reason": "占位" 最终：{"relevance_score": 9, "relevance_reason": "高度相关"]"#;
+        let r = parse_analysis_result(reply).unwrap();
+        assert_eq!((r.relevance_score, r.relevance_reason.as_str()), (9.0, "高度相关"));
+    }
+
+    #[test]
+    fn a_parse_failure_says_where_the_reply_broke() {
+        let head = "x".repeat(300);
+        let reply = format!(r#"{{"relevance_reason": "{head}" oops "#);
+        let err = parse_analysis_result(&reply).err().unwrap();
+        assert!(err.starts_with("Parse AI JSON"), "{err}");
+        assert!(err.contains("出错位置附近"), "{err}");
+        assert!(err.contains("【此处】oops"), "{err}");
     }
 
     #[test]

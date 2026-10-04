@@ -1,0 +1,41 @@
+#!/bin/sh
+# Refuses a commit whose staged changes contain a secret (API key, token, signing
+# key). Enabled by `npm install` (scripts/setup-git-hooks.js points core.hooksPath
+# here); rules live in .gitleaks.toml.
+#
+# A finding that is not a secret: put `gitleaks:allow` in a comment on that line,
+# or add the fingerprint gitleaks prints to .gitleaksignore. `git commit
+# --no-verify` skips every hook; the CI scan in .github/workflows/gitleaks.yml is
+# the backstop for that.
+
+# GUI git clients (Tower, GitHub Desktop, an IDE started from the Dock) hand hooks
+# a bare PATH without Homebrew's bin, so look in the usual places too.
+PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/go/bin:$HOME/.local/bin"
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+
+  ✖ 没有找到 gitleaks，这次提交已被拦下（否则就没人检查有没有把密钥提交进去）。
+
+    安装：  brew install gitleaks      （Windows: winget install gitleaks 或 scoop install gitleaks）
+    装好后重新提交即可。确实要跳过：git commit --no-verify（之后 CI 仍会扫描）。
+
+EOF
+  exit 1
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+if ! gitleaks git --pre-commit --staged --redact --no-banner --verbose .; then
+  cat >&2 <<'EOF'
+
+  ✖ 暂存的改动里发现了疑似密钥（上面是脱敏后的位置，密钥本身没有打印）。
+
+    · 真的是密钥：把它从文件里去掉（改读环境变量 / 应用内的密钥设置），重新 git add。
+      如果它已经出现在更早的提交里，说明它已经泄露，需要去服务商那边作废并重新生成。
+    · 不是密钥（测试数据、占位符）：在该行加注释 gitleaks:allow，
+      或把上面的 Fingerprint 追加到 .gitleaksignore。
+
+EOF
+  exit 1
+fi

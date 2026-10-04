@@ -88,6 +88,11 @@ export interface Highlight {
    *  resolution (last edit wins) and lets a re-edit beat an older delete. */
   updated_at?: string
   style?: 'highlight' | 'underline'
+  /** PDF only. `text` is kept exactly as captured, line breaks included, but a
+   *  highlight reads and exports as ONE paragraph (see utils/highlightText). `true`
+   *  opts out and keeps the original line breaks — for a list, code or an equation.
+   *  Absent = merged, so it is only ever written when the user asks for the breaks. */
+  keep_line_breaks?: boolean
   /** Ebook-only reflow-safe anchor (char offsets into the sanitized chapter DOM text). */
   start_offset?: number
   end_offset?: number
@@ -280,6 +285,13 @@ export interface AppSettings {
   sections_ai_model_id?: string
   sections_ai_prompt?: string
   auto_check_updates?: boolean
+  /** Read-aloud (朗读): the media provider and speech model, and their knob values. */
+  speech_provider_id?: string
+  speech_model_id?: string
+  /** Keyed by the selected model's `MediaField.key`; only that adapter reads it back. */
+  speech_options?: Record<string, unknown>
+  /** Leave literature citations ("[12]", "[Hinton et al., 2006]") out of the spoken text. Absent = on. */
+  speech_skip_citations?: boolean
 }
 
 // ── M4: Search ────────────────────────────────────────────────────────────────
@@ -426,6 +438,8 @@ export type ChatContentPart =
 export interface ExportedHighlight {
   /** PDF: 1-based page. Ebooks: 1-based chapter index. */
   page: number
+  /** Last page of a selection that crosses a page break (`page` is its first). */
+  pageEnd?: number
   text: string
   /** The comment attached to the highlight, if any. */
   note?: string
@@ -520,6 +534,11 @@ export interface MediaModelSpec {
   fileRequired?: boolean
   promptRequired: boolean
   promptPlaceholder?: string
+  /**
+   * The longest main text one request accepts, in characters. Absent = the adapter
+   * does not say. Read-aloud cuts the passage into chunks of at most this size.
+   */
+  maxPromptChars?: number
 }
 
 export interface MediaCapability {

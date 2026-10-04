@@ -694,25 +694,68 @@ pub async fn read_pdf_bytes(
 /// Rasterise one **1-based** page to a base64 PNG via the bundled PDFium engine.
 /// The viewer uses this only for PDFs whose figures use fonts pdf.js can't render
 /// (e.g. Type 3 fonts), where its own vector render drops the text — PDFium (the
-/// same engine the AI page-view uses) renders them faithfully. `dpi` should track
-/// the on-screen scale × devicePixelRatio so the raster stays crisp.
+/// same engine the AI page-view uses) renders them faithfully.
+///
+/// `width` / `height` are the page's on-screen box × devicePixelRatio, and the PNG
+/// comes back exactly that size so the reader can show it pixel for pixel (see
+/// `render::render_pdf_page_png_sized`). `dpi` is the older way to ask — any
+/// whole-number DPI misses the box slightly and the page is resampled soft — and
+/// is used only when no size is given.
 #[tauri::command]
 pub async fn render_page_png(
     slug: String,
     page: u32,
     dpi: u32,
+    width: Option<u32>,
+    height: Option<u32>,
     state: State<'_, LibraryRoot>,
 ) -> Result<String, String> {
     use base64::Engine as _;
     let root = get_root(&state)?;
     let pdf_path = metadata::find_pdf_in_dir(&root, &slug);
     let dpi = dpi.clamp(72, 400);
-    let png = tauri::async_runtime::spawn_blocking(move || {
-        crate::render::render_pdf_page_png(&pdf_path, page, dpi)
+    let png = tauri::async_runtime::spawn_blocking(move || match (width, height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => {
+            crate::render::render_pdf_page_png_sized(&pdf_path, page, w, h)
+        }
+        _ => crate::render::render_pdf_page_png(&pdf_path, page, dpi),
     })
     .await
     .map_err(|e| e.to_string())??;
     Ok(base64::engine::general_purpose::STANDARD.encode(png))
+}
+
+/// Same render as `render_page_png` at an exact pixel size, but the PNG goes back as
+/// raw bytes — a binary IPC response the front end receives as an `ArrayBuffer` —
+/// instead of a base64 string inside JSON, which cost a third more bytes to move
+/// plus an encode here and a decode there for every page. The pixels are identical.
+///
+/// `width` / `height` are required and must be non-zero. A request above
+/// `render::MAX_VIEW_PIXELS` comes back shrunk with its aspect ratio kept, so read
+/// the PNG's own dimensions if they matter.
+#[tauri::command]
+pub async fn render_page_image(
+    slug: String,
+    page: u32,
+    width: u32,
+    height: u32,
+    state: State<'_, LibraryRoot>,
+) -> Result<tauri::ipc::Response, String> {
+    if width == 0 || height == 0 {
+        return Err(format!("渲染尺寸必须大于 0（收到 {width}×{height}）"));
+    }
+    // `find_pdf_in_dir` already maps an invalid slug to a folder that does not
+    // exist; checking first just turns that into a plain error instead of a failed
+    // render (and a pointless poppler attempt).
+    crate::path_guard::validate_segment("paper slug", &slug)?;
+    let root = get_root(&state)?;
+    let pdf_path = metadata::find_pdf_in_dir(&root, &slug);
+    let png = tauri::async_runtime::spawn_blocking(move || {
+        crate::render::render_pdf_page_png_sized(&pdf_path, page, width, height)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(png))
 }
 
 // ── PDF import ────────────────────────────────────────────────────────────────

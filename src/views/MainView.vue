@@ -30,6 +30,7 @@ import AddSnippetModal from '../components/AddSnippetModal.vue'
 import UpdatePrompt from '../components/UpdatePrompt.vue'
 import RelatedPapersPopover from '../components/RelatedPapersPopover.vue'
 import CitationGraphModal from '../components/CitationGraphModal.vue'
+import SpeechHost from '../components/SpeechHost.vue'
 
 // Conditionally-rendered heavyweights (pdfjs / vue-flow / settings panels) are
 // code-split so the main window paints before any of them download.
@@ -1130,6 +1131,9 @@ watch(
 
     <!-- Global update-available prompt (auto checks fire even when settings is closed) -->
     <UpdatePrompt />
+
+    <!-- Read aloud: the floating mini-player and the "no speech model yet" prompt -->
+    <SpeechHost />
 
     <!-- Related-papers popover (opened from viewer toolbars and the list right-click menu) -->
     <RelatedPapersPopover />

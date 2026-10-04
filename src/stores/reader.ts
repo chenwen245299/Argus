@@ -525,37 +525,62 @@ export const useReaderStore = defineStore('reader', () => {
 
   // add/update/remove act on the active tab — only the visible viewer and the
   // sidebar (which mirror the active tab) ever mutate highlights.
-  function addHighlight(h: Highlight) {
+  //
+  // A selection across a page break is several records (see utils/highlightGroups),
+  // so every mutation has a batch form: ONE in-memory swap, ONE save, ONE shared
+  // timestamp. Looping the single-record versions would save N times and leave a
+  // half-applied group on disk (and synced to another machine) between the calls.
+  function addHighlights(list: Highlight[]) {
     const slug = activeSlug.value
-    if (!slug) return
-    setHighlights(slug, [...(highlightsBySlug.value[slug] ?? []), h])
+    if (!slug || list.length === 0) return
+    setHighlights(slug, [...(highlightsBySlug.value[slug] ?? []), ...list])
+    saveHighlights()
+  }
+
+  function addHighlight(h: Highlight) {
+    addHighlights([h])
+  }
+
+  function updateHighlights(
+    ids: readonly string[],
+    changes: Partial<Pick<Highlight, 'note' | 'color' | 'style' | 'keep_line_breaks' | 'start_offset' | 'end_offset'>>,
+  ) {
+    const slug = activeSlug.value
+    if (!slug || ids.length === 0) return
+    const target = new Set(ids)
+    // Stamp the edit time so a concurrent edit on another machine resolves
+    // last-writer-wins (and a re-edit can beat an older delete).
+    const edited = { ...changes, updated_at: new Date().toISOString() }
+    setHighlights(slug, (highlightsBySlug.value[slug] ?? []).map(h => target.has(h.id) ? { ...h, ...edited } : h))
     saveHighlights()
   }
 
   function updateHighlight(
     id: string,
-    changes: Partial<Pick<Highlight, 'note' | 'color' | 'style' | 'start_offset' | 'end_offset'>>,
+    changes: Partial<Pick<Highlight, 'note' | 'color' | 'style' | 'keep_line_breaks' | 'start_offset' | 'end_offset'>>,
   ) {
+    updateHighlights([id], changes)
+  }
+
+  function removeHighlights(ids: readonly string[]) {
     const slug = activeSlug.value
-    if (!slug) return
-    // Stamp the edit time so a concurrent edit on another machine resolves
-    // last-writer-wins (and a re-edit can beat an older delete).
-    const edited = { ...changes, updated_at: new Date().toISOString() }
-    setHighlights(slug, (highlightsBySlug.value[slug] ?? []).map(h => h.id === id ? { ...h, ...edited } : h))
+    if (!slug || ids.length === 0) return
+    const target = new Set(ids)
+    // Record a tombstone per id so the delete survives the cross-machine union merge.
+    const deleted_at = new Date().toISOString()
+    highlightTombstones.value = {
+      ...highlightTombstones.value,
+      [slug]: [
+        ...(highlightTombstones.value[slug] ?? []).filter(t => !target.has(t.id)),
+        ...ids.map((id): HighlightTombstone => ({ id, deleted_at })),
+      ],
+    }
+    setHighlights(slug, (highlightsBySlug.value[slug] ?? []).filter(h => !target.has(h.id)))
     saveHighlights()
   }
 
   function removeHighlight(id: string) {
-    const slug = activeSlug.value
-    if (!slug) return
-    // Record a tombstone so the delete survives the cross-machine union merge.
-    const tomb: HighlightTombstone = { id, deleted_at: new Date().toISOString() }
-    highlightTombstones.value = {
-      ...highlightTombstones.value,
-      [slug]: [...(highlightTombstones.value[slug] ?? []).filter(t => t.id !== id), tomb],
-    }
-    setHighlights(slug, (highlightsBySlug.value[slug] ?? []).filter(h => h.id !== id))
-    saveHighlights()
+    removeHighlights([id])
   }
 
   function jumpToHighlight(id: string) {
@@ -591,8 +616,11 @@ export const useReaderStore = defineStore('reader', () => {
     }
   }
 
-  async function persistReadingState(rs: ReadingState) {
-    const slug = activeSlug.value
+  // `slug` names whose position it is, and it is required on purpose. A viewer that is being
+  // backgrounded runs after the active tab already changed, so a default of "the active tab" would
+  // file its position under the tab being switched TO (EbookViewer did exactly that). Making the
+  // caller say whose position this is turns a forgotten argument into a type error.
+  async function persistReadingState(rs: ReadingState, slug: string) {
     if (!slug) return
     setReadingState(slug, rs)
     try {
@@ -647,8 +675,11 @@ export const useReaderStore = defineStore('reader', () => {
     setReadingState,
     saveHighlights,
     addHighlight,
+    addHighlights,
     updateHighlight,
+    updateHighlights,
     removeHighlight,
+    removeHighlights,
     jumpToHighlight,
     persistReadingState,
     reloadFromDisk,

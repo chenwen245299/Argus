@@ -10,6 +10,7 @@ import {
 } from '../../stores/translationHistory'
 import { useAiStore } from '../../stores/ai'
 import { useSettingsStore } from '../../stores/settings'
+import { estimateCostCny } from '../../utils/modelPricing'
 
 type View = 'current' | 'history'
 const view = ref<View>('current')
@@ -55,15 +56,11 @@ function formatCostCny(costUsd: number | null | undefined) {
   return fmtCny(cny)
 }
 
-// DeepSeek-style peak hours in Beijing time (UTC+8): 09:00–12:00 & 14:00–18:00.
-function isPeakHour(date: Date): boolean {
-  const minutes = ((date.getUTCHours() + 8) % 24) * 60 + date.getUTCMinutes()
-  const h = minutes / 60
-  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
-}
-
 // Estimated CNY cost for providers that don't return a cost (e.g. DeepSeek),
 // using the configured per-million prices. Returns null when unavailable.
+// Priced through `estimateCostCny` like every other cost in the app, at the time
+// the translation finished — a result produced at 11:55 must not turn into an
+// off-peak one because the tab was opened at 12:05.
 const estimatedCostCny = computed<number | null>(() => {
   const inTok = currentTranslation.inputTokens
   const outTok = currentTranslation.outputTokens
@@ -71,14 +68,17 @@ const estimatedCostCny = computed<number | null>(() => {
   const provider = ai.settings.providers.find(p => p.id === currentTranslation.providerId)
   const m = provider?.models.find(x => x.id === currentTranslation.modelId)
   if (!m || (m.input_price_per_million == null && m.output_price_per_million == null)) return null
-  const peak = !!m.peak_pricing && isPeakHour(new Date())
-  const inPrice = (peak && m.peak_input_price_per_million != null ? m.peak_input_price_per_million : m.input_price_per_million) ?? 0
-  const outPrice = (peak && m.peak_output_price_per_million != null ? m.peak_output_price_per_million : m.output_price_per_million) ?? 0
-  const cacheHit = currentTranslation.cacheHitTokens ?? 0
-  const cacheMiss = Math.max(0, inTok - cacheHit)
-  const cacheHitPrice = m.cache_hit_input_price_per_million != null ? m.cache_hit_input_price_per_million : inPrice
-  const cost = (cacheMiss / 1e6) * inPrice + (cacheHit / 1e6) * cacheHitPrice + (outTok / 1e6) * outPrice
-  return Number.isFinite(cost) && cost > 0 ? cost : null
+  // This estimate has only ever read the CNY per-million fields (a model priced in
+  // USD gets its cost from the backend instead), so mask the USD ones: the shared
+  // function would otherwise prefer them and change the number shown here.
+  const cnyPriced = { ...m, input_price_usd_per_million: undefined, output_price_usd_per_million: undefined }
+  const at = currentTranslation.finishedAt > 0 ? new Date(currentTranslation.finishedAt) : new Date()
+  const cost = estimateCostCny(
+    cnyPriced,
+    { inputTokens: inTok, outputTokens: outTok, cacheHitTokens: currentTranslation.cacheHitTokens, at },
+    usdToCnyRate.value,
+  )
+  return cost != null && cost > 0 ? cost : null
 })
 
 const hasUsage = computed(() =>

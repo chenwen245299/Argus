@@ -30,3 +30,14 @@ package-lock\ 2.json
 
 # macOS
 __MACOSX/
+
+# Secrets and key material (a second line of defence behind the gitleaks hooks —
+# see .gitleaks.toml). Argus's own key store lives in a library's .argus/ folder.
+*.pem
+*.p12
+*.pfx
+*.p8
+*.key
+.argus/
+api_keys.json
+.keymaster

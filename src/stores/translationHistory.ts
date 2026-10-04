@@ -71,6 +71,11 @@ export const currentTranslation = reactive({
   // Timings for a tok/s estimate
   startedAt: 0,
   endedAt: 0,
+  // Wall-clock time (epoch ms) the stream ended, 0 while it runs. `startedAt` /
+  // `endedAt` are performance.now() readings and cannot date a call; this does,
+  // so the cost estimate is priced at peak or off-peak for when the translation
+  // was produced, not for whenever the tab happens to be looked at.
+  finishedAt: 0,
 })
 
 // Signal MainView to switch to translations tab
@@ -106,6 +111,7 @@ export function startTranslation(sourceText: string, model?: TranslationModel) {
   currentTranslation.costUsd = undefined
   currentTranslation.startedAt = performance.now()
   currentTranslation.endedAt = 0
+  currentTranslation.finishedAt = 0
   switchToTranslationsTab.value = true
 }
 
@@ -123,14 +129,16 @@ export function applyTranslationUsage(usage: StreamUsagePayload) {
 }
 
 export function finishTranslation() {
+  const finishedAt = Date.now()
   currentTranslation.loading = false
   currentTranslation.endedAt = performance.now()
+  currentTranslation.finishedAt = finishedAt
   if (!currentTranslation.result) return
   const entry: TranslationEntry = {
     id: crypto.randomUUID(),
     sourceText: currentTranslation.sourceText,
     result: currentTranslation.result,
-    createdAt: new Date().toISOString(),
+    createdAt: new Date(finishedAt).toISOString(),
     providerName: currentTranslation.providerName,
     modelName: currentTranslation.modelName,
     inputTokens: currentTranslation.inputTokens,
@@ -149,6 +157,7 @@ export function finishTranslation() {
 export function failTranslation(error: string) {
   currentTranslation.loading = false
   currentTranslation.endedAt = performance.now()
+  currentTranslation.finishedAt = Date.now()
   currentTranslation.error = error
 }
 

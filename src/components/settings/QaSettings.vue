@@ -7,7 +7,8 @@
  * (the embedding model and vector store behind the 向量图谱; chat does not read
  * it), the per-task analysis models, and the arXiv crawler. They used to be four
  * separate top-level sections, which made settings read as a list of unrelated
- * features rather than one place where the AI is configured.
+ * features rather than one place where the AI is configured. 朗读 (read aloud) is
+ * the newest sub-tab: which speech model voices a PDF selection.
  */
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -15,18 +16,20 @@ import AgentSettings from './AgentSettings.vue'
 import RagSettings from './RagSettings.vue'
 import ExtractionSettings from './ExtractionSettings.vue'
 import ArxivSettings from './ArxivSettings.vue'
+import SpeechSettings from './SpeechSettings.vue'
 
 const props = defineProps<{ initialTab?: string }>()
 const { t } = useI18n()
 
-type Tab = 'agent' | 'rag' | 'extraction' | 'arxiv'
-const TABS: Tab[] = ['agent', 'rag', 'extraction', 'arxiv']
+type Tab = 'agent' | 'rag' | 'extraction' | 'arxiv' | 'speech'
+const TABS: Tab[] = ['agent', 'rag', 'extraction', 'arxiv', 'speech']
 
 const tabs: { id: Tab; label: string }[] = [
   { id: 'agent', label: 'qaSettings.agentTab' },
   { id: 'rag', label: 'qaSettings.ragTab' },
   { id: 'extraction', label: 'qaSettings.extractionTab' },
   { id: 'arxiv', label: 'qaSettings.arxivTab' },
+  { id: 'speech', label: 'qaSettings.speechTab' },
 ]
 
 function asTab(value: string | undefined): Tab | null {
@@ -48,6 +51,7 @@ const DESCRIPTIONS: Record<Tab, string> = {
   rag: 'ragSettings.desc',
   extraction: 'settings.extractionDesc',
   arxiv: 'arxivSettings.desc',
+  speech: 'speech.settingsDesc',
 }
 const description = computed(() => t(DESCRIPTIONS[activeTab.value]))
 </script>
@@ -75,6 +79,7 @@ const description = computed(() => t(DESCRIPTIONS[activeTab.value]))
       <AgentSettings v-if="activeTab === 'agent'" />
       <RagSettings v-else-if="activeTab === 'rag'" />
       <ExtractionSettings v-else-if="activeTab === 'extraction'" />
+      <SpeechSettings v-else-if="activeTab === 'speech'" />
       <ArxivSettings v-else />
     </div>
   </div>

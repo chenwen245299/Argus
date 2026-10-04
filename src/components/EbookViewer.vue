@@ -12,11 +12,13 @@ import { invoke } from '@tauri-apps/api/core'
 import DOMPurify from 'dompurify'
 import { runTranslation, triggerAskAi } from '../stores/translationHistory'
 import { openAddSnippetModal } from '../stores/snippetLibrary'
+import { useSpeechStore } from '../stores/speech'
 import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import { renderMarkdown } from '../utils/renderMarkdown'
 import { notePopupStyle, clampNotePopupPos, startNotePopupResize, forgetNotePopupSize } from '../utils/notePopup'
+import { popupShift } from '../utils/popupFit'
 import type { EbookManifest, Highlight } from '../types'
 
 // One instance per open ebook tab; `slug` never changes for an instance.
@@ -24,6 +26,7 @@ const props = defineProps<{ slug: string }>()
 
 const reader = useReaderStore()
 const library = useLibraryStore()
+const speech = useSpeechStore()
 const { t } = useI18n()
 
 const isActiveTab = computed(() => reader.activeSlug === props.slug)
@@ -175,6 +178,33 @@ const hlNoteEditing = ref(false)
 const noteTextareaRef = ref<HTMLTextAreaElement | null>(null)
 const hlColorPopup = ref<{ x: number; y: number; hlId: string } | null>(null)
 
+// The selection toolbar is centred on the mouse position, but its width varies with the UI
+// language and the buttons present, so a selection ending near a window edge pushes part of it
+// out of view. It is measured once laid out and pulled back inside, on open and when its own size
+// changes - never on scroll, where it follows its anchor instead (repositionAnchoredPopups).
+const selPopupRef = ref<HTMLElement | null>(null)
+let selPopupObserver: ResizeObserver | null = null
+
+function fitSelectionPopup() {
+  const el = selPopupRef.value
+  const open = selectionPopup.value
+  if (!el || !open) return
+  const { dx, dy } = popupShift(
+    el.getBoundingClientRect(),
+    { width: window.innerWidth, height: window.innerHeight },
+    // 12 px = the gap between the cursor and the toolbar (see onWindowMouseUp)
+    { margin: 8, flipGap: 12 },
+  )
+  if (dx || dy) selectionPopup.value = { ...open, x: open.x + dx, y: open.y + dy }
+}
+
+watch(selPopupRef, (el) => {
+  selPopupObserver?.disconnect()
+  if (!el || typeof ResizeObserver === 'undefined') return
+  selPopupObserver ??= new ResizeObserver(() => fitSelectionPopup())
+  selPopupObserver.observe(el)
+}, { flush: 'post' })
+
 // Notes are authored as markdown + $TeX$ and rendered on the view side, matching
 // the PDF reader and the notes tab.
 const hlNoteHtml = computed(() => renderMarkdown(hlNoteText.value))
@@ -238,6 +268,7 @@ watch(isActiveTab, (active) => {
 onUnmounted(() => {
   removeGlobalListeners()
   observer?.disconnect()
+  selPopupObserver?.disconnect()
   if (progressDebounce) clearTimeout(progressDebounce)
   if (resizeDebounce) clearTimeout(resizeDebounce)
   for (const url of blobUrls.values()) URL.revokeObjectURL(url)
@@ -695,6 +726,9 @@ function onWindowMouseUp(e: MouseEvent) {
     startOffset,
     endOffset,
   }
+  // An already-open popup keeps its element and size, so the observer would not fire for the
+  // new position: fit it explicitly.
+  void nextTick(fitSelectionPopup)
 }
 
 const CONTEXT_CHARS = 32
@@ -734,6 +768,20 @@ function askAiWithSelection() {
   const { text } = selectionPopup.value
   selectionPopup.value = null
   triggerAskAi(text)
+}
+
+/** The popup's text is the one being read right now: the button then reads 停止朗读. */
+const readingSelection = computed(() =>
+  !!selectionPopup.value && speech.isReadingText(selectionPopup.value.text, 'ebook'))
+
+// Read aloud (朗读). `speech.read` must run in the click's own call stack — the audio
+// element is unlocked there, before any network wait (see stores/speech.ts) — so nothing
+// here awaits ahead of it. Not configured yet: it opens the "set up a voice" prompt instead.
+function readAloudSelection(source: 'pdf' | 'ebook') {
+  if (!selectionPopup.value) return
+  const { text } = selectionPopup.value
+  selectionPopup.value = null
+  void speech.read(text, { source })
 }
 
 const SNIPPET_HIGHLIGHT_COLOR = '#CE93D8'
@@ -1211,11 +1259,13 @@ function schedulePageMetricsUpdate() {
 function flushReadingState() {
   const pos = currentPosition()
   if (!pos) return
+  // This viewer's own slug: flush also runs when the tab is being backgrounded, and by then the
+  // active tab is already the one being switched to.
   reader.persistReadingState({
     page: pos.chapter,
     scroll_ratio: pos.ratio,
     updated_at: new Date().toISOString(),
-  })
+  }, props.slug)
 }
 
 async function restorePosition() {
@@ -1498,6 +1548,7 @@ defineExpose({ closeToList: handleBack })
     <!-- Selection popup -->
     <div
       v-if="selectionPopup"
+      ref="selPopupRef"
       class="sel-popup"
       :style="{ left: `${selectionPopup.x}px`, top: `${selectionPopup.y}px` }"
     >
@@ -1530,6 +1581,16 @@ defineExpose({ closeToList: handleBack })
       <button class="sel-translate-btn" @click="translateSelection">
         <Icon icon="argus:translate" width="13" height="13" />
         <span class="sel-translate-label">{{ t('pdf.translate') }}</span>
+      </button>
+      <div class="sel-sep" />
+      <button
+        class="sel-translate-btn"
+        :class="{ active: readingSelection }"
+        @click="readAloudSelection('ebook')"
+        :title="readingSelection ? t('pdf.readAloudStop') : t('pdf.readAloud')"
+      >
+        <Icon :icon="readingSelection ? 'fluent:speaker-off-24-regular' : 'fluent:speaker-2-24-regular'" width="13" height="13" />
+        <span class="sel-translate-label">{{ readingSelection ? t('pdf.readAloudStop') : t('pdf.readAloud') }}</span>
       </button>
       <div class="sel-sep" />
       <button class="sel-translate-btn" @click="askAiWithSelection" :title="t('pdf.askAi')">
@@ -2106,6 +2167,11 @@ defineExpose({ closeToList: handleBack })
   box-shadow: var(--shadow-lg);
   padding: 6px 8px;
   transform: translateX(-50%);
+  /* Natural width whatever `left` is (a fixed box is otherwise sized to the room to its right),
+     and wrapping rather than running off the window when it is wider than the window. */
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  flex-wrap: wrap;
 }
 .sel-colors { display: flex; gap: 5px; }
 .sel-color-dot {
@@ -2133,7 +2199,7 @@ defineExpose({ closeToList: handleBack })
   background: var(--bg-secondary);
   color: var(--text-primary);
 }
-.sel-style-btn.active { color: var(--accent); }
+.sel-style-btn.active, .sel-translate-btn.active { color: var(--accent); }
 .sel-translate-label { white-space: nowrap; }
 
 /* Resizable note window — dragging is driven by the .hl-note-resizer grabber

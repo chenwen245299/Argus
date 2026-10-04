@@ -71,3 +71,42 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+
+# Dev builds only — and only the crates a PDF page's PNG passes through. A dev
+# build compiles every dependency at opt-level 0, and there the reader's PNG
+# encode of an 8 MP page (190 % zoom on a 2x display) took about 2 s, or 0.5 s
+# with the encoder settings render.rs now uses. With these crates optimised it is
+# about 90 ms; a release build does it in 7 ms. Output is bit-for-bit the same
+# either way. Measured on that page, encode only:
+#   no override                                              500 ms
+#   opt-level = 3                                            128 ms
+#   + debug-assertions / overflow-checks off (as release)     87 ms
+# codegen-units = 1 added nothing, and leaving out the two checksum crates below
+# costs 65 ms. The first dev build after this recompiles these crates and what
+# links them (tauri ...), about half a minute once. A "*" override would
+# optimise every dependency (tauri, reqwest, rmcp ...) and slow every clean dev
+# build for no benefit, so the crates are named: image + png (encoder, filters),
+# fdeflate + simd-adler32 (the fast DEFLATE the encoder uses), crc32fast (chunk
+# checksums). pdfium-render is left out: its own part (the bitmap copy) is under
+# a millisecond even at opt-level 0. The rest of the gap to release is generic
+# encoder code that is compiled into `argus` itself, at argus's own opt-level.
+[profile.dev.package.image]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.png]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.fdeflate]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.simd-adler32]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.crc32fast]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false

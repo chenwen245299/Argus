@@ -269,8 +269,11 @@ pub fn is_throttle_code(code: u32) -> bool {
 //
 //   * A Token Plan subscription key is limited by how much runs at once: the
 //     plan's FAQ puts peak-hour capacity at "约 3-4 个 Agent" on Plus, 4–5 on
-//     Max and 6–7 on Ultra, and says a throttle "通常约 1 分钟恢复". Four in
-//     flight fits even Plus.
+//     Max and 6–7 on Ultra, and says a throttle "通常约 1 分钟恢复". Three in
+//     flight is the low end of Plus. In practice four was the edge: with a
+//     batch holding four, one more request on the same key — off-peak — was
+//     answered `2062` about half the time, so the user's own chat would be
+//     throttled for as long as the batch ran.
 //   * Every key is held to the model's requests per minute — 200 for M3, 500
 //     for the M2 line. Ten requests in flight at about three seconds each is
 //     already 200 a minute on M3.
@@ -278,8 +281,9 @@ pub fn is_throttle_code(code: u32) -> bool {
 // References: <https://platform.minimax.cn/docs/token-plan/faq>,
 // <https://platform.minimax.io/docs/guides/rate-limits>
 
-/// Most requests a batch keeps in flight on a Token Plan key.
-pub const PLAN_MAX_IN_FLIGHT: usize = 4;
+/// Most requests a batch keeps in flight on a Token Plan key, leaving one for
+/// whatever else the user does with it meanwhile.
+pub const PLAN_MAX_IN_FLIGHT: usize = 3;
 
 /// A Token Plan subscription key (`sk-cp-…`), as opposed to a pay-as-you-go
 /// one. MiniMax keeps the two apart; neither works in the other's place.

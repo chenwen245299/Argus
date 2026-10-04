@@ -27,6 +27,43 @@
 //! `<audio>` can show directly and `write_bytes_to_file` can save), a remote URL
 //! the provider hosts, or plain text — transcription is a media task whose output
 //! is words. One task can produce several.
+//!
+//! ## How to add a provider
+//!
+//! Adapters today: [`crate::stepfun_media`] (every kind) and
+//! [`crate::minimax_media`] (speech). The checklist, in order:
+//!
+//!  1. **Adapter file** `<provider>_media.rs`, declared in `lib.rs` next to its
+//!     chat module. It exposes `capabilities() -> Vec<MediaCapability>` and
+//!     `async fn run(provider, api_key, req) -> Result<MediaResult, String>`.
+//!  2. **Describe, don't hard-code.** Each model is a [`MediaModelSpec`] and each
+//!     knob a [`MediaField`] (`select` / `number` / `Toggle` / `Text`) whose `key`
+//!     is the name `run` reads back with [`opt_str`] / [`opt_f64`] / [`opt_bool`].
+//!     A field's `default` must be what `run` does when the key is absent — the
+//!     settings form seeds from it, but a request may also arrive with no options
+//!     at all (read-aloud before the form was ever touched). A select's default
+//!     must be one of its options. Offer a knob only for the models that accept it.
+//!  3. **Declare [`MediaModelSpec::max_prompt_chars`]** — the longest main text one
+//!     request accepts, in characters. The read-aloud player splits what it reads
+//!     by it, so every speech model must declare it (a test enforces that).
+//!     Enforce the same number in `run` with a message that says the count, so an
+//!     over-long request fails before it is billed.
+//!  4. **Wire the dispatch**: one `is_<provider>` arm in [`capabilities`] and one
+//!     in [`run`] below. Detection is by `kind` or base URL, like the chat side.
+//!  5. **Map errors through [`crate::llm::friendly_error`]** for HTTP failures. A
+//!     provider that reports failures inside a 200 body (MiniMax's `base_resp`)
+//!     must turn them into a message that still ends in the vendor code in
+//!     parentheses, which `llm::classify_error` reads. Never put the API key in
+//!     an error, a log line or an artifact.
+//!  6. **Tests**: the request body for several option combinations, the response
+//!     parser on a canned body, and one row in the `adapters()` helper of this
+//!     file's test module, so the shared form rules (`adapters_declare_a_consistent_form`
+//!     and friends) cover the new adapter too.
+//!
+//! The frontend then needs nothing: the studio form is generated from the
+//! description, and 设置 → AI 随航 → 朗读 lists every speech model of every
+//! provider that has an adapter and an API key, rendering its knobs the same way.
+//! Synthesis goes through `run_media_task` with `kind: "speech"`.
 
 use serde::{Deserialize, Serialize};
 
@@ -173,6 +210,17 @@ pub struct MediaModelSpec {
     /// Placeholder for the main text box.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_placeholder: Option<String>,
+    /// The longest main text (`MediaRequest::prompt`) one request accepts,
+    /// counted in characters rather than bytes. `None` means the adapter does not
+    /// declare one.
+    ///
+    /// The read-aloud player cuts what it reads into chunks by this number, so a
+    /// speech model needs it. It is the provider's *hard* limit, which is not
+    /// always the comfortable one — MiniMax accepts nearly 10 000 characters but
+    /// answers a request that long slowly — so the player is free to choose
+    /// smaller chunks, never larger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_prompt_chars: Option<u32>,
 }
 
 /// What one provider can do, for one kind of task.
@@ -251,6 +299,9 @@ pub fn capabilities(provider: &AiProvider) -> Vec<MediaCapability> {
     if crate::stepfun::is_stepfun(provider) {
         return crate::stepfun_media::capabilities();
     }
+    if crate::minimax::is_minimax(provider) {
+        return crate::minimax_media::capabilities();
+    }
     Vec::new()
 }
 
@@ -261,6 +312,9 @@ pub async fn run(
 ) -> Result<MediaResult, String> {
     if crate::stepfun::is_stepfun(provider) {
         return crate::stepfun_media::run(provider, api_key, req).await;
+    }
+    if crate::minimax::is_minimax(provider) {
+        return crate::minimax_media::run(provider, api_key, req).await;
     }
     Err(format!("{} 暂不支持这类媒体生成。", provider.name))
 }
@@ -434,5 +488,221 @@ mod tests {
         assert_eq!(ext_for("audio/mpeg"), "mp3");
         assert_eq!(ext_for("audio/wav"), "wav");
         assert_eq!(ext_for("application/x-unheard-of"), "bin");
+    }
+
+    // ── Dispatch and the rules every adapter's form must follow ──────────────
+
+    fn provider(name: &str, kind: &str, base_url: &str) -> AiProvider {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("id-{kind}"), "name": name, "kind": kind,
+            "base_url": base_url, "created_at": ""
+        }))
+        .unwrap()
+    }
+
+    /// One row per adapter. **Add the new provider here** (step 6 of "How to add
+    /// a provider"): every test below then holds it to the same form rules.
+    fn adapters() -> Vec<AiProvider> {
+        vec![
+            provider("StepFun", "stepfun", "https://api.stepfun.com/v1"),
+            provider("MiniMax", "minimax", "https://api.minimax.cn/v1"),
+        ]
+    }
+
+    fn speech_models(p: &AiProvider) -> Vec<MediaModelSpec> {
+        capabilities(p)
+            .into_iter()
+            .filter(|c| c.kind == MediaKind::Speech)
+            .flat_map(|c| c.models)
+            .collect()
+    }
+
+    #[test]
+    fn the_right_adapter_answers_for_each_provider() {
+        let step = capabilities(&provider("StepFun", "stepfun", "https://api.stepfun.com/v1"));
+        let mini = capabilities(&provider("MiniMax", "minimax", "https://api.minimax.cn/v1"));
+        // StepFun does all six kinds; MiniMax is speech only.
+        assert_eq!(step.len(), 6);
+        assert_eq!(mini.len(), 1);
+        assert_eq!(mini[0].kind, MediaKind::Speech);
+        let ids = |caps: &[MediaCapability]| -> Vec<String> {
+            caps.iter()
+                .filter(|c| c.kind == MediaKind::Speech)
+                .flat_map(|c| c.models.iter().map(|m| m.id.clone()))
+                .collect()
+        };
+        assert!(ids(&step).iter().all(|id| !id.starts_with("speech-")));
+        assert!(ids(&mini).iter().all(|id| id.starts_with("speech-")));
+
+        // Detected by base URL as well as by kind, like the chat side: a custom
+        // provider that points at MiniMax is MiniMax.
+        let by_url = capabilities(&provider("我的", "openai_compatible", "https://api.minimaxi.com/v1"));
+        assert_eq!(by_url.len(), 1);
+        let by_url = capabilities(&provider("我的", "openai_compatible", "https://api.stepfun.com/v1"));
+        assert_eq!(by_url.len(), 6);
+    }
+
+    #[test]
+    fn a_provider_with_no_adapter_offers_nothing() {
+        for p in [
+            provider("DeepSeek", "openai_compatible", "https://api.deepseek.com/v1"),
+            provider("Claude", "anthropic", "https://api.anthropic.com"),
+            provider("Ollama", "openai_compatible", "http://localhost:11434/v1"),
+        ] {
+            assert!(capabilities(&p).is_empty(), "{}", p.name);
+        }
+    }
+
+    /// `run` must reach the same adapter `capabilities` did. Without a network:
+    /// an over-long text is refused by the adapter itself, and each adapter names
+    /// its own limit in the refusal.
+    #[tokio::test]
+    async fn run_reaches_the_adapter_that_listed_the_model() {
+        let long = "x".repeat(20_000);
+        let ask = |p: &AiProvider, model: &str| {
+            let r = MediaRequest {
+                provider_id: p.id.clone(),
+                kind: MediaKind::Speech,
+                model: model.into(),
+                prompt: long.clone(),
+                inputs: vec![],
+                options: Default::default(),
+            };
+            let p = p.clone();
+            async move { run(&p, "k", &r).await }
+        };
+
+        let step = provider("StepFun", "stepfun", "https://api.stepfun.com/v1");
+        let err = ask(&step, "step-tts-mini").await.unwrap_err();
+        assert!(err.contains("1000"), "{err}");
+
+        let mini = provider("MiniMax", "minimax", "https://api.minimax.cn/v1");
+        let err = ask(&mini, "speech-2.8-turbo").await.unwrap_err();
+        assert!(err.contains("9999"), "{err}");
+
+        // No adapter: a clear refusal that names the provider.
+        let other = provider("DeepSeek", "openai_compatible", "https://api.deepseek.com/v1");
+        let err = ask(&other, "deepseek-chat").await.unwrap_err();
+        assert!(err.contains("DeepSeek") && err.contains("暂不支持"), "{err}");
+    }
+
+    /// The studio and the read-aloud settings both render a form from this
+    /// description with no knowledge of any provider, so a malformed field is not
+    /// a compile error anywhere — it is a blank or broken control. These are the
+    /// rules that keep it from happening.
+    #[test]
+    fn adapters_declare_a_consistent_form() {
+        for p in adapters() {
+            let caps = capabilities(&p);
+            assert!(!caps.is_empty(), "{} lists nothing", p.name);
+            for cap in &caps {
+                assert!(!cap.label.is_empty());
+                assert!(!cap.models.is_empty(), "{} {:?}: no models", p.name, cap.kind);
+                for m in &cap.models {
+                    let who = format!("{} {:?} {}", p.name, cap.kind, m.id);
+                    assert!(!m.id.trim().is_empty() && !m.display_name.is_empty(), "{who}");
+
+                    let mut keys = std::collections::BTreeSet::new();
+                    for f in &m.fields {
+                        assert!(!f.key.is_empty() && !f.label.is_empty(), "{who}: {f:?}");
+                        assert!(keys.insert(f.key.clone()), "{who}: duplicate field {}", f.key);
+                        match f.kind {
+                            FieldKind::Select => {
+                                assert!(!f.options.is_empty(), "{who}: select {} has no options", f.key);
+                                let mut values = std::collections::BTreeSet::new();
+                                for o in &f.options {
+                                    assert!(!o.label.is_empty(), "{who}: {} option {:?}", f.key, o.value);
+                                    assert!(values.insert(o.value.clone()), "{who}: {} repeats {:?}", f.key, o.value);
+                                }
+                                // A default that is not an option renders as a
+                                // select with nothing selected.
+                                if let Some(d) = &f.default {
+                                    let d = d.as_str().unwrap_or_default();
+                                    assert!(values.contains(d), "{who}: {} default {d:?} not in options", f.key);
+                                }
+                            }
+                            FieldKind::Number => {
+                                let (lo, hi) = (f.min.unwrap(), f.max.unwrap());
+                                assert!(lo < hi, "{who}: {} range {lo}..{hi}", f.key);
+                                assert!(f.step.unwrap() > 0.0, "{who}: {} step", f.key);
+                                if let Some(d) = f.default.as_ref().and_then(|d| d.as_f64()) {
+                                    assert!((lo..=hi).contains(&d), "{who}: {} default {d} outside {lo}..{hi}", f.key);
+                                }
+                            }
+                            _ => assert!(f.options.is_empty(), "{who}: {} is not a select", f.key),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The read-aloud player chunks by this number; a speech model without one
+    /// would be sent whatever the player guessed.
+    #[test]
+    fn every_speech_model_declares_how_much_text_one_request_takes() {
+        for p in adapters() {
+            let models = speech_models(&p);
+            assert!(!models.is_empty(), "{} has no speech model", p.name);
+            for m in &models {
+                let n = m.max_prompt_chars.unwrap_or(0);
+                assert!(n >= 100, "{} {}: max_prompt_chars {:?}", p.name, m.id, m.max_prompt_chars);
+                assert!(m.prompt_required, "{} {}: speech without text", p.name, m.id);
+                assert!(m.accepts.is_empty() && !m.file_required);
+            }
+        }
+        // Where a limit was already stated in a placeholder, the two agree.
+        let step = speech_models(&provider("StepFun", "stepfun", "https://api.stepfun.com/v1"));
+        assert!(step.iter().all(|m| m.max_prompt_chars == Some(1000)));
+        let mini = speech_models(&provider("MiniMax", "minimax", "https://api.minimax.cn/v1"));
+        assert!(mini.iter().all(|m| m.max_prompt_chars == Some(9999)));
+    }
+
+    /// The field is optional in both directions on the wire: absent when an
+    /// adapter does not declare one, camelCase when it does.
+    #[test]
+    fn max_prompt_chars_travels_as_an_optional_camel_case_key() {
+        let spec = |n: Option<u32>| MediaModelSpec {
+            id: "m".into(),
+            display_name: "M".into(),
+            note: None,
+            fields: vec![],
+            accepts: vec![],
+            file_required: false,
+            prompt_required: true,
+            prompt_placeholder: None,
+            max_prompt_chars: n,
+        };
+        let with = serde_json::to_value(spec(Some(1000))).unwrap();
+        assert_eq!(with["maxPromptChars"], 1000);
+        let without = serde_json::to_value(spec(None)).unwrap();
+        assert!(without.get("maxPromptChars").is_none());
+
+        // And an older description without the key still parses.
+        let old: MediaModelSpec = serde_json::from_value(serde_json::json!({
+            "id": "m", "displayName": "M", "promptRequired": true
+        }))
+        .unwrap();
+        assert_eq!(old.max_prompt_chars, None);
+    }
+
+    /// Nothing an adapter offers may be a format a player cannot open — the one
+    /// rule about *values* that is the same for every provider.
+    #[test]
+    fn no_adapter_offers_headerless_pcm_as_an_output() {
+        for p in adapters() {
+            for m in speech_models(&p) {
+                for f in &m.fields {
+                    for o in &f.options {
+                        let v = o.value.to_lowercase();
+                        assert!(
+                            !(f.key.contains("format") && (v == "pcm" || v.starts_with("pcmu"))),
+                            "{} {}: {} offers {}",
+                            p.name, m.id, f.key, o.value
+                        );
+                    }
+                }
+            }
+        }
     }
 }

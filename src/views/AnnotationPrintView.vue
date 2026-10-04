@@ -59,13 +59,16 @@ function isEmpty(p: ExportedPaper) {
   return p.highlights.length === 0 && filledNotes(p).length === 0
 }
 
-/** Group a paper's highlights by page, preserving the backend's ordering. */
+/** Group a paper's highlights by page, preserving the backend's ordering. A
+ *  selection that crosses a page break arrives once, with `pageEnd`, and gets a
+ *  page-range heading of its own rather than being listed under each page. */
 function byPage(p: ExportedPaper) {
-  const groups: { page: number; items: ExportedPaper['highlights'] }[] = []
+  const groups: { page: number; pageEnd: number; items: ExportedPaper['highlights'] }[] = []
   for (const h of p.highlights) {
+    const pageEnd = h.pageEnd ?? h.page
     const last = groups[groups.length - 1]
-    if (last && last.page === h.page) last.items.push(h)
-    else groups.push({ page: h.page, items: [h] })
+    if (last && last.page === h.page && last.pageEnd === pageEnd) last.items.push(h)
+    else groups.push({ page: h.page, pageEnd, items: [h] })
   }
   return groups
 }
@@ -152,8 +155,10 @@ onMounted(async () => {
 
           <template v-if="p.highlights.length">
             <h3>{{ t('annotationExport.highlights', { n: p.highlights.length }) }}</h3>
-            <div v-for="g in byPage(p)" :key="g.page" class="ap-page-group">
-              <div class="ap-page-label">{{ t('annotationExport.page', { n: g.page }) }}</div>
+            <div v-for="g in byPage(p)" :key="`${g.page}-${g.pageEnd}`" class="ap-page-group">
+              <div class="ap-page-label">{{ g.pageEnd > g.page
+                ? t('annotationExport.pageRange', { from: g.page, to: g.pageEnd })
+                : t('annotationExport.page', { n: g.page }) }}</div>
               <div v-for="(h, hi) in g.items" :key="hi" class="ap-hl">
                 <!-- The user's own highlight colour, as a left rule: it survives
                      printing where a background wash usually does not. -->
@@ -271,6 +276,11 @@ onMounted(async () => {
   margin: 5px 0 0 12px;
   font-size: 13px;
   color: var(--text-secondary, #4b5563);
+  /* A cross-page highlight whose halves carry different notes arrives as
+     "first\n\nsecond"; without this the blank line collapses and they read as one
+     run-on sentence. The quote above does the same. */
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .ap-note { margin-bottom: 14px; }
 /* The note's own title. Needs its own class because the `:deep` rules below

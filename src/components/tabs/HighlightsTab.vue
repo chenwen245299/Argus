@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { useReaderStore } from '../../stores/reader'
 import { useLibraryStore } from '../../stores/library'
 import { renderMarkdown } from '../../utils/renderMarkdown'
 import { isEbookFileType } from '../../types'
+import { groupHighlights, groupAppearance, type HighlightGroup } from '../../utils/highlightGroups'
 
 const { t } = useI18n()
 const reader = useReaderStore()
@@ -22,39 +23,73 @@ const isEbook = computed(() => {
   return isEbookFileType(tab?.fileType ?? library.papers.find(p => p.slug === slug)?.file_type)
 })
 
-const sortedHighlights = computed(() => {
-  return [...reader.highlights].sort((a, b) => {
+// One row per highlight the user made. A selection across a page break is stored
+// as a record per page, so rows are groups of records — see utils/highlightGroups.
+const sortedHighlights = computed<HighlightGroup[]>(() => {
+  return groupHighlights(reader.highlights).sort((a, b) => {
     if (a.page !== b.page) return a.page - b.page
-    return (a.rects[0]?.y ?? 0) - (b.rects[0]?.y ?? 0)
+    return (a.members[0].rects[0]?.y ?? 0) - (b.members[0].rects[0]?.y ?? 0)
   })
 })
 
-function jumpTo(id: string) {
-  reader.jumpToHighlight(id)
+// A PDF has only printed lines, so a selection arrives with a break at every wrap and
+// a highlight is shown (and exported) as one merged paragraph. This is the opt-out for
+// text whose line structure matters — a list, code, an equation. It is a per-highlight
+// flag, written only when set; clearing it removes the key again.
+function toggleLineBreaks(g: HighlightGroup) {
+  reader.updateHighlights(g.ids, { ...groupAppearance(g), keep_line_breaks: g.keepLineBreaks ? undefined : true })
 }
 
-function deleteHighlight(id: string) {
-  reader.removeHighlight(id)
+function pageLabel(g: HighlightGroup): string {
+  return g.pageEnd > g.page ? `p.${g.page}–${g.pageEnd}` : `p.${g.page}`
+}
+
+// Jump by the canonical member's real id — never a synthetic key, or the viewer's
+// scrollToHighlightId watcher would be left holding an id it cannot find.
+function jumpTo(g: HighlightGroup) {
+  reader.jumpToHighlight(g.id)
+}
+
+// Every edit goes to ALL records of the highlight in one save. Touching only the
+// clicked half would leave the twin with the old note/colour, and the merge's
+// last-edit-wins would then flip the row back.
+function deleteHighlight(g: HighlightGroup) {
+  reader.removeHighlights(g.ids)
 }
 
 const editingNoteId = ref<string | null>(null)
+// Every record of the row being edited, so the editor can follow its row when the
+// canonical id changes under it (see the watch below).
+let editingIds: string[] = []
 const editingNoteValue = ref('')
 
-function startEditNote(id: string) {
-  const hl = reader.highlights.find(h => h.id === id)
-  if (!hl) return
-  editingNoteId.value = id
-  editingNoteValue.value = hl.note ?? ''
+function startEditNote(g: HighlightGroup) {
+  editingNoteId.value = g.id
+  editingIds = g.ids
+  editingNoteValue.value = g.note ?? ''
 }
 
-function saveNote(id: string) {
-  reader.updateHighlight(id, { note: editingNoteValue.value || undefined })
+function saveNote(g: HighlightGroup) {
+  reader.updateHighlights(g.ids, { ...groupAppearance(g), note: editingNoteValue.value || undefined })
   editingNoteId.value = null
 }
 
 function cancelNote() {
   editingNoteId.value = null
 }
+
+// Focus and file-watch events replace the whole array. A row is keyed by its
+// lowest-page record, so if an older build on another machine deleted that half the
+// row comes back under the other half's id: follow it, so the typed note is not lost.
+// If no record of the row is left (deleted outright), drop the editor instead of
+// leaving it armed for an id that could reappear.
+watch(sortedHighlights, rows => {
+  const id = editingNoteId.value
+  if (!id || rows.some(r => r.id === id)) return
+  const moved = rows.find(r => r.ids.some(i => editingIds.includes(i)))
+  if (moved) { editingNoteId.value = moved.id; editingIds = moved.ids }
+  else editingNoteId.value = null
+})
 
 // Same markdown + $TeX$ rendering as the reader's note popup, so a formula reads
 // the same on both sides instead of showing raw source here.
@@ -89,9 +124,9 @@ function colorStyle(color: string, alpha = 0.35): string {
       <div v-for="hl in sortedHighlights" :key="hl.id" class="highlight-item">
         <div class="hl-color-bar" :style="{ background: hl.color }" />
         <div class="hl-body">
-          <p class="hl-text" :style="{ background: colorStyle(hl.color) }">{{ hl.text }}</p>
+          <p class="hl-text" :class="{ 'keep-lines': hl.keepLineBreaks }" :style="{ background: colorStyle(hl.color) }">{{ hl.displayText }}</p>
           <div v-if="!isEbook" class="hl-meta">
-            <span class="hl-page">p.{{ hl.page }}</span>
+            <span class="hl-page">{{ pageLabel(hl) }}</span>
           </div>
           <div v-if="hl.note" class="hl-note" v-html="noteHtml(hl.note)" />
 
@@ -101,22 +136,29 @@ function colorStyle(color: string, alpha = 0.35): string {
               class="note-input"
               rows="2"
               :placeholder="t('hl.notePlaceholder')"
-              @keydown.enter.ctrl="saveNote(hl.id)"
+              @keydown.enter.ctrl="saveNote(hl)"
               @keydown.escape="cancelNote"
             />
             <div class="note-actions">
-              <button class="note-save" @click="saveNote(hl.id)">{{ t('hl.save') }}</button>
+              <button class="note-save" @click="saveNote(hl)">{{ t('hl.save') }}</button>
               <button class="note-cancel" @click="cancelNote">{{ t('hl.cancel') }}</button>
             </div>
           </div>
 
           <div class="hl-actions" v-if="editingNoteId !== hl.id">
-            <button class="act-btn" @click="jumpTo(hl.id)">
+            <button class="act-btn" @click="jumpTo(hl)">
               <Icon icon="fluent:arrow-right-24-regular" width="12" height="12" />
               {{ t('hl.go') }}
             </button>
-            <button class="act-btn" @click="startEditNote(hl.id)">{{ t('hl.note') }}</button>
-            <button class="act-btn danger" @click="deleteHighlight(hl.id)">{{ t('hl.delete') }}</button>
+            <button class="act-btn" @click="startEditNote(hl)">{{ t('hl.note') }}</button>
+            <button
+              v-if="hl.hasLineBreaks"
+              class="act-btn"
+              :class="{ on: hl.keepLineBreaks }"
+              :title="hl.keepLineBreaks ? t('hl.mergeLinesHint') : t('hl.keepLinesHint')"
+              @click="toggleLineBreaks(hl)"
+            >{{ hl.keepLineBreaks ? t('hl.mergeLines') : t('hl.keepLines') }}</button>
+            <button class="act-btn danger" @click="deleteHighlight(hl)">{{ t('hl.delete') }}</button>
           </div>
         </div>
       </div>
@@ -177,6 +219,9 @@ function colorStyle(color: string, alpha = 0.35): string {
   overflow: hidden;
 }
 
+/* Kept line breaks: honour them (and only them — runs of spaces still collapse). */
+.hl-text.keep-lines { white-space: pre-line; }
+
 .hl-meta { display: flex; gap: 8px; font-size: var(--font-size-xs); color: var(--text-tertiary); margin-bottom: 4px; }
 .hl-page { flex-shrink: 0; }
 
@@ -223,6 +268,8 @@ function colorStyle(color: string, alpha = 0.35): string {
   cursor: pointer;
 }
 .act-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+/* The non-default state of a toggle (line breaks kept). */
+.act-btn.on { border-color: var(--accent); color: var(--accent); }
 .act-btn.danger { color: #cc3333; }
 .act-btn.danger:hover { background: #fff0f0; border-color: #ffcccc; }
 

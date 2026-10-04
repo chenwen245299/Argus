@@ -18,6 +18,9 @@ mod deepseek;
 mod ebook;
 mod extraction;
 mod fsutil;
+mod highlight_groups;
+mod highlight_text;
+mod holidays;
 mod library;
 mod llm;
 mod mcp;
@@ -25,6 +28,7 @@ mod media;
 mod metadata;
 mod mimo;
 mod minimax;
+mod minimax_media;
 mod moleapi;
 mod models;
 mod net;
@@ -124,6 +128,10 @@ pub fn run() {
             // been withdrawn stops advertising itself. Returns immediately.
             offer_sync::spawn(app.handle());
 
+            // Keep the China public-holiday calendar current (it decides which
+            // weekdays DeepSeek's peak window applies to). Returns immediately.
+            holidays::spawn(app.handle());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -172,6 +180,7 @@ pub fn run() {
             commands::open_paper_folder,
             commands::read_pdf_bytes,
             commands::render_page_png,
+            commands::render_page_image,
             // ── M0-M3: Import + metadata ──
             commands::pick_pdf_files,
             commands::import_pdf,
@@ -395,6 +404,7 @@ pub fn run() {
             commands::agent_probe_server,
             commands::agent_list_builtin_tools,
             commands::disarm_cache_keepalive,
+            holidays::get_cn_holidays,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

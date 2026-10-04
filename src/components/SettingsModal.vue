@@ -22,14 +22,28 @@ type Section = 'general' | 'themes' | 'ai' | 'about' | 'agent' | 'mcp'
 // still ask for them by their old names — the embedding map's "configure RAG"
 // button, the analysis entry points. Those names are mapped to the tab rather
 // than dropped, so no existing link goes nowhere.
-const QA_TABS = ['agent', 'rag', 'extraction', 'arxiv'] as const
-const requested = props.initialSection
-const isQaTab = (QA_TABS as readonly string[]).includes(requested ?? '')
-const initialQaTab = isQaTab ? requested : 'agent'
+const QA_TABS = ['agent', 'rag', 'extraction', 'arxiv', 'speech'] as const
+const activeSection = ref<Section>('general')
+const initialQaTab = ref('agent')
+/** Bumped on every jump so QaSettings is rebuilt and lands on the requested sub-tab even when it is the one already named. */
+const qaNonce = ref(0)
 
-const activeSection = ref<Section>(
-  isQaTab ? 'agent' : ((requested as Section) ?? 'general'),
-)
+function goTo(requested: string | undefined) {
+  const isQaTab = (QA_TABS as readonly string[]).includes(requested ?? '')
+  initialQaTab.value = isQaTab ? (requested as string) : 'agent'
+  activeSection.value = isQaTab ? 'agent' : ((requested as Section) ?? 'general')
+  qaNonce.value += 1
+}
+goTo(props.initialSection)
+
+// A panel inside the modal can send you somewhere else in it (the read-aloud tab's
+// "go to AI Providers"). They use the same window event as every other caller of
+// 设置, which MainView only turns into "open the modal" — so an already open modal
+// has to listen for it too, or the button would do nothing.
+function onOpenSettingsEvent(e: Event) {
+  const section = (e as CustomEvent<{ section?: string }>).detail?.section
+  if (section) goTo(section)
+}
 
 const sections: { id: Section; label: string; placeholder?: boolean }[] = [
   { id: 'general', label: 'settings.general' },
@@ -52,8 +66,14 @@ function onKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') close()
 }
 
-onMounted(() => window.addEventListener('keydown', onKeydown))
-onUnmounted(() => window.removeEventListener('keydown', onKeydown))
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown)
+  window.addEventListener('argus-open-settings', onOpenSettingsEvent)
+})
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('argus-open-settings', onOpenSettingsEvent)
+})
 </script>
 
 <template>
@@ -106,7 +126,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <GeneralSettings v-if="activeSection === 'general'" />
               <ThemeSettings v-else-if="activeSection === 'themes'" />
               <AiSettings v-else-if="activeSection === 'ai'" />
-              <QaSettings v-else-if="activeSection === 'agent'" :initial-tab="initialQaTab" />
+              <QaSettings v-else-if="activeSection === 'agent'" :key="qaNonce" :initial-tab="initialQaTab" />
               <McpSettings v-else-if="activeSection === 'mcp'" />
               <AboutSettings v-else-if="activeSection === 'about'" />
               <div v-else class="placeholder-panel">

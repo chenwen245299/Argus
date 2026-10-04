@@ -505,6 +505,8 @@ export type MediaFieldKind = 'text' | 'long_text' | 'select' | 'number' | 'toggl
 export interface MediaFieldOption {
   value: string
   label: string
+  /** What the option belongs to — a voice's language. Absent for ungrouped options. */
+  group?: string
 }
 
 /** One control in the generated form. `key` is what its value is sent back under. */

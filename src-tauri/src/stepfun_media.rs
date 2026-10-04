@@ -91,7 +91,9 @@ fn voices() -> Vec<FieldOption> {
         ("livelybreezy-female", "活力轻快"),
     ]
     .into_iter()
-    .map(|(v, l)| FieldOption::new(v, l))
+    // Every system voice is a Mandarin one; grouped so 朗读 settings can show
+    // the language beside MiniMax's.
+    .map(|(v, l)| FieldOption::grouped(v, l, "普通话"))
     .collect()
 }
 

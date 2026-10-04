@@ -139,9 +139,12 @@ function commitNumber() {
 }
 .mfi.wide { grid-column: 1 / -1; }
 .mfi-label { font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+/* A fixed height rather than padding, so a select (whose vertical padding WebKit
+   ignores) and a text or number box line up in one row. */
 .mfi-input {
   width: 100%;
-  padding: 7px 10px;
+  height: 30px;
+  padding: 0 10px;
   font-size: 12.5px;
   color: var(--text-primary);
   background: var(--bg-primary);
@@ -150,7 +153,7 @@ function commitNumber() {
   box-sizing: border-box;
 }
 .mfi-input:focus { outline: none; border-color: var(--accent); }
-.mfi-textarea { resize: vertical; line-height: 1.5; }
+.mfi-textarea { height: auto; padding: 7px 10px; resize: vertical; line-height: 1.5; }
 .mfi-note { font-size: 11px; color: var(--text-tertiary); line-height: 1.5; }
 
 .mfi-toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }

@@ -54,6 +54,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { runTranslation, triggerAskAi } from '../stores/translationHistory'
 import { openAddSnippetModal } from '../stores/snippetLibrary'
 import { useSpeechStore } from '../stores/speech'
+import { spokenSentences, locateSentences, sentenceAt, lineBands, type SpokenSentence, type TextRange } from '../utils/speechFollow'
 import {
   spansFromTextLayer, selectedTextBySpan, planFurnitureDropReport, keptSelectionTextAcrossPages,
   estimateBodyFontSize, furniturePageFromTextContent, preferContentGeometry,
@@ -946,9 +947,159 @@ const readingSelection = computed(() =>
 function readAloudSelection(source: 'pdf' | 'ebook') {
   if (!selectionPopup.value) return
   const { text } = selectionPopup.value
+  // The page text the selection came from, so the sentence being spoken can be lit on the page.
+  const pageText = popupSource ? captureReadingText(popupSource.range, popupSource.skip) : null
   selectionPopup.value = null
-  void speech.read(text, { source })
+  readingTrack = pageText ? { text, source, pageText } : null
+  void speech.read(text, { source, paper: props.slug })
+  // The selection's own tint would sit under the sentence being lit; the popup is gone, so is it.
+  if (pageText) window.getSelection()?.removeAllRanges()
 }
+
+// ── Read aloud: the sentence being spoken, lit on the page ───────────────────
+// A read started here is followed sentence by sentence (utils/speechFollow.ts): its sentences
+// are found in the text layer once, when the read starts, and turned into page rectangles
+// (scale-1 coordinates, like a highlight's), so zooming and re-rendering only redraw them.
+// Which one is lit follows the player's playhead. Another read, a stop or the end clears it.
+
+const READING_COLOR = '#A78BFA'
+
+/** The selection the popup was opened for: the popup keeps only its text, the read needs where it is. */
+let popupSource: { range: Range; skip: ReadonlySet<HTMLElement> | null } | null = null
+
+/** The selected text as the text layer holds it: its text nodes in order, skipped spans left out. */
+interface ReadingText {
+  text: string
+  nodes: { node: Text; start: number; at: number; len: number }[]
+  skip: ReadonlySet<HTMLElement> | null
+}
+
+/** The read this viewer started, until it is over or replaced. */
+let readingTrack: { text: string; source: string; pageText: ReadingText } | null = null
+/** Its sentences, each with where it sits on the pages; null while this viewer is not being read. */
+let readingSentences: (SpokenSentence & { pages: { pageIndex: number; rects: Rect[] }[] })[] | null = null
+let readingSentenceIdx = -1
+
+function captureReadingText(range: Range, skip: ReadonlySet<HTMLElement> | null): ReadingText | null {
+  const root = range.commonAncestorContainer
+  const rootEl = (root.nodeType === Node.ELEMENT_NODE ? root : root.parentNode) as HTMLElement | null
+  if (!rootEl || !rootEl.isConnected) return null
+  const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue) return NodeFilter.FILTER_REJECT
+      return range.intersectsNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+    },
+  })
+  let text = ''
+  const nodes: ReadingText['nodes'] = []
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const parent = node.parentElement
+    if (!parent?.closest('.textLayer') || skip?.has(parent)) continue
+    const value = node.nodeValue ?? ''
+    const start = node === range.startContainer ? range.startOffset : 0
+    const end = node === range.endContainer ? range.endOffset : value.length
+    if (end <= start) continue
+    nodes.push({ node: node as Text, start, at: text.length, len: end - start })
+    text += value.slice(start, end)
+  }
+  return nodes.length ? { text, nodes, skip } : null
+}
+
+/** A place in the captured text as a DOM position; an end may sit at the very end of a node. */
+function readingPoint(t: ReadingText, at: number, isEnd: boolean): { node: Text; offset: number } | null {
+  for (const n of t.nodes) {
+    if (isEnd ? at > n.at && at <= n.at + n.len : at >= n.at && at < n.at + n.len) {
+      return { node: n.node, offset: n.start + (at - n.at) }
+    }
+  }
+  return null
+}
+
+function readingRects(t: ReadingText, r: TextRange): { pageIndex: number; rects: Rect[] }[] {
+  const a = readingPoint(t, r.start, false)
+  const b = readingPoint(t, r.end, true)
+  if (!a || !b || !a.node.isConnected || !b.node.isConnected) return []
+  const range = document.createRange()
+  try {
+    range.setStart(a.node, a.offset)
+    range.setEnd(b.node, b.offset)
+  } catch {
+    return []
+  }
+  return collectSelectionRectsByPage(range, t.skip ?? undefined)
+    .map(({ pageIndex, rects }) => ({ pageIndex, rects: lineBands(rects) }))
+}
+
+function pagesOfReadingSentence(i: number): number[] {
+  return readingSentences?.[i]?.pages.map(p => p.pageIndex) ?? []
+}
+
+function redrawReadingPages(pages: Iterable<number>) {
+  for (const idx of new Set(pages)) {
+    const overlay = pageRefs.value[idx]?.querySelector('.highlight-overlay') as HTMLDivElement | null
+    if (overlay) drawReadingHighlight(overlay, idx)
+  }
+}
+
+function showReadingSentence(i: number) {
+  if (i === readingSentenceIdx) return
+  const before = pagesOfReadingSentence(readingSentenceIdx)
+  readingSentenceIdx = i
+  redrawReadingPages([...before, ...pagesOfReadingSentence(i)])
+}
+
+function clearReading() {
+  const before = pagesOfReadingSentence(readingSentenceIdx)
+  readingSentences = null
+  readingSentenceIdx = -1
+  readingTrack = null
+  redrawReadingPages(before)
+}
+
+/** Draws the sentence being spoken on one page (or nothing); renderHighlightsOnPage calls it last. */
+function drawReadingHighlight(container: HTMLDivElement, pageIndex: number) {
+  container.querySelector(':scope > .reading-hl')?.remove()
+  const rects = readingSentences?.[readingSentenceIdx]?.pages.find(p => p.pageIndex === pageIndex)?.rects
+  if (!rects?.length) return
+  const s = scale.value
+  const NS = 'http://www.w3.org/2000/svg'
+  const svg = document.createElementNS(NS, 'svg') as SVGSVGElement
+  svg.setAttribute('class', 'reading-hl')
+  svg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;overflow:visible;pointer-events:none'
+  // One group at one opacity, like a highlight: overlapping boxes do not stack darker.
+  const g = document.createElementNS(NS, 'g') as SVGGElement
+  g.setAttribute('fill', READING_COLOR)
+  for (const rect of rects) {
+    const r = document.createElementNS(NS, 'rect') as SVGRectElement
+    r.setAttribute('x', String(rect.x * s))
+    r.setAttribute('y', String(rect.y * s))
+    r.setAttribute('width', String(rect.width * s))
+    r.setAttribute('height', String(rect.height * s))
+    r.setAttribute('rx', '2')
+    g.appendChild(r)
+  }
+  svg.appendChild(g)
+  container.appendChild(svg)
+}
+
+// A new read (here or anywhere), a stop, the end: `readChunks` changes with each.
+watch(() => speech.readChunks, (chunks) => {
+  const track = readingTrack
+  if (!track || chunks.length === 0 || !speech.isReadingText(track.text, track.source)) {
+    if (readingSentences || readingTrack) clearReading()
+    return
+  }
+  const sentences = spokenSentences(chunks)
+  const ranges = locateSentences(track.pageText.text, sentences.map(x => x.text))
+  const before = pagesOfReadingSentence(readingSentenceIdx)
+  readingSentences = sentences.map((x, i) => ({ ...x, pages: ranges[i] ? readingRects(track.pageText, ranges[i]!) : [] }))
+  readingSentenceIdx = sentenceAt(readingSentences, speech.playhead.index, speech.playhead.fraction)
+  redrawReadingPages([...before, ...pagesOfReadingSentence(readingSentenceIdx)])
+})
+
+watch(() => speech.playhead, (p) => {
+  if (readingSentences) showReadingSentence(sentenceAt(readingSentences, p.index, p.fraction))
+})
 
 const SNIPPET_HIGHLIGHT_COLOR = '#CE93D8'
 
@@ -2196,6 +2347,7 @@ function renderHighlightsOnPage(container: HTMLDivElement, pageIndex: number) {
       container.appendChild(svg)
     }
   })
+  drawReadingHighlight(container, pageIndex)
 }
 
 // Re-render highlight overlays when THIS tab's highlights change
@@ -3042,7 +3194,10 @@ function clearSkippedSpans() {
 }
 
 // Whatever closes the popup (or replaces it with one that skips nothing) ends the marking.
-watch(selectionPopup, p => { if (!p?.furniture) clearSkippedSpans() })
+watch(selectionPopup, p => {
+  if (!p?.furniture) clearSkippedSpans()
+  if (!p) popupSource = null
+})
 
 /** ⌘C copies what the popup holds for a selection across pages: the text with a line break between the
  *  pages, without the spans shown as not selected. */
@@ -3101,6 +3256,7 @@ function onWindowMouseUp(e: MouseEvent) {
       ? { ...at, text: plan.text, pages, full: { text: plan.text, pages } }
       : { ...at, text, pages }
   if (furniture) showSkippedSpans([...furniture.skip])
+  popupSource = { range: range.cloneRange(), skip: furniture?.skip ?? null }
   // A popup that is already open keeps its element (and so its size), so the observer will not
   // fire for the new position: fit it explicitly.
   void nextTick(fitSelectionPopup)
@@ -3971,6 +4127,15 @@ function triggerInitialRender() {
 }
 
 :deep(.hl-rect:hover) { opacity: 0.75; }
+
+:deep(.reading-hl g) {
+  opacity: 0.35;
+  animation: reading-in 0.18s ease-out;
+}
+
+@keyframes reading-in {
+  from { opacity: 0; }
+}
 
 :deep(.hl-flash) {
   animation: flash 0.8s ease-in-out 2;

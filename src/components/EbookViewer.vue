@@ -781,7 +781,7 @@ function readAloudSelection(source: 'pdf' | 'ebook') {
   if (!selectionPopup.value) return
   const { text } = selectionPopup.value
   selectionPopup.value = null
-  void speech.read(text, { source })
+  void speech.read(text, { source, paper: props.slug })
 }
 
 const SNIPPET_HIGHLIGHT_COLOR = '#CE93D8'

@@ -226,6 +226,7 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `arxiv.rs` / `arxiv_scheduler.rs` | arXiv/bioRxiv fetching, inbox storage, scheduled catch-up |
 | `canvas.rs` / `canvas_enhance.rs` | Canvas CRUD, edge suggestions, auto-layout, export |
 | `snippets.rs` | Snippet library CRUD. Snippets are not embedded: the agent finds them with `search_snippets` (`mcp/tools.rs`), a substring match over text, note, source-paper title and tags |
+| `speech_cache.rs` | Read-aloud clips kept in `papers/<slug>/audio/`, keyed by voice + text, so a passage read before plays from disk instead of being billed again |
 | `token_usage.rs` | Token and USD cost tracking |
 | `url_import.rs` | Import from ACL Anthology, OpenReview, arXiv, direct PDF |
 | `settings.rs` | `config.json` settings I/O |
@@ -627,8 +628,25 @@ frontend, deliberately small:
    normalised to `None` in `settings.rs`; `None` is what "not configured" means.
 3. Synthesis is `run_media_task` with `kind: "speech"`, `model`, `prompt` = one
    chunk and `options` = `speech_options`; the result is `artifacts[0]` =
-   `{mime, dataUrl, filename}`. There is no read-aloud command: it would only
-   duplicate the dispatch and the key lookup.
+   `{mime, dataUrl, filename}`. There is no read-aloud synthesis command: it
+   would only duplicate the dispatch and the key lookup. The only read-aloud
+   commands are the per-paper audio store below (`read_speech_audio` /
+   `save_speech_audio`), which never call a provider.
+
+**Read-aloud audio is kept in the paper's folder** (`speech_cache.rs`):
+`papers/<slug>/audio/<key>.<ext>`, one file per chunk, where the key is
+`speechCacheKey(voice scope, chunk text)` — provider, model, every option and the
+exact text — so another voice, speed or wording is just another file and nothing
+else is recorded. `read(text, { source, paper })` (both viewers pass their slug;
+the 试听 preview passes none and is never kept) makes `synthesizeChunk` look there
+before calling `run_media_task` and keep what it synthesises (fire and forget).
+Either failing only falls back to synthesising / not keeping. The paper is part of
+the engine scope, so a late prefetch keeps its clip in the right paper's folder.
+Keys are validated to `speechCacheKey`'s exact shape, the paper must exist
+(`find_paper_dir`; no folder is created for a missing one), symlinks are refused,
+writes are atomic, and the new folder is registered with `fsutil::note_self_write`
+so the library watcher does not report it as an outside edit. Deleting the folder
+only means those chunks are billed again.
 
 **Read-aloud flow (frontend).** The selection popup's 朗读 button calls
 `useSpeechStore().read(text, { source })` synchronously from the click, before
@@ -665,15 +683,50 @@ with the same text while it is being read stops it, so the button is a toggle.
   nothing), and one retry for transient errors only (`classifySpeechError`, which
   reads the same markers as `llm::classify_error`: balance, key, length and
   unrecognised errors are fatal and shown with the provider's own words).
+  `position()` (chunk + fraction of its clip), `seek(index, fraction)` (inside the
+  playing clip it moves `currentTime`; elsewhere the same read restarts at that
+  chunk — cache, in-flight request or a new one — so skipped chunks are never
+  requested; a paused read stays paused; a clip's start is applied on
+  `loadedmetadata`) and `setRate()` (`playbackRate` *and* `defaultPlaybackRate`,
+  since a new `src` resets the former to the latter — the player's speed costs
+  nothing and needs no re-synthesis).
+- `utils/speechFollow.ts` — pure. Following a read on the page: `spokenSentences`
+  (each chunk's sentences with their estimated share of its clip, by characters —
+  the providers return no timings), `locateSentences` (finds them in the page text
+  by runs of letters/digits, NFKC + case-folded, since preparing only removes;
+  falls back to an inner run when a citation sits right after the first word),
+  `sentenceAt`, `readFraction` / `seekTarget` (bar <-> chunk, chunks weighted by
+  length) and `lineBands` (a line's span boxes joined into one band).
+- The store exposes `readChunks`, a `playhead` sampled every frame while a clip
+  plays (rAF, once per other state change), `heard`, `seekTo`, `rate` /
+  `setRate` (`SPEECH_RATES` 0.5–2) and `volume` / `setVolume` (0–1, the element's
+  own), both kept in localStorage per device (`argus:speech-rate`,
+  `argus:speech-volume`).
+- `PdfViewer.vue` lights the sentence being spoken in light purple: mouse-up keeps
+  a clone of the selection's Range (`popupSource`), 朗读 captures its text nodes
+  (furniture-skipped spans left out) and clears the selection, and when the store
+  publishes `readChunks` for that read the sentences are located once and turned
+  into scale-1 page rects through `collectSelectionRectsByPage`.
+  `renderHighlightsOnPage` redraws them last (`drawReadingHighlight`), so zoom and
+  re-renders keep them. The ebook viewer gets the player but no highlight.
 - `components/SpeechHost.vue`, mounted once in `MainView.vue` — the floating
   mini-player (z-index 900, under the selection popup at 1000; only the pill takes
-  pointer events) and the *not configured* prompt. Its button dispatches
+  pointer events): the speaker at its left is the volume button (vertical slider,
+  wheel, mute), then the progress bar (drag or click to seek, applied on release;
+  arrow keys move 5 %) and the speed menu — one popover open at a time — and the
+  *not configured* prompt. Its button dispatches
   `argus-open-settings` with `{ section: 'speech' }` (or `'ai'` when no provider
   can speak at all); `SettingsModal.vue` also listens for that event while open,
   because `MainView` only turns it into "show the modal".
 - `components/settings/SpeechSettings.vue` (+ `MediaFieldInput.vue`) — 设置 → AI
-  随航 → 朗读 (section id `speech`): provider chips, model, one control per
-  `MediaField`, the citations toggle and a 试听 button that says it is billed.
+  随航 → 朗读 (section id `speech`): provider chips, model (no notes under it),
+  then only 语言 / 音色 / 语速 with the 试听 button at the right of the 声音设置
+  heading, and the citations toggle. The language is the voice
+  options' `FieldOption::group` (each adapter sets it), not a stored setting.
+  Every other knob is read at the model's default: `readAloudOptions` sends only
+  `READ_ALOUD_KEYS` (`voice`, `speed`) from `speech_options`, so values an older
+  build saved for volume, pitch, emotion, format or a custom voice id are ignored.
+  The media studio still offers every field.
 
 If no speech provider/model is set — or the provider has since been deleted,
 disabled or lost its key, so it no longer appears in `list_media_capabilities` —
@@ -749,7 +802,8 @@ The library root contains:
 │   ├── reading_state.json
 │   ├── .status.json
 │   ├── chat.json
-│   └── ai_conversations.json
+│   ├── ai_conversations.json
+│   └── audio/               # Read-aloud clips, one per chunk (speech_cache.rs); safe to delete
 ├── canvases/                # Canvas JSON files
 ├── inbox/                   # arXiv/bioRxiv daily inbox JSON (YYYY-MM-DD.json), read_state.json, filtered.json (papers filtered out, restorable)
 └── snippets/                # Snippet library JSON (never embedded)
@@ -970,7 +1024,7 @@ extend `LUNAR_HOLIDAYS` (HKO conversion tables) when it runs out.
 | Change agent mode | `src-tauri/src/copilot.rs` (the loop), `mcp/client.rs` (external servers), `src/components/settings/AgentSettings.vue`, `src/components/LibraryChat.vue` (the trail, pins, fallback notice) |
 | Change embedding map | `src/views/EmbeddingMapView.vue`, `src-tauri/src/rag.rs` |
 | Add a media / text-to-speech provider | A new `src-tauri/src/<provider>_media.rs` + two dispatch lines in `media.rs` + a row in the `adapters()` test helper there; follow the checklist in the `media.rs` module doc. No UI change: the studio and 设置 → AI 随航 → 朗读 render from the description |
-| Change read-aloud | `src/stores/speech.ts`, `src/utils/speechText.ts` (chunking), `src/utils/speechEngine.ts` (playback), `src/components/SpeechHost.vue`, `src/components/settings/SpeechSettings.vue`; backend side `src-tauri/src/minimax_media.rs` / `stepfun_media.rs` |
+| Change read-aloud | `src/stores/speech.ts`, `src/utils/speechText.ts` (chunking), `src/utils/speechEngine.ts` (playback, seek, speed), `src/utils/speechFollow.ts` (sentence highlight, progress), `src/components/SpeechHost.vue`, `src/components/settings/SpeechSettings.vue`; backend side `src-tauri/src/minimax_media.rs` / `stepfun_media.rs` |
 
 ---
 

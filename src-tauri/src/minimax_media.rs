@@ -114,40 +114,41 @@ fn mime_for(format: &str) -> &'static str {
 ///
 /// Ordered for this app's reader: English first (the default heads the list),
 /// then Mandarin, then the two other languages a researcher is likely to want.
-/// Labels carry the voice's own display name; the gloss after it is a translation
+/// Each row is (id, language, label): the language is the option's `group`, so
+/// the read-aloud settings ask for it first. Labels carry the voice's own display name; the gloss after it is a translation
 /// of that name or, for the two the docs describe (沉稳高管, 新闻女声), of their
 /// description. Nothing is claimed about a timbre the docs do not state.
 ///
 /// The field stays free text underneath (`voice_custom`), so a cloned or designed
 /// voice id — which is never in any list — can still be typed in.
-const VOICES: &[(&str, &str)] = &[
-    ("English_Graceful_Lady", "英语 · Graceful Lady（优雅女声）"),
-    ("English_Trustworthy_Man", "英语 · Trustworthy Man（可信赖男声）"),
+const VOICES: &[(&str, &str, &str)] = &[
+    ("English_Graceful_Lady", "英语", "Graceful Lady（优雅女声）"),
+    ("English_Trustworthy_Man", "英语", "Trustworthy Man（可信赖男声）"),
     // The next three are in the T2A reference's list of current voices but not
     // yet in the roster page.
-    ("English_Insightful_Speaker", "英语 · Insightful Speaker（睿智演讲者）"),
-    ("English_Persuasive_Man", "英语 · Persuasive Man（有说服力的男声）"),
-    ("English_radiant_girl", "英语 · Radiant Girl（明朗女声）"),
-    ("English_Diligent_Man", "英语 · Diligent Man（勤勉男声）"),
-    ("English_Gentle-voiced_man", "英语 · Gentle-voiced man（温和男声）"),
-    ("Chinese (Mandarin)_Reliable_Executive", "普通话 · 沉稳高管（中年男声）"),
-    ("Chinese (Mandarin)_News_Anchor", "普通话 · 新闻女声（播音腔）"),
-    ("Chinese (Mandarin)_Male_Announcer", "普通话 · 播报男声"),
-    ("Chinese (Mandarin)_Radio_Host", "普通话 · 电台男主播"),
-    ("Chinese (Mandarin)_Gentleman", "普通话 · 温润男声"),
-    ("Chinese (Mandarin)_Lyrical_Voice", "普通话 · 抒情男声"),
-    ("Chinese (Mandarin)_Sweet_Lady", "普通话 · 甜美女声"),
-    ("Chinese (Mandarin)_Gentle_Senior", "普通话 · 温柔学姐"),
-    ("male-qn-jingying", "普通话 · 精英青年音色"),
-    ("female-chengshu", "普通话 · 成熟女性音色"),
-    ("Cantonese_GentleLady", "粤语 · 温柔女声"),
-    ("Japanese_IntellectualSenior", "日语 · Intellectual Senior（知性前辈）"),
+    ("English_Insightful_Speaker", "英语", "Insightful Speaker（睿智演讲者）"),
+    ("English_Persuasive_Man", "英语", "Persuasive Man（有说服力的男声）"),
+    ("English_radiant_girl", "英语", "Radiant Girl（明朗女声）"),
+    ("English_Diligent_Man", "英语", "Diligent Man（勤勉男声）"),
+    ("English_Gentle-voiced_man", "英语", "Gentle-voiced man（温和男声）"),
+    ("Chinese (Mandarin)_Reliable_Executive", "普通话", "沉稳高管（中年男声）"),
+    ("Chinese (Mandarin)_News_Anchor", "普通话", "新闻女声（播音腔）"),
+    ("Chinese (Mandarin)_Male_Announcer", "普通话", "播报男声"),
+    ("Chinese (Mandarin)_Radio_Host", "普通话", "电台男主播"),
+    ("Chinese (Mandarin)_Gentleman", "普通话", "温润男声"),
+    ("Chinese (Mandarin)_Lyrical_Voice", "普通话", "抒情男声"),
+    ("Chinese (Mandarin)_Sweet_Lady", "普通话", "甜美女声"),
+    ("Chinese (Mandarin)_Gentle_Senior", "普通话", "温柔学姐"),
+    ("male-qn-jingying", "普通话", "精英青年音色"),
+    ("female-chengshu", "普通话", "成熟女性音色"),
+    ("Cantonese_GentleLady", "粤语", "温柔女声"),
+    ("Japanese_IntellectualSenior", "日语", "Intellectual Senior（知性前辈）"),
 ];
 
 fn voices() -> Vec<FieldOption> {
     VOICES
         .iter()
-        .map(|(id, label)| FieldOption::new(id, label))
+        .map(|(id, lang, label)| FieldOption::grouped(id, label, lang))
         .collect()
 }
 
@@ -392,7 +393,7 @@ fn voice_id(req: &MediaRequest) -> String {
         return custom.to_string();
     }
     match opt_str(req, "voice") {
-        Some(v) if VOICES.iter().any(|(id, _)| *id == v) => v.to_string(),
+        Some(v) if VOICES.iter().any(|(id, _, _)| *id == v) => v.to_string(),
         _ => DEFAULT_VOICE.to_string(),
     }
 }
@@ -717,17 +718,17 @@ mod tests {
 
     #[test]
     fn the_default_voice_is_in_the_list_and_is_english() {
-        assert!(VOICES.iter().any(|(id, _)| *id == DEFAULT_VOICE));
+        assert!(VOICES.iter().any(|(id, _, _)| *id == DEFAULT_VOICE));
         assert!(DEFAULT_VOICE.starts_with("English_"));
         assert_eq!(VOICES[0].0, DEFAULT_VOICE, "the default heads the list");
-        let mut ids: Vec<&str> = VOICES.iter().map(|(id, _)| *id).collect();
+        let mut ids: Vec<&str> = VOICES.iter().map(|(id, _, _)| *id).collect();
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), VOICES.len(), "duplicate voice id");
         assert!((12..=20).contains(&VOICES.len()), "{}", VOICES.len());
-        for (id, label) in VOICES {
+        for (id, lang, label) in VOICES {
             assert!(!id.trim().is_empty() && id.trim() == *id, "{id:?}");
-            assert!(!label.is_empty());
+            assert!(!label.is_empty() && !lang.is_empty());
         }
         // The dropdown's own note must not promise something it cannot do.
         let voice = tts_fields("speech-2.8-turbo")

@@ -65,12 +65,28 @@ export interface SynthResult {
 /** The slice of `HTMLAudioElement` the engine uses — and a fake can implement. */
 export interface AudioLike {
   src: string
+  /** For `position()` and `seek()`; a fake may leave them out. */
+  currentTime?: number
+  readonly duration?: number
+  readonly readyState?: number
+  /** Written by `setRate()` / `setVolume()`; a fake may leave them out. */
+  playbackRate?: number
+  defaultPlaybackRate?: number
+  volume?: number
   play(): Promise<void> | void
   pause(): void
   addEventListener(type: string, listener: () => void): void
   removeEventListener(type: string, listener: () => void): void
   removeAttribute?(name: string): void
   load?(): void
+}
+
+/** Where a read is: the chunk being loaded or played, and how much of its clip has played. */
+export interface SpeechPosition {
+  index: number
+  total: number
+  /** 0..1 of chunk `index`'s clip; 0 while that clip is still being synthesised. */
+  fraction: number
 }
 
 export interface SpeechEngineDeps {
@@ -279,6 +295,14 @@ export class SpeechEngine {
   private run: Run | null = null
   private current: SpeechState = 'idle'
   private cancelPlay: (() => void) | null = null
+  /** The chunk whose clip the element holds, or -1: between chunks it still holds the last one, ended. */
+  private clipIndex = -1
+  /** Playback speed of every clip, 1 = as synthesised. */
+  private rate = 1
+  /** 0..1, the element's own volume (the system volume still applies on top). */
+  private volume = 1
+  /** A seek into a clip that is not playing yet: applied once its length is known (`applyStart`). */
+  private startAt: { index: number; fraction: number } | null = null
   /** Bumped by every pause(): a play() that began before it was cut short by the engine itself. */
   private pauseCount = 0
   private maxCache: number
@@ -318,6 +342,7 @@ export class SpeechEngine {
     try {
       const audio = this.ensureAudio()
       audio.src = SILENT_WAV
+      this.clipIndex = -1
       const p = audio.play()
       if (p && typeof (p as Promise<void>).catch === 'function') (p as Promise<void>).catch(() => {})
     } catch { /* unlocking is best effort */ }
@@ -371,6 +396,95 @@ export class SpeechEngine {
     return true
   }
 
+  /**
+   * Play faster or slower (the player offers 0.5 to 2). Applies to the clip playing now
+   * and to every later one. Nothing is synthesised again — the clips are the same, only
+   * played at another speed — so it costs nothing and takes effect at once.
+   */
+  setRate(rate: number): void {
+    if (!Number.isFinite(rate) || rate <= 0) return
+    this.rate = rate
+    if (this.audio) this.applyRate(this.audio)
+  }
+
+  /** Louder or quieter, 0..1. Applies at once, to this clip and every later one. */
+  setVolume(volume: number): void {
+    if (!Number.isFinite(volume)) return
+    this.volume = Math.min(1, Math.max(0, volume))
+    if (this.audio) this.applyVolume(this.audio)
+  }
+
+  private applyVolume(audio: AudioLike): void {
+    try { audio.volume = this.volume } catch { /* a WebView that refuses it plays at full volume */ }
+  }
+
+  private applyRate(audio: AudioLike): void {
+    try {
+      // Loading a new source resets `playbackRate` to `defaultPlaybackRate`: set both.
+      audio.defaultPlaybackRate = this.rate
+      audio.playbackRate = this.rate
+    } catch { /* a WebView that refuses a rate plays at 1x */ }
+  }
+
+  /**
+   * How far the read has got, or null when nothing is being read. Cheap: a UI
+   * may call it every frame.
+   */
+  position(): SpeechPosition | null {
+    const run = this.run
+    if (!run || !this.isReading) return null
+    const index = this.lastIndex
+    let fraction = 0
+    const audio = this.audio
+    if (this.startAt?.index === index) {
+      fraction = this.startAt.fraction
+    } else if (audio && this.clipIndex === index) {
+      const duration = audio.duration ?? NaN
+      const at = audio.currentTime ?? 0
+      if (Number.isFinite(duration) && duration > 0) fraction = Math.min(1, Math.max(0, at / duration))
+    }
+    return { index, total: run.chunks.length, fraction }
+  }
+
+  /**
+   * Jump to `fraction` (0..1) of chunk `index`'s clip — what dragging the player's bar
+   * does. Inside the clip being played it only moves the playhead. Anywhere else the
+   * same read starts over from that chunk, its audio taken from the cache, from a
+   * request already under way, or from a new one; the chunks jumped over are never
+   * requested, so they are never billed. A paused read stays paused. False when
+   * nothing is being read.
+   */
+  seek(index: number, fraction: number): boolean {
+    const run = this.run
+    if (!run || !this.isReading) return false
+    const total = run.chunks.length
+    const i = Math.min(total - 1, Math.max(0, Math.floor(index)))
+    // Not quite 1: a clip moved to its very end ends, and the read would skip ahead.
+    const f = Math.min(0.999, Math.max(0, Number.isFinite(fraction) ? fraction : 0))
+    const audio = this.audio
+    if (audio && this.cancelPlay && this.clipIndex === i && this.lastIndex === i) {
+      if (this.startAt?.index === i) {
+        // Its length is not known yet either: move where it will start.
+        this.startAt = { index: i, fraction: f }
+        return true
+      }
+      const duration = audio.duration ?? NaN
+      if (Number.isFinite(duration) && duration > 0) {
+        try {
+          audio.currentTime = f * duration
+          return true
+        } catch { /* start the chunk over below */ }
+      }
+    }
+    const paused = this.current === 'paused'
+    this.invalidate()
+    const next: Run = { chunks: run.chunks, scope: run.scope, dead: false, held: new Set() }
+    this.run = next
+    this.startAt = f > 0 ? { index: i, fraction: f } : null
+    this.drive(next, i, paused).catch((err) => this.fail(next, i, err))
+    return true
+  }
+
   /** Stop everything and go idle. Safe to call in any state, any number of times. */
   stop(): void {
     this.invalidate()
@@ -388,7 +502,11 @@ export class SpeechEngine {
   private lastIndex = 0
 
   private ensureAudio(): AudioLike {
-    if (!this.audio) this.audio = this.deps.createAudio()
+    if (!this.audio) {
+      this.audio = this.deps.createAudio()
+      this.applyRate(this.audio)
+      this.applyVolume(this.audio)
+    }
     return this.audio
   }
 
@@ -412,6 +530,7 @@ export class SpeechEngine {
       if (f.refs.size === 0) f.signal.cancelled = true
     }
     run.held.clear()
+    this.startAt = null
     const abort = this.cancelPlay
     this.cancelPlay = null
     abort?.()
@@ -420,6 +539,7 @@ export class SpeechEngine {
 
   /** Stop sound and release the clip's memory, without leaving an error event behind. */
   private silence(): void {
+    this.clipIndex = -1
     const audio = this.audio
     if (!audio) return
     try { audio.pause() } catch { /* ignore */ }
@@ -430,10 +550,11 @@ export class SpeechEngine {
     } catch { /* ignore */ }
   }
 
-  private async drive(run: Run): Promise<void> {
+  /** Read `run` from chunk `from` (a seek starts later than 0), the first clip held paused if `startPaused`. */
+  private async drive(run: Run, from = 0, startPaused = false): Promise<void> {
     const total = run.chunks.length
-    let slot: Slot | null = this.fetchClip(run, 0)
-    for (let i = 0; i < total; i++) {
+    let slot: Slot | null = this.fetchClip(run, from)
+    for (let i = from; i < total; i++) {
       if (run.dead || !slot) return
       this.lastIndex = i
       // Only say "loading" when there is actually something to wait for: between
@@ -451,7 +572,7 @@ export class SpeechEngine {
       // One ahead, started before this chunk plays so the two overlap.
       slot = i + 1 < total ? this.fetchClip(run, i + 1) : null
       try {
-        await this.playClip(run, clip, i)
+        await this.playClip(run, clip, i, startPaused && i === from)
       } catch (err) {
         if (!run.dead) this.fail(run, i, err)
         return
@@ -591,14 +712,28 @@ export class SpeechEngine {
     }
   }
 
-  /** Play one clip on the persistent element; resolves when it ends, rejects on failure. */
-  private playClip(run: Run, clip: SynthResult, index: number): Promise<void> {
+  /** Move a fresh clip to where a seek asked for, once its length is known. */
+  private applyStart(audio: AudioLike, index: number): void {
+    const start = this.startAt
+    if (!start || start.index !== index || this.clipIndex !== index) return
+    this.startAt = null
+    const duration = audio.duration ?? NaN
+    if (!Number.isFinite(duration) || duration <= 0) return
+    try { audio.currentTime = start.fraction * duration } catch { /* plays from its start */ }
+  }
+
+  /**
+   * Play one clip on the persistent element; resolves when it ends, rejects on failure.
+   * `paused`: load it and wait for `resume()` (a seek made while paused).
+   */
+  private playClip(run: Run, clip: SynthResult, index: number, paused = false): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const audio = this.ensureAudio()
       let settled = false
       const cleanup = () => {
         audio.removeEventListener('ended', onEnded)
         audio.removeEventListener('error', onError)
+        audio.removeEventListener('loadedmetadata', onMeta)
         if (this.cancelPlay === abort) this.cancelPlay = null
       }
       const settle = (done: () => void) => {
@@ -608,6 +743,12 @@ export class SpeechEngine {
         done()
       }
       const onEnded = () => settle(resolve)
+      // The clip's length is known once its metadata is in — and playback cannot begin
+      // before that, so a seek lands before anything from the clip's start is heard.
+      const onMeta = () => {
+        audio.removeEventListener('loadedmetadata', onMeta)
+        this.applyStart(audio, index)
+      }
       const onError = () => settle(() => reject(new SpeechEngineError(
         'decode', `audio could not be decoded (${clip.mime || 'unknown type'})`, true,
       )))
@@ -618,6 +759,16 @@ export class SpeechEngine {
       audio.addEventListener('error', onError)
       try {
         audio.src = clip.dataUrl
+        this.clipIndex = index
+        this.applyRate(audio)
+        if (this.startAt?.index === index) {
+          if ((audio.readyState ?? 0) >= 1) this.applyStart(audio, index)
+          else audio.addEventListener('loadedmetadata', onMeta)
+        }
+        if (paused) {
+          this.emit('paused', { index, total: run.chunks.length })
+          return
+        }
         const pausesAtStart = this.pauseCount
         const started = audio.play()
         Promise.resolve(started).then(

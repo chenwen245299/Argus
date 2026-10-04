@@ -16,7 +16,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
-import { useSpeechStore } from '../stores/speech'
+import { SPEECH_RATES, useSpeechStore } from '../stores/speech'
 
 const { t } = useI18n()
 const speech = useSpeechStore()
@@ -26,6 +26,7 @@ onMounted(() => speech.init())
 onUnmounted(() => {
   speech.stop()
   window.removeEventListener('keydown', onPromptKeydown, true)
+  closePopover()
 })
 
 // ── Mini-player ───────────────────────────────────────────────────────────────
@@ -40,6 +41,144 @@ const stateLabel = computed(() => {
   if (isPaused.value) return t('speech.player.paused')
   return t('speech.player.playing')
 })
+
+/** The bar: how much has been heard, as a percentage. Moves every frame while a clip plays. */
+const heardPercent = computed(() => Math.round(speech.heard * 1000) / 10)
+
+// ── Seeking ──
+// The bar follows the pointer while it is held and the read jumps on release: jumping on
+// every move would start (and, for a part not synthesised yet, pay for) a clip per pixel.
+
+const barEl = ref<HTMLElement | null>(null)
+/** While the bar is held: where, 0..1. */
+const dragFraction = ref<number | null>(null)
+const shownPercent = computed(() => (dragFraction.value === null ? heardPercent.value : dragFraction.value * 100))
+
+function fractionAt(clientX: number): number {
+  const r = barEl.value?.getBoundingClientRect()
+  if (!r || r.width <= 0) return 0
+  return Math.min(1, Math.max(0, (clientX - r.left) / r.width))
+}
+function onBarDown(e: PointerEvent) {
+  if (e.button !== 0) return
+  e.preventDefault()
+  barEl.value?.setPointerCapture(e.pointerId)
+  dragFraction.value = fractionAt(e.clientX)
+}
+function onBarMove(e: PointerEvent) {
+  if (dragFraction.value !== null) dragFraction.value = fractionAt(e.clientX)
+}
+function onBarUp(e: PointerEvent) {
+  if (dragFraction.value === null) return
+  const f = fractionAt(e.clientX)
+  dragFraction.value = null
+  speech.seekTo(f)
+}
+function onBarCancel() { dragFraction.value = null }
+function onBarKey(e: KeyboardEvent) {
+  const step = e.key === 'ArrowRight' ? 0.05 : e.key === 'ArrowLeft' ? -0.05 : 0
+  if (!step) return
+  e.preventDefault()
+  speech.seekTo(Math.min(1, Math.max(0, speech.heard + step)))
+}
+
+// ── Popovers (speed, volume) ──
+// Small panels above the pill, one open at a time; a press outside or Escape closes it.
+
+type Popover = 'rate' | 'volume'
+const popover = ref<Popover | null>(null)
+const rateEl = ref<HTMLElement | null>(null)
+const volEl = ref<HTMLElement | null>(null)
+
+function onPopoverOutside(e: Event) {
+  const root = popover.value === 'rate' ? rateEl.value : volEl.value
+  if (root && !root.contains(e.target as Node)) closePopover()
+}
+function onPopoverKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape') return
+  e.preventDefault()
+  e.stopPropagation()
+  closePopover()
+}
+function togglePopover(p: Popover) {
+  if (popover.value === p) { closePopover(); return }
+  if (!popover.value) {
+    document.addEventListener('pointerdown', onPopoverOutside, true)
+    window.addEventListener('keydown', onPopoverKeydown, true)
+  }
+  popover.value = p
+}
+function closePopover() {
+  popover.value = null
+  document.removeEventListener('pointerdown', onPopoverOutside, true)
+  window.removeEventListener('keydown', onPopoverKeydown, true)
+}
+watch(playerVisible, (v) => { if (!v) closePopover() })
+
+// ── Speed ──
+// A menu rather than a button that cycles: six speeds, and going from 1.25x back to
+// 1x should not take five clicks.
+
+function rateLabel(r: number): string { return `${r}×` }
+
+function pickRate(r: number) {
+  speech.setRate(r)
+  closePopover()
+}
+
+// ── Volume ──
+// The speaker at the left of the pill opens a vertical slider; the wheel over either
+// changes it too. It changes as the slider moves — unlike seeking, that costs nothing.
+
+const volumePercent = computed(() => Math.round(speech.volume * 100))
+const volumeIcon = computed(() => {
+  const v = speech.volume
+  if (v === 0) return 'fluent:speaker-mute-24-regular'
+  if (v < 0.34) return 'fluent:speaker-0-24-regular'
+  if (v < 0.67) return 'fluent:speaker-1-24-regular'
+  return 'fluent:speaker-2-24-regular'
+})
+
+const volBar = ref<HTMLElement | null>(null)
+let volDragging = false
+/** What muting took away, given back by unmuting. */
+let volumeBeforeMute = 1
+
+function volumeAt(clientY: number): number {
+  const r = volBar.value?.getBoundingClientRect()
+  if (!r || r.height <= 0) return speech.volume
+  return Math.min(1, Math.max(0, (r.bottom - clientY) / r.height))
+}
+function onVolDown(e: PointerEvent) {
+  if (e.button !== 0) return
+  e.preventDefault()
+  volBar.value?.setPointerCapture(e.pointerId)
+  volDragging = true
+  speech.setVolume(volumeAt(e.clientY))
+}
+function onVolMove(e: PointerEvent) {
+  if (volDragging) speech.setVolume(volumeAt(e.clientY))
+}
+function onVolUp() { volDragging = false }
+function onVolKey(e: KeyboardEvent) {
+  const step = e.key === 'ArrowUp' || e.key === 'ArrowRight' ? 0.05
+    : e.key === 'ArrowDown' || e.key === 'ArrowLeft' ? -0.05 : 0
+  if (!step) return
+  e.preventDefault()
+  speech.setVolume(speech.volume + step)
+}
+/** A mouse wheel notch is 5 %; a trackpad's small steps add up smoothly. */
+function onVolWheel(e: WheelEvent) {
+  speech.setVolume(speech.volume + Math.max(-0.05, Math.min(0.05, -e.deltaY / 1000)))
+}
+function toggleMute() {
+  if (speech.volume > 0) {
+    volumeBeforeMute = speech.volume
+    speech.setVolume(0)
+  } else {
+    speech.setVolume(volumeBeforeMute || 1)
+  }
+}
 
 /** "2/5" — only worth showing when the passage was split. */
 const progressText = computed(() => {
@@ -108,12 +247,98 @@ watch(
       <div v-if="playerVisible" class="sp-dock">
         <div class="sp-pill" :class="{ error: isError }" role="status" aria-live="polite">
           <template v-if="!isError">
-            <span class="sp-lead" :class="{ playing: speech.state === 'playing' }">
-              <Icon v-if="isLoading" icon="fluent:spinner-ios-20-regular" class="sp-spin" width="16" height="16" />
-              <Icon v-else icon="fluent:speaker-2-24-regular" width="16" height="16" />
+            <span ref="volEl" class="sp-vol">
+              <button
+                class="sp-lead"
+                :class="{ playing: speech.state === 'playing', open: popover === 'volume' }"
+                :title="t('speech.player.volume')"
+                :aria-label="t('speech.player.volume')"
+                aria-haspopup="dialog"
+                :aria-expanded="popover === 'volume'"
+                @click="togglePopover('volume')"
+                @wheel.prevent="onVolWheel"
+              >
+                <Icon v-if="isLoading" icon="fluent:spinner-ios-20-regular" class="sp-spin" width="16" height="16" />
+                <Icon v-else :icon="volumeIcon" width="16" height="16" />
+              </button>
+              <span v-if="popover === 'volume'" class="sp-vol-pop" @wheel.prevent="onVolWheel">
+                <span class="sp-vol-value">{{ volumePercent }}</span>
+                <span
+                  ref="volBar"
+                  class="sp-vol-bar"
+                  role="slider"
+                  tabindex="0"
+                  aria-orientation="vertical"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  :aria-valuenow="volumePercent"
+                  :aria-label="t('speech.player.volume')"
+                  @pointerdown="onVolDown"
+                  @pointermove="onVolMove"
+                  @pointerup="onVolUp"
+                  @pointercancel="onVolUp"
+                  @keydown="onVolKey"
+                >
+                  <span class="sp-vol-track">
+                    <span class="sp-vol-fill" :style="{ height: `${volumePercent}%` }" />
+                  </span>
+                  <span class="sp-vol-thumb" :style="{ bottom: `${volumePercent}%` }" />
+                </span>
+                <button
+                  class="sp-vol-mute"
+                  :title="speech.volume === 0 ? t('speech.player.unmute') : t('speech.player.mute')"
+                  :aria-label="speech.volume === 0 ? t('speech.player.unmute') : t('speech.player.mute')"
+                  @click="toggleMute"
+                >
+                  <Icon :icon="speech.volume === 0 ? 'fluent:speaker-mute-24-regular' : 'fluent:speaker-2-24-regular'" width="14" height="14" />
+                </button>
+              </span>
             </span>
             <span class="sp-label">{{ stateLabel }}</span>
+            <span
+              ref="barEl"
+              class="sp-bar"
+              :class="{ dragging: dragFraction !== null }"
+              role="slider"
+              tabindex="0"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              :aria-valuenow="Math.round(shownPercent)"
+              :aria-label="t('speech.player.seek')"
+              @pointerdown="onBarDown"
+              @pointermove="onBarMove"
+              @pointerup="onBarUp"
+              @pointercancel="onBarCancel"
+              @keydown="onBarKey"
+            >
+              <span class="sp-bar-track">
+                <span class="sp-bar-fill" :style="{ width: `${shownPercent}%` }" />
+              </span>
+              <span class="sp-bar-thumb" :style="{ left: `${shownPercent}%` }" />
+            </span>
             <span v-if="progressText" class="sp-progress">{{ progressText }}</span>
+            <span ref="rateEl" class="sp-rate">
+              <button
+                class="sp-rate-btn"
+                :class="{ open: popover === 'rate' }"
+                :title="t('speech.player.rate')"
+                :aria-label="t('speech.player.rate')"
+                aria-haspopup="menu"
+                :aria-expanded="popover === 'rate'"
+                @click="togglePopover('rate')"
+              >{{ rateLabel(speech.rate) }}</button>
+              <span v-if="popover === 'rate'" class="sp-rate-menu" role="menu">
+                <button
+                  v-for="r in [...SPEECH_RATES].reverse()"
+                  :key="r"
+                  class="sp-rate-item"
+                  :class="{ active: r === speech.rate }"
+                  role="menuitemradio"
+                  :aria-checked="r === speech.rate"
+                  @click="pickRate(r)"
+                >{{ rateLabel(r) }}</button>
+              </span>
+            </span>
             <button
               v-if="!isLoading"
               class="sp-btn"
@@ -193,7 +418,7 @@ watch(
   align-items: center;
   gap: 8px;
   max-width: min(560px, 100%);
-  padding: 5px 6px 5px 12px;
+  padding: 5px 6px 5px 7px;
   font-size: var(--font-size-sm);
   color: var(--text-primary);
   background: var(--bg-primary);
@@ -206,15 +431,168 @@ watch(
   border-color: color-mix(in srgb, #ef4444 38%, var(--border-default));
   padding: 7px 7px 7px 12px;
 }
-.sp-lead { display: inline-flex; color: var(--accent); flex-shrink: 0; }
+/* The speaker doubles as the volume button. */
+.sp-vol { position: relative; display: inline-flex; flex-shrink: 0; }
+.sp-lead {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.sp-lead:hover, .sp-lead.open { background: var(--bg-hover); }
+.sp-vol-pop {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 42px;
+  padding: 9px 0 5px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+.sp-vol-value {
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+.sp-vol-bar {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  width: 24px;
+  height: 96px;
+  cursor: pointer;
+  touch-action: none;
+  outline: none;
+}
+.sp-vol-track {
+  position: relative;
+  width: 4px;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--text-tertiary) 24%, transparent);
+}
+.sp-vol-fill { position: absolute; left: 0; right: 0; bottom: 0; background: var(--accent); }
+.sp-vol-thumb {
+  position: absolute;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg-primary);
+  transform: translate(-50%, 50%);
+  pointer-events: none;
+}
+.sp-vol-mute {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  color: var(--text-secondary);
+}
+.sp-vol-mute:hover { background: var(--bg-hover); color: var(--text-primary); }
 .sp-lead.playing svg { animation: sp-pulse 1.4s ease-in-out infinite; }
 .sp-label { font-weight: 500; white-space: nowrap; }
+.sp-bar {
+  /* The hit area is taller than the 4px track, so the bar is easy to grab. */
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 140px;
+  height: 16px;
+  flex-shrink: 0;
+  cursor: pointer;
+  touch-action: none;
+  outline: none;
+}
+.sp-bar-track {
+  position: relative;
+  width: 100%;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--text-tertiary) 24%, transparent);
+}
+.sp-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--accent);
+}
+.sp-bar-thumb {
+  position: absolute;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg-primary);
+  transform: translate(-50%, -50%) scale(0);
+  transition: transform 0.12s ease;
+  pointer-events: none;
+}
+.sp-bar:hover .sp-bar-thumb,
+.sp-bar.dragging .sp-bar-thumb,
+.sp-bar:focus-visible .sp-bar-thumb { transform: translate(-50%, -50%) scale(1); }
 .sp-progress {
   font-size: var(--font-size-xs);
   font-variant-numeric: tabular-nums;
   color: var(--text-tertiary);
   white-space: nowrap;
 }
+.sp-rate { position: relative; display: inline-flex; flex-shrink: 0; }
+.sp-rate-btn {
+  min-width: 38px;
+  height: 22px;
+  padding: 0 7px;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  border-radius: var(--radius-pill);
+  background: var(--bg-hover);
+}
+.sp-rate-btn:hover, .sp-rate-btn.open { color: var(--text-primary); background: color-mix(in srgb, var(--text-tertiary) 22%, transparent); }
+/* Above the pill: the dock sits at the bottom of the window. Fastest first, top down. */
+.sp-rate-menu {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 64px;
+  padding: 4px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+.sp-rate-item {
+  padding: 5px 10px;
+  font-size: var(--font-size-sm);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+}
+.sp-rate-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+.sp-rate-item.active { color: var(--accent); background: var(--accent-light); font-weight: 600; }
 .sp-btn {
   display: inline-flex;
   align-items: center;

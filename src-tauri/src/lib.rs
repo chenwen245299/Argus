@@ -44,6 +44,7 @@ mod sections;
 mod security_bookmark;
 mod settings;
 mod snippets;
+mod speech_cache;
 mod stepfun;
 mod stepfun_media;
 mod token_usage;
@@ -158,6 +159,8 @@ pub fn run() {
             commands::save_note,
             commands::save_note_asset,
             commands::read_note_asset,
+            commands::read_speech_audio,
+            commands::save_speech_audio,
             commands::rename_note,
             commands::delete_note,
             commands::get_highlights,

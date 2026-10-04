@@ -1,12 +1,13 @@
 import { defineStore } from 'pinia'
-import { ref, computed, watch } from 'vue'
+import { ref, shallowRef, computed, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { i18n } from '../i18n'
 import { useSettingsStore } from './settings'
 import { useAiStore } from './ai'
 import { prepareSpeechText, chunkForSpeech } from '../utils/speechText'
+import { readFraction, seekTarget } from '../utils/speechFollow'
 import {
-  SpeechEngine, speechScope,
+  SpeechEngine, speechScope, speechCacheKey,
   type SpeechState, type SpeechInfo, type SpeechErrorReason, type SynthResult, type SynthSignal,
 } from '../utils/speechEngine'
 import type {
@@ -47,10 +48,44 @@ interface RequestConfig {
   providerId: string
   model: string
   options: Record<string, unknown>
+  /** Provider, model and options: what decides the sound, and so a saved clip's key. */
+  voiceScope: string
+  /** The paper read from: its `audio/` folder keeps every clip (see `synthesizeChunk`). */
+  paper?: string
 }
 
 /** Used when a model does not declare `maxPromptChars`: short enough for any speech API. */
 export const FALLBACK_MAX_CHARS = 500
+
+/** The player's speeds. Applied to playback, not to synthesis: switching is instant and free. */
+export const SPEECH_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2] as const
+
+/** The player speed is a per-device habit, not a library setting: kept in localStorage. */
+const RATE_KEY = 'argus:speech-rate'
+
+function loadRate(): number {
+  try {
+    const v = Number(localStorage.getItem(RATE_KEY))
+    if ((SPEECH_RATES as readonly number[]).includes(v)) return v
+  } catch { /* storage blocked: start at 1x */ }
+  return 1
+}
+
+/** The player volume, likewise per device. */
+const VOLUME_KEY = 'argus:speech-volume'
+
+function loadVolume(): number {
+  try {
+    const raw = localStorage.getItem(VOLUME_KEY)
+    const v = raw === null ? NaN : Number(raw)
+    if (Number.isFinite(v) && v >= 0 && v <= 1) return v
+  } catch { /* storage blocked: full volume */ }
+  return 1
+}
+
+function mimeOfDataUrl(url: string): string {
+  return /^data:([^;,]+)/.exec(url)?.[1] ?? 'audio/mpeg'
+}
 
 /** Short, bilingual, a couple of seconds: enough to hear a voice without paying for a page. */
 export const PREVIEW_TEXT = '你好，这是 Argus 的朗读试听。Hello, this is a read-aloud preview from Argus.'
@@ -81,6 +116,28 @@ export function effectiveOptions(
     else if (f.default !== undefined && f.default !== null) out[f.key] = f.default
   }
   return out
+}
+
+/**
+ * The knobs 朗读 settings lets the user set: the voice (whose option `group` is
+ * its language) and the speed. Every adapter names them `voice` and `speed`.
+ * Everything else a model declares — volume, pitch, emotion, format, a custom
+ * voice id ... — is sent at the model's own default.
+ */
+export const READ_ALOUD_KEYS = ['voice', 'speed'] as const
+
+/**
+ * What a read sends: the user's voice and speed over the model's defaults. A value
+ * stored for any other key (an older build offered them all) is ignored, so it
+ * cannot keep changing the sound behind a setting the panel no longer shows.
+ */
+export function readAloudOptions(
+  model: MediaModelSpec | null | undefined,
+  stored: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const picked: Record<string, unknown> = {}
+  for (const k of READ_ALOUD_KEYS) if (stored?.[k] !== undefined) picked[k] = stored[k]
+  return effectiveOptions(model, picked)
 }
 
 function speechCapabilityOf(p: MediaProviderCapabilities): MediaCapability | undefined {
@@ -218,6 +275,16 @@ export const useSpeechStore = defineStore('speech', () => {
   /** Who started the current read (`opts.source`), for the UI. */
   const activeSource = ref('')
   const isReading = computed(() => state.value === 'loading' || state.value === 'playing' || state.value === 'paused')
+  /**
+   * The chunks of the read in progress (one speech request each), exactly as the engine
+   * reads them — what a viewer follows on the page (see `utils/speechFollow.ts`). Empty
+   * when nothing is being read.
+   */
+  const readChunks = shallowRef<readonly string[]>([])
+  /** Where the read in progress is: the chunk, and how much of its clip has played (0..1). */
+  const playhead = ref({ index: 0, fraction: 0 })
+  /** How much of the read in progress has been heard, 0..1, each chunk weighted by its length. */
+  const heard = computed(() => readFraction(readChunks.value, playhead.value.index, playhead.value.fraction))
 
   /**
    * The request settings of every read still alive, by scope. The engine hands
@@ -233,9 +300,25 @@ export const useSpeechStore = defineStore('speech', () => {
   /** Bumped by every read() and stop(): an awaiting read that finds it moved on gives up. */
   let readSeq = 0
 
+  /**
+   * One chunk's audio. A read from a paper looks in that paper's `audio/` folder first
+   * (the same chunk, voice and options read before — after a restart too) and keeps
+   * whatever it has to synthesise there; only a miss reaches the provider and is billed.
+   * Either way of touching the folder failing just falls back to synthesising, or to not
+   * keeping the clip: it never fails the read.
+   */
   async function synthesizeChunk(text: string, _signal: SynthSignal, scope: string): Promise<SynthResult> {
     const cfg = scopeConfigs.get(scope)
     if (!cfg) throw new Error('speech request settings are missing')
+    const savedKey = cfg.paper ? speechCacheKey(cfg.voiceScope, text) : ''
+    if (savedKey) {
+      try {
+        const saved = await invoke<string | null>('read_speech_audio', { slug: cfg.paper, key: savedKey })
+        if (saved) return { dataUrl: saved, mime: mimeOfDataUrl(saved) }
+      } catch (e) {
+        console.warn('Read aloud: the saved audio could not be read; synthesising instead:', e)
+      }
+    }
     const result = await invoke<MediaResult>('run_media_task', {
       request: {
         providerId: cfg.providerId,
@@ -250,11 +333,16 @@ export const useSpeechStore = defineStore('speech', () => {
     if (!art) throw new Error('empty audio returned')
     const mime = art.mime || 'audio/mpeg'
     const dataUrl = art.dataUrl ?? (art.url ? await downloadAsDataUrl(art.url, mime) : '')
+    if (savedKey && dataUrl) {
+      invoke('save_speech_audio', { slug: cfg.paper, key: savedKey, dataUrl })
+        .catch((e) => console.warn('Read aloud: the audio was not kept in the paper folder:', e))
+    }
     return { dataUrl, mime }
   }
 
   function onEngineState(s: SpeechState, info: SpeechInfo) {
     state.value = s
+    if (s === 'idle' || s === 'error') readChunks.value = []
     if (s === 'idle') {
       progress.value = { index: 0, total: 0 }
       errorMessage.value = ''
@@ -288,8 +376,56 @@ export const useSpeechStore = defineStore('speech', () => {
     onState: onEngineState,
   })
 
+  /** Player speed (one of `SPEECH_RATES`), on top of the voice's own speed set in 设置. */
+  const rate = ref(loadRate())
+  engine.setRate(rate.value)
+
+  function setRate(r: number) {
+    if (!(SPEECH_RATES as readonly number[]).includes(r)) return
+    rate.value = r
+    engine.setRate(r)
+    try { localStorage.setItem(RATE_KEY, String(r)) } catch { /* kept for this session only */ }
+  }
+
+  /** Player volume, 0..1 (the element's own; the system volume applies on top). */
+  const volume = ref(loadVolume())
+  engine.setVolume(volume.value)
+
+  function setVolume(v: number) {
+    if (!Number.isFinite(v)) return
+    volume.value = Math.min(1, Math.max(0, Math.round(v * 100) / 100))
+    engine.setVolume(volume.value)
+    try { localStorage.setItem(VOLUME_KEY, String(volume.value)) } catch { /* kept for this session only */ }
+  }
+
+  // The engine says where it is when asked. While a clip plays this asks every frame —
+  // which moves the player's progress bar and the sentence lit on the page — and once
+  // on every other change of state, so a pause or a chunk still loading reads right.
+  let frame = 0
+  function samplePlayhead() {
+    const p = engine.position()
+    const next = p ? { index: p.index, fraction: p.fraction } : { index: 0, fraction: 0 }
+    const cur = playhead.value
+    if (next.index !== cur.index || Math.abs(next.fraction - cur.fraction) > 1e-4) playhead.value = next
+  }
+  function followPlayback() {
+    frame = 0
+    samplePlayhead()
+    if (state.value === 'playing') frame = requestAnimationFrame(followPlayback)
+  }
+  watch(state, (s) => {
+    if (s === 'playing') {
+      if (!frame) frame = requestAnimationFrame(followPlayback)
+      return
+    }
+    if (frame) cancelAnimationFrame(frame)
+    frame = 0
+    samplePlayhead()
+  })
+
   function setError(reason: 'empty' | 'capabilities', message: string) {
     engine.stop()
+    readChunks.value = []
     state.value = 'error'
     errorReason.value = reason
     errorMessage.value = message
@@ -312,7 +448,7 @@ export const useSpeechStore = defineStore('speech', () => {
    *
    * Never rejects.
    */
-  function read(text: string, opts?: { source?: string }): Promise<void> {
+  function read(text: string, opts?: { source?: string; paper?: string }): Promise<void> {
     engine.unlock()
     return readInner(text, opts).catch((e) => {
       console.error('Read aloud failed:', e)
@@ -320,7 +456,7 @@ export const useSpeechStore = defineStore('speech', () => {
     })
   }
 
-  async function readInner(text: string, opts?: { source?: string }): Promise<void> {
+  async function readInner(text: string, opts?: { source?: string; paper?: string }): Promise<void> {
     const key = keyOf(text, opts?.source)
     if (isReading.value && key === currentKey.value) {
       stop()
@@ -352,12 +488,14 @@ export const useSpeechStore = defineStore('speech', () => {
       return
     }
     const chunks = chunkForSpeech(prepared, { maxChars: model.maxPromptChars ?? FALLBACK_MAX_CHARS })
-    const cfg: RequestConfig = {
-      providerId: providerId.value,
-      model: modelId.value,
-      options: effectiveOptions(model, storedOptions.value),
-    }
-    const scope = speechScope(cfg.providerId, cfg.model, cfg.options)
+    const options = readAloudOptions(model, storedOptions.value)
+    const voiceScope = speechScope(providerId.value, modelId.value, options)
+    const paper = opts?.paper || undefined
+    const cfg: RequestConfig = { providerId: providerId.value, model: modelId.value, options, voiceScope, paper }
+    // The paper is part of the engine's scope: a late prefetch of this read must keep
+    // its clip in THIS paper's folder, even if a read of another paper (same voice)
+    // has started since.
+    const scope = paper ? `${voiceScope}|paper:${paper}` : voiceScope
     if (scopeConfigs.size >= MAX_SCOPES && !scopeConfigs.has(scope)) {
       const oldest = scopeConfigs.keys().next().value
       if (oldest !== undefined) scopeConfigs.delete(oldest)
@@ -366,13 +504,18 @@ export const useSpeechStore = defineStore('speech', () => {
 
     currentKey.value = key
     activeSource.value = opts?.source ?? ''
-    engine.read(chunks, scope)
+    // The same list the engine plays (it drops blank chunks too), so a chunk index means
+    // the same thing to both.
+    const list = chunks.map((c) => c.trim()).filter(Boolean)
+    readChunks.value = list
+    engine.read(list, scope)
   }
 
   /** Stop reading and clear any error. */
   function stop() {
     readSeq++
     engine.stop()
+    readChunks.value = []
     if (state.value !== 'idle') {
       // `engine.stop()` is silent when the engine itself was idle (an error that
       // came from this store, not from playback).
@@ -393,6 +536,13 @@ export const useSpeechStore = defineStore('speech', () => {
    */
   function isReadingText(text: string, source?: string): boolean {
     return isReading.value && currentKey.value === keyOf(text, source)
+  }
+
+  /** Jump to `fraction` (0..1) of the whole read — what dragging the player's bar does (see `SpeechEngine.seek`). */
+  function seekTo(fraction: number) {
+    const target = seekTarget(readChunks.value, fraction)
+    if (!target || !engine.seek(target.index, target.fraction)) return
+    samplePlayhead()
   }
 
   function pause() { engine.pause() }
@@ -425,6 +575,7 @@ export const useSpeechStore = defineStore('speech', () => {
     save, select, setOption,
     // reading
     state, progress, errorMessage, errorReason, setupPrompt, activeSource, isReading,
-    read, stop, pause, resume, togglePause, preview, isReadingText, dismissSetup, openSettings,
+    readChunks, playhead, heard, rate, setRate, volume, setVolume,
+    read, stop, pause, resume, togglePause, seekTo, preview, isReadingText, dismissSetup, openSettings,
   }
 })

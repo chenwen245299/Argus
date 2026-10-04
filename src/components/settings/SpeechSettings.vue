@@ -5,16 +5,21 @@
  * Nothing here knows a provider. The backend lists, per provider, the speech models
  * it offers and the knobs each one takes (voice, speed, format ...) as data, and
  * this panel renders that: the provider chips come from what is configured, the
- * model list from the provider, the fields from the model. A provider that gains a
- * speech adapter shows up here, with its own fields, without this file changing.
+ * model list from the provider, the voices and speed range from the model. A
+ * provider that gains a speech adapter shows up here without this file changing.
+ *
+ * Only three things are offered — language, voice, speed (`READ_ALOUD_KEYS`);
+ * every other knob a model declares is read at its default. The language is not a
+ * setting of its own: it is the `group` of the voice options, and picking one
+ * picks that language's first voice.
  */
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { providerLogo } from '../../utils/providerLogo'
-import { charCount } from '../../utils/speechText'
-import { effectiveOptions, PREVIEW_TEXT, useSpeechStore } from '../../stores/speech'
+import { readAloudOptions, useSpeechStore } from '../../stores/speech'
 import { useSettingsStore } from '../../stores/settings'
+import type { MediaField } from '../../types'
 import MediaFieldInput from './MediaFieldInput.vue'
 
 const { t } = useI18n()
@@ -34,8 +39,46 @@ onMounted(() => {
 
 const model = computed(() => speech.selectedModel)
 const fields = computed(() => model.value?.fields ?? [])
-/** Stored values over the model's defaults: what the form shows and what a read sends. */
-const values = computed(() => effectiveOptions(model.value, speech.config.options))
+/** What a read sends, and so what the form shows. */
+const values = computed(() => readAloudOptions(model.value, speech.config.options))
+
+const voiceField = computed(() => fields.value.find((f) => f.key === 'voice' && f.kind === 'select'))
+const speedField = computed(() => fields.value.find((f) => f.key === 'speed'))
+
+/** The voices' languages, in the order the adapter lists them. */
+const languages = computed(() => {
+  const out: string[] = []
+  for (const o of voiceField.value?.options ?? []) if (o.group && !out.includes(o.group)) out.push(o.group)
+  return out
+})
+/** The language of the saved voice; only the panel's own pick when it has none. */
+const pickedLanguage = ref('')
+const language = computed(() => {
+  const voice = voiceField.value?.options?.find((o) => o.value === values.value.voice)
+  return voice?.group ?? (languages.value.includes(pickedLanguage.value) ? pickedLanguage.value : languages.value[0] ?? '')
+})
+watch(model, () => { pickedLanguage.value = '' })
+
+/** The language dropdown, built as a field so it renders exactly like the two beside it. */
+const languageField = computed<MediaField | null>(() =>
+  languages.value.length
+    ? { key: 'language', label: t('speech.language'), kind: 'select', options: languages.value.map((l) => ({ value: l, label: l })) }
+    : null,
+)
+
+/** The voice dropdown, narrowed to the chosen language. */
+const voiceFieldInLanguage = computed(() => {
+  const f = voiceField.value
+  if (!f || languages.value.length === 0) return f
+  return { ...f, label: t('speech.voice'), options: (f.options ?? []).filter((o) => o.group === language.value) }
+})
+
+function pickLanguage(lang: string) {
+  if (lang === language.value) return
+  pickedLanguage.value = lang
+  const first = voiceField.value?.options?.find((o) => o.group === lang)
+  if (first) void speech.setOption('voice', first.value)
+}
 
 /** The saved choice is no longer offered (deleted, disabled, key removed, model retired). */
 const choiceGone = computed(() => speech.notConfiguredReason === 'provider-missing')
@@ -126,24 +169,42 @@ function goProviders() { speech.openSettings('ai') }
             <option v-if="!model" value="" disabled>—</option>
             <option v-for="m in speech.selectedCapability.models" :key="m.id" :value="m.id">{{ m.displayName }}</option>
           </select>
-          <p v-if="model?.note" class="setting-hint">{{ model.note }}</p>
-          <p v-if="model?.maxPromptChars" class="setting-hint">
-            {{ t('speech.maxChars', { n: model.maxPromptChars }) }}
-          </p>
         </div>
 
-        <!-- One control per field the model declares; the backend named them. -->
-        <div v-if="model && fields.length" class="group">
-          <label class="setting-label">{{ t('speech.voiceLabel') }}</label>
-          <div class="fields">
+        <div v-if="model" class="group">
+          <div class="group-head">
+            <label class="setting-label">{{ t('speech.voiceLabel') }}</label>
+            <button class="primary-btn" :disabled="!speech.isConfigured" @click="togglePreview">
+              <Icon v-if="previewLoading" icon="fluent:spinner-ios-20-regular" class="spin" width="14" height="14" />
+              <Icon v-else-if="previewing" icon="fluent:stop-24-filled" width="14" height="14" />
+              <Icon v-else icon="fluent:speaker-2-24-regular" width="14" height="14" />
+              {{ previewLoading ? t('speech.previewing') : previewing ? t('speech.previewStop') : t('speech.preview') }}
+            </button>
+          </div>
+          <div v-if="voiceField || speedField" class="fields">
             <MediaFieldInput
-              v-for="f in fields"
-              :key="`${speech.providerId}/${speech.modelId}/${f.key}`"
-              :field="f"
-              :model-value="values[f.key]"
-              @update:model-value="speech.setOption(f.key, $event)"
+              v-if="languageField"
+              :key="`${speech.providerId}/${speech.modelId}/language`"
+              :field="languageField"
+              :model-value="language"
+              @update:model-value="pickLanguage(String($event))"
+            />
+            <MediaFieldInput
+              v-if="voiceFieldInLanguage"
+              :key="`${speech.providerId}/${speech.modelId}/voice`"
+              :field="voiceFieldInLanguage"
+              :model-value="values.voice"
+              @update:model-value="speech.setOption('voice', $event)"
+            />
+            <MediaFieldInput
+              v-if="speedField"
+              :key="`${speech.providerId}/${speech.modelId}/speed`"
+              :field="speedField"
+              :model-value="values.speed"
+              @update:model-value="speech.setOption('speed', $event)"
             />
           </div>
+          <p v-if="previewError" class="error-text">{{ previewError }}</p>
         </div>
       </div>
 
@@ -151,7 +212,6 @@ function goProviders() { speech.openSettings('ai') }
         <div class="field-row">
           <div>
             <label class="setting-label">{{ t('speech.skipCitations') }}</label>
-            <p class="setting-hint">{{ t('speech.skipCitationsHint') }}</p>
           </div>
           <label class="toggle">
             <input
@@ -162,19 +222,6 @@ function goProviders() { speech.openSettings('ai') }
             <span class="toggle-track" />
           </label>
         </div>
-
-        <div class="divider" />
-
-        <div class="preview-row">
-          <button class="primary-btn" :disabled="!speech.isConfigured" @click="togglePreview">
-            <Icon v-if="previewLoading" icon="fluent:spinner-ios-20-regular" class="spin" width="14" height="14" />
-            <Icon v-else-if="previewing" icon="fluent:stop-24-filled" width="14" height="14" />
-            <Icon v-else icon="fluent:speaker-2-24-regular" width="14" height="14" />
-            {{ previewLoading ? t('speech.previewing') : previewing ? t('speech.previewStop') : t('speech.preview') }}
-          </button>
-          <p class="setting-hint grow">{{ t('speech.previewNote', { n: charCount(PREVIEW_TEXT) }) }}</p>
-        </div>
-        <p v-if="previewError" class="error-text">{{ previewError }}</p>
       </div>
     </template>
   </div>
@@ -201,12 +248,11 @@ function goProviders() { speech.openSettings('ai') }
 }
 
 .group { display: flex; flex-direction: column; gap: 7px; }
+.group-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .field-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .setting-label { font-size: 13px; font-weight: 600; color: var(--text-primary); display: block; }
 .setting-hint { font-size: 12px; color: var(--text-tertiary); margin: 0; line-height: 1.55; }
 .setting-hint.center { text-align: center; max-width: 440px; }
-.setting-hint.grow { flex: 1; }
-.divider { height: 1px; background: var(--border-subtle); margin: 2px 0; }
 
 .state-note {
   display: flex;
@@ -261,9 +307,13 @@ function goProviders() { speech.openSettings('ai') }
 }
 .chip-logo { width: 15px; height: 15px; object-fit: contain; }
 
+/* A fixed height rather than padding: WebKit ignores a select's vertical padding,
+   so padded selects came out 20px tall beside a 31px number box. Same height as
+   `.mfi-input` in MediaFieldInput.vue. */
 .field-input {
   width: 100%;
-  padding: 7px 10px;
+  height: 30px;
+  padding: 0 10px;
   font-size: 12.5px;
   color: var(--text-primary);
   background: var(--bg-primary);
@@ -286,7 +336,6 @@ function goProviders() { speech.openSettings('ai') }
 .toggle-track::after { content: ''; position: absolute; width: 12px; height: 12px; border-radius: 50%; background: #fff; top: 3px; left: 3px; transition: left 0.15s; }
 .toggle input:checked + .toggle-track::after { left: 17px; }
 
-.preview-row { display: flex; align-items: center; gap: 12px; }
 .ghost-btn, .primary-btn {
   display: inline-flex;
   align-items: center;

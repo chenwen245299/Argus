@@ -347,7 +347,7 @@ const KIND_ICONS: Record<string, string> = {
                 class="ms-input"
                 @change="options[f.key] = ($event.target as HTMLSelectElement).value"
               >
-                <option v-for="o in f.options" :key="o.value" :value="o.value">{{ o.label }}</option>
+                <option v-for="o in f.options" :key="o.value" :value="o.value">{{ o.group ? `${o.group} · ${o.label}` : o.label }}</option>
               </select>
 
               <textarea

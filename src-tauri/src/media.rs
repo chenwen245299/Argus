@@ -103,6 +103,11 @@ pub enum FieldKind {
 pub struct FieldOption {
     pub value: String,
     pub label: String,
+    /// What the option belongs to, for a long list the UI may split in two —
+    /// a voice's language, so 朗读 settings can ask for the language first and
+    /// then list only that language's voices. `None` for ungrouped options.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub group: Option<String>,
 }
 
 impl FieldOption {
@@ -110,6 +115,13 @@ impl FieldOption {
         Self {
             value: value.to_string(),
             label: label.to_string(),
+            group: None,
+        }
+    }
+    pub fn grouped(value: &str, label: &str, group: &str) -> Self {
+        Self {
+            group: Some(group.to_string()),
+            ..Self::new(value, label)
         }
     }
     /// An option whose id is its own label — sizes, formats, sample rates.

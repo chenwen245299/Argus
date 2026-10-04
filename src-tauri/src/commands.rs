@@ -372,6 +372,42 @@ pub async fn save_note_asset(
     paper::write_note_asset(&root, &slug, &ext, &bytes)
 }
 
+/// Read-aloud audio this paper already has for one chunk (see `speech_cache`), as a
+/// data URL, or null. The read-aloud player asks before paying for a synthesis.
+#[tauri::command]
+pub async fn read_speech_audio(
+    slug: String,
+    key: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<Option<String>, String> {
+    let root = get_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(crate::speech_cache::read(&root, &slug, &key)?
+            .map(|(bytes, mime)| crate::media::to_data_url(mime, &bytes)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Keep one synthesised read-aloud chunk in the paper's `audio/` folder, so the next
+/// read of the same passage with the same voice costs nothing.
+#[tauri::command]
+pub async fn save_speech_audio(
+    slug: String,
+    key: String,
+    data_url: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (mime, bytes) =
+            crate::media::split_data_url(&data_url).map_err(|_| "Invalid audio data".to_string())?;
+        crate::speech_cache::write(&root, &slug, &key, &mime, &bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Read a note image back for display, as base64. The bytes are turned into a
 /// blob URL in the webview — they are never written into the markdown.
 #[tauri::command]

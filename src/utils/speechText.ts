@@ -428,7 +428,8 @@ function splitLine(line: string): string[] {
   return out.map((s) => s.trim()).filter(Boolean)
 }
 
-function splitSentences(text: string): string[] {
+/** Text -> sentences, by the rules above. The chunker's unit, and what the reader lights up while it is spoken. */
+export function splitSentences(text: string): string[] {
   const out: string[] = []
   for (const line of text.split(/[\r\n\u2028\u2029]+/)) {
     const flat = line.replace(/[ \t\f\v ]+/g, ' ').trim()

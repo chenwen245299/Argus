@@ -2615,7 +2615,9 @@ pub async fn read_chat_image(
     state: State<'_, LibraryRoot>,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
-    copilot::read_conversation_image(&root, &conversation_id, &file)
+    tokio::task::spawn_blocking(move || copilot::read_conversation_image(&root, &conversation_id, &file))
+        .await
+        .map_err(|e| format!("Read chat image task: {e}"))?
 }
 
 // ── M7: RAG Settings ─────────────────────────────────────────────────────────
@@ -4267,8 +4269,8 @@ pub struct AgentSettingsView {
     pub settings: crate::mcp::client::AgentSettings,
     /// How many tools the built-in library server contributes.
     pub builtin_tool_count: usize,
-    /// The prompt in force when the user has not written one, so the panel can
-    /// show it as a placeholder and offer to restore it.
+    /// Default task/tool instructions. Response style is added independently,
+    /// so copying these into a custom prompt does not pin the old style.
     pub default_system_prompt: &'static str,
     pub min_rounds: usize,
     pub max_rounds_limit: usize,
@@ -4292,12 +4294,17 @@ pub async fn agent_save_settings(
     settings: crate::mcp::client::AgentSettings,
     app: tauri::AppHandle,
 ) -> Result<AgentSettingsView, String> {
+    let previous = crate::mcp::client::read_settings(&app);
     crate::mcp::client::write_settings(&app, &settings)?;
     // The setting is read when a keepalive is armed, which happens at the end of
     // an answer — so switching it off would otherwise leave the current loop
     // pinging for up to an hour, with the indicator still breathing. Turning it
     // off has to mean "stop now", not "stop after the next answer".
-    if !settings.keep_cache_warm {
+    // A style or task-prompt change also makes the old warmed prefix obsolete.
+    if !settings.keep_cache_warm
+        || previous.response_style != settings.response_style
+        || previous.system_prompt.trim() != settings.system_prompt.trim()
+    {
         crate::cache_keepalive::disarm_and_announce(&app);
     }
     agent_get_settings(app).await

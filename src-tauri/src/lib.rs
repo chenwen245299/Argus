@@ -27,6 +27,7 @@ mod mcp;
 mod media;
 mod metadata;
 mod mimo;
+mod mimo_media;
 mod minimax;
 mod minimax_media;
 mod moleapi;

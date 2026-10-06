@@ -66,7 +66,7 @@ pub fn is_qwen(provider: &AiProvider) -> bool {
 /// OpenAI-SDK compatibility guarantees that), so both are sent and the endpoint
 /// simply ignores the one it does not read. A no-op change of headers for every
 /// other provider.
-fn openai_auth(
+pub(crate) fn openai_auth(
     req: reqwest::RequestBuilder,
     provider: &AiProvider,
     api_key: &str,

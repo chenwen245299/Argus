@@ -354,11 +354,10 @@ async function saveServerTools() {
 // ── DeepSeek file store ───────────────────────────────────────────────────────
 //
 // DeepSeek's vision models can read an image either inline or by handle. The
-// handle route is the only one that takes an image above 32 MiB and the only one
-// that survives across turns without re-sending the bytes, so the store gets its
-// own panel: what is in it, what each file costs in space, and a `file_id` to
-// paste into a request.
+// Normal chat handles uploads automatically. Manual file management is an
+// advanced panel, closed by default and loaded only when the user opens it.
 
+const dsAdvancedOpen = ref(false)
 const dsFiles = ref<DeepSeekFile[]>([])
 const dsLoading = ref(false)
 const dsUploading = ref(false)
@@ -369,6 +368,7 @@ const dsCopiedId = ref('')
 /** Seconds until an upload expires; 0 keeps it until it is deleted by hand. */
 const dsExpiry = ref(0)
 const dsFileInput = ref<HTMLInputElement | null>(null)
+let dsLoadGeneration = 0
 
 const isDeepSeekProvider = computed(() =>
   !!selectedProvider.value?.base_url.toLowerCase().includes('deepseek')
@@ -393,34 +393,47 @@ function dsDate(unixSeconds?: number | null) {
 }
 
 function resetDeepSeekFiles() {
+  dsLoadGeneration++
+  dsAdvancedOpen.value = false
+  dsLoading.value = false
   dsFiles.value = []
   dsError.value = ''
   dsHasMore.value = false
   dsCopiedId.value = ''
 }
 
+function onDeepSeekAdvancedToggle(event: Event) {
+  const panel = event.currentTarget as HTMLDetailsElement
+  if (!panel.isConnected) return
+  dsAdvancedOpen.value = panel.open
+  if (panel.open && selectedProvider.value?.has_key) void loadDeepSeekFiles()
+}
+
 /** Load a page. `append` continues after the last row instead of replacing it. */
 async function loadDeepSeekFiles(append = false) {
   const providerId = selectedId.value
   if (!providerId || !isDeepSeekProvider.value || dsLoading.value) return
+  const generation = dsLoadGeneration
   dsLoading.value = true
   dsError.value = ''
   try {
     if (!dsLimits.value) {
       dsLimits.value = await invoke<DeepSeekVisionLimits>('deepseek_vision_limits')
     }
+    if (generation !== dsLoadGeneration) return
     const page = await invoke<DeepSeekFileList>('deepseek_list_files', {
       providerId,
       after: append ? dsFiles.value[dsFiles.value.length - 1]?.id : undefined,
       limit: 50,
       order: 'desc',
     })
+    if (generation !== dsLoadGeneration) return
     dsFiles.value = append ? [...dsFiles.value, ...page.data] : page.data
     dsHasMore.value = page.has_more
   } catch (e) {
-    dsError.value = String(e)
+    if (generation === dsLoadGeneration) dsError.value = String(e)
   } finally {
-    dsLoading.value = false
+    if (generation === dsLoadGeneration) dsLoading.value = false
   }
 }
 
@@ -513,9 +526,6 @@ function selectProvider(id: string) {
   editServerTools.value = { ...DEFAULT_SERVER_TOOLS, ...(p.server_tools ?? {}) }
   editSpeech.value = { ...DEFAULT_SPEECH, ...(p.speech ?? {}) }
   resetDeepSeekFiles()
-  // Only auto-load with a key on file: without one the list call would fail and
-  // greet the user with an error box they did not ask for.
-  if (p.base_url.toLowerCase().includes('deepseek') && p.has_key) void loadDeepSeekFiles()
 }
 
 watch(() => ai.settings.providers, (providers) => {
@@ -1382,76 +1392,91 @@ function toggleCapability(form: ModelForm, cap: string) {
           </template>
         </div>
 
-        <!-- DeepSeek file store: images uploaded once and referenced by id -->
-        <div v-if="isDeepSeekProvider" class="field-group ds-files">
-          <div class="ds-files-header">
-            <div class="field-label">{{ t('aiService.dsFilesTitle') }}</div>
-            <div class="ds-files-actions">
-              <select v-model.number="dsExpiry" class="select-input xs" :title="t('aiService.dsExpiryLabel')">
-                <option v-for="opt in dsExpiryOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-              </select>
-              <button class="btn-ghost sm" :disabled="dsUploading" @click="dsFileInput?.click()">
-                {{ dsUploading ? t('aiService.dsUploading') : t('aiService.dsUpload') }}
-              </button>
-              <button class="btn-ghost sm" :disabled="dsLoading" @click="loadDeepSeekFiles(false)">
-                {{ t('aiService.dsRefresh') }}
-              </button>
-            </div>
-          </div>
-          <div class="field-note">
-            {{ dsLimits
-              ? t('aiService.dsFilesNote', {
-                  inline: Math.round(dsLimits.maxInlineImageBytes / 1024 / 1024),
-                  file: Math.round(dsLimits.maxFileImageBytes / 1024 / 1024),
-                  count: dsLimits.maxImagesPerRequest,
-                  tokens: dsLimits.tokensPerImageOriginal,
-                })
-              : t('aiService.dsFilesNoteShort') }}
-          </div>
-          <input
-            ref="dsFileInput"
-            type="file"
-            accept="image/jpeg,image/png,image/gif,image/webp"
-            multiple
-            style="display: none"
-            @change="onDeepSeekUpload"
-          />
-
-          <div v-if="dsError" class="test-result error">{{ dsError }}</div>
-
-          <div v-if="dsFiles.length === 0 && !dsLoading" class="ds-files-empty">
-            {{ t('aiService.dsFilesEmpty') }}
-          </div>
-          <div v-else class="ds-file-list">
-            <div v-for="file in dsFiles" :key="file.id" class="ds-file-row">
-              <div class="ds-file-main">
-                <span class="ds-file-name" :title="file.filename">{{ file.filename || file.id }}</span>
-                <span class="ds-file-meta">
-                  {{ dsBytes(file.bytes) }} · {{ dsDate(file.created_at) }}
-                  <template v-if="file.expires_at">
-                    · {{ t('aiService.dsExpiresAt', { at: dsDate(file.expires_at) }) }}
-                  </template>
-                </span>
-                <code class="ds-file-id">{{ file.id }}</code>
-              </div>
-              <div class="ds-file-actions">
-                <button
-                  class="btn-ghost xs"
-                  :title="t('aiService.dsCopyIdHint')"
-                  @click="copyDeepSeekFileId(file)"
-                >
-                  {{ dsCopiedId === file.id ? t('aiService.dsCopied') : t('aiService.dsCopyId') }}
+        <!-- Manual image management is optional; ordinary chat needs no setup. -->
+        <details
+          v-if="isDeepSeekProvider"
+          :key="selectedId ?? ''"
+          :open="dsAdvancedOpen"
+          class="field-group ds-advanced"
+          @toggle="onDeepSeekAdvancedToggle"
+        >
+          <summary>
+            <Icon icon="fluent:chevron-right-16-regular" class="ds-advanced-chevron" width="14" height="14" />
+            {{ t('aiService.dsAdvanced') }}
+          </summary>
+          <div v-if="dsAdvancedOpen" class="ds-files">
+            <div class="ds-files-header">
+              <div class="field-label">{{ t('aiService.dsFilesTitle') }}</div>
+              <div class="ds-files-actions">
+                <select v-model.number="dsExpiry" class="select-input xs" :title="t('aiService.dsExpiryLabel')">
+                  <option v-for="opt in dsExpiryOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+                </select>
+                <button class="btn-ghost sm" :disabled="dsUploading" @click="dsFileInput?.click()">
+                  {{ dsUploading ? t('aiService.dsUploading') : t('aiService.dsUpload') }}
                 </button>
-                <button class="btn-ghost xs danger" @click="deleteDeepSeekFile(file)">
-                  {{ t('aiService.dsDelete') }}
+                <button class="btn-ghost sm" :disabled="dsLoading" @click="loadDeepSeekFiles(false)">
+                  {{ t('aiService.dsRefresh') }}
                 </button>
               </div>
             </div>
+            <div class="field-note">
+              {{ dsLimits
+                ? t('aiService.dsFilesNote', {
+                    inline: Math.round(dsLimits.maxInlineImageBytes / 1024 / 1024),
+                    file: Math.round(dsLimits.maxFileImageBytes / 1024 / 1024),
+                    count: dsLimits.maxImagesPerRequest,
+                    tokens: dsLimits.tokensPerImageOriginal,
+                  })
+                : t('aiService.dsFilesNoteShort') }}
+            </div>
+            <input
+              ref="dsFileInput"
+              type="file"
+              accept="image/jpeg,image/png,image/gif,image/webp"
+              multiple
+              style="display: none"
+              @change="onDeepSeekUpload"
+            />
+
+            <div v-if="dsError" class="test-result error">{{ dsError }}</div>
+
+            <div v-if="dsLoading && dsFiles.length === 0" class="ds-files-empty" role="status">
+              {{ t('aiService.dsFilesLoading') }}
+            </div>
+            <div v-else-if="dsFiles.length === 0" class="ds-files-empty">
+              {{ t('aiService.dsFilesEmpty') }}
+            </div>
+            <div v-else class="ds-file-list">
+              <div v-for="file in dsFiles" :key="file.id" class="ds-file-row">
+                <div class="ds-file-main">
+                  <span class="ds-file-name" :title="file.filename">{{ file.filename || file.id }}</span>
+                  <span class="ds-file-meta">
+                    {{ dsBytes(file.bytes) }} · {{ dsDate(file.created_at) }}
+                    <template v-if="file.expires_at">
+                      · {{ t('aiService.dsExpiresAt', { at: dsDate(file.expires_at) }) }}
+                    </template>
+                  </span>
+                  <code class="ds-file-id">{{ file.id }}</code>
+                </div>
+                <div class="ds-file-actions">
+                  <button
+                    class="btn-ghost xs"
+                    :title="t('aiService.dsCopyIdHint')"
+                    @click="copyDeepSeekFileId(file)"
+                  >
+                    {{ dsCopiedId === file.id ? t('aiService.dsCopied') : t('aiService.dsCopyId') }}
+                  </button>
+                  <button class="btn-ghost xs danger" @click="deleteDeepSeekFile(file)">
+                    {{ t('aiService.dsDelete') }}
+                  </button>
+                </div>
+              </div>
+            </div>
+            <button v-if="dsHasMore" class="btn-ghost sm" :disabled="dsLoading" @click="loadDeepSeekFiles(true)">
+              {{ t('aiService.dsLoadMore') }}
+            </button>
           </div>
-          <button v-if="dsHasMore" class="btn-ghost sm" :disabled="dsLoading" @click="loadDeepSeekFiles(true)">
-            {{ t('aiService.dsLoadMore') }}
-          </button>
-        </div>
+        </details>
 
         <!-- Fetch model selection dialog -->
         <Transition name="fetch-dialog">
@@ -2298,11 +2323,36 @@ function toggleCapability(form: ModelForm, cap: string) {
 }
 
 /* ── DeepSeek file store ──────────────────────────────────────────────────── */
+.ds-advanced {
+  padding-top: 10px;
+  border-top: 1px solid var(--border-default);
+}
+.ds-advanced > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  list-style: none;
+}
+.ds-advanced > summary::-webkit-details-marker { display: none; }
+.ds-advanced > summary:hover { color: var(--text-primary); }
+.ds-advanced > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+.ds-advanced-chevron { flex-shrink: 0; }
+.ds-advanced[open] .ds-advanced-chevron { transform: rotate(90deg); }
+.ds-files { margin-top: 10px; }
 .ds-files-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  flex-wrap: wrap;
 }
 .ds-files-actions {
   display: flex;

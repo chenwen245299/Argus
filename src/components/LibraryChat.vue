@@ -14,6 +14,8 @@ import WriteConfirmCard from './WriteConfirmCard.vue'
 import { buildToolExchangeMessages } from '../utils/agentHistory'
 import WindowControls from './WindowControls.vue'
 import ChatPageImage from './ChatPageImage.vue'
+import ChatSentImages from './ChatSentImages.vue'
+import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../types/chatImages'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
 import { sortPapersByRecentAccess } from '../utils/recentPapers'
@@ -113,17 +115,6 @@ interface AgentStep {
   previewClipped?: boolean
   /** Page images rendered by `view_paper_page`, shown beneath the row. */
   images?: AgentStepImage[]
-}
-
-/** One page image a `view_paper_page` call rendered. */
-interface AgentStepImage {
-  slug: string
-  page: number
-  /** Filename in the conversation's image folder; used to reload after saving. */
-  file?: string
-  /** Live data URL for immediate display; dropped before the conversation is
-   *  saved (the PNG lives on disk under `file`) and reloaded on demand. */
-  dataUrl?: string
 }
 
 interface LibraryAnswerVariant {
@@ -286,7 +277,7 @@ interface AgentEventPayload {
   preview?: string
   /** Whether `preview` is only part of what the model received. */
   truncated?: boolean
-  /** `result` phase, `view_paper_page` only: the rendered page images. */
+  /** `result` phase: viewed pages or images sent into the answer. */
   images?: AgentStepImage[] | null
   /** `servers` phase: how many extra tools the external servers contributed. */
   extraTools?: number
@@ -1968,6 +1959,10 @@ async function runAssistantRequest(
         step.truncated = p.truncated
         if (p.images?.length) step.images = p.images
       }
+      if (p.images?.length) {
+        persistConvSoon(conv, streamEpoch)
+        if (activeConvId.value === conv?.id) scrollToBottom()
+      }
     }
   }))
 
@@ -2839,7 +2834,7 @@ onUnmounted(() => {
                           <span v-if="step.chars" class="agent-step-size">{{ formatChars(step.chars) }}</span>
                         </button>
 
-                        <div v-if="step.images?.length" class="agent-step-images">
+                        <div v-if="step.images?.length && step.tool !== SEND_PAPER_IMAGE_TOOL" class="agent-step-images">
                           <ChatPageImage
                             v-for="img in step.images"
                             :key="`${img.slug}-${img.page}-${img.file || ''}`"
@@ -2917,6 +2912,11 @@ onUnmounted(() => {
                       <MarkdownBody :content="activeAnswer(msg).content" />
                     </template>
                     <ServerToolTraceCard :trace="activeAnswer(msg).serverTools" />
+                    <ChatSentImages
+                      :conversation-id="activeConvId"
+                      :steps="activeAnswer(msg).agentSteps"
+                      @open="previewImage = $event"
+                    />
                     <!-- An end-to-end speech model's spoken reply. The text above
                          is its transcript, so this is an addition, not the answer. -->
                     <div v-if="activeAnswer(msg).audioUrl" class="answer-audio">
@@ -3918,7 +3918,7 @@ onUnmounted(() => {
   flex-direction: column;
   justify-content: center;
   align-items: flex-start;
-  gap: 7px;
+  gap: 2px;
   padding: 16px 0;
   overflow: hidden;
   pointer-events: none;   /* only the ticks are interactive */

@@ -45,6 +45,7 @@ const SERVERS_KEY: &str = "mcp_external_servers";
 const ROUNDS_KEY: &str = "agent_max_rounds";
 const KEEP_WARM_KEY: &str = "agent_keep_cache_warm";
 const SYSTEM_PROMPT_KEY: &str = "agent_system_prompt";
+const RESPONSE_STYLE_KEY: &str = "agent_response_style";
 
 /// A server that refuses to start must not hold the answer hostage.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -88,6 +89,16 @@ impl ExternalServer {
     }
 }
 
+/// Default answer depth shared by paper AI, library chat and its plain fallback.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseStyle {
+    #[default]
+    Concise,
+    Standard,
+    Detailed,
+}
+
 /// Everything the 智能问答 settings tab owns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +114,8 @@ pub struct AgentSettings {
     /// instructions at all.
     #[serde(default)]
     pub system_prompt: String,
+    #[serde(default)]
+    pub response_style: ResponseStyle,
     pub servers: Vec<ExternalServer>,
 }
 
@@ -112,6 +125,7 @@ impl Default for AgentSettings {
             max_rounds: crate::copilot::DEFAULT_AGENT_ROUNDS,
             keep_cache_warm: true,
             system_prompt: String::new(),
+            response_style: ResponseStyle::default(),
             servers: Vec::new(),
         }
     }
@@ -140,6 +154,10 @@ pub fn read_settings(app: &tauri::AppHandle) -> AgentSettings {
             .get(SYSTEM_PROMPT_KEY)
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default(),
+        response_style: store
+            .get(RESPONSE_STYLE_KEY)
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default(),
         servers,
     }
 }
@@ -164,6 +182,7 @@ pub fn write_settings(app: &tauri::AppHandle, settings: &AgentSettings) -> Resul
         serde_json::json!(crate::copilot::clamp_agent_rounds(Some(settings.max_rounds))),
     );
     store.set(KEEP_WARM_KEY, serde_json::json!(settings.keep_cache_warm));
+    store.set(RESPONSE_STYLE_KEY, serde_json::json!(settings.response_style));
     // Stored trimmed: trailing whitespace would change the prompt bytes and so
     // the cached prefix, for no visible difference.
     store.set(
@@ -711,7 +730,7 @@ mod wire_tests {
         }
 
         // And the round-trip the save command performs.
-        for key in ["keepCacheWarm", "systemPrompt", "defaultSystemPrompt"] {
+        for key in ["keepCacheWarm", "systemPrompt", "defaultSystemPrompt", "responseStyle"] {
             assert!(json.get(key).is_some(), "missing '{key}' in {json}");
         }
 
@@ -726,5 +745,26 @@ mod wire_tests {
         assert_eq!(parsed.servers[0].env.get("K").map(String::as_str), Some("v"));
         assert!(!parsed.keep_cache_warm);
         assert_eq!(parsed.system_prompt, "Answer in haiku.");
+        assert_eq!(parsed.response_style, super::ResponseStyle::Concise,
+            "settings saved before response styles existed must remain concise");
+        assert_eq!(json["responseStyle"], "concise");
+    }
+
+    #[test]
+    fn all_response_styles_round_trip_without_changing_other_preferences() {
+        for (name, style) in [
+            ("concise", super::ResponseStyle::Concise),
+            ("standard", super::ResponseStyle::Standard),
+            ("detailed", super::ResponseStyle::Detailed),
+        ] {
+            let sent = serde_json::json!({
+                "maxRounds": 12, "keepCacheWarm": false,
+                "systemPrompt": "Answer in haiku.", "servers": [],
+                "responseStyle": name,
+            });
+            let parsed: super::AgentSettings = serde_json::from_value(sent.clone()).unwrap();
+            assert_eq!(parsed.response_style, style);
+            assert_eq!(serde_json::to_value(parsed).unwrap(), sent);
+        }
     }
 }

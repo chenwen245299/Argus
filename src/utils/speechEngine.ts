@@ -1,6 +1,6 @@
 /**
  * Read-aloud playback: turns a list of text chunks into one continuous stretch of
- * audio, one speech request at a time.
+ * audio, requesting speech in short chunks.
  *
  * Pure TypeScript with everything environmental injected — the synthesiser (a
  * Tauri `invoke` in the app), the audio element (`new Audio()` in the app) and
@@ -8,10 +8,10 @@
  *
  * What it guarantees, and why each matters here:
  *
- * - ONE persistent audio element, reused for every chunk by swapping `src`.
- *   Older WebKits decide whether sound may start per element, so a fresh element
- *   per chunk would need a fresh user gesture each time and the second chunk
- *   could be silent; one element is unlocked once and plays them all.
+ * - TWO persistent audio elements, both unlocked by the initial user gesture.
+ *   The spare loads the next clip during playback and then becomes the player,
+ *   avoiding source loading/decoding at the boundary. Older WebKits decide whether
+ *   sound may start per element, so no fresh element is created between chunks.
  * - Synthesis is billed per character, so nothing is requested twice: a finished
  *   chunk goes into an LRU cache, an in-flight request is shared by whoever asks
  *   for the same text next, and a stopped-then-restarted selection costs nothing
@@ -276,13 +276,18 @@ interface Flight {
 
 interface Run {
   chunks: string[]
+  input: {
+    next?: () => Promise<readonly string[] | null>
+    pending?: Promise<void>
+    finished: boolean
+  }
   scope: string
   dead: boolean
   held: Set<Flight>
 }
 
 interface Slot {
-  promise: Promise<SynthResult>
+  promise: Promise<SynthResult | null>
   /** Already resolved when it was asked for (a cache hit) or since. */
   done: boolean
 }
@@ -290,6 +295,8 @@ interface Slot {
 export class SpeechEngine {
   private deps: SpeechEngineDeps
   private audio: AudioLike | null = null
+  private spareAudio: AudioLike | null = null
+  private prepared: { run: Run; index: number; audio: AudioLike } | null = null
   private cache = new Map<string, SynthResult>()
   private inflight = new Map<string, Flight>()
   private run: Run | null = null
@@ -328,7 +335,7 @@ export class SpeechEngine {
   /**
    * Call this SYNCHRONOUSLY from the click handler, before anything is awaited.
    *
-   * Starts a silent clip on the persistent element (see `SILENT_WAV`), so a
+   * Starts a silent clip on both persistent elements (see `SILENT_WAV`), so a
    * WebView that wants a user gesture for sound sees the element user-started
    * before the real `play()` seconds later. A rejection here is expected outside
    * a gesture and is swallowed — if playback really is blocked, the real `play()`
@@ -339,33 +346,44 @@ export class SpeechEngine {
    */
   unlock(): void {
     if (this.isReading) return
-    try {
-      const audio = this.ensureAudio()
-      audio.src = SILENT_WAV
-      this.clipIndex = -1
-      const p = audio.play()
-      if (p && typeof (p as Promise<void>).catch === 'function') (p as Promise<void>).catch(() => {})
-    } catch { /* unlocking is best effort */ }
+    this.ensureAudio()
+    for (const audio of [this.audio, this.spareAudio]) {
+      try {
+        if (!audio) continue
+        audio.src = SILENT_WAV
+        const p = audio.play()
+        if (p && typeof (p as Promise<void>).catch === 'function') (p as Promise<void>).catch(() => {})
+      } catch { /* unlocking is best effort */ }
+    }
+    this.clipIndex = -1
   }
 
   /**
    * Start reading `chunks`. Replaces any read in progress. `scope` identifies the
    * provider, model and options (see `speechScope`) so cached audio is only reused
-   * for the same voice.
+   * for the same voice. Optional `next` supplies local text a page at a time,
+   * returning null at the end; it is pulled only when the lookahead reaches the
+   * end of the chunks already prepared. Seeking shares the same pending pull.
    */
-  read(chunks: string[], scope: string): void {
+  read(chunks: string[], scope: string, options: {
+    next?: () => Promise<readonly string[] | null>
+    startPaused?: boolean
+    startAt?: { index: number; fraction: number }
+  } = {}): void {
     this.invalidate()
     const items = chunks.map((c) => c.trim()).filter(Boolean)
     if (items.length === 0) {
       this.emit('idle', { index: 0, total: 0, reason: 'finished' })
       return
     }
-    const run: Run = { chunks: items, scope, dead: false, held: new Set() }
+    const run: Run = { chunks: items, input: { next: options.next, finished: !options.next }, scope, dead: false, held: new Set() }
     this.run = run
-    this.emit('loading', { index: 0, total: items.length })
+    this.lastIndex = options.startAt?.index ?? 0
+    this.startAt = options.startAt ?? null
+    this.emit('loading', { index: this.lastIndex, total: items.length })
     // `drive` reports its own failures as an error state; this catch is the last
     // line of defence so nothing can become an unhandled rejection.
-    this.drive(run).catch((err) => this.fail(run, 0, err))
+    this.drive(run, this.lastIndex, options.startPaused).catch((err) => this.fail(run, this.lastIndex, err))
   }
 
   pause(): boolean {
@@ -405,6 +423,7 @@ export class SpeechEngine {
     if (!Number.isFinite(rate) || rate <= 0) return
     this.rate = rate
     if (this.audio) this.applyRate(this.audio)
+    if (this.spareAudio) this.applyRate(this.spareAudio)
   }
 
   /** Louder or quieter, 0..1. Applies at once, to this clip and every later one. */
@@ -412,6 +431,7 @@ export class SpeechEngine {
     if (!Number.isFinite(volume)) return
     this.volume = Math.min(1, Math.max(0, volume))
     if (this.audio) this.applyVolume(this.audio)
+    if (this.spareAudio) this.applyVolume(this.spareAudio)
   }
 
   private applyVolume(audio: AudioLike): void {
@@ -478,7 +498,7 @@ export class SpeechEngine {
     }
     const paused = this.current === 'paused'
     this.invalidate()
-    const next: Run = { chunks: run.chunks, scope: run.scope, dead: false, held: new Set() }
+    const next: Run = { chunks: run.chunks, input: run.input, scope: run.scope, dead: false, held: new Set() }
     this.run = next
     this.startAt = f > 0 ? { index: i, fraction: f } : null
     this.drive(next, i, paused).catch((err) => this.fail(next, i, err))
@@ -494,6 +514,7 @@ export class SpeechEngine {
   dispose(): void {
     this.stop()
     this.audio = null
+    this.spareAudio = null
     this.clearCache()
   }
 
@@ -506,6 +527,11 @@ export class SpeechEngine {
       this.audio = this.deps.createAudio()
       this.applyRate(this.audio)
       this.applyVolume(this.audio)
+    }
+    if (!this.spareAudio) {
+      this.spareAudio = this.deps.createAudio()
+      this.applyRate(this.spareAudio)
+      this.applyVolume(this.spareAudio)
     }
     return this.audio
   }
@@ -540,28 +566,66 @@ export class SpeechEngine {
   /** Stop sound and release the clip's memory, without leaving an error event behind. */
   private silence(): void {
     this.clipIndex = -1
-    const audio = this.audio
-    if (!audio) return
-    try { audio.pause() } catch { /* ignore */ }
+    this.prepared = null
+    for (const audio of [this.audio, this.spareAudio]) {
+      if (!audio) continue
+      try { audio.pause() } catch { /* ignore */ }
+      try {
+        if (audio.removeAttribute) audio.removeAttribute('src')
+        else audio.src = ''
+        audio.load?.()
+      } catch { /* ignore */ }
+    }
+  }
+
+  private async ensureChunk(run: Run, index: number): Promise<boolean> {
+    const input = run.input
+    while (!run.dead && index >= run.chunks.length && !input.finished) {
+      if (!input.pending) {
+        input.pending = Promise.resolve().then(async () => {
+          const more = await input.next!()
+          if (more === null) input.finished = true
+          else run.chunks.push(...more.map(c => c.trim()).filter(Boolean))
+        }).finally(() => { input.pending = undefined })
+      }
+      await input.pending
+    }
+    return !run.dead && index < run.chunks.length
+  }
+
+  private nextClip(run: Run, index: number): Slot {
+    if (index < run.chunks.length) return this.fetchClip(run, index)
+    const slot: Slot = {
+      done: run.input.finished,
+      promise: this.ensureChunk(run, index).then(ok => ok ? this.fetchClip(run, index).promise : null),
+    }
+    slot.promise.then(() => { slot.done = true }, () => { slot.done = true })
+    return slot
+  }
+
+  private preloadClip(run: Run, clip: SynthResult, index: number): void {
+    if (run.dead || !this.spareAudio) return
     try {
-      if (audio.removeAttribute) audio.removeAttribute('src')
-      else audio.src = ''
+      const audio = this.spareAudio
+      audio.src = clip.dataUrl
+      this.applyRate(audio)
+      this.applyVolume(audio)
       audio.load?.()
-    } catch { /* ignore */ }
+      this.prepared = { run, index, audio }
+    } catch { /* playClip can load it normally if preloading was refused */ }
   }
 
   /** Read `run` from chunk `from` (a seek starts later than 0), the first clip held paused if `startPaused`. */
   private async drive(run: Run, from = 0, startPaused = false): Promise<void> {
-    const total = run.chunks.length
-    let slot: Slot | null = this.fetchClip(run, from)
-    for (let i = from; i < total; i++) {
-      if (run.dead || !slot) return
+    let slot = this.fetchClip(run, from)
+    for (let i = from; ; i++) {
+      if (run.dead) return
       this.lastIndex = i
       // Only say "loading" when there is actually something to wait for: between
       // two chunks the next one is normally already here, and flashing the
       // spinner every ten seconds would be noise.
-      if (!slot.done && this.current !== 'loading') this.emit('loading', { index: i, total })
-      let clip: SynthResult
+      if (!slot.done && this.current !== 'loading') this.emit('loading', { index: i, total: run.chunks.length })
+      let clip: SynthResult | null
       try {
         clip = await slot.promise
       } catch (err) {
@@ -569,8 +633,10 @@ export class SpeechEngine {
         return
       }
       if (run.dead) return
+      if (!clip) break
       // One ahead, started before this chunk plays so the two overlap.
-      slot = i + 1 < total ? this.fetchClip(run, i + 1) : null
+      slot = this.nextClip(run, i + 1)
+      slot.promise.then(next => { if (next) this.preloadClip(run, next, i + 1) }, () => {})
       try {
         await this.playClip(run, clip, i, startPaused && i === from)
       } catch (err) {
@@ -584,6 +650,7 @@ export class SpeechEngine {
     for (const f of run.held) f.refs.delete(run)
     run.held.clear()
     this.silence()
+    const total = run.chunks.length
     this.emit('idle', { index: total - 1, total, reason: 'finished' })
   }
 
@@ -642,7 +709,12 @@ export class SpeechEngine {
     flight.refs.add(run)
     run.held.add(flight)
     const slot: Slot = { promise: flight.promise, done: false }
-    flight.promise.then(() => { slot.done = true }, () => { slot.done = true })
+    const release = () => {
+      slot.done = true
+      flight!.refs.delete(run)
+      run.held.delete(flight!)
+    }
+    flight.promise.then(release, release)
     return slot
   }
 
@@ -723,12 +795,18 @@ export class SpeechEngine {
   }
 
   /**
-   * Play one clip on the persistent element; resolves when it ends, rejects on failure.
+   * Play one clip, reusing the preloaded spare when available; resolves at its end.
    * `paused`: load it and wait for `resume()` (a seek made while paused).
    */
   private playClip(run: Run, clip: SynthResult, index: number, paused = false): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const audio = this.ensureAudio()
+      let audio = this.ensureAudio()
+      const prepared = this.prepared
+      if (prepared?.run === run && prepared.index === index) {
+        this.spareAudio = audio
+        this.audio = audio = prepared.audio
+        this.prepared = null
+      }
       let settled = false
       const cleanup = () => {
         audio.removeEventListener('ended', onEnded)
@@ -758,7 +836,7 @@ export class SpeechEngine {
       audio.addEventListener('ended', onEnded)
       audio.addEventListener('error', onError)
       try {
-        audio.src = clip.dataUrl
+        if (audio.src !== clip.dataUrl) audio.src = clip.dataUrl
         this.clipIndex = index
         this.applyRate(audio)
         if (this.startAt?.index === index) {

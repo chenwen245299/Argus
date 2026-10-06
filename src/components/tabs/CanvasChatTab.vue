@@ -19,6 +19,8 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useAiStore, type ModelOption } from '../../stores/ai'
 import { useCanvasStore } from '../../stores/canvas'
 import MarkdownBody from '../MarkdownBody.vue'
+import ChatSentImages from '../ChatSentImages.vue'
+import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import CanvasEditConfirmCard from '../CanvasEditConfirmCard.vue'
 import ProviderBalanceTag from '../ProviderBalanceTag.vue'
@@ -40,6 +42,7 @@ interface AgentStep {
   tool: string
   args: string
   ok?: boolean
+  images?: AgentStepImage[]
 }
 
 interface CanvasMessage {
@@ -75,6 +78,7 @@ const historyOpen = ref(false)
 const model = ref<ModelSelection | null>(null)
 const messagesEl = ref<HTMLElement | null>(null)
 const errorText = ref('')
+const previewImage = ref<string | null>(null)
 
 // A write the agent asked for, waiting on the user. Two shapes share the queue:
 // a note (the same card the library chat uses) and a canvas edit (drawn on the
@@ -183,7 +187,13 @@ function persistable(list: CanvasConversation[]) {
     .filter(c => c.messages.length > 0)
     .map(c => ({
       ...c,
-      messages: c.messages.map(({ streaming: _streaming, displayContent: _display, ...m }) => m),
+      messages: c.messages.map(({ streaming: _streaming, displayContent: _display, ...m }) => ({
+        ...m,
+        steps: m.steps?.map(step => ({
+          ...step,
+          images: step.images?.map(({ dataUrl: _liveOnly, ...image }) => image),
+        })),
+      })),
     }))
 }
 
@@ -307,7 +317,10 @@ async function send() {
     live.serverTools = mergeServerToolTrace(live.serverTools, e.payload)
   }))
 
-  unlisteners.push(await listen<{ phase?: string; tool?: string; arguments?: unknown; ok?: boolean }>(
+  unlisteners.push(await listen<{
+    phase?: string; tool?: string; arguments?: unknown; ok?: boolean
+    images?: AgentStepImage[] | null
+  }>(
     `${eventName}-agent`,
     (e) => {
       const p = e.payload
@@ -318,7 +331,14 @@ async function send() {
         scrollToBottom()
       } else if (p.phase === 'result') {
         const step = [...(live.steps ?? [])].reverse().find(s => s.tool === p.tool && s.ok === undefined)
-        if (step) step.ok = p.ok ?? true
+        if (step) {
+          step.ok = p.ok ?? true
+          if (p.images?.length) {
+            step.images = p.images
+            scheduleSave()
+            if (activeConvId.value === conv.id) scrollToBottom()
+          }
+        }
       }
     },
   ))
@@ -387,7 +407,10 @@ async function send() {
     conv.updatedAt = new Date().toISOString()
     // An answer that produced nothing at all (stopped immediately) would leave
     // an empty bubble behind.
-    if (!live.content.trim() && !live.error) {
+    const hasImages = live.steps?.some(step =>
+      step.tool === SEND_PAPER_IMAGE_TOOL && step.ok === true && step.images?.length,
+    )
+    if (!live.content.trim() && !live.error && !hasImages) {
       conv.messages = conv.messages.filter(m => m.id !== live.id)
     }
     scheduleSave()
@@ -678,6 +701,11 @@ onUnmounted(() => {
           </div>
           <div class="cc-answer" :class="{ error: msg.error }">
             <MarkdownBody :content="streamText(msg)" :streaming="msg.streaming" />
+            <ChatSentImages
+              :conversation-id="activeConvId"
+              :steps="msg.steps"
+              @open="previewImage = $event"
+            />
             <span v-if="msg.streaming && !streamText(msg)" class="cc-thinking">{{ t('canvasChat.thinking') }}</span>
             <ServerToolTraceCard :trace="msg.serverTools" />
           </div>
@@ -728,9 +756,46 @@ onUnmounted(() => {
       </div>
     </div>
   </div>
+  <Teleport to="body">
+    <div v-if="previewImage" class="cc-image-lightbox" @click.self="previewImage = null">
+      <img :src="previewImage" :alt="t('chat.imageEnlarge')" />
+      <button type="button" :title="t('chat.imageClose')" @click="previewImage = null">
+        <Icon icon="fluent:dismiss-24-regular" width="20" height="20" />
+      </button>
+    </div>
+  </Teleport>
 </template>
 
 <style scoped>
+.cc-image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.65);
+}
+.cc-image-lightbox img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--radius-md);
+}
+.cc-image-lightbox button {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
 .cc-root {
   position: relative;
   display: flex;

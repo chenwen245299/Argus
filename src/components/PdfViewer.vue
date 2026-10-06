@@ -54,6 +54,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { runTranslation, triggerAskAi } from '../stores/translationHistory'
 import { openAddSnippetModal } from '../stores/snippetLibrary'
 import { useSpeechStore } from '../stores/speech'
+import { pdfSpeechText } from '../utils/speechPages'
 import { spokenSentences, locateSentences, sentenceAt, lineBands, type SpokenSentence, type TextRange } from '../utils/speechFollow'
 import {
   spansFromTextLayer, selectedTextBySpan, planFurnitureDropReport, keptSelectionTextAcrossPages,
@@ -904,6 +905,7 @@ async function showViewer() {
 // Fires when the tab is closed (removed from the open-tabs list) — the PDF is
 // fully released here.
 onUnmounted(() => {
+  if (speech.isReadingPaper(props.slug)) speech.stop()
   removeGlobalListeners()
   teardownRenderScheduling()
   dprQuery?.removeEventListener('change', onDevicePixelRatioChange)
@@ -950,11 +952,45 @@ function readAloudSelection(source: 'pdf' | 'ebook') {
   // The page text the selection came from, so the sentence being spoken can be lit on the page.
   const pageText = popupSource ? captureReadingText(popupSource.range, popupSource.skip) : null
   selectionPopup.value = null
+  clearReading()
   readingTrack = pageText ? { text, source, pageText } : null
   void speech.read(text, { source, paper: props.slug })
   // The selection's own tint would sit under the sentence being lit; the popup is gone, so is it.
   if (pageText) window.getSelection()?.removeAllRanges()
 }
+
+const readingPaper = computed(() => speech.isReadingPaper(props.slug))
+
+/** Capture this tab and page at the click; text extraction never follows a newly active tab. */
+function readAloudFromPage() {
+  if (readingPaper.value) { speech.stop(); return }
+  const doc = pdfDoc.value
+  if (!doc) return
+  clearReading()
+  const startPage = displayPage.value
+  lastReadPage = startPage
+  void speech.readPages({
+    paper: props.slug, startPage, endPage: doc.numPages,
+    getText: async (page) => {
+      if (pdfDoc.value !== doc || renderingTornDown) throw new Error(t('pdf.readDocumentClosed'))
+      const cached = pageTextSources.get(page - 1)?.content
+      const content = cached ?? await (await doc.getPage(page)).getTextContent()
+      return pdfSpeechText(content.items)
+    },
+  })
+}
+
+// Advance with the voice, only when this tab is visible. A late render cannot pull the
+// viewport back after a seek or after the user has stopped/replaced this read.
+let lastReadPage = 0
+watch(() => [speech.pageProgress?.page, speech.state, isActiveTab.value] as const, ([page, state, active]) => {
+  if (!page || !active || !readingPaper.value || (state !== 'playing' && state !== 'paused')) return
+  if (page === lastReadPage) return
+  lastReadPage = page
+  void ensurePageRendered(page - 1).then(() => {
+    if (isActiveTab.value && readingPaper.value && speech.pageProgress?.page === page) jumpToPage(page)
+  })
+})
 
 // ── Read aloud: the sentence being spoken, lit on the page ───────────────────
 // A read started here is followed sentence by sentence (utils/speechFollow.ts): its sentences
@@ -1083,8 +1119,11 @@ function drawReadingHighlight(container: HTMLDivElement, pageIndex: number) {
 }
 
 // A new read (here or anywhere), a stop, the end: `readChunks` changes with each.
-watch(() => speech.readChunks, (chunks) => {
+watch(() => [speech.readChunks, speech.activeSource, speech.isReading] as const, ([chunks]) => {
   const track = readingTrack
+  // The store cancels the previous read before awaiting configuration. Keep this
+  // new selection's geometry while its first chunks are still being prepared.
+  if (track && !chunks.length && speech.state === 'loading' && speech.isReadingText(track.text, track.source)) return
   if (!track || chunks.length === 0 || !speech.isReadingText(track.text, track.source)) {
     if (readingSentences || readingTrack) clearReading()
     return
@@ -3357,6 +3396,18 @@ function triggerInitialRender() {
 
       <div class="toolbar-spacer" />
 
+      <button
+        class="related-btn read-page-btn"
+        :class="{ active: readingPaper }"
+        :disabled="!pdfDoc || loading || !!error"
+        :aria-pressed="readingPaper"
+        :title="readingPaper ? t('pdf.readAloudStop') : t('pdf.readFromPage', { page: displayPage })"
+        @click="readAloudFromPage"
+      >
+        <Icon :icon="readingPaper ? 'fluent:stop-20-filled' : 'fluent:speaker-2-20-regular'" width="15" height="15" />
+        <span>{{ readingPaper ? t('pdf.readAloudStop') : t('pdf.readAloud') }}</span>
+      </button>
+
       <button class="related-btn" :title="t('citeGraph.buttonTitle')" @click="openCitationGraph">
         <span class="related-btn-icon" aria-hidden="true">
           <Icon v-if="citationEmojiIcon" :icon="citationEmojiIcon" width="15" height="15" />
@@ -3711,6 +3762,8 @@ function triggerInitialRender() {
   transition: background 0.1s;
 }
 .related-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+.read-page-btn.active { background: var(--accent-light); border-color: var(--accent); color: var(--accent); }
+.read-page-btn:disabled { opacity: 0.45; cursor: default; }
 .related-btn-icon {
   width: 15px;
   height: 15px;

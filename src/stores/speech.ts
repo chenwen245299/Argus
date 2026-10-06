@@ -6,6 +6,7 @@ import { useSettingsStore } from './settings'
 import { useAiStore } from './ai'
 import { prepareSpeechText, chunkForSpeech } from '../utils/speechText'
 import { readFraction, seekTarget } from '../utils/speechFollow'
+import { SpeechPages } from '../utils/speechPages'
 import {
   SpeechEngine, speechScope, speechCacheKey,
   type SpeechState, type SpeechInfo, type SpeechErrorReason, type SynthResult, type SynthSignal,
@@ -52,6 +53,19 @@ interface RequestConfig {
   voiceScope: string
   /** The paper read from: its `audio/` folder keeps every clip (see `synthesizeChunk`). */
   paper?: string
+}
+
+export interface ReadPagesOptions {
+  paper: string
+  startPage: number
+  endPage: number
+  getText: (page: number) => Promise<string>
+}
+
+interface ReadConfig {
+  scope: string
+  maxChars: number
+  skipCitations: boolean
 }
 
 /** Used when a model does not declare `maxPromptChars`: short enough for any speech API. */
@@ -270,10 +284,11 @@ export const useSpeechStore = defineStore('speech', () => {
   const state = ref<SpeechState>('idle')
   const progress = ref({ index: 0, total: 0 })
   const errorMessage = ref('')
-  const errorReason = ref<SpeechErrorReason | 'empty' | 'capabilities' | null>(null)
+  const errorReason = ref<SpeechErrorReason | 'empty' | 'capabilities' | 'text' | null>(null)
   const setupPrompt = ref<{ reason: SpeechSetupReason } | null>(null)
   /** Who started the current read (`opts.source`), for the UI. */
   const activeSource = ref('')
+  const activePaper = ref('')
   const isReading = computed(() => state.value === 'loading' || state.value === 'playing' || state.value === 'paused')
   /**
    * The chunks of the read in progress (one speech request each), exactly as the engine
@@ -284,7 +299,21 @@ export const useSpeechStore = defineStore('speech', () => {
   /** Where the read in progress is: the chunk, and how much of its clip has played (0..1). */
   const playhead = ref({ index: 0, fraction: 0 })
   /** How much of the read in progress has been heard, 0..1, each chunk weighted by its length. */
-  const heard = computed(() => readFraction(readChunks.value, playhead.value.index, playhead.value.fraction))
+  const pagedRead = shallowRef<{ input: SpeechPages; options: ReadPagesOptions; config: ReadConfig } | null>(null)
+  const pageProgress = computed(() => {
+    const read = pagedRead.value
+    if (!read) return null
+    // readChunks changes when a lazy page arrives; the class itself is deliberately non-reactive.
+    void readChunks.value
+    const at = read.input.position(playhead.value.index, playhead.value.fraction)
+    return { ...at, startPage: read.options.startPage, endPage: read.options.endPage }
+  })
+  const heard = computed(() => {
+    const page = pageProgress.value
+    return page
+      ? (page.page - page.startPage + page.fraction) / (page.endPage - page.startPage + 1)
+      : readFraction(readChunks.value, playhead.value.index, playhead.value.fraction)
+  })
 
   /**
    * The request settings of every read still alive, by scope. The engine hands
@@ -319,6 +348,8 @@ export const useSpeechStore = defineStore('speech', () => {
         console.warn('Read aloud: the saved audio could not be read; synthesising instead:', e)
       }
     }
+    // Stopping during the disk lookup must not start a fresh, billable request.
+    if (_signal.cancelled) throw new Error('speech request cancelled')
     const result = await invoke<MediaResult>('run_media_task', {
       request: {
         providerId: cfg.providerId,
@@ -342,12 +373,16 @@ export const useSpeechStore = defineStore('speech', () => {
 
   function onEngineState(s: SpeechState, info: SpeechInfo) {
     state.value = s
-    if (s === 'idle' || s === 'error') readChunks.value = []
+    if (s === 'idle' || s === 'error') {
+      readChunks.value = []
+      pagedRead.value = null
+    }
     if (s === 'idle') {
       progress.value = { index: 0, total: 0 }
       errorMessage.value = ''
       errorReason.value = null
       activeSource.value = ''
+      activePaper.value = ''
       currentKey.value = ''
       return
     }
@@ -423,9 +458,10 @@ export const useSpeechStore = defineStore('speech', () => {
     samplePlayhead()
   })
 
-  function setError(reason: 'empty' | 'capabilities', message: string) {
+  function setError(reason: 'empty' | 'capabilities' | 'text', message: string) {
     engine.stop()
     readChunks.value = []
+    pagedRead.value = null
     state.value = 'error'
     errorReason.value = reason
     errorMessage.value = message
@@ -450,7 +486,9 @@ export const useSpeechStore = defineStore('speech', () => {
    */
   function read(text: string, opts?: { source?: string; paper?: string }): Promise<void> {
     engine.unlock()
+    const seq = readSeq + 1
     return readInner(text, opts).catch((e) => {
+      if (seq !== readSeq) return
       console.error('Read aloud failed:', e)
       setError('capabilities', String(e))
     })
@@ -463,14 +501,37 @@ export const useSpeechStore = defineStore('speech', () => {
       return
     }
     const seq = ++readSeq
+    engine.stop()
+    pagedRead.value = null
+    readChunks.value = []
+    currentKey.value = key
+    activeSource.value = opts?.source ?? ''
+    activePaper.value = opts?.paper ?? ''
+    state.value = 'loading'
     setupPrompt.value = null
+
+    const config = await configureRead(seq, opts?.paper)
+    if (!config || seq !== readSeq) return
+    const prepared = prepareSpeechText(text, { skipCitations: config.skipCitations })
+    if (!prepared) {
+      setError('empty', t('speech.errors.empty'))
+      return
+    }
+    const list = chunkForSpeech(prepared, { maxChars: config.maxChars })
+    readChunks.value = list
+    playhead.value = { index: 0, fraction: 0 }
+    engine.read(list, config.scope)
+  }
+
+  /** Freeze the voice once per read; lazy pages and seeks keep exactly these settings. */
+  async function configureRead(seq: number, paper?: string): Promise<ReadConfig | null> {
 
     if (!loaded.value) {
       const ok = await loadCapabilities()
-      if (seq !== readSeq) return
+      if (seq !== readSeq) return null
       if (!ok && !loaded.value) {
         setError('capabilities', t('speech.errors.capabilities', { message: loadError.value }))
-        return
+        return null
       }
     }
 
@@ -478,19 +539,15 @@ export const useSpeechStore = defineStore('speech', () => {
       engine.stop()
       state.value = 'idle'
       setupPrompt.value = { reason: notConfiguredReason.value ?? 'unset' }
-      return
+      activeSource.value = ''
+      activePaper.value = ''
+      currentKey.value = ''
+      return null
     }
 
     const model = selectedModel.value as MediaModelSpec
-    const prepared = prepareSpeechText(text, { skipCitations: skipCitations.value })
-    if (!prepared) {
-      setError('empty', t('speech.errors.empty'))
-      return
-    }
-    const chunks = chunkForSpeech(prepared, { maxChars: model.maxPromptChars ?? FALLBACK_MAX_CHARS })
     const options = readAloudOptions(model, storedOptions.value)
     const voiceScope = speechScope(providerId.value, modelId.value, options)
-    const paper = opts?.paper || undefined
     const cfg: RequestConfig = { providerId: providerId.value, model: modelId.value, options, voiceScope, paper }
     // The paper is part of the engine's scope: a late prefetch of this read must keep
     // its clip in THIS paper's folder, even if a read of another paper (same voice)
@@ -502,13 +559,65 @@ export const useSpeechStore = defineStore('speech', () => {
     }
     scopeConfigs.set(scope, cfg)
 
-    currentKey.value = key
-    activeSource.value = opts?.source ?? ''
-    // The same list the engine plays (it drops blank chunks too), so a chunk index means
-    // the same thing to both.
-    const list = chunks.map((c) => c.trim()).filter(Boolean)
-    readChunks.value = list
-    engine.read(list, scope)
+    return { scope, maxChars: model.maxPromptChars ?? FALLBACK_MAX_CHARS, skipCitations: skipCitations.value }
+  }
+
+  /** Called in the toolbar click's call stack, before reading even the first local page. */
+  function readPages(options: ReadPagesOptions): Promise<void> {
+    if (isReadingPaper(options.paper)) { stop(); return Promise.resolve() }
+    engine.unlock()
+    const seq = ++readSeq
+    engine.stop()
+    readChunks.value = []
+    pagedRead.value = null
+    currentKey.value = keyOf(options.paper, 'pdf-pages')
+    activeSource.value = 'pdf-pages'
+    activePaper.value = options.paper
+    setupPrompt.value = null
+    state.value = 'loading'
+    return (async () => {
+      const config = await configureRead(seq, options.paper)
+      if (!config || seq !== readSeq) return
+      await startPages(options, config, seq, options.startPage)
+    })().catch(e => {
+      if (seq === readSeq) setError('text', t('speech.errors.text', { message: String(e) }))
+    })
+  }
+
+  async function startPages(options: ReadPagesOptions, config: ReadConfig, seq: number,
+    page: number, fraction = 0, paused = false) {
+    const input: SpeechPages = new SpeechPages({
+      ...options, startPage: page, maxChars: config.maxChars, skipCitations: config.skipCitations,
+      cancelled: (): boolean => seq !== readSeq || pagedRead.value !== read,
+    })
+    const read = { input, options, config }
+    playhead.value = { index: 0, fraction: 0 }
+    pagedRead.value = read
+    const first = await input.next()
+    if (seq !== readSeq || pagedRead.value !== read) return
+    if (!first) { setError('empty', t('speech.errors.pagesEmpty')); return }
+    readChunks.value = [...input.chunks]
+    const target = input.target(page, fraction)
+    playhead.value = target ?? { index: 0, fraction: 0 }
+    engine.read(first, config.scope, {
+      startPaused: paused,
+      startAt: target ?? undefined,
+      next: async () => {
+        try {
+          const chunks = await input.next()
+          if (seq !== readSeq || pagedRead.value !== read) return null
+          readChunks.value = [...input.chunks]
+          return chunks
+        } catch (e) {
+          if (seq !== readSeq || pagedRead.value !== read) return null
+          throw new Error(t('speech.errors.text', { message: String(e) }))
+        }
+      },
+    })
+  }
+
+  function isReadingPaper(paper: string): boolean {
+    return isReading.value && activeSource.value === 'pdf-pages' && activePaper.value === paper
   }
 
   /** Stop reading and clear any error. */
@@ -516,6 +625,7 @@ export const useSpeechStore = defineStore('speech', () => {
     readSeq++
     engine.stop()
     readChunks.value = []
+    pagedRead.value = null
     if (state.value !== 'idle') {
       // `engine.stop()` is silent when the engine itself was idle (an error that
       // came from this store, not from playback).
@@ -526,6 +636,7 @@ export const useSpeechStore = defineStore('speech', () => {
     }
     currentKey.value = ''
     activeSource.value = ''
+    activePaper.value = ''
   }
 
   /**
@@ -540,6 +651,25 @@ export const useSpeechStore = defineStore('speech', () => {
 
   /** Jump to `fraction` (0..1) of the whole read — what dragging the player's bar does (see `SpeechEngine.seek`). */
   function seekTo(fraction: number) {
+    const read = pagedRead.value
+    if (read) {
+      const f = Math.min(0.999999, Math.max(0, Number.isFinite(fraction) ? fraction : 0))
+      const at = f * (read.options.endPage - read.options.startPage + 1)
+      const page = read.options.startPage + Math.floor(at)
+      const target = read.input.target(page, at % 1)
+      if (target && engine.seek(target.index, target.fraction)) { samplePlayhead(); return }
+      const paused = state.value === 'paused'
+      const seq = ++readSeq
+      engine.stop()
+      currentKey.value = keyOf(read.options.paper, 'pdf-pages')
+      activeSource.value = 'pdf-pages'
+      activePaper.value = read.options.paper
+      state.value = 'loading'
+      void startPages(read.options, read.config, seq, page, at % 1, paused).catch(e => {
+        if (seq === readSeq) setError('text', t('speech.errors.text', { message: String(e) }))
+      })
+      return
+    }
     const target = seekTarget(readChunks.value, fraction)
     if (!target || !engine.seek(target.index, target.fraction)) return
     samplePlayhead()
@@ -575,7 +705,7 @@ export const useSpeechStore = defineStore('speech', () => {
     save, select, setOption,
     // reading
     state, progress, errorMessage, errorReason, setupPrompt, activeSource, isReading,
-    readChunks, playhead, heard, rate, setRate, volume, setVolume,
-    read, stop, pause, resume, togglePause, seekTo, preview, isReadingText, dismissSetup, openSettings,
+    readChunks, playhead, heard, pageProgress, rate, setRate, volume, setVolume,
+    read, readPages, isReadingPaper, stop, pause, resume, togglePause, seekTo, preview, isReadingText, dismissSetup, openSettings,
   }
 })

@@ -220,7 +220,7 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `llm.rs` | OpenAI-compatible / Anthropic chat, embeddings, OpenRouter, token usage |
 | `render.rs` | Rasterises one PDF page to PNG through the bundled PDFium (the reader's path for PDFs with Type 3 fonts, `view_paper_page` for the agent). One dedicated `argus-pdfium` thread owns the binding and a small document cache (4 docs, keyed by path + mtime + size + file identity, released after 60 s idle); PNG is encoded off that thread with the fast lossless encoder. `render_page_image` returns raw PNG bytes (`tauri::ipc::Response`), `render_page_png` is the older base64 twin. Pixels must stay identical across encoder/cache changes — compare decoded pixels, never PNG bytes |
 | `media.rs` | The provider-agnostic contract for everything that is not a conversation (image, speech, transcription, sound, music): task kinds, form-as-data (`MediaField` / `MediaModelSpec`), request/result types, dispatch to the adapters, and the "How to add a provider" checklist — see *Media generation and read-aloud* |
-| `stepfun_media.rs` / `minimax_media.rs` | The media adapters: StepFun (all six kinds) and MiniMax (speech only). One file per provider; nothing else changes when one is added |
+| `stepfun_media.rs` / `minimax_media.rs` / `mimo_media.rs` | The media adapters: StepFun (all six kinds), MiniMax and MiMo (speech only). One file per provider; nothing else changes when one is added |
 | `ai_summary.rs` | Generate AI paper summaries and abstract extraction |
 | `copilot.rs` | Per-paper and library-wide chat, chat history persistence |
 | `arxiv.rs` / `arxiv_scheduler.rs` | arXiv/bioRxiv fetching, inbox storage, scheduled catch-up |
@@ -398,6 +398,17 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   `agent_system_prompt` is shared with the keepalive —
   the two must send byte-identical system messages or the warmed prefix is not
   the one the next question sends.
+  Answer depth is a separate app-store setting, `agent_response_style`, exposed
+  as `responseStyle` by the agent settings commands: `concise` (精炼, the default
+  for new and old settings), `standard` (标准), or `detailed` (详解). Shared rules
+  in `src-tauri/src/prompts/response_style.txt` plus the selected
+  `response_style_<style>.txt` are appended to both default and custom agent
+  instructions, and to every tool-free fallback. Explicit requests in the user's
+  question for more or less detail take precedence. The advanced prompt editor
+  shows only task/tool instructions, so editing them does not freeze a style.
+  The prompt is snapshotted once per answer and reused by the keepalive. Saving a
+  different style or task prompt stops the old keepalive; an answer that finishes
+  after its style changed cannot re-arm its obsolete prefix.
 - The loop is bounded by `MAX_AGENT_ROUNDS` (500); on hitting it the model gets
   one final tool-less turn to answer with what it has.
 - **Tool output is budgeted in tokens, from the model's window.**
@@ -421,6 +432,21 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
 - Progress is emitted on `{event_name}-agent`, phases `servers` / `thinking` /
   `tool` / `result` / `evicted` / `answering` / `limit`, plus `fallback` from the
   fallback path.
+
+**Images in answers.** The app-only `send_paper_image` tool (`mcp/paper_images.rs`)
+renders one PDF page or a crop into the current answer. It takes a paper slug,
+a 1-based PDF page index, optional `crop: {x, y, width, height}` in 0–1 fractions
+of the displayed page (top-left origin), optional caption, and 72–300 DPI
+(default 150). A vision model should inspect with `view_paper_page` first;
+text-only models can send a full page but must not guess a crop. It is part of
+the answer, so it does not ask for note/canvas write confirmation, and it is
+not exposed by the external read-only MCP server. Both tools return images via
+the existing `result` event; base64 stays out of the textual tool transcript.
+Images are immutable PNG files in `chats/<conversation-stem>/` (also used for
+paper AI and canvas conversations). Answer steps retain filenames and source/crop metadata;
+the frontend drops live `dataUrl` values before saving JSON. `ChatSentImages.vue`
+derives the inline gallery from those steps, and `ChatPageImage.vue` reloads via
+`read_chat_image`. Saving failures are tool errors rather than successful sends.
 
 **Prompt-cache keepalive (`cache_keepalive.rs`).** An agent turn sends a large
 prefix (the system prompt, every tool schema — external servers' too — and the
@@ -583,7 +609,7 @@ settings alike. Adding a provider is one adapter file plus two dispatch lines;
 no `.vue` changes.
 
 - **Dispatch.** `media::capabilities(provider)` and `media::run(provider, key,
-  req)` pick the adapter with `is_stepfun` / `is_minimax` (by `kind` or base
+  req)` pick the adapter with `is_stepfun` / `is_minimax` / `is_mimo` (by `kind` or base
   URL, like the chat side). `list_media_capabilities` lists only providers that
   are enabled, have an adapter *and* have an API key on file; `run_media_task`
   takes a `MediaRequest` (`providerId`, `kind`, `model`, `prompt`, `inputs`,
@@ -593,7 +619,16 @@ no `.vue` changes.
 - **Adapters.** `stepfun_media.rs`: all six kinds; its speech is JSON to
   `/v1/audio/speech` answering with *raw bytes and no envelope*, 1000 characters
   per request. `minimax_media.rs`: speech only, `POST {base_url}/t2a_v2`; see the
-  gotchas below.
+  gotchas below. `mimo_media.rs`: `mimo-v2.5-tts` with the eight Chinese/English
+  preset voices plus `mimo_default`, `POST {base_url}/chat/completions` using
+  `api-key` authentication. The original text is one **assistant** message;
+  `choices[0].message.audio.data` is base64 MP3/WAV. It preserves the configured
+  host (including Token Plan/relays), rejects truncated/filtered/malformed audio,
+  and keeps the API key out of error messages. Default voice is English `Mia`,
+  default output is MP3; stale voice/format values fall back to these defaults.
+  No undocumented numeric synthesis-speed field is offered; the player's speed
+  control works as usual. Voice design/cloning models require different inputs
+  and are not listed for this preset-voice reader.
 - **Adding a speech provider** (the same checklist is the module doc of
   `media.rs`): (1) `<provider>_media.rs` with `capabilities()` and `run()`, and
   a `mod` line in `lib.rs`; (2) describe every knob as a `MediaField`, each
@@ -612,9 +647,10 @@ no `.vue` changes.
 frontend, deliberately small:
 
 1. `MediaModelSpec.max_prompt_chars` (wire: `maxPromptChars`, optional) is the
-   provider's *hard* limit on `prompt`, in characters. The player chunks by it
-   and may choose smaller chunks, never larger. StepFun speech declares 1000,
-   MiniMax 9 999.
+   declared limit on `prompt`, in characters. The player chunks by it and may
+   choose smaller chunks, never larger. StepFun's documented hard limit is 1000,
+   MiniMax's 9 999. MiMo uses a conservative app-side ceiling of 1000 for short
+   clips; its current API reference does not publish a character limit.
 2. `AppSettings` gains `speech_provider_id`, `speech_model_id`,
    `speech_options` (keys are the selected model's `MediaField::key`; untyped
    like `MediaRequest::options`) and `speech_skip_citations` (default **true**).
@@ -651,9 +687,22 @@ only means those chunks are billed again.
 **Read-aloud flow (frontend).** The selection popup's 朗读 button calls
 `useSpeechStore().read(text, { source })` synchronously from the click, before
 any `await`: the first thing it does is `engine.unlock()`, which starts a silent
-clip on the engine's one persistent `Audio` element (insurance for WebViews that
+clip on both of the engine's persistent `Audio` elements (insurance for WebViews that
 want a user gesture for sound; see the comment on `SILENT_WAV`). Calling it again
 with the same text while it is being read stops it, so the button is a toggle.
+
+The PDF toolbar has a 朗读 toggle immediately before 引用图谱. It calls
+`speech.readPages({paper, startPage, endPage, getText})` in the click's own stack,
+starting at the displayed page. `speechPages.ts` pulls local PDF text one page at
+a time as the engine's single-chunk lookahead reaches a page boundary; it never
+renders the entire PDF or sends whole pages/documents to the provider. Blank pages
+are skipped, extraction failures are shown, and a document without embedded text
+gets a readable notice. The voice/options/citation preference and paper slug are
+frozen for the read; clips use the same per-paper audio cache as selection reads.
+The mini-player shows the spoken page and progress over the original remaining
+pages. Seeking to an unprepared page extracts only that page before continuing,
+and preserves pause state. The visible PDF follows page changes; closing its tab
+stops the read, including text extraction that has not finished yet.
 
 - `stores/speech.ts` — the configuration (`speech_*` in the app settings, checked
   against `list_media_capabilities`: `isConfigured` / `notConfiguredReason` =
@@ -677,6 +726,8 @@ with the same text while it is being read stops it, so the button is a toggle.
   MiniMax's 9 999, which the docs advise against anyway — counted in code points.
 - `utils/speechEngine.ts` — pure, I/O injected, tested under Node with fakes. One
   chunk of lookahead (chunk *i+1* is synthesised while *i* plays, never further),
+  two persistent audio elements (the spare loads/decodes that next clip while the
+  current one plays, then swaps in without resetting its source),
   a generation token so `stop()` or a new read invalidates everything in flight,
   an LRU cache keyed by `speechCacheKey(scope, text)` (20 chunks / 48 M
   characters; TTS is billed per character, so a replay or a double click costs
@@ -690,6 +741,10 @@ with the same text while it is being read stops it, so the button is a toggle.
   `loadedmetadata`) and `setRate()` (`playbackRate` *and* `defaultPlaybackRate`,
   since a new `src` resets the former to the latter — the player's speed costs
   nothing and needs no re-synthesis).
+  Completed request references are released immediately, so a long read still
+  holds only the bounded LRU plus the two loaded clips. Regression checks for
+  lazy pages, preloading, cancellation, seeks, retries and cache limits run with
+  `node --test scripts/test-speech.mjs` (local fake audio, no API calls).
 - `utils/speechFollow.ts` — pure. Following a read on the page: `spokenSentences`
   (each chunk's sentences with their estimated share of its clip, by characters —
   the providers return no timings), `locateSentences` (finds them in the page text
@@ -779,7 +834,7 @@ The library root contains:
 
 ```
 <library>/
-├── chats/                   # 智能问答 conversations, one JSON file each
+├── chats/                   # 智能问答: <id>.json; viewed/sent PNGs in <conversation-stem>/ (paper AI too)
 ├── .argus/
 │   ├── config.json          # Library config, app settings, RAG/arXiv/canvas settings
 │   ├── index.json           # Rebuildable paper index cache

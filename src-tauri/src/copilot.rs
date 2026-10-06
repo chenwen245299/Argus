@@ -281,6 +281,36 @@ fn conversation_images_dir(root: &str, conversation_id: &str) -> PathBuf {
     conversations_dir(root).join(conversation_file_stem(conversation_id))
 }
 
+/// These folders contain only chat-owned PNGs. Refuse links rather than
+/// following a conversation image into a different part of the library.
+fn checked_images_dir(root: &str, id: &str, create: bool) -> Result<PathBuf, String> {
+    let dir = conversation_images_dir(root, id);
+    for path in [conversations_dir(root), dir.clone()] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err("Chat image folder must be a real directory, not a link.".into());
+            }
+            Ok(_) => {}
+            Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
+                // Two answer variants may render their first image concurrently.
+                std::fs::create_dir(&path)
+                    .or_else(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { Ok(()) } else { Err(e) })
+                    .map_err(|e| format!("Create chat image folder: {e}"))?;
+                let meta = std::fs::symlink_metadata(&path)
+                    .map_err(|e| format!("Read chat image folder: {e}"))?;
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err("Chat image folder must be a real directory, not a link.".into());
+                }
+            }
+            Err(e) => return Err(format!("Read chat image folder: {e}")),
+        }
+    }
+    Ok(dir)
+}
+
+const MAX_CHAT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
 /// Read one saved page image back as a `data:image/png;base64,...` URL, for the
 /// frontend to show when a conversation is reopened.
 pub fn read_conversation_image(
@@ -290,15 +320,25 @@ pub fn read_conversation_image(
 ) -> Result<String, String> {
     use base64::Engine;
     crate::path_guard::validate_segment("page image", file)?;
-    let path = conversation_images_dir(root, conversation_id).join(file);
+    if !file.ends_with(".png") {
+        return Err("Chat images must be PNG files.".into());
+    }
+    let path = checked_images_dir(root, conversation_id, false)?.join(file);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("Read page image: {e}"))?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_CHAT_IMAGE_BYTES as u64 {
+        return Err("Invalid chat image file or image is too large.".into());
+    }
     let bytes = std::fs::read(&path).map_err(|e| format!("Read page image: {e}"))?;
+    if !bytes.starts_with(PNG_SIGNATURE) {
+        return Err("Invalid PNG image.".into());
+    }
     Ok(format!(
         "data:image/png;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     ))
 }
 
-/// Decode and save the PNGs a `view_paper_page` result carries into the
+/// Decode and save the PNGs a page-view or image-delivery result carries into the
 /// conversation's image folder, returning display metadata per page.
 ///
 /// The base64 becomes real PNG files so the persisted conversation references
@@ -308,13 +348,10 @@ fn save_view_page_images(
     root: &str,
     conversation_id: Option<&str>,
     value: &serde_json::Value,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, String> {
     use base64::Engine;
     let slug = value.get("slug").and_then(|s| s.as_str()).unwrap_or("");
-    let dir = conversation_id.map(|id| conversation_images_dir(root, id));
-    if let Some(d) = &dir {
-        let _ = std::fs::create_dir_all(d);
-    }
+    let dir = conversation_id.map(|id| checked_images_dir(root, id, true)).transpose()?;
     let mut out = Vec::new();
     for page in value
         .get("pages")
@@ -327,51 +364,73 @@ fn save_view_page_images(
         if b64.is_empty() {
             continue;
         }
-        // Persist to disk (for reload) and return inline (for the live view).
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64)
+            .map_err(|e| format!("Decode chat image: {e}"))?;
+        if bytes.len() > MAX_CHAT_IMAGE_BYTES || !bytes.starts_with(PNG_SIGNATURE) {
+            return Err("Invalid PNG image or image is too large.".into());
+        }
+        // Each call gets an immutable file: two crops of the same page (or a
+        // later higher-resolution render) must not overwrite an earlier answer.
         let mut file = String::new();
         if let Some(d) = &dir {
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                let name = format!("{slug}-p{n}.png");
-                if crate::path_guard::validate_segment("page image", &name).is_ok()
-                    && crate::fsutil::atomic_write(&d.join(&name), &bytes).is_ok()
-                {
-                    file = name;
-                }
-            }
+            let name = format!("image-{}.png", uuid::Uuid::new_v4());
+            crate::fsutil::atomic_write(&d.join(&name), &bytes)
+                .map_err(|e| format!("Save chat image: {e}"))?;
+            file = name;
         }
-        out.push(serde_json::json!({
+        let mut image = serde_json::json!({
             "page": n,
             "slug": slug,
             "file": file,                                 // "" when not persisted
             "dataUrl": format!("data:image/png;base64,{b64}"),
-        }));
+        });
+        for key in ["caption", "crop", "width", "height", "dpi"] {
+            if let Some(v) = page.get(key) {
+                image[key] = v.clone();
+            }
+        }
+        out.push(image);
     }
-    out
+    if out.is_empty() {
+        return Err("No image was rendered.".into());
+    }
+    Ok(out)
 }
 
 /// The text a `view_paper_page` result contributes to the model's transcript:
 /// page numbers and each page's extracted text, but never the base64 image —
 /// that goes back to a vision model as a separate image message instead.
-fn view_page_summary(value: &serde_json::Value) -> serde_json::Value {
+fn page_image_summary(value: &serde_json::Value, sent: bool) -> serde_json::Value {
     let pages: Vec<serde_json::Value> = value
         .get("pages")
         .and_then(|p| p.as_array())
         .map(|arr| {
             arr.iter()
                 .map(|page| {
-                    serde_json::json!({
+                    let mut summary = serde_json::json!({
                         "page": page.get("page").cloned().unwrap_or(serde_json::Value::Null),
                         "text": page.get("text").and_then(|t| t.as_str()).unwrap_or(""),
-                    })
+                    });
+                    for key in ["caption", "crop", "width", "height", "dpi"] {
+                        if let Some(v) = page.get(key) {
+                            summary[key] = v.clone();
+                        }
+                    }
+                    summary
                 })
                 .collect()
         })
         .unwrap_or_default();
     serde_json::json!({
         "slug": value.get("slug").and_then(|s| s.as_str()).unwrap_or(""),
-        "note": "The requested page(s) were rendered as images and shown to the user. \
+        "note": if sent {
+            "The image was saved with this conversation and sent into your answer. \
+             The user can click it to enlarge. Do not send a markdown image path or base64."
+        } else {
+            "The requested page(s) were rendered as images and shown to the user. \
                  If you can see images, the rendered page(s) accompany this result. \
-                 Each page's extracted text is below.",
+                 Each page's extracted text is below."
+        },
         "pages": pages,
     })
 }
@@ -446,6 +505,85 @@ mod conversation_store_tests {
             "id": id, "title": id, "messages": [],
             "createdAt": updated, "updatedAt": updated,
         })
+    }
+
+    fn image_result(color: [u8; 4]) -> serde_json::Value {
+        use base64::Engine;
+        let image = image::RgbaImage::from_pixel(12, 8, image::Rgba(color));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        serde_json::json!({
+            "slug": "paper",
+            "pages": [{
+                "page": 3,
+                "caption": "Figure 2",
+                "crop": {"x": 0.0, "y": 0.0, "width": 0.5, "height": 0.5},
+                "width": 12,
+                "height": 8,
+                "dpi": 150,
+                "png_base64": base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+            }],
+        })
+    }
+
+    #[test]
+    fn sent_images_survive_reload_without_overwriting_another_crop() {
+        let root = TempRoot::new("image-roundtrip");
+        let first = save_view_page_images(&root.path(), Some("chat"), &image_result([255, 0, 0, 255])).unwrap();
+        let second = save_view_page_images(&root.path(), Some("chat"), &image_result([0, 0, 255, 255])).unwrap();
+        let a = first[0]["file"].as_str().unwrap();
+        let b = second[0]["file"].as_str().unwrap();
+        assert_ne!(a, b, "a second crop overwrote the first answer's image");
+        assert_eq!(read_conversation_image(&root.path(), "chat", a).unwrap(), first[0]["dataUrl"]);
+        assert_eq!(read_conversation_image(&root.path(), "chat", b).unwrap(), second[0]["dataUrl"]);
+        assert_eq!(first[0]["caption"], "Figure 2");
+        assert_eq!(first[0]["width"], 12);
+        assert_eq!(first[0]["crop"]["width"], 0.5);
+        // Persist exactly the frontend's file-reference shape, without base64.
+        let mut saved = first[0].clone();
+        saved.as_object_mut().unwrap().remove("dataUrl");
+        let conversation = serde_json::json!({"id":"chat", "messages":[{"images":[saved]}]});
+        write_library_conversation(&root.path(), &conversation).unwrap();
+        let text = std::fs::read_to_string(root.0.join("chats/chat.json")).unwrap();
+        assert!(!text.contains("base64"));
+        let reloaded = read_library_conversations(&root.path());
+        let file = reloaded[0]["messages"][0]["images"][0]["file"].as_str().unwrap();
+        assert_eq!(read_conversation_image(&root.path(), "chat", file).unwrap(), first[0]["dataUrl"]);
+    }
+
+    #[test]
+    fn image_save_failures_and_non_image_reads_are_reported() {
+        let root = TempRoot::new("image-errors");
+        std::fs::write(root.0.join("chats"), "not a directory").unwrap();
+        assert!(save_view_page_images(&root.path(), Some("chat"), &image_result([0, 0, 0, 255])).is_err());
+        assert!(read_conversation_image(&root.path(), "chat", "../escape.png").is_err());
+        assert!(read_conversation_image(&root.path(), "chat", "config.json").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_reads_and_writes_refuse_symlinks() {
+        let root = TempRoot::new("image-links");
+        let outside = root.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.0.join("chats")).unwrap();
+        assert!(save_view_page_images(&root.path(), Some("chat"), &image_result([0, 0, 0, 255])).is_err());
+        std::fs::remove_file(root.0.join("chats")).unwrap();
+        let saved = save_view_page_images(&root.path(), Some("chat"), &image_result([0, 0, 0, 255])).unwrap();
+        let file = saved[0]["file"].as_str().unwrap();
+        std::os::unix::fs::symlink(root.0.join("chats/chat").join(file), root.0.join("chats/chat/link.png")).unwrap();
+        assert!(read_conversation_image(&root.path(), "chat", "link.png").is_err());
+    }
+
+    #[test]
+    fn image_summary_carries_provenance_but_never_base64() {
+        let value = image_result([0, 0, 0, 255]);
+        let summary = page_image_summary(&value, true);
+        assert_eq!(summary["pages"][0]["caption"], "Figure 2");
+        assert_eq!(summary["pages"][0]["crop"]["width"], 0.5);
+        assert!(summary["pages"][0].get("png_base64").is_none());
+        assert!(!summary.to_string().contains(value["pages"][0]["png_base64"].as_str().unwrap()));
+        assert!(summary["note"].as_str().unwrap().contains("sent into your answer"));
     }
 
     #[test]
@@ -947,6 +1085,10 @@ pub async fn chat_with_library(
         let _ = app.emit(sources_event_name, Vec::<crate::models::RetrievedChunk>::new());
         system = build_plain_system_prompt();
     }
+    let system = with_response_style(
+        system,
+        crate::mcp::client::read_settings(app).response_style,
+    );
 
     let mut messages = messages;
     let mut extra_parts: Vec<ChatContentPart> = Vec::new();
@@ -1265,6 +1407,35 @@ pub fn build_paper_context_block(meta: Option<&PaperMeta>, fulltext: &str) -> St
 /// shared cacheable prefix).
 pub const PAPER_ASSISTANT_PERSONA: &str = "You are a research assistant helping the user understand and analyze a specific paper. Answer questions clearly and accurately based on the paper content provided.";
 
+/// Style instructions are independent of the editable task/tool prompt. Every
+/// chat path uses the same composition, including custom prompts and fallbacks.
+fn response_style_prompt(style: crate::mcp::client::ResponseStyle) -> &'static str {
+    use crate::mcp::client::ResponseStyle;
+    match style {
+        ResponseStyle::Concise => concat!(
+            include_str!("prompts/response_style.txt"),
+            "\n",
+            include_str!("prompts/response_style_concise.txt"),
+        ),
+        ResponseStyle::Standard => concat!(
+            include_str!("prompts/response_style.txt"),
+            "\n",
+            include_str!("prompts/response_style_standard.txt"),
+        ),
+        ResponseStyle::Detailed => concat!(
+            include_str!("prompts/response_style.txt"),
+            "\n",
+            include_str!("prompts/response_style_detailed.txt"),
+        ),
+    }
+}
+
+fn with_response_style(mut prompt: String, style: crate::mcp::client::ResponseStyle) -> String {
+    prompt.push_str("\n\n");
+    prompt.push_str(response_style_prompt(style));
+    prompt
+}
+
 fn get_fulltext_context(
     root: &str,
     slug: &str,
@@ -1291,7 +1462,7 @@ fn build_plain_system_prompt() -> String {
          Respond in the same language the user uses (Chinese if asked in Chinese).\n\
          Answer from your own knowledge. No documents from the user's library are \
          attached to this conversation, so do not claim to be citing them; if a \
-         question needs a specific paper the user has not provided, say so.",
+         question needs a specific paper the user has not provided, say so.\n\n",
     )
 }
 
@@ -1753,9 +1924,9 @@ A bare `find_papers` keyword sweep across the whole library is the last resort, 
 
 ## Writing a note
 
-`create_paper_note` is the only tool here that changes anything. It adds a new note to a paper; it cannot edit, overwrite or delete a note that already exists, so everything you want kept goes in `content`.
+`create_paper_note` adds a new note to a paper; it cannot edit, overwrite or delete a note that already exists, so everything you want kept goes in `content`.
 
-Do not reach for it on your own initiative. Offer the note in your reply, and call the tool when the user asks you to save it. Every call is shown to the user — the exact title and body — and written only if they approve, so send the note you actually mean to save. If the result says they declined, stop there and ask what they would rather have; do not rephrase and try again.
+Call it only when the user asks you to save a note. Every call is shown to the user — the exact title and body — and written only if they approve, so send the note you actually mean to save. If the result says they declined, stop; do not rephrase and try again without a new instruction.
 
 ## Answering
 
@@ -1768,7 +1939,14 @@ Reply in the language the user wrote in."#;
 /// Shared by the agent loop and the cache keepalive — they must send byte-identical
 /// system messages or the warmed prefix is not the one the next question asks for.
 fn agent_system_prompt(app: &tauri::AppHandle) -> String {
-    resolve_system_prompt(crate::mcp::client::read_settings(app).system_prompt)
+    configured_agent_system_prompt(&crate::mcp::client::read_settings(app))
+}
+
+fn configured_agent_system_prompt(settings: &crate::mcp::client::AgentSettings) -> String {
+    with_response_style(
+        resolve_system_prompt(settings.system_prompt.clone()),
+        settings.response_style,
+    )
 }
 
 /// The paper a conversation is anchored to, rendered as a system message.
@@ -2259,6 +2437,8 @@ pub async fn chat_with_library_agent(
     use tauri::Emitter;
 
     let settings = crate::mcp::client::read_settings(app);
+    // Freeze the prompt for this whole answer and its matching cache prefix.
+    let system_prompt = configured_agent_system_prompt(&settings);
     // The caller may override, but the round budget lives in settings so both
     // windows agree on it without having to pass it around.
     let max_rounds = clamp_agent_rounds(max_rounds.or(Some(settings.max_rounds)));
@@ -2315,6 +2495,7 @@ pub async fn chat_with_library_agent(
         reasoning_effort,
         max_rounds,
         conversation_id,
+        &system_prompt,
         paper_block.as_deref(),
         current_page,
         canvas_id,
@@ -2348,6 +2529,7 @@ pub async fn chat_with_library_agent(
             &warm_from,
             answer,
             tool_defs,
+            &system_prompt,
             paper_block.as_deref(),
             owner_window,
             app,
@@ -2369,11 +2551,15 @@ fn arm_cache_keepalive(
     messages: &[AgentMessage],
     answer: &str,
     tool_defs: Vec<serde_json::Value>,
+    system_prompt: &str,
     paper_block: Option<&str>,
     owner_window: &str,
     app: &tauri::AppHandle,
 ) {
-    if !crate::mcp::client::read_settings(app).keep_cache_warm {
+    if !crate::mcp::client::read_settings(app).keep_cache_warm
+        || agent_system_prompt(app) != system_prompt
+    {
+        // A style/prompt changed during the answer: do not re-arm an old prefix.
         crate::cache_keepalive::disarm_and_announce(app);
         return;
     }
@@ -2393,7 +2579,7 @@ fn arm_cache_keepalive(
     // carries `tool` messages the next request will not repeat.
     let mut warm = vec![serde_json::json!({
         "role": "system",
-        "content": agent_system_prompt(app),
+        "content": system_prompt,
     })];
     // The paper card sits where the loop puts it, or the warmed prefix is a
     // different prefix.
@@ -2568,6 +2754,7 @@ async fn run_agent_loop(
     reasoning_effort: Option<&str>,
     max_rounds: usize,
     conversation_id: Option<&str>,
+    system_prompt: &str,
     // `get_paper` for the paper this conversation is anchored to, if any.
     paper_block: Option<&str>,
     // The 1-based page the reader is looking at right now, when a paper is open.
@@ -2618,7 +2805,7 @@ async fn run_agent_loop(
 
     let mut convo: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
-        "content": agent_system_prompt(app),
+        "content": system_prompt,
     })];
     // Directly after the instructions and before the turns, so it is part of
     // the stable prefix every question in this conversation shares.
@@ -2795,7 +2982,13 @@ async fn run_agent_loop(
                 }),
             );
 
-            let outcome = if call.name == crate::mcp::agent::VIEW_PAGE_TOOL && !model_sees_images {
+            let image_tool = call.name == crate::mcp::agent::VIEW_PAGE_TOOL
+                || call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL;
+            let mut outcome = if call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL
+                && conversation_id.is_none()
+            {
+                Err("Sending an image requires a conversation to save it in.".into())
+            } else if call.name == crate::mcp::agent::VIEW_PAGE_TOOL && !model_sees_images {
                 // The tool was not offered to this model, so a call for it can
                 // only come from a model inventing one (or from a stale tools
                 // block). Refuse before anything is rendered: the point is that
@@ -2858,16 +3051,35 @@ async fn run_agent_loop(
             // A failed tool is fed back as text rather than aborting: the model
             // can read the message and correct itself (wrong slug, bad section
             // name) on the next round.
-            // `view_paper_page` returns images. Keep the base64 out of the
+            // Page-view and image-delivery tools return images. Keep base64 out of the
             // token-costed tool message (it gets the page text instead), save the
             // PNGs to the conversation folder for the UI, and — for a vision
             // model — queue the images to feed back after this round's results.
             let mut result_images: Option<serde_json::Value> = None;
+            if image_tool {
+                if let Ok(value) = &outcome {
+                    if cancelled() {
+                        break 'rounds Err("cancelled".into());
+                    }
+                    let root_owned = root.to_string();
+                    let id = conversation_id.map(str::to_string);
+                    let value = value.clone();
+                    // PNG decoding and disk writes belong off the async runtime
+                    // too. Report failure to the model rather than announcing an
+                    // image that will disappear when the conversation is reopened.
+                    match tokio::task::spawn_blocking(move || {
+                        save_view_page_images(&root_owned, id.as_deref(), &value)
+                    }).await {
+                        Ok(Ok(saved)) => result_images = Some(serde_json::Value::Array(saved)),
+                        Ok(Err(e)) => outcome = Err(e),
+                        Err(e) => outcome = Err(format!("Save chat image task: {e}")),
+                    }
+                }
+            }
             let (content, ok, cut) = match &outcome {
-                Ok(value) if call.name == crate::mcp::agent::VIEW_PAGE_TOOL => {
-                    let saved = save_view_page_images(root, conversation_id, value);
+                Ok(value) if image_tool => {
                     if model_sees_images {
-                        for img in &saved {
+                        for img in result_images.as_ref().and_then(|v| v.as_array()).into_iter().flatten() {
                             if let Some(url) = img.get("dataUrl").and_then(|u| u.as_str()) {
                                 round_image_parts.push(serde_json::json!({
                                     "type": "image_url",
@@ -2876,9 +3088,10 @@ async fn run_agent_loop(
                             }
                         }
                     }
-                    let (text, cut) =
-                        truncate_tool_result(&view_page_summary(value), budget.single_result);
-                    result_images = Some(serde_json::Value::Array(saved));
+                    let (text, cut) = truncate_tool_result(
+                        &page_image_summary(value, call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL),
+                        budget.single_result,
+                    );
                     (text, true, cut)
                 }
                 Ok(value) => {
@@ -2908,7 +3121,7 @@ async fn run_agent_loop(
                     "chars": content.chars().count(),
                     "preview": content,
                     "truncated": cut,
-                    // Rendered page images for view_paper_page; null otherwise.
+                    // Viewed pages or images sent into the answer; null otherwise.
                     "images": result_images,
                 }),
             );
@@ -3269,6 +3482,8 @@ mod agent_tests {
         let with_vision = names(true);
         let text_only = names(false);
         assert!(with_vision.iter().any(|n| n == crate::mcp::agent::VIEW_PAGE_TOOL));
+        assert!(with_vision.iter().any(|n| n == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL));
+        assert!(text_only.iter().any(|n| n == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL));
         assert!(
             !text_only.iter().any(|n| n == crate::mcp::agent::VIEW_PAGE_TOOL),
             "view_paper_page was offered to a model that cannot see images"
@@ -3460,6 +3675,56 @@ mod agent_tests {
             "Answer in haiku.",
             "a real prompt must win outright, not be appended to the default"
         );
+    }
+
+    #[test]
+    fn changing_style_keeps_task_instructions_and_replaces_only_the_style() {
+        use crate::mcp::client::{AgentSettings, ResponseStyle};
+        let mut settings = AgentSettings::default();
+        let concise = configured_agent_system_prompt(&settings);
+        assert!(concise.starts_with(DEFAULT_AGENT_SYSTEM_PROMPT));
+        assert!(concise.contains("Selected style: Concise"));
+        assert_eq!(concise.matches("## Response style").count(), 1);
+
+        for (style, label) in [
+            (ResponseStyle::Standard, "Standard"),
+            (ResponseStyle::Detailed, "Detailed"),
+        ] {
+            settings.response_style = style;
+            let prompt = configured_agent_system_prompt(&settings);
+            assert!(prompt.starts_with(DEFAULT_AGENT_SYSTEM_PROMPT));
+            assert!(prompt.contains(&format!("Selected style: {label}")));
+            assert!(!prompt.contains("Selected style: Concise"));
+            assert_eq!(prompt.matches("### Selected style:").count(), 1);
+            assert_ne!(prompt, concise, "changing style must change the model's prefix");
+        }
+
+        settings.system_prompt = "Answer in haiku.".into();
+        let custom = configured_agent_system_prompt(&settings);
+        assert!(custom.starts_with("Answer in haiku.\n\n"));
+        assert!(custom.contains("Selected style: Detailed"));
+        assert!(!custom.contains("list_collections"), "do not overwrite custom task instructions");
+        assert!(custom.contains("takes precedence over the default style"),
+            "the user's explicit request must still override the default answer depth");
+    }
+
+    #[test]
+    fn fallback_contexts_can_use_every_style_without_losing_grounding_rules() {
+        use crate::mcp::client::ResponseStyle;
+        let provider = model("test-model", Some(128_000));
+        let bases = [
+            build_plain_system_prompt(),
+            build_selected_papers_system_prompt("unused", &[], &provider, "test-model").0,
+            build_selected_papers_pdf_system_prompt("unused", &[]).0,
+        ];
+        for base in bases {
+            for style in [ResponseStyle::Concise, ResponseStyle::Standard, ResponseStyle::Detailed] {
+                let prompt = with_response_style(base.clone(), style);
+                assert!(prompt.starts_with(&base));
+                assert_eq!(prompt.matches("## Response style").count(), 1);
+                assert_eq!(prompt.matches("### Selected style:").count(), 1);
+            }
+        }
     }
 
     #[test]

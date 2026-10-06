@@ -19,6 +19,7 @@ interface AgentSettingsView {
   maxRounds: number
   keepCacheWarm: boolean
   systemPrompt: string
+  responseStyle: ResponseStyle
   defaultSystemPrompt: string
   servers: ExternalServer[]
   builtinToolCount: number
@@ -26,6 +27,9 @@ interface AgentSettingsView {
   maxRoundsLimit: number
   maxServers: number
 }
+
+type ResponseStyle = 'concise' | 'standard' | 'detailed'
+const RESPONSE_STYLES: ResponseStyle[] = ['concise', 'standard', 'detailed']
 
 interface ToolInfo {
   name: string
@@ -53,6 +57,7 @@ const view = ref<AgentSettingsView>({
   maxRounds: 50,
   keepCacheWarm: true,
   systemPrompt: '',
+  responseStyle: 'concise',
   defaultSystemPrompt: '',
   servers: [],
   builtinToolCount: 0,
@@ -73,6 +78,20 @@ const builtinAccess = computed(() => {
 })
 const showBuiltinTools = ref(false)
 const error = ref('')
+const ready = ref(false)
+const styleSaving = ref(false)
+
+async function chooseResponseStyle(style: ResponseStyle) {
+  if (!ready.value || styleSaving.value || style === view.value.responseStyle) return
+  const previous = view.value.responseStyle
+  view.value.responseStyle = style
+  styleSaving.value = true
+  try {
+    if (!await persist()) view.value.responseStyle = previous
+  } finally {
+    styleSaving.value = false
+  }
+}
 
 // ── Round budget ──────────────────────────────────────────────────────────────
 
@@ -240,17 +259,21 @@ async function persist() {
         maxRounds: view.value.maxRounds,
         keepCacheWarm: view.value.keepCacheWarm,
         systemPrompt: view.value.systemPrompt,
+        responseStyle: view.value.responseStyle,
         servers: view.value.servers,
       },
     })
+    return true
   } catch (e) {
     error.value = String(e)
+    return false
   }
 }
 
 async function refresh() {
   try {
     view.value = await invoke<AgentSettingsView>('agent_get_settings')
+    ready.value = true
     builtinTools.value = await invoke<ToolInfo[]>('agent_list_builtin_tools')
   } catch (e) {
     error.value = String(e)
@@ -262,6 +285,34 @@ onMounted(refresh)
 
 <template>
   <div class="settings-section">
+    <div class="settings-card">
+      <label class="setting-label">{{ t('agentSettings.responseStyle') }}</label>
+      <div class="response-style-options" role="radiogroup" :aria-label="t('agentSettings.responseStyle')" :aria-busy="styleSaving">
+        <label
+          v-for="style in RESPONSE_STYLES"
+          :key="style"
+          class="response-style-option"
+          :class="{ active: view.responseStyle === style }"
+        >
+          <span class="response-style-heading">
+            <input
+              type="radio"
+              name="agent-response-style"
+              :value="style"
+              :checked="view.responseStyle === style"
+              :disabled="!ready || styleSaving"
+              @change="chooseResponseStyle(style)"
+            />
+            <span class="response-style-title">{{ t(`agentSettings.style_${style}`) }}</span>
+            <span v-if="style === 'concise'" class="response-style-default">{{ t('agentSettings.responseStyleDefault') }}</span>
+          </span>
+          <span class="response-style-desc">{{ t(`agentSettings.style_${style}_hint`) }}</span>
+        </label>
+      </div>
+      <p class="setting-hint">{{ t('agentSettings.responseStyleHint') }}</p>
+      <p v-if="error" class="error-text">{{ error }}</p>
+    </div>
+
     <!-- Tool call budget -->
     <div class="settings-card">
       <div class="field-row">
@@ -294,35 +345,6 @@ onMounted(refresh)
 
       <div class="divider" />
 
-      <div class="divider" />
-
-      <div class="field-row">
-        <div>
-          <label class="setting-label">{{ t('agentSettings.systemPrompt') }}</label>
-          <p class="setting-hint">{{ t('agentSettings.systemPromptHint') }}</p>
-        </div>
-        <button
-          class="ghost-btn"
-          :disabled="usingDefaultPrompt"
-          @click="resetPrompt"
-        >{{ t('agentSettings.resetPrompt') }}</button>
-      </div>
-      <textarea
-        class="prompt-area"
-        :class="{ inherited: usingDefaultPrompt }"
-        rows="10"
-        :value="usingDefaultPrompt ? view.defaultSystemPrompt : view.systemPrompt"
-        :placeholder="view.defaultSystemPrompt"
-        @focus="forkDefaultPrompt"
-        @input="view.systemPrompt = ($event.target as HTMLTextAreaElement).value"
-        @change="persist()"
-      />
-      <p class="prompt-state">
-        {{ usingDefaultPrompt ? t('agentSettings.usingDefault') : t('agentSettings.customPrompt') }}
-      </p>
-
-      <div class="divider" />
-
       <div class="field-row">
         <label class="setting-label">{{ t('agentSettings.keepWarm') }}</label>
         <label class="toggle">
@@ -334,6 +356,38 @@ onMounted(refresh)
           <span class="toggle-track" />
         </label>
       </div>
+
+      <details class="prompt-details">
+        <summary>
+          <Icon icon="fluent:chevron-right-16-regular" class="prompt-chevron" width="14" height="14" />
+          {{ t('agentSettings.advancedPrompt') }}
+          <span v-if="!usingDefaultPrompt" class="prompt-custom-badge">{{ t('agentSettings.customPrompt') }}</span>
+        </summary>
+        <div class="prompt-editor">
+          <div class="field-row">
+            <div>
+              <label class="setting-label">{{ t('agentSettings.systemPrompt') }}</label>
+              <p class="setting-hint">{{ t('agentSettings.systemPromptHint') }}</p>
+            </div>
+            <button class="ghost-btn" :disabled="usingDefaultPrompt" @click="resetPrompt">
+              {{ t('agentSettings.resetPrompt') }}
+            </button>
+          </div>
+          <textarea
+            class="prompt-area"
+            :class="{ inherited: usingDefaultPrompt }"
+            rows="10"
+            :value="usingDefaultPrompt ? view.defaultSystemPrompt : view.systemPrompt"
+            :placeholder="view.defaultSystemPrompt"
+            @focus="forkDefaultPrompt"
+            @input="view.systemPrompt = ($event.target as HTMLTextAreaElement).value"
+            @change="persist()"
+          />
+          <p class="prompt-state">
+            {{ usingDefaultPrompt ? t('agentSettings.usingDefault') : t('agentSettings.customPrompt') }}
+          </p>
+        </div>
+      </details>
     </div>
 
     <!-- MCP servers -->
@@ -488,7 +542,6 @@ onMounted(refresh)
       </button>
       <p v-else class="empty-note">{{ t('agentSettings.limitReached', { n: view.maxServers }) }}</p>
 
-      <p v-if="error" class="error-text">{{ error }}</p>
     </div>
   </div>
 </template>
@@ -542,6 +595,36 @@ onMounted(refresh)
 }
 .rounds-verdict svg { color: var(--accent); flex-shrink: 0; }
 .divider { height: 1px; background: var(--border-subtle); margin: 2px 0; }
+
+.response-style-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.response-style-option {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  cursor: pointer;
+}
+.response-style-option.active { border-color: var(--accent); background: var(--accent-light); }
+.response-style-option:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.response-style-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.response-style-heading input { margin: 0; accent-color: var(--accent); }
+.response-style-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.response-style-default { font-size: 10px; color: var(--accent); }
+.response-style-desc { font-size: 12px; line-height: 1.5; color: var(--text-secondary); }
+@media (max-width: 520px) { .response-style-options { grid-template-columns: 1fr; } }
+
+.prompt-details { border-top: 1px solid var(--border-subtle); padding-top: 10px; }
+.prompt-details > summary { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); cursor: pointer; list-style: none; }
+.prompt-details > summary::-webkit-details-marker { display: none; }
+.prompt-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-sm); }
+.prompt-chevron { flex-shrink: 0; }
+.prompt-details[open] .prompt-chevron { transform: rotate(90deg); }
+.prompt-custom-badge { font-size: 11px; color: var(--accent); }
+.prompt-editor { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
 
 .prompt-area {
   width: 100%;

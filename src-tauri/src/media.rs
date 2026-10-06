@@ -1,8 +1,8 @@
 //! Media generation that is not a conversation: text-to-image, image editing,
 //! speech synthesis, transcription, sound design and music.
 //!
-//! These answer on their own routes rather than `/chat/completions`, and no two
-//! providers spell them the same way — StepFun posts JSON to `/v1/images/…` and
+//! These use their own request/response contracts, and no two providers spell
+//! them the same way — StepFun posts JSON to `/v1/images/…` and
 //! multipart to `/v1/audio/transcriptions`, submits music as an async job and
 //! polls it, and returns TTS as raw bytes with no envelope at all. So this module
 //! is a *contract*, not an implementation: it says what a media task looks like
@@ -31,7 +31,7 @@
 //! ## How to add a provider
 //!
 //! Adapters today: [`crate::stepfun_media`] (every kind) and
-//! [`crate::minimax_media`] (speech). The checklist, in order:
+//! [`crate::minimax_media`] and [`crate::mimo_media`] (speech). The checklist, in order:
 //!
 //!  1. **Adapter file** `<provider>_media.rs`, declared in `lib.rs` next to its
 //!     chat module. It exposes `capabilities() -> Vec<MediaCapability>` and
@@ -44,7 +44,8 @@
 //!     at all (read-aloud before the form was ever touched). A select's default
 //!     must be one of its options. Offer a knob only for the models that accept it.
 //!  3. **Declare [`MediaModelSpec::max_prompt_chars`]** — the longest main text one
-//!     request accepts, in characters. The read-aloud player splits what it reads
+//!     request accepts, in characters (a conservative adapter ceiling when the
+//!     vendor does not publish one). The read-aloud player splits what it reads
 //!     by it, so every speech model must declare it (a test enforces that).
 //!     Enforce the same number in `run` with a message that says the count, so an
 //!     over-long request fails before it is billed.
@@ -227,10 +228,10 @@ pub struct MediaModelSpec {
     /// declare one.
     ///
     /// The read-aloud player cuts what it reads into chunks by this number, so a
-    /// speech model needs it. It is the provider's *hard* limit, which is not
-    /// always the comfortable one — MiniMax accepts nearly 10 000 characters but
-    /// answers a request that long slowly — so the player is free to choose
-    /// smaller chunks, never larger.
+    /// speech model needs it. It is the provider's hard limit, or a conservative
+    /// adapter ceiling if the vendor does not publish one. The hard limit is not
+    /// always comfortable — MiniMax accepts nearly 10 000 characters but answers
+    /// that slowly — so the player may choose smaller chunks, never larger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_prompt_chars: Option<u32>,
 }
@@ -314,6 +315,9 @@ pub fn capabilities(provider: &AiProvider) -> Vec<MediaCapability> {
     if crate::minimax::is_minimax(provider) {
         return crate::minimax_media::capabilities();
     }
+    if crate::mimo::is_mimo(provider) {
+        return crate::mimo_media::capabilities();
+    }
     Vec::new()
 }
 
@@ -327,6 +331,9 @@ pub async fn run(
     }
     if crate::minimax::is_minimax(provider) {
         return crate::minimax_media::run(provider, api_key, req).await;
+    }
+    if crate::mimo::is_mimo(provider) {
+        return crate::mimo_media::run(provider, api_key, req).await;
     }
     Err(format!("{} 暂不支持这类媒体生成。", provider.name))
 }
@@ -518,6 +525,7 @@ mod tests {
         vec![
             provider("StepFun", "stepfun", "https://api.stepfun.com/v1"),
             provider("MiniMax", "minimax", "https://api.minimax.cn/v1"),
+            provider("MiMo", "mimo", "https://api.xiaomimimo.com/v1"),
         ]
     }
 
@@ -533,10 +541,14 @@ mod tests {
     fn the_right_adapter_answers_for_each_provider() {
         let step = capabilities(&provider("StepFun", "stepfun", "https://api.stepfun.com/v1"));
         let mini = capabilities(&provider("MiniMax", "minimax", "https://api.minimax.cn/v1"));
+        let mimo = capabilities(&provider("MiMo", "mimo", "https://api.xiaomimimo.com/v1"));
         // StepFun does all six kinds; MiniMax is speech only.
         assert_eq!(step.len(), 6);
         assert_eq!(mini.len(), 1);
         assert_eq!(mini[0].kind, MediaKind::Speech);
+        assert_eq!(mimo.len(), 1);
+        assert_eq!(mimo[0].kind, MediaKind::Speech);
+        assert_eq!(mimo[0].models[0].id, "mimo-v2.5-tts");
         let ids = |caps: &[MediaCapability]| -> Vec<String> {
             caps.iter()
                 .filter(|c| c.kind == MediaKind::Speech)
@@ -552,6 +564,8 @@ mod tests {
         assert_eq!(by_url.len(), 1);
         let by_url = capabilities(&provider("我的", "openai_compatible", "https://api.stepfun.com/v1"));
         assert_eq!(by_url.len(), 6);
+        let by_url = capabilities(&provider("我的", "openai_compatible", "https://api.xiaomimimo.com/v1"));
+        assert_eq!(by_url[0].models[0].id, "mimo-v2.5-tts");
     }
 
     #[test]
@@ -591,6 +605,10 @@ mod tests {
         let mini = provider("MiniMax", "minimax", "https://api.minimax.cn/v1");
         let err = ask(&mini, "speech-2.8-turbo").await.unwrap_err();
         assert!(err.contains("9999"), "{err}");
+
+        let mimo = provider("MiMo", "mimo", "https://api.xiaomimimo.com/v1");
+        let err = ask(&mimo, "mimo-v2.5-tts").await.unwrap_err();
+        assert!(err.contains("1000"), "{err}");
 
         // No adapter: a clear refusal that names the provider.
         let other = provider("DeepSeek", "openai_compatible", "https://api.deepseek.com/v1");

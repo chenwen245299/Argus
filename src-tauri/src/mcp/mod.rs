@@ -25,6 +25,7 @@
 pub mod agent;
 pub mod app_tools;
 pub mod client;
+mod paper_images;
 mod server;
 // `tools` is the read-only data layer. `pub(crate)` rather than private so
 // the paper AI panel can front-load a paper's `get_paper` card into its system

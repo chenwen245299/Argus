@@ -21,6 +21,8 @@ import type {
 } from '../../types'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import ChatPageImage from '../ChatPageImage.vue'
+import ChatSentImages from '../ChatSentImages.vue'
+import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
 import { askAiText } from '../../stores/translationHistory'
 import { estimateCostCny } from '../../utils/modelPricing'
@@ -110,17 +112,6 @@ interface AgentStep {
   truncated?: boolean
   /** Page images rendered by `view_paper_page`, shown beneath the row. */
   images?: AgentStepImage[]
-}
-
-/** One page image a `view_paper_page` call rendered. */
-interface AgentStepImage {
-  slug: string
-  page: number
-  /** Filename in the conversation's image folder; used to reload after saving. */
-  file?: string
-  /** Live data URL for immediate display; dropped before the conversation is
-   *  saved (the PNG lives on disk under `file`) and reloaded on demand. */
-  dataUrl?: string
 }
 
 interface Conversation {
@@ -1498,6 +1489,9 @@ async function streamAnswer(
         step.truncated = p.truncated
         if (p.images?.length) step.images = p.images
       }
+      if (p.images?.length) {
+        if (isAnswerVisible(answer.id)) scrollToBottom()
+      }
     } else if (p.phase === 'servers') {
       if (p.failed?.length) reactiveAns.serverErrors = p.failed
     } else if (p.phase === 'limit') {
@@ -2410,7 +2404,7 @@ onUnmounted(() => {
                     <!-- Page thumbnails rendered by view_paper_page. Live view
                          uses the inline data URL; a reloaded conversation fetches
                          the saved PNG by file name. -->
-                    <div v-if="step.images?.length" class="agent-step-images">
+                    <div v-if="step.images?.length && step.tool !== SEND_PAPER_IMAGE_TOOL" class="agent-step-images">
                       <ChatPageImage
                         v-for="img in step.images"
                         :key="`${img.slug}-${img.page}-${img.file || ''}`"
@@ -2466,6 +2460,11 @@ onUnmounted(() => {
                     <div v-else-if="!reasoningText(answer)" class="thinking-placeholder">{{ answer.withReasoning ? '正在思考…' : '生成中…' }}</div>
                   </template>
                   <MarkdownBody v-else :content="answer.content" />
+                  <ChatSentImages
+                    :conversation-id="activeConversation?.id ?? null"
+                    :steps="answer.steps"
+                    @open="previewImage = $event"
+                  />
                   <ServerToolTraceCard :trace="answer.serverTools" />
                   <!-- An end-to-end speech model's spoken reply. The text above is
                        its transcript, so this is an addition, not the answer. -->
@@ -3158,7 +3157,7 @@ onUnmounted(() => {
   flex-direction: column;
   justify-content: center;
   align-items: flex-start;
-  gap: 7px;
+  gap: 2px;
   padding: 16px 0;
   overflow: hidden;
   pointer-events: none;   /* only the ticks are interactive */

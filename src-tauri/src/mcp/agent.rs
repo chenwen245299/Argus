@@ -20,11 +20,12 @@ use super::app_tools;
 use super::server;
 use super::tools;
 
-/// The one tool whose result carries images. `copilot` special-cases it: the
+/// The page-inspection tool whose result carries images. `copilot` special-cases it: the
 /// base64 PNGs are stripped out of the token-costed tool message, saved as files
 /// under the conversation folder, and — for a vision model — fed back as a
 /// separate image message. Kept here so both sides name it the same thing.
 pub const VIEW_PAGE_TOOL: &str = "view_paper_page";
+pub use super::paper_images::SEND_PAPER_IMAGE_TOOL;
 
 /// A tool as the LLM needs to see it: name, purpose, and argument schema.
 #[derive(Debug, Clone, Serialize)]
@@ -50,8 +51,8 @@ pub fn declares_read_only(tool: &rmcp::model::Tool) -> bool {
         .unwrap_or(false)
 }
 
-/// Every tool the agent may call: the MCP server's read-only surface, plus the
-/// writing tools that exist only inside the app (see [`app_only_tools`]).
+/// Every tool the agent may call: the MCP server's read-only surface, plus
+/// in-app note creation and image delivery.
 ///
 /// The read-only half is taken from the same router the MCP server serves, so
 /// the two can never describe different tools.
@@ -65,7 +66,54 @@ pub fn tools() -> Vec<AgentTool> {
             input_schema: serde_json::Value::Object((*t.input_schema).clone()),
         })
         .chain(app_only_tools())
+        .chain(std::iter::once(send_paper_image_tool()))
         .collect()
+}
+
+/// Sending an image is part of the answer, just like streaming text. It does
+/// not edit the paper and needs no note/canvas confirmation. Only the app's
+/// chat loop can persist and display it; it is not an external MCP tool.
+fn send_paper_image_tool() -> AgentTool {
+    AgentTool {
+        name: SEND_PAPER_IMAGE_TOOL.into(),
+        read_only: true,
+        description: "Send an image from a library paper's PDF directly into this chat answer. \
+            Pass slug and a 1-based PDF page number (not the printed page label). Omit crop to \
+            send the whole page, or crop to a figure/table/diagram using fractions of the \
+            displayed page: x/y start at the TOP LEFT, width/height are positive, all in 0–1. \
+            Example: crop {x:0.05,y:0.1,width:0.9,height:0.35} sends the upper region. \
+            If you can see images, first inspect the page with view_paper_page to locate the \
+            correct region; include axes, legends and relevant caption. If you cannot see \
+            images, send the full page unless the user supplied the crop; never guess a \
+            figure's location or claim to have inspected it. Optional caption describes the \
+            image; dpi (72–300, default 150) controls clarity. Repeat for multiple figures. \
+            The app renders, saves and displays the image for you; do not embed base64 or \
+            local file paths in your reply. A successful result means the image was sent."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "slug": { "type": "string", "description": "Paper slug from get_paper/find_papers." },
+                "page": { "type": "integer", "minimum": 1, "description": "1-based PDF page index." },
+                "crop": {
+                    "type": "object",
+                    "description": "Optional crop in page fractions. Omit to send the entire page.",
+                    "properties": {
+                        "x": { "type": "number", "minimum": 0, "maximum": 1 },
+                        "y": { "type": "number", "minimum": 0, "maximum": 1 },
+                        "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+                        "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+                    },
+                    "required": ["x", "y", "width", "height"],
+                    "additionalProperties": false
+                },
+                "caption": { "type": "string", "maxLength": 1000, "description": "Optional short figure label or explanation." },
+                "dpi": { "type": "integer", "minimum": 72, "maximum": 300, "default": 150 }
+            },
+            "required": ["slug", "page"],
+            "additionalProperties": false
+        }),
+    }
 }
 
 /// Tools the in-app agent has and the MCP endpoint does not.
@@ -283,6 +331,10 @@ pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_js
                     .collect::<Vec<_>>(),
             }))
         }
+        "send_paper_image" => {
+            let p: super::paper_images::SendImageArgs = params(args)?;
+            super::paper_images::render(root, p)
+        }
         "get_note" => {
             let p: server::NoteParams = params(args)?;
             ok(tools::get_note(root, &p.slug, p.note_id.as_deref())?)
@@ -419,6 +471,8 @@ mod tests {
                 tool.name
             );
         }
+        assert!(!server::tool_declarations().iter().any(|t| t.name == SEND_PAPER_IMAGE_TOOL));
+        assert!(tools().iter().any(|t| t.name == SEND_PAPER_IMAGE_TOOL));
     }
 
     /// And the reverse: nothing dispatchable that is not declared, which would

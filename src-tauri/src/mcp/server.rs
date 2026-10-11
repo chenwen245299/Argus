@@ -153,6 +153,9 @@ pub struct ViewPageParams {
     /// 1-based page numbers to render, e.g. [3] or [4, 5]. Several may be
     /// requested at once; capped at 8 per call.
     pub pages: Vec<u32>,
+    /// Optional crop in 0–1 fractions of the displayed page, top-left origin.
+    /// Pass exactly one page when previewing a crop. Omit for full pages.
+    pub crop: Option<super::paper_images::Crop>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema, Default)]
@@ -485,7 +488,7 @@ impl ArgusMcpServer {
     /// Render specific PDF pages to images the model can actually look at.
     #[tool(
         name = "view_paper_page",
-        description = "Render specific pages of a paper's PDF and return them as images, so you can SEE the page — figures, architecture/model diagrams, plots and result curves, tables, equations, and layout — not just its text. This is also how to read one specific page (pass its number) instead of paging the whole extracted text with get_paper_fulltext. `pages` is 1-based; request several at once (capped at 8). Each page's extracted text is included alongside its image.",
+        description = "Render specific pages of a paper's PDF as images to inspect figures, tables, equations and layout. `pages` contains 1-based PDF page indices, NOT printed page labels or figure numbers; several may be requested (capped at 8). Each FULL page's text is included. To locate a figure, inspect the full page first and read its figure caption. Then pass exactly one page and optional `crop` {x,y,width,height} in 0–1 fractions of that FULL displayed page, TOP-LEFT origin, to preview the selected region. Verify the intended figure, axes, legends and caption; adjust and preview again if anything is missing. Never estimate coordinates from an already cropped image.",
         annotations(title = "View paper page", read_only_hint = true)
     )]
     async fn view_paper_page(
@@ -493,16 +496,17 @@ impl ArgusMcpServer {
         Parameters(p): Parameters<ViewPageParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let root = self.root()?;
-        let pages = blocking(move || tools::render_paper_pages(&root, &p.slug, &p.pages)).await?;
+        let pages = blocking(move || tools::render_paper_pages(&root, &p.slug, &p.pages, p.crop)).await?;
         let mut blocks: Vec<ContentBlock> = Vec::new();
         for page in &pages {
             // The page's text precedes its image so a text-only client still has
             // something to read; capped so one dense page cannot balloon the reply.
             let text: String = page.text.chars().take(4000).collect();
+            let region = page.crop.map(|crop| format!(" — crop {} (text below is from the full page)", serde_json::to_string(&crop).unwrap_or_default())).unwrap_or_default();
             let label = if text.trim().is_empty() {
-                format!("Page {} (image only — no extractable text):", page.page)
+                format!("PDF page index {}{} (image only — no extractable text):", page.page, region)
             } else {
-                format!("Page {}:\n{}", page.page, text)
+                format!("PDF page index {}{}:\n{}", page.page, region, text)
             };
             blocks.push(ContentBlock::text(label));
             let b64 = base64::engine::general_purpose::STANDARD.encode(&page.png);

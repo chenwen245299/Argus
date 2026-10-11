@@ -938,6 +938,11 @@ pub struct RenderedPage {
     pub png: Vec<u8>,
     /// Extracted text of that page; empty for a scanned page.
     pub text: String,
+    pub crop: Option<super::paper_images::Crop>,
+    pub width: u32,
+    pub height: u32,
+    pub page_width: u32,
+    pub page_height: u32,
 }
 
 /// Render one or more pages of a paper's PDF to PNG images (with each page's
@@ -947,7 +952,14 @@ pub fn render_paper_pages(
     root: &str,
     slug: &str,
     pages: &[u32],
+    crop: Option<super::paper_images::Crop>,
 ) -> Result<Vec<RenderedPage>, String> {
+    if let Some(crop) = crop {
+        crop.validate()?;
+        if pages.len() != 1 {
+            return Err("A crop preview needs exactly one PDF page index in pages.".into());
+        }
+    }
     let meta = paper::read_meta(root, slug)?;
     if ebook::is_ebook_file_type(meta.file_type.as_deref()) {
         return Err(format!(
@@ -975,10 +987,16 @@ pub fn render_paper_pages(
     let mut out = Vec::with_capacity(wanted.len());
     for p in wanted {
         let png = crate::render::render_pdf_page_png(&pdf_path, p, crate::render::DEFAULT_DPI)?;
+        let image = super::paper_images::prepare_page_png(png, crop)?;
         out.push(RenderedPage {
             page: p,
-            png,
+            png: image.png,
             text: texts.get(&p).cloned().unwrap_or_default(),
+            crop,
+            width: image.width,
+            height: image.height,
+            page_width: image.page_width,
+            page_height: image.page_height,
         });
     }
     Ok(out)

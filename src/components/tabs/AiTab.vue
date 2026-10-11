@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { modelOffer, modelSizeLabel } from '../../utils/modelOffers'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { storeToRefs } from 'pinia'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
@@ -11,8 +12,8 @@ import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import ServerToolTraceCard from '../ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../../utils/serverToolTrace'
 import { useSettingsStore } from '../../stores/settings'
+import { useThinkingStore } from '../../stores/thinking'
 import { useReaderStore } from '../../stores/reader'
-import MarkdownBody from '../MarkdownBody.vue'
 import { svgStringToPngBlob } from '../../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../../utils/clipboard'
 import { beginDragSelectionGuard, endDragSelectionGuard } from '../../utils/dragSelectionGuard'
@@ -21,7 +22,7 @@ import type {
 } from '../../types'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import ChatPageImage from '../ChatPageImage.vue'
-import ChatSentImages from '../ChatSentImages.vue'
+import ChatAnswerBody from '../ChatAnswerBody.vue'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
 import { askAiText } from '../../stores/translationHistory'
@@ -334,13 +335,11 @@ async function copyText(id: string, text: string) {
 
 async function openPopupWindow() {
   if (!props.slug) return
-  localStorage.setItem('argus:paper-ai-slug', props.slug)
   await invoke('open_paper_ai_window', { slug: props.slug })
 }
 
-// Reasoning / thinking mode state
-const useReasoning = ref(false)
-const reasoningLevel = ref<'low' | 'medium' | 'high'>('high')
+// Shared with library chat and persisted across panel/window/app reopen.
+const { useReasoning, reasoningLevel } = storeToRefs(useThinkingStore())
 const reasoningOpen = ref(false)
 const reasoningRoot = ref<HTMLElement | null>(null)
 
@@ -2451,20 +2450,14 @@ onUnmounted(() => {
                   class="answer-body markdown-body"
                   :class="{ pending: answer.streaming && !answer.content && !reasoningText(answer) }"
                 >
-                  <template v-if="answer.streaming">
-                    <MarkdownBody
-                      v-if="answer.content"
-                      :content="answer.displayContent ?? answer.content"
-                      :streaming="true"
-                    />
-                    <div v-else-if="!reasoningText(answer)" class="thinking-placeholder">{{ answer.withReasoning ? '正在思考…' : '生成中…' }}</div>
-                  </template>
-                  <MarkdownBody v-else :content="answer.content" />
-                  <ChatSentImages
+                  <ChatAnswerBody
+                    :content="answer.streaming ? answer.displayContent ?? answer.content : answer.content"
+                    :streaming="answer.streaming"
                     :conversation-id="activeConversation?.id ?? null"
                     :steps="answer.steps"
                     @open="previewImage = $event"
                   />
+                  <div v-if="answer.streaming && !answer.content && !reasoningText(answer)" class="thinking-placeholder">{{ answer.withReasoning ? '正在思考…' : '生成中…' }}</div>
                   <ServerToolTraceCard :trace="answer.serverTools" />
                   <!-- An end-to-end speech model's spoken reply. The text above is
                        its transcript, so this is an addition, not the answer. -->

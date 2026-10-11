@@ -25,7 +25,7 @@ use super::tools;
 /// under the conversation folder, and — for a vision model — fed back as a
 /// separate image message. Kept here so both sides name it the same thing.
 pub const VIEW_PAGE_TOOL: &str = "view_paper_page";
-pub use super::paper_images::SEND_PAPER_IMAGE_TOOL;
+pub use super::paper_images::{CropPreviews, SEND_PAPER_IMAGE_TOOL};
 
 /// A tool as the LLM needs to see it: name, purpose, and argument schema.
 #[derive(Debug, Clone, Serialize)]
@@ -59,11 +59,15 @@ pub fn declares_read_only(tool: &rmcp::model::Tool) -> bool {
 pub fn tools() -> Vec<AgentTool> {
     server::tool_declarations()
         .into_iter()
-        .map(|t| AgentTool {
-            name: t.name.to_string(),
-            read_only: declares_read_only(&t),
-            description: t.description.map(|d| d.to_string()).unwrap_or_default(),
-            input_schema: serde_json::Value::Object((*t.input_schema).clone()),
+        .map(|t| {
+            let mut description = t.description.as_ref().map(|d| d.to_string()).unwrap_or_default();
+            if t.name == VIEW_PAGE_TOOL {
+                description.push_str(" Full-page inspections in this app include a labelled 0–1 grid; crop previews are clean. Before send_paper_image with a crop, WAIT for this preview and inspect it. A send must use the exact crop from an earlier tool round; same-batch preview + send is rejected.");
+            }
+            AgentTool {
+                name: t.name.to_string(), read_only: declares_read_only(&t), description,
+                input_schema: serde_json::Value::Object((*t.input_schema).clone()),
+            }
         })
         .chain(app_only_tools())
         .chain(std::iter::once(send_paper_image_tool()))
@@ -81,14 +85,16 @@ fn send_paper_image_tool() -> AgentTool {
             Pass slug and a 1-based PDF page number (not the printed page label). Omit crop to \
             send the whole page, or crop to a figure/table/diagram using fractions of the \
             displayed page: x/y start at the TOP LEFT, width/height are positive, all in 0–1. \
-            Example: crop {x:0.05,y:0.1,width:0.9,height:0.35} sends the upper region. \
-            If you can see images, first inspect the page with view_paper_page to locate the \
-            correct region; include axes, legends and relevant caption. If you cannot see \
-            images, send the full page unless the user supplied the crop; never guess a \
-            figure's location or claim to have inspected it. Optional caption describes the \
-            image; dpi (72–300, default 150) controls clarity. Repeat for multiple figures. \
-            The app renders, saves and displays the image for you; do not embed base64 or \
-            local file paths in your reply. A successful result means the image was sent."
+            First inspect the FULL page with view_paper_page and read the figure caption; \
+            its labelled grid uses the full page's 0–1 coordinates. Preview your crop with \
+            view_paper_page {slug,pages:[page],crop}, WAIT for that result, and visually check \
+            the figure number/content, axes, legends and caption. Only then send EXACTLY \
+            that crop. An unpreviewed crop is rejected. If you cannot see images, send the \
+            full page; do not guess a crop. dpi (72–300, default 150) controls clarity. \
+            A successful result supplies a markdown reference. Copy that reference on its \
+            own line beside the paragraph explaining this image, interleaving images and \
+            explanation throughout the answer. Do not collect them at the end, invent \
+            references, or embed base64/local paths. Repeat for multiple figures."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -315,20 +321,27 @@ pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_js
         }
         "view_paper_page" => {
             let p: server::ViewPageParams = params(args)?;
-            let pages = tools::render_paper_pages(root, &p.slug, &p.pages)?;
+            let pages = tools::render_paper_pages(root, &p.slug, &p.pages, p.crop)?;
             // Return each page's text plus its PNG as base64. `copilot` decodes
             // and saves the PNGs, keeps the base64 out of the token-costed tool
             // message, and (for a vision model) feeds the images back separately.
+            let pages = pages.iter().map(|r| {
+                let png = if r.crop.is_none() {
+                    super::paper_images::coordinate_grid(&r.png)?
+                } else {
+                    r.png.clone()
+                };
+                Ok(serde_json::json!({
+                    "page": r.page, "text": r.text, "crop": r.crop,
+                    "width": r.width, "height": r.height,
+                    "page_width": r.page_width, "page_height": r.page_height,
+                    "coordinate_grid": r.crop.is_none(), "dpi": crate::render::DEFAULT_DPI,
+                    "png_base64": base64::engine::general_purpose::STANDARD.encode(png),
+                }))
+            }).collect::<Result<Vec<serde_json::Value>, String>>()?;
             ok(serde_json::json!({
                 "slug": p.slug,
-                "pages": pages
-                    .iter()
-                    .map(|r| serde_json::json!({
-                        "page": r.page,
-                        "text": r.text,
-                        "png_base64": base64::engine::general_purpose::STANDARD.encode(&r.png),
-                    }))
-                    .collect::<Vec<_>>(),
+                "pages": pages,
             }))
         }
         "send_paper_image" => {

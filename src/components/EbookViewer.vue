@@ -18,7 +18,7 @@ import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'
 import { renderMarkdown } from '../utils/renderMarkdown'
 import { notePopupStyle, clampNotePopupPos, startNotePopupResize, forgetNotePopupSize } from '../utils/notePopup'
-import { popupShift } from '../utils/popupFit'
+import { popupShift, selectionPopupAnchor } from '../utils/popupFit'
 import type { EbookManifest, Highlight } from '../types'
 
 // One instance per open ebook tab; `slug` never changes for an instance.
@@ -47,7 +47,7 @@ const error = ref<string | null>(null)
 
 const chapterEls = ref<(HTMLElement | null)[]>([])
 const renderedChapters = ref<Set<number>>(new Set())   // 0-based
-const renderingChapters = new Set<number>()
+const renderingChapters = new Map<number, Promise<void>>()
 const displayChapter = ref(1)                          // 1-based SPINE index of the topmost visible chapter
 const displayPage = ref(1)
 const pageCount = ref(1)
@@ -56,6 +56,7 @@ const pageMarkers = ref<Array<{ page: number; top: number }>>([])
 let observer: IntersectionObserver | null = null
 let progressDebounce: ReturnType<typeof setTimeout> | null = null
 let resizeDebounce: ReturnType<typeof setTimeout> | null = null
+let viewerTornDown = false
 
 // Blob URLs for book images, keyed by resource href; revoked on unmount.
 const blobUrls = new Map<string, string>()
@@ -178,7 +179,7 @@ const hlNoteEditing = ref(false)
 const noteTextareaRef = ref<HTMLTextAreaElement | null>(null)
 const hlColorPopup = ref<{ x: number; y: number; hlId: string } | null>(null)
 
-// The selection toolbar is centred on the mouse position, but its width varies with the UI
+// The selection toolbar is anchored to the selected text, but its width varies with the UI
 // language and the buttons present, so a selection ending near a window edge pushes part of it
 // out of view. It is measured once laid out and pulled back inside, on open and when its own size
 // changes - never on scroll, where it follows its anchor instead (repositionAnchoredPopups).
@@ -192,7 +193,7 @@ function fitSelectionPopup() {
   const { dx, dy } = popupShift(
     el.getBoundingClientRect(),
     { width: window.innerWidth, height: window.innerHeight },
-    // 12 px = the gap between the cursor and the toolbar (see onWindowMouseUp)
+    // 12 px = the gap between the selected text and the toolbar.
     { margin: 8, flipGap: 12 },
   )
   if (dx || dy) selectionPopup.value = { ...open, x: open.x + dx, y: open.y + dy }
@@ -266,6 +267,8 @@ watch(isActiveTab, (active) => {
 }, { immediate: true })
 
 onUnmounted(() => {
+  viewerTornDown = true
+  if (speech.isReadingPaper(props.slug)) speech.stop()
   removeGlobalListeners()
   observer?.disconnect()
   selPopupObserver?.disconnect()
@@ -370,11 +373,19 @@ const PURIFY_CONFIG = {
   ADD_ATTR: ['data-argus-res', 'data-argus-link-url', 'data-argus-link-chapter', 'data-argus-link-anchor'],
 } as const
 
-async function renderChapter(idx: number) {
-  if (renderedChapters.value.has(idx) || renderingChapters.has(idx)) return
-  renderingChapters.add(idx)
+function renderChapter(idx: number): Promise<void> {
+  if (renderedChapters.value.has(idx)) return Promise.resolve()
+  const pending = renderingChapters.get(idx)
+  if (pending) return pending
+  const task = loadChapter(idx).finally(() => renderingChapters.delete(idx))
+  renderingChapters.set(idx, task)
+  return task
+}
+
+async function loadChapter(idx: number) {
   try {
     const html = await invoke<string>('read_ebook_chapter', { slug: props.slug, index: idx + 1 })
+    if (viewerTornDown) return
     const el = chapterEls.value[idx]
     if (!el) return
     const content = el.querySelector('.chapter-content') as HTMLElement | null
@@ -391,6 +402,7 @@ async function renderChapter(idx: number) {
     // A chapter materializing ABOVE the viewport changes the scroll geometry —
     // compensate so the visible text doesn't jump.
     await nextTick()
+    if (viewerTornDown) return
     if (wasAbove && scrollEl) {
       scrollEl.scrollTop += el.offsetHeight - oldHeight
     }
@@ -401,8 +413,6 @@ async function renderChapter(idx: number) {
     schedulePageMetricsUpdate()
   } catch (e) {
     console.error(`Failed to render chapter ${idx + 1}:`, e)
-  } finally {
-    renderingChapters.delete(idx)
   }
 }
 
@@ -673,9 +683,11 @@ function rangeFromOffsets(root: HTMLElement, start: number, end: number): Range 
 // ── Selection popup ───────────────────────────────────────────────────────────
 /** True while a drag that began inside the note popup is in flight. */
 let noteDragOrigin = false
+let pressInPopup = false
 
 function onWindowMouseDown(e: MouseEvent) {
   noteDragOrigin = !!(e.target as HTMLElement).closest?.('.hl-note-popup')
+  pressInPopup = !!(e.target as HTMLElement).closest?.('.hl-note-popup, .hl-color-popup, .sel-popup')
 }
 
 function onWindowMouseUp(e: MouseEvent) {
@@ -683,7 +695,8 @@ function onWindowMouseUp(e: MouseEvent) {
   // release often lands outside, and dismissing there would tear down the very
   // text the user is selecting (and with it the selection they meant to copy).
   if (noteDragOrigin) { noteDragOrigin = false; return }
-  if ((e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup')) return
+  const overPopup = (e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup')
+  if (overPopup && (pressInPopup || !overPopup.classList.contains('sel-popup'))) return
   hlNotePopup.value = null
   if (e.button !== 2) hlColorPopup.value = null
 
@@ -718,9 +731,16 @@ function onWindowMouseUp(e: MouseEvent) {
   const text = clamped.toString().trim()
   if (!text || endOffset <= startOffset) { selectionPopup.value = null; return }
 
+  const previous = selectionPopup.value
+  if (previous?.chapterIndex === chapterIndex && previous.startOffset === startOffset
+    && previous.endOffset === endOffset && previous.text === text) return
+
+  const at = selectionPopupAnchor(Array.from(clamped.getClientRects()), {
+    width: window.innerWidth, height: window.innerHeight,
+  })
+  if (!at) { selectionPopup.value = null; return }
   selectionPopup.value = {
-    x: e.clientX,
-    y: e.clientY + 12,
+    ...at,
     text,
     chapterIndex,
     startOffset,
@@ -783,6 +803,49 @@ function readAloudSelection(source: 'pdf' | 'ebook') {
   selectionPopup.value = null
   void speech.read(text, { source, paper: props.slug })
 }
+
+const readingBook = computed(() => speech.isReadingPaper(props.slug))
+
+/** Read stable chapter text lazily, independent of font size and virtual pages. */
+function readAloudFromChapter() {
+  if (readingBook.value) { speech.stop(); return }
+  const book = manifest.value
+  if (!book || !book.chapters.length || loading.value || error.value) return
+  selectionPopup.value = null
+  lastReadChapter = 0
+  void speech.readPages({
+    paper: props.slug, unit: 'chapter',
+    startPage: currentPosition()?.chapter ?? displayChapter.value,
+    endPage: book.chapters.length,
+    getText: async (chapter) => {
+      if (viewerTornDown || manifest.value !== book) throw new Error(t('ebook.readDocumentClosed'))
+      return invoke<string>('read_ebook_chapter_text', { slug: props.slug, index: chapter })
+    },
+  })
+}
+
+// Render only the spoken chapter when following playback. Recheck after the
+// async render so stopping, seeking or switching tabs cannot cause a late jump.
+let lastReadChapter = 0
+let followChapterSeq = 0
+watch(() => [speech.pageProgress?.page, speech.state, isActiveTab.value, readingBook.value] as const,
+  ([chapter, state, active, reading]) => {
+    const seq = ++followChapterSeq
+    if (!active || !reading) { lastReadChapter = 0; return }
+    if (!chapter || (state !== 'playing' && state !== 'paused')) return
+    if (chapter === lastReadChapter) return
+    void ensureChapterRendered(chapter - 1).then(() => {
+      if (seq !== followChapterSeq || viewerTornDown || !isActiveTab.value || !readingBook.value
+        || speech.pageProgress?.page !== chapter) return
+      const el = chapterEls.value[chapter - 1]
+      const scrollEl = containerRef.value
+      if (!el || !scrollEl) return
+      lastReadChapter = chapter
+      scrollEl.scrollTop = Math.max(0, el.offsetTop - 8)
+      updateDisplayChapter()
+      updatePageMetrics()
+    })
+  })
 
 const SNIPPET_HIGHLIGHT_COLOR = '#CE93D8'
 function addToSnippetLibrary() {
@@ -1392,6 +1455,18 @@ defineExpose({ closeToList: handleBack })
 
       <div class="toolbar-spacer" />
 
+      <button
+        class="related-btn read-book-btn"
+        :class="{ active: readingBook }"
+        :disabled="!manifest || !chapterCount || loading || !!error"
+        :aria-pressed="readingBook"
+        :title="readingBook ? t('pdf.readAloudStop') : t('ebook.readFromChapter')"
+        @click="readAloudFromChapter"
+      >
+        <Icon :icon="readingBook ? 'fluent:stop-20-filled' : 'fluent:speaker-2-20-regular'" width="15" height="15" />
+        <span>{{ readingBook ? t('pdf.readAloudStop') : t('pdf.readAloud') }}</span>
+      </button>
+
       <button class="related-btn" :title="t('related.buttonTitle')" @click="openRelatedFromToolbar">
         <span class="related-btn-icon">🔗</span>
         <span class="related-btn-label">{{ t('related.buttonLabel') }}</span>
@@ -1698,6 +1773,8 @@ defineExpose({ closeToList: handleBack })
   transition: background 0.1s;
 }
 .related-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+.read-book-btn.active { background: var(--accent-light); border-color: var(--accent); color: var(--accent); }
+.read-book-btn:disabled { opacity: 0.45; cursor: default; }
 .related-btn-icon { font-size: 12px; }
 .related-btn-count {
   min-width: 16px;
@@ -2166,7 +2243,6 @@ defineExpose({ closeToList: handleBack })
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
   padding: 6px 8px;
-  transform: translateX(-50%);
   /* Natural width whatever `left` is (a fixed box is otherwise sized to the room to its right),
      and wrapping rather than running off the window when it is wider than the window. */
   width: max-content;

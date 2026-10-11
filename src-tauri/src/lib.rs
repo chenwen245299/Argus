@@ -80,7 +80,8 @@ pub fn run() {
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
-                .skip_initial_state("paper-ai")
+                // Paper AI windows persist their shared size in copilot.rs.
+                .with_filter(|label| !label.starts_with("paper-ai-"))
                 .skip_initial_state("arxiv")
                 .skip_initial_state("library-chat")
                 .skip_initial_state("note-window")
@@ -192,6 +193,7 @@ pub fn run() {
             commands::import_ebook,
             commands::read_ebook_manifest,
             commands::read_ebook_chapter,
+            commands::read_ebook_chapter_text,
             commands::read_ebook_resource,
             commands::regen_ebook_sections,
             commands::fetch_metadata,

@@ -71,7 +71,7 @@ import { computeSections } from '../utils/sections'
 import { renderMarkdown } from '../utils/renderMarkdown'
 import { groupHighlights, groupAppearance, indexGroups } from '../utils/highlightGroups'
 import { notePopupStyle, clampNotePopupPos, startNotePopupResize, forgetNotePopupSize } from '../utils/notePopup'
-import { popupShift } from '../utils/popupFit'
+import { popupShift, selectionPopupAnchor } from '../utils/popupFit'
 import { fluentIconFor, fluentReady } from '../utils/fluentEmoji'
 import type { Highlight, Rect, PaperSections } from '../types'
 // The legacy build includes its own Promise.withResolvers polyfill, so the worker
@@ -748,7 +748,7 @@ async function openHighlightMenu(e: MouseEvent, id: string) {
   if (x !== open.x || y !== open.y) hlColorPopup.value = { ...open, x, y }
 }
 
-// The selection toolbar is placed at the mouse position, but its width varies (language, the
+// The selection toolbar is anchored to selected text, but its width varies (language, the
 // read-aloud button, the page-furniture toggle) so, like the menu above, it is measured once laid
 // out and pulled back inside the window. Only on open and when its own size changes - never on
 // scroll, where it follows its anchor instead (repositionAnchoredPopups).
@@ -762,7 +762,7 @@ function fitSelectionPopup() {
   const { dx, dy } = popupShift(
     el.getBoundingClientRect(),
     { width: window.innerWidth, height: window.innerHeight },
-    // 12 px = the gap between the cursor and the toolbar (see onWindowMouseUp)
+    // 12 px = the gap between the selected text and the toolbar.
     { margin: 8, flipGap: 12 },
   )
   if (dx || dy) selectionPopup.value = { ...open, x: open.x + dx, y: open.y + dy }
@@ -3274,6 +3274,15 @@ function onWindowMouseUp(e: MouseEvent) {
   // Pre-compute rects NOW while the selection is still active — reading them
   // later (after a mousedown on a color dot) would find it already cleared.
   const range = sel.getRangeAt(0)
+  // Clicking a non-selectable pane can leave the original selection intact.
+  // Keep its toolbar and furniture policy instead of following this click.
+  const previous = popupSource?.range
+  if (selectionPopup.value && previous
+    && range.startContainer === previous.startContainer && range.startOffset === previous.startOffset
+    && range.endContainer === previous.endContainer && range.endOffset === previous.endOffset) {
+    if (popupSource?.skip) showSkippedSpans([...popupSource.skip])
+    return
+  }
   const pages = collectSelectionRectsByPage(range)
   const text = sel.toString().trim()
   if (pages.length === 0) { selectionPopup.value = null; return }
@@ -3286,9 +3295,10 @@ function onWindowMouseUp(e: MouseEvent) {
   const plan = planSelectionFurniture(range, pages, text)
   const furniture = plan?.furniture ?? null
 
-  // Anchor the toolbar to where the mouse was released rather than the bottom
-  // of the selection — feels more direct and stays near the cursor.
-  const at = { x: e.clientX, y: e.clientY + 12 }
+  const at = selectionPopupAnchor(Array.from(range.getClientRects()), {
+    width: window.innerWidth, height: window.innerHeight,
+  })
+  if (!at) { selectionPopup.value = null; return }
   selectionPopup.value = furniture && plan
     ? { ...at, text: furniture.trimmed.text, pages: furniture.trimmed.pages, full: { text: plan.text, pages }, furniture: furniture.report }
     : plan

@@ -1,7 +1,7 @@
 /**
  * Keeps a `position: fixed` popup inside the window.
  *
- * The selection toolbar is placed at the mouse position and its width depends on the UI language
+ * The selection toolbar is anchored to selected text and its width depends on the UI language
  * and on which buttons are present (read-aloud, the page-furniture toggle), so a fixed `left`
  * can push the right-hand buttons past the window edge. The viewers measure the laid-out popup
  * and shift it by the amount this returns. It only ever returns a shift for the popup as it is
@@ -9,6 +9,20 @@
  * scrolls, because the popup follows its anchor then and clamping would re-detach it.
  */
 export interface BoxRect { left: number; top: number; right: number; bottom: number }
+
+/** Anchor below the last visible selected text run, independent of the mouse release. */
+export function selectionPopupAnchor(
+  rects: readonly BoxRect[],
+  win: { width: number; height: number },
+): { x: number; y: number } | null {
+  for (let i = rects.length - 1; i >= 0; i--) {
+    const r = rects[i]
+    if (r.right <= r.left || r.bottom <= r.top || r.bottom <= 0 || r.top >= win.height
+      || r.right <= 0 || r.left >= win.width) continue
+    return { x: Math.max(0, r.left), y: Math.min(win.height, r.bottom) + 12 }
+  }
+  return null
+}
 
 export interface FitOptions {
   /** Smallest gap kept between the popup and each window edge (px). */

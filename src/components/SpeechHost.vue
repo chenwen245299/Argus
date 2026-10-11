@@ -183,7 +183,13 @@ function toggleMute() {
 /** "2/5" — only worth showing when the passage was split. */
 const progressText = computed(() => {
   const page = speech.pageProgress
-  if (page) return t('speech.player.page', { page: page.page, total: page.endPage })
+  if (page) {
+    // EPUB spine indices include cover/preface documents and differ from the
+    // reader's logical chapter numbers. Show progress without conflicting counts.
+    return page.unit === 'chapter'
+      ? t('speech.player.bookProgress', { percent: Math.round(speech.heard * 100) })
+      : t('speech.player.page', { page: page.page, total: page.endPage })
+  }
   const { index, total } = speech.progress
   return total > 1 ? `${Math.min(index + 1, total)}/${total}` : ''
 })

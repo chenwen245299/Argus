@@ -82,9 +82,8 @@ async function print() {
 }
 
 onMounted(async () => {
-  // Handed over through localStorage, the same way the paper-ai window receives
-  // its slug: a window cannot take arguments, and a round trip through the
-  // backend just to pass three values would be more moving parts than this.
+  // The print preview reads the selected papers and options from the caller's
+  // localStorage handoff.
   let slugs: string[] = []
   try {
     const raw = localStorage.getItem('argus:annotation-print')

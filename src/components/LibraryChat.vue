@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { storeToRefs } from 'pinia'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
@@ -9,12 +10,12 @@ import ProviderBalanceTag from './ProviderBalanceTag.vue'
 import ServerToolTraceCard from './ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../utils/serverToolTrace'
 import { useSettingsStore } from '../stores/settings'
-import MarkdownBody from './MarkdownBody.vue'
+import { useThinkingStore } from '../stores/thinking'
 import WriteConfirmCard from './WriteConfirmCard.vue'
 import { buildToolExchangeMessages } from '../utils/agentHistory'
 import WindowControls from './WindowControls.vue'
 import ChatPageImage from './ChatPageImage.vue'
-import ChatSentImages from './ChatSentImages.vue'
+import ChatAnswerBody from './ChatAnswerBody.vue'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../types/chatImages'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
@@ -743,10 +744,9 @@ const keepaliveTitle = computed(() => {
   ].filter(Boolean).join('\n')
 })
 
-// Reasoning / thinking-mode state (mirrors AiTab). DeepSeek exposes high/max;
-// everyone else low/medium/high — the backend maps DeepSeek's levels.
-const useReasoning = ref(false)
-const reasoningLevel = ref<'low' | 'medium' | 'high'>('high')
+// Keep the user's thinking choice across conversations and window/app reopen.
+// DeepSeek exposes high/max; the backend maps the stored low/medium/high levels.
+const { useReasoning, reasoningLevel } = storeToRefs(useThinkingStore())
 const reasoningOpen = ref(false)
 const isDeepSeekSelected = computed(() => {
   const sel = effectiveModel()
@@ -2899,24 +2899,15 @@ onUnmounted(() => {
                          raw content, so long answers don't re-render on every token.
                          Before any content arrives we show just a blinking cursor —
                          no "思考中" placeholder (the 思考过程 box already covers thinking). -->
-                    <template v-if="activeAnswer(msg).streaming">
-                      <MarkdownBody
-                        v-if="activeAnswer(msg).content"
-                        :content="activeAnswer(msg).displayContent ?? activeAnswer(msg).content"
-                        :streaming="true"
-                      />
-                      <span class="cursor-blink"/>
-                    </template>
-                    <!-- Done: Mermaid-aware segment rendering -->
-                    <template v-else>
-                      <MarkdownBody :content="activeAnswer(msg).content" />
-                    </template>
-                    <ServerToolTraceCard :trace="activeAnswer(msg).serverTools" />
-                    <ChatSentImages
+                    <ChatAnswerBody
+                      :content="activeAnswer(msg).streaming ? activeAnswer(msg).displayContent ?? activeAnswer(msg).content : activeAnswer(msg).content"
+                      :streaming="activeAnswer(msg).streaming"
                       :conversation-id="activeConvId"
                       :steps="activeAnswer(msg).agentSteps"
                       @open="previewImage = $event"
                     />
+                    <span v-if="activeAnswer(msg).streaming" class="cursor-blink"/>
+                    <ServerToolTraceCard :trace="activeAnswer(msg).serverTools" />
                     <!-- An end-to-end speech model's spoken reply. The text above
                          is its transcript, so this is an addition, not the answer. -->
                     <div v-if="activeAnswer(msg).audioUrl" class="answer-audio">

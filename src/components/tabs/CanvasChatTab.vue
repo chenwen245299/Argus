@@ -18,8 +18,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useAiStore, type ModelOption } from '../../stores/ai'
 import { useCanvasStore } from '../../stores/canvas'
-import MarkdownBody from '../MarkdownBody.vue'
-import ChatSentImages from '../ChatSentImages.vue'
+import ChatAnswerBody from '../ChatAnswerBody.vue'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import CanvasEditConfirmCard from '../CanvasEditConfirmCard.vue'
@@ -700,8 +699,9 @@ onUnmounted(() => {
             </div>
           </div>
           <div class="cc-answer" :class="{ error: msg.error }">
-            <MarkdownBody :content="streamText(msg)" :streaming="msg.streaming" />
-            <ChatSentImages
+            <ChatAnswerBody
+              :content="streamText(msg)"
+              :streaming="msg.streaming"
               :conversation-id="activeConvId"
               :steps="msg.steps"
               @open="previewImage = $event"

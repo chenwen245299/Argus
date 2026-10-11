@@ -400,20 +400,34 @@ fn save_view_page_images(
 /// The text a `view_paper_page` result contributes to the model's transcript:
 /// page numbers and each page's extracted text, but never the base64 image —
 /// that goes back to a vision model as a separate image message instead.
-fn page_image_summary(value: &serde_json::Value, sent: bool) -> serde_json::Value {
+fn page_image_summary(
+    value: &serde_json::Value,
+    sent: bool,
+    images: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let pages: Vec<serde_json::Value> = value
         .get("pages")
         .and_then(|p| p.as_array())
         .map(|arr| {
             arr.iter()
-                .map(|page| {
+                .enumerate()
+                .map(|(index, page)| {
                     let mut summary = serde_json::json!({
                         "page": page.get("page").cloned().unwrap_or(serde_json::Value::Null),
                         "text": page.get("text").and_then(|t| t.as_str()).unwrap_or(""),
                     });
-                    for key in ["caption", "crop", "width", "height", "dpi"] {
+                    for key in ["caption", "crop", "width", "height", "dpi", "page_width", "page_height", "coordinate_grid"] {
                         if let Some(v) = page.get(key) {
                             summary[key] = v.clone();
+                        }
+                    }
+                    if sent {
+                        if let Some(file) = images.and_then(|v| v.as_array())
+                            .and_then(|arr| arr.get(index))
+                            .and_then(|image| image["file"].as_str())
+                            .filter(|file| !file.is_empty())
+                        {
+                            summary["markdown"] = serde_json::json!(format!("![](argus-image://{file})"));
                         }
                     }
                     summary
@@ -425,14 +439,47 @@ fn page_image_summary(value: &serde_json::Value, sent: bool) -> serde_json::Valu
         "slug": value.get("slug").and_then(|s| s.as_str()).unwrap_or(""),
         "note": if sent {
             "The image was saved with this conversation and sent into your answer. \
-             The user can click it to enlarge. Do not send a markdown image path or base64."
+             The user can click it to enlarge. Copy each page's markdown reference EXACTLY, \
+             on its own line beside the paragraph discussing it, interleaving images and \
+             explanation. Never invent references or substitute a local path/base64."
         } else {
-            "The requested page(s) were rendered as images and shown to the user. \
-                 If you can see images, the rendered page(s) accompany this result. \
-                 Each page's extracted text is below."
+            "The requested page(s) accompany this result as labelled images. Full pages have \
+             a 0–1 coordinate grid (x grows right, y grows down); crop previews are clean. \
+             Coordinates ALWAYS refer to the full displayed page, never to a crop preview. \
+             Read the actual figure caption and verify the PDF page index; do not confuse \
+             figure numbers or printed page labels with PDF indices. Before sending a crop, \
+             inspect its preview and check the figure, axes, legends and caption. The text \
+             below comes from the FULL page and is NOT evidence that a crop contains it."
         },
         "pages": pages,
     })
+}
+
+/// Label EACH image immediately before its pixels. A batch of unlabelled pages
+/// made it too easy for a model to associate one page's caption with another.
+fn model_page_image_parts(
+    value: &serde_json::Value,
+    images: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut parts = Vec::new();
+    for (index, image) in images.as_array().into_iter().flatten().enumerate() {
+        let Some(url) = image["dataUrl"].as_str() else { continue; };
+        let page = &value["pages"][index];
+        let kind = if !page["crop"].is_null() {
+            format!("CROP PREVIEW from full-page fractions {}. Check the actual visible figure and caption.", page["crop"])
+        } else if page["coordinate_grid"].as_bool() == Some(true) {
+            "FULL PAGE with 0–1 coordinate grid: x increases right, y increases down; top-left is (0,0).".into()
+        } else {
+            "FULL PAGE (clean image).".into()
+        };
+        parts.push(serde_json::json!({
+            "type": "text",
+            "text": format!("Paper '{}', PDF page index {} (NOT a figure number or printed page label). {} Image size {}×{}.",
+                image["slug"].as_str().unwrap_or(""), image["page"], kind, page["width"], page["height"]),
+        }));
+        parts.push(serde_json::json!({ "type": "image_url", "image_url": { "url": url } }));
+    }
+    parts
 }
 
 /// Split the old single-file store into one file per conversation.
@@ -578,12 +625,34 @@ mod conversation_store_tests {
     #[test]
     fn image_summary_carries_provenance_but_never_base64() {
         let value = image_result([0, 0, 0, 255]);
-        let summary = page_image_summary(&value, true);
+        let saved = serde_json::json!([{"file":"image-test.png"}]);
+        let summary = page_image_summary(&value, true, Some(&saved));
         assert_eq!(summary["pages"][0]["caption"], "Figure 2");
         assert_eq!(summary["pages"][0]["crop"]["width"], 0.5);
         assert!(summary["pages"][0].get("png_base64").is_none());
         assert!(!summary.to_string().contains(value["pages"][0]["png_base64"].as_str().unwrap()));
         assert!(summary["note"].as_str().unwrap().contains("sent into your answer"));
+        assert_eq!(summary["pages"][0]["markdown"], "![](argus-image://image-test.png)");
+    }
+
+    #[test]
+    fn every_model_image_is_preceded_by_its_own_page_and_crop_label() {
+        let value = serde_json::json!({"pages":[
+            {"page":3, "width":100, "height":200, "coordinate_grid":true},
+            {"page":5, "width":80, "height":60, "crop":{"x":0.1,"y":0.2,"width":0.8,"height":0.3}}
+        ]});
+        let images = serde_json::json!([
+            {"slug":"first", "page":3, "dataUrl":"data:image/png;base64,first"},
+            {"slug":"second", "page":5, "dataUrl":"data:image/png;base64,second"}
+        ]);
+        let parts = model_page_image_parts(&value, &images);
+        assert_eq!(parts.len(), 4);
+        assert!(parts[0]["text"].as_str().unwrap().contains("'first', PDF page index 3"));
+        assert!(parts[0]["text"].as_str().unwrap().contains("FULL PAGE"));
+        assert_eq!(parts[1]["image_url"]["url"], images[0]["dataUrl"]);
+        assert!(parts[2]["text"].as_str().unwrap().contains("'second', PDF page index 5"));
+        assert!(parts[2]["text"].as_str().unwrap().contains("CROP PREVIEW"));
+        assert_eq!(parts[3]["image_url"]["url"], images[1]["dataUrl"]);
     }
 
     #[test]
@@ -1203,14 +1272,23 @@ pub fn save_paper_ai_window_size(app: &tauri::AppHandle, width: f64, height: f64
     }
 }
 
-pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: Option<&str>) -> Result<(), String> {
-    use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+// Encode the complete UTF-8 slug rather than sanitizing it: different paper names
+// must never collapse to the same window label. The view decodes its own label,
+// so opening another paper cannot overwrite its identity during startup/reload.
+fn paper_ai_window_label(slug: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    format!("paper-ai-{}", URL_SAFE_NO_PAD.encode(slug))
+}
 
-    if let Some(win) = app.get_webview_window("paper-ai") {
+pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: &str) -> Result<(), String> {
+    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+    crate::path_guard::validate_segment("paper slug", slug)?;
+    let label = paper_ai_window_label(slug);
+
+    if let Some(win) = app.get_webview_window(&label) {
+        let _ = win.unminimize();
         let _ = win.set_focus();
-        if let Some(slug) = slug {
-            let _ = win.emit("paper-ai-slug", slug.to_string());
-        }
         return Ok(());
     }
 
@@ -1219,7 +1297,7 @@ pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: Option<&str>) -> Resul
 
     let builder = WebviewWindowBuilder::new(
         app,
-        "paper-ai",
+        &label,
         WebviewUrl::App(std::path::PathBuf::from("/")),
     )
     .title("Argus — 论文 AI")
@@ -1256,17 +1334,49 @@ pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: Option<&str>) -> Resul
     });
 
     let win_c = win.clone();
-    let slug = slug.map(|s| s.to_string());
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let _ = win_c.unmaximize();
         let _ = win_c.set_size(tauri::LogicalSize::new(width, height));
-        if let Some(slug) = slug {
-            let _ = win_c.emit("paper-ai-slug", slug);
-        }
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod paper_ai_window_tests {
+    use super::paper_ai_window_label;
+
+    #[test]
+    fn different_papers_have_distinct_window_labels() {
+        let slugs = ["paper-a", "paper-b", "paper a", "paper_a", "论文 A", "论文 B"];
+        let labels: std::collections::HashSet<_> =
+            slugs.iter().map(|slug| paper_ai_window_label(slug)).collect();
+        assert_eq!(labels.len(), slugs.len());
+        assert_eq!(
+            paper_ai_window_label("paper-a"),
+            paper_ai_window_label("paper-a")
+        );
+    }
+
+    #[test]
+    fn labels_preserve_utf8_and_use_only_tauri_label_characters() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        for slug in ["paper-a", "论文 A", "研究 🧪", &"a".repeat(255)] {
+            let label = paper_ai_window_label(slug);
+            assert!(label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+            assert_eq!(
+                URL_SAFE_NO_PAD
+                    .decode(label.strip_prefix("paper-ai-").unwrap())
+                    .unwrap(),
+                slug.as_bytes()
+            );
+        }
+        // Shared with the frontend regression fixtures.
+        assert_eq!(paper_ai_window_label("论文 A"), "paper-ai-6K665paHIEE");
+    }
 }
 
 pub fn open_library_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
@@ -2648,7 +2758,13 @@ fn agent_tool_defs(
         .chain(canvas_edit.then(crate::mcp::agent::canvas_edit_tool))
         .filter(|t| vision || t.name != crate::mcp::agent::VIEW_PAGE_TOOL)
         .chain(bridge.tools().iter().cloned())
-        .map(|t| {
+        .map(|mut t| {
+            if !vision && t.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL {
+                if let Some(props) = t.input_schema["properties"].as_object_mut() {
+                    props.remove("crop");
+                }
+                t.description = "Send a FULL PDF page into the answer, using slug and a 1-based PDF page index. This model cannot inspect images, so cropping is unavailable; do not guess a figure's location. Optional caption labels the page; dpi is 72–300 (default 150). Copy the successful result's markdown reference exactly on its own line beside the relevant explanation, interleaving text and images. Never invent references or embed base64/local paths.".into();
+            }
             serde_json::json!({
                 "type": "function",
                 "function": {
@@ -2836,6 +2952,7 @@ async fn run_agent_loop(
     // Everything the model said across all rounds, in order. Kept so the
     // persisted answer matches what the user watched appear.
     let mut streamed = String::new();
+    let mut crop_previews = crate::mcp::agent::CropPreviews::default();
     // Summed across rounds and emitted once at the end. Per round would show
     // the user a cost strip while the agent is still working, reporting only
     // the most recent call rather than what the answer actually cost.
@@ -2984,7 +3101,14 @@ async fn run_agent_loop(
 
             let image_tool = call.name == crate::mcp::agent::VIEW_PAGE_TOOL
                 || call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL;
-            let mut outcome = if call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL
+            let crop_check = if call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL {
+                crop_previews.check_send(&call.arguments, model_sees_images, rounds)
+            } else {
+                Ok(())
+            };
+            let mut outcome = if let Err(error) = crop_check {
+                Err(error)
+            } else if call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL
                 && conversation_id.is_none()
             {
                 Err("Sending an image requires a conversation to save it in.".into())
@@ -3078,18 +3202,16 @@ async fn run_agent_loop(
             }
             let (content, ok, cut) = match &outcome {
                 Ok(value) if image_tool => {
+                    if call.name == crate::mcp::agent::VIEW_PAGE_TOOL {
+                        crop_previews.remember(value, rounds);
+                    }
                     if model_sees_images {
-                        for img in result_images.as_ref().and_then(|v| v.as_array()).into_iter().flatten() {
-                            if let Some(url) = img.get("dataUrl").and_then(|u| u.as_str()) {
-                                round_image_parts.push(serde_json::json!({
-                                    "type": "image_url",
-                                    "image_url": { "url": url },
-                                }));
-                            }
+                        if let Some(images) = &result_images {
+                            round_image_parts.extend(model_page_image_parts(value, images));
                         }
                     }
                     let (text, cut) = truncate_tool_result(
-                        &page_image_summary(value, call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL),
+                        &page_image_summary(value, call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL, result_images.as_ref()),
                         budget.single_result,
                     );
                     (text, true, cut)
@@ -3152,7 +3274,7 @@ async fn run_agent_loop(
         if !round_image_parts.is_empty() {
             let mut parts = vec![serde_json::json!({
                 "type": "text",
-                "text": "Rendered images of the page(s) you asked to view:",
+                "text": "Each image below is preceded by its paper slug, PDF page index and full-page/crop status. Check the pixels and actual caption, not just the extracted page text. Crop coordinates always refer to the full page.",
             })];
             parts.extend(round_image_parts);
             convo.push(serde_json::json!({ "role": "user", "content": parts }));
@@ -3488,7 +3610,12 @@ mod agent_tests {
             !text_only.iter().any(|n| n == crate::mcp::agent::VIEW_PAGE_TOOL),
             "view_paper_page was offered to a model that cannot see images"
         );
-        // Only that one tool differs — a text-only model keeps everything else.
+        for vision in [true, false] {
+            let send = agent_tool_defs(&bridge, vision, false).into_iter()
+                .find(|tool| tool["function"]["name"] == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL).unwrap();
+            assert_eq!(send["function"]["parameters"]["properties"].get("crop").is_some(), vision);
+        }
+        // Only that one tool is omitted — a text-only model keeps the rest.
         assert_eq!(with_vision.len(), text_only.len() + 1);
     }
 

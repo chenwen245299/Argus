@@ -175,7 +175,7 @@ The app uses multiple Tauri windows rather than browser-style routing. `src/App.
 | `arxiv` | `ArxivView` | arXiv / bioRxiv recommendation inbox |
 | `canvas` | `CanvasView` | Paper relationship canvas (Vue Flow) |
 | `library-chat` | `LibraryChatView` | Library-wide 智能问答 (agent chat) |
-| `paper-ai` | `PaperAiView` | Per-paper AI chat |
+| `paper-ai-*` | `PaperAiView` | Per-paper AI chat; one window per slug (base64url UTF-8 in the label), reused only for the same paper. The view reads its own label, with no shared slug storage or switching event |
 | `embedding-map` | `EmbeddingMapView` | 2-D visualization of the vector embedding space |
 | `note-window-*` | `NoteWindowView` | Standalone note editor |
 
@@ -199,6 +199,7 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `arxiv.ts` | arXiv inbox, config, schedule status, analysis |
 | `canvas.ts` | Canvas list, current canvas, auto-save |
 | `speech.ts` | Read-aloud: configured speech provider/model/options, the speech capabilities from `list_media_capabilities`, `read()` and its state — see *Media generation and read-aloud* |
+| `thinking.ts` | The user's thinking-mode switch and reasoning level, shared by paper AI and library chat, saved per device in localStorage (`argus:thinking-preference`) and synchronized across windows through storage events. Reopening panels, conversations or the app must restore the choice |
 
 `snippetLibrary.ts`, `translationHistory.ts`, and `update.ts` are reactive helper modules, not Pinia stores.
 
@@ -437,15 +438,24 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
 renders one PDF page or a crop into the current answer. It takes a paper slug,
 a 1-based PDF page index, optional `crop: {x, y, width, height}` in 0–1 fractions
 of the displayed page (top-left origin), optional caption, and 72–300 DPI
-(default 150). A vision model should inspect with `view_paper_page` first;
-text-only models can send a full page but must not guess a crop. It is part of
+(default 150). In-app `view_paper_page` full-page images carry a labelled 0–1
+coordinate grid; its optional `crop` previews exactly one page with clean pixels.
+A cropped send must match a successful preview from an **earlier** tool round
+in the current answer, so batching preview + send cannot bypass inspection.
+Text-only models are offered full-page sends only. Each image fed back to a
+vision model is labelled with its slug, PDF page index and full-page/crop status;
+printed page labels and figure numbers are never PDF indices. It is part of
 the answer, so it does not ask for note/canvas write confirmation, and it is
 not exposed by the external read-only MCP server. Both tools return images via
 the existing `result` event; base64 stays out of the textual tool transcript.
 Images are immutable PNG files in `chats/<conversation-stem>/` (also used for
 paper AI and canvas conversations). Answer steps retain filenames and source/crop metadata;
-the frontend drops live `dataUrl` values before saving JSON. `ChatSentImages.vue`
-derives the inline gallery from those steps, and `ChatPageImage.vue` reloads via
+the frontend drops live `dataUrl` values before saving JSON. A successful send
+returns `![](argus-image://<file>)`, which the model places on its own line beside
+the relevant explanation. `ChatAnswerBody.vue` + `utils/chatImageContent.ts`
+resolve only images actually sent in that answer (never arbitrary paths), keep
+references inside code fences as text, and retain unreferenced/legacy images at
+the end when streaming finishes. `ChatPageImage.vue` reloads via
 `read_chat_image`. Saving failures are tool errors rather than successful sends.
 
 **Prompt-cache keepalive (`cache_keepalive.rs`).** An agent turn sends a large
@@ -595,6 +605,7 @@ Dragging from the foot of one page into the next also selects, in DOM order, the
 - **Geometry comes from pdf.js text content**, not from the DOM: WebKit measures text-layer span widths differently from Chrome, which broke footnote detection in the real WKWebView. `renderPage` keeps `{content, view, rotate}` per rendered page (`pageTextSources`) and `preferContentGeometry` swaps it in when span counts and texts match one to one; the DOM supplies only element identity and line ends.
 - **Fail safe**: the text rebuilt from the spans *without* dropping anything must equal `selection.toString()` **ignoring whitespace**, otherwise nothing is trimmed. Never compare line breaks: the app shell is `user-select: none` with only `.textLayer` opting back in (App.vue), so WebKit's `toString()` puts no line break between two pages ("…composition.\n2In contrast") and an exact comparison failed on every cross-page selection — the feature was a silent no-op in the app for that reason while every harness without App.vue's CSS passed. Every selection across pages therefore takes the rebuilt text (`planSelectionFurniture` → `popup.full`), which also fixes words running together across a page break. Test this path only with App.vue's selection rules applied. Records of one highlight must keep sharing the same trimmed `text` and `created_at` (`highlightGroups` groups on that pair).
 - The report (`items`, `counts`) describes only spans that are in the selection (nothing in the popup shows it now; keep it that way for any notice that comes back).
+- Both viewers anchor the selection toolbar to the last visible selected text run (`selectionPopupAnchor` in `utils/popupFit.ts`). An unchanged selection keeps its existing position when another non-selectable pane is clicked; a mouse release alone must not move it. PDF also restores the skipped-span tint for that unchanged selection.
 - Verified on 6977 pages of 310 PDFs (precision first: no false positive found in the audits; recall roughly 83–95 % depending on the kind). Known misses fail towards the old behaviour. Scanned/OCR pages and `/Rotate` pages are a no-op by design. Floats were audited on the same corpus (7101 pages, ~4100 floats): body text next to a float, tables at body size and every first-page float were checked by hand; simulated cross-page selections (6011 page pairs) drop a float on 1503 of them. Single-page selections are untouched, floats included.
 
 ### Media generation and read-aloud
@@ -703,6 +714,15 @@ The mini-player shows the spoken page and progress over the original remaining
 pages. Seeking to an unprepared page extracts only that page before continuing,
 and preserves pause state. The visible PDF follows page changes; closing its tab
 stops the read, including text extraction that has not finished yet.
+
+The ebook toolbar offers the same continuous read through `readPages` with
+`unit: "chapter"`, from the start of the current spine chapter to the end of the
+book. `read_ebook_chapter_text` returns the parser's existing normalized plain
+text one chapter at a time, without rendering chapters or loading images for
+speech. The mini-player uses book progress rather than virtual page or logical
+TOC chapter numbers (both differ from spine indices). Playback follows chapter
+changes in the active ebook tab; late renders cannot jump after a stop, seek or
+tab switch. Closing the tab cancels the read, including pending text loads.
 
 - `stores/speech.ts` — the configuration (`speech_*` in the app settings, checked
   against `list_media_capabilities`: `isConfigured` / `notConfiguredReason` =
@@ -1083,4 +1103,4 @@ extend `LUNAR_HOLIDAYS` (HKO conversion tables) when it runs out.
 
 ---
 
-*Last updated: 2026-10-04. Keep this file in sync with major architectural changes.*
+*Last updated: 2026-10-08. Keep this file in sync with major architectural changes.*

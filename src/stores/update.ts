@@ -115,10 +115,9 @@ export const startUpdate = async () => {
 
 // ── Auto-update scheduling ──────────────────────────────────────────────────
 // Many users leave the app running for days, so a one-shot check at launch
-// rarely catches a release. We run a check shortly after startup and then once
+// rarely catches a release. We run a check immediately at startup and then once
 // a day at 9am for as long as the window stays open.
 
-let startupTimer: ReturnType<typeof setTimeout> | null = null
 let dailyTimer: ReturnType<typeof setTimeout> | null = null
 
 const HOUR_OF_DAY = 9
@@ -136,8 +135,8 @@ function msUntilNext9am(): number {
 export const startAutoUpdateSchedule = () => {
   stopAutoUpdateSchedule()
 
-  // Catch-up check a little after launch (endpoint/network settle time).
-  startupTimer = setTimeout(() => { checkForUpdates(false) }, 60 * 1000)
+  // Start the launch check without blocking app startup.
+  void checkForUpdates(false)
 
   // Recurring daily check at 9am; re-arm each day since setTimeout is one-shot.
   const scheduleNextDaily = () => {
@@ -150,6 +149,5 @@ export const startAutoUpdateSchedule = () => {
 }
 
 export const stopAutoUpdateSchedule = () => {
-  if (startupTimer) { clearTimeout(startupTimer); startupTimer = null }
   if (dailyTimer) { clearTimeout(dailyTimer); dailyTimer = null }
 }

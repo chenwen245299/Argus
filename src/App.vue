@@ -69,7 +69,7 @@ onMounted(async () => {
     <CanvasView v-else-if="windowLabel === 'canvas'" />
     <LibraryChatView v-else-if="windowLabel === 'library-chat'" />
     <EmbeddingMapView v-else-if="windowLabel === 'embedding-map'" />
-    <PaperAiView v-else-if="windowLabel === 'paper-ai'" />
+    <PaperAiView v-else-if="windowLabel.startsWith('paper-ai-')" />
     <MediaStudioView v-else-if="windowLabel === 'media-studio'" />
     <AnnotationPrintView v-else-if="windowLabel === 'annotation-print'" />
     <NoteWindowView v-else-if="windowLabel.startsWith('note-window')" />

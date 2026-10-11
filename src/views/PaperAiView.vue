@@ -1,18 +1,18 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useAiStore } from '../stores/ai'
 import AiTab from '../components/tabs/AiTab.vue'
 import type { PaperMeta } from '../types'
+import { paperAiWindowSlug } from '../utils/paperAiWindow'
 
 const ai = useAiStore()
-const slug = ref<string | null>(null)
+const slug = ref(paperAiWindowSlug(getCurrentWebviewWindow().label))
 const paperTitle = ref('论文 AI')
 const isMac = navigator.userAgent.toLowerCase().includes('macintosh')
-let unlistenSlug: UnlistenFn | null = null
 let unlistenResize: UnlistenFn | null = null
 let resizeTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -51,11 +51,6 @@ async function saveWindowSize() {
 
 onMounted(async () => {
   if (!ai.loaded) await ai.load()
-  slug.value = localStorage.getItem('argus:paper-ai-slug')
-  unlistenSlug = await listen<string>('paper-ai-slug', (event) => {
-    slug.value = event.payload
-    localStorage.setItem('argus:paper-ai-slug', event.payload)
-  })
 
   try {
     const appWindow = getCurrentWindow()
@@ -71,7 +66,6 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  unlistenSlug?.()
   unlistenResize?.()
   if (resizeTimer) clearTimeout(resizeTimer)
   saveWindowSize()
@@ -82,7 +76,9 @@ watch(slug, updateWindowTitle, { immediate: true })
 
 <template>
   <div class="paper-ai-view" :class="{ 'mac-overlay': isMac }">
-    <div v-if="isMac" class="drag-region" data-tauri-drag-region />
+    <div v-if="isMac" class="drag-region" data-tauri-drag-region>
+      <span class="drag-title" :title="paperTitle" data-tauri-drag-region>{{ paperTitle }}</span>
+    </div>
     <AiTab v-if="slug" :slug="slug" standalone @open-settings="() => {}" />
     <div v-else class="loading-state">
       <div class="loading-spinner" />
@@ -111,6 +107,21 @@ watch(slug, updateWindowTitle, { immediate: true })
   right: 0;
   height: 28px;
   z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 96px;
+}
+.drag-title {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-base);
+  font-weight: 500;
+  line-height: 18px;
+  color: var(--text-secondary);
 }
 .loading-state {
   flex: 1;

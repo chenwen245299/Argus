@@ -57,6 +57,8 @@ interface RequestConfig {
 
 export interface ReadPagesOptions {
   paper: string
+  /** EPUB sections use stable spine indices; PDF pages remain the default. */
+  unit?: 'page' | 'chapter'
   startPage: number
   endPage: number
   getText: (page: number) => Promise<string>
@@ -306,7 +308,7 @@ export const useSpeechStore = defineStore('speech', () => {
     // readChunks changes when a lazy page arrives; the class itself is deliberately non-reactive.
     void readChunks.value
     const at = read.input.position(playhead.value.index, playhead.value.fraction)
-    return { ...at, startPage: read.options.startPage, endPage: read.options.endPage }
+    return { ...at, startPage: read.options.startPage, endPage: read.options.endPage, unit: read.options.unit ?? 'page' }
   })
   const heard = computed(() => {
     const page = pageProgress.value
@@ -562,7 +564,15 @@ export const useSpeechStore = defineStore('speech', () => {
     return { scope, maxChars: model.maxPromptChars ?? FALLBACK_MAX_CHARS, skipCitations: skipCitations.value }
   }
 
-  /** Called in the toolbar click's call stack, before reading even the first local page. */
+  function pagesSource(options: ReadPagesOptions): string {
+    return options.unit === 'chapter' ? 'ebook-chapters' : 'pdf-pages'
+  }
+
+  function textError(options: ReadPagesOptions, e: unknown): string {
+    return t(options.unit === 'chapter' ? 'speech.errors.ebookText' : 'speech.errors.text', { message: String(e) })
+  }
+
+  /** Called in the toolbar click's call stack, before reading the first local page/chapter. */
   function readPages(options: ReadPagesOptions): Promise<void> {
     if (isReadingPaper(options.paper)) { stop(); return Promise.resolve() }
     engine.unlock()
@@ -570,8 +580,8 @@ export const useSpeechStore = defineStore('speech', () => {
     engine.stop()
     readChunks.value = []
     pagedRead.value = null
-    currentKey.value = keyOf(options.paper, 'pdf-pages')
-    activeSource.value = 'pdf-pages'
+    currentKey.value = keyOf(options.paper, pagesSource(options))
+    activeSource.value = pagesSource(options)
     activePaper.value = options.paper
     setupPrompt.value = null
     state.value = 'loading'
@@ -580,7 +590,7 @@ export const useSpeechStore = defineStore('speech', () => {
       if (!config || seq !== readSeq) return
       await startPages(options, config, seq, options.startPage)
     })().catch(e => {
-      if (seq === readSeq) setError('text', t('speech.errors.text', { message: String(e) }))
+      if (seq === readSeq) setError('text', textError(options, e))
     })
   }
 
@@ -595,7 +605,10 @@ export const useSpeechStore = defineStore('speech', () => {
     pagedRead.value = read
     const first = await input.next()
     if (seq !== readSeq || pagedRead.value !== read) return
-    if (!first) { setError('empty', t('speech.errors.pagesEmpty')); return }
+    if (!first) {
+      setError('empty', t(options.unit === 'chapter' ? 'speech.errors.chaptersEmpty' : 'speech.errors.pagesEmpty'))
+      return
+    }
     readChunks.value = [...input.chunks]
     const target = input.target(page, fraction)
     playhead.value = target ?? { index: 0, fraction: 0 }
@@ -610,14 +623,15 @@ export const useSpeechStore = defineStore('speech', () => {
           return chunks
         } catch (e) {
           if (seq !== readSeq || pagedRead.value !== read) return null
-          throw new Error(t('speech.errors.text', { message: String(e) }))
+          throw new Error(textError(options, e))
         }
       },
     })
   }
 
   function isReadingPaper(paper: string): boolean {
-    return isReading.value && activeSource.value === 'pdf-pages' && activePaper.value === paper
+    return isReading.value && (activeSource.value === 'pdf-pages' || activeSource.value === 'ebook-chapters')
+      && activePaper.value === paper
   }
 
   /** Stop reading and clear any error. */
@@ -661,12 +675,12 @@ export const useSpeechStore = defineStore('speech', () => {
       const paused = state.value === 'paused'
       const seq = ++readSeq
       engine.stop()
-      currentKey.value = keyOf(read.options.paper, 'pdf-pages')
-      activeSource.value = 'pdf-pages'
+      currentKey.value = keyOf(read.options.paper, pagesSource(read.options))
+      activeSource.value = pagesSource(read.options)
       activePaper.value = read.options.paper
       state.value = 'loading'
       void startPages(read.options, read.config, seq, page, at % 1, paused).catch(e => {
-        if (seq === readSeq) setError('text', t('speech.errors.text', { message: String(e) }))
+        if (seq === readSeq) setError('text', textError(read.options, e))
       })
       return
     }

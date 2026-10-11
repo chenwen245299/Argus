@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import ts from 'typescript'
+import { createPinia, disposePinia } from 'pinia'
 
 const dir = await mkdtemp(join(tmpdir(), 'argus-speech-test-'))
 after(() => rm(dir, { recursive: true, force: true }))
@@ -18,13 +19,35 @@ for (const name of ['speechEngine', 'speechPages', 'speechText', 'speechFollow',
 }
 const { SpeechEngine, SILENT_WAV } = await import(pathToFileURL(join(dir, 'speechEngine.mjs')))
 const { SpeechPages, pdfSpeechText } = await import(pathToFileURL(join(dir, 'speechPages.mjs')))
+
+// Exercise the real store with local settings and fake Tauri/audio I/O. In
+// particular, seeking must retain an ebook read's identity and frozen voice.
+await writeFile(join(dir, 'speechStoreMocks.mjs'), `
+let current
+export const configure = mocks => { current = mocks }
+export const invoke = (...args) => current.invoke(...args)
+export const useSettingsStore = () => current.settings
+export const useAiStore = () => ({ settings: { providers: [] } })
+export const i18n = { global: { t: key => key } }
+`)
+const storeSource = await readFile(new URL('../src/stores/speech.ts', import.meta.url), 'utf8')
+const storeJs = ts.transpileModule(storeSource, {
+  compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.ESNext },
+}).outputText
+await writeFile(join(dir, 'speechStore.mjs'), storeJs
+  .replace(/from 'pinia'/g, `from '${import.meta.resolve('pinia')}'`)
+  .replace(/from 'vue'/g, `from '${import.meta.resolve('vue')}'`)
+  .replace(/from '(?:@tauri-apps\/api\/core|\.\.\/i18n|\.\/settings|\.\/ai)'/g, "from './speechStoreMocks.mjs'")
+  .replace(/from '\.\.\/utils\/([^']+)'/g, "from './$1.mjs'"))
+const { configure } = await import(pathToFileURL(join(dir, 'speechStoreMocks.mjs')))
+const { useSpeechStore } = await import(pathToFileURL(join(dir, 'speechStore.mjs')))
 const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve() }
 const deferred = () => {
   let resolve, reject
   const promise = new Promise((yes, no) => { resolve = yes; reject = no })
   return { promise, resolve, reject }
 }
-const clip = text => ({ dataUrl: `data:audio/wav;base64,${btoa(text)}`, mime: 'audio/wav' })
+const clip = text => ({ dataUrl: `data:audio/wav;base64,${Buffer.from(text).toString('base64')}`, mime: 'audio/wav' })
 
 class FakeAudio {
   _src = ''; currentTime = 0; duration = 10; readyState = 0
@@ -63,6 +86,145 @@ function harness(synthesize, extra = {}) {
   const active = () => audios.find(a => a.playing && a.src !== SILENT_WAV)
   return { engine, audios, requests, events, active }
 }
+
+function storeHarness(t, patch = {}) {
+  const audios = [], requests = []
+  // Playback positions are sampled on state changes and seeks. Do not schedule
+  // a perpetual animation loop in this Node test process.
+  globalThis.requestAnimationFrame = () => 1
+  globalThis.cancelAnimationFrame = () => {}
+  globalThis.localStorage = { getItem: () => null, setItem: () => {} }
+  globalThis.Audio = class extends FakeAudio {
+    constructor() { super(); audios.push(this) }
+  }
+  const settings = { settings: {
+    speech_provider_id: 'provider', speech_model_id: 'voice',
+    speech_options: {}, speech_skip_citations: true, ...patch,
+  } }
+  configure({ settings, invoke: async (name, args) => {
+    requests.push({ name, args })
+    if (name === 'list_media_capabilities') return [{
+      providerId: 'provider', capabilities: [{ kind: 'speech', models: [{ id: 'voice', maxPromptChars: 80, fields: [] }] }],
+    }]
+    if (name === 'read_speech_audio' || name === 'save_speech_audio') return null
+    if (name === 'run_media_task') return { artifacts: [clip(args.request.prompt)] }
+    throw new Error(`Unexpected command: ${name}`)
+  } })
+  const pinia = createPinia()
+  const store = useSpeechStore(pinia)
+  t.after(() => { store.stop(); disposePinia(pinia) })
+  return {
+    store, settings, audios, requests,
+    active: () => audios.find(a => a.playing && a.src !== SILENT_WAV),
+    synths: () => requests.filter(r => r.name === 'run_media_task').map(r => r.args.request),
+  }
+}
+
+test('ebook continuous read unlocks audio, loads chapters lazily, skips blanks and finishes', async t => {
+  const h = storeHarness(t), fetched = []
+  const read = h.store.readPages({ paper: 'book', unit: 'chapter', startPage: 3, endPage: 6,
+    getText: async chapter => { fetched.push(chapter); return chapter === 4 ? '' : `章节 ${chapter}。` + '正文有文献引用 [12]。'.repeat(40) },
+  })
+  assert(h.audios.length === 2 && h.audios.every(a => a.plays.includes(SILENT_WAV)))
+  assert(h.store.isReadingPaper('book')) // Also true while the first local text is pending.
+  assert(!h.store.isReadingPaper('other-book'))
+  await read; await flush()
+  assert.deepEqual(fetched, [3])
+  assert.equal(h.store.activeSource, 'ebook-chapters')
+  assert.equal(h.store.pageProgress.unit, 'chapter')
+  assert.equal(h.store.pageProgress.page, 3)
+  for (let i = 0; i < 100 && h.store.state !== 'idle'; i++) {
+    assert(h.active(), 'continuous playback must have an active clip')
+    h.active().end(); await flush()
+  }
+  assert.equal(h.store.state, 'idle')
+  assert.deepEqual(fetched, [3, 4, 5, 6])
+  assert(h.synths().every(r => Array.from(r.prompt).length <= 80 && !r.prompt.includes('[12]')))
+  assert.equal(h.store.pageProgress, null)
+  assert(!h.store.isReadingPaper('book'))
+})
+
+test('ebook seek loads only its target chapter, retains pause state and uses the frozen voice', async t => {
+  const h = storeHarness(t), fetched = []
+  await h.store.readPages({ paper: 'book', unit: 'chapter', startPage: 3, endPage: 10,
+    getText: async chapter => { fetched.push(chapter); return `Chapter ${chapter}. ` + 'A sentence. '.repeat(60) },
+  }); await flush()
+  h.store.setRate(1.5); h.store.setVolume(0.3); h.store.pause()
+  h.settings.settings.speech_model_id = 'changed-voice'
+  h.store.seekTo(4.5 / 8); await flush()
+  assert.deepEqual(fetched, [3, 7])
+  assert.equal(h.store.state, 'paused')
+  assert(h.store.isReadingPaper('book'))
+  assert.equal(h.store.activeSource, 'ebook-chapters')
+  assert.equal(h.store.pageProgress.unit, 'chapter')
+  assert.equal(h.store.pageProgress.page, 7)
+  assert(Math.abs(h.store.heard - 4.5 / 8) < 0.001)
+  assert(h.synths().every(r => r.model === 'voice'))
+  assert(h.audios.every(a => a.playbackRate === 1.5 && a.volume === 0.3))
+  h.store.resume(); await flush()
+  assert.equal(h.store.state, 'playing')
+  assert(h.active())
+})
+
+test('closing an ebook while its text is loading prevents late audio and further chapter loads', async t => {
+  const h = storeHarness(t), pending = deferred(), fetched = []
+  const read = h.store.readPages({ paper: 'book', unit: 'chapter', startPage: 2, endPage: 100,
+    getText: chapter => { fetched.push(chapter); return pending.promise },
+  })
+  await flush()
+  if (h.store.isReadingPaper('book')) h.store.stop() // The viewer's close-tab action.
+  pending.resolve('Late chapter text.'); await read; await flush()
+  assert.equal(h.store.state, 'idle')
+  assert.deepEqual(fetched, [2])
+  assert.deepEqual(h.synths(), [])
+  assert(h.audios.every(a => !a.src || a.src === SILENT_WAV))
+})
+
+test('clicking an ebook read toggle again stops it before the text arrives', async t => {
+  const h = storeHarness(t), pending = deferred()
+  const options = { paper: 'book', unit: 'chapter', startPage: 1, endPage: 2, getText: () => pending.promise }
+  const read = h.store.readPages(options); await flush()
+  await h.store.readPages(options)
+  pending.resolve('Late text.'); await read; await flush()
+  assert.equal(h.store.state, 'idle')
+  assert.deepEqual(h.synths(), [])
+})
+
+test('unconfigured ebook reading opens voice setup without fetching text or synthesizing', async t => {
+  const h = storeHarness(t, { speech_provider_id: '', speech_model_id: '' })
+  await h.store.readPages({ paper: 'book', unit: 'chapter', startPage: 1, endPage: 2,
+    getText: () => { assert.fail('text must not load before a voice is chosen') },
+  }); await flush()
+  assert.equal(h.store.state, 'idle')
+  assert.equal(h.store.setupPrompt.reason, 'unset')
+  assert.deepEqual(h.synths(), [])
+})
+
+test('empty ebooks and chapter load failures show ebook-specific notices', async t => {
+  const h = storeHarness(t)
+  await h.store.readPages({ paper: 'book', unit: 'chapter', startPage: 1, endPage: 2, getText: async () => '' })
+  assert.equal(h.store.state, 'error')
+  assert.equal(h.store.errorMessage, 'speech.errors.chaptersEmpty')
+  h.store.stop()
+  await h.store.readPages({ paper: 'book', unit: 'chapter', startPage: 1, endPage: 2,
+    getText: async () => { throw new Error('chapter unavailable') },
+  })
+  assert.equal(h.store.state, 'error')
+  assert.equal(h.store.errorMessage, 'speech.errors.ebookText')
+  assert.deepEqual(h.synths(), [])
+})
+
+test('PDF continuous reads keep page progress and PDF notices by default', async t => {
+  const h = storeHarness(t)
+  await h.store.readPages({ paper: 'pdf', startPage: 2, endPage: 3, getText: async () => 'A sentence. '.repeat(60) })
+  await flush()
+  assert.equal(h.store.activeSource, 'pdf-pages')
+  assert.equal(h.store.pageProgress.unit, 'page')
+  assert(h.store.isReadingPaper('pdf'))
+  h.store.stop()
+  await h.store.readPages({ paper: 'pdf', startPage: 2, endPage: 3, getText: async () => '' })
+  assert.equal(h.store.errorMessage, 'speech.errors.pagesEmpty')
+})
 
 test('PDF text preserves line ends, separates words and ignores marked-content records', () => {
   assert.equal(pdfSpeechText([{ str: 'One' }, { str: 'two.', hasEOL: true }, { type: 'begin' }, { str: 'Three.' }]), 'One two.\nThree. ')

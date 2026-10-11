@@ -1081,6 +1081,29 @@ pub async fn read_ebook_chapter(
     .map_err(|e| e.to_string())?
 }
 
+/// One chapter's normalized plain text for continuous read-aloud (1-based index).
+#[tauri::command]
+pub async fn read_ebook_chapter_text(
+    slug: String,
+    index: u32,
+    state: State<'_, LibraryRoot>,
+) -> Result<String, String> {
+    let root = get_root(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = ebook::get_parsed(&root, &slug)?;
+        let i = (index as usize)
+            .checked_sub(1)
+            .ok_or_else(|| "Chapter index is 1-based".to_string())?;
+        parsed
+            .chapter_text
+            .get(i)
+            .cloned()
+            .ok_or_else(|| format!("Chapter {index} out of range"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// One image resource, base64-encoded. `href` is looked up in the parsed
 /// book's resource map only — it never becomes a filesystem path.
 #[tauri::command]
@@ -3058,10 +3081,10 @@ fn save_note_window_size(app: &tauri::AppHandle, width: f64, height: f64) {
 
 #[tauri::command]
 pub async fn open_paper_ai_window(
-    slug: Option<String>,
+    slug: String,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    copilot::open_paper_ai_window(&app, slug.as_deref())
+    copilot::open_paper_ai_window(&app, &slug)
 }
 
 #[tauri::command]

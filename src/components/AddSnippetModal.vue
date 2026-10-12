@@ -33,6 +33,9 @@ const tagFocused = ref(false)
 const tags = ref<string[]>([])
 const note = ref('')
 const selectedColor = ref(props.pending.color ?? '#CE93D8')
+const saving = ref(false)
+const isMac = navigator.userAgent.toLowerCase().includes('macintosh')
+const confirmShortcut = isMac ? '⌘↵' : 'Ctrl+Enter'
 
 const sortedLibraries = computed(() => [...libraries.value])
 
@@ -109,31 +112,36 @@ function removeTag(tag: string) {
 }
 
 async function confirm() {
-  if (!selectedLibraryId.value || !pendingSnippet.value) return
-  commitTag()
-  const pending = pendingSnippet.value
-  await addSnippet({
-    libraryId: selectedLibraryId.value,
-    text: pending.text,
-    tags: tags.value,
-    note: note.value.trim(),
-    paperId: pending.paperId,
-    paperTitle: pending.paperTitle,
-    page: pending.page,
-    color: selectedColor.value,
-  })
-  // Trigger highlight creation in PdfViewer after successful save
-  if (pending.rects?.length && pending.pageIndex !== undefined) {
-    window.dispatchEvent(new CustomEvent('argus-snippet-highlight', {
-      detail: {
-        rects: pending.rects,
-        pageIndex: pending.pageIndex,
-        text: pending.text,
-        color: selectedColor.value,
-      }
-    }))
+  if (saving.value || !selectedLibraryId.value || !pendingSnippet.value) return
+  saving.value = true
+  try {
+    commitTag()
+    const pending = pendingSnippet.value
+    await addSnippet({
+      libraryId: selectedLibraryId.value,
+      text: pending.text,
+      tags: tags.value,
+      note: note.value.trim(),
+      paperId: pending.paperId,
+      paperTitle: pending.paperTitle,
+      page: pending.page,
+      color: selectedColor.value,
+    })
+    // Trigger highlight creation in PdfViewer after successful save
+    if (pending.rects?.length && pending.pageIndex !== undefined) {
+      window.dispatchEvent(new CustomEvent('argus-snippet-highlight', {
+        detail: {
+          rects: pending.rects,
+          pageIndex: pending.pageIndex,
+          text: pending.text,
+          color: selectedColor.value,
+        }
+      }))
+    }
+    emit('close')
+  } finally {
+    saving.value = false
   }
-  emit('close')
 }
 
 function cancel() {
@@ -141,11 +149,19 @@ function cancel() {
 }
 
 function onKeydown(e: KeyboardEvent) {
-  if (e.key === 'Escape') cancel()
+  if (e.isComposing || e.keyCode === 229) return
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault()
+    e.stopPropagation()
+    if (!e.repeat) void confirm()
+  } else if (e.key === 'Escape') {
+    cancel()
+  }
 }
 
-onMounted(() => window.addEventListener('keydown', onKeydown))
-onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
+// Capture the submit chord before tag/new-library inputs handle their own Enter.
+onMounted(() => window.addEventListener('keydown', onKeydown, true))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown, true))
 </script>
 
 <template>
@@ -250,8 +266,15 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
         <div class="modal-footer">
           <button class="btn-cancel" @click="cancel">{{ t('pdf.cancel') }}</button>
-          <button class="btn-confirm" :disabled="!selectedLibraryId" @click="confirm">
+          <button
+            class="btn-confirm"
+            :disabled="!selectedLibraryId || saving"
+            :title="`${t('snippets.addConfirm')} (${confirmShortcut})`"
+            :aria-keyshortcuts="isMac ? 'Meta+Enter' : 'Control+Enter'"
+            @click="confirm"
+          >
             {{ t('snippets.addConfirm') }}
+            <kbd class="confirm-shortcut">{{ confirmShortcut }}</kbd>
           </button>
         </div>
       </div>
@@ -513,6 +536,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 .btn-cancel:hover { background: var(--bg-hover); }
 
 .btn-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 6px 14px;
   border-radius: 6px;
   font-size: 13px;
@@ -522,4 +548,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 }
 .btn-confirm:hover { opacity: 0.9; }
 .btn-confirm:disabled { opacity: 0.4; cursor: default; }
+.confirm-shortcut {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  opacity: 0.75;
+}
 </style>

@@ -55,6 +55,7 @@ import { runTranslation, triggerAskAi } from '../stores/translationHistory'
 import { openAddSnippetModal } from '../stores/snippetLibrary'
 import { useSpeechStore } from '../stores/speech'
 import { pdfSpeechText } from '../utils/speechPages'
+import { renderSelectableTextLayer } from '../utils/pdfTextLayer'
 import { spokenSentences, locateSentences, sentenceAt, lineBands, type SpokenSentence, type TextRange } from '../utils/speechFollow'
 import {
   spansFromTextLayer, selectedTextBySpan, planFurnitureDropReport, keptSelectionTextAcrossPages,
@@ -2052,6 +2053,7 @@ async function renderPage(idx: number) {
         if (superseded()) { bail(); return }
         const img = new Image()
         img.className = 'pdf-canvas'
+        img.draggable = false
         img.src = src
         try { await img.decode() } catch { /* show it anyway */ }
         img.style.width = `${cssW}px`
@@ -2109,7 +2111,7 @@ async function renderPage(idx: number) {
     if (newObjectUrl) { pageObjectUrls.set(idx, newObjectUrl); newObjectUrl = null }
 
     // Text layer at logical scale so CSS positions match layout
-    const textLayerDiv = document.createElement('div')
+    let textLayerDiv = document.createElement('div')
     textLayerDiv.className = 'textLayer'
     // pdfjs v5 uses --total-scale-factor to size the container via setLayerDimensions
     textLayerDiv.style.setProperty('--total-scale-factor', String(scenScale))
@@ -2128,12 +2130,26 @@ async function renderPage(idx: number) {
           rotate: page.rotate,
         }
       }
-      const textLayer = new pdfjsLib.TextLayer({
-        textContentSource: textSource.content as unknown as ConstructorParameters<typeof pdfjsLib.TextLayer>[0]['textContentSource'],
+      if (superseded()) { bail(); return }
+      // Selection can start as soon as TextLayer paints its spans. Publish the
+      // matching PDF geometry now, before annotation rendering awaits more I/O.
+      pageTextSources.set(idx, textSource)
+      const selectableLayer = await renderSelectableTextLayer({
         container: textLayerDiv,
+        content: textSource.content,
         viewport: logicalVp,
+        cancelled: superseded,
+        create: container => new pdfjsLib.TextLayer({
+          textContentSource: textSource!.content as unknown as ConstructorParameters<typeof pdfjsLib.TextLayer>[0]['textContentSource'],
+          container,
+          viewport: logicalVp,
+        }),
       })
-      await textLayer.render()
+      if (selectableLayer !== textLayerDiv) {
+        textLayerDiv = selectableLayer
+        appended.push(textLayerDiv)
+      }
+      if (superseded()) { bail(); return }
       // Anchor drag-selection so dragging into whitespace doesn't over-select.
       setupTextLayerSelection(textLayerDiv)
     } catch (e) {
@@ -2202,7 +2218,6 @@ async function renderPage(idx: number) {
       console.warn('Linkify text layer failed:', e)
     }
 
-    if (textSource) pageTextSources.set(idx, textSource)
     renderedPages.value = new Set(renderedPages.value).add(idx)
     pageRenderScales.set(idx, scenScale)
     pageRenderDprs.set(idx, dpr)
@@ -3238,16 +3253,45 @@ watch(selectionPopup, p => {
   if (!p) popupSource = null
 })
 
-/** ⌘C copies what the popup holds for a selection across pages: the text with a line break between the
- *  pages, without the spans shown as not selected. */
+/** A selection must belong to this viewer, rather than a note or another PDF tab. */
+function ownsTextSelection(range: Range): boolean {
+  const inLayer = (node: Node) => {
+    const el = node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement
+    const layer = el?.closest('.textLayer')
+    return !!layer && pageRefs.value.some(page => page?.contains(layer))
+  }
+  return inLayer(range.startContainer) && inLayer(range.endContainer)
+}
+
+/** Copy is also an entry point: keyboard selection and a missed/delayed mouse-up
+ *  must not bypass filtering just because no fully planned popup exists yet. */
 function onCopySelection(e: ClipboardEvent) {
-  const p = selectionPopup.value
-  if (!p?.full || !e.clipboardData) return
-  // Only the selection the popup was built from (a later one, or one in a note, copies as it is).
+  if (!e.clipboardData) return
   const sel = window.getSelection()
-  if (!sel || sel.isCollapsed || !sameText(sel.toString(), p.full.text)) return
-  e.clipboardData.setData('text/plain', p.text)
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return
+  const range = sel.getRangeAt(0)
+  if (!ownsTextSelection(range)) return
+  const plan = planSelectionFurniture(range, collectSelectionRectsByPage(range), sel.toString().trim())
+  if (!plan) return
+  e.clipboardData.setData('text/plain', plan.furniture?.trimmed.text ?? plan.text)
   e.preventDefault()
+}
+
+/** Recheck the saved range when an action takes its text/rects. The text layer's
+ *  geometry may have finished loading since mouse-up; a plain popup is not a
+ *  permanent decision to include page furniture. A disconnected or mismatched
+ *  range cannot replace the original, already captured selection. */
+function refreshSelectionFurniture() {
+  const popup = selectionPopup.value
+  const range = popupSource?.range
+  if (!popup || !range || !ownsTextSelection(range)) return
+  const pages = collectSelectionRectsByPage(range)
+  const plan = planSelectionFurniture(range, pages, popup.full?.text ?? popup.text)
+  if (!plan?.furniture) return
+  const { report, trimmed, skip } = plan.furniture
+  selectionPopup.value = { ...popup, ...trimmed, full: { text: plan.text, pages }, furniture: report }
+  popupSource = { range, skip }
+  showSkippedSpans([...skip])
 }
 
 function onWindowMouseUp(e: MouseEvent) {
@@ -3312,6 +3356,7 @@ function onWindowMouseUp(e: MouseEvent) {
 }
 
 function createHighlight(color?: string) {
+  refreshSelectionFurniture()
   const popup = selectionPopup.value
   if (!popup || popup.pages.length === 0) { selectionPopup.value = null; return }
 
@@ -4078,7 +4123,10 @@ function triggerInitialRender() {
 
 /* ── Page wrapper ── */
 .page-wrapper {
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
   position: relative;
+  isolation: isolate;
   background: white;
   box-shadow: var(--shadow-md);
   flex-shrink: 0;
@@ -4091,6 +4139,10 @@ function triggerInitialRender() {
   top: 0;
   left: 0;
   display: block;
+  z-index: 0;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* ── PDF.js text layer — positioned over canvas, pdfjs CSS handles the rest ── */
@@ -4098,6 +4150,7 @@ function triggerInitialRender() {
   position: absolute;
   top: 0;
   left: 0;
+  z-index: 1;
 }
 
 :deep(.textLayer ::selection) {
@@ -4133,6 +4186,7 @@ function triggerInitialRender() {
   left: 0;
   pointer-events: none;
   overflow: hidden;
+  z-index: 2;
 }
 
 /* ── PDF.js annotation layer (links) ── */
@@ -4147,6 +4201,7 @@ function triggerInitialRender() {
   position: absolute;
   inset: 0;
   pointer-events: none;
+  z-index: 3;
 }
 
 :deep(.annotationLayer section) {
@@ -4168,6 +4223,7 @@ function triggerInitialRender() {
   left: 0;
   pointer-events: none;
   overflow: hidden;
+  z-index: 3;
 }
 
 :deep(.linkify-overlay .text-link) {

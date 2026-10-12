@@ -22,13 +22,15 @@
 //! again. What the dialog showed is therefore what lands on disk, even if the
 //! model's arguments were odd, ambiguous, or re-sent differently later.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::paper;
 
 /// The write tool's name, shared by the declaration, the dispatcher and the
 /// confirmation UI so they cannot drift apart.
 pub const CREATE_NOTE_TOOL: &str = "create_paper_note";
+pub const CREATE_HIGHLIGHTS_TOOL: &str = "create_paper_highlights";
+pub const CREATE_ANNOTATIONS_TOOL: &str = "create_paper_annotations";
 
 /// Whether `name` is a tool that changes the library.
 ///
@@ -38,7 +40,8 @@ pub const CREATE_NOTE_TOOL: &str = "create_paper_note";
 /// [`crate::canvas_edit`]): it never runs read-only either, and lives behind the
 /// same confirmation.
 pub fn is_write_tool(name: &str) -> bool {
-    name == CREATE_NOTE_TOOL || crate::canvas_edit::is_edit_tool(name)
+    matches!(name, CREATE_NOTE_TOOL | CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL)
+        || crate::canvas_edit::is_edit_tool(name)
 }
 
 /// Longest note title accepted. Titles show up in lists and tabs; a model that
@@ -53,7 +56,7 @@ const MAX_CONTENT_CHARS: usize = 50_000;
 ///
 /// Carries everything the write needs, so nothing has to be re-derived after the
 /// user says yes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PendingWrite {
     CreateNote {
         slug: String,
@@ -63,7 +66,30 @@ pub enum PendingWrite {
         title: String,
         content: String,
     },
+    MarkPassages {
+        tool: String,
+        slug: String,
+        paper_id: String,
+        paper_title: String,
+        pdf_path: std::path::PathBuf,
+        revision: crate::render::PdfRevision,
+        highlights: Vec<crate::models::Highlight>,
+    },
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Passage {
+    pub page: u32,
+    pub text: String,
+    #[serde(default = "default_color")]
+    pub color: String,
+    #[serde(default = "default_style")]
+    pub style: String,
+    pub note: Option<String>,
+}
+fn default_color() -> String { "#FFEB3B".into() }
+fn default_style() -> String { "highlight".into() }
 
 /// What the confirmation dialog renders.
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +106,8 @@ pub struct WritePreview {
     /// either way — a new note is always created — but the user deserves to know
     /// they are about to have two notes with one name.
     pub duplicate_title: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub passages: Vec<Passage>,
 }
 
 impl PendingWrite {
@@ -90,6 +118,59 @@ impl PendingWrite {
     /// dialog for a call that was malformed.
     pub fn parse(root: &str, name: &str, args: &serde_json::Value) -> Result<Self, String> {
         match name {
+            CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL => {
+                let slug = str_arg(args, "slug")?;
+                let passages: Vec<Passage> = serde_json::from_value(args.get("passages").cloned()
+                    .ok_or("`passages` is required.")?).map_err(|e| format!("Invalid passages: {e}"))?;
+                if passages.is_empty() || passages.len() > 30 {
+                    return Err("Provide 1–30 passages in one call.".into());
+                }
+                let meta = paper::read_meta(root, &slug)?;
+                if meta.file_type.as_deref().is_some_and(|t| t != "pdf") {
+                    return Err("These tools currently mark PDF passages only.".into());
+                }
+                let pdf_path = crate::metadata::find_pdf_in_dir(root, &slug);
+                let revision = crate::render::pdf_revision(&pdf_path)?;
+                let units = crate::render::pdf_page_units(&pdf_path)?;
+                let mut pages = std::collections::HashMap::new();
+                let mut highlights = Vec::new();
+                for p in passages {
+                    if p.page == 0 || p.text.trim().is_empty() || p.text.chars().count() > 10_000 {
+                        return Err("Each passage needs a 1-based PDF page and 1–10,000 characters of original text.".into());
+                    }
+                    if !["highlight", "underline"].contains(&p.style.as_str()) {
+                        return Err("`style` must be highlight or underline.".into());
+                    }
+                    if p.color.len() != 7 || !p.color.starts_with('#') || !p.color[1..].bytes().all(|c| c.is_ascii_hexdigit()) {
+                        return Err("`color` must be a #RRGGBB color.".into());
+                    }
+                    if p.note.as_ref().is_some_and(|s| s.chars().count() > 10_000)
+                        || (name == CREATE_ANNOTATIONS_TOOL && p.note.as_deref().unwrap_or("").trim().is_empty()) {
+                        return Err("An annotation needs a nonempty `note` (maximum 10,000 characters).".into());
+                    }
+                    if name == CREATE_HIGHLIGHTS_TOOL && p.note.is_some() {
+                        return Err("The highlight tool does not add comments. Use create_paper_annotations only when the user explicitly requests annotations.".into());
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(e) = pages.entry(p.page) {
+                        let unit = *units.get(&p.page).ok_or_else(|| format!("PDF page {} does not exist.", p.page))?;
+                        e.insert(crate::render::page_text_geometry(&pdf_path, p.page, unit)?);
+                    }
+                    let (text, rects) = locate_passage(&pages[&p.page], &p.text)
+                        .map_err(|e| format!("Page {}: {e}", p.page))?;
+                    highlights.push(crate::models::Highlight {
+                        id: uuid::Uuid::new_v4().to_string(), page: p.page, text, rects,
+                        color: p.color.to_ascii_uppercase(), style: p.style, note: p.note,
+                        created_at: chrono::Utc::now().to_rfc3339(), updated_at: None,
+                        start_offset: None, end_offset: None, anchor_prefix: None,
+                        anchor_suffix: None, keep_line_breaks: None,
+                    });
+                }
+                if crate::render::pdf_revision(&pdf_path)? != revision {
+                    return Err("PDF changed while locating passages. Inspect it again and retry.".into());
+                }
+                Ok(Self::MarkPassages { tool: name.into(), slug, paper_id: meta.id,
+                    paper_title: meta.title, pdf_path, revision, highlights })
+            }
             CREATE_NOTE_TOOL => {
                 let slug = str_arg(args, "slug")?;
                 let title = str_arg(args, "title")?;
@@ -152,6 +233,13 @@ impl PendingWrite {
                 note_title: title.clone(),
                 content: content.clone(),
                 duplicate_title: paper::list_notes(root, slug).iter().any(|n| &n.title == title),
+                passages: Vec::new(),
+            },
+            Self::MarkPassages { tool, slug, paper_title, highlights, .. } => WritePreview {
+                tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
+                note_title: String::new(), content: String::new(), duplicate_title: false,
+                passages: highlights.iter().map(|h| Passage { page: h.page, text: h.text.clone(),
+                    color: h.color.clone(), style: h.style.clone(), note: h.note.clone() }).collect(),
             },
         }
     }
@@ -162,6 +250,14 @@ impl PendingWrite {
     /// reached after the user approved this exact value.
     pub fn execute(&self, root: &str) -> Result<serde_json::Value, String> {
         match self {
+            Self::MarkPassages { slug, paper_id, pdf_path, revision, highlights, .. } => {
+                if paper::read_meta(root, slug)?.id != *paper_id
+                    || crate::render::pdf_revision(pdf_path)? != *revision {
+                    return Err("Paper or PDF changed since the preview. Nothing was saved; inspect it again.".into());
+                }
+                let saved = paper::append_highlights(root, slug, highlights.clone())?;
+                Ok(serde_json::json!({"saved": true, "slug": slug, "highlights": saved}))
+            }
             PendingWrite::CreateNote {
                 slug,
                 title,
@@ -186,6 +282,59 @@ fn str_arg(args: &serde_json::Value, key: &str) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("`{key}` is required and must be a string."))
+}
+
+/// Ignore PDF line wrapping, discretionary hyphens and common font ligatures,
+/// while retaining a map back to the actual glyphs. Never fuzzy-match a quote.
+fn normalized_chars(chars: &[char]) -> Vec<(char, usize)> {
+    let mut out = Vec::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_whitespace() || c == '\u{ad}' { continue; }
+        if c == '-' && chars.get(i + 1).is_some_and(|c| matches!(c, '\r' | '\n'))
+            && i > 0 && chars[i - 1].is_alphabetic() {
+            continue;
+        }
+        let expanded = match c {
+            'ﬀ' => "ff", 'ﬁ' => "fi", 'ﬂ' => "fl", 'ﬃ' => "ffi", 'ﬄ' => "ffl", _ => "",
+        };
+        if expanded.is_empty() { out.push((c, i)); }
+        else { out.extend(expanded.chars().map(|c| (c, i))); }
+    }
+    out
+}
+
+fn locate_passage(glyphs: &[(char, Option<crate::models::Rect>)], quote: &str)
+    -> Result<(String, Vec<crate::models::Rect>), String> {
+    let chars: Vec<char> = glyphs.iter().map(|(c, _)| *c).collect();
+    let source = normalized_chars(&chars);
+    let target = normalized_chars(&quote.chars().collect::<Vec<_>>());
+    if target.is_empty() || target.len() > source.len() {
+        return Err("Original text was not found. Read this PDF page and quote its text exactly.".into());
+    }
+    let matches: Vec<usize> = source.windows(target.len()).enumerate()
+        .filter_map(|(i, w)| w.iter().zip(&target).all(|(a, b)| a.0 == b.0).then_some(i)).collect();
+    if matches.len() != 1 {
+        return Err(if matches.is_empty() { "Original text was not found. Quote the page text exactly." }
+            else { "This text occurs more than once on the page. Include a longer, unique excerpt." }.into());
+    }
+    let start = source[matches[0]].1;
+    let end = source[matches[0] + target.len() - 1].1;
+    let mut rects: Vec<crate::models::Rect> = Vec::new();
+    for (ch, rect) in &glyphs[start..=end] {
+        if ch.is_whitespace() || *ch == '\u{ad}' { continue; }
+        let r = rect.as_ref().ok_or("The selected text has no reliable glyph geometry; nothing was marked.")?;
+        if let Some(last) = rects.last_mut() {
+            if (last.y - r.y).abs() < r.height * 0.25 && (last.height - r.height).abs() < r.height * 0.35
+                && r.x >= last.x && r.x <= last.x + last.width + r.height * 0.8 {
+                last.width = (r.x + r.width).max(last.x + last.width) - last.x;
+                last.height = (r.y + r.height).max(last.y + last.height) - last.y;
+                continue;
+            }
+        }
+        rects.push(r.clone());
+    }
+    if rects.is_empty() { return Err("No selectable PDF text in this passage.".into()); }
+    Ok((chars[start..=end].iter().collect(), rects))
 }
 
 #[cfg(test)]
@@ -314,5 +463,71 @@ mod tests {
             preview.note_title,
             "the title written is the title shown"
         );
+    }
+
+    fn mark_args(slug: &str, text: &str, note: Option<&str>) -> serde_json::Value {
+        let mut passage = serde_json::json!({"page": 1, "text": text});
+        if let Some(note) = note { passage["note"] = note.into(); }
+        serde_json::json!({"slug": slug, "passages": [passage]})
+    }
+
+    #[test]
+    fn marks_are_located_previewed_appended_and_retries_are_idempotent() {
+        let root = library_with_paper("copy-a", "Identical title");
+        let pdf = paper::paper_dir(&root, "copy-a").join("paper.pdf");
+        crate::render::annotation_fixture(&pdf, "Alpha beta. A second sentence.", 0, 1.0, false);
+        let args = mark_args("copy-a", "Alpha beta.", None);
+        let pending = PendingWrite::parse(&root, CREATE_HIGHLIGHTS_TOOL, &args).unwrap();
+        assert!(paper::read_highlights(&root, "copy-a").is_empty(), "preview must not write");
+        let preview = pending.preview(&root);
+        assert_eq!(preview.passages[0].text, "Alpha beta.");
+        let saved = pending.execute(&root).unwrap();
+        let first_id = saved["highlights"][0]["id"].clone();
+        let retry = PendingWrite::parse(&root, CREATE_HIGHLIGHTS_TOOL, &args).unwrap().execute(&root).unwrap();
+        assert_eq!(retry["highlights"][0]["id"], first_id);
+        assert_eq!(paper::read_highlights(&root, "copy-a").len(), 1);
+        assert!(!paper::read_highlights(&root, "copy-a")[0].rects.is_empty());
+
+        let annotated = PendingWrite::parse(&root, CREATE_ANNOTATIONS_TOOL,
+            &mark_args("copy-a", "A second sentence.", Some("解释这句话"))).unwrap();
+        assert_eq!(annotated.preview(&root).passages[0].note.as_deref(), Some("解释这句话"));
+        annotated.execute(&root).unwrap();
+        let marks = paper::read_highlights(&root, "copy-a");
+        assert_eq!(marks.len(), 2);
+        assert_eq!(marks[0].id, first_id.as_str().unwrap());
+        assert_eq!(marks[1].note.as_deref(), Some("解释这句话"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn marking_refuses_ambiguous_missing_text_and_changed_pdf_without_writing() {
+        let root = library_with_paper("copy-b", "B");
+        let pdf = paper::paper_dir(&root, "copy-b").join("paper.pdf");
+        crate::render::annotation_fixture(&pdf, "Repeat. Repeat. Unique sentence.", 0, 1.0, false);
+        for quote in ["Repeat.", "Invented text"] {
+            assert!(PendingWrite::parse(&root, CREATE_HIGHLIGHTS_TOOL, &mark_args("copy-b", quote, None)).is_err());
+        }
+        assert!(PendingWrite::parse(&root, CREATE_ANNOTATIONS_TOOL,
+            &mark_args("copy-b", "Unique sentence.", None)).is_err());
+        assert!(PendingWrite::parse(&root, CREATE_HIGHLIGHTS_TOOL,
+            &mark_args("copy-b", "Unique sentence.", Some("unsolicited note"))).is_err());
+        let pending = PendingWrite::parse(&root, CREATE_HIGHLIGHTS_TOOL,
+            &mark_args("copy-b", "Unique sentence.", None)).unwrap();
+        crate::render::annotation_fixture(&pdf, "Different text.", 0, 1.0, false);
+        assert!(pending.execute(&root).unwrap_err().contains("changed"));
+        assert!(paper::read_highlights(&root, "copy-b").is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn passage_matching_preserves_geometry_across_wrapping_ligatures_and_cjk() {
+        let text = "An efﬁcient optimi-\nzation. 中文\n段落。";
+        let glyphs = text.chars().enumerate().map(|(i, c)| (c, Some(crate::models::Rect {
+            x: i as f32 * 8.0, y: 10.0, width: 7.0, height: 12.0,
+        }))).collect::<Vec<_>>();
+        let (actual, rects) = locate_passage(&glyphs, "An efficient optimization.").unwrap();
+        assert_eq!(actual, "An efﬁcient optimi-\nzation.");
+        assert!(!rects.is_empty());
+        assert_eq!(locate_passage(&glyphs, "中文段落。").unwrap().0, "中文\n段落。");
     }
 }

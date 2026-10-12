@@ -824,8 +824,7 @@ pub async fn import_pdf(
     let root = get_root(&state)?;
 
     let id = uuid::Uuid::new_v4();
-    let short_id: String = id.to_string().replace('-', "").chars().take(8).collect();
-    let temp_slug = format!("importing_{}", short_id);
+    let temp_slug = format!("importing_{}", id.simple());
 
     let src = std::path::Path::new(&source_path);
     let filename = src
@@ -840,9 +839,8 @@ pub async fn import_pdf(
         .to_string();
 
     // Create paper directory
-    let papers_dir = std::path::Path::new(&root).join("papers");
-    let paper_dir = papers_dir.join(&temp_slug);
-    std::fs::create_dir_all(&paper_dir).map_err(|e| format!("Cannot create paper dir: {e}"))?;
+    let paper_dir = paper::reserve_import_dir(&root, &temp_slug).await?;
+    let temp_slug = paper_dir.file_name().unwrap().to_string_lossy().to_string();
 
     // Copy PDF (non-blocking) — named after the sanitized original file stem
     let pdf_filename = format!("{}.pdf", metadata::sanitize_filename(&title));
@@ -937,8 +935,7 @@ pub async fn import_ebook(
             .map_err(|e| e.to_string())??;
 
     let id = uuid::Uuid::new_v4();
-    let short_id: String = id.to_string().replace('-', "").chars().take(8).collect();
-    let temp_slug = format!("importing_{}", short_id);
+    let temp_slug = format!("importing_{}", id.simple());
 
     let filename = src
         .file_name()
@@ -954,9 +951,8 @@ pub async fn import_ebook(
         parsed.meta.title.trim().to_string()
     };
 
-    let papers_dir = std::path::Path::new(&root).join("papers");
-    let paper_dir = papers_dir.join(&temp_slug);
-    std::fs::create_dir_all(&paper_dir).map_err(|e| format!("Cannot create paper dir: {e}"))?;
+    let paper_dir = paper::reserve_import_dir(&root, &temp_slug).await?;
+    let temp_slug = paper_dir.file_name().unwrap().to_string_lossy().to_string();
 
     // Copy the book file, named after the sanitized title with its original extension.
     let lower_name = filename.to_ascii_lowercase();
@@ -2573,11 +2569,23 @@ pub async fn save_paper_ai_conversations(
     slug: String,
     conversations: serde_json::Value,
     tombstones: Option<serde_json::Value>,
+    origin: Option<String>,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
+    if expected_root.as_deref().is_some_and(|expected| expected != root) {
+        return Err("The active library changed before the conversation was saved.".to_string());
+    }
     let tombstones = tombstones.unwrap_or_else(|| serde_json::json!([]));
-    copilot::write_paper_ai_conversations(&root, &slug, &conversations, &tombstones)
+    copilot::write_paper_ai_conversations(&root, &slug, &conversations, &tombstones)?;
+    // Self-writes are intentionally ignored by the filesystem watcher. Tell
+    // both paper AI views directly, after the merged file has been committed.
+    let _ = app.emit("paper-ai-conversations-saved", serde_json::json!({
+        "root": root, "slug": slug, "origin": origin,
+    }));
+    Ok(())
 }
 
 #[tauri::command]

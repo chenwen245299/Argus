@@ -2570,18 +2570,12 @@ pub async fn add_to_library(
 
     // Create paper directory
     let slug = make_slug(&paper.authors, &paper.published, &paper.title);
-    let papers_root = Path::new(root).join("papers");
-
-    // If slug collision, find the next free suffix instead of blindly using
-    // `-2` (which would overwrite an existing `-2` paper and lose its data).
-    let final_dir = unique_paper_dir(&papers_root, &slug);
+    let final_dir = crate::paper::reserve_import_dir(root, &slug).await?;
     let final_slug = final_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(&slug)
         .to_string();
-
-    std::fs::create_dir_all(&final_dir).map_err(|e| format!("Create paper dir: {e}"))?;
 
     // Write PDF
     let pdf_path = final_dir.join("paper.pdf");
@@ -3109,26 +3103,6 @@ async fn download_pdf(
     })
 }
 
-/// Resolve a collision-free paper directory under `papers_root` for `slug`.
-/// Returns `papers_root/slug` if free, otherwise `slug-2`, `slug-3`, … picking
-/// the first path that does not yet exist so an existing paper is never
-/// overwritten.
-pub(crate) fn unique_paper_dir(papers_root: &Path, slug: &str) -> PathBuf {
-    let base = papers_root.join(slug);
-    if !base.exists() {
-        return base;
-    }
-    // Bounded search for a free suffix; fall back to a UUID so a pathological
-    // run of collisions can never spin forever.
-    for n in 2u32..=10_000 {
-        let candidate = papers_root.join(format!("{slug}-{n}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    papers_root.join(format!("{slug}-{}", uuid::Uuid::new_v4()))
-}
-
 /// Import an arXiv paper by URL or bare ID.
 /// Fetches metadata by scraping the abs page HTML (no API calls — they time out).
 /// Downloads the PDF from the link found in the page.
@@ -3216,31 +3190,13 @@ pub async fn import_by_url(
     // ── Create paper directory ────────────────────────────────────────────────
     let year_str = year.map(|y| y.to_string()).unwrap_or_default();
     let slug_base = make_slug(&authors, &format!("{year_str}-01-01"), &title);
-    let papers_dir = Path::new(root).join("papers");
-    // Find a non-conflicting directory name (skip orphaned dirs with no meta.json)
-    let final_dir = {
-        let candidate = papers_dir.join(&slug_base);
-        if !candidate.exists() {
-            candidate
-        } else if !candidate.join("meta.json").exists() {
-            // Orphaned dir from a previous failed import — reuse it
-            candidate
-        } else {
-            let mut n = 2u32;
-            loop {
-                let c = papers_dir.join(format!("{slug_base}-{n}"));
-                if !c.exists() || !c.join("meta.json").exists() { break c; }
-                n += 1;
-            }
-        }
-    };
+    let final_dir = crate::paper::reserve_import_dir(root, &slug_base).await?;
     let final_slug = final_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(&slug_base)
         .to_string();
 
-    std::fs::create_dir_all(&final_dir).map_err(|e| format!("Create paper dir: {e}"))?;
     std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
         .map_err(|e| format!("Write PDF: {e}"))?;
 

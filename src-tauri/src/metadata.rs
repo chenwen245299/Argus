@@ -2047,6 +2047,8 @@ pub fn title_to_slug(title: &str, year: Option<u32>) -> String {
 // ── Folder rename ─────────────────────────────────────────────────────────────
 
 pub fn rename_folder(root: &str, old_slug: &str) -> Result<String, String> {
+    let lock = crate::paper::namespace_lock(root);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let meta = crate::paper::read_meta(root, old_slug)?;
     let base_slug = title_to_slug(&meta.title, meta.year);
 
@@ -2055,22 +2057,16 @@ pub fn rename_folder(root: &str, old_slug: &str) -> Result<String, String> {
         return Ok(old_slug.to_string());
     }
 
-    let new_slug = if crate::paper::find_paper_dir(root, &base_slug).is_none() {
-        base_slug
-    } else {
-        let suffix: String = uuid::Uuid::new_v4()
-            .to_string()
-            .replace('-', "")
-            .chars()
-            .take(6)
-            .collect();
-        format!("{}_{}", base_slug, suffix)
-    };
-
     let old_path = crate::paper::paper_dir(root, old_slug);
     let parent = old_path
         .parent()
         .ok_or_else(|| "Current paper folder has no parent".to_string())?;
+    // A canonical copy keeps its identity when metadata enrichment runs again.
+    if old_slug.strip_prefix(&format!("{base_slug}-"))
+        .is_some_and(|s| s.parse::<u32>().is_ok_and(|n| n >= 2)) {
+        return Ok(old_slug.to_string());
+    }
+    let new_slug = crate::paper::free_slug(root, &base_slug, parent)?;
     let new_path = parent.join(&new_slug);
 
     if new_path.exists() {

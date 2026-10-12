@@ -181,6 +181,35 @@ The app uses multiple Tauri windows rather than browser-style routing. `src/App.
 
 All top-level views are loaded with `defineAsyncComponent` so each window only loads the code it needs.
 
+**Paper AI window synchronization.** `AiTab.vue` uses `utils/paperAiSync.ts`
+to keep the sidebar panel and standalone window current without reopening them.
+The event scope includes library root, paper slug and sender identity; revisions
+reject delayed live patches. A request/snapshot handshake joins an answer already
+in progress, then current-answer patches are coalesced every 250 ms (not the
+whole history or attachment blobs). Only the window owning a request writes its
+live answer; mirrors forward stop requests to that owner and never echo saves.
+`save_paper_ai_conversations` checks the optional `expectedRoot` and emits
+`paper-ai-conversations-saved` only after the CRDT merge commits. Receivers
+reconcile canonical records, including deletions, while retaining live objects,
+drafts, selected conversations and model tabs. Focus refresh and session restore
+repair missed notifications. Shared record types live in `types/paperAi.ts`.
+
+**Note clipboard compatibility.** `VditorEditor.vue` installs
+`utils/noteClipboard.ts` after editor initialization, on the editable elements
+themselves. Vditor stops copy/cut propagation and writes an empty `text/html`
+flavor alongside valid Markdown text. Removing that empty flavor lets native
+rich-text applications such as PowerPoint consume the text instead of pasting
+nothing. Keep Vditor's original Markdown/TeX conversion and cut deletion; do not
+replace these with flattened selection text or an asynchronous clipboard write.
+
+**Mermaid labels in chat.** `MermaidBlock.vue` renders with root-level
+`htmlLabels: false` and locks that key alongside Mermaid's default secure keys.
+The SVG-only DOMPurify profile strips `foreignObject` HTML labels, leaving nodes
+and arrows without text; use SVG text labels so display and PNG copying retain
+them. Do not loosen the sanitizer to admit HTML inside the SVG. The root option
+takes precedence over deprecated `flowchart.htmlLabels`; diagram directives and
+frontmatter must not override it.
+
 ### Frontend state management (Pinia stores)
 
 Stores live in `src/stores/` and use the Composition API style (`defineStore('id', () => {...})`).
@@ -458,6 +487,30 @@ references inside code fences as text, and retain unreferenced/legacy images at
 the end when streaming finishes. `ChatPageImage.vue` reloads via
 `read_chat_image`. Saving failures are tool errors rather than successful sends.
 
+**App-only PDF marking.** `create_paper_highlights` and `create_paper_annotations`
+are declared in `mcp/agent.rs`, parsed in `mcp/app_tools.rs`, and executed only
+through the existing write-confirmation handshake. Their descriptions and the
+default prompt forbid proactive use: the user must explicitly request marking
+or annotations. A batch has 1–30 original excerpts with 1-based PDF page indices;
+annotations require a `note`, and the highlight tool cannot attach comments.
+PDFium locates unique text and supplies glyph boxes on its existing thread;
+`render::pdf_page_units` supplies UserUnit, which PDFium's coordinates ignore.
+Missing/ambiguous text and changed source files fail without writing. Append
+under the highlights lock, preserve user edits/tombstones, and reuse identical
+records on retry. `paper-highlights-added` carries root/slug/records to the open
+reader; merge them without replacing unsaved local edits. Only ids/pages reach
+the model's result transcript. External MCP remains read-only.
+
+**Duplicate imports.** Local PDFs, ebooks and URL imports let the user keep an
+independent copy or skip it; an accepted URL duplicate retries with `force` and
+does not ask again during metadata enrichment. Each copy has its own UUID and
+library-wide unique slug. `paper::reserve_paper_dir` reserves directories under
+a library namespace lock and checks papers inside collections too;
+`metadata::rename_folder` uses the same lock/namespace. Never reuse another
+copy's folder or identity because its title, DOI or arXiv ID matches. Notes,
+highlights, reading state, chats, search/vector identity and collection
+membership continue to belong to that exact slug/UUID.
+
 **Prompt-cache keepalive (`cache_keepalive.rs`).** An agent turn sends a large
 prefix (the system prompt, every tool schema — external servers' too — and the
 conversation), and providers with automatic prefix caching bill a repeat of it
@@ -492,6 +545,9 @@ re-sends the same prefix every 5 minutes with `max_tokens: 1`.
   the indicator lands on the one conversation whose prefix is actually held. `disarm` is silent — `arm` calls it to
   replace its predecessor, and announcing there would blink the badge between
   every question; explicit stops go through `disarm_and_announce`.
+  Generating conversations pulse green; an idle conversation whose cache is held
+  warm pulses blue (shared `--status-generating` / `--status-cache-warm` tokens).
+  Both paper AI history lists track live stream owners rather than their saved snapshots.
 
 **External MCP servers (`mcp/client.rs`).** Users can point agent mode at other
 MCP servers, which Argus launches as stdio subprocesses exactly the way Claude
@@ -591,6 +647,18 @@ Two engines draw a page, and **a page's bitmap is always derived from its CSS bo
 - A hidden viewer plans nothing and keeps its canvases. On show it restores the scroll position first, then re-checks every mounted page against `(scale, dpr)` (a zoom while hidden leaves a stretched stale bitmap otherwise) and renders only what is missing. A tab that finishes loading while hidden defers `fitWidth` / `restorePosition` until it is shown (`scrollTop` cannot be set on a `display:none` box).
 - `renderingPages`, `inflightRenders` and the generation counter keep their meaning; never clear `renderingPages`.
 - `PDF_ENABLE_HWA` (next to `getDocument`) makes pdf.js use accelerated canvases: far less main-thread compositing per page, text pixel-identical, vector line art antialiased slightly differently. Set it to `false` for bit-identical output with the old software canvases.
+- A visible page must retain selectable text even if PDF.js's font/layout path
+  fails. `utils/pdfTextLayer.ts` keeps the normal layer when its text and boxes
+  are complete; rejected, hung (1.5 s) or empty layouts recover from the PDF's
+  own text/coordinates using DOM measurement, without OCR or external packages.
+  The failed task is cancelled and its container detached before recovery, so
+  late work cannot duplicate spans. Keep span order/line ends and the geometry
+  source used by cross-page filtering. Recovery positions and font sizes track
+  `--total-scale-factor` during zoom. Hidden tabs are not judged by zero boxes.
+- Page layers have explicit stacking: bitmap 0 (no pointer events), text 1,
+  highlights 2 and links 3. PDFium images are not draggable. The page supplies
+  PDF.js's `--scale-round-x/y` variables; this custom viewer does not inherit
+  them from PDF.js's `.pdfViewer .page` wrapper.
 - `reader.persistReadingState(rs, slug)` takes the viewer's own slug: the deactivation watcher runs after `activeSlug` has already changed, so defaulting to it saved a tab's position into the next tab.
 - Measured with the real viewer in a WKWebView harness: a tab switch used to cost 33–450 ms of white and 3 renders per switch, now 0 and 0.
 
@@ -600,9 +668,11 @@ Dragging from the foot of one page into the next also selects, in DOM order, the
 
 **Floats** (`classifyFloats`) are found from their caption: `captionHead` wants a label, a number and a delimiter ("Figure 3:", "Fig. 2.", "TABLE IV" over its title, "Algorithm 1 Training" with the label in its own span, "图 3："), and the block must not continue the paragraph above it. The float's text is then walked outwards inside the caption's column — a figure's labels above it (past the picture's white band only small type within its width), a table's rows on the side that holds cells, an algorithm's numbered steps — and every walk stops at running text, a heading, a numbered display, another caption or furniture. Traps found in the corpus: a wrapfigure's caption runs together with the text beside it (continuation lines must be aligned and no wider); the next column's text is not a "piece" of a caption line; a paragraph can open a column with "Figure 1. At the top level, …" (a caption in the text's size must show its float — labels, rows, a picture band ≥ 2.5 em — or be ≤ 4 lines set off from what follows); pdf.js reports CJK faces as monospace (CJK is never "code"); "Table7.Obviously" / "Figures 4a–4d present" are prose.
 
-`planSelectionFurniture` in `PdfViewer.vue` runs at mouse-up, while the selection exists: `popup.text` / `popup.pages` hold the trimmed selection and `popup.full` the whole one (its text rebuilt from the text layers). There is **no toggle** to put the skipped spans back — the user asked for the popup's "已跳过…" button to go (2026-10-04) — so the skipped spans get `.sel-skip` (their `::selection` is transparent) and the page shows what a highlight will take; ⌘C copies the trimmed text (`onCopySelection`); a selection that starts or ends inside furniture of a side, or inside a float, keeps it. A drag released over the previous selection's popup is a new selection, not a click on the popup (`pressInPopup`). Rules for anyone touching it:
+`planSelectionFurniture` in `PdfViewer.vue` runs at mouse-up, while the selection exists: `popup.text` / `popup.pages` hold the trimmed selection and `popup.full` the whole one (its text rebuilt from the text layers). Copy plans the live range directly, including keyboard selections and a missed mouse-up; saving a highlight rechecks `popupSource.range` so an initially plain popup can use geometry that has since finished loading. Both paths keep the same text-match fail safe and only handle this viewer's text layers. There is **no toggle** to put the skipped spans back — the user asked for the popup's "已跳过…" button to go (2026-10-04) — so the skipped spans get `.sel-skip` (their `::selection` is transparent) and the page shows what a highlight will take; ⌘C copies the trimmed text (`onCopySelection`); a selection that starts or ends inside furniture of a side, or inside a float, keeps it. A drag released over the previous selection's popup is a new selection, not a click on the popup (`pressInPopup`). Rules for anyone touching it:
 
 - **Geometry comes from pdf.js text content**, not from the DOM: WebKit measures text-layer span widths differently from Chrome, which broke footnote detection in the real WKWebView. `renderPage` keeps `{content, view, rotate}` per rendered page (`pageTextSources`) and `preferContentGeometry` swaps it in when span counts and texts match one to one; the DOM supplies only element identity and line ends.
+  Publish that source before the text layer starts rendering, after checking the
+  render is still current; selection must not wait for annotation rendering to finish.
 - **Fail safe**: the text rebuilt from the spans *without* dropping anything must equal `selection.toString()` **ignoring whitespace**, otherwise nothing is trimmed. Never compare line breaks: the app shell is `user-select: none` with only `.textLayer` opting back in (App.vue), so WebKit's `toString()` puts no line break between two pages ("…composition.\n2In contrast") and an exact comparison failed on every cross-page selection — the feature was a silent no-op in the app for that reason while every harness without App.vue's CSS passed. Every selection across pages therefore takes the rebuilt text (`planSelectionFurniture` → `popup.full`), which also fixes words running together across a page break. Test this path only with App.vue's selection rules applied. Records of one highlight must keep sharing the same trimmed `text` and `created_at` (`highlightGroups` groups on that pair).
 - The report (`items`, `counts`) describes only spans that are in the selection (nothing in the popup shows it now; keep it that way for any notice that comes back).
 - Both viewers anchor the selection toolbar to the last visible selected text run (`selectionPopupAnchor` in `utils/popupFit.ts`). An unchanged selection keeps its existing position when another non-selectable pane is clicked; a mouse release alone must not move it. PDF also restores the skipped-span tint for that unchanged selection.
@@ -944,7 +1014,34 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
 
 ## Testing instructions
 
-- **Frontend:** No test runner or test files. `vue-tsc --noEmit` (part of `npm run build`) is the only check.
+- **Frontend:** `vue-tsc --noEmit` runs as part of `npm run build`. Local regression scripts use Node's built-in test runner.
+- PDF selection regression checks: `node --test scripts/test-page-furniture.mjs`
+  exercises cross-page copy/save entry points, trimmed text and rects, and the
+  single-page / other-viewer / text-mismatch fail safes without accessing a library.
+- PDF text-layer recovery: `node --test scripts/test-pdf-text-layer.mjs` covers
+  normal layers, font/layout rejection, zero boxes, timeout, cancellation,
+  hidden/image-only pages, PDF coordinates, zoom, rotation and vertical text.
+- Paper AI regeneration: `node --test scripts/test-paper-ai-regenerate.mjs`
+  exercises the real regeneration, stream events and saved snapshots with local
+  provider mocks. `resetAnswerResult` in `AiTab.vue` clears the previous tool
+  trail, images, notices and render copies before both persistence and streaming;
+  other answers and earlier conversation turns remain intact.
+- Paper AI window synchronization: `node --test scripts/test-paper-ai-sync.mjs`
+  exercises two local clients with the real transport/reconciliation and view
+  handlers: live late joins, saved edits/deletes, delayed events, owner-only
+  cancellation, draft/session preservation and library/paper isolation. It does
+  not access a real library or call a provider.
+- Note clipboard compatibility: `node --test scripts/test-note-clipboard.mjs`
+  exercises the installed Vditor copy handler and local clipboard mocks, covering
+  rich-text fallback, Markdown/TeX preservation, cut behavior and listener scope.
+  It does not read or overwrite the system clipboard.
+- Mermaid browser regression: `node --test scripts/test-mermaid.mjs` with
+  Playwright available and Chrome installed. `ARGUS_TEST_PLAYWRIGHT` can point to
+  a bundled Playwright `index.mjs`; `ARGUS_TEST_OUTPUT_DIR` optionally retains a
+  diagram screenshot. It mounts the real component and checks sanitized labels,
+  directive overrides, PNG text pixels and invalid-source fallback, using a fresh
+  headless profile and localhost only (no library or system clipboard access).
+- **Paper marking / duplicate import:** `node --test scripts/test-duplicate-import.mjs scripts/test-paper-marking.mjs` exercises the real import store and reader merge with command/dialog mocks. `scripts/test-write-confirm.mjs` uses the same Playwright setup as the Mermaid test to check batch previews and approval/rejection with actual Chinese translations. Rust tests in `mcp/app_tools.rs`, `mcp/agent.rs`, `render.rs` and `paper.rs` cover exact quote matching, write isolation, idempotent retries, app-only exposure, explicit-request descriptions, crop/rotation/UserUnit and concurrent directory reservations.
 - **Backend:** Unit tests live in `#[cfg(test)]` modules inside the files they test — 43 of the 61 files under `src-tauri/src/`, about 450 tests (444 run by default; 4 more are `#[ignore]`d — a live MCP probe, a scan timing and two sample dumps, run by hand with `-- --ignored`). The heavier suites guard behavior described elsewhere in this file: `llm.rs` (`error_class_tests`, `provider_error_tests`), `copilot.rs` (context budget, eviction, fallback), `mcp/server.rs` + `mcp/agent.rs` (tool list, schema rules, dispatch sync), `arxiv.rs` (batch analysis).
 - **CI:** The release workflow does not run tests.
 

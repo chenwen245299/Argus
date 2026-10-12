@@ -61,7 +61,17 @@ async function loadMermaid(): Promise<MermaidMod> {
   if (!_mermaid) {
     const mod = await import('mermaid')
     _mermaid = mod.default
-    _mermaid.initialize({ startOnLoad: false, theme: 'neutral', fontFamily: '"Helvetica Neue", Arial, sans-serif' })
+    _mermaid.initialize({
+      startOnLoad: false,
+      theme: 'neutral',
+      fontFamily: '"Helvetica Neue", Arial, sans-serif',
+      // Our SVG-only sanitizer removes foreignObject HTML labels. Render text
+      // as SVG instead so labels survive sanitizing and standalone PNG export.
+      htmlLabels: false,
+      // Keep Mermaid's default secure keys, and prevent per-diagram directives
+      // from switching the labels back to HTML before they reach the sanitizer.
+      secure: ['secure', 'securityLevel', 'startOnLoad', 'maxTextSize', 'suppressErrorRendering', 'maxEdges', 'htmlLabels'],
+    })
   }
   return _mermaid
 }

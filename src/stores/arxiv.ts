@@ -460,7 +460,7 @@ export const useArxivStore = defineStore('arxiv', () => {
       collectionId: collectionId ?? null,
     })
     if (res.status === 'duplicate') {
-      const msg = i18n.global.t('import.duplicateConfirm').replace('{title}', res.title ?? arxivId)
+      const msg = i18n.global.t('import.duplicateConfirm', { title: res.title ?? arxivId })
       if (!window.confirm(msg)) return null   // canceled — leave recommendation in place
       res = await invoke<ImportOutcome>('add_arxiv_to_library', {
         arxivId,

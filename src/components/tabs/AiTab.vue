@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { modelOffer, modelSizeLabel } from '../../utils/modelOffers'
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowReactive, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
@@ -27,6 +27,14 @@ import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImag
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
 import { askAiText } from '../../stores/translationHistory'
 import { estimateCostCny } from '../../utils/modelPricing'
+import type {
+  PaperAiChatNode as ChatNode, PaperAiAnswer as AssistantAnswer,
+  PaperAiAgentStep as AgentStep, PaperAiConversation as Conversation,
+} from '../../types/paperAi'
+import {
+  PaperAiSync, PAPER_AI_SAVED_EVENT, reconcilePaperAiConversations, translatePaperAiClocks,
+  type PaperAiSyncMessage, type PaperAiSavedMessage, type PaperAiStreamInfo,
+} from '../../utils/paperAiSync'
 
 const props = withDefaults(defineProps<{ slug: string | null; standalone?: boolean }>(), {
   standalone: false,
@@ -45,85 +53,7 @@ const settingsStore = useSettingsStore()
 // simply skipped, which is the intended graceful fallback.
 const reader = useReaderStore()
 
-// `Attachment` now lives in utils/attachments.ts, shared with the library chat.
-
-type ChatNode =
-  | { id: string; role: 'user'; content: string; attachments?: Attachment[]; createdAt: string }
-  | { id: string; role: 'assistantGroup'; promptId: string; answers: AssistantAnswer[]; createdAt: string }
 type AssistantGroupNode = Extract<ChatNode, { role: 'assistantGroup' }>
-
-interface AssistantAnswer {
-  id: string
-  providerId: string
-  providerName: string
-  modelId: string
-  modelName: string
-  content: string
-  // Throttled copy of `content` used for live markdown rendering while
-  // streaming (re-rendering the full markdown on every token freezes the UI).
-  displayContent?: string
-  reasoningContent?: string
-  // Throttled copy of `reasoningContent`, for the same reason as
-  // `displayContent`: reasoning streams token by token too, and repainting a
-  // long chain of thought on every one of them freezes the tab by itself.
-  displayReasoning?: string
-  withReasoning?: boolean
-  createdAt: string
-  startedAt?: number
-  endedAt?: number
-  streaming?: boolean
-  error?: boolean
-  errorText?: string
-  tokenEstimate?: number
-  inputTokens?: number
-  outputTokens?: number
-  totalTokens?: number
-  cacheHitTokens?: number
-  costUsd?: number | null
-  source?: 'chat' | 'metadataExtraction'
-  /**
-   * A spoken reply from an end-to-end speech model, as a `data:audio/wav` URL.
-   * Arrives once, when the stream ends — the backend concatenates the streamed
-   * PCM and gives it a header, because a half-written clip is not playable. Not
-   * persisted: a minute of wav is megabytes of base64, and the answer text is
-   * already its transcript.
-   */
-  audioUrl?: string
-  /** What OpenRouter's server tools contributed: pages cited, images drawn. */
-  serverTools?: ServerToolTrace
-  /** What the agent did to answer: one entry per tool call, in order. */
-  steps?: AgentStep[]
-  /** Servers the user configured that would not start this turn. */
-  serverErrors?: string[]
-  /** The model ran out of tool rounds before it was finished. */
-  limitHit?: { rounds: number; max: number }
-}
-
-/** One tool call the agent made, as shown in the trail above an answer. */
-interface AgentStep {
-  tool: string
-  server?: string
-  args: string
-  argsJson?: string
-  ok?: boolean
-  chars?: number
-  /** The tool result, as the model received it. Shown when the row is opened. */
-  preview?: string
-  /** Whether the model's own copy was cut to fit its context budget. */
-  truncated?: boolean
-  /** Page images rendered by `view_paper_page`, shown beneath the row. */
-  images?: AgentStepImage[]
-}
-
-interface Conversation {
-  id: string
-  slug: string
-  title: string
-  createdAt: string
-  updatedAt: string
-  nodes: ChatNode[]
-  source?: 'chat' | 'metadataExtraction'
-}
 
 interface StreamPayload {
   delta: string
@@ -260,7 +190,10 @@ const activeRequestIds = new Map<string, string>()
 // owns them. Holding the conversation here keeps it alive and reactive after the
 // user switches to another paper, so a generation started on paper A keeps
 // streaming into A's conversation in the background instead of being dropped.
-const streamOwners = new Map<string, { slug: string; conv: Conversation }>()
+const streamOwners = shallowReactive(new Map<string, { slug: string; conv: Conversation; origin?: string; root?: string }>())
+// History entries are saved snapshots; live owners track generations even after
+// switching conversations. Only additions/removals need to update these dots.
+const generatingConvIds = computed(() => new Set([...streamOwners.values()].map(o => o.conv.id)))
 // Per-paper view state, snapshotted when leaving a paper and restored when
 // coming back, so switching tabs doesn't drop the user back into a blank chat.
 interface PaperSession {
@@ -336,6 +269,11 @@ async function copyText(id: string, text: string) {
 async function openPopupWindow() {
   if (!props.slug) return
   await invoke('open_paper_ai_window', { slug: props.slug })
+  const conv = activeConversation.value
+  if (conv && syncLibraryRoot) {
+    broadcastConversationSnapshot(conv, true)
+    void paperAiSync.send({ kind: 'select', root: syncLibraryRoot, slug: props.slug, conversationId: conv.id })
+  }
 }
 
 // Shared with library chat and persisted across panel/window/app reopen.
@@ -546,6 +484,11 @@ function normalizeConversations(value: unknown, slug: string): Conversation[] {
       title: c.title || '新对话',
       createdAt: c.createdAt || nowIso(),
       updatedAt: c.updatedAt || c.createdAt || nowIso(),
+      // Disk cannot tell us which window still owns a request. Live status is
+      // supplied by the sync handshake; a saved flag must not lock the composer.
+      nodes: c.nodes.map(n => n.role === 'assistantGroup'
+        ? { ...n, answers: n.answers.map(a => ({ ...a, streaming: false })) }
+        : n),
     }))
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
 }
@@ -565,6 +508,229 @@ function persistedConversations(): Conversation[] {
 // known here), and emits a tombstone only for the former.
 const knownConvIds = new Map<string, Set<string>>()
 
+// A save notification is the durable path; live answer patches avoid writing or
+// re-sending the entire history on every token. Each view retains its own draft.
+const paperAiSync = new PaperAiSync(handlePaperAiSync)
+let syncLibraryRoot: string | null = null
+let syncLibraryRevision = 0
+let syncReady: Promise<void> | null = null
+let syncDisposed = false
+const syncUnlisteners: UnlistenFn[] = []
+const paperSaves = new Map<string, Promise<void>>()
+let syncRefresh: Promise<void> | null = null
+let syncRefreshPending = false
+let selectionRevision = 0
+let initialSyncSelectionRevision: number | null = null
+
+async function ensurePaperAiSync() {
+  if (syncReady) return syncReady
+  syncReady = (async () => {
+    await paperAiSync.start()
+    const bindings: Array<Promise<UnlistenFn>> = [
+      listen<PaperAiSavedMessage>(PAPER_AI_SAVED_EVENT, event => {
+        const p = event.payload
+        if (p?.root === syncLibraryRoot && p.slug === props.slug && p.origin !== paperAiSync.origin) void refreshSyncedConversations()
+      }),
+      listen<{ slugs?: string[]; other?: boolean }>('library-files-changed', event => {
+        if (props.slug && (event.payload?.other || event.payload?.slugs?.includes(props.slug))) void refreshSyncedConversations()
+      }),
+      listen<string>('library-changed', event => {
+        if (event.payload === syncLibraryRoot) return
+        syncLibraryRevision++
+        // An in-flight answer belongs to the old library, never the new root.
+        for (const owner of [...streamOwners.values()]) if (!owner.origin) stopConversationStreaming(owner.conv, false)
+        streamOwners.clear()
+        sessions.clear()
+        knownConvIds.clear()
+        syncLibraryRoot = event.payload
+        activeConversation.value = null
+        conversations.value = []
+        void refreshSyncedConversations()
+      }),
+    ]
+    const results = await Promise.allSettled(bindings)
+    for (const result of results) if (result.status === 'fulfilled') {
+      if (syncDisposed) result.value()
+      else syncUnlisteners.push(result.value)
+    }
+    const revision = syncLibraryRevision
+    const root = await invoke<string | null>('get_current_library')
+    if (syncLibraryRevision === revision && !syncDisposed) syncLibraryRoot = root
+  })().catch(() => { syncReady = null })
+  return syncReady
+}
+
+function localConversationStreams(conv: Conversation): PaperAiStreamInfo[] {
+  return [...streamOwners.entries()]
+    .filter(([id, o]) => !o.origin && o.conv.id === conv.id && o.conv.nodes.some(n => n.role === 'assistantGroup' && n.answers.some(a => a.id === id && a.streaming)))
+    .map(([answerId]) => ({ answerId }))
+}
+
+function broadcastConversationSnapshot(conv: Conversation, select = false, target?: string) {
+  const owner = [...streamOwners.values()].find(o => o.conv.id === conv.id)
+  if (owner?.origin) return // mirrors never echo another window's answer
+  const root = owner?.root ?? syncLibraryRoot
+  if (!root || syncDisposed) return
+  paperAiSync.cancel(conv.id)
+  void paperAiSync.send({ kind: 'snapshot', root, slug: conv.slug, target, select,
+    conversation: persistableConversation(conv), streams: localConversationStreams(conv) })
+}
+
+function broadcastStreamUpdate(answerId: string) {
+  const owner = streamOwners.get(answerId)
+  if (!owner || owner.origin || !syncLibraryRoot || syncDisposed) return
+  const { conv } = owner
+  paperAiSync.queue(conv.id, () => {
+    const ids = new Set(localConversationStreams(conv).map(s => s.answerId))
+    // Only current answers are cloned/capped. Old turns and attachment blobs
+    // are sent once in the initial snapshot, rather than at streaming frequency.
+    const patch = persistableConversation({ ...conv, nodes: conv.nodes.flatMap(n =>
+      n.role === 'assistantGroup' ? [{ ...n, answers: n.answers.filter(a => ids.has(a.id)) }] : []) })
+    return { kind: 'update', root: owner.root ?? syncLibraryRoot!, slug: conv.slug,
+      conversationId: conv.id, title: conv.title, updatedAt: conv.updatedAt,
+      answers: patch.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : []),
+      streams: localConversationStreams(conv) }
+  })
+}
+
+function ownsConversationStream(id: string) {
+  return [...streamOwners.values()].some(o => o.conv.id === id && !o.origin)
+}
+
+function adoptSyncedConversation(incoming: Conversation, streams: PaperAiStreamInfo[], origin: string, select = false) {
+  if (incoming.slug !== props.slug || ownsConversationStream(incoming.id)) return
+  const old = activeConversation.value?.id === incoming.id ? activeConversation.value
+    : liveConversationById(incoming.id) ?? conversations.value.find(c => c.id === incoming.id)
+  if (old && old.updatedAt > incoming.updatedAt) return
+  const liveIds = new Set(streams.map(s => s.answerId))
+  for (const n of incoming.nodes) if (n.role === 'assistantGroup') for (const a of n.answers) {
+    const before = old?.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : []).find(b => b.id === a.id)
+    if (before && before.createdAt !== a.createdAt) {
+      expandedSteps.value = new Set([...expandedSteps.value].filter(k => !k.startsWith(`${a.id}:`)))
+    }
+    a.streaming = liveIds.has(a.id)
+  }
+  const adopted = old ? Object.assign(old, incoming) : incoming
+  if (adopted.nodes.length) {
+    const idx = conversations.value.findIndex(c => c.id === adopted.id)
+    if (idx >= 0) conversations.value[idx] = adopted
+    else conversations.value.unshift(adopted)
+    conversations.value.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+  }
+  const proxy = activeConversation.value?.id === adopted.id ? activeConversation.value
+    : conversations.value.find(c => c.id === adopted.id) ?? adopted
+  for (const [id, owner] of streamOwners) if (owner.origin && owner.conv.id === adopted.id) streamOwners.delete(id)
+  for (const { answerId } of streams) streamOwners.set(answerId, { slug: incoming.slug, conv: proxy, origin, root: syncLibraryRoot ?? undefined })
+  if (select || activeConversation.value?.id === adopted.id) {
+    activeConversation.value = proxy
+    if (select) { activeAnswerTabs.value = {}; void nextTick(() => scrollToBottom(true)) }
+  }
+  const cached = sessions.get(incoming.slug)
+  if (cached?.conv?.id === incoming.id) cached.conv = proxy
+}
+
+function handlePaperAiSync(p: PaperAiSyncMessage) {
+  if (syncDisposed || p.root !== syncLibraryRoot) return
+  if (p.kind === 'closed') {
+    for (const [id, owner] of streamOwners) if (owner.origin === p.origin) {
+      for (const n of owner.conv.nodes) if (n.role === 'assistantGroup') for (const a of n.answers) if (a.id === id) a.streaming = false
+      streamOwners.delete(id)
+    }
+    if (p.slug === props.slug) void refreshSyncedConversations()
+    return
+  }
+  if (p.kind === 'request') {
+    const owned = new Map([...streamOwners.values()].filter(o => !o.origin && o.slug === p.slug).map(o => [o.conv.id, o.conv]))
+    const active = props.slug === p.slug ? activeConversation.value : null
+    if (active && ![...streamOwners.values()].some(o => o.conv.id === active.id && o.origin)) owned.set(active.id, active)
+    for (const conv of owned.values()) if (!p.conversationId || p.conversationId === conv.id) {
+      broadcastConversationSnapshot(conv, !!p.select && conv.id === active?.id, p.origin)
+    }
+    return
+  }
+  if (p.kind === 'stop') {
+    const owner = [...streamOwners.values()].find(o => !o.origin && o.slug === p.slug && o.conv.id === p.conversationId)
+    if (owner) stopConversationStreaming(owner.conv)
+    return
+  }
+  if (p.slug !== props.slug) {
+    const cached = sessions.get(p.slug)
+    if (cached?.conv && p.kind === 'snapshot' && cached.conv.id === p.conversation.id && !ownsConversationStream(cached.conv.id)) cached.conv = p.conversation
+    return
+  }
+  if (p.kind === 'select') {
+    initialSyncSelectionRevision = null // explicit pop-out follows the chosen conversation
+    openConversation(p.conversationId)
+    if (activeConversation.value?.id !== p.conversationId) void paperAiSync.send({ kind: 'request', root: p.root, slug: p.slug, conversationId: p.conversationId, select: true, target: p.origin })
+  } else if (p.kind === 'snapshot') {
+    translatePaperAiClocks(p.conversation.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : []), p.clock)
+    const select = !!p.select && (initialSyncSelectionRevision === null || (initialSyncSelectionRevision === selectionRevision && !input.value && !editingNodeId.value))
+    adoptSyncedConversation(p.conversation, p.streams, p.origin, select)
+    if (select) initialSyncSelectionRevision = null
+  } else if (p.kind === 'update') {
+    translatePaperAiClocks(p.answers, p.clock)
+    const conv = liveConversationById(p.conversationId) ?? conversations.value.find(c => c.id === p.conversationId)
+    if (!conv) { void paperAiSync.send({ kind: 'request', root: p.root, slug: p.slug, conversationId: p.conversationId, target: p.origin, select: initialSyncSelectionRevision !== null }); return }
+    if (ownsConversationStream(conv.id)) return
+    const answers = new Map(p.answers.map(a => [a.id, a]))
+    const snapshot: Conversation = { ...conv, title: p.title, updatedAt: p.updatedAt,
+      nodes: conv.nodes.map(n => n.role === 'assistantGroup' ? { ...n, answers: n.answers.map(a => answers.get(a.id) ?? a) } : n) }
+    adoptSyncedConversation(snapshot, p.streams, p.origin)
+  }
+}
+
+function applySyncedDiskConversations(list: Conversation[], slug: string) {
+  // The durable completion notification is also a fallback if the final live
+  // event was missed. A pre-request snapshot has no endedAt and cannot do this.
+  for (const [id, owner] of streamOwners) if (owner.origin && owner.slug === slug) {
+    const saved = list.find(c => c.id === owner.conv.id)?.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : []).find(a => a.id === id)
+    const live = owner.conv.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : []).find(a => a.id === id)
+    if (saved && typeof saved.endedAt === 'number' && saved.createdAt === live?.createdAt) streamOwners.delete(id)
+  }
+  const protectedIds = new Set([...streamOwners.values()].filter(o => o.slug === slug).map(o => o.conv.id))
+  if (paperSaves.has(slug)) conversations.value.forEach(c => protectedIds.add(c.id))
+  const active = activeConversation.value
+  if (editingNodeId.value && active) protectedIds.add(active.id)
+  conversations.value = reconcilePaperAiConversations(conversations.value, list, protectedIds)
+  knownConvIds.set(slug, new Set(list.map(c => c.id)))
+  if (active?.nodes.length && !protectedIds.has(active.id)) {
+    const updated = conversations.value.find(c => c.id === active.id)
+    if (updated) Object.assign(active, cloneConversation(updated))
+    else { activeConversation.value = createBlankConversation(slug); activeAnswerTabs.value = {} }
+  }
+  const cached = sessions.get(slug)
+  if (cached?.conv?.nodes.length && !protectedIds.has(cached.conv.id)) {
+    cached.conv = conversations.value.find(c => c.id === cached.conv!.id) ?? null
+  }
+}
+
+function refreshSyncedConversations(): Promise<void> {
+  syncRefreshPending = true
+  if (syncRefresh) return syncRefresh
+  syncRefresh = (async () => {
+    do {
+      syncRefreshPending = false
+      const slug = props.slug, root = syncLibraryRoot
+      if (!slug || !root || syncDisposed) return
+      await (paperSaves.get(slug) ?? Promise.resolve()).catch(() => {})
+      await (backgroundSaves.get(slug) ?? Promise.resolve()).catch(() => {})
+      const value = await invoke<unknown>('get_paper_ai_conversations', { slug })
+      if (props.slug === slug && syncLibraryRoot === root && !syncDisposed) applySyncedDiskConversations(normalizeConversations(value, slug), slug)
+    } while (syncRefreshPending)
+  })().catch(() => {}).finally(() => {
+    syncRefresh = null
+    if (syncRefreshPending && !syncDisposed) void refreshSyncedConversations()
+  })
+  return syncRefresh
+}
+
+function onPaperAiFocus() {
+  void ensurePaperAiSync().then(() => {
+    void refreshSyncedConversations()
+    if (syncLibraryRoot && props.slug) void paperAiSync.send({ kind: 'request', root: syncLibraryRoot, slug: props.slug })
+  })
+}
+
 function deletionTombstones(slug: string, persisted: Conversation[]): { id: string; deleted_at: string }[] {
   const known = knownConvIds.get(slug) ?? new Set<string>()
   const currentIds = new Set(persisted.map(c => c.id))
@@ -578,7 +744,13 @@ async function saveConversationsToPaper(slug: string) {
   const persisted = persistedConversations()
   conversations.value = persisted
   const tombstones = deletionTombstones(slug, persisted)
-  await invoke('save_paper_ai_conversations', { slug, conversations: persisted, tombstones })
+  const root = syncLibraryRoot
+  const previous = paperSaves.get(slug) ?? Promise.resolve()
+  const next: Promise<void> = previous.catch(() => {}).then(() => invoke<void>('save_paper_ai_conversations', {
+    slug, conversations: persisted, tombstones, origin: paperAiSync.origin, expectedRoot: root,
+  })).finally(() => { if (paperSaves.get(slug) === next) paperSaves.delete(slug) })
+  paperSaves.set(slug, next)
+  await next
   try {
     localStorage.removeItem(storageKey(slug))
   } catch {
@@ -586,10 +758,11 @@ async function saveConversationsToPaper(slug: string) {
   }
 }
 
-async function importLegacyHistory(slug: string) {
+async function importLegacyHistory(slug: string, root: string | null) {
   if (conversations.value.length > 0) return
   try {
     const history = await invoke<ChatMessage[]>('get_chat_history', { slug })
+    if (props.slug !== slug || syncLibraryRoot !== root) return
     const nodes: ChatNode[] = []
     for (const msg of history.filter(m => {
       if (m.role === 'system') return false
@@ -635,6 +808,8 @@ async function importLegacyHistory(slug: string) {
 }
 
 async function loadConversations(slug: string) {
+  await ensurePaperAiSync()
+  const root = syncLibraryRoot
   // A background generation for this paper may still be flushing to disk; read
   // after it lands so the history list isn't one answer behind.
   await (backgroundSaves.get(slug) ?? Promise.resolve()).catch(() => {})
@@ -645,12 +820,13 @@ async function loadConversations(slug: string) {
     list = []
   }
   // The user may have switched papers again while this was loading.
-  if (props.slug !== slug) return
-  conversations.value = list
-  knownConvIds.set(slug, new Set(list.map(c => c.id)))
-  await importLegacyHistory(slug)
-  if (props.slug !== slug) return
+  if (props.slug !== slug || syncLibraryRoot !== root) return
+  applySyncedDiskConversations(list, slug)
+  await importLegacyHistory(slug, root)
+  if (props.slug !== slug || syncLibraryRoot !== root) return
   restoreSession(slug)
+  initialSyncSelectionRevision = selectionRevision
+  if (syncLibraryRoot) void paperAiSync.send({ kind: 'request', root: syncLibraryRoot, slug, select: true })
 }
 
 // Papers whose view state is kept in memory. Old entries are dropped, but never
@@ -685,10 +861,14 @@ function restoreSession(slug: string) {
   const session = sessions.get(slug)
   sessions.delete(slug)
   if (!session?.conv) {
-    startNewConversation(false)
+    const latest = conversations.value[0]
+    if (latest) { activeConversation.value = liveConversationById(latest.id) ?? cloneConversation(latest); activeAnswerTabs.value = {} }
+    else startNewConversation(false)
     return
   }
-  activeConversation.value = session.conv
+  // A session keeps the draft/selection, not a stale copy of saved messages.
+  const current = liveConversationById(session.conv.id) ?? conversations.value.find(c => c.id === session.conv!.id)
+  activeConversation.value = current ?? (session.conv.nodes.length === 0 ? session.conv : createBlankConversation(slug))
   activeAnswerTabs.value = session.tabs
   input.value = session.input
   showHistory.value = false
@@ -712,6 +892,7 @@ function onPaperMetaUpdated(event: Event) {
 
 function startNewConversation(closeHistory = true) {
   if (!props.slug) return
+  selectionRevision++
   activeConversation.value = createBlankConversation(props.slug)
   activeAnswerTabs.value = {}
   if (closeHistory) showHistory.value = false
@@ -733,6 +914,7 @@ watch(askAiText, (text) => {
 function openConversation(id: string) {
   const conv = conversations.value.find(c => c.id === id)
   if (!conv) return
+  selectionRevision++
   // If this conversation still has a live generation, reopen the streaming
   // object itself — a snapshot would stop updating.
   activeConversation.value = liveConversationById(id) ?? cloneConversation(conv)
@@ -747,6 +929,9 @@ function openConversation(id: string) {
 function deleteConversation(id: string, event?: MouseEvent) {
   event?.stopPropagation()
   if (!props.slug) return
+  // Both views expose the same live answer; stop it before deleting its record.
+  // Otherwise its eventual save would legitimately revive the delete tombstone.
+  if ([...streamOwners.values()].some(o => o.conv.id === id)) return
   conversations.value = conversations.value.filter(c => c.id !== id)
   if (activeConversation.value?.id === id) startNewConversation(false)
   saveConversationsToPaper(props.slug).catch(() => {})
@@ -762,12 +947,15 @@ function persistActiveConversation() {
 // background generation can finish long after the user switched away.
 function persistConversationFor(slug: string, conv: Conversation) {
   if (conv.nodes.length === 0) return
-  conv.updatedAt = nowIso()
+  // Several model variants may finish within the same millisecond. CRDT ties
+  // keep the disk copy, so every local mutation needs a strictly newer time.
+  conv.updatedAt = new Date(Math.max(Date.now(), (Date.parse(conv.updatedAt) || 0) + 1)).toISOString()
   conv.title = isMetadataExtractionConversation(conv)
     ? 'AI 元数据提取'
     : firstUserTitle(conv.nodes) || conv.title || '新对话'
   if (slug !== props.slug) {
     queueBackgroundSave(slug, conv)
+    broadcastConversationSnapshot(conv)
     return
   }
   const idx = conversations.value.findIndex(c => c.id === conv.id)
@@ -776,6 +964,7 @@ function persistConversationFor(slug: string, conv: Conversation) {
   conversations.value.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
   saveConversationsToPaper(slug).catch(() => {})
   saveLegacyActiveHistory(slug, conv).catch(() => {})
+  broadcastConversationSnapshot(conv)
 }
 
 // Saving for a paper this view doesn't have loaded is a read-modify-write on its
@@ -786,10 +975,11 @@ const backgroundSaves = new Map<string, Promise<void>>()
 function queueBackgroundSave(slug: string, conv: Conversation) {
   // Snapshot now: the live conversation keeps mutating while the write awaits.
   const snapshot = persistableConversation(conv)
+  const root = syncLibraryRoot
   const prev = backgroundSaves.get(slug) ?? Promise.resolve()
   const next: Promise<void> = prev
     .catch(() => {})
-    .then(() => saveConversationForOtherPaper(slug, snapshot))
+    .then(() => saveConversationForOtherPaper(slug, snapshot, root))
     .catch(() => {})
     .finally(() => {
       if (backgroundSaves.get(slug) === next) backgroundSaves.delete(slug)
@@ -797,7 +987,7 @@ function queueBackgroundSave(slug: string, conv: Conversation) {
   backgroundSaves.set(slug, next)
 }
 
-async function saveConversationForOtherPaper(slug: string, snapshot: Conversation) {
+async function saveConversationForOtherPaper(slug: string, snapshot: Conversation, root: string | null) {
   let list: Conversation[] = []
   try {
     list = normalizeConversations(await invoke<unknown>('get_paper_ai_conversations', { slug }), slug)
@@ -810,7 +1000,7 @@ async function saveConversationForOtherPaper(slug: string, snapshot: Conversatio
   const persisted = list
     .filter(c => c.nodes.length > 0)
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-  await invoke('save_paper_ai_conversations', { slug, conversations: persisted })
+  await invoke('save_paper_ai_conversations', { slug, conversations: persisted, origin: paperAiSync.origin, expectedRoot: root })
   await invoke('save_chat_history', { slug, messages: flattenConversation(snapshot) })
 }
 
@@ -1186,17 +1376,7 @@ async function regenerate(group: ChatNode, answer: AssistantAnswer) {
   const conv = activeConversation.value
   const ra = findReactiveAnswer(answer.id)
   if (ra) {
-    ra.content = ''
-    ra.reasoningContent = ''
-    ra.displayReasoning = ''
-    ra.error = false
-    ra.errorText = ''
-    ra.tokenEstimate = undefined
-    ra.inputTokens = undefined
-    ra.outputTokens = undefined
-    ra.totalTokens = undefined
-    ra.costUsd = undefined
-    ra.audioUrl = undefined
+    resetAnswerResult(ra)
     ra.createdAt = nowIso()
   }
   persistConversationFor(slug, conv)
@@ -1267,10 +1447,24 @@ function onEditKeydown(e: KeyboardEvent, node: UserNode) {
 function stopAllStreaming() {
   const conv = activeConversation.value
   if (!conv) return
+  stopConversationStreaming(conv)
+}
+
+function stopConversationStreaming(conv: Conversation, persist = true) {
   const answerIds = conv.nodes.flatMap(n =>
     n.role === 'assistantGroup' ? n.answers.filter(a => a.streaming).map(a => a.id) : []
   )
-  for (const answerId of answerIds) {
+  const localAnswerIds = answerIds.filter(id => {
+    const owner = streamOwners.get(id)
+    return !!owner && !owner.origin
+  })
+  const remoteOrigins = new Set(answerIds.map(id => streamOwners.get(id)?.origin).filter((origin): origin is string => !!origin))
+  for (const target of remoteOrigins) if (syncLibraryRoot && persist) {
+    void paperAiSync.send({ kind: 'stop', root: syncLibraryRoot, slug: conv.slug, conversationId: conv.id, target })
+  }
+  let stoppedLocal = false
+  for (const answerId of localAnswerIds) {
+    stoppedLocal = true
     // Tell the backend to truly cancel the in-flight request (closes the HTTP
     // stream so the provider stops generating / billing).
     const requestId = activeRequestIds.get(answerId)
@@ -1285,12 +1479,13 @@ function stopAllStreaming() {
     }
     streamOwners.delete(answerId)
   }
+  if (!stoppedLocal) return
   // Any write the agent was still waiting on is refused when the user stops.
   for (const pending of pendingWrites.value) {
     invoke('resolve_agent_write', { requestId: pending.requestId, approved: false }).catch(() => {})
   }
   pendingWrites.value = []
-  persistActiveConversation()
+  if (persist) persistConversationFor(conv.slug, conv)
 }
 
 // ── Throttled streaming render ────────────────────────────────────────────────
@@ -1321,6 +1516,7 @@ function applyStreamRender(ans: AssistantAnswer) {
   const startedAt = performance.now()
   ans.displayContent = ans.content
   ans.displayReasoning = ans.reasoningContent
+  broadcastStreamUpdate(ans.id)
   nextTick(() => streamRenderCost.set(ans.id, performance.now() - startedAt))
   // An answer streaming in the background must not scroll the paper on screen.
   if (isAnswerVisible(ans.id)) scrollToBottom()
@@ -1356,6 +1552,33 @@ function flushStreamRender(ans: AssistantAnswer) {
   ans.displayReasoning = ans.reasoningContent
 }
 
+/** A new run replaces this answer's previous result, including its tool trail.
+ *  Reset before persisting a regeneration and before listening to new events. */
+function resetAnswerResult(ans: AssistantAnswer) {
+  ans.content = ''
+  ans.reasoningContent = ''
+  ans.startedAt = undefined
+  ans.endedAt = undefined
+  flushStreamRender(ans)
+  ans.error = false
+  ans.errorText = ''
+  ans.tokenEstimate = undefined
+  ans.inputTokens = undefined
+  ans.outputTokens = undefined
+  ans.totalTokens = undefined
+  ans.cacheHitTokens = undefined
+  ans.costUsd = undefined
+  ans.audioUrl = undefined
+  ans.serverTools = undefined
+  ans.steps = undefined
+  ans.serverErrors = undefined
+  ans.limitHit = undefined
+  // Row keys reuse the answer id and index, so a new first step must not inherit
+  // the previous first step's expanded details. Other answers stay as they are.
+  const prefix = `${ans.id}:`
+  expandedSteps.value = new Set([...expandedSteps.value].filter(k => !k.startsWith(prefix)))
+}
+
 /** The reasoning text to paint: the throttled copy while it streams, the real
  *  one once it is done. */
 function reasoningText(a: AssistantAnswer) {
@@ -1383,7 +1606,8 @@ async function streamAnswer(
 ) {
   // Pin the conversation object that owns this answer.
   const owner = activeConversation.value?.id === conv.id ? activeConversation.value : conv
-  streamOwners.set(answer.id, { slug, conv: owner })
+  const rootAtStart = syncLibraryRoot
+  streamOwners.set(answer.id, { slug, conv: owner, root: rootAtStart ?? undefined })
   const eventName = `paper-ai-chat-${answer.id}`
   const reasoningEventName = `${eventName}-reasoning`
   // Backend cancellation id: sent to `chat_with_library`, used by
@@ -1394,24 +1618,12 @@ async function streamAnswer(
   // Initialize through reactive proxy chain so Vue tracks all mutations
   const ra = findReactiveAnswer(answer.id)
   if (ra) {
+    resetAnswerResult(ra)
     ra.streaming = true
-    ra.error = false
-    ra.errorText = ''
-    ra.content = ''
-    ra.reasoningContent = ''
-    ra.displayReasoning = ''
     ra.startedAt = performance.now()
     ra.endedAt = undefined
-    ra.tokenEstimate = undefined
-    ra.inputTokens = undefined
-    ra.outputTokens = undefined
-    ra.totalTokens = undefined
-    ra.costUsd = undefined
-    ra.serverTools = undefined
-    // Otherwise a regenerated answer keeps playing the previous run's clip under
-    // new text — LibraryChat resets this in the same place.
-    ra.audioUrl = undefined
   }
+  broadcastConversationSnapshot(owner)
 
   const unlisten = await listen<StreamPayload>(eventName, (event) => {
     if (event.payload.done) return
@@ -1427,6 +1639,7 @@ async function streamAnswer(
   const unlistenUsage = await listen<StreamUsagePayload>(`${eventName}-usage`, (event) => {
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) applyUsage(reactiveAns, event.payload)
+    broadcastStreamUpdate(answer.id)
   })
   unlisteners.set(`${answer.id}-usage`, unlistenUsage)
 
@@ -1445,6 +1658,7 @@ async function streamAnswer(
       const reactiveAns = findReactiveAnswer(answer.id)
       if (reactiveAns) {
         reactiveAns.serverTools = mergeServerToolTrace(reactiveAns.serverTools, event.payload)
+        broadcastStreamUpdate(answer.id)
       }
     }
   )
@@ -1496,6 +1710,7 @@ async function streamAnswer(
     } else if (p.phase === 'limit') {
       reactiveAns.limitHit = { rounds: p.rounds ?? 0, max: p.max ?? 0 }
     }
+    broadcastStreamUpdate(answer.id)
   })
   unlisteners.set(`${answer.id}-agent`, unlistenAgent)
 
@@ -1592,7 +1807,7 @@ async function streamAnswer(
     streamOwners.delete(answer.id)
     // Save to the paper this answer was started on, even if another one is now
     // on screen.
-    persistConversationFor(slug, owner)
+    if (rootAtStart === syncLibraryRoot) persistConversationFor(slug, owner)
     if (visible) scrollToBottom()
   }
 }
@@ -1978,6 +2193,9 @@ watch(activeConversationIsMetadataExtraction, (isMetadataExtraction) => {
 })
 
 onMounted(async () => {
+  await ensurePaperAiSync()
+  if (syncDisposed) return
+  window.addEventListener('focus', onPaperAiFocus)
   // Apply a remembered composer height right away — otherwise it wouldn't take
   // effect until the first keystroke re-ran the sizing.
   if (composerHeight.value) resizeTextarea()
@@ -2046,6 +2264,7 @@ onMounted(async () => {
     activeConversation.value = conv
     // Pin the extraction to this paper so it survives a paper switch too.
     streamOwners.set(answer_id, { slug: ev.payload.slug, conv: activeConversation.value! })
+    broadcastConversationSnapshot(activeConversation.value!)
 
     // Wire up stream listener using the same event pattern as copilot
     const unlisten = await listen<StreamPayload>(`paper-ai-chat-${answer_id}`, (event) => {
@@ -2089,6 +2308,10 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  paperAiSync.dispose(syncLibraryRoot && props.slug ? { root: syncLibraryRoot, slug: props.slug } : undefined)
+  syncDisposed = true
+  syncUnlisteners.forEach(off => off())
+  window.removeEventListener('focus', onPaperAiFocus)
   panelResizeObserver?.disconnect()
   panelResizeObserver = null
   document.removeEventListener('mousedown', closeFloating)
@@ -2152,11 +2375,12 @@ onUnmounted(() => {
             @click="openConversation(conv.id)"
           >
             <span class="history-title">
-              <span v-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
+              <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" title="正在生成" />
+              <span v-else-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
               {{ conv.title }}
             </span>
             <span class="history-meta">{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
-            <button class="history-delete" title="删除" @click="deleteConversation(conv.id, $event)">
+            <button class="history-delete" title="删除" :disabled="generatingConvIds.has(conv.id)" @click="deleteConversation(conv.id, $event)">
               <Icon icon="fluent:delete-24-regular" width="13" height="13" />
             </button>
           </div>
@@ -2711,11 +2935,12 @@ onUnmounted(() => {
                 @click="openConversation(conv.id)"
               >
                 <span class="history-title">
-                  <span v-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
+                  <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" title="正在生成" />
+                  <span v-else-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
                   {{ conv.title }}
                 </span>
                 <span class="history-meta">{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
-                <button class="history-delete" title="删除" @click="deleteConversation(conv.id, $event)">
+                <button class="history-delete" title="删除" :disabled="generatingConvIds.has(conv.id)" @click="deleteConversation(conv.id, $event)">
                   <Icon icon="fluent:delete-24-regular" width="13" height="13" />
                 </button>
               </div>
@@ -3379,14 +3604,9 @@ onUnmounted(() => {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent);
-  animation: live-pulse 1.15s infinite;
+  background: var(--status-generating);
+  animation: conv-breathe 1.5s ease-in-out infinite;
   flex-shrink: 0;
-}
-@keyframes live-pulse {
-  70% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--accent) 0%, transparent); }
-  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
 }
 .mini-action {
   width: 25px;
@@ -4034,21 +4254,35 @@ onUnmounted(() => {
   word-break: break-word;
 }
 
-/* Marks the one conversation whose prompt cache is being kept warm. */
+/* Green while generating, blue while the idle conversation's cache is warm. */
+.conv-pulse,
 .conv-cache-dot {
   display: inline-block;
   width: 6px;
   height: 6px;
   margin-right: 5px;
   border-radius: 50%;
-  background: #22c55e;
   vertical-align: middle;
   flex-shrink: 0;
+}
+.conv-pulse {
+  background: var(--status-generating);
+  animation: conv-breathe 1.5s ease-in-out infinite;
+}
+@keyframes conv-breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--status-generating) 55%, transparent); }
+  50% { opacity: 0.45; box-shadow: 0 0 0 4px transparent; }
+}
+.conv-cache-dot {
+  background: var(--status-cache-warm);
   animation: conv-cache-breathe 2.4s ease-in-out infinite;
 }
 @keyframes conv-cache-breathe {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
-  50% { opacity: 0.4; box-shadow: 0 0 0 4px rgba(34, 197, 94, 0); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--status-cache-warm) 45%, transparent); }
+  50% { opacity: 0.4; box-shadow: 0 0 0 4px transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .conv-pulse, .conv-cache-dot, .live-dot { animation: none; }
 }
 .agent-step-server {
   flex-shrink: 0;
@@ -4213,6 +4447,7 @@ onUnmounted(() => {
 }
 .history-item:hover .history-delete { opacity: 1; }
 .history-delete:hover { color: #ff3b30; background: color-mix(in srgb, #ff3b30 9%, transparent); }
+.history-delete:disabled { opacity: 0.35; cursor: default; }
 .history-empty {
   padding: 28px 8px;
   text-align: center;

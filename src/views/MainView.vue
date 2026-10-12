@@ -619,6 +619,7 @@ let unlistenDragDrop: (() => void) | null = null
 let unlistenOpenPaper: UnlistenFn | null = null
 let unlistenLibraryPaperAdded: UnlistenFn | null = null
 let unlistenRagSettingsChanged: UnlistenFn | null = null
+let unlistenHighlightsAdded: UnlistenFn | null = null
 let mainFocusRetryTimer: number | null = null
 
 async function focusMainWindowNow() {
@@ -674,6 +675,10 @@ onMounted(async () => {
     // import so they end up with equivalent metadata coverage.
     const slug = event.payload?.slug
     if (slug) importStore.processAddedPaper(slug, event.payload?.title)
+  })
+
+  unlistenHighlightsAdded = await listen<{ root: string; slug: string; highlights: import('../types').Highlight[] }>('paper-highlights-added', ({ payload }) => {
+    if (payload.root === libraryStore.currentPath) readerStore.mergeAddedHighlights(payload.slug, payload.highlights)
   })
 
   // RAG settings can be saved from another window (the embedding map opens its
@@ -761,6 +766,7 @@ onUnmounted(() => {
   unlistenDragDrop?.()
   unlistenLibraryPaperAdded?.()
   unlistenRagSettingsChanged?.()
+  unlistenHighlightsAdded?.()
 })
 
 // ── Resizable columns ─────────────────────────────────────────────────────────

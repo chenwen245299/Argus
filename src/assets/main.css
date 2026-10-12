@@ -52,6 +52,9 @@
   --accent-hover:   #0063d1;
   --accent-light:   rgba(0, 122, 255, 0.10);
 
+  --status-generating: #22c55e;
+  --status-cache-warm: #3b82f6;
+
   --input-bg: rgba(0, 0, 0, 0.07);
 
   /* Flat accent — no gradients or inner shadows */

@@ -2,6 +2,7 @@
 import { onMounted, onBeforeUnmount, ref, nextTick, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import type VditorType from 'vditor'
+import { installNoteClipboard } from '../utils/noteClipboard'
 
 const props = defineProps<{
   initialContent: string
@@ -14,6 +15,7 @@ const emit = defineEmits<{ change: [markdown: string] }>()
 const containerEl = ref<HTMLDivElement | null>(null)
 let vd: VditorType | null = null
 let destroyed = false
+let removeClipboardHandlers: (() => void) | null = null
 
 function normalizeDisplayMathDelimiters(markdown: string) {
   const blocks: string[] = []
@@ -117,6 +119,8 @@ onMounted(async () => {
       },
     },
     after() {
+      if (destroyed || !containerEl.value) return
+      removeClipboardHandlers = installNoteClipboard(containerEl.value)
       requestAnimationFrame(() => {
         if (content && vd?.getValue().trim() === '') {
           vd.setValue(content, true)
@@ -131,6 +135,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   destroyed = true
+  removeClipboardHandlers?.()
   vd?.destroy()
   vd = null
   clearHighlights()

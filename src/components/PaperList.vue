@@ -1524,7 +1524,7 @@ async function deleteBatch() {
         >
           <Icon v-if="exportBusy" icon="fluent:spinner-ios-20-filled" width="14" height="14" class="spin" />
           <Icon v-else-if="exportDone" icon="fluent:checkmark-24-regular" width="14" height="14" />
-          <Icon v-else icon="fluent:arrow-download-24-regular" width="14" height="14" />
+          <Icon v-else icon="fluent:arrow-export-24-regular" width="14" height="14" />
         </button>
         <button
           class="col-picker-btn"

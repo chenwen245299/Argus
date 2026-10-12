@@ -100,6 +100,62 @@ pub fn render_pdf_page_png(pdf_path: &Path, page: u32, dpi: u32) -> Result<Vec<u
 
 // ── PDFium (bundled, the normal path) ─────────────────────────────────────────
 
+/// Character boxes in the reader's scale-1, top-left viewport coordinates.
+/// PDFium's PageToDevice applies crop origins and intrinsic rotation, matching
+/// the displayed PDF rather than assuming an unrotated MediaBox at (0, 0).
+/// PDFium ignores UserUnit; the caller reads it once per document and supplies
+/// it here to match pdf.js's viewport (which includes UserUnit).
+pub fn page_text_geometry(pdf_path: &Path, page: u32, user_unit: f32) -> Result<Vec<(char, Option<crate::models::Rect>)>, String> {
+    let index = page.checked_sub(1).and_then(|n| u16::try_from(n).ok())
+        .ok_or_else(|| "Use a valid 1-based PDF page index.".to_string())?;
+    let path = pdf_path.to_path_buf();
+    run_on_pdfium(move |pdfium, cache| {
+        let key = DocKey::of(&path)?;
+        let (result, _) = cache.with_doc(pdfium, &key, |doc| {
+            let page = doc.pages().get(index).map_err(|e| format!("PDF page not found: {e}"))?;
+            let text = page.text().map_err(|e| format!("PDF text unavailable: {e}"))?;
+            // Work at 8× to preserve sub-point precision (PageToDevice rounds
+            // to integer pixels). No bitmap is allocated.
+            let precision = 8.0;
+            let config = PdfRenderConfig::new().set_target_size(
+                (page.width().value * precision).round() as i32,
+                (page.height().value * precision).round() as i32,
+            );
+            let mut glyphs = Vec::new();
+            for c in text.chars().iter() {
+                let Some(ch) = c.unicode_char() else { continue };
+                let rect = c.loose_bounds().ok().and_then(|b| {
+                    let (x1, y1) = page.points_to_pixels(b.left(), b.top(), &config).ok()?;
+                    let (x2, y2) = page.points_to_pixels(b.right(), b.bottom(), &config).ok()?;
+                    let rect = crate::models::Rect {
+                        x: x1.min(x2) as f32 / precision * user_unit,
+                        y: y1.min(y2) as f32 / precision * user_unit,
+                        width: (x2 - x1).abs() as f32 / precision * user_unit,
+                        height: (y2 - y1).abs() as f32 / precision * user_unit,
+                    };
+                    (rect.width > 0.0 && rect.height > 0.0).then_some(rect)
+                });
+                glyphs.push((ch, rect));
+            }
+            Ok::<_, String>(glyphs)
+        })?;
+        result
+    })?
+}
+
+pub fn pdf_page_units(path: &Path) -> Result<std::collections::HashMap<u32, f32>, String> {
+    let doc = lopdf::Document::load(path).map_err(|e| format!("Cannot validate PDF page units: {e}"))?;
+    doc.get_pages().into_iter().map(|(page, id)| {
+        let dict = doc.get_dictionary(id).map_err(|e| e.to_string())?;
+        let unit = match dict.get(b"UserUnit") {
+            Ok(value) => doc.dereference(value).map_err(|e| e.to_string())?.1.as_float().map_err(|e| e.to_string())?,
+            Err(_) => 1.0,
+        };
+        if !unit.is_finite() || unit <= 0.0 || unit > 75_000.0 { return Err("Invalid PDF UserUnit.".into()); }
+        Ok((page, unit))
+    }).collect()
+}
+
 /// Candidate locations for the bundled PDFium dynamic library, most specific
 /// first. Resolved from the running executable so it works from both the
 /// packaged app and the MCP subprocess (same binary), with a dev copy under
@@ -424,6 +480,13 @@ struct DocKey {
     identity: Option<FileIdentity>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PdfRevision(DocKey);
+
+pub(crate) fn pdf_revision(path: &Path) -> Result<PdfRevision, String> {
+    DocKey::of(path).map(PdfRevision)
+}
+
 /// Device, inode, and change time (seconds, nanoseconds).
 type FileIdentity = (u64, u64, i64, i64);
 
@@ -667,6 +730,26 @@ fn render_with_pdftoppm(pdf_path: &Path, page: u32, size_args: &[String]) -> Res
 }
 
 #[cfg(test)]
+pub(crate) fn annotation_fixture(path: &Path, text: &str, rotation: i64, unit: f32, crop: bool) {
+    use lopdf::{dictionary, Document, Object, Stream};
+    let mut doc = Document::with_version("1.7");
+    let pages = doc.new_object_id();
+    let font = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+    let content = doc.add_object(Stream::new(dictionary! {}, format!("BT /F1 12 Tf 100 700 Td ({text}) Tj ET").into_bytes()));
+    let mut page = dictionary! {
+        "Type" => "Page", "Parent" => pages, "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
+        "Resources" => dictionary! {"Font" => dictionary! {"F1" => font}}, "Contents" => content,
+        "Rotate" => rotation, "UserUnit" => Object::Real(unit),
+    };
+    if crop { page.set("CropBox", vec![20.into(), 30.into(), 580.into(), 770.into()]); }
+    let page_id = doc.add_object(page);
+    doc.objects.insert(pages, dictionary! {"Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1}.into());
+    let catalog = doc.add_object(dictionary! {"Type" => "Catalog", "Pages" => pages});
+    doc.trailer.set("Root", catalog);
+    doc.save(path).unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
@@ -679,6 +762,32 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("argus-render-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn annotation_boxes_follow_crop_rotation_and_user_unit() {
+        let dir = scratch_dir();
+        let path = dir.join("geometry.pdf");
+        for rotation in [0, 90, 180, 270] {
+            for unit in [1.0, 2.0] {
+                annotation_fixture(&path, "Alpha beta", rotation, unit, true);
+                let units = pdf_page_units(&path).unwrap();
+                assert_eq!(units[&1], unit);
+                let glyphs = page_text_geometry(&path, 1, units[&1]).unwrap();
+                assert!(glyphs.iter().map(|(c, _)| c).collect::<String>().contains("Alpha beta"));
+                let r = glyphs.iter().find(|(c, _)| *c == 'A').unwrap().1.as_ref().unwrap();
+                let expected = match rotation {
+                    0 => (80.0, 58.0), 90 => (666.0, 80.0),
+                    180 => (470.0, 666.0), _ => (58.0, 470.0),
+                };
+                assert!((r.x - expected.0 * unit).abs() < 6.0 * unit
+                    && (r.y - expected.1 * unit).abs() < 6.0 * unit,
+                    "rotation={rotation} unit={unit} got={r:?} expected={expected:?}");
+            }
+        }
+        assert!(page_text_geometry(&path, 0, 1.0).is_err());
+        assert!(page_text_geometry(&path, 2, 1.0).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Write a PDF with one blank page per entry of `sizes` (in points).

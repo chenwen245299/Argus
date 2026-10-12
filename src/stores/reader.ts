@@ -505,6 +505,19 @@ export const useReaderStore = defineStore('reader', () => {
     highlightsBySlug.value = { ...highlightsBySlug.value, [slug]: hl }
   }
 
+  function mergeAddedHighlights(slug: string, incoming: Highlight[]) {
+    if (!tabs.value.some(t => t.slug === slug)) return
+    const deleted = new Set((highlightTombstones.value[slug] ?? []).map(t => t.id))
+    const merged = new Map((highlightsBySlug.value[slug] ?? []).map(h => [h.id, h]))
+    for (const h of incoming) {
+      const local = merged.get(h.id)
+      if (!deleted.has(h.id) && (!local || (h.updated_at ?? h.created_at) > (local.updated_at ?? local.created_at))) {
+        merged.set(h.id, h)
+      }
+    }
+    setHighlights(slug, [...merged.values()])
+  }
+
   function setReadingState(slug: string, rs: ReadingState | null) {
     readingStateBySlug.value = { ...readingStateBySlug.value, [slug]: rs }
   }
@@ -683,5 +696,6 @@ export const useReaderStore = defineStore('reader', () => {
     jumpToHighlight,
     persistReadingState,
     reloadFromDisk,
+    mergeAddedHighlights,
   }
 })

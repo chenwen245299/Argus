@@ -2580,7 +2580,7 @@ onUnmounted(() => {
           >
             <div class="conv-body">
               <div class="conv-title-text">
-                <span v-if="isGenerating(conv.id)" class="conv-pulse" title="正在后台生成" />
+                <span v-if="isGenerating(conv.id)" class="conv-pulse" title="正在生成" />
                 <!-- Only when idle: a conversation that is generating obviously
                      still has a live context, and two dots would say the same
                      thing twice. -->
@@ -3551,13 +3551,13 @@ onUnmounted(() => {
   height: 6px;
   margin-right: 5px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--status-generating);
   vertical-align: middle;
   animation: conv-breathe 1.5s ease-in-out infinite;
 }
 @keyframes conv-breathe {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
-  50% { opacity: 0.45; box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--status-generating) 55%, transparent); }
+  50% { opacity: 0.45; box-shadow: 0 0 0 4px transparent; }
 }
 
 .conv-item:hover { background: var(--bg-hover); }
@@ -5186,23 +5186,21 @@ onUnmounted(() => {
 }
 .agent-rounds:hover { background: var(--bg-hover); color: var(--text-primary); }
 
-/* The conversation-list counterpart of the breathing keepalive dot, so the user can see which conversation
-   is being held warm without opening it. Green rather than the accent: this is
-   "ready", not "working". */
+/* The conversation-list counterpart of the blue keepalive dot. */
 .conv-cache-dot {
   display: inline-block;
   width: 6px;
   height: 6px;
   margin-right: 5px;
   border-radius: 50%;
-  background: #22c55e;
+  background: var(--status-cache-warm);
   vertical-align: middle;
   flex-shrink: 0;
   animation: conv-cache-breathe 2.4s ease-in-out infinite;
 }
 @keyframes conv-cache-breathe {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
-  50% { opacity: 0.4; box-shadow: 0 0 0 4px rgba(34, 197, 94, 0); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--status-cache-warm) 45%, transparent); }
+  50% { opacity: 0.4; box-shadow: 0 0 0 4px transparent; }
 }
 .agent-rounds-label { color: var(--text-tertiary); white-space: nowrap; }
 .agent-rounds:hover .agent-rounds-label { color: var(--text-primary); }
@@ -5250,18 +5248,18 @@ onUnmounted(() => {
   background: var(--text-tertiary);
   flex-shrink: 0;
 }
-/* Breathes on the tool-settings button while this conversation's prompt cache
-   is being held open, in place of the button's icon. Only rendered while warm,
-   so it carries the accent itself. Slower than the agent's working pulse: this
-   is idle upkeep, not work in flight. */
+/* The same blue cache state on the tool-settings button. */
 .ks-dot.warm {
-  background: var(--accent);
+  background: var(--status-cache-warm);
   margin: 0 3px;
   animation: ks-dot-breathe 2.4s ease-in-out infinite;
 }
 @keyframes ks-dot-breathe {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
-  50% { opacity: 0.35; box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--status-cache-warm) 45%, transparent); }
+  50% { opacity: 0.35; box-shadow: 0 0 0 4px transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .conv-pulse, .conv-cache-dot, .ks-dot.warm { animation: none; }
 }
 
 /* ── Reasoning / thinking-mode picker (flat toolbar button + popover) ──────── */

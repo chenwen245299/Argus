@@ -9,6 +9,7 @@ import { useSelectionStore } from './selection'
 import { useCollectionsStore } from './collections'
 import { useRanksStore } from './ranks'
 import { useSettingsStore } from './settings'
+import { i18n } from '../i18n'
 
 /** A paper already in the library that matches the one being imported. */
 interface DuplicateHit { existingSlug: string; title: string }
@@ -61,8 +62,12 @@ export const useImportStore = defineStore('import', () => {
     jobs.value = jobs.value.filter(j => j.slug !== slug && j.id !== slug)
   }
 
+  function keepDuplicate(dup: DuplicateHit): boolean {
+    return window.confirm(i18n.global.t('import.duplicateConfirm', { title: dup.title }))
+  }
+
   /**
-   * A duplicate stops the import outright. Whatever was already written for the
+   * Only a user-declined duplicate is removed. Whatever was already written for the
    * half-imported paper — its folder, search-index entry, vector chunks and
    * collection membership — is removed by `delete_paper`, so a rejected import
    * leaves nothing behind, and the user is told which paper it matched.
@@ -105,7 +110,7 @@ export const useImportStore = defineStore('import', () => {
     const selection = useSelectionStore()
     const collections = useCollectionsStore()
 
-    const jobId = `ebook_${Date.now()}`
+    const jobId = `ebook_${crypto.randomUUID()}`
     _addJob(jobId, filename)
     try {
       const finalSlug = await invoke<string>('import_ebook', { sourcePath, collectionId })
@@ -113,7 +118,7 @@ export const useImportStore = defineStore('import', () => {
       // The ebook's metadata is embedded, so it's known right after import — check
       // for a duplicate before keeping it.
       const dup = await invoke<DuplicateHit | null>('find_duplicate_paper', { slug: finalSlug })
-      if (dup) {
+      if (dup && !keepDuplicate(dup)) {
         await _abortAsDuplicate(finalSlug, filename, dup)
         return
       }
@@ -256,13 +261,13 @@ export const useImportStore = defineStore('import', () => {
     // 1.5 Duplicate check, now that the title and authors are known: this is the
     //     first point where a local PDF can be matched against the library at
     //     all, and it also catches URL imports whose scraped title was wrong and
-    //     only came out right after AI extraction. A hit stops the import and
-    //     discards the paper — see `_abortAsDuplicate`.
+    //     only came out right after AI extraction. The user can keep an
+    //     independent copy or skip it — see `_abortAsDuplicate`.
     if (checkDuplicate) {
       const source = jobs.value.find(j => j.slug === cur)?.filename ?? cur
       try {
         const dup = await invoke<DuplicateHit | null>('find_duplicate_paper', { slug: cur })
-        if (dup) {
+        if (dup && !keepDuplicate(dup)) {
           await _abortAsDuplicate(cur, source, dup)
           return
         }
@@ -323,7 +328,7 @@ export const useImportStore = defineStore('import', () => {
     const selection = useSelectionStore()
     const collections = useCollectionsStore()
 
-    const jobId = `url_${Date.now()}`
+    const jobId = `url_${crypto.randomUUID()}`
     const job: ImportJob = {
       id: jobId,
       slug: jobId,
@@ -361,18 +366,25 @@ export const useImportStore = defineStore('import', () => {
         collectionId,
       })
 
-      // Duplicate: stop. Metadata is known backend-side (title/DOI/arXiv id) and
-      // nothing was written yet, so there is no folder to clean up here.
+      // The backend has not written a duplicate yet. Retry with force only
+      // after the user opts into a new, independent copy.
+      let acceptedDuplicate = false
       if (res.status === 'duplicate') {
-        _removeJob(jobId)
-        lastDuplicate.value = {
-          title: res.title ?? url.trim(),
-          existingSlug: res.existingSlug ?? '',
-          source: url.trim(),
+        if (keepDuplicate({ title: res.title ?? url.trim(), existingSlug: res.existingSlug ?? '' })) {
+          acceptedDuplicate = true
+          res = await invoke<ImportOutcome>('import_paper_url', { url: url.trim(), collectionId, force: true })
+          if (res.status !== 'imported' || !res.slug) throw new Error('Duplicate import did not create a separate paper')
+        } else {
+          _removeJob(jobId)
+          lastDuplicate.value = {
+            title: res.title ?? url.trim(),
+            existingSlug: res.existingSlug ?? '',
+            source: url.trim(),
+          }
+          await library.refresh()
+          if (res.existingSlug) selection.selectPaper(res.existingSlug)
+          return
         }
-        await library.refresh()
-        if (res.existingSlug) selection.selectPaper(res.existingSlug)
-        return
       }
 
       const finalSlug = res.slug ?? jobId
@@ -393,9 +405,9 @@ export const useImportStore = defineStore('import', () => {
       // Run the full metadata pipeline in the background — the same AI-metadata
       // extraction plus Semantic Scholar / easyScholar enrichment as a local PDF
       // import, so link imports end up with identical metadata coverage. The
-      // duplicate check runs again there: the backend matched on the scraped
-      // title, which AI extraction may correct into a title that does match.
-      enqueueMetadata(finalSlug, true)
+      // duplicate check runs again unless the user already accepted a copy:
+      // AI extraction may correct a scraped title into one that does match.
+      enqueueMetadata(finalSlug, !acceptedDuplicate)
     } catch (e) {
       const j = jobs.value.find(j => j.id === jobId)
       if (j) {

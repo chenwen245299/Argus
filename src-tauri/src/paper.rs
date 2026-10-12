@@ -65,6 +65,45 @@ pub fn list_paper_dirs(root: &str) -> Result<Vec<(String, PathBuf)>, String> {
     Ok(out)
 }
 
+/// Slugs are library-wide identities, including papers inside collections.
+/// Reserve before downloading/writing; two concurrent imports must never share
+/// a directory, even before either has written its meta.json.
+pub(crate) fn namespace_lock(root: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<LockMap> = std::sync::OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    locks.entry(root.to_string()).or_default().clone()
+}
+
+pub(crate) fn free_slug(root: &str, base: &str, parent: &Path) -> Result<String, String> {
+    validate_slug(base)?;
+    let occupied: std::collections::HashSet<String> = list_paper_dirs(root)?
+        .into_iter().map(|(slug, _)| slug).collect();
+    for n in 1..=10_000 {
+        let slug = if n == 1 { base.to_string() } else { format!("{base}-{n}") };
+        if !occupied.contains(&slug) && !parent.join(&slug).exists() {
+            return Ok(slug);
+        }
+    }
+    Ok(format!("{base}-{}", uuid::Uuid::new_v4()))
+}
+
+pub fn reserve_paper_dir(root: &str, base: &str) -> Result<PathBuf, String> {
+    let lock = namespace_lock(root);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let parent = papers_dir(root);
+    std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+    let slug = free_slug(root, base, &parent)?;
+    let dir = parent.join(slug);
+    std::fs::create_dir(&dir).map_err(|e| format!("Reserve paper directory: {e}"))?;
+    Ok(dir)
+}
+
+pub async fn reserve_import_dir(root: &str, base: &str) -> Result<PathBuf, String> {
+    let (root, base) = (root.to_string(), base.to_string());
+    tauri::async_runtime::spawn_blocking(move || reserve_paper_dir(&root, &base))
+        .await.map_err(|e| format!("Reserve paper task: {e}"))?
+}
+
 fn collect_paper_dirs(dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("Read {}: {e}", dir.display()))?;
 
@@ -556,6 +595,29 @@ pub fn save_highlights_merged(
     atomic_write(&highlights_path(root, slug), &content)
 }
 
+/// Append a validated agent batch without replacing user edits or tombstones.
+/// Retrying an identical tool call reuses the existing records.
+pub fn append_highlights(root: &str, slug: &str, incoming: Vec<Highlight>) -> Result<Vec<Highlight>, String> {
+    validate_slug(slug)?;
+    let lock = highlights_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut disk = read_highlights_doc(root, slug);
+    let mut result = Vec::new();
+    for h in incoming {
+        if let Some(existing) = disk.highlights.iter().find(|e| e.page == h.page && e.text == h.text
+            && e.color == h.color && e.style == h.style && e.note == h.note) {
+            result.push(existing.clone());
+        } else {
+            result.push(h.clone());
+            disk.highlights.push(h);
+        }
+    }
+    let merged = merge_highlights(disk, Vec::new(), Vec::new());
+    let content = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
+    atomic_write(&highlights_path(root, slug), &content)?;
+    Ok(result)
+}
+
 type LockMap = std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>;
 
 fn highlights_lock(root: &str, slug: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
@@ -566,6 +628,94 @@ fn highlights_lock(root: &str, slug: &str) -> std::sync::Arc<std::sync::Mutex<()
     map.entry(key)
         .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
         .clone()
+}
+
+#[cfg(test)]
+mod duplicate_import_tests {
+    use super::*;
+    struct Library(String);
+    impl Library {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("argus-duplicate-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join(".argus")).unwrap();
+            Self(root.to_string_lossy().into())
+        }
+        fn seed(&self, base: &str) -> String {
+            let dir = reserve_paper_dir(&self.0, base).unwrap();
+            let slug = dir.file_name().unwrap().to_string_lossy().to_string();
+            let meta: PaperMeta = serde_json::from_value(serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(), "title": "Same Paper", "authors": ["Alice"],
+                "doi": "10.1000/same", "arxiv_id": "2401.12345", "year": 2024,
+                "added_at": "2026-01-01", "reading_status": "unread",
+            })).unwrap();
+            write_meta(&self.0, &slug, &meta).unwrap();
+            ensure_paper_files(&self.0, &slug);
+            std::fs::write(dir.join("paper.pdf"), b"independent original PDF").unwrap();
+            slug
+        }
+    }
+    impl Drop for Library { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+    #[test]
+    fn duplicate_copies_stay_independent_inside_different_collections() {
+        let lib = Library::new();
+        let original = lib.seed("same");
+        let original_meta = read_meta(&lib.0, &original).unwrap();
+        let parent = crate::collections::create_collection(&lib.0, "Library".into(), None).unwrap();
+        let col = crate::collections::create_collection(&lib.0, "Originals".into(), Some(parent.id)).unwrap();
+        crate::collections::move_paper_to_collection(&lib.0, &original_meta.id, &col.id).unwrap();
+        let original_path = paper_dir(&lib.0, &original);
+        let meta_before = std::fs::read(original_path.join("meta.json")).unwrap();
+        let note = create_note_with(&lib.0, &original, "Notes", "original note").unwrap();
+        let highlights_before = std::fs::read(original_path.join("highlights.json")).unwrap();
+        crate::copilot::write_paper_ai_conversations(&lib.0, &original, &serde_json::json!([
+            {"id":"original-chat", "nodes":[], "updatedAt":"2026-01-01"}
+        ]), &serde_json::json!([])).unwrap();
+        let chat_before = std::fs::read(original_path.join("ai_conversations.json")).unwrap();
+
+        // Original lives in a collection, so checking only papers/same would miss it.
+        let copy = lib.seed("same");
+        assert_eq!(copy, "same-2");
+        let copy_meta = read_meta(&lib.0, &copy).unwrap();
+        assert_ne!(original_meta.id, copy_meta.id);
+        let canonical = crate::metadata::rename_folder(&lib.0, &original).unwrap();
+        let copy = crate::metadata::rename_folder(&lib.0, &copy).unwrap();
+        assert_ne!(canonical, copy);
+        assert_eq!(crate::metadata::rename_folder(&lib.0, &copy).unwrap(), copy, "copy slug stays stable");
+        create_note_with(&lib.0, &copy, "Notes", "copy note").unwrap();
+        write_reading_state(&lib.0, &copy, &ReadingState { page: 5, ..Default::default() }).unwrap();
+        crate::copilot::write_paper_ai_conversations(&lib.0, &copy, &serde_json::json!([
+            {"id":"copy-chat", "nodes":[], "updatedAt":"2026-01-02"}
+        ]), &serde_json::json!([])).unwrap();
+        let h: Highlight = serde_json::from_value(serde_json::json!({
+            "id":"copy-highlight", "page":1, "rects":[], "text":"Same text", "color":"#FFEB3B", "note":"Copy only", "created_at":"2026-01-02"
+        })).unwrap();
+        append_highlights(&lib.0, &copy, vec![h]).unwrap();
+        let path = paper_dir(&lib.0, &canonical);
+        assert_eq!(std::fs::read(path.join("meta.json")).unwrap(), meta_before);
+        assert_eq!(std::fs::read(path.join("highlights.json")).unwrap(), highlights_before);
+        assert_eq!(std::fs::read(path.join("ai_conversations.json")).unwrap(), chat_before);
+        assert_eq!(get_note(&lib.0, &canonical, &note.id), "original note");
+        assert!(read_reading_state(&lib.0, &canonical).is_none());
+        assert_eq!(read_highlights(&lib.0, &copy).len(), 1);
+        crate::collections::purge_paper(&lib.0, &copy_meta.id).unwrap();
+        std::fs::remove_dir_all(paper_dir(&lib.0, &copy)).unwrap();
+        assert_eq!(std::fs::read(crate::metadata::find_pdf_in_dir(&lib.0, &canonical)).unwrap(), b"independent original PDF");
+        assert_eq!(crate::collections::list_papers_in_collection(&lib.0, &col.id).unwrap().into_iter()
+            .map(|p| p.id).collect::<Vec<_>>(), vec![original_meta.id]);
+    }
+
+    #[test]
+    fn concurrent_import_reservations_never_share_an_unfinished_directory() {
+        let lib = Library::new();
+        let handles: Vec<_> = (0..8).map(|_| {
+            let root = lib.0.clone();
+            std::thread::spawn(move || reserve_paper_dir(&root, "same").unwrap())
+        }).collect();
+        let paths: std::collections::HashSet<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(paths.len(), 8);
+        assert!(paths.iter().all(|p| p.is_dir()));
+    }
 }
 
 #[cfg(test)]

@@ -27,24 +27,24 @@ const { t } = useI18n()
 <template>
   <div class="write-confirm">
     <div class="wc-head">
-      <Icon class="wc-icon" icon="doodle:notebook" width="20" height="20" />
-      <span class="wc-title">{{ t('writeConfirm.title') }}</span>
+      <Icon class="wc-icon" :icon="preview.passages?.length ? 'fluent:highlight-24-regular' : 'doodle:notebook'" width="20" height="20" />
+      <span class="wc-title">{{ t(preview.passages?.length ? 'writeConfirm.markTitle' : 'writeConfirm.title') }}</span>
       <span v-if="props.queued" class="wc-queued">{{ t('writeConfirm.queued', { n: props.queued }) }}</span>
     </div>
 
     <dl class="wc-fields">
       <div class="wc-field">
         <dt>{{ t('writeConfirm.paper') }}</dt>
-        <dd :title="preview.paperTitle">{{ preview.paperTitle }}</dd>
+        <dd :title="preview.slug">{{ preview.paperTitle }}</dd>
       </div>
-      <div class="wc-field">
+      <div v-if="!preview.passages?.length" class="wc-field">
         <dt>{{ t('writeConfirm.noteTitle') }}</dt>
         <dd :title="preview.noteTitle">{{ preview.noteTitle }}</dd>
       </div>
       <div class="wc-field">
         <dt>{{ t('writeConfirm.location') }}</dt>
         <dd class="wc-location">
-          {{ t('writeConfirm.locationValue', { paper: preview.paperTitle }) }}
+          {{ preview.passages?.length ? preview.slug : t('writeConfirm.locationValue', { paper: preview.paperTitle }) }}
         </dd>
       </div>
     </dl>
@@ -55,7 +55,14 @@ const { t } = useI18n()
     </p>
 
     <!-- Read-only preview of the note body, capped at roughly ten lines. -->
-    <div class="wc-body">
+    <div v-if="preview.passages?.length" class="wc-body">
+      <div v-for="(passage, index) in preview.passages" :key="index" class="wc-passage">
+        <div class="wc-page">{{ t('writeConfirm.page', { n: passage.page }) }} · {{ t(passage.style === 'underline' ? 'writeConfirm.underline' : 'writeConfirm.highlight') }}</div>
+        <blockquote :style="{ borderColor: passage.color }">{{ passage.text }}</blockquote>
+        <MarkdownBody v-if="passage.note" :content="passage.note" />
+      </div>
+    </div>
+    <div v-else class="wc-body">
       <MarkdownBody :content="preview.content" />
     </div>
 
@@ -144,6 +151,9 @@ const { t } = useI18n()
 .wc-body :deep(ul), .wc-body :deep(ol) { margin: 6px 0; padding-left: 20px; }
 .wc-body :deep(pre) { font-size: 11.5px; overflow-x: auto; }
 .wc-body :deep(img) { max-width: 100%; }
+.wc-passage + .wc-passage { border-top: 1px solid var(--border-subtle); margin-top: 10px; padding-top: 10px; }
+.wc-page { color: var(--text-tertiary); font-size: 11px; }
+.wc-passage blockquote { border-left: 4px solid; padding: 3px 9px; margin: 5px 0; white-space: pre-wrap; }
 
 .wc-actions { display: flex; align-items: center; gap: 8px; }
 .wc-hint { flex: 1; min-width: 0; font-size: 11px; color: var(--text-tertiary); }

@@ -107,15 +107,13 @@ mod pdf_url {
 
         let title = title_from_url(url);
         let slug_base = super::build_slug(&[], None, &title);
-        let papers_dir = Path::new(root).join("papers");
-        let final_dir = crate::arxiv::unique_paper_dir(&papers_dir, &slug_base);
+        let final_dir = paper::reserve_import_dir(root, &slug_base).await?;
         let final_slug = final_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&slug_base)
             .to_string();
 
-        std::fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir: {e}"))?;
         std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
             .map_err(|e| format!("write PDF: {e}"))?;
 
@@ -506,15 +504,13 @@ mod acl {
         emit("importing");
 
         let slug_base = super::build_slug(&meta.authors, meta.year, &meta.title);
-        let papers_dir = Path::new(root).join("papers");
-        let final_dir = crate::arxiv::unique_paper_dir(&papers_dir, &slug_base);
+        let final_dir = paper::reserve_import_dir(root, &slug_base).await?;
         let final_slug = final_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&slug_base)
             .to_string();
 
-        std::fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir: {e}"))?;
         std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
             .map_err(|e| format!("write PDF: {e}"))?;
 
@@ -748,15 +744,13 @@ mod aaai {
         emit("importing");
 
         let slug_base = super::build_slug(&meta.authors, meta.year, &meta.title);
-        let papers_dir = Path::new(root).join("papers");
-        let final_dir = crate::arxiv::unique_paper_dir(&papers_dir, &slug_base);
+        let final_dir = paper::reserve_import_dir(root, &slug_base).await?;
         let final_slug = final_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&slug_base)
             .to_string();
 
-        std::fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir: {e}"))?;
         std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
             .map_err(|e| format!("write PDF: {e}"))?;
 
@@ -1003,15 +997,13 @@ mod openreview {
         emit("importing");
 
         let slug_base = super::build_slug(&meta.authors, meta.year, &meta.title);
-        let papers_dir = Path::new(root).join("papers");
-        let final_dir = crate::arxiv::unique_paper_dir(&papers_dir, &slug_base);
+        let final_dir = paper::reserve_import_dir(root, &slug_base).await?;
         let final_slug = final_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&slug_base)
             .to_string();
 
-        std::fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir: {e}"))?;
         std::fs::write(final_dir.join("paper.pdf"), &pdf_bytes)
             .map_err(|e| format!("write PDF: {e}"))?;
 

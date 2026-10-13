@@ -2466,7 +2466,7 @@ onUnmounted(() => {
               </template>
             </span>
             <span class="model-trigger-label">{{ selectedModelLabel() }}</span>
-            <Icon class="chevron" :class="{ open: showModelMenu }" icon="fluent:chevron-down-24-regular" width="12" height="12" />
+            <Icon class="chevron" icon="fluent:chevron-down-24-regular" width="12" height="12" />
           </button>
 
           <div v-if="showModelMenu" class="model-menu">
@@ -3296,8 +3296,7 @@ onUnmounted(() => {
   font-weight: 500;
   text-align: center;
 }
-.chevron { color: var(--text-tertiary); transition: transform .16s ease; flex-shrink: 0; }
-.chevron.open { transform: rotate(180deg); }
+.chevron { color: var(--text-tertiary); flex-shrink: 0; }
 
 .icon-btn {
   width: 30px;

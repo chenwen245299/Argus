@@ -272,6 +272,10 @@ pub struct HighlightEntry {
     /// PDF: 1-based page. Ebooks: 1-based chapter index.
     pub page: u32,
     pub text: String,
+    /// Exact stored marking color, usually #RRGGBB. Preserve it when copying marks.
+    pub color: String,
+    /// Marking style: "highlight" or "underline".
+    pub style: String,
     /// The user's annotation on this highlight; empty when they only marked it.
     pub note: String,
     pub created_at: String,
@@ -1044,6 +1048,8 @@ pub fn get_highlights(root: &str, slug: &str) -> Result<Vec<HighlightEntry>, Str
                 id: g.rep.id,
                 page: g.rep.page,
                 text,
+                color: g.rep.color,
+                style: g.rep.style,
                 note: g.rep.note.unwrap_or_default(),
                 created_at: g.rep.created_at,
                 page_end: g.page_end,
@@ -2105,6 +2111,53 @@ mod tests {
         let json = serde_json::to_value(&listed).unwrap();
         assert_eq!(json[0]["page_end"], 11);
         assert!(json[1].get("page_end").is_none(), "{}", json[1]);
+    }
+
+    #[test]
+    fn get_highlights_exposes_exact_colors_and_styles_to_the_agent() {
+        use crate::highlight_groups::fixtures;
+
+        let colors = ["#FFEB3B", "#A5D6A7", "#90CAF9", "#F48FB1", "#FFCC80", "#CE93D8", "#12ab34"];
+        let mut stored = Vec::new();
+        for (i, color) in colors.iter().enumerate() {
+            let mut h = fixtures::record(&format!("hl-{i}"), 1, &format!("passage {i}"), fixtures::PAIR_CREATED_AT);
+            h.color = (*color).into();
+            h.style = if i % 2 == 0 { "highlight" } else { "underline" }.into();
+            h.note = Some(format!("annotation {i}"));
+            stored.push(h);
+        }
+        let lib = fixtures::library_with("a-paper", &stored);
+        // Exercise the actual in-app dispatch and its JSON serialization, not
+        // just the struct that also backs the external MCP response.
+        let result = super::super::agent::call(lib.root(), "get_highlights", &serde_json::json!({"slug": "a-paper"})).unwrap();
+        let items = result["items"].as_array().unwrap();
+        assert_eq!(items.len(), colors.len());
+        for (i, item) in items.iter().enumerate() {
+            assert_eq!(item["color"], colors[i]);
+            assert_eq!(item["style"], stored[i].style);
+            assert_eq!(item["note"], stored[i].note.as_deref().unwrap());
+        }
+        let after = paper::read_highlights(lib.root(), "a-paper");
+        assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(stored).unwrap(), "reading must not change stored marks");
+    }
+
+    #[test]
+    fn get_highlights_exposes_the_latest_cross_page_color_and_style() {
+        use crate::highlight_groups::fixtures;
+
+        let mut stored = fixtures::cross_page_pair(10);
+        stored[0].color = "#FFEB3B".into();
+        stored[1].color = "#90CAF9".into();
+        stored[1].style = "underline".into();
+        stored[1].updated_at = Some("2026-03-02T10:00:00.000Z".into());
+        let lib = fixtures::library_with("a-paper", &stored);
+
+        let json = serde_json::to_value(get_highlights(lib.root(), "a-paper").unwrap()).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["id"], "hl-10");
+        assert_eq!(json[0]["page_end"], 11);
+        assert_eq!(json[0]["color"], "#90CAF9");
+        assert_eq!(json[0]["style"], "underline");
     }
 
     /// A PDF selection arrives with a line break at every printed wrap. The agent

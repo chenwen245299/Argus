@@ -12,7 +12,4 @@
 <style scoped>
 .guided-reading-icon { display: block; width: 1em; height: 1em; flex-shrink: 0; }
 .book-tint { fill: currentColor; opacity: .1; }
-.ai-star { transform-origin: 21.5px 8px; transition: transform .22s ease; }
-:global(button:hover) .ai-star { transform: rotate(16deg) scale(1.12); }
-@media (prefers-reduced-motion: reduce) { .ai-star { transition: none; transform: none !important; } }
 </style>

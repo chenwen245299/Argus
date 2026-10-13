@@ -346,6 +346,13 @@ and replaces a series of filtered probes. `list_collections` reports both the
 direct `paper_count` and the deduplicated `total_paper_count` across
 descendants, along with a readable `path`.
 
+`get_highlights` returns each marking's exact stored `color` and `style`
+(`highlight` / `underline`) alongside its text, page and note, in both the
+in-app agent and external MCP. Cross-page selections retain the newest edited
+color/style through `highlight_groups`; reads never recolor or rewrite records.
+The tool description identifies the six reader palette colors, while custom
+RGB values are returned unchanged so the agent can preserve them when copying.
+
 When adding a tool: implement the read in `tools.rs` (never touch the filesystem
 in `server.rs`), mark it `read_only_hint = true`, and add its name to
 `EXPECTED_TOOLS` in `mcp/server.rs` — the test there fails otherwise, which is
@@ -1068,6 +1075,7 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
 - Themes are applied via `data-theme` (`system`, `light`, `dark`, `warm`, `forest`, `rose`, `midnight`, `aurora`, `twilight`, `ocean`, `mocha`, `pine`, `sepia`, `mint`, `sky`, `sakura`, `mist`, `peach`). When no `data-theme` is set, the dark palette follows `prefers-color-scheme: dark`. Palettes live in `src/assets/themes.css`; the marketplace metadata (names, preview colors, light/dark kind) lives in `src/utils/themes.ts` — keep the two in sync. Dark themes additionally invert PDF page colors via CSS `filter` rules in `themes.css`.
 - Common tokens: `--bg-primary`, `--bg-secondary`, `--text-primary`, `--text-secondary`, `--accent`, `--accent-hover`, `--border-subtle`, `--divider`, `--shadow-sm/md/lg`, `--radius-sm/md/lg`.
 - The design is intentionally flat: no gradients or inner shadows on accent elements.
+- Do not add decorative rotation, tilt or scaling to buttons. Keep existing glass backgrounds and floating shadows when removing motion. `GuidedReadingIcon.vue` is static; a scoped selector such as `:global(button:hover) .ai-star` compiles to a global `button:hover` rule and must not be used.
 
 ### TypeScript
 

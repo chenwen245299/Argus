@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { soclaasLogo } from '../../utils/soclaas'
 import { ref, computed, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import {
@@ -95,6 +96,9 @@ for (const [path, mod] of Object.entries(modelSvgModules)) {
 }
 
 function modelLogo(modelId = '', providerName = '', providerId = '') {
+  const provider = ai.settings.providers.find(p => p.id === providerId)
+  const nus = soclaasLogo(providerName || provider?.name, provider?.base_url, provider?.kind)
+  if (nus) return nus
   const haystack = `${modelId} ${providerName} ${providerId}`.toLowerCase()
   if (haystack.includes('deepseek')) return modelIconMap.deepseek
   if (haystack.includes('claude') || haystack.includes('anthropic')) return modelIconMap.claude

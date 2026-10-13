@@ -21,6 +21,9 @@
 //! same value — [`PendingWrite::execute`] never looks at the model's arguments
 //! again. What the dialog showed is therefore what lands on disk, even if the
 //! model's arguments were odd, ambiguous, or re-sent differently later.
+//! The only editable fields in a marking preview are the colors: choices from
+//! the user's approval are validated and applied to the captured passages;
+//! paper identity, excerpts, comments, pages and geometry cannot be changed.
 
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +94,25 @@ pub struct Passage {
 fn default_color() -> String { "#FFEB3B".into() }
 fn default_style() -> String { "highlight".into() }
 
+/// Named colors match the reader palette; custom RGB colors remain supported.
+pub fn normalize_mark_color(color: &str) -> Result<String, String> {
+    let color = color.trim().to_lowercase();
+    let named = match color.as_str() {
+        "yellow" | "黄色" => Some("#FFEB3B"),
+        "green" | "绿色" => Some("#A5D6A7"),
+        "blue" | "蓝色" => Some("#90CAF9"),
+        "pink" | "粉色" => Some("#F48FB1"),
+        "orange" | "橙色" => Some("#FFCC80"),
+        "purple" | "紫色" => Some("#CE93D8"),
+        _ => None,
+    };
+    if let Some(hex) = named { return Ok(hex.into()); }
+    if color.len() == 7 && color.starts_with('#') && color[1..].bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(color.to_ascii_uppercase());
+    }
+    Err("`color` must be yellow, green, blue, pink, orange, purple, or #RRGGBB.".into())
+}
+
 /// What the confirmation dialog renders.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,8 +142,22 @@ impl PendingWrite {
         match name {
             CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL => {
                 let slug = str_arg(args, "slug")?;
-                let passages: Vec<Passage> = serde_json::from_value(args.get("passages").cloned()
-                    .ok_or("`passages` is required.")?).map_err(|e| format!("Invalid passages: {e}"))?;
+                let batch_color = match args.get("color") {
+                    Some(value) => normalize_mark_color(value.as_str().ok_or("`color` must be a string.")?)?,
+                    None => default_color(),
+                };
+                let mut raw_passages = args.get("passages").cloned().ok_or("`passages` is required.")?;
+                let items = raw_passages.as_array_mut().ok_or("`passages` must be an array.")?;
+                for item in items {
+                    let item = item.as_object_mut().ok_or("Each passage must be an object.")?;
+                    let color = match item.get("color") {
+                        Some(value) => normalize_mark_color(value.as_str().ok_or("`color` must be a string.")?)?,
+                        None => batch_color.clone(),
+                    };
+                    item.insert("color".into(), color.into());
+                }
+                let passages: Vec<Passage> = serde_json::from_value(raw_passages)
+                    .map_err(|e| format!("Invalid passages: {e}"))?;
                 if passages.is_empty() || passages.len() > 30 {
                     return Err("Provide 1–30 passages in one call.".into());
                 }
@@ -140,9 +176,6 @@ impl PendingWrite {
                     }
                     if !["highlight", "underline"].contains(&p.style.as_str()) {
                         return Err("`style` must be highlight or underline.".into());
-                    }
-                    if p.color.len() != 7 || !p.color.starts_with('#') || !p.color[1..].bytes().all(|c| c.is_ascii_hexdigit()) {
-                        return Err("`color` must be a #RRGGBB color.".into());
                     }
                     if p.note.as_ref().is_some_and(|s| s.chars().count() > 10_000)
                         || (name == CREATE_ANNOTATIONS_TOOL && p.note.as_deref().unwrap_or("").trim().is_empty()) {
@@ -274,6 +307,19 @@ impl PendingWrite {
                 }))
             }
         }
+    }
+
+    /// Only the user's reviewed colors may change after preview. Quote, page,
+    /// comment, geometry and paper identity stay bound to the validated write.
+    pub fn apply_passage_colors(&mut self, colors: Option<&[String]>) -> Result<(), String> {
+        let Some(colors) = colors else { return Ok(()); };
+        let Self::MarkPassages { highlights, .. } = self else {
+            return Err("Color choices only apply to PDF marking.".into());
+        };
+        if colors.len() != highlights.len() { return Err("Color choices must match the previewed passages.".into()); }
+        let normalized = colors.iter().map(|c| normalize_mark_color(c)).collect::<Result<Vec<_>, _>>()?;
+        for (highlight, color) in highlights.iter_mut().zip(normalized) { highlight.color = color; }
+        Ok(())
     }
 }
 
@@ -497,6 +543,55 @@ mod tests {
         assert_eq!(marks[0].id, first_id.as_str().unwrap());
         assert_eq!(marks[1].note.as_deref(), Some("解释这句话"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn named_colors_match_the_reader_palette_and_custom_rgb_is_validated() {
+        for (name, alias, hex) in [("yellow", "黄色", "#FFEB3B"), ("green", "绿色", "#A5D6A7"),
+            ("blue", "蓝色", "#90CAF9"), ("pink", "粉色", "#F48FB1"),
+            ("orange", "橙色", "#FFCC80"), ("purple", "紫色", "#CE93D8")] {
+            assert_eq!(normalize_mark_color(name).unwrap(), hex);
+            assert_eq!(normalize_mark_color(alias).unwrap(), hex);
+        }
+        assert_eq!(normalize_mark_color(" #12ab34 ").unwrap(), "#12AB34");
+        for invalid in ["red", "#abc", "#000000FF", "url(x)", "#12345g", "", "#中文"] {
+            assert!(normalize_mark_color(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn both_marking_tools_inherit_batch_colors_and_save_only_reviewed_color_edits() {
+        for tool in [CREATE_HIGHLIGHTS_TOOL, CREATE_ANNOTATIONS_TOOL] {
+            let root = library_with_paper("colored-copy", "A paper");
+            let pdf = paper::paper_dir(&root, "colored-copy").join("paper.pdf");
+            crate::render::annotation_fixture(&pdf, "Alpha beta. A second sentence.", 0, 1.0, false);
+            let mut args = serde_json::json!({"slug": "colored-copy", "color": "blue", "passages": [
+                {"page": 1, "text": "Alpha beta."},
+                {"page": 1, "text": "A second sentence.", "color": "粉色"}
+            ]});
+            if tool == CREATE_ANNOTATIONS_TOOL {
+                for p in args["passages"].as_array_mut().unwrap() { p["note"] = "A comment".into(); }
+            }
+            let mut pending = PendingWrite::parse(&root, tool, &args).unwrap();
+            let before = pending.preview(&root);
+            assert_eq!(before.passages[0].color, "#90CAF9");
+            assert_eq!(before.passages[1].color, "#F48FB1");
+            assert!(pending.apply_passage_colors(Some(&["green".into()])).is_err());
+            assert!(pending.apply_passage_colors(Some(&["green".into(), "invalid".into()])).is_err());
+            assert_eq!(pending.preview(&root).passages[0].color, "#90CAF9", "failed changes are atomic");
+            assert!(paper::read_highlights(&root, "colored-copy").is_empty());
+            pending.apply_passage_colors(Some(&["green".into(), "#123abc".into()])).unwrap();
+            let after = pending.preview(&root);
+            for (old, new) in before.passages.iter().zip(&after.passages) {
+                assert_eq!(old.text, new.text); assert_eq!(old.page, new.page); assert_eq!(old.note, new.note);
+            }
+            pending.execute(&root).unwrap();
+            let saved = paper::read_highlights(&root, "colored-copy");
+            assert_eq!(saved[0].color, "#A5D6A7");
+            assert_eq!(saved[1].color, "#123ABC");
+            assert_eq!(saved[0].note.as_deref(), if tool == CREATE_ANNOTATIONS_TOOL { Some("A comment") } else { None });
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]

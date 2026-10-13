@@ -74,8 +74,25 @@ impl Decision {
     }
 }
 
-fn registry() -> &'static Mutex<HashMap<String, oneshot::Sender<bool>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, oneshot::Sender<bool>>>> = OnceLock::new();
+#[derive(Debug, PartialEq, Eq)]
+pub struct Resolution {
+    pub decision: Decision,
+    pub passage_colors: Option<Vec<String>>,
+}
+
+impl Resolution {
+    fn from_decision(decision: Decision) -> Self { Self { decision, passage_colors: None } }
+    pub fn approved(&self) -> bool { self.decision.approved() }
+    pub fn message(&self) -> &'static str { self.decision.message() }
+}
+
+struct PendingConfirmation {
+    sender: oneshot::Sender<Resolution>,
+    passage_count: Option<usize>,
+}
+
+fn registry() -> &'static Mutex<HashMap<String, PendingConfirmation>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, PendingConfirmation>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -94,11 +111,12 @@ pub async fn request(
     event_name: &str,
     preview: serde_json::Value,
     cancel: Option<Arc<AtomicBool>>,
-) -> Decision {
+) -> Resolution {
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = oneshot::channel();
     if let Ok(mut map) = registry().lock() {
-        map.insert(id.clone(), tx);
+        let passage_count = preview.get("passages").and_then(|p| p.as_array()).map(Vec::len).filter(|n| *n > 0);
+        map.insert(id.clone(), PendingConfirmation { sender: tx, passage_count });
     }
     // Undoes the registration on every exit path below.
     let guard = PendingGuard(id.clone());
@@ -111,7 +129,7 @@ pub async fn request(
         .emit(format!("{event_name}-confirm").as_str(), payload)
         .is_err()
     {
-        return Decision::TimedOut;
+        return Resolution::from_decision(Decision::TimedOut);
     }
 
     let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
@@ -120,15 +138,15 @@ pub async fn request(
         // dialog down promptly instead of holding the loop for three minutes.
         tokio::select! {
             answer = &mut rx => break match answer {
-                Ok(true) => Decision::Approved,
+                Ok(resolution) => resolution,
                 // A dropped sender means the entry was cleared without an
                 // answer; treat it exactly like a refusal.
-                Ok(false) | Err(_) => Decision::Rejected,
+                Err(_) => Resolution::from_decision(Decision::Rejected),
             },
-            _ = tokio::time::sleep_until(deadline) => break Decision::TimedOut,
+            _ = tokio::time::sleep_until(deadline) => break Resolution::from_decision(Decision::TimedOut),
             _ = tokio::time::sleep(CANCEL_POLL) => {
                 if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
-                    break Decision::Cancelled;
+                    break Resolution::from_decision(Decision::Cancelled);
                 }
             }
         }
@@ -157,17 +175,37 @@ impl Drop for PendingGuard {
 
 /// Deliver the user's answer. Unknown ids are ignored: the request may have
 /// timed out, been cancelled, or already been answered.
-pub fn resolve(request_id: &str, approved: bool) {
-    let sender = registry().lock().ok().and_then(|mut m| m.remove(request_id));
-    if let Some(tx) = sender {
-        let _ = tx.send(approved);
+#[cfg(test)]
+fn resolve(request_id: &str, approved: bool) {
+    let _ = resolve_with_colors(request_id, approved, None);
+}
+
+fn resolve_with_colors(request_id: &str, approved: bool, colors: Option<Vec<String>>) -> Result<(), String> {
+    let mut map = registry().lock().map_err(|_| "Confirmation registry unavailable".to_string())?;
+    let Some(pending) = map.get(request_id) else { return Ok(()); };
+    let passage_colors = if approved {
+        match colors {
+            Some(colors) => {
+                if pending.passage_count != Some(colors.len()) {
+                    return Err("Color choices must match the previewed PDF passages.".into());
+                }
+                Some(colors.iter().map(|c| crate::mcp::app_tools::normalize_mark_color(c)).collect::<Result<Vec<_>, _>>()?)
+            }
+            None => None,
+        }
+    } else { None };
+    if let Some(pending) = map.remove(request_id) {
+        let _ = pending.sender.send(Resolution {
+            decision: if approved { Decision::Approved } else { Decision::Rejected }, passage_colors,
+        });
     }
+    Ok(())
 }
 
 /// Tauri command: the window's answer to a pending write confirmation.
 #[tauri::command]
-pub fn resolve_agent_write(request_id: String, approved: bool) {
-    resolve(&request_id, approved);
+pub fn resolve_agent_write(request_id: String, approved: bool, passage_colors: Option<Vec<String>>) -> Result<(), String> {
+    resolve_with_colors(&request_id, approved, passage_colors)
 }
 
 #[cfg(test)]
@@ -198,12 +236,36 @@ mod tests {
     #[tokio::test]
     async fn only_the_first_answer_counts() {
         let (tx, rx) = oneshot::channel();
-        registry().lock().unwrap().insert("req-1".into(), tx);
+        registry().lock().unwrap().insert("req-1".into(), PendingConfirmation { sender: tx, passage_count: None });
 
         resolve("req-1", true);
         resolve("req-1", false);
 
-        assert_eq!(rx.await.unwrap(), true);
+        assert_eq!(rx.await.unwrap().decision, Decision::Approved);
         assert!(!registry().lock().unwrap().contains_key("req-1"));
+    }
+
+    #[tokio::test]
+    async fn approved_colors_are_normalized_and_bound_to_the_preview_count() {
+        let (tx, rx) = oneshot::channel();
+        registry().lock().unwrap().insert("colored-batch".into(), PendingConfirmation { sender: tx, passage_count: Some(2) });
+        assert!(resolve_with_colors("colored-batch", true, Some(vec!["blue".into()])).is_err());
+        assert!(resolve_with_colors("colored-batch", true, Some(vec!["blue".into(), "bad-color".into()])).is_err());
+        assert!(registry().lock().unwrap().contains_key("colored-batch"));
+        resolve_with_colors("colored-batch", true, Some(vec!["blue".into(), "#12ab34".into()])).unwrap();
+        let choice = rx.await.unwrap();
+        assert!(choice.approved());
+        assert_eq!(choice.passage_colors, Some(vec!["#90CAF9".into(), "#12AB34".into()]));
+    }
+
+    #[tokio::test]
+    async fn notes_cannot_receive_color_edits_and_rejection_discards_edits() {
+        let (tx, rx) = oneshot::channel();
+        registry().lock().unwrap().insert("note-no-colors".into(), PendingConfirmation { sender: tx, passage_count: None });
+        assert!(resolve_with_colors("note-no-colors", true, Some(vec!["blue".into()])).is_err());
+        resolve_with_colors("note-no-colors", false, Some(vec!["bad".into()])).unwrap();
+        let choice = rx.await.unwrap();
+        assert!(!choice.approved());
+        assert_eq!(choice.passage_colors, None);
     }
 }

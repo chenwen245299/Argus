@@ -8,6 +8,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
+import { HIGHLIGHT_COLORS } from '../utils/highlightColors'
 import { invoke } from '@tauri-apps/api/core'
 import DOMPurify from 'dompurify'
 import { runTranslation, triggerAskAi } from '../stores/translationHistory'
@@ -155,14 +156,7 @@ function toggleHighlightStyle() {
   highlightStyle.value = highlightStyle.value === 'highlight' ? 'underline' : 'highlight'
   localStorage.setItem(HIGHLIGHT_STYLE_KEY, highlightStyle.value)
 }
-const COLORS = computed(() => [
-  { label: t('pdf.yellow'), value: '#FFEB3B' },
-  { label: t('pdf.green'),  value: '#A5D6A7' },
-  { label: t('pdf.blue'),   value: '#90CAF9' },
-  { label: t('pdf.pink'),   value: '#F48FB1' },
-  { label: t('pdf.orange'), value: '#FFCC80' },
-  { label: t('pdf.purple'), value: '#CE93D8' },
-])
+const COLORS = computed(() => HIGHLIGHT_COLORS.map(color => ({ label: t(color.labelKey), value: color.value })))
 
 // ── Popups ────────────────────────────────────────────────────────────────────
 const selectionPopup = ref<{

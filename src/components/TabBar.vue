@@ -234,6 +234,7 @@ function onDocumentMouseDown(e: MouseEvent) {
 }
 
 const homeTitle = computed(() => {
+  if (selection.activeNav === 'arxiv') return t('sidebar.arxivPapers')
   if (selection.activeNav === 'recent') return t('sidebar.recentPapers')
   if (!selection.activeCollectionId) return t('sidebar.allPapers')
   return collections.collectionById(selection.activeCollectionId)?.name ?? t('sidebar.allPapers')

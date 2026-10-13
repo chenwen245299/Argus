@@ -1150,6 +1150,19 @@ onUnmounted(() => {
 
             <div class="all-papers-section">
               <button
+                class="nav-item"
+                :class="{ active: selection.activeNav === 'arxiv' && !selection.highlightedCollectionId }"
+                :title="t('sidebar.arxivHint')"
+                @click="select('arxiv')"
+              >
+                <Icon icon="fluent:tray-item-add-24-regular" width="14" height="14" />
+                {{ t('sidebar.arxivPapers') }}
+                <span class="badge">{{ collectionsStore.arxivPapers.length }}</span>
+              </button>
+            </div>
+
+            <div class="all-papers-section">
+              <button
               class="nav-item"
               :class="{ active: selection.activeNav === 'recent' && !selection.highlightedCollectionId }"
                 @click="select('recent')"

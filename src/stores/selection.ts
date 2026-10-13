@@ -51,7 +51,7 @@ export const useSelectionStore = defineStore('selection', () => {
   function selectNav(item: NavItem) {
     navSelectionSeq.value += 1
     activeNav.value = item
-    if (item === 'all' || item === 'recent' || item === 'inbox') {
+    if (item === 'all' || item === 'arxiv' || item === 'recent' || item === 'inbox') {
       tagFilter.value = null
       activeCollectionId.value = null
       highlightedCollectionId.value = null

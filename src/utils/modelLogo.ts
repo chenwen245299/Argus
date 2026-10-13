@@ -6,6 +6,7 @@
 // pointed at DeepSeek must show DeepSeek's mark, not OpenAI's.
 
 import type { ModelOption } from '../stores/ai'
+import { soclaasLogo } from './soclaas'
 
 const modelSvgModules = import.meta.glob<{ default: string }>('/src/assets/models/*.svg', { eager: true })
 const modelIconMap: Record<string, string> = {}
@@ -19,8 +20,10 @@ for (const [path, mod] of Object.entries(modelSvgModules)) {
  *   "openai_compatible" is passed through as empty: it is the generic adapter
  *   used for DeepSeek/Kimi/… and would otherwise claim the OpenAI brand.
  */
-export function modelLogo(model?: ModelOption | null, providerKind?: string): string {
+export function modelLogo(model?: ModelOption | null, providerKind?: string, providerBaseUrl = ''): string {
   if (!model) return ''
+  const nus = soclaasLogo(model.providerName, providerBaseUrl, providerKind)
+  if (nus) return nus
   const kind = providerKind === 'openai_compatible' ? '' : providerKind
   const haystack = [kind, model.providerId, model.providerName, model.modelId, model.displayName]
     .filter(Boolean)

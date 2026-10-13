@@ -6,6 +6,8 @@
 // specific brand first, because a provider added as a plain `openai_compatible`
 // adapter is identified only by where it points.
 
+import { soclaasLogo } from './soclaas'
+
 const providerSvgModules = import.meta.glob<{ default: string }>(
   '/src/assets/providers/*.svg',
   { eager: true },
@@ -50,7 +52,9 @@ const LOGO_MAP: [string[], string][] = [
 ]
 
 /** Resolved asset URL for a provider's mark, or '' when no brand matches. */
-export function providerLogo(name: string, baseUrl = ''): string {
+export function providerLogo(name: string, baseUrl = '', kind = ''): string {
+  const nus = soclaasLogo(name, baseUrl, kind)
+  if (nus) return nus
   const haystack = `${name} ${baseUrl}`.toLowerCase()
   for (const [keywords, file] of LOGO_MAP) {
     if (keywords.some(k => haystack.includes(k))) {

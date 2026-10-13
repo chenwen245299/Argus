@@ -84,6 +84,41 @@ function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
+// Some saved answers put TeX-like formulas in backticks instead of math
+// delimiters. Recover only clearly mathematical snippets: ordinary identifiers,
+// source code, paths and prose must retain their code formatting.
+function renderMathCode(text: string): string | null {
+  let tex = text.trim()
+  const delimited = tex.match(/^\$\$([\s\S]+)\$\$$/)
+    ?? tex.match(/^\$([^$]+)\$$/)
+    ?? tex.match(/^\\\(([\s\S]+)\\\)$/)
+    ?? tex.match(/^\\\[([\s\S]+)\\\]$/)
+  if (delimited) {
+    tex = delimited[1].trim()
+  } else {
+    if (tex.length > 2000 || !/(?:[_^]\s*\{|\\(?:frac|dfrac|tfrac|sqrt|sum|prod|int|lim)\b)/.test(tex)) return null
+    if (/(?:===|!==|=>|&&|\|\||`|"|\r|\n|[\u3400-\u9fff])/.test(tex) || /;\s*$/.test(tex)) return null
+    const mathWords = new Set(['arg', 'argmin', 'argmax', 'min', 'max', 'log', 'ln', 'exp',
+      'sin', 'cos', 'tan', 'lim', 'sup', 'inf', 'det', 'tr', 'diag', 'Pr'])
+    const words = tex.replace(/\\[A-Za-z]+/g, '').match(/[A-Za-z]{2,}/g) ?? []
+    if (words.some(word => !mathWords.has(word))) return null
+
+    // Plain-text mathematical operators in older answers need their TeX form.
+    // Already-written TeX is left intact, including operatorname arguments.
+    if (!/\\[A-Za-z]+/.test(tex)) {
+      tex = tex.replace(/\b(arg\s*min|arg\s*max|min|max|log|ln|exp|sin|cos|tan|lim|sup|inf)(?=[^A-Za-z]|$)/g,
+        (_, op: string) => op.replace(/\s/g, '').startsWith('arg')
+          ? `\\operatorname*{arg\\,${op.replace(/\s/g, '').slice(3)}}` : `\\${op}`)
+      tex = tex.replace(/([A-Za-z])\*(?=_\{)/g, '$1^{*}')
+    }
+  }
+  try {
+    return katex.renderToString(tex, { displayMode: false, throwOnError: true, strict: false, trust: false })
+  } catch {
+    return null
+  }
+}
+
 marked.use({
   breaks: true,
   renderer: {
@@ -99,7 +134,7 @@ marked.use({
       return `<div class="md-code-block"><div class="md-code-header"><span class="md-code-lang">${escapeHtml(validLang)}</span><button class="md-copy-btn" data-md-action="copy-code" type="button">${COPY_ICON}</button></div><pre><code class="hljs ${escapeHtmlAttr(validLang)}">${highlighted}</code></pre></div>`
     },
     codespan(token: Tokens.Codespan): string {
-      return `<code class="md-inline-code">${escapeHtml(token.text)}</code>`
+      return renderMathCode(token.text) ?? `<code class="md-inline-code">${escapeHtml(token.text)}</code>`
     },
     image(token: Tokens.Image): string {
       const safeHref = escapeHtmlAttr(token.href)
@@ -124,7 +159,7 @@ export function renderMarkdown(content: string): string {
     })
 
     const inlineCodes: string[] = []
-    md = md.replace(/`[^`]+`/g, (m) => {
+    md = md.replace(/(`+)([\s\S]*?)\1(?!`)/g, (m) => {
       inlineCodes.push(m)
       return `<!--INLINE_CODE_${inlineCodes.length - 1}-->`
     })
@@ -185,8 +220,7 @@ export function renderMarkdown(content: string): string {
     })
 
     html = html.replace(/<!--INLINE_CODE_(\d+)-->/g, (_, i) => {
-      const raw = (inlineCodes[+i] ?? '``').slice(1, -1)
-      return `<code class="md-inline-code">${escapeHtml(raw)}</code>`
+      return marked.parseInline(inlineCodes[+i] ?? '') as string
     })
 
     return DOMPurify.sanitize(html, {

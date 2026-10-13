@@ -4,6 +4,7 @@ import {
   planPageRender, planHiddenBudget, hiddenKeepSet, ScrollTracker,
   type PageGeometry, type HiddenLevel, type HiddenViewerState,
 } from '../utils/pageRenderPolicy'
+import { HIGHLIGHT_COLORS } from '../utils/highlightColors'
 
 // Bitmap memory the on-screen viewer may hold (pixels, 4 bytes each); only ever trims pages
 // outside its render zone. A Letter page at 189 % on a 2x display is about 7 MP.
@@ -481,14 +482,7 @@ function onNoteResizeStart(e: PointerEvent) {
   startNotePopupResize(e, p.hlId, { x: p.x, y: p.y })
 }
 
-const COLORS = computed(() => [
-  { label: t('pdf.yellow'), value: '#FFEB3B' },
-  { label: t('pdf.green'),  value: '#A5D6A7' },
-  { label: t('pdf.blue'),   value: '#90CAF9' },
-  { label: t('pdf.pink'),   value: '#F48FB1' },
-  { label: t('pdf.orange'), value: '#FFCC80' },
-  { label: t('pdf.purple'), value: '#CE93D8' },
-])
+const COLORS = computed(() => HIGHLIGHT_COLORS.map(color => ({ label: t(color.labelKey), value: color.value })))
 
 // Debounce timer for reading state
 let progressDebounce: ReturnType<typeof setTimeout> | null = null

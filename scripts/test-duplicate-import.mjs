@@ -6,6 +6,7 @@ import { readFile } from 'node:fs/promises'
 import { webcrypto } from 'node:crypto'
 import { ref, computed } from 'vue'
 import ts from 'typescript'
+import { confirm as nativeConfirm } from '@tauri-apps/plugin-dialog'
 
 const transpile = code => ts.transpileModule(code, {
   compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.ESNext },
@@ -18,11 +19,11 @@ const store = ast.statements.find(n => ts.isVariableStatement(n) &&
 const createStore = new Function('env', transpile(`
   const { ref, computed, invoke, listen, window, CustomEvent, crypto, i18n,
     useLibraryStore, useReaderStore, useSelectionStore, useCollectionsStore,
-    useRanksStore, useSettingsStore } = env;
+    useRanksStore, useSettingsStore, confirmDuplicateImport } = env;
   return (${store})();
 `))
 
-function fixture(accept, duplicate = true) {
+function fixture(accept, duplicate = true, deleteFails = false) {
   const calls = [], questions = [], moves = [], renames = []
   const library = { papers: [], refresh: async () => {} }
   const selection = { selectedSlug: '', selectPaper(slug) { this.selectedSlug = slug } }
@@ -30,9 +31,10 @@ function fixture(accept, duplicate = true) {
     movePaper: async (id, collection) => { moves.push({ id, collection }) } }
   const env = {
     ref, computed, crypto: webcrypto,
-    window: { confirm(message) { questions.push(message); return accept }, dispatchEvent() {} },
+    window: { confirm() { throw new Error('Deprecated window.confirm must not be used') }, dispatchEvent() {} },
+    confirmDuplicateImport: async title => { questions.push(`Import ${title} as an independent copy?`); return typeof accept === 'function' ? await accept() : await accept },
     CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init.detail } },
-    i18n: { global: { t: (_key, vars) => `Import ${vars.title} as an independent copy?` } },
+    i18n: { global: { t: (_key, vars = {}) => `Import ${vars.title} as an independent copy?` } },
     listen: async () => () => {},
     useLibraryStore: () => library, useSelectionStore: () => selection,
     useCollectionsStore: () => collections,
@@ -41,6 +43,7 @@ function fixture(accept, duplicate = true) {
     invoke: async (name, args) => {
       calls.push({ name, args })
       switch (name) {
+        case 'delete_paper': if (deleteFails) throw new Error('delete failed'); return null
         case 'import_pdf': return 'new-temp'
         case 'import_ebook': return 'ebook-copy'
         case 'import_paper_url': return !args.force && duplicate
@@ -121,4 +124,93 @@ test('ordinary new imports proceed without a duplicate prompt', async () => {
   await idle(f.store)
   assert.equal(f.questions.length, 0)
   assert.equal(f.store.jobs.value[0].status, 'done')
+})
+
+const deferred = () => {
+  let resolve
+  const promise = new Promise(done => { resolve = done })
+  return { promise, resolve }
+}
+async function until(predicate) {
+  for (let i = 0; i < 100 && !predicate(); i++) await new Promise(resolve => setImmediate(resolve))
+  assert.ok(predicate())
+}
+
+test('a local import pauses until the actual asynchronous duplicate choice arrives', async () => {
+  for (const accept of [false, true]) {
+    const choice = deferred(), f = fixture(choice.promise)
+    await f.store.importFile('/tmp/paper.pdf', 'leaf')
+    await until(() => f.questions.length === 1)
+    assert.ok(f.store.activeCount.value > 0)
+    assert.equal(f.calls.some(c => ['rename_paper_folder', 'fetch_citation_count', 'delete_paper'].includes(c.name)), false)
+    choice.resolve(accept)
+    await idle(f.store)
+    assert.equal(f.calls.some(c => c.name === 'delete_paper'), !accept)
+    assert.equal(f.calls.some(c => c.name === 'rename_paper_folder'), accept)
+  }
+})
+
+test('URL duplicates cannot force a copy before the asynchronous user choice', async () => {
+  const choice = deferred(), f = fixture(choice.promise)
+  const importing = f.store.importPaperUrl('https://arxiv.org/abs/2401.12345', 'leaf')
+  await until(() => f.questions.length === 1)
+  assert.equal(f.calls.filter(c => c.name === 'import_paper_url').length, 1)
+  choice.resolve(false)
+  await importing
+  assert.equal(f.calls.filter(c => c.name === 'import_paper_url').length, 1)
+  assert.equal(f.store.jobs.value.length, 0)
+})
+
+test('a dialog failure never silently approves a known local or URL duplicate', async () => {
+  const fail = () => { throw new Error('dialog failed') }
+  const local = fixture(fail)
+  await local.store.importFile('/tmp/paper.pdf', 'leaf')
+  await idle(local.store)
+  assert.equal(local.store.jobs.value[0].status, 'error')
+  assert.equal(local.calls.some(c => ['rename_paper_folder', 'fetch_citation_count', 'delete_paper'].includes(c.name)), false)
+  const url = fixture(fail)
+  await url.store.importPaperUrl('https://arxiv.org/abs/2401.12345', 'leaf')
+  assert.equal(url.calls.filter(c => c.name === 'import_paper_url').length, 1)
+  assert.equal(url.store.jobs.value[0].status, 'error')
+  const ebook = fixture(fail)
+  await ebook.store.importFile('/tmp/book.epub', 'leaf')
+  assert.equal(ebook.store.jobs.value[0].status, 'error')
+  assert.equal(ebook.store.activeCount.value, 0)
+  assert.equal(ebook.calls.some(c => c.name === 'delete_paper'), false)
+})
+
+test('a failed cleanup is reported as an error and never claims the import was skipped or deletes the original', async () => {
+  const f = fixture(false, true, true)
+  await f.store.importFile('/tmp/paper.pdf', 'leaf')
+  await idle(f.store)
+  assert.equal(f.store.jobs.value[0].status, 'error')
+  assert.equal(f.store.lastDuplicate.value, null)
+  assert.deepEqual(f.calls.filter(c => c.name === 'delete_paper'), [{ name: 'delete_paper', args: { slug: 'new-temp' } }])
+  assert.equal(f.calls.some(c => c.name === 'rename_paper_folder'), false)
+})
+
+test('the real dialog helper uses the supported native command and localized keep/skip buttons', async () => {
+  const helper = await readFile(new URL('../src/utils/duplicateImport.ts', import.meta.url), 'utf8')
+  const helperAst = ts.createSourceFile('duplicateImport.ts', helper, ts.ScriptTarget.Latest, true)
+  const fn = helperAst.statements.find(n => ts.isFunctionDeclaration(n)).getText(helperAst).replace(/^export /, '')
+  const translations = { 'import.duplicateConfirm': 'Same-title paper: {title}', 'import.duplicateTitle': '论文可能重复',
+    'import.keepDuplicate': '保留副本', 'import.skipDuplicate': '跳过导入' }
+  const confirmDuplicate = new Function('confirm', 'i18n', transpile(`${fn}\nreturn confirmDuplicateImport;`))(
+    nativeConfirm, { global: { t: (key, args = {}) => translations[key].replace('{title}', args.title ?? '') } })
+  const previousWindow = globalThis.window
+  try {
+    for (const accept of [true, false]) {
+      const choice = deferred(), calls = []
+      globalThis.window = { confirm() { throw new Error('Broken shim') }, __TAURI_INTERNALS__: {
+        invoke(command, args) { calls.push({ command, args }); return choice.promise },
+      } }
+      const result = confirmDuplicate('Same Paper')
+      assert.equal(calls[0].command, 'plugin:dialog|message')
+      assert.equal(calls[0].args.title, '论文可能重复')
+      assert.ok(JSON.stringify(calls[0].args.buttons).includes('保留副本'))
+      assert.ok(JSON.stringify(calls[0].args.buttons).includes('跳过导入'))
+      choice.resolve(accept ? '保留副本' : '跳过导入')
+      assert.equal(await result, accept)
+    }
+  } finally { globalThis.window = previousWindow }
 })

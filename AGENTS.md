@@ -202,6 +202,22 @@ rich-text applications such as PowerPoint consume the text instead of pasting
 nothing. Keep Vditor's original Markdown/TeX conversion and cut deletion; do not
 replace these with flattened selection text or an asynchronous clipboard write.
 
+**Paper AI guided reading.** The shared `AiTab.vue` header exposes AI 领读 in
+both the sidebar and `PaperAiView`. It starts a fresh conversation with
+`source: "guidedReading"`, immediately sends the localized preset from
+`utils/guidedReading.ts` through the normal agent chat, and preserves unsent text
+and attachments. Later turns and regeneration use the ordinary chat path. The
+stored first question retains the complete prompt; the user bubble and history
+title show a concise localized label. The prompt requires full paginated reading,
+visual inspection of all figures/tables, concrete examples, and one small point
+per turn followed by an understanding check.
+`GuidedReadingIntro.vue` is hosted once per main/standalone window after setup
+is ready. Its device-local announcement is suppressed only after a successful,
+nonempty, uncancelled answer in a guided conversation, or when the user checks
+不再显示 and acknowledges. Closing or acknowledging without that checkbox is
+transient. Storage and a local change event synchronize open windows. Keep
+implementation and persistence rules out of the feature announcement copy.
+
 **Mermaid labels in chat.** `MermaidBlock.vue` renders with root-level
 `htmlLabels: false` and locks that key alongside Mermaid's default secure keys.
 The SVG-only DOMPurify profile strips `foreignObject` HTML labels, leaving nodes
@@ -209,6 +225,17 @@ and arrows without text; use SVG text labels so display and PNG copying retain
 them. Do not loosen the sanitizer to admit HTML inside the SVG. The root option
 takes precedence over deprecated `flowchart.htmlLabels`; diagram directives and
 frontmatter must not override it.
+
+**Chat formulas.** `utils/renderMarkdown.ts` uses KaTeX for delimited math and
+also recovers clearly mathematical inline-code snippets in older answers
+(e.g. `q*_{t+1}` or `min_{a∈A} G_t(a)`). Ordinary identifiers, commands, paths,
+prose, malformed TeX and fenced examples retain their code presentation.
+Inline code is restored through the same marked codespan renderer so both
+paths agree; final HTML still passes through DOMPurify and keeps the TeX
+annotation used by `copyAsMarkdown`. The shared response-style prompt asks
+models to use `$...$` / `$$...$$`, reserving backticks for source examples.
+Browser regressions: `node --test scripts/test-markdown-math.mjs` (Playwright
+and Chrome; `ARGUS_TEST_PLAYWRIGHT` can point to a bundled runtime).
 
 ### Frontend state management (Pinia stores)
 
@@ -493,12 +520,18 @@ through the existing write-confirmation handshake. Their descriptions and the
 default prompt forbid proactive use: the user must explicitly request marking
 or annotations. A batch has 1–30 original excerpts with 1-based PDF page indices;
 annotations require a `note`, and the highlight tool cannot attach comments.
+Both tools accept a batch `color` and per-passage overrides: yellow, green, blue,
+pink, orange, purple (the reader palette) or #RRGGBB. Omission defaults to yellow.
+`WriteConfirmCard` lets the user adjust every passage's palette/custom color
+before approving; `resolve_agent_write` binds the color list to that request's
+passage count and validates it, then `PendingWrite::apply_passage_colors` applies
+only those colors. Paper identity, text, note, page and geometry stay frozen.
 PDFium locates unique text and supplies glyph boxes on its existing thread;
 `render::pdf_page_units` supplies UserUnit, which PDFium's coordinates ignore.
 Missing/ambiguous text and changed source files fail without writing. Append
 under the highlights lock, preserve user edits/tombstones, and reuse identical
 records on retry. `paper-highlights-added` carries root/slug/records to the open
-reader; merge them without replacing unsaved local edits. Only ids/pages reach
+reader; merge them without replacing unsaved local edits. Only ids/pages/colors reach
 the model's result transcript. External MCP remains read-only.
 
 **Duplicate imports.** Local PDFs, ebooks and URL imports let the user keep an
@@ -510,6 +543,17 @@ a library namespace lock and checks papers inside collections too;
 copy's folder or identity because its title, DOI or arXiv ID matches. Notes,
 highlights, reading state, chats, search/vector identity and collection
 membership continue to belong to that exact slug/UUID.
+`arxiv::find_duplicate` is an import advisory: exact DOI/arXiv identifiers take
+priority, and an equal normalized title prompts regardless of authors. It
+excludes the incoming slug and includes papers inside collections; its frontend
+payload names the original `existingSlug`. This is separate from the stricter
+recommendation `in_library` lookup. Local PDFs/ebooks, URL imports and the arXiv
+inbox await `utils/duplicateImport.ts`, which uses the native dialog module API
+with 保留副本 / 跳过导入. Do not use `window.confirm`: the installed dialog
+plugin replaces it with an asynchronous legacy shim that calls a removed
+command; testing it as a boolean skips the user's decision. A dialog failure
+does not approve a known duplicate. Cleanup failure stays an error and must
+not report that the new copy was removed.
 
 **Prompt-cache keepalive (`cache_keepalive.rs`).** An agent turn sends a large
 prefix (the system prompt, every tool schema — external servers' too — and the
@@ -572,7 +616,34 @@ When a client silently shows no tools, `claude --debug-file <path> -p hi` prints
 the actual validation errors with the offending tool index. Claude Desktop's own
 logs report only a bare `result` and reveal nothing.
 
+### SoCLaaS (`soclaas.rs`)
+
+NUS's gateway uses OpenAI-compatible Chat Completions and Embeddings at
+`https://soclaas-api.comp.nus.edu.sg/v1`. Detect it by kind, host or provider
+name so existing generic configurations work. Use only the public model ids
+returned for that API key; `soclaas.display_name` / `description` supply display
+metadata, and all four documented context-length aliases are recognized.
+Do not substitute private upstream ids or add a hardcoded model catalogue.
+The app's high setting maps to `xhigh` for `x-test-1`; off maps to its lowest
+supported setting, `low`. Other models receive `none` when thinking is off,
+as documented in the quickstart. Streaming requests may repair one explicit
+HTTP 400 effort-validation refusal that lists accepted values, before any
+stream or client tool is consumed. Other errors and providers do not retry.
+Gateway string errors (`{"error":"message"}`), including SSE and HTTP 200
+error bodies, fail visibly rather than ending with an empty successful answer.
+The NUS Computing favicon is bundled locally for provider and model rows.
+Backend coverage lives in `soclaas::tests` and `llm::soclaas_request_tests`;
+`node --test scripts/test-soclaas.mjs` checks provider branding and presets.
+
 ### arXiv batch analysis (`arxiv.rs`)
+
+**Library staging.** Adding a recommendation to the library goes directly into
+the virtual **arXiv Papers** (`arxiv`) sidebar view below All Papers, without a
+collection picker. `collections.arxivPapers` selects `arxiv` / `biorxiv` imports
+with no assignment to an existing collection; it is not a collection itself.
+The normal paper-list drag (including multi-selection) assigns and moves the
+paper into a user collection, removing it from staging immediately. Source
+metadata and persisted assignments restore the same view after reopening.
 
 "AI 分析全部" (`start_analysis`) claims every `pending` *and* `failed` paper
 (pending first; a stale `analyzing` counts as pending), runs them through a
@@ -1015,6 +1086,21 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
 ## Testing instructions
 
 - **Frontend:** `vue-tsc --noEmit` runs as part of `npm run build`. Local regression scripts use Node's built-in test runner.
+- Guided reading: `node --test scripts/test-guided-reading.mjs` with
+  `ARGUS_TEST_PLAYWRIGHT` pointing to Playwright checks the real Vue sidebar,
+  standalone panel and intro with desktop/model mocks: draft preservation,
+  immediate preset send, follow-ups, failure/cancellation, announcement choices,
+  cross-window suppression, focus and narrow/wide layouts. Optional
+  `ARGUS_TEST_OUTPUT_DIR` saves screenshots.
+- Update notes: `node --test scripts/test-update-notes.mjs` uses the same
+  Playwright setup for the real update store and modal with updater/desktop
+  mocks: skipped versions, cached and simultaneous checks, latest-note fallback,
+  failure/retry, stale results, download progress, sanitization and layouts.
+  `cargo test --lib update_notes::tests` covers SemVer filtering, empty bodies
+  and paging against a local HTTP fixture (requires a loopback socket).
+- arXiv library staging: `node --test scripts/test-arxiv-staging.mjs` checks
+  direct imports, duplicate choices, navigation, single/multiple paper drags,
+  reactive staging counts and reloads with isolated command mocks.
 - PDF selection regression checks: `node --test scripts/test-page-furniture.mjs`
   exercises cross-page copy/save entry points, trimmed text and rects, and the
   single-page / other-viewer / text-mismatch fail safes without accessing a library.
@@ -1042,6 +1128,13 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   directive overrides, PNG text pixels and invalid-source fallback, using a fresh
   headless profile and localhost only (no library or system clipboard access).
 - **Paper marking / duplicate import:** `node --test scripts/test-duplicate-import.mjs scripts/test-paper-marking.mjs` exercises the real import store and reader merge with command/dialog mocks. `scripts/test-write-confirm.mjs` uses the same Playwright setup as the Mermaid test to check batch previews and approval/rejection with actual Chinese translations. Rust tests in `mcp/app_tools.rs`, `mcp/agent.rs`, `render.rs` and `paper.rs` cover exact quote matching, write isolation, idempotent retries, app-only exposure, explicit-request descriptions, crop/rotation/UserUnit and concurrent directory reservations.
+  Duplicate tests also verify real native-dialog command/button mapping,
+  asynchronous choices and failures across local/URL/ebook/arXiv imports;
+  `arxiv` tests cover title-only advisories and exact-id precedence. Marking
+  tests cover batch/individual/named/custom colors, changing only colors in a
+  reviewed write, the bounded confirmation payload and forwarding it from both
+  paper and library chat. Browser previews verify selectable colors and that
+  choosing/rejecting a color never implicitly approves a write.
 - **Backend:** Unit tests live in `#[cfg(test)]` modules inside the files they test — 43 of the 61 files under `src-tauri/src/`, about 450 tests (444 run by default; 4 more are `#[ignore]`d — a live MCP probe, a scan timing and two sample dumps, run by hand with `-- --ignored`). The heavier suites guard behavior described elsewhere in this file: `llm.rs` (`error_class_tests`, `provider_error_tests`), `copilot.rs` (context budget, eviction, fallback), `mcp/server.rs` + `mcp/agent.rs` (tool list, schema rules, dispatch sync), `arxiv.rs` (batch analysis).
 - **CI:** The release workflow does not run tests.
 
@@ -1086,6 +1179,22 @@ Updater endpoint configured in `tauri.conf.json`:
 ```
 https://github.com/chenwen245299/Argus/releases/latest/download/latest.json
 ```
+
+**Cumulative update notes.** `stores/update.ts` obtains the installed version
+before checking, shows the offered manifest's latest notes immediately, then
+loads history through `get_update_release_notes`. `update_notes.rs` reads all
+published GitHub Releases pages (100/page, at most 10 pages, 30 s total timeout,
+8 MiB/page), filters by SemVer `installed < release <= offered`, removes drafts,
+previews and duplicate build metadata, and sorts newest first. Never stop at the
+first older version: a release may have been published out of version order.
+`UpdatePrompt.vue` renders every version as a separate expanded section through
+the shared sanitized Markdown renderer. Empty latest notes fall back to the
+updater manifest; empty earlier notes remain an explicit placeholder. History
+errors retain the latest notes and install button, with an independent retry.
+The store caches history for five minutes and rejects stale results from a
+superseded check. History loading does not change the installer or download
+state; the signed updater manifest remains the sole installation source.
+No release-workflow changes or separate changelog maintenance are needed.
 
 ### macOS install note
 

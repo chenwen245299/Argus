@@ -44,3 +44,23 @@ test('retry events retain newer local notes and pending local deletions', () => 
   assert.equal(env.highlightsBySlug.value.paper.find(h => h.id === 'shared').note, 'Unsaved local annotation')
   assert.equal(env.highlightsBySlug.value.paper.some(h => h.id === 'deleted'), false)
 })
+
+test('paper and library chat forward the approved color list against the exact queued request, while rejections omit edits', async () => {
+  for (const path of ['../src/components/tabs/AiTab.vue', '../src/components/LibraryChat.vue']) {
+    const source = await readFile(new URL(path, import.meta.url), 'utf8')
+    const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script>'))
+    const ast = ts.createSourceFile(path, script, ts.ScriptTarget.Latest, true)
+    const fn = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name.text === 'answerWrite').getText(ast)
+    for (const approved of [true, false]) {
+      const pending = { requestId: 'colored-request', preview: { passages: [{ color: '#FFEB3B' }] } }
+      const queue = ref([pending, { requestId: 'next-request' }]), calls = []
+      const answer = new Function('currentWrite', 'pendingWrites', 'invoke', ts.transpileModule(`${fn}\nreturn answerWrite;`, {
+        compilerOptions: { target: ts.ScriptTarget.ES2021 },
+      }).outputText)({ value: pending }, queue, async (command, args) => calls.push({ command, args }))
+      answer(approved, ['#90CAF9'])
+      assert.deepEqual(calls, [{ command: 'resolve_agent_write', args: { requestId: 'colored-request', approved, passageColors: approved ? ['#90CAF9'] : null } }])
+      assert.equal(queue.value[0].requestId, 'next-request')
+      assert.equal(pending.preview.passages[0].color, '#FFEB3B')
+    }
+  }
+})

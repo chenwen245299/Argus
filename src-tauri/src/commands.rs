@@ -15,6 +15,14 @@ use crate::{
     metadata, models, paper, rag,
     search, sections, security_bookmark, settings, snippets, url_import, watcher, writing,
 };
+#[tauri::command]
+pub async fn get_update_release_notes(
+    current_version: String,
+    target_version: String,
+) -> Result<Vec<crate::update_notes::ReleaseNote>, String> {
+    crate::update_notes::fetch(&current_version, &target_version).await
+}
+
 // ── Library management ────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -3565,16 +3573,12 @@ pub async fn cancel_arxiv_analysis() -> Result<(), String> {
 #[tauri::command]
 pub async fn add_arxiv_to_library(
     arxiv_id: String,
-    collection_id: Option<String>,
     force: Option<bool>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<ImportResult, String> {
     let root = get_root(&state)?;
-    if let Some(cid) = collection_id.as_deref().filter(|c| !c.trim().is_empty()) {
-        collections::ensure_collection_can_receive_papers(&root, cid)?;
-    }
-    arxiv::add_to_library(&root, &arxiv_id, collection_id.as_deref(), &app, force.unwrap_or(false)).await
+    arxiv::add_to_library(&root, &arxiv_id, &app, force.unwrap_or(false)).await
 }
 
 // ── URL-based arXiv import ────────────────────────────────────────────────────
@@ -3622,7 +3626,6 @@ pub async fn find_duplicate_paper(
         meta.arxiv_id.as_deref(),
         meta.doi.as_deref(),
         &meta.title,
-        &meta.authors,
         Some(&slug),
     ))
 }

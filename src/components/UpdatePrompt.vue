@@ -4,7 +4,7 @@ import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { renderMarkdown } from '../utils/renderMarkdown'
-import { updateStore, startUpdate } from '../stores/update'
+import { updateStore, startUpdate, loadUpdateReleaseNotes } from '../stores/update'
 
 const { t } = useI18n()
 
@@ -19,20 +19,20 @@ function openIssues() {
 // Route release notes (fetched from the remote GitHub release) through the
 // shared renderer, which sanitizes with DOMPurify and forces external links to
 // open with rel="noopener" — no bespoke, laxer sanitize config here.
-const renderedNotes = computed(() => {
-  if (!updateStore.releaseNotes) return ''
-  return renderMarkdown(updateStore.releaseNotes)
-})
+const renderedReleases = computed(() => updateStore.releaseHistory.map(release => ({
+  ...release, html: release.body.trim() ? renderMarkdown(release.body) : '',
+  date: release.published_at?.match(/^\d{4}-\d{2}-\d{2}/)?.[0] ?? '',
+})))
 </script>
 
 <template>
   <Teleport to="body">
     <div v-if="updateStore.showReleaseNotes" class="rn-overlay" @click.self="updateStore.state !== 'downloading' && (updateStore.showReleaseNotes = false)">
-      <div class="rn-modal">
+      <div class="rn-modal" role="dialog" aria-modal="true" aria-labelledby="release-notes-title">
         <div class="rn-header">
           <div class="rn-title-wrap">
             <span class="rn-badge">v{{ updateStore.newVersion }}</span>
-            <h2 class="rn-title">{{ t('about.releaseNotesTitle') }}</h2>
+            <h2 id="release-notes-title" class="rn-title">{{ t('about.releaseNotesTitle') }}</h2>
           </div>
           <!-- Kept during download as an escape hatch if it stalls; the overlay
                click-outside is disabled so only a deliberate click dismisses it. -->
@@ -40,8 +40,30 @@ const renderedNotes = computed(() => {
             <Icon icon="fluent:dismiss-24-regular" width="14" height="14" />
           </button>
         </div>
-        <div v-if="renderedNotes" class="rn-body markdown-body" v-html="renderedNotes" />
-        <div v-else class="rn-body rn-body-empty">{{ t('about.updateAvailableDesc', { v: updateStore.newVersion }) }}</div>
+        <div class="rn-body">
+          <div v-if="updateStore.version" class="rn-range">
+            <span>{{ t('about.updateRange', { from: updateStore.version, to: updateStore.newVersion }) }}</span>
+            <span v-if="updateStore.releaseHistoryState === 'ready'" class="rn-count">{{ t('about.releaseCount', { count: renderedReleases.length }) }}</span>
+          </div>
+          <div v-if="updateStore.releaseHistoryState === 'loading'" class="rn-history-status" role="status">
+            <Icon icon="fluent:arrow-sync-16-regular" width="14" height="14" />
+            {{ t('about.loadingReleaseHistory') }}
+          </div>
+          <div v-else-if="updateStore.releaseHistoryState === 'error'" class="rn-history-status" role="status">
+            <span>{{ t('about.releaseHistoryUnavailable') }}</span>
+            <button class="rn-history-retry" @click="loadUpdateReleaseNotes(true)">{{ t('about.retryReleaseHistory') }}</button>
+          </div>
+          <section v-for="(release, index) in renderedReleases" :key="release.version" class="rn-release">
+            <div class="rn-release-heading">
+              <h3>v{{ release.version }}</h3>
+              <span v-if="index === 0" class="rn-latest">{{ t('about.latestRelease') }}</span>
+              <time v-if="release.date" :datetime="release.date">{{ release.date }}</time>
+            </div>
+            <div v-if="release.html" class="markdown-body" v-html="release.html" />
+            <p v-else class="rn-no-notes">{{ t('about.noReleaseNotes') }}</p>
+          </section>
+          <p v-if="!renderedReleases.length">{{ t('about.updateAvailableDesc', { v: updateStore.newVersion }) }}</p>
+        </div>
         <div class="rn-star">
           <div class="rn-cta-row">
             <p class="rn-star-text">{{ t('about.starText') }}</p>
@@ -171,7 +193,16 @@ const renderedNotes = computed(() => {
 .rn-body::-webkit-scrollbar { width: 4px; }
 .rn-body::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 2px; }
 
-.rn-body-empty { flex: none; }
+.rn-range { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px; font-size: 11px; }
+.rn-count { padding: 1px 6px; border-radius: 5px; background: var(--bg-secondary); color: var(--text-secondary); }
+.rn-history-status { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; font-size: 11px; color: var(--text-tertiary); }
+.rn-history-retry { flex-shrink: 0; border: none; background: transparent; color: var(--accent); font-size: inherit; cursor: pointer; }
+.rn-release + .rn-release { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border-subtle); }
+.rn-release-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.rn-release-heading h3 { margin: 0; font-size: 13px; font-weight: 650; color: var(--text-primary); }
+.rn-release-heading time { margin-left: auto; font-size: 10px; color: var(--text-tertiary); }
+.rn-latest { border-radius: 4px; padding: 0 5px; color: var(--accent); background: var(--accent-light); font-size: 10px; }
+.rn-no-notes { margin: 0; font-size: 12px; color: var(--text-tertiary); }
 
 .rn-star {
   display: flex;
@@ -295,20 +326,20 @@ const renderedNotes = computed(() => {
 }
 
 /* markdown content */
-.rn-body.markdown-body p { margin: 0 0 8px; }
-.rn-body.markdown-body p:last-child { margin-bottom: 0; }
-.rn-body.markdown-body h1,
-.rn-body.markdown-body h2,
-.rn-body.markdown-body h3 { font-size: 13px; font-weight: 600; color: var(--text-primary); margin: 12px 0 5px; }
-.rn-body.markdown-body ul,
-.rn-body.markdown-body ol { padding-left: 1.4em; margin: 5px 0; }
-.rn-body.markdown-body li { margin: 3px 0; }
-.rn-body.markdown-body code {
+.rn-body .markdown-body p { margin: 0 0 8px; }
+.rn-body .markdown-body p:last-child { margin-bottom: 0; }
+.rn-body .markdown-body h1,
+.rn-body .markdown-body h2,
+.rn-body .markdown-body h3 { font-size: 13px; font-weight: 600; color: var(--text-primary); margin: 12px 0 5px; }
+.rn-body .markdown-body ul,
+.rn-body .markdown-body ol { padding-left: 1.4em; margin: 5px 0; }
+.rn-body .markdown-body li { margin: 3px 0; }
+.rn-body .markdown-body code {
   background: var(--bg-tertiary);
   border-radius: 4px;
   padding: 1px 5px;
   font-family: 'SF Mono', 'Menlo', monospace;
   font-size: 0.87em;
 }
-.rn-body.markdown-body hr { border: none; border-top: 1px solid var(--border-subtle); margin: 10px 0; }
+.rn-body .markdown-body hr { border: none; border-top: 1px solid var(--border-subtle); margin: 10px 0; }
 </style>

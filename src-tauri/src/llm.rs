@@ -401,6 +401,9 @@ pub async fn test_connection(provider: &AiProvider, api_key: &str) -> Result<Str
     }
 
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
+    if crate::soclaas::is_soclaas(provider) {
+        crate::soclaas::apply_reasoning(&mut body, model, false, None);
+    }
     let mut req = client
         .post(&url)
         .header("Content-Type", "application/json");
@@ -784,6 +787,10 @@ async fn stream_with_pdf_injected(
         }
     }
 
+    if crate::soclaas::is_soclaas(provider) {
+        crate::soclaas::apply_reasoning(&mut body, model, use_reasoning, reasoning_effort);
+    }
+
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
     let mut req = client
         .post(&url)
@@ -795,11 +802,7 @@ async fn stream_with_pdf_injected(
         // a gzipped SSE stream, so ask for identity encoding to keep it plain text.
         req = req.header("Accept-Encoding", "identity");
     }
-    let resp = req
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| describe_stream_error(&e))?;
+    let resp = send_chat_with_soclaas_retry(req, provider, &body, false).await?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -1001,6 +1004,36 @@ async fn stream_with_pdf_injected(
 
 // ── OpenAI-compatible ─────────────────────────────────────────────────────────
 
+/// SoCLaaS aliases may change upstream models. A validation error naming the
+/// accepted effort range can be repaired once, before any generation stream or
+/// client tool execution. Quotas, permissions, network failures and other
+/// providers never enter this retry.
+async fn send_chat_with_soclaas_retry(
+    req: reqwest::RequestBuilder,
+    provider: &AiProvider,
+    body: &serde_json::Value,
+    client_tools_offered: bool,
+) -> Result<reqwest::Response, String> {
+    let retry = req.try_clone();
+    let resp = req.json(body).send().await.map_err(|e| describe_stream_error(&e))?;
+    if !crate::soclaas::is_soclaas(provider) || resp.status().as_u16() != 400 {
+        return Ok(resp);
+    }
+    let text = resp.text().await.unwrap_or_default();
+    let mut repaired = body.clone();
+    if let Some(retry) = retry {
+        if crate::soclaas::repair_reasoning_rejection(&mut repaired, &text) {
+            return retry.json(&repaired).send().await.map_err(|e| describe_stream_error(&e));
+        }
+    }
+    let err = friendly_error(400, &text);
+    if client_tools_offered && looks_like_tools_rejected(400, &text) {
+        Err(format!("{TOOLS_REJECTED_PREFIX}{err}"))
+    } else {
+        Err(err)
+    }
+}
+
 async fn chat_openai_compat(
     provider: &AiProvider,
     api_key: &str,
@@ -1073,6 +1106,9 @@ async fn chat_openai_compat(
     }
     if crate::stepfun::is_stepfun(provider) {
         crate::stepfun::apply_reasoning(&mut body, model, false, None);
+    }
+    if crate::soclaas::is_soclaas(provider) {
+        crate::soclaas::apply_reasoning(&mut body, model, false, None);
     }
 
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
@@ -1312,6 +1348,10 @@ async fn stream_openai_compat(
         }
     }
 
+    if crate::soclaas::is_soclaas(provider) {
+        crate::soclaas::apply_reasoning(&mut body, model, use_reasoning, reasoning_effort);
+    }
+
     // OpenRouter's server-side tools ride along on every chat request. They are
     // run by OpenRouter mid-answer rather than handed back to us, so no client
     // loop is needed and nothing is billed unless the model actually reaches for
@@ -1369,11 +1409,7 @@ async fn stream_openai_compat(
         // Kimi Code may return a gzipped SSE stream; ask for identity to keep it plain text.
         req = req.header("Accept-Encoding", "identity");
     }
-    let resp = req
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| describe_stream_error(&e))?;
+    let resp = send_chat_with_soclaas_retry(req, provider, &body, false).await?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -2642,7 +2678,13 @@ async fn fetch_openai_models(provider: &AiProvider, api_key: &str) -> Result<Vec
 
     let mut models: Vec<AiModel> = data
         .iter()
-        .filter_map(|item| parse_model_item(item))
+        .filter_map(|item| {
+            if crate::soclaas::is_soclaas(provider) {
+                parse_model_item(&crate::soclaas::catalogue_item(item))
+            } else {
+                parse_model_item(item)
+            }
+        })
         .collect();
 
     // OpenRouter keeps embedding models in a separate endpoint that the standard
@@ -3286,14 +3328,14 @@ fn anthropic_known_models() -> Vec<AiModel> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Total-request timeout for non-streaming calls. Streaming calls only get the
-/// connect timeout: their body legitimately takes as long as the generation
+/// Total-request timeout for non-streaming calls. Streaming calls use connect
+/// and idle-read timeouts: their body can take as long as the generation
 /// (reasoning models regularly exceed 2 minutes).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the shared client waits for a TCP + TLS connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the shared client waits between two reads of a response body.
-const READ_TIMEOUT: Duration = Duration::from_secs(180);
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Process-wide shared client: reuses the connection pool (TCP + TLS sessions)
 /// across requests instead of paying a fresh handshake per AI call, which
@@ -3628,7 +3670,13 @@ fn body_error(json: &serde_json::Value) -> Option<(Option<u16>, String)> {
         };
         return Some((None, text));
     }
-    let err = json.get("error")?.as_object()?;
+    let error = json.get("error")?;
+    // SoCLaaS uses {"error":"message"}, including failures inside SSE and
+    // an HTTP 200 JSON body. A string refusal must not become an empty answer.
+    if let Some(message) = error.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some((None, format!("服务商返回错误：{}", char_prefix(message, 500))));
+    }
+    let err = error.as_object()?;
     let message = err
         .get("message")
         .and_then(|m| m.as_str())
@@ -4164,6 +4212,18 @@ mod provider_error_tests {
     // ── provider_error_in_body ──────────────────────────────────────────────
 
     #[test]
+    fn soclaas_string_errors_fail_json_and_sse_responses() {
+        let body = json!({"error": "quota exceeded"});
+        let err = provider_error_in_body(&body).expect("gateway error");
+        assert!(err.contains("quota exceeded"));
+        assert_eq!(stray_body_error(&body.to_string(), ""), Some(err));
+        assert!(provider_error_in_body(&json!({"error": " "})).is_none());
+        assert!(provider_error_in_body(&json!({"choices": [{"delta": {"content": "hi"}}]})).is_none());
+        let long = provider_error_in_body(&json!({"error": "错".repeat(2000)})).unwrap();
+        assert!(long.chars().count() < 550);
+    }
+
+    #[test]
     fn a_base_resp_with_a_numeric_code_is_an_error() {
         let body = json!({
             "id": "x", "choices": null,
@@ -4237,7 +4297,7 @@ mod provider_error_tests {
             json!({"id": "c", "choices": [{"delta": {"content": "hi"}}], "error": null}),
             json!({"error": {}}),
             json!({"error": {"message": "   "}}),
-            json!({"error": "a bare string is not the in-body shape"}),
+            json!({"error": ""}),
             json!({"id": "gen-1", "provider": "OpenAI", "choices": [{"delta": {"content": "x"}}],
                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0}}),
             json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}}),
@@ -4406,7 +4466,7 @@ mod provider_error_tests {
         for msg in [
             "请求超时（120 秒内未完成）: error sending request for url (https://api.minimax.cn/v1/chat/completions)",
             "请求超时（30 秒内未能连上服务器）: error sending request for url (https://x/v1)",
-            "请求超时（180 秒内没有收到任何数据）: error decoding response body",
+            "请求超时（300 秒内没有收到任何数据）: error decoding response body",
             "Network error: 无法连接到服务器 — error sending request: tcp connect error: Connection refused (os error 61)",
             "读取响应失败: Network error: error decoding response body",
             "Stream read error: Network error: error decoding response body",
@@ -4846,6 +4906,9 @@ pub async fn touch_prompt_cache(
         body["tools"] = serde_json::json!(tools);
         body["tool_choice"] = serde_json::json!("auto");
     }
+    if crate::soclaas::is_soclaas(provider) {
+        crate::soclaas::apply_reasoning(&mut body, model, false, None);
+    }
 
     let req = client
         .post(&url)
@@ -5124,14 +5187,14 @@ pub async fn stream_with_tools(
         }
     }
 
+    if crate::soclaas::is_soclaas(provider) {
+        crate::soclaas::apply_reasoning(&mut body, model, use_reasoning, reasoning_effort);
+    }
+
     let req = client
         .post(&url)
         .header("Content-Type", "application/json");
-    let resp = openai_auth(req, provider, api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| describe_stream_error(&e))?;
+    let resp = send_chat_with_soclaas_retry(openai_auth(req, provider, api_key), provider, &body, !tools.is_empty()).await?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -5355,6 +5418,21 @@ pub async fn stream_with_tools(
 #[cfg(test)]
 mod offer_tests {
     use super::*;
+
+    #[test]
+    fn soclaas_catalogue_uses_public_aliases_display_metadata_and_context_limits() {
+        let item = serde_json::json!({
+            "id": "internal-alias", "max_context_tokens": 65536,
+            "soclaas": {"display_name": "Research model", "description": "A private backend"},
+            "supported_parameters": ["tools", "reasoning_effort"],
+        });
+        let model = parse_model_item(&crate::soclaas::catalogue_item(&item)).unwrap();
+        assert_eq!(model.id, "internal-alias");
+        assert_eq!(model.display_name, "Research model");
+        assert_eq!(model.context_length, Some(65536));
+        assert!(model.capabilities.contains(&"tool_calling".to_string()));
+        assert!(model.capabilities.contains(&"reasoning".to_string()));
+    }
 
     /// Both directions must be zero. A model free to read but charging to
     /// generate is not free, and the tag would cost the user money.
@@ -5751,5 +5829,118 @@ mod tool_call_tests {
         for raw in [None, Some(""), Some("   "), Some("{not json")] {
             assert_eq!(parse_tool_arguments(raw), serde_json::json!({}), "{raw:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod soclaas_request_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Local fake gateway: captures real HTTP request bodies and serves exactly
+    // the expected number of replies. No credentials or remote calls.
+    async fn gateway(replies: Vec<(u16, Value)>) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let offset = loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(offset) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..offset]);
+                        let len: usize = headers.lines().find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok())?
+                        }).unwrap_or(0);
+                        if request.len() >= offset + 4 + len { break offset + 4; }
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..offset]).to_ascii_lowercase();
+                assert!(headers.starts_with("post /v1/chat/completions "));
+                assert!(headers.contains("authorization: bearer test-key"));
+                requests.push(serde_json::from_slice(&request[offset..]).unwrap());
+                let body = body.to_string();
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{addr}/v1"), task)
+    }
+
+    fn provider(kind: &str, base_url: &str) -> AiProvider {
+        serde_json::from_value(json!({"id": "isolated-test", "name": "Research", "kind": kind, "base_url": base_url, "created_at": ""})).unwrap()
+    }
+
+    async fn send(kind: &str, url: &str, body: &Value, tools: bool) -> Result<reqwest::Response, String> {
+        let provider = provider(kind, url);
+        let req = openai_auth(reqwest::Client::new().post(format!("{url}/chat/completions")), &provider, "test-key");
+        send_chat_with_soclaas_retry(req, &provider, body, tools).await
+    }
+
+    fn rejection() -> Value {
+        json!({"error": "Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low."})
+    }
+
+    #[tokio::test]
+    async fn soclaas_retries_an_explicit_validation_once_without_changing_the_alias_or_tools() {
+        let (url, server) = gateway(vec![(400, rejection()), (200, json!({"choices": []}))]).await;
+        let body = json!({"model": "operator-alias", "reasoning_effort": "high", "stream": true,
+            "messages": [{"role": "user", "content": "Question"}],
+            "tools": [{"type": "function", "function": {"name": "get_paper"}}], "stream_options": {"include_usage": true}});
+        let response = send("soclaas", &url, &body, true).await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], body);
+        let mut expected = body.clone();
+        expected["reasoning_effort"] = json!("xhigh");
+        assert_eq!(requests[1], expected);
+    }
+
+    #[tokio::test]
+    async fn ordinary_openai_providers_never_enter_the_soclaas_retry() {
+        let (url, server) = gateway(vec![(400, rejection())]).await;
+        let response = send("openai_compatible", &url, &json!({"reasoning_effort": "high"}), false).await.unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn even_a_second_effort_rejection_is_returned_without_a_third_request() {
+        let (url, server) = gateway(vec![(400, rejection()), (400, rejection())]).await;
+        let response = send("soclaas", &url, &json!({"reasoning_effort": "high"}), false).await.unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn quota_permissions_and_model_refusals_are_not_retried() {
+        for (status, message) in [(401, "invalid API key"), (403, "model not allowed"), (429, "quota exceeded"), (503, "backend unavailable"), (400, "invalid model")] {
+            let (url, server) = gateway(vec![(status, json!({"error": message}))]).await;
+            let result = send("soclaas", &url, &json!({"reasoning_effort": "high"}), false).await;
+            if status == 400 {
+                assert!(result.unwrap_err().contains(message));
+            } else {
+                assert_eq!(result.unwrap().status().as_u16(), status);
+            }
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_rejection_keeps_the_library_fallback_marker() {
+        let (url, server) = gateway(vec![(400, json!({"error": "tools are not supported by this model"}))]).await;
+        let err = send("soclaas", &url, &json!({"tools": [], "reasoning_effort": "high"}), true).await.unwrap_err();
+        assert!(err.starts_with(TOOLS_REJECTED_PREFIX), "{err}");
+        assert_eq!(server.await.unwrap().len(), 1);
     }
 }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { modelOffer, modelSizeLabel } from '../../utils/modelOffers'
+import { soclaasLogo } from '../../utils/soclaas'
 import { computed, nextTick, onMounted, onUnmounted, ref, shallowReactive, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { Icon } from '@iconify/vue'
@@ -23,6 +24,8 @@ import type {
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import ChatPageImage from '../ChatPageImage.vue'
 import ChatAnswerBody from '../ChatAnswerBody.vue'
+import GuidedReadingIcon from '../GuidedReadingIcon.vue'
+import { guidedReadingPrompt, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
 import { askAiText } from '../../stores/translationHistory'
@@ -45,7 +48,7 @@ import {
   ATTACHMENT_ACCEPT, buildContentParts, readAttachmentFile, type Attachment,
 } from '../../utils/attachments'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const ai = useAiStore()
 const settingsStore = useSettingsStore()
 // Only for reading the current page, so the model can resolve "this page" in a
@@ -246,12 +249,12 @@ interface PendingWrite { requestId: string; preview: AgentWritePreview }
 const pendingWrites = ref<PendingWrite[]>([])
 const currentWrite = computed<PendingWrite | null>(() => pendingWrites.value[0] ?? null)
 
-function answerWrite(approved: boolean) {
+function answerWrite(approved: boolean, passageColors?: string[]) {
   const pending = currentWrite.value
   if (!pending) return
   // Drop it from the queue first so the button can't answer the same request twice.
   pendingWrites.value = pendingWrites.value.slice(1)
-  invoke('resolve_agent_write', { requestId: pending.requestId, approved }).catch(() => {})
+  invoke('resolve_agent_write', { requestId: pending.requestId, approved, passageColors: approved ? passageColors ?? null : null }).catch(() => {})
 }
 
 /** Take a request off the queue without answering — the backend already stopped
@@ -393,6 +396,11 @@ const activeTitle = computed(() => {
 
 const canSend = computed(() =>
   !!props.slug && input.value.trim().length > 0 && selectedModels.value.length > 0 && !hasStreaming.value
+)
+const guidedReadingStarting = ref(false)
+const canStartGuidedReading = computed(() =>
+  !!props.slug && activeConversation.value?.slug === props.slug
+  && selectedModels.value.length > 0 && !hasStreaming.value && !guidedReadingStarting.value
 )
 
 function storageKey(slug: string) {
@@ -1060,6 +1068,7 @@ function deleteAnswer(group: ChatNode, answer: AssistantAnswer) {
 function firstUserTitle(nodes: ChatNode[]) {
   const first = nodes.find((n): n is Extract<ChatNode, { role: 'user' }> => n.role === 'user')
   if (!first) return ''
+  if (isGuidedReadingPrompt(first.content)) return t('guidedReading.title')
   const title = first.content.replace(/\s+/g, ' ').trim()
   return title.length > 32 ? `${title.slice(0, 32)}…` : title
 }
@@ -1137,6 +1146,9 @@ function selectedModelLabel() {
 }
 
 function modelLogo(modelId: string, providerName = '', providerId = '') {
+  const provider = ai.settings.providers.find(p => p.id === providerId)
+  const nus = soclaasLogo(providerName || provider?.name, provider?.base_url, provider?.kind)
+  if (nus) return nus
   const haystack = `${modelId} ${providerName} ${providerId}`.toLowerCase()
   if (haystack.includes('deepseek')) return modelIconMap.deepseek
   if (haystack.includes('claude') || haystack.includes('anthropic')) return modelIconMap.claude
@@ -1324,6 +1336,27 @@ async function sendMessage() {
   // set up, and the answer must still belong to the paper they asked about.
   const slug = props.slug
   const text = input.value.trim()
+  const files = [...attachments.value]
+  input.value = ''
+  attachments.value = []
+  await submitQuestion(slug, text, files)
+}
+
+async function startGuidedReading() {
+  if (!canStartGuidedReading.value || !props.slug) return
+  const slug = props.slug
+  guidedReadingStarting.value = true
+  try {
+    startNewConversation(true)
+    activeConversation.value!.source = 'guidedReading'
+    // Send the preset directly. The user's unfinished draft and files stay put.
+    await submitQuestion(slug, guidedReadingPrompt(locale.value), [])
+  } finally {
+    guidedReadingStarting.value = false
+  }
+}
+
+async function submitQuestion(slug: string, text: string, files: Attachment[]) {
   activeConversation.value = activeConversation.value ?? createBlankConversation(slug)
   // Read it back so `conv` is the reactive proxy, not the raw object: streaming
   // mutations (possibly from the background) must be tracked by Vue.
@@ -1333,7 +1366,7 @@ async function sendMessage() {
     id: newId('user'),
     role: 'user',
     content: text,
-    attachments: attachments.value.length > 0 ? [...attachments.value] : undefined,
+    attachments: files.length > 0 ? files : undefined,
     createdAt: nowIso(),
   }
   const group: ChatNode = {
@@ -1346,8 +1379,6 @@ async function sendMessage() {
   if (group.answers[0]) setActiveAnswer(group.id, group.answers[0].id)
   conv.nodes.push(userNode, group)
   conv.title = firstUserTitle(conv.nodes) || conv.title
-  input.value = ''
-  attachments.value = []
   persistConversationFor(slug, conv)
   await nextTick()
   resizeTextarea()
@@ -1786,6 +1817,11 @@ async function streamAnswer(
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) {
       if (!reactiveAns.content && finalText) reactiveAns.content = finalText
+      // A click, an API failure or a cancelled partial reply is not an experience.
+      if (owner.source === 'guidedReading' && !reactiveAns.error && reactiveAns.content.trim()
+        && activeRequestIds.get(answer.id) === requestId && rootAtStart === syncLibraryRoot) {
+        markGuidedReadingExperienced()
+      }
     }
   } catch (e) {
     const reactiveAns = findReactiveAnswer(answer.id)
@@ -2389,7 +2425,7 @@ onUnmounted(() => {
       </aside>
 
       <section class="chat-main">
-        <header class="ai-header" :data-tauri-drag-region="props.standalone ? '' : undefined">
+        <header class="ai-header" :class="{ 'with-model-picker': !activeConversationIsMetadataExtraction }" :data-tauri-drag-region="props.standalone ? '' : undefined">
           <div class="header-main" :data-tauri-drag-region="props.standalone ? '' : undefined">
             <span class="spark-icon">
               <Icon icon="fluent:sparkle-24-regular" width="15" height="15" />
@@ -2398,13 +2434,24 @@ onUnmounted(() => {
           </div>
 
           <div class="header-actions">
+            <button
+              class="guided-reading-btn"
+              :class="{ compact: props.standalone ? panelWidth < 480 : panelWidth < (locale.startsWith('zh') ? 300 : 400) }"
+              :title="t('guidedReading.hint')"
+              :aria-label="t('guidedReading.title')"
+              :disabled="!canStartGuidedReading"
+              @click="startGuidedReading"
+            >
+              <GuidedReadingIcon />
+              <span>{{ t('guidedReading.title') }}</span>
+            </button>
             <button class="icon-btn" title="新建对话" @click="startNewConversation(true)">
               <Icon icon="fluent:add-24-regular" width="15" height="15" />
             </button>
             <button v-if="!props.standalone" class="icon-btn" title="在独立窗口打开" @click="openPopupWindow">
               <Icon icon="fluent:open-24-regular" width="14" height="14" />
             </button>
-            <button v-if="!props.standalone" class="icon-btn" title="对话历史" @click="showHistory = true">
+            <button class="icon-btn" :class="{ 'window-history-button': props.standalone }" title="对话历史" @click="showHistory = true">
               <Icon icon="fluent:chat-24-regular" width="16" height="16" />
             </button>
           </div>
@@ -2542,7 +2589,7 @@ onUnmounted(() => {
                     <span class="user-attachment-name">{{ att.name }}</span>
                   </button>
                 </div>
-                <div class="user-bubble">{{ node.content }}</div>
+                <div class="user-bubble">{{ isGuidedReadingPrompt(node.content) ? t('guidedReading.startMessage') : node.content }}</div>
                 <div class="msg-footer user-footer">
                   <div class="msg-actions">
                     <button class="action-btn" :class="{ done: copiedIds.has(node.id) }" title="复制" @click="copyText(node.id, node.content)">
@@ -2765,7 +2812,7 @@ onUnmounted(() => {
             :key="currentWrite.requestId"
             :preview="currentWrite.preview"
             :queued="pendingWrites.length - 1"
-            @approve="answerWrite(true)"
+            @approve="answerWrite(true, $event)"
             @reject="answerWrite(false)"
           />
         </div>
@@ -2909,7 +2956,7 @@ onUnmounted(() => {
         </div>
         </footer>
 
-        <div v-if="!props.standalone && showHistory" class="history-layer" @mousedown.self="showHistory = false">
+        <div v-if="showHistory" class="history-layer" @mousedown.self="showHistory = false">
           <aside class="history-panel">
             <div class="history-head">
               <div>
@@ -3092,9 +3139,6 @@ onUnmounted(() => {
   align-items: center;
   gap: 7px;
 }
-.standalone .header-main {
-  padding-right: clamp(120px, 42vw, 280px);
-}
 .spark-icon {
   display: inline-flex;
   color: var(--accent);
@@ -3122,6 +3166,46 @@ onUnmounted(() => {
 }
 .standalone .header-actions {
   margin-left: 12px;
+}
+.standalone .with-model-picker .header-actions {
+  margin-right: 232px;
+}
+.guided-reading-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-primary));
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background .18s, border-color .18s;
+}
+.guided-reading-btn :deep(svg) { font-size: 21px; }
+.guided-reading-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-primary));
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.guided-reading-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.guided-reading-btn:disabled { opacity: .45; cursor: default; }
+.guided-reading-btn.compact { width: 30px; padding: 0; }
+.guided-reading-btn.compact span { display: none; }
+.standalone .window-history-button { display: none; }
+@media (max-width: 700px) {
+  .standalone .history-sidebar { display: none; }
+  .standalone .window-history-button { display: inline-flex; }
+}
+@media (max-width: 480px) {
+  .standalone .ai-header { padding: 0 12px; }
+  .standalone .with-model-picker .header-actions { margin-right: 162px; }
+  .paper-ai.standalone .floating-model-picker { right: 12px; }
+  .paper-ai.standalone .model-trigger { width: 150px; }
 }
 
 .model-picker { position: relative; }

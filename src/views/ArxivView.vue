@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted, computed, watch } from 'vue'
 import { Icon } from '@iconify/vue'
+import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
@@ -8,8 +9,7 @@ import { LogicalSize } from '@tauri-apps/api/dpi'
 import { emitTo, type UnlistenFn } from '@tauri-apps/api/event'
 import { useArxivStore, type SortMode } from '../stores/arxiv'
 import { useAiStore } from '../stores/ai'
-import { useCollectionsStore } from '../stores/collections'
-import type { ArxivPaper, Collection } from '../types'
+import type { ArxivPaper } from '../types'
 import WindowControls from '../components/WindowControls.vue'
 import ArxivWaitBadge from '../components/ArxivWaitBadge.vue'
 import ArxivFilteredPanel from '../components/ArxivFilteredPanel.vue'
@@ -22,7 +22,7 @@ function openUrl(url: string) {
   invoke('open_url', { url }).catch(console.error)
 }
 
-const collectionsStore = useCollectionsStore()
+const { t } = useI18n()
 
 const store = useArxivStore()
 const aiStore = useAiStore()
@@ -278,87 +278,15 @@ watch(() => store.analysisNotice, (n) => {
   }
 })
 
-// Collection picker
-const showColPicker = ref(false)
-const colPickerPos = ref({ top: 0, left: 0 })
-
-const PICKER_PANEL_W = 196
-const PICKER_PANEL_GAP = 3
-
-function openColPicker(e: MouseEvent) {
-  const btn = e.currentTarget as HTMLElement
-  const r = btn.getBoundingClientRect()
-  colPickerPos.value = { top: r.bottom + 4, left: r.left }
-  showColPicker.value = true
-  hoveredPath.value = []
-  subPanelTops.value = []
-  collectionsStore.load()
-}
-
-// Cascading collection picker
-const colsByParent = computed(() => {
-  const map = new Map<string | null, Collection[]>()
-  for (const col of collectionsStore.file.collections) {
-    const pid = col.parent_id ?? null
-    if (!map.has(pid)) map.set(pid, [])
-    map.get(pid)!.push(col)
-  }
-  for (const items of map.values()) {
-    items.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }))
-  }
-  return map
-})
-
-function colChildren(parentId: string | null): Collection[] {
-  return colsByParent.value.get(parentId) ?? []
-}
-
-function colHasChildren(colId: string): boolean {
-  return (colsByParent.value.get(colId)?.length ?? 0) > 0
-}
-
-const hoveredPath = ref<string[]>([])
-const subPanelTops = ref<number[]>([])
-
-function onColHover(col: Collection, level: number, e: MouseEvent) {
-  hoveredPath.value = [...hoveredPath.value.slice(0, level), col.id]
-  if (colHasChildren(col.id)) {
-    const el = e.currentTarget as HTMLElement
-    const itemTop = el.getBoundingClientRect().top - colPickerPos.value.top
-    subPanelTops.value = [...subPanelTops.value.slice(0, level), itemTop]
-  } else {
-    subPanelTops.value = subPanelTops.value.slice(0, level)
-  }
-}
-
-interface CascadePanel { items: Collection[]; left: number; top: number }
-
-const cascadePanels = computed<CascadePanel[]>(() => {
-  const { left, top } = colPickerPos.value
-  const result: CascadePanel[] = [{ items: colChildren(null), left, top }]
-  for (let i = 0; i < hoveredPath.value.length; i++) {
-    const children = colChildren(hoveredPath.value[i])
-    if (children.length === 0) break
-    result.push({
-      items: children,
-      left: left + (i + 1) * (PICKER_PANEL_W + PICKER_PANEL_GAP),
-      top: top + (subPanelTops.value[i] ?? 0),
-    })
-  }
-  return result
-})
-
 onMounted(async () => {
   await watchWindowSize()
   const restoreSizePromise = restoreWindowSize().catch(() => {})
   const aiLoadPromise = aiStore.load().catch(console.error)
-  const collectionsLoadPromise = collectionsStore.load().catch(console.error)
 
   await store.load()
   await store.subscribeEvents()
   await restoreSizePromise
   void aiLoadPromise
-  void collectionsLoadPromise
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('mousedown', onGlobalMousedown)
   emitTo('main', 'arxiv-window-opened').catch(() => {})
@@ -385,7 +313,6 @@ function onKeydown(e: KeyboardEvent) {
     showSettings.value = false
     showSortMenu.value = false
     showCalendar.value = false
-    showColPicker.value = false
     showTopicMenu.value = false
   }
 }
@@ -460,9 +387,8 @@ async function refreshPapers() {
   await store.refreshInbox()
 }
 
-async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
+async function addToLibrary(paper: ArxivPaper) {
   if (paper.in_library || addingId.value) return
-  showColPicker.value = false
   addingId.value = paper.arxiv_id
   setAddMessage('')
 
@@ -477,29 +403,22 @@ async function addToLibrary(paper: ArxivPaper, collectionId?: string) {
   if (nextId) selectedId.value = nextId
 
   try {
-    const slug = await store.addToLibrary(paper.arxiv_id, collectionId)
+    const slug = await store.addToLibrary(paper.arxiv_id)
     if (!slug) {
       // Duplicate, and the user canceled — the recommendation stays put.
       if (nextId) selectedId.value = paper.arxiv_id
       return
     }
-    const colName = collectionId
-      ? (collectionsStore.file.collections.find(c => c.id === collectionId)?.name ?? '')
-      : ''
-    setAddMessage(colName ? `已添加到「${colName}」` : '已添加到文库', 3000)
+    setAddMessage(t('arxiv.addedToStaging'), 3000)
     // Pass the slug so the main window can run the full AI-metadata + enrichment
     // pipeline on the freshly-added paper (it only has arXiv source metadata so far).
     emitTo('main', 'library-paper-added', { slug, title: paper.title }).catch(() => {})
   } catch (e) {
+    if (nextId) selectedId.value = paper.arxiv_id
     setAddMessage(String(e))
   } finally {
     addingId.value = null
   }
-}
-
-function addToLibraryIfAllowed(paper: ArxivPaper, col: Collection) {
-  if (!collectionsStore.canReceivePapers(col.id)) return
-  addToLibrary(paper, col.id)
 }
 
 async function doFetch() {
@@ -1375,74 +1294,15 @@ function jumpToDate(dateStr: string) {
           <!-- Action buttons -->
           <div class="detail-actions">
             <template v-if="!selectedPaper.in_library">
-              <!-- Single button: always opens collection picker first -->
+              <!-- Recommendations go directly to the arXiv staging list. -->
               <button
                 class="btn-add-main"
                 :disabled="!!addingId"
-                @click="openColPicker"
+                @click="addToLibrary(selectedPaper)"
               >
                 <Icon icon="fluent:add-24-regular" width="14" height="14" />
-                {{ addingId === selectedPaper.arxiv_id ? '添加中...' : '添加到文库' }}
+                {{ addingId === selectedPaper.arxiv_id ? t('arxiv.adding') : t('arxiv.addToLibrary') }}
               </button>
-
-              <!-- Collection picker: cascading flyout -->
-              <Teleport to="body">
-                <div v-if="showColPicker" class="col-picker-backdrop" @click="showColPicker = false" />
-                <template v-if="showColPicker">
-                  <Transition name="col-pop" appear>
-                    <!-- Level 0: animated -->
-                    <div
-                      class="col-cascade-panel"
-                      :style="{ left: cascadePanels[0].left + 'px', top: cascadePanels[0].top + 'px' }"
-                    >
-                      <div class="col-picker-header">选择分类</div>
-                      <div class="col-picker-list">
-                        <div v-if="cascadePanels[0].items.length === 0" class="col-picker-empty">暂无分类，请先在文库中创建</div>
-                        <button
-                          v-for="col in cascadePanels[0].items"
-                          :key="col.id"
-                          class="col-picker-item"
-                          :class="{
-                            'col-item-open': hoveredPath[0] === col.id,
-                            'col-picker-item-disabled': !collectionsStore.canReceivePapers(col.id),
-                          }"
-                          @mouseenter="onColHover(col, 0, $event)"
-                          @click="addToLibraryIfAllowed(selectedPaper, col)"
-                        >
-                          <span class="col-emoji">{{ col.emoji ?? '📁' }}</span>
-                          <span class="col-name">{{ col.name }}</span>
-                          <Icon v-if="colHasChildren(col.id)" class="col-chevron-right" icon="fluent:chevron-right-24-regular" width="10" height="10" />
-                        </button>
-                      </div>
-                    </div>
-                  </Transition>
-                  <!-- Level 1+: appear instantly, aligned to hovered row -->
-                  <div
-                    v-for="(panel, idx) in cascadePanels.slice(1)"
-                    :key="idx + 1"
-                    class="col-cascade-panel"
-                    :style="{ left: panel.left + 'px', top: panel.top + 'px' }"
-                  >
-                    <div class="col-picker-list">
-                        <button
-                          v-for="col in panel.items"
-                          :key="col.id"
-                          class="col-picker-item"
-                          :class="{
-                            'col-item-open': hoveredPath[idx + 1] === col.id,
-                            'col-picker-item-disabled': !collectionsStore.canReceivePapers(col.id),
-                          }"
-                          @mouseenter="onColHover(col, idx + 1, $event)"
-                          @click="addToLibraryIfAllowed(selectedPaper, col)"
-                        >
-                        <span class="col-emoji">{{ col.emoji ?? '📁' }}</span>
-                        <span class="col-name">{{ col.name }}</span>
-                        <Icon v-if="colHasChildren(col.id)" class="col-chevron-right" icon="fluent:chevron-right-24-regular" width="10" height="10" />
-                      </button>
-                    </div>
-                  </div>
-                </template>
-              </Teleport>
             </template>
 
             <span v-else class="in-lib-tag">
@@ -2361,52 +2221,6 @@ export default defineComponent({ components: { ArxivSettingsPanel } })
 }
 .btn-add-main:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-add-main:disabled { opacity: 0.5; cursor: not-allowed; }
-
-/* Collection picker: cascading flyout */
-.col-picker-backdrop {
-  position: fixed; inset: 0; z-index: 999;
-}
-.col-cascade-panel {
-  position: fixed; z-index: 1000;
-  background: var(--bg-primary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-lg);
-  width: 196px;
-  overflow: hidden;
-}
-.col-pop-enter-active { transition: opacity 0.14s ease, transform 0.14s ease; }
-.col-pop-leave-active { transition: opacity 0.1s ease, transform 0.1s ease; }
-.col-pop-enter-from { opacity: 0; transform: translateY(-5px) scale(0.97); }
-.col-pop-leave-to   { opacity: 0; transform: translateY(-5px) scale(0.97); }
-.col-picker-header {
-  padding: 9px 12px 7px;
-  font-size: 11px; font-weight: 600;
-  color: var(--text-tertiary); letter-spacing: 0.04em;
-  border-bottom: 1px solid var(--border-subtle);
-}
-.col-picker-list {
-  max-height: 240px; overflow-y: auto;
-  padding: 4px 0;
-}
-.col-picker-list::-webkit-scrollbar { width: 3px; }
-.col-picker-list::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 2px; }
-.col-picker-empty { padding: 12px; font-size: 12px; color: var(--text-tertiary); text-align: center; }
-.col-picker-item {
-  display: flex; align-items: center; gap: 7px;
-  width: 100%; padding: 7px 10px;
-  font-size: 12px; color: var(--text-primary);
-  text-align: left; transition: background 0.1s;
-}
-.col-picker-item:hover,
-.col-picker-item.col-item-open { background: var(--bg-hover); }
-.col-picker-item-disabled {
-  color: var(--text-secondary);
-  cursor: default;
-}
-.col-emoji { font-size: 13px; flex-shrink: 0; }
-.col-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.col-chevron-right { flex-shrink: 0; color: var(--text-tertiary); }
 
 .in-lib-tag {
   display: inline-flex; align-items: center; gap: 4px;

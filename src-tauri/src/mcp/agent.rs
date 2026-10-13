@@ -179,6 +179,10 @@ fn passage_tool(annotation: bool) -> AgentTool {
             (not printed labels). Coordinates are computed from the PDF; never guess boxes. \
             Each quote must be unique on its page; include more context if ambiguous. \
             PDF line wraps/ligatures are tolerated. Supply 1–30 passages per call; \
+            Respect the user's requested colors: set `color` for the whole batch, or \
+            override `color` on individual passages. Named colors yellow, green, blue, pink, \
+            orange and purple match the reader palette; custom #RRGGBB is also supported. \
+            If no color is requested, yellow is the default. \
             {} The user reviews the located text and approves the batch. \
             This only adds records and never replaces an existing highlight or comment. \
             Identical retries reuse existing records. Scanned image-only PDFs cannot be marked.",
@@ -189,13 +193,14 @@ fn passage_tool(annotation: bool) -> AgentTool {
             "type": "object", "additionalProperties": false,
             "properties": {
                 "slug": {"type": "string", "description": "Exact paper slug from find_papers/get_paper; duplicate titles have distinct slugs."},
+                "color": {"type": "string", "description": "Default batch color: yellow, green, blue, pink, orange, purple, or #RRGGBB. Individual passage colors override it.", "default": "yellow"},
                 "passages": {"type": "array", "minItems": 1, "maxItems": 30, "items": {
                     "type": "object", "additionalProperties": false,
                     "properties": {
                         "page": {"type": "integer", "minimum": 1},
                         "text": {"type": "string", "minLength": 1, "maxLength": 10000, "description": "Unique original excerpt from this PDF page."},
                         "note": {"type": "string", "maxLength": 10000, "description": "Annotation/comment to attach to this excerpt."},
-                        "color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$", "default": "#FFEB3B"},
+                        "color": {"type": "string", "description": "Color of this passage: yellow, green, blue, pink, orange, purple, or #RRGGBB. Omit to inherit the batch color (yellow by default)."},
                         "style": {"type": "string", "enum": ["highlight", "underline"], "default": "highlight"}
                     }, "required": required
                 }}

@@ -8,6 +8,7 @@ import { useAiStore } from '../../stores/ai'
 import { useSettingsStore } from '../../stores/settings'
 import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import { providerLogo } from '../../utils/providerLogo'
+import { SOCLAAS_BASE_URL } from '../../utils/soclaas'
 import type {
   AiModel, AiProviderInfo, AiProviderInput, DeepSeekFile, DeepSeekFileList,
   DeepSeekVisionLimits, ModelSelection, ServerTools, SpeechOutput,
@@ -20,6 +21,7 @@ const settingsStore = useSettingsStore()
 // ── Presets ───────────────────────────────────────────────────────────────────
 
 const PRESETS = [
+  { label: 'SoCLaaS (NUS)', base_url: SOCLAAS_BASE_URL,                    kind: 'soclaas' },
   { label: 'OpenAI',       base_url: 'https://api.openai.com/v1',         kind: 'openai_compatible' },
   { label: 'OpenRouter',   base_url: 'https://openrouter.ai/api/v1',      kind: 'openrouter' },
   { label: 'DeepSeek',     base_url: 'https://api.deepseek.com/v1',       kind: 'openai_compatible' },
@@ -916,8 +918,8 @@ async function setDefaultModel(providerId: string, modelId: string) {
 // The map itself lives in utils/providerLogo.ts so the usage dashboard shows the
 // same mark for the same provider.
 
-function providerLogoUrl(name: string, baseUrl: string): string | null {
-  return providerLogo(name, baseUrl) || null
+function providerLogoUrl(name: string, baseUrl: string, kind = ''): string | null {
+  return providerLogo(name, baseUrl, kind) || null
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1072,7 +1074,7 @@ function toggleCapability(form: ModelForm, cap: string) {
             @contextmenu.prevent="openProviderCtx($event, p)"
           >
             <span class="provider-initial">
-              <img v-if="providerLogoUrl(p.name, p.base_url)" :src="providerLogoUrl(p.name, p.base_url)!" class="provider-logo" alt="" />
+              <img v-if="providerLogoUrl(p.name, p.base_url, p.kind)" :src="providerLogoUrl(p.name, p.base_url, p.kind)!" class="provider-logo" alt="" />
               <template v-else>{{ p.name[0]?.toUpperCase() ?? 'P' }}</template>
             </span>
             <span class="provider-name">{{ p.name }}</span>
@@ -1125,6 +1127,7 @@ function toggleCapability(form: ModelForm, cap: string) {
           <div class="field-label">{{ t('aiService.serviceType') }}</div>
           <select v-model="addForm.kind" class="select-input">
             <option value="openai_compatible">{{ t('aiService.openaiCompat') }}</option>
+            <option value="soclaas">{{ t('aiService.soclaas') }}</option>
             <option value="openrouter">{{ t('aiService.openrouter') }}</option>
             <option value="kimi">{{ t('aiService.kimi') }}</option>
             <option value="qwenai">{{ t('aiService.qwenai') }}</option>
@@ -1160,8 +1163,8 @@ function toggleCapability(form: ModelForm, cap: string) {
       <template v-else>
         <div class="detail-header">
           <img
-            v-if="providerLogoUrl(selectedProvider.name, selectedProvider.base_url)"
-            :src="providerLogoUrl(selectedProvider.name, selectedProvider.base_url)!"
+            v-if="providerLogoUrl(selectedProvider.name, selectedProvider.base_url, selectedProvider.kind)"
+            :src="providerLogoUrl(selectedProvider.name, selectedProvider.base_url, selectedProvider.kind)!"
             class="detail-logo"
             alt=""
           />
@@ -1262,6 +1265,7 @@ function toggleCapability(form: ModelForm, cap: string) {
           <div class="field-label">{{ t('aiService.serviceType') }}</div>
           <select v-model="editKind" class="select-input" @change="saveProvider()">
             <option value="openai_compatible">{{ t('aiService.openaiCompat') }}</option>
+            <option value="soclaas">{{ t('aiService.soclaas') }}</option>
             <option value="openrouter">{{ t('aiService.openrouter') }}</option>
             <option value="kimi">{{ t('aiService.kimi') }}</option>
             <option value="qwenai">{{ t('aiService.qwenai') }}</option>

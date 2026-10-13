@@ -8,6 +8,17 @@ export const useCollectionsStore = defineStore('collections', () => {
   const file = ref<CollectionsFile>({ collections: [], assignments: [] })
   const library = useLibraryStore()
 
+  // A virtual staging list, not a collection. Assigning a recommendation to a
+  // collection removes it immediately; the source metadata survives restarts.
+  const arxivPapers = computed(() => {
+    const collectionIds = new Set(file.value.collections.map(c => c.id))
+    const assignedIds = new Set(file.value.assignments
+      .filter(a => collectionIds.has(a.collection_id))
+      .map(a => a.paper_id))
+    return library.papers.filter(p =>
+      (p.import_source === 'arxiv' || p.import_source === 'biorxiv') && !assignedIds.has(p.id))
+  })
+
   const topLevel = computed(() =>
     file.value.collections
       .filter(c => !c.parent_id)
@@ -226,6 +237,7 @@ export const useCollectionsStore = defineStore('collections', () => {
 
   return {
     file,
+    arxivPapers,
     topLevel,
     childrenOf,
     collectionById,

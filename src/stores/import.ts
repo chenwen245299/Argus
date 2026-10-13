@@ -10,6 +10,7 @@ import { useCollectionsStore } from './collections'
 import { useRanksStore } from './ranks'
 import { useSettingsStore } from './settings'
 import { i18n } from '../i18n'
+import { confirmDuplicateImport } from '../utils/duplicateImport'
 
 /** A paper already in the library that matches the one being imported. */
 interface DuplicateHit { existingSlug: string; title: string }
@@ -62,10 +63,6 @@ export const useImportStore = defineStore('import', () => {
     jobs.value = jobs.value.filter(j => j.slug !== slug && j.id !== slug)
   }
 
-  function keepDuplicate(dup: DuplicateHit): boolean {
-    return window.confirm(i18n.global.t('import.duplicateConfirm', { title: dup.title }))
-  }
-
   /**
    * Only a user-declined duplicate is removed. Whatever was already written for the
    * half-imported paper — its folder, search-index entry, vector chunks and
@@ -78,7 +75,10 @@ export const useImportStore = defineStore('import', () => {
     const collections = useCollectionsStore()
     try {
       await invoke('delete_paper', { slug })
-    } catch { /* nothing was written yet, or it's already gone */ }
+    } catch {
+      _setStatus(slug, 'error', i18n.global.t('import.duplicateCleanupFailed'))
+      return
+    }
     _removeJob(slug)
     lastDuplicate.value = { title: dup.title, existingSlug: dup.existingSlug, source }
     // Only follow the user's focus: during a batch import the selection must not
@@ -111,14 +111,16 @@ export const useImportStore = defineStore('import', () => {
     const collections = useCollectionsStore()
 
     const jobId = `ebook_${crypto.randomUUID()}`
+    let currentSlug = jobId
     _addJob(jobId, filename)
     try {
       const finalSlug = await invoke<string>('import_ebook', { sourcePath, collectionId })
+      currentSlug = finalSlug
       _updateSlug(jobId, finalSlug)
       // The ebook's metadata is embedded, so it's known right after import — check
       // for a duplicate before keeping it.
       const dup = await invoke<DuplicateHit | null>('find_duplicate_paper', { slug: finalSlug })
-      if (dup && !keepDuplicate(dup)) {
+      if (dup && !await confirmDuplicateImport(dup.title)) {
         await _abortAsDuplicate(finalSlug, filename, dup)
         return
       }
@@ -127,7 +129,7 @@ export const useImportStore = defineStore('import', () => {
       await library.refresh()
       selection.selectPaper(finalSlug)
     } catch (e) {
-      _setStatus(jobId, 'error', String(e))
+      _setStatus(currentSlug, 'error', String(e))
     }
   }
 
@@ -265,13 +267,23 @@ export const useImportStore = defineStore('import', () => {
     //     independent copy or skip it — see `_abortAsDuplicate`.
     if (checkDuplicate) {
       const source = jobs.value.find(j => j.slug === cur)?.filename ?? cur
+      let dup: DuplicateHit | null = null
       try {
-        const dup = await invoke<DuplicateHit | null>('find_duplicate_paper', { slug: cur })
-        if (dup && !keepDuplicate(dup)) {
+        dup = await invoke<DuplicateHit | null>('find_duplicate_paper', { slug: cur })
+      } catch { /* lookup failed — metadata remains best-effort */ }
+      if (dup) {
+        let keep: boolean
+        try {
+          keep = await confirmDuplicateImport(dup.title)
+        } catch {
+          _setStatus(cur, 'error', i18n.global.t('import.duplicatePromptFailed'))
+          return
+        }
+        if (!keep) {
           await _abortAsDuplicate(cur, source, dup)
           return
         }
-      } catch { /* check failed — proceed with import rather than block */ }
+      }
     }
 
     // 2. Rename the folder to the canonical title-based slug.
@@ -370,7 +382,7 @@ export const useImportStore = defineStore('import', () => {
       // after the user opts into a new, independent copy.
       let acceptedDuplicate = false
       if (res.status === 'duplicate') {
-        if (keepDuplicate({ title: res.title ?? url.trim(), existingSlug: res.existingSlug ?? '' })) {
+        if (await confirmDuplicateImport(res.title ?? url.trim())) {
           acceptedDuplicate = true
           res = await invoke<ImportOutcome>('import_paper_url', { url: url.trim(), collectionId, force: true })
           if (res.status !== 'imported' || !res.slug) throw new Error('Duplicate import did not create a separate paper')

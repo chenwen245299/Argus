@@ -247,7 +247,6 @@ async fn finalize_paper(
             meta.arxiv_id.as_deref(),
             meta.doi.as_deref(),
             &meta.title,
-            &meta.authors,
             None,
         ) {
             return Ok(Some(hit));

@@ -10,6 +10,10 @@ const { chromium } = await import(process.env.ARGUS_TEST_PLAYWRIGHT || 'playwrig
 const localeSource = await readFile(new URL('../src/i18n/locales.ts', import.meta.url), 'utf8')
 const localeCode = ts.transpileModule(localeSource, { compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.ESNext } }).outputText
 const { zh } = await import('data:text/javascript;base64,' + Buffer.from(localeCode).toString('base64'))
+const { HIGHLIGHT_COLORS } = await import('data:text/javascript;base64,' + Buffer.from(ts.transpileModule(
+  await readFile(new URL('../src/utils/highlightColors.ts', import.meta.url), 'utf8'),
+  { compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.ESNext } },
+).outputText).toString('base64'))
 const source = await readFile(new URL('../src/components/WriteConfirmCard.vue', import.meta.url), 'utf8')
 const { descriptor } = parse(source)
 const compiled = compileScript(descriptor, { id: 'write-preview-test' })
@@ -17,7 +21,8 @@ const vueImports = (_, names) => `const {${names.replace(/\bas\b/g, ':')}} = win
 const script = ts.transpileModule(compiled.content, { compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.ESNext } }).outputText
   .replace(/import \{([^}]+)\} from ['"]vue['"];?/g, vueImports)
   .replace(/import \{ Icon \} from ['"]@iconify\/vue['"];?/g, 'const Icon = { render: () => window.Vue.h("span") };')
-  .replace(/import \{ useI18n \} from ['"]vue-i18n['"];?/g, String.raw`const useI18n = () => ({ t: (key, args = {}) => (window.translations[key.replace('writeConfirm.', '')] || key).replace(/\{(\w+)\}/g, (_, name) => args[name] ?? '') });`)
+  .replace(/import \{ useI18n \} from ['"]vue-i18n['"];?/g, String.raw`const useI18n = () => ({ t: (key, args = {}) => (key.split('.').reduce((value, name) => value?.[name], window.translations) || key).replace(/\{(\w+)\}/g, (_, name) => args[name] ?? '') });`)
+  .replace(/import \{ HIGHLIGHT_COLORS \} from ['"][^'"]+['"];?/g, `const HIGHLIGHT_COLORS = ${JSON.stringify(HIGHLIGHT_COLORS)};`)
   .replace(/import MarkdownBody from ['"][^'"]+['"];?/g, `const MarkdownBody = { props: ['content'], render() { return window.Vue.h('div', this.content) } };`)
   .replace('export default', 'const component =')
 const template = compileTemplate({ source: descriptor.template.content, filename: 'WriteConfirmCard.vue', id: 'write-preview-test',
@@ -33,7 +38,7 @@ const files = new Map([
     :root { --accent:#6386ae; --bg-primary:#f7f9fa; --bg-secondary:#edf1f3; --border-subtle:#e3e8ed;
       --text-primary:#202c3d; --text-secondary:#53677e; --text-tertiary:#8b9caf; --radius-md:8px; --radius-lg:12px; }
     body { padding:20px; font-family:Arial,sans-serif; } #app { max-width:620px; } ${styles}
-    </style><div id="app"></div><script>window.translations = ${JSON.stringify(zh.writeConfirm)}</script><script src="/vue.js"></script><script src="/card.js"></script>`)],
+    </style><div id="app"></div><script>window.translations = ${JSON.stringify({ writeConfirm: zh.writeConfirm, pdf: zh.pdf })}</script><script src="/vue.js"></script><script src="/card.js"></script>`)],
 ])
 let server, browser, page, origin
 before(async () => {
@@ -53,8 +58,10 @@ async function mount(preview) {
   await page.goto(origin)
   await page.evaluate(preview => {
     window.decisions = []
+    window.approvedColors = []
+    window.originalPreview = preview
     window.Vue.createApp({ render: () => window.Vue.h(window.Card, { preview, queued: 2,
-      onApprove: () => window.decisions.push('approved'), onReject: () => window.decisions.push('rejected') }) }).mount('#app')
+      onApprove: colors => { window.decisions.push('approved'); window.approvedColors.push(colors) }, onReject: () => window.decisions.push('rejected') }) }).mount('#app')
   }, preview)
 }
 test('a marking batch shows the exact copy, page indices, excerpts and annotations before approving', async () => {
@@ -75,6 +82,7 @@ test('a marking batch shows the exact copy, page indices, excerpts and annotatio
   }
   await page.locator('.wc-btn.primary').click()
   assert.deepEqual(await page.evaluate(() => window.decisions), ['approved'])
+  assert.deepEqual(await page.evaluate(() => window.approvedColors), [['#FFEB3B', '#93C5FD']])
 })
 test('note previews and rejection still work with the existing payload shape', async () => {
   await mount({ tool: 'create_paper_note', slug: 'paper', paperTitle: 'A Paper', noteTitle: 'Reading notes', content: 'Existing note preview', duplicateTitle: true })
@@ -83,4 +91,33 @@ test('note previews and rejection still work with the existing payload shape', a
   assert.equal(await page.locator('.wc-warn').count(), 1)
   await page.locator('.wc-btn').first().click()
   assert.deepEqual(await page.evaluate(() => window.decisions), ['rejected'])
+})
+
+test('highlight and annotation batches allow independent palette and custom colors, preview them, and send only the confirmed choices', async () => {
+  for (const tool of ['create_paper_highlights', 'create_paper_annotations']) {
+    await mount({ tool, slug: 'paper', paperTitle: 'Paper', noteTitle: '', content: '', duplicateTitle: false,
+      passages: [{ page: 1, text: 'First passage.', note: tool.endsWith('annotations') ? 'First note' : null, color: '#FFEB3B', style: 'highlight' },
+        { page: 2, text: 'Second passage.', note: tool.endsWith('annotations') ? 'Second note' : null, color: '#F48FB1', style: 'underline' }] })
+    const first = page.locator('.wc-passage').first(), second = page.locator('.wc-passage').nth(1)
+    assert.equal(await first.locator('.wc-color').count(), 6)
+    await first.getByRole('button', { name: '蓝色', exact: true }).click()
+    await second.locator('input[type=color]').fill('#12ab34')
+    assert.equal(await first.getByRole('button', { name: '蓝色', exact: true }).getAttribute('aria-pressed'), 'true')
+    assert.equal(await first.locator('blockquote').evaluate(el => getComputedStyle(el).borderLeftColor), 'rgb(144, 202, 249)')
+    assert.equal(await second.locator('blockquote').evaluate(el => getComputedStyle(el).borderLeftColor), 'rgb(18, 171, 52)')
+    assert.deepEqual(await page.evaluate(() => window.decisions), [], 'choosing a color never approves a write')
+    assert.deepEqual(await page.evaluate(() => window.originalPreview.passages.map(p => p.color)), ['#FFEB3B', '#F48FB1'], 'captured preview is not mutated')
+    if (process.env.ARGUS_TEST_OUTPUT_DIR) await page.locator('#app').screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/write-confirm-colors.png` })
+    await page.locator('.wc-btn.primary').click()
+    assert.deepEqual(await page.evaluate(() => window.approvedColors), [['#90CAF9', '#12ab34']])
+  }
+})
+
+test('rejecting a color-edited batch does not send color choices or an approval', async () => {
+  await mount({ tool: 'create_paper_highlights', slug: 'paper', paperTitle: 'Paper', noteTitle: '', content: '', duplicateTitle: false,
+    passages: [{ page: 1, text: 'First passage.', color: '#FFEB3B', style: 'highlight' }] })
+  await page.getByRole('button', { name: '紫色', exact: true }).click()
+  await page.locator('.wc-btn').first().click()
+  assert.deepEqual(await page.evaluate(() => window.decisions), ['rejected'])
+  assert.deepEqual(await page.evaluate(() => window.approvedColors), [])
 })

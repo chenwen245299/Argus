@@ -45,11 +45,13 @@ mod sections;
 mod security_bookmark;
 mod settings;
 mod snippets;
+mod soclaas;
 mod speech_cache;
 mod stepfun;
 mod stepfun_media;
 mod token_usage;
 mod url_import;
+mod update_notes;
 mod watcher;
 mod write_confirm;
 mod writing;
@@ -371,6 +373,7 @@ pub fn run() {
             commands::export_canvas_image,
             // ── Shell ──
             commands::open_url,
+            commands::get_update_release_notes,
             commands::open_in_finder,
             // ── Folder paths ──
             commands::get_canvases_folder_path,

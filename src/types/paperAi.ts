@@ -59,5 +59,5 @@ export interface PaperAiConversation {
   createdAt: string
   updatedAt: string
   nodes: PaperAiChatNode[]
-  source?: 'chat' | 'metadataExtraction'
+  source?: 'chat' | 'metadataExtraction' | 'guidedReading'
 }

@@ -39,6 +39,7 @@ const EbookViewer = defineAsyncComponent(() => import('../components/EbookViewer
 const CanvasPanel = defineAsyncComponent(() => import('../components/CanvasPanel.vue'))
 const SettingsModal = defineAsyncComponent(() => import('../components/SettingsModal.vue'))
 const WelcomeOnboarding = defineAsyncComponent(() => import('../components/WelcomeOnboarding.vue'))
+const GuidedReadingIntro = defineAsyncComponent(() => import('../components/GuidedReadingIntro.vue'))
 const SnippetLibraryView = defineAsyncComponent(() => import('../components/SnippetLibraryView.vue'))
 const WritingView = defineAsyncComponent(() => import('../components/WritingView.vue'))
 
@@ -509,6 +510,7 @@ function openSettingsOnAi() {
 // "don't remind me again" checkbox (which sets the flag below).
 const ONBOARDING_DISMISSED_KEY = 'argus:onboarding:dismissed'
 const showOnboarding = ref(false)
+const guidedReadingIntroReady = ref(false)
 
 function onboardingNeeded(): boolean {
   const modelDone = !!aiStore.findModel(aiStore.defaultSelection)
@@ -712,6 +714,7 @@ onMounted(async () => {
     await loadMainLayout(libraryStore.currentPath)
     initSnippetStore()
     maybeShowOnboarding()
+    guidedReadingIntroReady.value = true
   }
 
   // Tauri 2 file drag-drop
@@ -817,6 +820,7 @@ async function onLibraryOpened() {
   await loadMainLayout(libraryStore.currentPath!)
   initSnippetStore()
   maybeShowOnboarding()
+  guidedReadingIntroReady.value = true
 }
 
 // Reload per-library stores whenever the library path changes — both the
@@ -1120,6 +1124,7 @@ watch(
 
     <!-- First-run onboarding (guides default-model + Semantic Scholar setup) -->
     <WelcomeOnboarding v-if="showOnboarding" @close="dismissOnboarding" />
+    <GuidedReadingIntro :ready="guidedReadingIntroReady && !showOnboarding && !showSettings" />
 
     <!-- Unified settings modal -->
     <SettingsModal

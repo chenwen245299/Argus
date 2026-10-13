@@ -225,7 +225,7 @@ export interface ImportJob {
 export type SortField = 'title' | 'year' | 'added_at' | 'authors' | 'venue' | 'cite_count'
 export type SortDir = 'asc' | 'desc'
 
-export type NavItem = 'all' | 'recent' | 'inbox' | 'search' | `tag:${string}` | `collection:${string}`
+export type NavItem = 'all' | 'arxiv' | 'recent' | 'inbox' | 'search' | `tag:${string}` | `collection:${string}`
 
 // ── M4: Collections ───────────────────────────────────────────────────────────
 

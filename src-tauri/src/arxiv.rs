@@ -679,14 +679,16 @@ pub fn mark_in_library_statuses(root: &str, papers: &mut Vec<ArxivPaper>) {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateHit {
+    #[serde(rename = "existingSlug")]
     pub slug: String,
     pub title: String,
 }
 
 /// Scan the library for a paper matching the given identity, returning the
 /// existing paper's slug + title if found. Match order: (1) arxiv_id
-/// (version-insensitive) or DOI equality, (2) normalized title + first-author
-/// lastname (matching also when either side has no first author). `exclude_slug`
+/// (version-insensitive) or DOI equality, (2) normalized title equality. Title
+/// matches are advisory: the user decides whether to keep an independent copy,
+/// even when authors differ or metadata is incomplete. `exclude_slug`
 /// skips one folder — used when the candidate is itself already present as a
 /// freshly-imported temp folder (local PDF/ebook path).
 pub fn find_duplicate(
@@ -694,7 +696,6 @@ pub fn find_duplicate(
     arxiv_id: Option<&str>,
     doi: Option<&str>,
     title: &str,
-    authors: &[String],
     exclude_slug: Option<&str>,
 ) -> Option<DuplicateHit> {
     let cand_arxiv_base = arxiv_id
@@ -703,11 +704,7 @@ pub fn find_duplicate(
         .map(|s| s.split('v').next().unwrap_or(s));
     let cand_doi = doi.map(str::trim).filter(|s| !s.is_empty());
     let cand_title = normalize_title(title);
-    let cand_lastname = authors
-        .first()
-        .map(|a| normalize_lastname(a))
-        .unwrap_or_default();
-
+    let mut title_hit = None;
     let entries = crate::paper::list_paper_dirs(root).ok()?;
     for (slug, path) in entries {
         if exclude_slug == Some(slug.as_str()) {
@@ -741,22 +738,13 @@ pub fn find_duplicate(
                 return hit();
             }
         }
-        // 2. Normalized title + first-author lastname
-        if !cand_title.is_empty() && normalize_title(stored_title_raw) == cand_title {
-            let stored_lastname = meta
-                .get("authors")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str())
-                .map(normalize_lastname)
-                .unwrap_or_default();
-            if cand_lastname.is_empty() || stored_lastname.is_empty() || stored_lastname == cand_lastname
-            {
-                return hit();
-            }
+        // Keep a title match as a fallback; an exact identifier anywhere in the
+        // library takes precedence regardless of directory iteration order.
+        if title_hit.is_none() && !cand_title.is_empty() && normalize_title(stored_title_raw) == cand_title {
+            title_hit = hit();
         }
     }
-    None
+    title_hit
 }
 
 
@@ -2504,14 +2492,9 @@ fn sanitize_slug(s: &str) -> String {
 pub async fn add_to_library(
     root: &str,
     arxiv_id: &str,
-    collection_id: Option<&str>,
     app: &tauri::AppHandle,
     force: bool,
 ) -> Result<ImportResult, String> {
-    if let Some(cid) = collection_id.filter(|s| !s.is_empty()) {
-        crate::collections::ensure_collection_can_receive_papers(root, cid)?;
-    }
-
     // Find paper in inbox
     let inbox = get_inbox(root);
     let paper = inbox
@@ -2531,7 +2514,7 @@ pub async fn add_to_library(
             (Some(arxiv_id), None)
         };
         if let Some(hit) =
-            find_duplicate(root, cand_arxiv, cand_doi, &paper.title, &paper.authors, None)
+            find_duplicate(root, cand_arxiv, cand_doi, &paper.title, None)
         {
             return Ok(ImportResult::duplicate(hit.slug, hit.title));
         }
@@ -2568,7 +2551,8 @@ pub async fn add_to_library(
         }),
     );
 
-    // Create paper directory
+    // Keep recommendation imports unassigned in papers/ until the user
+    // classifies them from the library's virtual arXiv staging list.
     let slug = make_slug(&paper.authors, &paper.published, &paper.title);
     let final_dir = crate::paper::reserve_import_dir(root, &slug).await?;
     let final_slug = final_dir
@@ -2644,11 +2628,6 @@ pub async fn add_to_library(
             "arxiv_id": arxiv_id, "status": "done", "slug": &final_slug
         }),
     );
-
-    // Assign to collection and physically move folder into it
-    if let Some(cid) = collection_id.filter(|s| !s.is_empty()) {
-        crate::collections::move_paper_to_collection(root, &meta.id, cid)?;
-    }
 
     // Fulltext extraction + FTS indexing in background
     let s = settings::read_settings(root);
@@ -3169,7 +3148,7 @@ pub async fn import_by_url(
 
     // ── Already in library? Report the duplicate so the frontend can confirm ──
     if !force {
-        if let Some(hit) = find_duplicate(root, Some(&arxiv_id), None, &title, &authors, None) {
+        if let Some(hit) = find_duplicate(root, Some(&arxiv_id), None, &title, None) {
             return Ok(ImportResult::duplicate(hit.slug, hit.title));
         }
     }
@@ -3274,6 +3253,46 @@ pub async fn import_by_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn duplicate_fixture() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("argus-duplicate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("papers")).unwrap();
+        root
+    }
+
+    fn stored_duplicate(root: &std::path::Path, slug: &str, title: &str, author: &str, doi: Option<&str>) {
+        let dir = root.join("papers").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), serde_json::json!({
+            "title": title, "authors": [author], "doi": doi,
+        }).to_string()).unwrap();
+    }
+
+    #[test]
+    fn duplicate_title_is_advisory_even_when_authors_differ_and_serializes_the_existing_slug() {
+        let root = duplicate_fixture();
+        stored_duplicate(&root, "category/original", "Energy-Based Transformers", "Alice Smith", None);
+        stored_duplicate(&root, "copy", "ENERGY-BASED   TRANSFORMERS", "Bob Lee", None);
+        let hit = find_duplicate(root.to_str().unwrap(), None, None, "ENERGY-BASED\nTRANSFORMERS", Some("copy")).unwrap();
+        assert_eq!(hit.slug, "original");
+        let wire = serde_json::to_value(hit).unwrap();
+        assert_eq!(wire["existingSlug"], "original");
+        assert!(wire.get("slug").is_none());
+        assert!(find_duplicate(root.to_str().unwrap(), None, None, "Unrelated paper", Some("copy")).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn duplicate_identity_wins_over_a_same_title_paper_and_blank_titles_do_not_match() {
+        let root = duplicate_fixture();
+        stored_duplicate(&root, "same-title", "Shared Title", "Alice", None);
+        stored_duplicate(&root, "exact-id", "Another title", "Bob", Some("10.1234/Actual"));
+        let hit = find_duplicate(root.to_str().unwrap(), None, Some("10.1234/actual"), "Shared Title", None).unwrap();
+        assert_eq!(hit.slug, "exact-id");
+        assert!(find_duplicate(root.to_str().unwrap(), None, None, "  ", None).is_none());
+        assert!(find_duplicate(root.to_str().unwrap(), None, None, "Shared Title", Some("same-title")).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn paper() -> ArxivPaper {
         ArxivPaper {

@@ -512,7 +512,8 @@ const filtered = computed<PaperIndexEntry[]>(() => {
     void recentPapersVersion.value
     return filterRecentlyRead(library.papers)
   }
-  let list = nav.startsWith('collection:') ? collectionPapers.value : library.papers
+  let list = nav === 'arxiv' ? collectionsStore.arxivPapers
+    : nav.startsWith('collection:') ? collectionPapers.value : library.papers
   const activeTag = selection.tagFilter ?? (nav.startsWith('tag:') ? nav.slice(4) : null)
   if (activeTag) list = list.filter(p => p.tags?.includes(activeTag))
   return list
@@ -1579,6 +1580,13 @@ async function deleteBatch() {
       <Icon icon="fluent:mail-inbox-24-regular" width="32" height="32" />
       <p>{{ t('list.inboxEmpty') }}</p>
       <span>{{ t('list.inboxHint') }}</span>
+    </div>
+
+    <!-- ── arXiv staging (empty) ─────────────────────────────────────────── -->
+    <div v-else-if="selection.activeNav === 'arxiv' && sorted.length === 0 && !library.isLoading" class="empty-state">
+      <Icon icon="fluent:tray-item-add-24-regular" width="32" height="32" />
+      <p>{{ t('sidebar.arxivEmpty') }}</p>
+      <span>{{ t('sidebar.arxivHint') }}</span>
     </div>
 
     <!-- ── Recently read (empty) ─────────────────────────────────────────── -->

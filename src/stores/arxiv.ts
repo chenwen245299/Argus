@@ -8,7 +8,7 @@ import type {
 } from '../types'
 import { fetchArxivCategories } from '../utils/arxivFetch'
 import { fetchBiorxivAsArxivPapers } from '../utils/biorxivFetch'
-import { i18n } from '../i18n'
+import { confirmDuplicateImport } from '../utils/duplicateImport'
 
 /** Result of a duplicate-aware import command (add_arxiv_to_library). */
 interface ImportOutcome { status: 'imported' | 'duplicate'; slug?: string; existingSlug?: string; title?: string }
@@ -454,22 +454,20 @@ export const useArxivStore = defineStore('arxiv', () => {
   }
 
   // Returns the imported paper's slug, or null when the user cancels a duplicate.
-  async function addToLibrary(arxivId: string, collectionId?: string): Promise<string | null> {
+  async function addToLibrary(arxivId: string): Promise<string | null> {
     let res = await invoke<ImportOutcome>('add_arxiv_to_library', {
       arxivId,
-      collectionId: collectionId ?? null,
     })
     if (res.status === 'duplicate') {
-      const msg = i18n.global.t('import.duplicateConfirm', { title: res.title ?? arxivId })
-      if (!window.confirm(msg)) return null   // canceled — leave recommendation in place
+      if (!await confirmDuplicateImport(res.title ?? arxivId)) return null // keep the recommendation on skip
       res = await invoke<ImportOutcome>('add_arxiv_to_library', {
         arxivId,
-        collectionId: collectionId ?? null,
         force: true,
       })
     }
+    if (res.status !== 'imported' || !res.slug) throw new Error('Import did not create an independent paper')
     papers.value = papers.value.filter(p => p.arxiv_id !== arxivId)
-    return res.slug ?? null
+    return res.slug
   }
 
   async function subscribeEvents() {

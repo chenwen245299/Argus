@@ -497,7 +497,8 @@ function fmtT(n: number) {
 }
 
 function fmtCost(n: number) {
-  if (n < 0.001) return n === 0 ? '' : '<¥0.01'
+  if (n === 0) return '¥0.0'
+  if (n < 0.001) return '<¥0.01'
   return '¥' + n.toFixed(n < 1 ? 3 : 2)
 }
 
@@ -626,7 +627,7 @@ onMounted(load)
                 </div>
 
                 <!-- Cost below -->
-                <span v-if="hasCostData && bar.cost > 0" class="bar-cost">{{ fmtCost(bar.cost) }}</span>
+                <span class="bar-cost">{{ fmtCost(bar.cost) }}</span>
 
                 <span class="bar-x">{{ bar.label }}</span>
               </div>
@@ -993,6 +994,7 @@ onMounted(load)
 .bar-stack.only-output .bar-output { border-radius: 5px; }
 .bar-cost {
   font-size: 9px; color: var(--usage-orange); font-weight: 550; white-space: nowrap; flex-shrink: 0;
+  height: 12px; line-height: 12px;
 }
 .bar-x { font-size: 10px; color: var(--usage-faint); line-height: 1; flex-shrink: 0; }
 

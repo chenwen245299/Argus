@@ -135,7 +135,7 @@ function openGitHub() {
         </button>
 
         <template v-else-if="updateStore.state === 'available'">
-          <button v-if="updateStore.releaseNotes" class="btn-notes" @click="updateStore.showReleaseNotes = true">
+          <button class="btn-notes" @click="updateStore.showReleaseNotes = true">
             {{ t('about.viewReleaseNotes') }}
           </button>
           <button class="btn-update" @click="startUpdate">

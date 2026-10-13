@@ -6,6 +6,7 @@ import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useAiStore } from '../stores/ai'
 import AiTab from '../components/tabs/AiTab.vue'
+import GuidedReadingIntro from '../components/GuidedReadingIntro.vue'
 import type { PaperMeta } from '../types'
 import { paperAiWindowSlug } from '../utils/paperAiWindow'
 
@@ -84,6 +85,7 @@ watch(slug, updateWindowTitle, { immediate: true })
       <div class="loading-spinner" />
       <p>加载中…</p>
     </div>
+    <GuidedReadingIntro :ready="!!slug && ai.loaded" />
   </div>
 </template>
 

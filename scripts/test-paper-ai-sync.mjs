@@ -13,6 +13,9 @@ const helper = transpile(await readFile(new URL('../src/utils/paperAiSync.ts', i
   .replace(/from '@tauri-apps\/api\/event'/g, `from '${import.meta.resolve('@tauri-apps/api/event')}'`)
 const { PaperAiSync, reconcilePaperAiConversations, translatePaperAiClocks, PAPER_AI_SYNC_INTERVAL_MS } =
   await import('data:text/javascript;base64,' + Buffer.from(helper).toString('base64'))
+const { isGuidedReadingPrompt } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
+  await readFile(new URL('../src/utils/guidedReading.ts', import.meta.url), 'utf8'),
+)).toString('base64'))
 
 const source = await readFile(new URL('../src/components/tabs/AiTab.vue', import.meta.url), 'utf8')
 const ast = ts.createSourceFile('AiTab.ts', source.slice(source.indexOf('>') + 1, source.indexOf('</script>')), ts.ScriptTarget.Latest, true)
@@ -39,7 +42,7 @@ const createView = new Function('env', transpile(`
     streamRenderLast, streamRenderCost, paperSaves, backgroundSaves, sessions, knownConvIds,
     input, editingNodeId, showHistory, textareaEl, nextTick, scrollToBottom,
     invoke, paperAiSync, crypto, persistableServerToolTrace, saveLegacyActiveHistory,
-    flattenConversation, reconcilePaperAiConversations, translatePaperAiClocks } = env;
+    flattenConversation, reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt, t } = env;
   let syncLibraryRoot = env.root, syncDisposed = false;
   let syncRefresh = null, syncRefreshPending = false;
   let selectionRevision = 0, initialSyncSelectionRevision = null;
@@ -99,7 +102,8 @@ function bus(initial = [conversation()]) {
       input: ref(''), editingNodeId: ref(null), showHistory: ref(false), textareaEl: ref(null),
       crypto: webcrypto, nextTick, scrollToBottom: () => {}, paperAiSync: sync,
       persistableServerToolTrace: trace => trace, saveLegacyActiveHistory: async () => {}, flattenConversation: () => [],
-      reconcilePaperAiConversations, translatePaperAiClocks,
+      reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt,
+      t: key => key === 'guidedReading.title' ? 'AI 领读' : key,
     }
     let readGate = null
     env.invoke = async (command, args) => {

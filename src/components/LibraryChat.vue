@@ -639,13 +639,13 @@ interface PendingWrite { requestId: string; preview: AgentWritePreview }
 const pendingWrites = ref<PendingWrite[]>([])
 const currentWrite = computed<PendingWrite | null>(() => pendingWrites.value[0] ?? null)
 
-function answerWrite(approved: boolean) {
+function answerWrite(approved: boolean, passageColors?: string[]) {
   const pending = currentWrite.value
   if (!pending) return
   // Drop it from the queue first: the button must not stay live for a request
   // that has already been answered.
   pendingWrites.value = pendingWrites.value.slice(1)
-  invoke('resolve_agent_write', { requestId: pending.requestId, approved }).catch(() => {})
+  invoke('resolve_agent_write', { requestId: pending.requestId, approved, passageColors: approved ? passageColors ?? null : null }).catch(() => {})
 }
 
 /** Take a request off the queue without answering — the backend has already
@@ -1313,7 +1313,7 @@ function persistSelectedModel(sel: ModelSelection | null) {
  *  matching itself lives in utils/modelLogo so every picker agrees. */
 function modelLogo(model?: ModelOption | null) {
   const provider = ai.settings.providers.find(p => p.id === model?.providerId)
-  return logoFor(model, provider?.kind)
+  return logoFor(model, provider?.kind, provider?.base_url)
 }
 
 /** The FREE / 折扣 badge for a picker row, or null when there is nothing to say.
@@ -3049,7 +3049,7 @@ onUnmounted(() => {
             :key="currentWrite.requestId"
             :preview="currentWrite.preview"
             :queued="pendingWrites.length - 1"
-            @approve="answerWrite(true)"
+            @approve="answerWrite(true, $event)"
             @reject="answerWrite(false)"
           />
           <div class="composer">

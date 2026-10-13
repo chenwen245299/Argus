@@ -9,9 +9,11 @@
 // window, stopping the answer or simply ignoring it all leave the library
 // untouched (the backend treats silence as a refusal after its timeout).
 import { useI18n } from 'vue-i18n'
+import { ref } from 'vue'
 import { Icon } from '@iconify/vue'
 import MarkdownBody from './MarkdownBody.vue'
 import type { AgentWritePreview } from '../types'
+import { HIGHLIGHT_COLORS } from '../utils/highlightColors'
 
 const props = defineProps<{
   preview: AgentWritePreview
@@ -19,9 +21,14 @@ const props = defineProps<{
   queued?: number
 }>()
 
-const emit = defineEmits<{ approve: []; reject: [] }>()
+const emit = defineEmits<{ approve: [colors?: string[]]; reject: [] }>()
 
 const { t } = useI18n()
+const selectedColors = ref(props.preview.passages?.map(p => p.color) ?? [])
+
+function approve() {
+  emit('approve', props.preview.passages?.length ? [...selectedColors.value] : undefined)
+}
 </script>
 
 <template>
@@ -58,7 +65,19 @@ const { t } = useI18n()
     <div v-if="preview.passages?.length" class="wc-body">
       <div v-for="(passage, index) in preview.passages" :key="index" class="wc-passage">
         <div class="wc-page">{{ t('writeConfirm.page', { n: passage.page }) }} · {{ t(passage.style === 'underline' ? 'writeConfirm.underline' : 'writeConfirm.highlight') }}</div>
-        <blockquote :style="{ borderColor: passage.color }">{{ passage.text }}</blockquote>
+        <div class="wc-colors" :aria-label="t('writeConfirm.color')" role="group">
+          <span>{{ t('writeConfirm.color') }}</span>
+          <button v-for="color in HIGHLIGHT_COLORS" :key="color.value" type="button" class="wc-color"
+            :title="t(color.labelKey)" :aria-label="t(color.labelKey)"
+            :aria-pressed="selectedColors[index]?.toUpperCase() === color.value"
+            :style="{ background: color.value }" @click="selectedColors[index] = color.value">
+            <Icon v-if="selectedColors[index]?.toUpperCase() === color.value" icon="fluent:checkmark-16-regular" width="12" height="12" />
+          </button>
+          <label class="wc-custom-color" :title="t('writeConfirm.customColor')">
+            <input v-model="selectedColors[index]" type="color" :aria-label="t('writeConfirm.customColor')" />
+          </label>
+        </div>
+        <blockquote :style="{ borderColor: selectedColors[index] }">{{ passage.text }}</blockquote>
         <MarkdownBody v-if="passage.note" :content="passage.note" />
       </div>
     </div>
@@ -69,7 +88,7 @@ const { t } = useI18n()
     <div class="wc-actions">
       <span class="wc-hint">{{ t('writeConfirm.hint') }}</span>
       <button class="wc-btn" @click="emit('reject')">{{ t('writeConfirm.reject') }}</button>
-      <button class="wc-btn primary" @click="emit('approve')">
+      <button class="wc-btn primary" @click="approve">
         <Icon icon="fluent:checkmark-24-regular" width="13" height="13" />
         {{ t('writeConfirm.approve') }}
       </button>
@@ -153,6 +172,13 @@ const { t } = useI18n()
 .wc-body :deep(img) { max-width: 100%; }
 .wc-passage + .wc-passage { border-top: 1px solid var(--border-subtle); margin-top: 10px; padding-top: 10px; }
 .wc-page { color: var(--text-tertiary); font-size: 11px; }
+.wc-colors { display: flex; align-items: center; gap: 7px; margin: 6px 0; }
+.wc-colors > span { margin-right: 2px; font-size: 11px; color: var(--text-tertiary); }
+.wc-color { display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 1px solid rgba(0,0,0,.12); border-radius: 50%; color: #263238; cursor: pointer; }
+.wc-color[aria-pressed="true"] { outline: 2px solid var(--accent); outline-offset: 2px; }
+.wc-color:focus-visible, .wc-custom-color input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.wc-custom-color { display: flex; align-items: center; width: 24px; height: 22px; margin-left: 2px; }
+.wc-custom-color input { width: 24px; height: 22px; padding: 1px; border: 1px solid var(--border-default); border-radius: 5px; background: var(--bg-primary); cursor: pointer; }
 .wc-passage blockquote { border-left: 4px solid; padding: 3px 9px; margin: 5px 0; white-space: pre-wrap; }
 
 .wc-actions { display: flex; align-items: center; gap: 8px; }

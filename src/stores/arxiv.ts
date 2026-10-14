@@ -172,6 +172,8 @@ export const useArxivStore = defineStore('arxiv', () => {
   let unlistenFetch: UnlistenFn | null = null
   let unlistenAnalysis: UnlistenFn | null = null
   let unlistenRecommend: UnlistenFn | null = null
+  let inboxLoadRevision = 0
+  let inboxEventRevision = 0
   let statusPollTimer: ReturnType<typeof setInterval> | null = null
 
   const sortedPapers = computed(() => {
@@ -215,8 +217,10 @@ export const useArxivStore = defineStore('arxiv', () => {
   }
 
   async function loadInbox() {
+    const revision = ++inboxLoadRevision
     try {
       const inbox = await invoke<{ papers: ArxivPaper[]; last_updated: string }>('get_arxiv_inbox')
+      if (revision !== inboxLoadRevision) return
       // Preserve read=true from current frontend state to guard against in-flight
       // mark_paper_read calls being overtaken by a concurrent loadInbox.
       const knownRead = new Set(papers.value.filter(p => p.read).map(p => p.arxiv_id))
@@ -224,7 +228,7 @@ export const useArxivStore = defineStore('arxiv', () => {
         ...p,
         read: p.read || knownRead.has(p.arxiv_id),
       })))
-    } catch { papers.value = [] }
+    } catch { if (revision === inboxLoadRevision) papers.value = [] }
   }
 
   function applyScheduleStatus(status: ArxivScheduleStatus) {
@@ -623,8 +627,16 @@ export const useArxivStore = defineStore('arxiv', () => {
       }
     })
 
-    unlistenRecommend = await listen<{ count: number }>('arxiv-new-recommendations', (e) => {
+    unlistenRecommend = await listen<{ count: number; root?: string; inboxChanged?: boolean }>('arxiv-new-recommendations', async (e) => {
+      const revision = ++inboxEventRevision
+      // The arXiv window deliberately does not initialize the library store.
+      // Resolve the active backend root without scanning the paper library.
+      if (e.payload.root) {
+        const currentRoot = await invoke<string | null>('get_current_library').catch(() => null)
+        if (e.payload.root !== currentRoot || revision !== inboxEventRevision) return
+      }
       newCount.value = e.payload.count
+      if (e.payload.inboxChanged && loaded.value) void loadInbox()
     })
 
     await loadScheduleStatus()

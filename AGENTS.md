@@ -237,6 +237,25 @@ models to use `$...$` / `$$...$$`, reserving backticks for source examples.
 Browser regressions: `node --test scripts/test-markdown-math.mjs` (Playwright
 and Chrome; `ARGUS_TEST_PLAYWRIGHT` can point to a bundled runtime).
 
+**Messages during generation.** `AiTab.vue` (sidebar and standalone) and
+`LibraryChat.vue` share `utils/chatSendQueue.ts` and `ChatMessageQueue.vue`.
+Enter or the send button queues while busy; Cmd/Ctrl+Enter or a queued row's
+Steer action cancels that conversation's current requests, retains partial
+output and completed tool results, and starts a continuation with the new user
+message. Queue rows support inline editing and deletion above the composer.
+Editing holds the row even if generation finishes, preserving FIFO and the
+composer draft. Attachments and model selections are captured when enqueued.
+Each window owns its pending queue; messages are scoped to their original
+conversation/paper/library. Stop pauses the queue until Resume, a new send or
+Steer; deletion, library switches and unmount clear the relevant pending rows.
+Steering waits for cancelled local requests to settle and forwards mirrored
+paper-AI stops to the owning window. Incomplete tools are marked interrupted;
+tool-only completed results also enter follow-up history. Write approvals are
+refused only for stopped requests, never granted by a queue action.
+`cancel::until_cancelled` makes pending HTTP headers and SSE reads cancellable
+without waiting for another chunk; stream finalization still records partial
+usage and the agent still shuts its MCP connections down normally.
+
 ### Frontend state management (Pinia stores)
 
 Stores live in `src/stores/` and use the Composition API style (`defineStore('id', () => {...})`).
@@ -643,6 +662,53 @@ Backend coverage lives in `soclaas::tests` and `llm::soclaas_request_tests`;
 `node --test scripts/test-soclaas.mjs` checks provider branding and presets.
 
 ### arXiv batch analysis (`arxiv.rs`)
+
+**Agent recommendation tools.** `mcp/arxiv_tools.rs` adds an app-only suite to
+the shared agent loop used by library Q&A, paper AI (sidebar and standalone)
+and canvas Q&A. Keep five distinct entries, without single/batch or text/image
+aliases: `list_arxiv_recommendations` (view `papers` / `tags`, with filtered
+counts, compact cards or `detail: "ids"`), `get_arxiv_recommendations`
+(1–50 IDs, even for one paper; `fields` selects `abstract`, `analysis` and/or
+`metadata`, default abstract only), `read_arxiv_paper` (format `text` / `image`),
+`import_arxiv_papers` and `delete_arxiv_recommendations`. Unavailable selected
+IDs are returned in `missing_ids`; requested content is never accompanied by
+unrequested abstracts/analysis/metadata. Reads include only
+analysed, retained inbox papers outside the library, respecting the filter
+threshold and user-restored `kept` papers. They never re-run filtering or search
+the vector store. Discover tags only when needed, narrow the list, select IDs,
+then fetch only missing content. The list never returns abstracts. PDF text has
+Unicode character offsets; optional `pages` selects 1–4 PDF indices, required
+for images. The shared model/keepalive tool builder removes image mode from
+text-only models, and the dispatcher refuses invented image calls before reading
+or downloading a PDF. Recommendation IDs (bioRxiv
+DOIs included) are not library slugs.
+
+PDF reads use `arxiv_pdf_cache.rs`, a persistent seven-day download cache in
+the application cache directory's `arxiv-pdfs/` (64 MiB per PDF). Successful
+download time is recorded; reads never extend the seven-day deadline. Text and
+image reads reuse downloads across answers/windows/restarts, keyed by library,
+source, recommendation ID, PDF URL and version. Per-key async locks avoid
+duplicate concurrent downloads. UUID PDF/JSON pairs contain no model-provided
+paths; active leases protect files while extraction/rendering/import copying
+runs. Cleanup checks on cache reads, immediately at app startup and every
+15 minutes while running, across all libraries even when none is open. Expired
+files from time spent with the app closed are cleaned on the next launch.
+Owned orphan/partial downloads and damaged records also expire, while unknown
+files and imported library papers are never cleanup targets. Imports copy the
+cached PDF into the library, then discard the cache copy (after active readers
+finish). Downloads stay on arXiv/bioRxiv hosts, including redirects. Both writes take
+1–20 exact IDs and go through `PendingWrite::Arxiv` and the existing approval
+card in both chat hosts. Preview captures paper identities, titles and duplicate
+policy; execute uses those same records. Imports reuse the normal staging
+pipeline, skip duplicates unless independent copies were explicitly reviewed,
+and report per-paper outcomes. Deletes affect only the inbox and validate all
+targets/day files under the inbox lock before changing anything. Changed/missing
+targets fail without deleting; cancellation prevents subsequent imports.
+`arxiv-new-recommendations` with `root` / `inboxChanged` refreshes open inboxes;
+the store discards stale refreshes. The external stdio MCP surface stays read-only
+and does not expose this suite. Coverage: `mcp::arxiv_tools::tests`, the agent/
+copilot schema and vision tests, `arxiv_pdf_cache::tests`, `test-write-confirm.mjs` and
+`test-arxiv-staging.mjs`.
 
 **Library staging.** Adding a recommendation to the library goes directly into
 the virtual **arXiv Papers** (`arxiv`) sidebar view below All Papers, without a
@@ -1125,6 +1191,11 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   handlers: live late joins, saved edits/deletes, delayed events, owner-only
   cancellation, draft/session preservation and library/paper isolation. It does
   not access a real library or call a provider.
+- Message queue: `node --test scripts/test-chat-send-queue.mjs` checks FIFO,
+  scope isolation, editing, pause/resume and cancellation races. With Playwright
+  and Chrome, `scripts/test-chat-queue-browser.mjs` exercises real sidebar,
+  standalone and library composers, attachments, shortcuts, partial/tool history
+  and library/paper changes with local desktop/provider mocks.
 - Note clipboard compatibility: `node --test scripts/test-note-clipboard.mjs`
   exercises the installed Vditor copy handler and local clipboard mocks, covering
   rich-text fallback, Markdown/TeX preservation, cut behavior and listener scope.
@@ -1169,6 +1240,16 @@ When adding significant backend logic, add a `#[cfg(test)]` module in the releva
 ---
 
 ## Deployment and release process
+
+**Release-note format (user preference).** For this project, follow the user's
+established format: `# Release Notes`, then `## ✨ New Features`,
+`## 🐛 Bug Fixes`, and `## 🔧 Improvements`, in that order. Write concise
+Chinese bullet points, each as `- **具体功能或修复摘要**：面向用户的说明。`.
+Describe the requested change scope from the actual diff; do not include
+already released features, invented version numbers, implementation details or
+test counts in the release-note body. Always deliver the complete Markdown
+source in a single fenced `markdown` code block so the user can copy it directly,
+rather than only rendering the formatted release note in chat.
 
 The release pipeline is defined in `.github/workflows/release.yml`.
 

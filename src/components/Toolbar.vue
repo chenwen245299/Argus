@@ -1194,15 +1194,15 @@ onUnmounted(() => {
       <!-- Dropdown: arXiv / library chat -->
       <Transition name="toolbar-dropdown">
         <div v-if="showAiMenu" class="import-menu ai-hub-menu">
+          <button class="import-menu-item" :title="t('toolbar.libraryChatTitle')" @click="chooseLibraryChat">
+            <Icon icon="fluent:chat-24-regular" width="15" height="15" />
+            {{ t('toolbar.libraryChat') }}
+          </button>
           <button class="import-menu-item" :title="t('toolbar.arxivTitle')" @click="chooseArxiv">
             <Icon icon="fluent:layer-24-regular" width="15" height="15" />
             {{ t('toolbar.arxivMenuItem') }}
             <span v-if="!arxivWindowOpen && arxivNewCount > 0" class="menu-badge">{{ arxivNewCount }}</span>
             <span v-else-if="arxivAnalyzing && arxivProgress.total > 0" class="menu-meta">{{ arxivProgress.done }}/{{ arxivProgress.total }}</span>
-          </button>
-          <button class="import-menu-item" :title="t('toolbar.libraryChatTitle')" @click="chooseLibraryChat">
-            <Icon icon="fluent:chat-24-regular" width="15" height="15" />
-            {{ t('toolbar.libraryChat') }}
           </button>
           <button class="import-menu-item" :title="t('toolbar.embeddingMapTitle')" @click="chooseEmbeddingMap">
             <Icon icon="fluent:data-scatter-24-regular" width="15" height="15" />

@@ -25,6 +25,8 @@ import WriteConfirmCard from '../WriteConfirmCard.vue'
 import ChatPageImage from '../ChatPageImage.vue'
 import ChatAnswerBody from '../ChatAnswerBody.vue'
 import GuidedReadingIcon from '../GuidedReadingIcon.vue'
+import ChatMessageQueue from '../ChatMessageQueue.vue'
+import { useChatSendQueue, type QueuedChatMessage } from '../../utils/chatSendQueue'
 import { guidedReadingPrompt, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
@@ -194,6 +196,7 @@ const activeRequestIds = new Map<string, string>()
 // user switches to another paper, so a generation started on paper A keeps
 // streaming into A's conversation in the background instead of being dropped.
 const streamOwners = shallowReactive(new Map<string, { slug: string; conv: Conversation; origin?: string; root?: string }>())
+const streamTasks = new Map<string, { convId: string; task: Promise<void> }>()
 // History entries are saved snapshots; live owners track generations even after
 // switching conversations. Only additions/removals need to update these dots.
 const generatingConvIds = computed(() => new Set([...streamOwners.values()].map(o => o.conv.id)))
@@ -245,7 +248,7 @@ const editingText = ref('')
 // queue behind it, since several models can be answering at once. Nothing is
 // written until answerWrite sends an approval back — the backend defaults every
 // other outcome (timeout, stop, this view closing) to "do not write".
-interface PendingWrite { requestId: string; preview: AgentWritePreview }
+interface PendingWrite { requestId: string; preview: AgentWritePreview; answerId: string }
 const pendingWrites = ref<PendingWrite[]>([])
 const currentWrite = computed<PendingWrite | null>(() => pendingWrites.value[0] ?? null)
 
@@ -395,7 +398,7 @@ const activeTitle = computed(() => {
 })
 
 const canSend = computed(() =>
-  !!props.slug && input.value.trim().length > 0 && selectedModels.value.length > 0 && !hasStreaming.value
+  !!props.slug && (input.value.trim().length > 0 || attachments.value.length > 0) && selectedModels.value.length > 0
 )
 const guidedReadingStarting = ref(false)
 const canStartGuidedReading = computed(() =>
@@ -530,6 +533,52 @@ let syncRefreshPending = false
 let selectionRevision = 0
 let initialSyncSelectionRevision: number | null = null
 
+interface PaperQueuedMessage extends QueuedChatMessage {
+  slug: string
+  root: string | null
+  conv: Conversation
+  models: ModelOption[]
+}
+function conversationScope(conv: Conversation) { return JSON.stringify([syncLibraryRoot, conv.slug, conv.id]) }
+function queuedConversation(item: PaperQueuedMessage) {
+  const live = liveConversationById(item.conv.id)
+  if (live) return live
+  if (activeConversation.value?.id === item.conv.id) return activeConversation.value
+  const cached = sessions.get(item.slug)?.conv
+  return cached?.id === item.conv.id ? cached : item.conv
+}
+const messageQueue = useChatSendQueue<PaperQueuedMessage>({
+  busy: scope => [...streamOwners.values()].some(owner => conversationScope(owner.conv) === scope),
+  valid: item => !syncDisposed && item.root === syncLibraryRoot,
+  send: item => submitQuestion(item.slug, item.text, item.files, queuedConversation(item), item.models),
+  interrupt: async item => {
+    const conv = liveConversationById(item.conv.id) ?? item.conv
+    const tasks = [...streamTasks.values()].filter(task => task.convId === conv.id).map(task => task.task)
+    stopConversationStreaming(conv)
+    await Promise.allSettled(tasks)
+    // A mirror forwards stop to the owning window. Its final snapshot carries
+    // the partial reply before this window begins the continuation.
+    if ([...streamOwners.values()].some(owner => owner.conv.id === conv.id && owner.origin)) {
+      await new Promise<void>(resolve => {
+        const off = watch(() => [...streamOwners.values()].some(owner => owner.conv.id === conv.id && owner.origin), busy => {
+          if (!busy) { off(); resolve() }
+        })
+      })
+    }
+  },
+})
+const queuedMessages = computed(() => activeConversation.value
+  ? messageQueue.items.value.filter(item => item.scope === conversationScope(activeConversation.value!)) : [])
+const queuePaused = computed(() => !!activeConversation.value && messageQueue.paused.has(conversationScope(activeConversation.value)))
+const composerBusy = computed(() => hasStreaming.value || (!!activeConversation.value && messageQueue.active.has(conversationScope(activeConversation.value))))
+function steerQueuedMessage(id: string) {
+  const item = messageQueue.items.value.find(item => item.id === id)
+  if (item) messageQueue.steer(item)
+}
+function resumeMessageQueue() {
+  if (activeConversation.value) messageQueue.resume(conversationScope(activeConversation.value))
+}
+
 async function ensurePaperAiSync() {
   if (syncReady) return syncReady
   syncReady = (async () => {
@@ -545,6 +594,7 @@ async function ensurePaperAiSync() {
       listen<string>('library-changed', event => {
         if (event.payload === syncLibraryRoot) return
         syncLibraryRevision++
+        messageQueue.clear()
         // An in-flight answer belongs to the old library, never the new root.
         for (const owner of [...streamOwners.values()]) if (!owner.origin) stopConversationStreaming(owner.conv, false)
         streamOwners.clear()
@@ -658,7 +708,10 @@ function handlePaperAiSync(p: PaperAiSyncMessage) {
   }
   if (p.kind === 'stop') {
     const owner = [...streamOwners.values()].find(o => !o.origin && o.slug === p.slug && o.conv.id === p.conversationId)
-    if (owner) stopConversationStreaming(owner.conv)
+    if (owner) {
+      messageQueue.pause(conversationScope(owner.conv))
+      stopConversationStreaming(owner.conv)
+    }
     return
   }
   if (p.slug !== props.slug) {
@@ -940,6 +993,7 @@ function deleteConversation(id: string, event?: MouseEvent) {
   // Both views expose the same live answer; stop it before deleting its record.
   // Otherwise its eventual save would legitimately revive the delete tombstone.
   if ([...streamOwners.values()].some(o => o.conv.id === id)) return
+  messageQueue.items.value.filter(item => item.conv.id === id).forEach(item => messageQueue.clear(item.scope))
   conversations.value = conversations.value.filter(c => c.id !== id)
   if (activeConversation.value?.id === id) startNewConversation(false)
   saveConversationsToPaper(props.slug).catch(() => {})
@@ -1308,12 +1362,12 @@ function buildHistoryUntil(conv: Conversation, stopGroupId?: string): ChatMessag
         active && !active.error && active.content.trim()
           ? active
           : node.answers.find(a => !a.error && a.content.trim()) ??
-            node.answers.find(a => a.content.trim())
-      if (answer && answer.content.trim()) {
+            node.answers.find(a => a.content.trim()) ?? node.answers.find(a => !a.error && a.steps?.length)
+      if (answer) {
         // Replay this turn's tool calls + results (as native tool messages)
         // before its answer, so a follow-up reuses them instead of re-fetching.
         messages.push(...buildToolExchangeMessages(answer.steps, answer.id))
-        messages.push({ role: 'assistant', content: answer.content })
+        if (answer.content.trim()) messages.push({ role: 'assistant', content: answer.content })
       }
     } else if (node.role === 'user') {
       if (node.attachments?.length) {
@@ -1330,16 +1384,24 @@ function flattenConversation(conv: Conversation): ChatMessage[] {
   return buildHistoryUntil(conv)
 }
 
-async function sendMessage() {
+async function sendMessage(immediate = false) {
+  if (!canSend.value || !props.slug) return
+  await ensurePaperAiSync()
   if (!canSend.value || !props.slug) return
   // Pin the paper up front: the user can switch tabs while this turn is being
   // set up, and the answer must still belong to the paper they asked about.
   const slug = props.slug
   const text = input.value.trim()
   const files = [...attachments.value]
+  activeConversation.value = activeConversation.value ?? createBlankConversation(slug)
+  const conv = activeConversation.value
+  const item: PaperQueuedMessage = { id: newId('queued'), scope: conversationScope(conv),
+    slug, root: syncLibraryRoot, conv, text, files, models: [...selectedModels.value] }
   input.value = ''
   attachments.value = []
-  await submitQuestion(slug, text, files)
+  if (immediate) messageQueue.steer(item)
+  else messageQueue.enqueue(item)
+  nextTick(() => { resizeTextarea(); textareaEl.value?.focus() })
 }
 
 async function startGuidedReading() {
@@ -1356,11 +1418,11 @@ async function startGuidedReading() {
   }
 }
 
-async function submitQuestion(slug: string, text: string, files: Attachment[]) {
-  activeConversation.value = activeConversation.value ?? createBlankConversation(slug)
+async function submitQuestion(slug: string, text: string, files: Attachment[], targetConv?: Conversation, models = selectedModels.value) {
+  if (!targetConv) activeConversation.value = activeConversation.value ?? createBlankConversation(slug)
   // Read it back so `conv` is the reactive proxy, not the raw object: streaming
   // mutations (possibly from the background) must be tracked by Vue.
-  const conv = activeConversation.value
+  const conv = targetConv ?? activeConversation.value!
 
   const userNode: ChatNode = {
     id: newId('user'),
@@ -1374,15 +1436,15 @@ async function submitQuestion(slug: string, text: string, files: Attachment[]) {
     role: 'assistantGroup',
     promptId: userNode.id,
     createdAt: nowIso(),
-    answers: selectedModels.value.map(model => modelToAnswer(model)),
+    answers: models.map(model => modelToAnswer(model)),
   }
-  if (group.answers[0]) setActiveAnswer(group.id, group.answers[0].id)
+  if (group.answers[0] && activeConversation.value?.id === conv.id) setActiveAnswer(group.id, group.answers[0].id)
   conv.nodes.push(userNode, group)
   conv.title = firstUserTitle(conv.nodes) || conv.title
   persistConversationFor(slug, conv)
-  await nextTick()
-  resizeTextarea()
-  scrollToBottom(true)
+  void nextTick(() => {
+    if (activeConversation.value?.id === conv.id) { resizeTextarea(); scrollToBottom(true) }
+  })
 
   const history = buildHistoryUntil(conv, group.id)
   await Promise.all(group.answers.map(answer => streamAnswer(slug, conv, answer, history)))
@@ -1478,6 +1540,7 @@ function onEditKeydown(e: KeyboardEvent, node: UserNode) {
 function stopAllStreaming() {
   const conv = activeConversation.value
   if (!conv) return
+  messageQueue.pause(conversationScope(conv))
   stopConversationStreaming(conv)
 }
 
@@ -1506,16 +1569,20 @@ function stopConversationStreaming(conv: Conversation, persist = true) {
     if (ra?.streaming) {
       ra.streaming = false
       ra.endedAt = performance.now()
+      for (const step of ra.steps ?? []) if (step.ok === undefined) {
+        step.ok = false
+        step.preview = '{"error":"Tool interrupted by the user before its result was received"}'
+      }
       flushStreamRender(ra)
     }
     streamOwners.delete(answerId)
   }
   if (!stoppedLocal) return
   // Any write the agent was still waiting on is refused when the user stops.
-  for (const pending of pendingWrites.value) {
+  for (const pending of pendingWrites.value.filter(pending => localAnswerIds.includes(pending.answerId))) {
     invoke('resolve_agent_write', { requestId: pending.requestId, approved: false }).catch(() => {})
   }
-  pendingWrites.value = []
+  pendingWrites.value = pendingWrites.value.filter(pending => !localAnswerIds.includes(pending.answerId))
   if (persist) persistConversationFor(conv.slug, conv)
 }
 
@@ -1629,7 +1696,15 @@ function clearAllStreamRenderTimers() {
 // `props.slug`: the user can switch papers mid-generation and everything below
 // must keep targeting that paper and conversation, not what is on screen when
 // the tokens arrive.
-async function streamAnswer(
+function streamAnswer(slug: string, conv: Conversation, answer: AssistantAnswer, history: ChatMessage[]) {
+  const task = streamAnswerImpl(slug, conv, answer, history).finally(() => {
+    if (streamTasks.get(answer.id)?.task === task) streamTasks.delete(answer.id)
+  })
+  streamTasks.set(answer.id, { convId: conv.id, task })
+  return task
+}
+
+async function streamAnswerImpl(
   slug: string,
   conv: Conversation,
   answer: AssistantAnswer,
@@ -1753,7 +1828,7 @@ async function streamAnswer(
     (event) => {
       const p = event.payload
       if (!p?.requestId || !p.preview) return
-      pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview }]
+      pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview, answerId: answer.id }]
     },
   )
   unlisteners.set(`${answer.id}-confirm`, unlistenConfirm)
@@ -1789,6 +1864,9 @@ async function streamAnswer(
     : reasoningLevel.value
 
   try {
+    // Stop/steer may have arrived while the event listeners were registering,
+    // before the backend knew the cancellation id.
+    if (activeRequestIds.get(answer.id) !== requestId || rootAtStart !== syncLibraryRoot || syncDisposed) return
     // Agent mode: the model reaches for what it needs instead of being handed a
     // pre-built context. `paperSlug` puts this paper's `get_paper` card in the
     // system prompt, so it starts knowing what it is reading.
@@ -1815,7 +1893,7 @@ async function streamAnswer(
       currentPage: reader.readingStateFor(slug)?.page ?? null,
     })
     const reactiveAns = findReactiveAnswer(answer.id)
-    if (reactiveAns) {
+    if (reactiveAns && activeRequestIds.get(answer.id) === requestId) {
       if (!reactiveAns.content && finalText) reactiveAns.content = finalText
       // A click, an API failure or a cancelled partial reply is not an experience.
       if (owner.source === 'guidedReading' && !reactiveAns.error && reactiveAns.content.trim()
@@ -1825,7 +1903,7 @@ async function streamAnswer(
     }
   } catch (e) {
     const reactiveAns = findReactiveAnswer(answer.id)
-    if (reactiveAns) {
+    if (reactiveAns && activeRequestIds.get(answer.id) === requestId) {
       reactiveAns.error = true
       reactiveAns.errorText = String(e)
       reactiveAns.content = `生成失败：${String(e)}`
@@ -2058,7 +2136,7 @@ function handleKeydown(e: KeyboardEvent) {
   // avoiding the race-prone Date.now() heuristic that could send half-typed text.
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
     e.preventDefault()
-    sendMessage()
+    void sendMessage(e.metaKey || e.ctrlKey)
   }
 }
 
@@ -2344,8 +2422,11 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  messageQueue.clear()
+  for (const owner of [...streamOwners.values()]) if (!owner.origin) stopConversationStreaming(owner.conv)
   paperAiSync.dispose(syncLibraryRoot && props.slug ? { root: syncLibraryRoot, slug: props.slug } : undefined)
   syncDisposed = true
+  streamOwners.clear()
   syncUnlisteners.forEach(off => off())
   window.removeEventListener('focus', onPaperAiFocus)
   panelResizeObserver?.disconnect()
@@ -2818,6 +2899,11 @@ onUnmounted(() => {
         </div>
 
         <footer class="composer">
+        <ChatMessageQueue
+          :items="queuedMessages" :paused="queuePaused"
+          @edit="messageQueue.edit" @hold="messageQueue.hold"
+          @remove="messageQueue.remove" @steer="steerQueuedMessage" @resume="resumeMessageQueue"
+        />
         <div
           class="composer-resizer"
           title="拖动调整输入框高度（双击恢复自适应）"
@@ -2874,6 +2960,7 @@ onUnmounted(() => {
             class="composer-input"
             rows="1"
             placeholder="问这篇论文里的任何问题…"
+            :title="t('chat.composerHint')"
             @keydown="handleKeydown"
             @paste="onPaste"
           />
@@ -2946,11 +3033,12 @@ onUnmounted(() => {
 
             <span class="toolbar-spacer" />
 
-            <button v-if="hasStreaming" class="send-btn stop-btn" title="停止生成" @click="stopAllStreaming">
+            <span class="queue-shortcut" :title="t('chat.composerHint')">{{ t(composerBusy ? 'chat.queueShortcut' : 'chat.sendShortcut') }}</span>
+            <button v-if="composerBusy" class="send-btn stop-btn" title="停止生成" @click="stopAllStreaming">
               <Icon icon="fluent:stop-24-filled" width="15" height="15" />
             </button>
-            <button v-else class="send-btn" :class="{ active: canSend }" :disabled="!canSend" @click="sendMessage">
-              <Icon icon="fluent:send-24-regular" width="15" height="15" />
+            <button class="send-btn" :class="{ active: canSend }" :disabled="!canSend" :title="t(composerBusy ? 'chat.queueSend' : 'copilot.send')" @click="sendMessage(false)">
+              <Icon :icon="composerBusy ? 'fluent:stack-add-20-regular' : 'fluent:send-24-regular'" width="15" height="15" />
             </button>
           </div>
         </div>
@@ -3893,6 +3981,7 @@ onUnmounted(() => {
 /* Holds the agent write-approval card, aligned to the composer's inner width. */
 .write-confirm-slot { flex-shrink: 0; padding: 0 10px; }
 
+.queue-shortcut { color: var(--text-tertiary); font-size: 10px; white-space: nowrap; }
 .composer {
   position: relative;
   flex-shrink: 0;

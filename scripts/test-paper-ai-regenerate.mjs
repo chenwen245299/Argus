@@ -20,7 +20,7 @@ const source = await readFile(new URL('../src/components/tabs/AiTab.vue', import
 const ast = ts.createSourceFile('AiTab.ts', source.slice(source.indexOf('>') + 1, source.indexOf('</script>')), ts.ScriptTarget.Latest, true)
 const functions = ['nowIso', 'findReactiveAnswer', 'isAnswerVisible', 'detachAnswerListeners',
   'activeAnswerForGroup', 'buildHistoryUntil', 'flushStreamRender', 'resetAnswerResult',
-  'regenerate', 'streamAnswer', 'summarizeToolArgs', 'applyUsage', 'dismissWrite']
+  'regenerate', 'streamAnswer', 'streamAnswerImpl', 'summarizeToolArgs', 'applyUsage', 'dismissWrite']
   .map(name => {
     const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name)
     assert.ok(node, `AiTab function ${name} exists`)
@@ -29,6 +29,8 @@ const functions = ['nowIso', 'findReactiveAnswer', 'isAnswerVisible', 'detachAns
 const eventSuffixes = ast.statements.find(n => ts.isVariableStatement(n) && n.declarationList.declarations
   .some(d => ts.isIdentifier(d.name) && d.name.text === 'ANSWER_EVENT_SUFFIXES')).getText(ast)
 const makeRunner = new Function('env', transpile(`
+  const streamTasks = new Map();
+  const syncDisposed = false;
   const { props, activeConversation, activeAnswerTabs, expandedSteps, streamOwners,
     activeRequestIds, unlisteners, useReasoning, reasoningLevel, pendingWrites,
     streamRenderTimers, streamRenderLast, streamRenderCost, ai, reader, crypto,

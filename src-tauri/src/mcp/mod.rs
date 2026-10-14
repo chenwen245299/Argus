@@ -24,6 +24,7 @@
 
 pub mod agent;
 pub mod app_tools;
+pub(crate) mod arxiv_tools;
 pub mod client;
 mod paper_images;
 mod server;

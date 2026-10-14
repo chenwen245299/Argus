@@ -218,3 +218,36 @@ test('the direct add action refreshes the main window; canceled or failed import
     }
   }
 })
+
+test('agent inbox changes reload recommendations, isolate libraries and discard stale refreshes', async () => {
+  const listeners = new Map(), pending = []
+  const useArxiv = storeFactory(arxivAst, 'useArxivStore', {
+    invoke: async name => {
+      if (name === 'get_arxiv_inbox') return new Promise(resolve => pending.push(resolve))
+      if (name === 'get_arxiv_schedule_status') return { analyzing: false, fetching: false }
+      if (name === 'get_current_library') return '/fixture/library'
+      throw new Error(`Unexpected command ${name}`)
+    },
+    listen: async (name, handler) => { listeners.set(name, handler); return () => listeners.delete(name) },
+    confirmDuplicateImport: async () => false,
+  })
+  const store = useArxiv(createPinia())
+  store.loaded = true
+  store.papers = [{ arxiv_id: 'old', read: false }]
+  await store.subscribeEvents()
+  try {
+    const changed = listeners.get('arxiv-new-recommendations')
+    await changed({ payload: { root: '/other/library', count: 99, inboxChanged: true } })
+    assert.equal(pending.length, 0)
+    assert.equal(store.newCount, 0)
+    await changed({ payload: { root: '/fixture/library', count: 1, inboxChanged: true } })
+    await changed({ payload: { root: '/fixture/library', count: 0, inboxChanged: true } })
+    assert.equal(pending.length, 2)
+    pending[1]({ papers: [], last_updated: '2026-10-14' })
+    await new Promise(resolve => setImmediate(resolve))
+    pending[0]({ papers: [{ arxiv_id: 'already-deleted', read: false }], last_updated: '2026-10-14' })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(store.papers, [], 'late old snapshot must not restore deleted recommendations')
+    assert.equal(store.newCount, 0)
+  } finally { store.unsubscribeEvents() }
+})

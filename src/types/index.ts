@@ -1038,7 +1038,7 @@ export interface EmbeddingMapData {
  * it from the same value it will execute, so this is literally what lands on
  * disk once the user approves. */
 export interface AgentWritePreview {
-  /** App-only note, highlight or annotation tool asking for a write. */
+  /** App-only tool asking for a reviewed write. */
   tool: string
   slug: string
   paperTitle: string
@@ -1048,6 +1048,8 @@ export interface AgentWritePreview {
   /** A note with this title already exists — nothing is overwritten either way. */
   duplicateTitle: boolean
   passages?: { page: number; text: string; note?: string | null; color: string; style: string }[]
+  recommendations?: { arxivId: string; title: string; source: string; existingSlug?: string | null; existingTitle?: string | null }[]
+  keepDuplicateCopies?: boolean
 }
 
 /** One validated canvas edit, as the panel applies it. Mirrors `CanvasOp` in

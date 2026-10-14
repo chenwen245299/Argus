@@ -670,7 +670,8 @@ onMounted(async () => {
   await syncActivityLibrary(libraryStore.currentPath)
   restoreWindowSize()
 
-  unlistenLibraryPaperAdded = await listen<{ slug?: string; title?: string }>('library-paper-added', async (event) => {
+  unlistenLibraryPaperAdded = await listen<{ root?: string; slug?: string; title?: string }>('library-paper-added', async (event) => {
+    if (event.payload.root && event.payload.root !== libraryStore.currentPath) return
     await Promise.all([libraryStore.refresh(), collectionsStore.load()])
     // arXiv-added papers arrive with only their arXiv source metadata; run the
     // same full AI-metadata + Semantic Scholar / easyScholar pipeline as a local

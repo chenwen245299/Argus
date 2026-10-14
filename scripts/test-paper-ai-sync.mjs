@@ -26,7 +26,7 @@ const functions = [
   'localConversationStreams', 'broadcastConversationSnapshot', 'broadcastStreamUpdate', 'ownsConversationStream',
   'adoptSyncedConversation', 'handlePaperAiSync', 'applySyncedDiskConversations', 'refreshSyncedConversations',
   'liveConversationById', 'restoreSession', 'openConversation', 'startNewConversation',
-  'firstUserTitle', 'isMetadataExtractionConversation', 'stopConversationStreaming',
+  'firstUserTitle', 'isMetadataExtractionConversation', 'stopConversationStreaming', 'conversationScope',
   'detachAnswerListeners', 'findReactiveAnswer', 'flushStreamRender',
 ].map(name => {
   const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name)
@@ -42,7 +42,7 @@ const createView = new Function('env', transpile(`
     streamRenderLast, streamRenderCost, paperSaves, backgroundSaves, sessions, knownConvIds,
     input, editingNodeId, showHistory, textareaEl, nextTick, scrollToBottom,
     invoke, paperAiSync, crypto, persistableServerToolTrace, saveLegacyActiveHistory,
-    flattenConversation, reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt, t } = env;
+    flattenConversation, reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt, t, messageQueue } = env;
   let syncLibraryRoot = env.root, syncDisposed = false;
   let syncRefresh = null, syncRefreshPending = false;
   let selectionRevision = 0, initialSyncSelectionRevision = null;
@@ -88,6 +88,7 @@ function bus(initial = [conversation()]) {
   }
   async function view(origin, root = 'root-a', slug = 'paper') {
     let client
+    const pausedScopes = new Set()
     const sync = {
       get origin() { return client.origin },
       send: p => client.send(p), queue: (id, make) => client.queue(id, make), cancel: id => client.cancel(id),
@@ -101,6 +102,7 @@ function bus(initial = [conversation()]) {
       paperSaves: new Map(), backgroundSaves: new Map(), sessions: new Map(), knownConvIds: new Map([[slug, new Set(current.map(c => c.id))]]),
       input: ref(''), editingNodeId: ref(null), showHistory: ref(false), textareaEl: ref(null),
       crypto: webcrypto, nextTick, scrollToBottom: () => {}, paperAiSync: sync,
+      pausedScopes, messageQueue: { pause: scope => pausedScopes.add(scope) },
       persistableServerToolTrace: trace => trace, saveLegacyActiveHistory: async () => {}, flattenConversation: () => [],
       reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt,
       t: key => key === 'guidedReading.title' ? 'AI 领读' : key,
@@ -275,6 +277,7 @@ test('a mirrored stop reaches the owning request instead of saving the receiver\
   assert.deepEqual(b.cancellations, ['sidebar-request'])
   assert.ok(b.writes.every(w => w.origin === 'sidebar'))
   assert.equal(popup.activeConversation.value.nodes.at(-1).answers[0].streaming, false)
+  assert.deepEqual([...sidebar.pausedScopes], [JSON.stringify(['root-a', 'paper', 'chat'])])
 })
 
 test('sync isolates papers/libraries and preserves the local object that owns a stream', async t => {

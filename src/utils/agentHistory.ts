@@ -47,6 +47,9 @@ export function buildToolExchangeMessages(
 
   steps.forEach((step, i) => {
     if (!step.tool) return
+    // A steer can interrupt a tool before it produced a result. Only completed
+    // exchanges may enter the continuation; an empty success would mislead it.
+    if (step.ok === undefined && !step.preview?.trim()) return
     const id = `call_${answerId}_${i}`
     // `arguments` must be a JSON string; argsJson already is one.
     const args = (step.argsJson ?? '').trim() || '{}'

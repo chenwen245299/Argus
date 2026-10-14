@@ -802,7 +802,12 @@ async fn stream_with_pdf_injected(
         // a gzipped SSE stream, so ask for identity encoding to keep it plain text.
         req = req.header("Accept-Encoding", "identity");
     }
-    let resp = send_chat_with_soclaas_retry(req, provider, &body, false).await?;
+    let resp = crate::cancel::until_cancelled(
+        cancel.as_ref(),
+        send_chat_with_soclaas_retry(req, provider, &body, false),
+    )
+    .await
+    .ok_or("cancelled")??;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -824,7 +829,10 @@ async fn stream_with_pdf_injected(
     let mut usage_emitted = false;
     let mut trace = crate::openrouter::ServerToolTrace::default();
 
-    'stream: while let Some(chunk) = stream.next().await {
+    'stream: while let Some(chunk) = crate::cancel::until_cancelled(cancel.as_ref(), stream.next())
+        .await
+        .flatten()
+    {
         // Backend cancellation: if the user pressed stop, break out of the loop.
         // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
         // provider stops generating (and billing). Return the partial text.
@@ -1409,7 +1417,12 @@ async fn stream_openai_compat(
         // Kimi Code may return a gzipped SSE stream; ask for identity to keep it plain text.
         req = req.header("Accept-Encoding", "identity");
     }
-    let resp = send_chat_with_soclaas_retry(req, provider, &body, false).await?;
+    let resp = crate::cancel::until_cancelled(
+        cancel.as_ref(),
+        send_chat_with_soclaas_retry(req, provider, &body, false),
+    )
+    .await
+    .ok_or("cancelled")??;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -1443,7 +1456,10 @@ async fn stream_openai_compat(
     // provider, and for StepFun with speech switched off.
     let mut audio_pcm: Vec<u8> = Vec::new();
 
-    'stream: while let Some(chunk) = stream.next().await {
+    'stream: while let Some(chunk) = crate::cancel::until_cancelled(cancel.as_ref(), stream.next())
+        .await
+        .flatten()
+    {
         // Backend cancellation: if the user pressed stop, break out of the loop.
         // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
         // provider stops generating (and billing). Return the partial text.
@@ -1740,10 +1756,9 @@ async fn stream_deepseek_responses(
     let req = client
         .post(&url)
         .header("Content-Type", "application/json");
-    let resp = openai_auth(req, provider, api_key)
-        .json(&body)
-        .send()
+    let resp = crate::cancel::until_cancelled(cancel.as_ref(), openai_auth(req, provider, api_key).json(&body).send())
         .await
+        .ok_or("cancelled")?
         .map_err(|e| describe_stream_error(&e))?;
 
     let status = resp.status().as_u16();
@@ -1764,7 +1779,10 @@ async fn stream_deepseek_responses(
     let mut cache_hit_tokens: u64 = 0;
     let mut usage_emitted = false;
 
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = crate::cancel::until_cancelled(cancel.as_ref(), stream.next())
+        .await
+        .flatten()
+    {
         if let Some(flag) = &cancel {
             if flag.load(Ordering::SeqCst) {
                 break;
@@ -2016,10 +2034,9 @@ async fn stream_ollama(
     if !api_key.is_empty() {
         req = req.header("Authorization", format!("Bearer {api_key}"));
     }
-    let resp = req
-        .json(&body)
-        .send()
+    let resp = crate::cancel::until_cancelled(cancel.as_ref(), req.json(&body).send())
         .await
+        .ok_or("cancelled")?
         .map_err(|e| format!("{}. Is Ollama running at {}?", describe_stream_error(&e), ollama_root(provider)))?;
 
     let status = resp.status().as_u16();
@@ -2038,7 +2055,10 @@ async fn stream_ollama(
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
 
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = crate::cancel::until_cancelled(cancel.as_ref(), stream.next())
+        .await
+        .flatten()
+    {
         if let Some(flag) = &cancel {
             if flag.load(Ordering::SeqCst) {
                 break;
@@ -2415,10 +2435,9 @@ async fn stream_anthropic(
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01");
     }
-    let resp = req
-        .json(&body)
-        .send()
+    let resp = crate::cancel::until_cancelled(cancel.as_ref(), req.json(&body).send())
         .await
+        .ok_or("cancelled")?
         .map_err(|e| describe_stream_error(&e))?;
 
     let status = resp.status().as_u16();
@@ -2439,7 +2458,10 @@ async fn stream_anthropic(
     // Anthropic reports cache hits separately from `input_tokens`.
     let mut cache_read: u64 = 0;
 
-    'stream: while let Some(chunk) = stream.next().await {
+    'stream: while let Some(chunk) = crate::cancel::until_cancelled(cancel.as_ref(), stream.next())
+        .await
+        .flatten()
+    {
         // Backend cancellation: if the user pressed stop, break out of the loop.
         // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
         // provider stops generating (and billing). Return the partial text.
@@ -5194,7 +5216,12 @@ pub async fn stream_with_tools(
     let req = client
         .post(&url)
         .header("Content-Type", "application/json");
-    let resp = send_chat_with_soclaas_retry(openai_auth(req, provider, api_key), provider, &body, !tools.is_empty()).await?;
+    let resp = crate::cancel::until_cancelled(
+        cancel.as_ref(),
+        send_chat_with_soclaas_retry(openai_auth(req, provider, api_key), provider, &body, !tools.is_empty()),
+    )
+    .await
+    .ok_or("cancelled")??;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -5233,7 +5260,10 @@ pub async fn stream_with_tools(
         trace.note_call("web_search", 1);
     }
 
-    'outer: while let Some(chunk) = stream.next().await {
+    'outer: while let Some(chunk) = crate::cancel::until_cancelled(cancel.as_ref(), stream.next())
+        .await
+        .flatten()
+    {
         if let Some(flag) = &cancel {
             if flag.load(Ordering::SeqCst) {
                 break;

@@ -276,6 +276,74 @@ pub fn get_inbox(root: &str) -> ArxivInbox {
     }
 }
 
+/// Agent reads must distinguish an empty inbox from a damaged day file. This
+/// does not prune or reanalyse recommendations, or expose the user's config.
+pub(crate) fn agent_recommendations(root: &str) -> Result<Vec<ArxivPaper>, String> {
+    let _guard = inbox_lock();
+    migrate_old_inbox(root);
+    let mut papers = Vec::new();
+    let mut seen = HashSet::new();
+    for date in list_day_dates(root) {
+        for p in read_day_papers_checked(root, &date)? {
+            if seen.insert(p.arxiv_id.clone()) { papers.push(p); }
+        }
+    }
+    let config = get_arxiv_config(root);
+    papers.retain(|p| p.analysis_status == "done" && (p.kept || !config.ai_filter_enabled
+        || p.relevance_score.is_some_and(|score| score >= config.ai_filter_threshold)));
+    let states = load_read_states(root);
+    for p in &mut papers {
+        if let Some(s) = states.get(&p.arxiv_id) { p.read = s.read; p.rating = s.rating; }
+    }
+    mark_in_library_statuses(root, &mut papers);
+    papers.retain(|p| !p.in_library);
+    Ok(papers)
+}
+
+/// Identity/content fields bound to the user's approval. Analysis and read
+/// state may change while the card is open without changing the target paper.
+pub(crate) fn same_recommendation(a: &ArxivPaper, b: &ArxivPaper) -> bool {
+    a.arxiv_id == b.arxiv_id && a.title == b.title && a.authors == b.authors
+        && a.summary == b.summary && a.source == b.source && a.pdf_url == b.pdf_url
+        && a.abs_url == b.abs_url && a.published == b.published && a.updated == b.updated
+}
+
+/// Delete only the exact recommendations reviewed by the user. Validate every
+/// day and every target before changing any file, under the analysis/fetch lock.
+pub(crate) fn delete_reviewed_recommendations(root: &str, reviewed: &[ArxivPaper]) -> Result<ArxivInbox, String> {
+    let guard = inbox_lock();
+    let mut days = Vec::new();
+    let mut found = HashSet::new();
+    for date in list_day_dates(root) {
+        let papers = read_day_papers_checked(root, &date)?;
+        for p in &papers {
+            if let Some(expected) = reviewed.iter().find(|r| r.arxiv_id == p.arxiv_id) {
+                if !same_recommendation(p, expected) {
+                    return Err(format!("Recommendation '{}' changed after preview; nothing was deleted.", p.arxiv_id));
+                }
+                found.insert(p.arxiv_id.clone());
+            }
+        }
+        days.push((date, papers));
+    }
+    if reviewed.iter().any(|p| !found.contains(&p.arxiv_id)) {
+        return Err("A reviewed recommendation is no longer in the inbox; nothing was deleted. Refresh the list.".into());
+    }
+    for (date, mut papers) in days {
+        let before = papers.len();
+        papers.retain(|p| !found.contains(&p.arxiv_id));
+        if papers.len() != before { write_day_papers(root, &date, &papers)?; }
+    }
+    {
+        let _state_guard = read_state_lock();
+        let mut states = load_read_states(root);
+        states.retain(|id, _| !found.contains(id));
+        save_read_states(root, &states)?;
+    }
+    drop(guard);
+    Ok(get_inbox(root))
+}
+
 /// Collect source ids of all papers already in the library.
 fn collect_library_arxiv_ids(root: &str) -> std::collections::HashSet<String> {
     let papers_dir = std::path::Path::new(root).join("papers");
@@ -2489,6 +2557,35 @@ fn sanitize_slug(s: &str) -> String {
         .to_string()
 }
 
+pub(crate) fn recommendation_pdf_url(paper: &ArxivPaper) -> Result<String, String> {
+    let url = if paper.pdf_url.is_empty() && paper.source.as_deref() != Some("biorxiv") {
+        let id = parse_arxiv_id(&paper.arxiv_id).ok_or("Invalid arXiv recommendation ID.")?;
+        format!("https://arxiv.org/pdf/{id}")
+    } else { paper.pdf_url.clone() };
+    crate::net::validate_host_suffix(&url, &["arxiv.org", "biorxiv.org"])?;
+    Ok(url)
+}
+
+/// Shared by reading an inbox PDF and importing the reviewed recommendation.
+/// Reject redirects away from preprint hosts and oversized/non-PDF bodies.
+pub(crate) async fn download_recommendation_pdf(paper: &ArxivPaper) -> Result<Vec<u8>, String> {
+    let url = recommendation_pdf_url(paper)?;
+    let client = reqwest::Client::builder().user_agent("Argus/0.1")
+        .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 { return attempt.error("Too many PDF redirects"); }
+            if crate::net::validate_host_suffix(attempt.url().as_str(), &["arxiv.org", "biorxiv.org"]).is_err() {
+                return attempt.error("PDF redirect left the preprint hosts");
+            }
+            attempt.follow()
+        })).build().map_err(|e| e.to_string())?;
+    let response = client.get(url).send().await.map_err(|e| format!("Recommendation PDF download: {e}"))?
+        .error_for_status().map_err(|e| format!("Recommendation PDF download: {e}"))?;
+    let bytes = crate::net::fetch_bytes_capped(response, 64 * 1024 * 1024).await?;
+    if !bytes.starts_with(b"%PDF") { return Err("The recommendation server returned non-PDF content.".into()); }
+    Ok(bytes)
+}
+
 pub async fn add_to_library(
     root: &str,
     arxiv_id: &str,
@@ -2504,6 +2601,20 @@ pub async fn add_to_library(
         .cloned()
         .ok_or_else(|| format!("Paper {} not found in inbox.", arxiv_id))?;
 
+    add_recommendation_to_library(root, paper, app, force, None).await
+}
+
+/// Import the captured recommendation, rather than resolving fresh model
+/// arguments after approval. The ordinary inbox action uses this path too.
+pub(crate) async fn add_recommendation_to_library(
+    root: &str,
+    paper: ArxivPaper,
+    app: &tauri::AppHandle,
+    force: bool,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<ImportResult, String> {
+    let arxiv_id = paper.arxiv_id.as_str();
+
     // Duplicate check by arxiv_id/DOI or title+first-author (unless forced). For
     // bioRxiv recommendations the `arxiv_id` field actually carries the DOI.
     if !force {
@@ -2513,9 +2624,11 @@ pub async fn add_to_library(
         } else {
             (Some(arxiv_id), None)
         };
-        if let Some(hit) =
-            find_duplicate(root, cand_arxiv, cand_doi, &paper.title, None)
-        {
+        let r = root.to_string(); let title = paper.title.clone();
+        let candidate_arxiv = cand_arxiv.map(str::to_string); let candidate_doi = cand_doi.map(str::to_string);
+        let hit = tokio::task::spawn_blocking(move || find_duplicate(&r, candidate_arxiv.as_deref(), candidate_doi.as_deref(), &title, None))
+            .await.map_err(|e| format!("Duplicate lookup failed: {e}"))?;
+        if let Some(hit) = hit {
             return Ok(ImportResult::duplicate(hit.slug, hit.title));
         }
     }
@@ -2527,22 +2640,21 @@ pub async fn add_to_library(
         }),
     );
 
-    // Download PDF
-    let client = reqwest::Client::builder()
-        .user_agent("Argus/0.1")
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("Build client: {e}"))?;
-
-    let pdf_url = if paper.pdf_url.is_empty() {
-        format!("https://arxiv.org/pdf/{}", arxiv_id)
-    } else {
-        paper.pdf_url.clone()
+    // Reuse the seven-day download cache, or download the captured PDF. The
+    // library receives an independent permanent copy after approval.
+    let cache_dir = crate::arxiv_pdf_cache::directory(app)?;
+    let cached_pdf = tokio::select! {
+        downloaded = crate::arxiv_pdf_cache::acquire(&cache_dir, root, &paper) => downloaded?,
+        _ = async {
+            loop {
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) { break; }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        } => return Err("Import cancelled before writing the paper.".into()),
     };
-
-    // Verify the response is a real PDF (checks HTTP status + `%PDF` magic) so a
-    // 404 / rate-limit / HTML error page never gets written as a broken paper.
-    let pdf_bytes = download_pdf(&client, &pdf_url, &[]).await?;
+    if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+        return Err("Import cancelled before writing the paper.".into());
+    }
 
     let _ = app.emit(
         "arxiv-import",
@@ -2561,63 +2673,83 @@ pub async fn add_to_library(
         .unwrap_or(&slug)
         .to_string();
 
-    // Write PDF
-    let pdf_path = final_dir.join("paper.pdf");
-    std::fs::write(&pdf_path, &pdf_bytes).map_err(|e| format!("Write PDF: {e}"))?;
+    let root_write = root.to_string();
+    let slug_write = final_slug.clone();
+    let paper_write = paper.clone();
+    let inbox = tokio::task::spawn_blocking(move || -> Result<ArxivInbox, String> {
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+            // The newly reserved directory is still empty.
+            let _ = std::fs::remove_dir(&final_dir);
+            return Err("Import cancelled before writing the paper.".into());
+        }
+        let root = root_write.as_str(); let final_slug = slug_write; let paper = paper_write;
+        let arxiv_id = paper.arxiv_id.as_str();
 
-    // Parse year from published (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
-    let year: Option<u32> = paper
-        .published
-        .chars()
-        .take(4)
-        .collect::<String>()
-        .parse()
-        .ok();
+        // Write PDF
+        let pdf_path = final_dir.join("paper.pdf");
+        std::fs::copy(cached_pdf.path(), &pdf_path).map_err(|e| format!("Copy PDF into library: {e}"))?;
 
-    // Build meta
-    let paper_id = uuid::Uuid::new_v4().to_string();
-    let meta = PaperMeta {
-        id: paper_id,
-        title: paper.title.clone(),
-        authors: paper.authors.clone(),
-        year,
-        // For bioRxiv papers the arxiv_id field holds the DOI; store it in doi instead.
-        doi: if paper.source.as_deref() == Some("biorxiv") { Some(arxiv_id.to_string()) } else { None },
-        arxiv_id: if paper.source.as_deref() == Some("biorxiv") { None } else { Some(arxiv_id.to_string()) },
-        venue: None,
-        tags: vec![],
-        added_at: chrono::Utc::now().to_rfc3339(),
-        original_filename: Some(format!("{}.pdf", arxiv_id.replace('/', "_"))),
-        reading_status: "unread".to_string(),
-        paper_abstract: Some(paper.summary.clone()).filter(|s| !s.trim().is_empty()),
-        bibtex: None,
-        canvas_notes: vec![],
-        import_source: Some(paper.source.clone().unwrap_or_else(|| "arxiv".to_string())),
-        cite_count: None,
-        file_type: None,
-        related_ids: Vec::new(),
-        journal_rank: None,
-    };
-    paper::write_meta(root, &final_slug, &meta)?;
-    paper::ensure_paper_files(root, &final_slug);
+        // Parse year from published (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        let year: Option<u32> = paper
+            .published
+            .chars()
+            .take(4)
+            .collect::<String>()
+            .parse()
+            .ok();
 
-    // Mark metadata_fetched in status
-    let mut status = PaperStatus::default();
-    status.metadata_fetched = true;
-    paper::write_status(root, &final_slug, &status)?;
-    let _ = search::index_paper(root, &final_slug);
+        // Build meta
+        let paper_id = uuid::Uuid::new_v4().to_string();
+        let meta = PaperMeta {
+            id: paper_id,
+            title: paper.title.clone(),
+            authors: paper.authors.clone(),
+            year,
+            // For bioRxiv papers the arxiv_id field holds the DOI; store it in doi instead.
+            doi: if paper.source.as_deref() == Some("biorxiv") { Some(arxiv_id.to_string()) } else { None },
+            arxiv_id: if paper.source.as_deref() == Some("biorxiv") { None } else { Some(arxiv_id.to_string()) },
+            venue: None,
+            tags: vec![],
+            added_at: chrono::Utc::now().to_rfc3339(),
+            original_filename: Some(format!("{}.pdf", arxiv_id.replace('/', "_"))),
+            reading_status: "unread".to_string(),
+            paper_abstract: Some(paper.summary.clone()).filter(|s| !s.trim().is_empty()),
+            bibtex: None,
+            canvas_notes: vec![],
+            import_source: Some(paper.source.clone().unwrap_or_else(|| "arxiv".to_string())),
+            cite_count: None,
+            file_type: None,
+            related_ids: Vec::new(),
+            journal_rank: None,
+        };
+        paper::write_meta(root, &final_slug, &meta)?;
+        paper::ensure_paper_files(root, &final_slug);
 
-    // Once imported, remove the recommendation from the arXiv inbox.
-    let inbox = {
-        let _guard = inbox_lock();
-        let mut inbox = get_inbox(root);
-        inbox.papers.retain(|p| p.arxiv_id != arxiv_id);
-        let _ = save_inbox(root, &inbox);
-        inbox
-    };
+        // Mark metadata_fetched in status
+        let mut status = PaperStatus::default();
+        status.metadata_fetched = true;
+        paper::write_status(root, &final_slug, &status)?;
+        let _ = search::index_paper(root, &final_slug);
+
+        // Once imported, remove the recommendation from the arXiv inbox.
+        let inbox = {
+            let _guard = inbox_lock();
+            let mut inbox = get_inbox(root);
+            inbox.papers.retain(|p| !same_recommendation(p, &paper));
+            let _ = save_inbox(root, &inbox);
+            inbox
+        };
+        drop(cached_pdf);
+        if let Err(e) = crate::arxiv_pdf_cache::discard_imported(&cache_dir, root, &paper) {
+            // The library copy already committed. A cache cleanup failure must
+            // not report a successful import as failed; the scheduler retries.
+            eprintln!("[arxiv-pdf-cache] imported-copy cleanup: {e}");
+        }
+        Ok(inbox)
+    }).await.map_err(|e| format!("Recommendation import task failed: {e}"))??;
     let _ = app.emit(
         "arxiv-new-recommendations",
-        serde_json::json!({ "count": inbox.papers.iter().filter(|p| !p.in_library).count() }),
+        serde_json::json!({ "count": inbox.papers.iter().filter(|p| !p.in_library).count(), "root": root, "inboxChanged": true }),
     );
 
     // Notify main window to refresh (before extraction so UI appears immediately)

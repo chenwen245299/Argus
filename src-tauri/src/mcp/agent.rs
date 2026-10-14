@@ -70,6 +70,7 @@ pub fn tools() -> Vec<AgentTool> {
             }
         })
         .chain(app_only_tools())
+        .chain(super::arxiv_tools::declarations())
         .chain(std::iter::once(send_paper_image_tool()))
         .collect()
 }
@@ -330,6 +331,9 @@ pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_js
             "'{name}' changes the library and cannot be run here — it must go through \
              the user's confirmation."
         ));
+    }
+    if super::arxiv_tools::is_tool(name) {
+        return super::arxiv_tools::call(root, name, args);
     }
     match name {
         "find_papers" => {

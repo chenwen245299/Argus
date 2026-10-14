@@ -44,6 +44,7 @@ pub const CREATE_ANNOTATIONS_TOOL: &str = "create_paper_annotations";
 /// same confirmation.
 pub fn is_write_tool(name: &str) -> bool {
     matches!(name, CREATE_NOTE_TOOL | CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL)
+        || super::arxiv_tools::is_write(name)
         || crate::canvas_edit::is_edit_tool(name)
 }
 
@@ -61,6 +62,7 @@ const MAX_CONTENT_CHARS: usize = 50_000;
 /// user says yes.
 #[derive(Debug, Clone)]
 pub enum PendingWrite {
+    Arxiv(super::arxiv_tools::PendingArxivWrite),
     CreateNote {
         slug: String,
         /// Resolved from the library at parse time, for the dialog. The user
@@ -130,6 +132,10 @@ pub struct WritePreview {
     pub duplicate_title: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub passages: Vec<Passage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recommendations: Vec<super::arxiv_tools::RecommendationPreview>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub keep_duplicate_copies: bool,
 }
 
 impl PendingWrite {
@@ -139,6 +145,9 @@ impl PendingWrite {
     /// it can fix the arguments and try again, and the user is never shown a
     /// dialog for a call that was malformed.
     pub fn parse(root: &str, name: &str, args: &serde_json::Value) -> Result<Self, String> {
+        if super::arxiv_tools::is_write(name) {
+            return super::arxiv_tools::PendingArxivWrite::parse(root, name, args).map(Self::Arxiv);
+        }
         match name {
             CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL => {
                 let slug = str_arg(args, "slug")?;
@@ -254,6 +263,7 @@ impl PendingWrite {
     /// What to show the user. Derived from `self`, never from the raw arguments.
     pub fn preview(&self, root: &str) -> WritePreview {
         match self {
+            Self::Arxiv(pending) => pending.preview(),
             PendingWrite::CreateNote {
                 slug,
                 paper_title,
@@ -267,10 +277,12 @@ impl PendingWrite {
                 content: content.clone(),
                 duplicate_title: paper::list_notes(root, slug).iter().any(|n| &n.title == title),
                 passages: Vec::new(),
+                recommendations: Vec::new(), keep_duplicate_copies: false,
             },
             Self::MarkPassages { tool, slug, paper_title, highlights, .. } => WritePreview {
                 tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
                 note_title: String::new(), content: String::new(), duplicate_title: false,
+                recommendations: Vec::new(), keep_duplicate_copies: false,
                 passages: highlights.iter().map(|h| Passage { page: h.page, text: h.text.clone(),
                     color: h.color.clone(), style: h.style.clone(), note: h.note.clone() }).collect(),
             },
@@ -283,6 +295,7 @@ impl PendingWrite {
     /// reached after the user approved this exact value.
     pub fn execute(&self, root: &str) -> Result<serde_json::Value, String> {
         match self {
+            Self::Arxiv(_) => Err("Recommendation writes require the approved async import/delete dispatcher.".into()),
             Self::MarkPassages { slug, paper_id, pdf_path, revision, highlights, .. } => {
                 if paper::read_meta(root, slug)?.id != *paper_id
                     || crate::render::pdf_revision(pdf_path)? != *revision {

@@ -3,6 +3,7 @@ mod ai_manager;
 mod ai_summary;
 mod annotations;
 mod arxiv;
+mod arxiv_pdf_cache;
 mod arxiv_scheduler;
 mod balance;
 mod cache_keepalive;
@@ -128,6 +129,7 @@ pub fn run() {
 
             // Start background scheduler
             arxiv_scheduler::start_scheduler(app.handle().clone());
+            arxiv_pdf_cache::spawn(app.handle());
 
             // Re-read model prices well after launch, so a free tier that has
             // been withdrawn stops advertising itself. Returns immediately.

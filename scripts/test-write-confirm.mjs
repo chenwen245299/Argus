@@ -93,6 +93,38 @@ test('note previews and rejection still work with the existing payload shape', a
   assert.deepEqual(await page.evaluate(() => window.decisions), ['rejected'])
 })
 
+test('recommendation import preview lists exact targets and duplicate policy before approval', async () => {
+  await mount({ tool: 'import_arxiv_papers', slug: '', paperTitle: '', noteTitle: '', content: '', duplicateTitle: false,
+    keepDuplicateCopies: true, recommendations: [
+      { arxivId: '2610.12345', title: 'Graph Research <script>', source: 'arxiv', existingSlug: 'graph-copy', existingTitle: 'Existing Graph Research' },
+      { arxivId: '10.1101/2026.10.13.123456', title: 'Biology Research', source: 'biorxiv' },
+    ] })
+  assert.match(await page.locator('.wc-title').innerText(), /加入文献库/)
+  assert.match(await page.locator('.wc-location').innerText(), /arXiv 论文/)
+  assert.equal(await page.locator('.wc-recommendation').count(), 2)
+  assert.match(await page.locator('.wc-body').innerText(), /2610\.12345/)
+  assert.match(await page.locator('.wc-body').innerText(), /10\.1101\/2026\.10\.13\.123456/)
+  assert.match(await page.locator('.wc-body').innerText(), /独立副本/)
+  assert.equal(await page.locator('.wc-paper-title script').count(), 0)
+  assert.deepEqual(await page.evaluate(() => window.decisions), [])
+  if (process.env.ARGUS_TEST_OUTPUT_DIR) await page.locator('#app').screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/arxiv-import-confirm.png` })
+  await page.getByRole('button', { name: '确认导入', exact: true }).click()
+  assert.deepEqual(await page.evaluate(() => window.decisions), ['approved'])
+  assert.deepEqual(await page.evaluate(() => window.approvedColors), [undefined])
+})
+
+test('recommendation deletion is clearly scoped to the inbox and rejecting never approves', async () => {
+  await mount({ tool: 'delete_arxiv_recommendations', slug: '', paperTitle: '', noteTitle: '', content: '', duplicateTitle: false,
+    recommendations: [{ arxivId: '2610.12345', title: 'A retained recommendation', source: 'arxiv' }] })
+  assert.match(await page.locator('.wc-title').innerText(), /删除/)
+  assert.match(await page.locator('.wc-location').innerText(), /文献库中的论文保留/)
+  assert.equal(await page.getByRole('button', { name: '确认删除推荐', exact: true }).count(), 1)
+  assert.equal(await page.locator('.wc-colors').count(), 0)
+  if (process.env.ARGUS_TEST_OUTPUT_DIR) await page.locator('#app').screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/arxiv-delete-confirm.png` })
+  await page.getByRole('button', { name: '取消', exact: true }).click()
+  assert.deepEqual(await page.evaluate(() => window.decisions), ['rejected'])
+})
+
 test('highlight and annotation batches allow independent palette and custom colors, preview them, and send only the confirmed choices', async () => {
   for (const tool of ['create_paper_highlights', 'create_paper_annotations']) {
     await mount({ tool, slug: 'paper', paperTitle: 'Paper', noteTitle: '', content: '', duplicateTitle: false,

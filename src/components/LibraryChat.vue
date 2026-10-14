@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import ChatMessageQueue from './ChatMessageQueue.vue'
+import { useChatSendQueue, type QueuedChatMessage } from '../utils/chatSendQueue'
 import { storeToRefs } from 'pinia'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
@@ -635,7 +637,7 @@ function fallbackTitle(f: AgentFallback): string {
 // it, since two conversations can be generating at once. Nothing is written
 // until `answerWrite` sends an approval back — the backend defaults every other
 // outcome (timeout, stop, this window closing) to "do not write".
-interface PendingWrite { requestId: string; preview: AgentWritePreview }
+interface PendingWrite { requestId: string; preview: AgentWritePreview; targetId: string }
 const pendingWrites = ref<PendingWrite[]>([])
 const currentWrite = computed<PendingWrite | null>(() => pendingWrites.value[0] ?? null)
 
@@ -1168,7 +1170,6 @@ function clearNavHover() {
 
 const canSend = computed(() =>
   (input.value.trim().length > 0 || attachments.value.length > 0) &&
-  !loading.value &&
   ai.isConfigured
 )
 const conversationSubtitle = computed(() => {
@@ -1586,11 +1587,11 @@ function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
       }
     } else {
       const ans = activeAnswer(m)
-      if (ans.streaming || ans.error || !ans.content.trim()) continue
+      if (ans.streaming || ans.error) continue
       // Replay this turn's tool calls + results (as native tool messages) before
       // its answer, so a follow-up reuses them instead of re-fetching.
       history.push(...buildToolExchangeMessages(ans.agentSteps, m.id))
-      history.push({ role: 'assistant', content: ans.content })
+      if (ans.content.trim()) history.push({ role: 'assistant', content: ans.content })
     }
   }
   return history
@@ -1673,6 +1674,7 @@ function deleteConversation(id: string) {
   // the provider stops billing for an answer nobody will read, and bar the id
   // from any further write.
   deletedConvIds.add(id)
+  messageQueue.clear(String(id))
   stopStreamingFor(id)
   conversations.value = conversations.value.filter(c => c.id !== id)
   if (activeConvId.value === id) {
@@ -1838,7 +1840,44 @@ function toggleAttachmentDetail(id: string) {
   att.detail = att.detail === 'low' ? undefined : 'low'
 }
 
-async function runAssistantRequest(
+const requestTasks = new Map<string, { convId: string; task: Promise<void> }>()
+let chatDisposed = false
+interface LibraryQueuedMessage extends QueuedChatMessage {
+  conv: LibraryConversation
+  epoch: number
+  model: ModelSelection | null
+}
+const messageQueue = useChatSendQueue<LibraryQueuedMessage>({
+  busy: scope => isGenerating(scope),
+  valid: item => !chatDisposed && stillWritable(item.conv.id, item.epoch),
+  send: item => submitQuestion(item.conv, item.text, item.files, item.model),
+  interrupt: async item => {
+    const tasks = [...requestTasks.values()].filter(task => task.convId === item.conv.id).map(task => task.task)
+    stopStreamingFor(item.conv.id)
+    await Promise.allSettled(tasks)
+  },
+})
+const queuedMessages = computed(() => messageQueue.items.value.filter(item => item.scope === activeConvId.value))
+const queuePaused = computed(() => !!activeConvId.value && messageQueue.paused.has(activeConvId.value))
+const composerBusy = computed(() => loading.value || (!!activeConvId.value && messageQueue.active.has(activeConvId.value)))
+function steerQueuedMessage(id: string) {
+  const item = messageQueue.items.value.find(item => item.id === id)
+  if (item) messageQueue.steer(item)
+}
+function resumeMessageQueue() {
+  if (activeConvId.value) messageQueue.resume(activeConvId.value)
+}
+
+function runAssistantRequest(conv: LibraryConversation, assistantMsg: LibraryUiMessage,
+  target: LibraryUiMessage | LibraryAnswerVariant, history: ChatMessage[], sel: ModelSelection | null) {
+  const task = runAssistantRequestImpl(conv, assistantMsg, target, history, sel).finally(() => {
+    if (requestTasks.get(target.id)?.task === task) requestTasks.delete(target.id)
+  })
+  requestTasks.set(target.id, { convId: conv.id, task })
+  return task
+}
+
+async function runAssistantRequestImpl(
   conv: LibraryConversation,
   assistantMsg: LibraryUiMessage,
   target: LibraryUiMessage | LibraryAnswerVariant,
@@ -1888,7 +1927,6 @@ async function runAssistantRequest(
   // The library this answer belongs to. Checked again when it finishes, which
   // may be after the user has switched to another library.
   const streamEpoch = libraryEpoch
-  targetConvIds.set(target.id, streamConvId)
   // Backend cancellation id: generated per request, sent to `chat_with_library`,
   // and used by stopStreaming to invoke `cancel_ai_request`.
   const requestId = crypto.randomUUID()
@@ -1899,6 +1937,7 @@ async function runAssistantRequest(
   // All listeners for this request are tracked under target.id so a later
   // request (or unmount / stop) can tear down exactly this request's listeners.
   detachListeners(target.id)
+  targetConvIds.set(target.id, streamConvId)
   const offs: UnlistenFn[] = []
   activeUnlisteners.set(target.id, offs)
 
@@ -1974,7 +2013,7 @@ async function runAssistantRequest(
     (e) => {
       const p = e.payload
       if (!p?.requestId || !p.preview) return
-      pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview }]
+      pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview, targetId: target.id }]
     },
   ))
   offs.push(await listen<{ requestId: string }>(`${eventName}-confirm-close`, (e) => {
@@ -2047,6 +2086,7 @@ async function runAssistantRequest(
   }))
 
   try {
+    if (stoppedTargetIds.has(target.id) || streamEpoch !== libraryEpoch || chatDisposed) return
     // Pins travel with every question: the backend renders them into the
     // stable block the model sees before the conversation. Only the ones still
     // in the library go — a deleted paper's slug would make the tool-free
@@ -2138,6 +2178,10 @@ function stopAllStreaming() {
   }
   clearAllStreamRenderTimers()
   generatingConvIds.value = new Set()
+  for (const pending of pendingWrites.value) {
+    invoke('resolve_agent_write', { requestId: pending.requestId, approved: false }).catch(() => {})
+  }
+  pendingWrites.value = []
 }
 
 function createAssistantMessage(sel: ModelSelection | null): LibraryUiMessage {
@@ -2158,6 +2202,7 @@ function createAssistantMessage(sel: ModelSelection | null): LibraryUiMessage {
  *  without this the request runs to completion against the provider, billed in
  *  full, for a conversation that no longer exists. */
 function stopStreamingFor(convId: string | null) {
+  const ids = new Set([...targetConvIds].filter(([, owner]) => owner === convId).map(([id]) => id))
   // Tell the backend to truly cancel each in-flight request (closes the HTTP
   // stream so the provider stops generating / billing).
   for (const [targetId, requestId] of [...activeRequestIds.entries()]) {
@@ -2170,6 +2215,26 @@ function stopStreamingFor(convId: string | null) {
     detachListeners(id)
   }
   markGenerating(convId, false)
+  if (convId === activeConvId.value) webSearchPhase.value = null
+  for (const pending of pendingWrites.value.filter(pending => ids.has(pending.targetId))) {
+    invoke('resolve_agent_write', { requestId: pending.requestId, approved: false }).catch(() => {})
+  }
+  pendingWrites.value = pendingWrites.value.filter(pending => !ids.has(pending.targetId))
+  const conv = conversations.value.find(conv => conv.id === convId)
+  if (conv) {
+    for (const msg of conv.messages) for (const target of [msg, ...(msg.variants ?? [])]) {
+      if (target.streaming) {
+        target.streaming = false
+        target.endedAt = performance.now()
+        for (const step of target.agentSteps ?? []) if (step.ok === undefined) {
+          step.ok = false
+          step.preview = '{"error":"Tool interrupted by the user before its result was received"}'
+        }
+        flushStreamRender(target)
+      }
+    }
+    persistConv(conv)
+  }
 }
 
 // Stop the streaming the user is looking at: cancel the HTTP request, detach
@@ -2180,42 +2245,33 @@ function stopStreaming() {
   // the background, and the stop button in front of the user means "stop what I
   // am looking at".
   const stoppingConvId = activeConvId.value
+  if (stoppingConvId) messageQueue.pause(stoppingConvId)
   stopStreamingFor(stoppingConvId)
-  const conv = activeConv.value
-  if (conv) {
-    for (const msg of conv.messages) {
-      const targets: StreamTarget[] = [msg, ...(msg.variants ?? [])]
-      for (const target of targets) {
-        if (target.streaming) {
-          target.streaming = false
-          webSearchPhase.value = null
-          target.endedAt = performance.now()
-          flushStreamRender(target)
-        }
-      }
-    }
-  }
-  persistActive()
 }
 
-async function sendMessage() {
+function sendMessage(immediate = false) {
   const text = input.value.trim()
-  if ((!text && !attachments.value.length) || loading.value) return
+  if (!canSend.value) return
 
   if (!activeConvId.value) newConversation()
   const conv = activeConv.value!
   const sel = effectiveModel()
-  const currentAttachments = attachments.value.length > 0 ? [...attachments.value] : undefined
+  const item: LibraryQueuedMessage = { id: genId(), scope: conv.id, conv, epoch: libraryEpoch,
+    text, files: [...attachments.value], model: sel ? { ...sel } : null }
   input.value = ''
   attachments.value = []
   nextTick(autoResize)
+  if (immediate) messageQueue.steer(item)
+  else messageQueue.enqueue(item)
+}
 
+async function submitQuestion(conv: LibraryConversation, text: string, files: Attachment[], sel: ModelSelection | null) {
   if (conv.messages.filter(m => m.role === 'user').length === 0) {
     conv.title = deriveTitleFromMsg(text)
   }
 
   conv.messages.push({
-    id: genId(), role: 'user', content: text, attachments: currentAttachments, createdAt: new Date().toISOString(),
+    id: genId(), role: 'user', content: text, attachments: files.length ? files : undefined, createdAt: new Date().toISOString(),
   })
   conv.messages.push(createAssistantMessage(sel))
   // Use the reactive reference from the array so Vue tracks mutations during streaming
@@ -2338,7 +2394,7 @@ async function copyMessage(msg: LibraryUiMessage) {
 function isIMEActive(e: KeyboardEvent) { return e.isComposing || e.keyCode === 229 }
 
 function handleKeydown(e: KeyboardEvent) {
-  if (e.key === 'Enter' && !e.shiftKey && !isIMEActive(e)) { e.preventDefault(); sendMessage() }
+  if (e.key === 'Enter' && !e.shiftKey && !isIMEActive(e)) { e.preventDefault(); sendMessage(e.metaKey || e.ctrlKey) }
 }
 
 function onMsgContainerClick(e: MouseEvent) {
@@ -2422,6 +2478,7 @@ onMounted(async () => {
     // backend has already switched roots, and a stream that settles after this
     // point would file the old library's conversation under the new one.
     libraryEpoch++
+    messageQueue.clear()
     stopAllStreaming()
     resetNewConversationContext()
     await ai.load()
@@ -2448,6 +2505,9 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  chatDisposed = true
+  messageQueue.clear()
+  stopAllStreaming()
   // Answer any write still waiting on this window with a refusal. The backend
   // would time out into the same outcome, but a closed window should release
   // the agent immediately rather than leave it parked for minutes.
@@ -3053,6 +3113,11 @@ onUnmounted(() => {
             @reject="answerWrite(false)"
           />
           <div class="composer">
+            <ChatMessageQueue
+              :items="queuedMessages" :paused="queuePaused"
+              @edit="messageQueue.edit" @hold="messageQueue.hold"
+              @remove="messageQueue.remove" @steer="steerQueuedMessage" @resume="resumeMessageQueue"
+            />
             <div v-if="attachmentError" class="attachment-warning">
             <Icon icon="fluent:warning-24-regular" width="13" height="13" />
             <span>{{ attachmentError }}</span>
@@ -3096,9 +3161,7 @@ onUnmounted(() => {
                 </button>
               </div>
             </div>
-            <!-- Never disabled while generating: the next question can be typed
-                 (and pasted into) right away — only sending waits. `sendMessage`
-                 and `canSend` are what actually hold the message back. -->
+            <!-- Enter queues while generating; Cmd/Ctrl+Enter steers immediately. -->
             <textarea
               ref="textareaEl"
               v-model="input"
@@ -3106,6 +3169,7 @@ onUnmounted(() => {
               :placeholder="loading ? t('libraryChat.inputPlaceholderBusy') : t('libraryChat.inputPlaceholder')"
               rows="1"
               @keydown="handleKeydown"
+              :title="t('chat.composerHint')"
               @paste="onPaste"
             />
             <input
@@ -3216,14 +3280,14 @@ onUnmounted(() => {
                 </button>
               </div>
               <div class="footer-right">
-                <span class="enter-hint">{{ t('libraryChat.enterHint') }}</span>
-                <button v-if="loading" class="send-btn stop-btn" title="停止生成" @click="stopStreaming">
+                <span class="enter-hint" :title="t('chat.composerHint')">{{ t(composerBusy ? 'chat.queueShortcut' : 'chat.sendShortcut') }}</span>
+                <button v-if="composerBusy" class="send-btn stop-btn" title="停止生成" @click="stopStreaming">
                   <Icon icon="fluent:stop-24-filled" width="13" height="13" />
                   停止
                 </button>
-                <button v-else class="send-btn" :disabled="!canSend" @click="sendMessage">
+                <button class="send-btn" :disabled="!canSend" :title="t('chat.composerHint')" @click="sendMessage(false)">
                   <Icon icon="fluent:send-24-regular" width="13" height="13" />
-                  {{ t('copilot.send') }}
+                  {{ t(composerBusy ? 'chat.queueSend' : 'copilot.send') }}
                 </button>
               </div>
             </div>

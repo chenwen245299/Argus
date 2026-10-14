@@ -4,14 +4,15 @@
 // invoke and passes it to the backend. The streaming command registers an
 // `Arc<AtomicBool>` flag under that id. When the user presses "stop", the
 // frontend calls the `cancel_ai_request` command, which flips the flag to
-// `true`. The streaming loop checks the flag on every chunk and, if set, breaks
-// out of the loop and drops the reqwest response (closing the connection so the
-// provider stops billing).
+// `true`. Streaming reads and response-header waits check the flag at least
+// every 50 ms, dropping the reqwest response even when no chunks arrive
+// (closing the connection so the provider stops generating).
 //
 // IMPORTANT: never hold the registry mutex across an `await`. Callers clone the
 // `Arc<AtomicBool>` out of the map and then only `.load()` it inside the loop.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -43,6 +44,30 @@ pub fn cancel(request_id: &str) {
         if let Some(flag) = map.get(request_id) {
             flag.store(true, Ordering::SeqCst);
         }
+    }
+}
+
+/// Drop a pending network operation promptly even when the provider stops
+/// sending SSE chunks (or has not sent response headers yet). Ending chunk
+/// reads with None lets each streaming adapter still account for partial usage.
+pub async fn until_cancelled<F: Future>(
+    flag: Option<&Arc<AtomicBool>>,
+    work: F,
+) -> Option<F::Output> {
+    let Some(flag) = flag else {
+        return Some(work.await);
+    };
+    if flag.load(Ordering::SeqCst) {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = async {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        } => None,
+        result = work => Some(result),
     }
 }
 
@@ -84,4 +109,54 @@ impl Drop for CancelGuard {
 #[tauri::command]
 pub fn cancel_ai_request(request_id: String) {
     cancel(&request_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_drops_a_stalled_operation_without_waiting_for_a_chunk() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let cancelling = flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cancelling.store(true, Ordering::SeqCst);
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            until_cancelled(Some(&flag), async {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_start_does_not_poll_the_operation() {
+        let flag = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            until_cancelled(Some(&flag), async { panic!("must not start") }).await,
+            None::<()>
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_work_and_requests_without_cancellation_keep_their_results() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert_eq!(until_cancelled(Some(&flag), async { 42 }).await, Some(42));
+        assert_eq!(until_cancelled(None, async { 7 }).await, Some(7));
+    }
 }

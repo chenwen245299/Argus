@@ -9,7 +9,7 @@
 // window, stopping the answer or simply ignoring it all leave the library
 // untouched (the backend treats silence as a refusal after its timeout).
 import { useI18n } from 'vue-i18n'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { Icon } from '@iconify/vue'
 import MarkdownBody from './MarkdownBody.vue'
 import type { AgentWritePreview } from '../types'
@@ -25,6 +25,8 @@ const emit = defineEmits<{ approve: [colors?: string[]]; reject: [] }>()
 
 const { t } = useI18n()
 const selectedColors = ref(props.preview.passages?.map(p => p.color) ?? [])
+const recommendationAction = computed(() => props.preview.recommendations?.length
+  ? (props.preview.tool === 'delete_arxiv_recommendations' ? 'delete' : 'import') : null)
 
 function approve() {
   emit('approve', props.preview.passages?.length ? [...selectedColors.value] : undefined)
@@ -34,12 +36,16 @@ function approve() {
 <template>
   <div class="write-confirm">
     <div class="wc-head">
-      <Icon class="wc-icon" :icon="preview.passages?.length ? 'fluent:highlight-24-regular' : 'doodle:notebook'" width="20" height="20" />
-      <span class="wc-title">{{ t(preview.passages?.length ? 'writeConfirm.markTitle' : 'writeConfirm.title') }}</span>
+      <Icon class="wc-icon" :icon="recommendationAction ? (recommendationAction === 'delete' ? 'fluent:delete-24-regular' : 'fluent:library-24-regular') : preview.passages?.length ? 'fluent:highlight-24-regular' : 'doodle:notebook'" width="20" height="20" />
+      <span class="wc-title">{{ t(recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Title` : preview.passages?.length ? 'writeConfirm.markTitle' : 'writeConfirm.title') }}</span>
       <span v-if="props.queued" class="wc-queued">{{ t('writeConfirm.queued', { n: props.queued }) }}</span>
     </div>
 
-    <dl class="wc-fields">
+    <dl v-if="recommendationAction" class="wc-fields">
+      <div class="wc-field"><dt>{{ t('writeConfirm.paper') }}</dt><dd>{{ t('writeConfirm.arxivCount', { n: preview.recommendations?.length }) }}</dd></div>
+      <div class="wc-field"><dt>{{ t('writeConfirm.location') }}</dt><dd class="wc-location">{{ t(recommendationAction === 'delete' ? 'writeConfirm.arxivDeleteLocation' : 'writeConfirm.arxivImportLocation') }}</dd></div>
+    </dl>
+    <dl v-else class="wc-fields">
       <div class="wc-field">
         <dt>{{ t('writeConfirm.paper') }}</dt>
         <dd :title="preview.slug">{{ preview.paperTitle }}</dd>
@@ -62,7 +68,15 @@ function approve() {
     </p>
 
     <!-- Read-only preview of the note body, capped at roughly ten lines. -->
-    <div v-if="preview.passages?.length" class="wc-body">
+    <div v-if="recommendationAction" class="wc-body">
+      <div v-for="paper in preview.recommendations" :key="paper.arxivId" class="wc-recommendation">
+        <div class="wc-paper-title">{{ paper.title }}</div>
+        <div class="wc-page">{{ paper.source === 'biorxiv' ? 'bioRxiv' : 'arXiv' }} · {{ paper.arxivId }}</div>
+        <p v-if="paper.existingSlug" class="wc-warn">{{ t(preview.keepDuplicateCopies ? 'writeConfirm.arxivKeepDuplicate' : 'writeConfirm.arxivSkipDuplicate', { title: paper.existingTitle || paper.existingSlug }) }}</p>
+      </div>
+      <p v-if="recommendationAction === 'import'" class="wc-page">{{ t(preview.keepDuplicateCopies ? 'writeConfirm.arxivKeepPolicy' : 'writeConfirm.arxivSkipPolicy') }}</p>
+    </div>
+    <div v-else-if="preview.passages?.length" class="wc-body">
       <div v-for="(passage, index) in preview.passages" :key="index" class="wc-passage">
         <div class="wc-page">{{ t('writeConfirm.page', { n: passage.page }) }} · {{ t(passage.style === 'underline' ? 'writeConfirm.underline' : 'writeConfirm.highlight') }}</div>
         <div class="wc-colors" :aria-label="t('writeConfirm.color')" role="group">
@@ -86,11 +100,11 @@ function approve() {
     </div>
 
     <div class="wc-actions">
-      <span class="wc-hint">{{ t('writeConfirm.hint') }}</span>
-      <button class="wc-btn" @click="emit('reject')">{{ t('writeConfirm.reject') }}</button>
-      <button class="wc-btn primary" @click="approve">
+      <span class="wc-hint">{{ t(recommendationAction ? 'writeConfirm.arxivHint' : 'writeConfirm.hint') }}</span>
+      <button class="wc-btn" @click="emit('reject')">{{ t(recommendationAction ? 'writeConfirm.arxivReject' : 'writeConfirm.reject') }}</button>
+      <button class="wc-btn primary" :class="{ danger: recommendationAction === 'delete' }" @click="approve">
         <Icon icon="fluent:checkmark-24-regular" width="13" height="13" />
-        {{ t('writeConfirm.approve') }}
+        {{ t(recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Approve` : 'writeConfirm.approve') }}
       </button>
     </div>
   </div>
@@ -172,6 +186,10 @@ function approve() {
 .wc-body :deep(img) { max-width: 100%; }
 .wc-passage + .wc-passage { border-top: 1px solid var(--border-subtle); margin-top: 10px; padding-top: 10px; }
 .wc-page { color: var(--text-tertiary); font-size: 11px; }
+.wc-recommendation + .wc-recommendation { border-top: 1px solid var(--border-subtle); margin-top: 8px; padding-top: 8px; }
+.wc-paper-title { font-weight: 550; overflow-wrap: anywhere; }
+.wc-recommendation .wc-page { overflow-wrap: anywhere; }
+.wc-btn.primary.danger { background: var(--color-danger, #dc2626); }
 .wc-colors { display: flex; align-items: center; gap: 7px; margin: 6px 0; }
 .wc-colors > span { margin-right: 2px; font-size: 11px; color: var(--text-tertiary); }
 .wc-color { display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 1px solid rgba(0,0,0,.12); border-radius: 50%; color: #263238; cursor: pointer; }

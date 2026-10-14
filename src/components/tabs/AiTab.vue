@@ -27,7 +27,7 @@ import ChatAnswerBody from '../ChatAnswerBody.vue'
 import GuidedReadingIcon from '../GuidedReadingIcon.vue'
 import ChatMessageQueue from '../ChatMessageQueue.vue'
 import { useChatSendQueue, type QueuedChatMessage } from '../../utils/chatSendQueue'
-import { guidedReadingPrompt, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
+import { guidedReadingPrompt, guidedReadingRequestHistory, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
 import { askAiText } from '../../stores/translationHistory'
@@ -1871,7 +1871,7 @@ async function streamAnswerImpl(
     // pre-built context. `paperSlug` puts this paper's `get_paper` card in the
     // system prompt, so it starts knowing what it is reading.
     const finalText = await invoke<string>('chat_with_library', {
-      messages: history,
+      messages: guidedReadingRequestHistory(history),
       providerId: answer.providerId || null,
       modelId: answer.modelId || null,
       eventName,

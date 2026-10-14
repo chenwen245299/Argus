@@ -12,6 +12,9 @@ const transpile = source => ts.transpileModule(source, {
 const { buildToolExchangeMessages } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
   await readFile(new URL('../src/utils/agentHistory.ts', import.meta.url), 'utf8'),
 )).toString('base64'))
+const { guidedReadingRequestHistory } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
+  await readFile(new URL('../src/utils/guidedReading.ts', import.meta.url), 'utf8'),
+)).toString('base64'))
 
 // Execute the real regenerate -> streamAnswer -> agent-event -> save path.
 // Only desktop I/O and markdown rendering are replaced; answer state and Vue
@@ -35,7 +38,7 @@ const makeRunner = new Function('env', transpile(`
     activeRequestIds, unlisteners, useReasoning, reasoningLevel, pendingWrites,
     streamRenderTimers, streamRenderLast, streamRenderCost, ai, reader, crypto,
     listen, invoke, persistConversationFor, scheduleStreamRender, scrollToBottom,
-    mergeServerToolTrace, buildToolExchangeMessages, syncLibraryRoot,
+    mergeServerToolTrace, buildToolExchangeMessages, guidedReadingRequestHistory, syncLibraryRoot,
     broadcastConversationSnapshot, broadcastStreamUpdate } = env;
   ${eventSuffixes}
   ${functions}
@@ -101,7 +104,7 @@ function harness() {
     persistConversationFor: (_slug, conversation) => snapshots.push(JSON.parse(JSON.stringify(conversation))),
     scheduleStreamRender: a => { a.displayContent = a.content; a.displayReasoning = a.reasoningContent },
     scrollToBottom: () => {}, mergeServerToolTrace: (prior, next) => ({ ...prior, ...next }),
-    buildToolExchangeMessages,
+    buildToolExchangeMessages, guidedReadingRequestHistory,
   }
   const runner = makeRunner(env)
   const begin = () => {

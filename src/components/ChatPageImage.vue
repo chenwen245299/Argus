@@ -57,22 +57,35 @@ const { t } = useI18n()
 const src = ref<string | null>(props.image.dataUrl ?? null)
 const loadFailed = ref(false)
 
-watch(() => [props.conversationId, props.image.file, props.image.dataUrl], async (_, __, onCleanup) => {
+// Sync/disk snapshots replace image objects even when the saved PNG is unchanged.
+// Watch the source values separately so those replacements do not clear the <img>
+// or cancel an outstanding read just because a fresh array was returned.
+watch([
+  () => props.conversationId,
+  () => props.image.file,
+  () => props.image.dataUrl,
+], async ([conversationId, file, dataUrl], [previousConversationId, previousFile], onCleanup) => {
   let current = true
   onCleanup(() => { current = false })
-  src.value = props.image.dataUrl ?? null
   loadFailed.value = false
+  if (dataUrl) {
+    src.value = dataUrl
+    return
+  }
+  // Persistence strips live data URLs. The immutable file still identifies the
+  // pixels already on screen, so keep them through that transition.
+  if (file && file === previousFile && conversationId === previousConversationId && src.value) return
+  src.value = null
   // A live render already carries the data URL; a reloaded conversation only has
   // the file name, so fetch the saved PNG from the conversation's image folder.
-  if (src.value) return
-  if (!props.image.file || !props.conversationId) {
+  if (!file || !conversationId) {
     loadFailed.value = true
     return
   }
   try {
     const url = await invoke<string>('read_chat_image', {
-      conversationId: props.conversationId,
-      file: props.image.file,
+      conversationId,
+      file,
     })
     if (current) src.value = url
   } catch {

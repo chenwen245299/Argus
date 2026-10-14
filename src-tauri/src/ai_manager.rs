@@ -126,10 +126,15 @@ pub fn has_api_key(root: &str, provider_id: &str) -> bool {
 }
 
 pub fn delete_api_key(root: &str, provider_id: &str) {
+    let _ = delete_api_key_checked(root, provider_id);
+}
+
+pub fn delete_api_key_checked(root: &str, provider_id: &str) -> Result<(), String> {
     let mut map = read_keys_map(root);
     if map.remove(provider_id).is_some() {
-        let _ = write_keys_map(root, &map);
+        write_keys_map(root, &map)?;
     }
+    Ok(())
 }
 
 // ── Provider access tokens ────────────────────────────────────────────────────

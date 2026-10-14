@@ -4359,6 +4359,34 @@ pub async fn agent_list_builtin_tools() -> Result<Vec<crate::mcp::agent::AgentTo
     Ok(crate::mcp::agent::tools())
 }
 
+#[tauri::command]
+pub async fn exa_get_settings(state: State<'_, LibraryRoot>) -> Result<crate::exa::SettingsView, String> {
+    let root = get_root(&state)?;
+    tokio::task::spawn_blocking(move || crate::exa::settings(&root))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn exa_save_settings(
+    enabled: bool,
+    api_key: Option<String>,
+    clear_key: Option<bool>,
+    expected_root: String,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<crate::exa::SettingsView, String> {
+    let root = get_root(&state)?;
+    if root != expected_root {
+        return Err("文献库已切换，请重新打开 Exa 设置。".into());
+    }
+    let saved = tokio::task::spawn_blocking(move || crate::exa::save_settings(
+        &root, enabled, api_key.as_deref(), clear_key.unwrap_or(false),
+    )).await.map_err(|e| e.to_string())??;
+    // The next answer's tool surface may differ from the warmed prefix.
+    crate::cache_keepalive::disarm_and_announce(&app);
+    Ok(saved)
+}
+
 /// Stop holding the last agent conversation's prompt cache open.
 ///
 /// Called when the chat window closes. The keepalive also

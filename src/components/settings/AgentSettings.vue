@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Icon } from '@iconify/vue'
 import { invoke } from '@tauri-apps/api/core'
+import ExaSettings from './ExaSettings.vue'
 
 const { t } = useI18n()
 
@@ -389,6 +390,8 @@ onMounted(refresh)
         </div>
       </details>
     </div>
+
+    <ExaSettings />
 
     <!-- MCP servers -->
     <div class="settings-card">

@@ -209,8 +209,15 @@ both the sidebar and `PaperAiView`. It starts a fresh conversation with
 and attachments. Later turns and regeneration use the ordinary chat path. The
 stored first question retains the complete prompt; the user bubble and history
 title show a concise localized label. The prompt requires full paginated reading,
-visual inspection of all figures/tables, concrete examples, and one small point
-per turn followed by an understanding check.
+visual inspection of all figures/tables, concrete examples, and one coherent
+core idea per turn. Understanding is the goal: explain and repair gaps from the
+user's feedback, ending naturally by default. Ask a specific question only when
+it resolves a relevant premise/misconception or checks application at a real
+difficulty; never require a question or confirmation at every turn's end.
+Exact shipped legacy presets remain recognizable for concise bubbles/titles.
+`guidedReadingRequestHistory` upgrades them only in outgoing model requests for
+follow-ups and regeneration; stored first questions, custom text, assistant
+replies and attachment parts remain intact.
 `GuidedReadingIntro.vue` is hosted once per main/standalone window after setup
 is ready. Its device-local announcement is suppressed only after a successful,
 nonempty, uncancelled answer in a guided conversation, or when the user checks
@@ -641,6 +648,26 @@ Agent 与工具.
 When a client silently shows no tools, `claude --debug-file <path> -p hi` prints
 the actual validation errors with the offending tool index. Claude Desktop's own
 logs report only a bare `result` and reveal nothing.
+
+**Exa web tools (`exa.rs`).** App-only `web_search` and `web_fetch` join the
+shared paper/library/canvas agent loop when Exa is enabled and has a key in the
+answer's library. 设置 → AI 随航 → Agent 与工具 owns the Exa card. The enabled
+flag lives in `.argus/exa.json`; the key uses the existing AES-GCM key store
+under `__exa__`, never the settings JSON, tool schema or model transcript.
+`exa_get_settings` returns status only; `exa_save_settings` checks `expectedRoot`.
+Search calls Exa `/search` for bounded highlights; fetch calls `/contents` for
+text, with Unicode offsets and optional `maxAgeHours` (never deprecated
+`livecrawl`). A four-page answer-local cache avoids repeated fetch charges for
+pagination and disappears when the answer ends. Exa requests use a fixed HTTPS
+host, refuse redirects, cap response bytes and are cancellable while waiting for
+headers/body. Errors and per-page extraction failures are explicit. Both the
+loop and keepalive receive the same snapshotted tool availability; saving Exa
+settings disarms an obsolete prefix. Results use the existing tool trail and
+its persistence caps; web text is untrusted evidence. External stdio MCP does
+not expose these tools or read the key. `cargo test --lib exa::tests` covers
+credentials, schemas, validation, HTTP payloads, pagination and cancellation;
+`node --test scripts/test-exa-settings.mjs` covers the settings card with local
+desktop mocks and Playwright.
 
 ### SoCLaaS (`soclaas.rs`)
 

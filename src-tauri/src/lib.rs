@@ -17,6 +17,7 @@ mod copilot;
 mod crdt;
 mod deepseek;
 mod ebook;
+mod exa;
 mod extraction;
 mod fsutil;
 mod highlight_groups;
@@ -414,6 +415,8 @@ pub fn run() {
             commands::agent_save_settings,
             commands::agent_probe_server,
             commands::agent_list_builtin_tools,
+            commands::exa_get_settings,
+            commands::exa_save_settings,
             commands::disarm_cache_keepalive,
             holidays::get_cn_holidays,
         ])

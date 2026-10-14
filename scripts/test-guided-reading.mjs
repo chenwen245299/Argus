@@ -2,11 +2,22 @@
 // ARGUS_TEST_PLAYWRIGHT may point to a bundled Playwright index.mjs.
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
+import ts from 'typescript'
 import { createServer } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
 const { chromium } = await import(process.env.ARGUS_TEST_PLAYWRIGHT || 'playwright')
+const promptSource = ts.createSourceFile('guidedReading.ts',
+  await readFile(new URL('../src/utils/guidedReading.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
+const legacyPresets = Object.fromEntries(['zh', 'en'].map(locale => {
+  const name = `LEGACY_PROMPT_${locale.toUpperCase()}`
+  const declaration = promptSource.statements.filter(ts.isVariableStatement)
+    .flatMap(statement => [...statement.declarationList.declarations])
+    .find(declaration => declaration.name.getText(promptSource) === name)
+  assert.ok(declaration && ts.isNoSubstitutionTemplateLiteral(declaration.initializer))
+  return [locale, declaration.initializer.text]
+}))
 let server, browser, context, page, origin
 const errors = []
 const mocks = {
@@ -51,12 +62,22 @@ before(async () => {
       import '/src/assets/main.css'; import '/src/assets/themes.css';
       addCollection(fluent);
       const query = new URLSearchParams(location.search), mode = query.get('mode') || 'intro';
-      const test = window.__test = { requests: [], saved: [], listeners: new Map(), guided,
+      const legacyPresets = ${JSON.stringify(legacyPresets)};
+      const legacy = query.get('legacy');
+      const savedGuide = legacy ? [{id:'legacy-guide',slug:'paper',title:'AI 领读',source:'guidedReading',
+        createdAt:'2026-01-01T00:00:00Z',updatedAt:'2026-01-01T00:00:00Z',nodes:[
+          {id:'legacy-question',role:'user',content:legacyPresets[legacy],createdAt:'2026-01-01T00:00:00Z'},
+          {id:'legacy-group',role:'assistantGroup',promptId:'legacy-question',createdAt:'2026-01-01T00:00:00Z',answers:[
+            {id:'legacy-answer',providerId:'provider',providerName:'Example',modelId:'test-vision',modelName:'Test vision',
+              content:'Earlier explanation.',streaming:false,createdAt:'2026-01-01T00:00:00Z'}]},
+        ]}] : [];
+      const test = window.__test = { requests: [], saved: [], listeners: new Map(), guided, legacyPresets,
         emit(name, payload) { for (const cb of test.listeners.get(name) || []) cb({ payload }); },
         invoke(command, args) {
           if (command === 'get_current_library') return Promise.resolve('/mock-library');
           if (command === 'get_paper_meta') return Promise.resolve({ title: 'Example paper', abstract: 'A complete paper' });
-          if (command === 'get_paper_ai_conversations' || command === 'get_paper_chat') return Promise.resolve([]);
+          if (command === 'get_paper_ai_conversations') return Promise.resolve(structuredClone(savedGuide));
+          if (command === 'get_paper_chat') return Promise.resolve([]);
           if (command === 'save_paper_ai_conversations') test.saved.push(structuredClone(args));
           if (command === 'chat_with_library') return new Promise((resolve, reject) => test.requests.push({ args, resolve, reject }));
           if (command === 'cancel_ai_request') test.cancelled = args.requestId;
@@ -104,7 +125,7 @@ async function start() {
   await page.locator('.guided-reading-btn').click()
   await page.waitForFunction(() => window.__test.requests.length > 0)
 }
-async function finish(text = '先想象一个走迷宫的机器人。它需要选择下一步问什么。这个场景清楚吗？') {
+async function finish(text = '先想象一个走迷宫的机器人。它保留几条可能的路线，走一段再判断，就能避免过早选错。') {
   await page.evaluate(text => window.__test.requests.at(-1).resolve(text), text)
   await page.locator('.stop-btn').waitFor({ state: 'hidden' })
 }
@@ -115,7 +136,7 @@ async function flags() {
   }))
 }
 
-test('both default prompts request full paginated text, visual inspection, concise teaching and a pause for understanding', async () => {
+test('both prompts prioritize understanding and meaningful questions without mandatory turn-end checks', async () => {
   await open()
   const prompts = await page.evaluate(() => ['zh', 'en'].map(locale => window.__test.guided.guidedReadingPrompt(locale)))
   for (const prompt of prompts) {
@@ -125,11 +146,64 @@ test('both default prompts request full paginated text, visual inspection, conci
     assert.match(prompt, /send_paper_image/)
     assert.match(prompt, /附录|appendices/)
     assert.match(prompt, /图表|figures/)
-    assert.match(prompt, /等我|Wait for my/)
+    assert.match(prompt, /自然收尾|end naturally/)
+    assert.match(prompt, /只有问题确实|only when it clarifies/)
+    assert.match(prompt, /具体误解|concrete misconception/)
+    assert.match(prompt, /主动换例子|actively use another example/)
+    assert.doesNotMatch(prompt, /每轮末尾只问|End each turn with one|Wait for my reply/)
     assert.match(prompt, /3—6|3–6/)
     assert.match(prompt, /例子|example/)
   }
 })
+
+test('request upgrades preserve stored presets, assistant quotes, custom messages and attachment data', async () => {
+  await open()
+  const result = await page.evaluate(() => {
+    const { guided, legacyPresets } = window.__test
+    const attachment = {type:'image_url',image_url:{url:'data:image/png;base64,test'}}
+    const history = [
+      {role:'user',content:legacyPresets.zh},
+      {role:'assistant',content:legacyPresets.zh},
+      {role:'user',content:[{type:'text',text:legacyPresets.en},attachment]},
+      {role:'user',content:legacyPresets.zh + '\nMy custom addition.'},
+      {role:'user',content:'继续'},
+    ]
+    const before = JSON.stringify(history)
+    const updated = guided.guidedReadingRequestHistory(history)
+    return {
+      unchanged: JSON.stringify(history) === before,
+      zh: updated[0].content === guided.guidedReadingPrompt('zh'),
+      en: updated[2].content[0].text === guided.guidedReadingPrompt('en'),
+      quote: updated[1] === history[1], attachment: updated[2].content[1] === attachment,
+      custom: updated[3] === history[3], normal: updated[4] === history[4],
+      recognizable: ['zh','en'].every(locale => guided.isGuidedReadingPrompt(legacyPresets[locale])),
+    }
+  })
+  assert.ok(Object.values(result).every(Boolean), JSON.stringify(result))
+})
+
+for (const legacy of ['zh', 'en']) {
+  test(`${legacy}: an existing guide follows the new rules on follow-up and regeneration without rewriting the first question`, async () => {
+    await open('standalone', `&legacy=${legacy}`)
+    const original = legacyPresets[legacy]
+    assert.equal(await page.locator('.user-bubble').first().innerText(), '请通读这篇论文和所有图表，用易懂的例子带我逐轮读懂。')
+    const composer = page.locator('.composer textarea')
+    await composer.fill('继续讲，不用每次都问我问题')
+    await page.locator('.send-btn').click()
+    await page.waitForFunction(() => window.__test.requests.length === 1)
+    const requested = await page.evaluate(() => window.__test.requests[0].args)
+    assert.equal(requested.conversationId, 'legacy-guide')
+    assert.equal(requested.messages[0].content, await page.evaluate(locale => window.__test.guided.guidedReadingPrompt(locale), legacy))
+    await finish()
+    await page.locator('button[title="重新生成"]').last().click()
+    await page.waitForFunction(() => window.__test.requests.length === 2)
+    const regenerated = await page.evaluate(() => window.__test.requests[1].args)
+    assert.equal(regenerated.messages[0].content, requested.messages[0].content)
+    await finish()
+    const saved = await page.evaluate(() => window.__test.saved.at(-1).conversations.find(conv => conv.id === 'legacy-guide'))
+    assert.equal(saved.nodes[0].content, original)
+  })
+}
 
 test('intro waits for setup, appears once per launch, and transient acknowledgement does not suppress the next launch', async () => {
   await open('intro', '&ready=false')

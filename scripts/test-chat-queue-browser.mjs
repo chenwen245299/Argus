@@ -1,6 +1,7 @@
 // Real Vue composers with mocked desktop/provider I/O. No external requests.
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdir } from 'node:fs/promises'
 import { createServer } from 'vite'
 import vue from '@vitejs/plugin-vue'
 const { chromium } = await import(process.env.ARGUS_TEST_PLAYWRIGHT || 'playwright')
@@ -102,17 +103,97 @@ const finish = (index, text) => page.evaluate(({index,text}) => window.__test.fi
 const history = index => page.evaluate(index => window.__test.requests[index].args.messages, index)
 
 for (const mode of ['sidebar', 'standalone', 'library']) {
+  test(`${mode}: composer floats over the conversation and queued rows tuck behind it`, async () => {
+    await page.setViewportSize({ width: 1100, height: 840 })
+    await open(mode)
+    if (mode !== 'library') await page.locator('.test-panel').evaluate((el, width) => el.style.width = width, mode === 'sidebar' ? '350px' : '100%')
+    await send('比较这些论文的方法'); await count(1)
+    await finish(0, '# 方法对比\n\n' + '先比较研究目标，再检查方法和实验依据。阅读时保留每篇论文的条件、局限和原始结论。\n\n'.repeat(30) + '结尾确认可读')
+    const last = page.getByText('结尾确认可读', { exact: true })
+    await last.waitFor()
+    const dockSelector = mode === 'library' ? '.input-area' : 'footer.composer'
+    const boxSelector = mode === 'library' ? '.composer' : '.composer-box'
+    const messages = page.locator('.messages')
+    await page.waitForFunction(selector => parseFloat(getComputedStyle(document.querySelector('.messages')).paddingBottom)
+      > document.querySelector(selector).getBoundingClientRect().height, dockSelector)
+    await messages.evaluate(el => el.scrollTop = el.scrollHeight)
+    let dock = await page.locator(dockSelector).boundingBox()
+    assert.ok((await messages.boundingBox()).y + (await messages.boundingBox()).height > dock.y + dock.height - 2, 'conversation viewport continues behind the floating dock')
+    assert.ok((await last.boundingBox()).y + (await last.boundingBox()).height < dock.y, 'final answer remains readable above the composer')
+    assert.deepEqual(await page.locator(dockSelector).evaluate(el => {
+      const style = getComputedStyle(el)
+      return [style.borderTopWidth, style.backgroundColor]
+    }), ['0px', 'rgba(0, 0, 0, 0)'], 'no full-width divider or footer background')
+
+    await send('继续分析'); await count(2)
+    await send('对了，这里先说明假设')
+    const queue = await page.locator('.chat-message-queue').boundingBox()
+    const box = await page.locator(boxSelector).boundingBox()
+    const row = await page.locator('.queue-item').boundingBox()
+    assert.ok(queue.x >= box.x + 12 && queue.x + queue.width <= box.x + box.width - 12, 'queued strip is inset behind the input card')
+    assert.ok(queue.y < box.y && queue.y + queue.height > box.y, 'input card overlaps the queued strip')
+    assert.ok(row.y + row.height <= box.y + 1, 'queued text and all actions stay exposed above the input')
+    assert.ok(box.x + box.width <= (mode === 'sidebar' ? 350 : 1100), 'input card stays inside the panel with no clipped right edge')
+    await messages.evaluate(el => {
+      el.scrollTop = 120
+      el.dispatchEvent(new WheelEvent('wheel', { deltaY: -40, bubbles: true }))
+    })
+    const readingPosition = await messages.evaluate(el => el.scrollTop)
+    await composer().fill('保留正在写的内容\n第二行\n第三行\n第四行\n第五行\n第六行')
+    await page.waitForFunction(selector => parseFloat(getComputedStyle(document.querySelector('.messages')).paddingBottom)
+      > document.querySelector(selector).getBoundingClientRect().height, dockSelector)
+    await page.waitForFunction(() => {
+      const input = document.querySelector('.composer textarea')
+      return input.scrollHeight <= input.clientHeight + 2
+    })
+    assert.ok(Math.abs((await messages.evaluate(el => el.scrollTop)) - readingPosition) < 2, 'growing a draft does not move a reader who has scrolled up')
+
+    if (mode !== 'library') {
+      const before = await composer().boundingBox()
+      const grip = await page.locator('.composer-resizer').boundingBox()
+      await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2)
+      await page.mouse.down(); await page.mouse.move(grip.x + grip.width / 2, grip.y - 60); await page.mouse.up()
+      await page.waitForFunction(height => document.querySelector('.composer-input').getBoundingClientRect().height > height + 40, before.height)
+      await page.locator('.composer-resizer').dblclick()
+    }
+
+    if (process.env.ARGUS_TEST_OUTPUT_DIR) {
+      await composer().fill('保留正在写的内容')
+      await messages.evaluate(el => el.scrollTop = el.scrollHeight)
+      await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR, { recursive: true })
+      await page.screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/${mode}-floating-light.png` })
+      await page.evaluate(() => document.documentElement.dataset.theme = 'dark')
+      await page.locator('.queue-more').click()
+      await page.screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/${mode}-floating-menu-dark.png` })
+      await page.locator(dockSelector).screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/${mode}-floating-detail.png` })
+      await page.keyboard.press('Escape')
+    }
+    await page.setViewportSize({ width: 1100, height: 520 })
+    dock = await page.locator(dockSelector).boundingBox()
+    assert.ok(dock.y >= 0 && dock.y + dock.height <= 521, 'floating queue and composer remain on screen in a shorter window')
+    await page.locator('.stop-btn').click()
+  })
+
   test(`${mode}: normal sends queue, edit preserves draft and FIFO, delete does not send`, async () => {
+    await page.setViewportSize({ width: 1100, height: 840 })
     await open(mode); await send('first'); await count(1)
     await send('second'); await send('remove me'); await send('third')
     assert.equal(await page.locator('.queue-item').count(), 3)
+    assert.equal(await page.locator('.queue-heading').count(), 0, 'no heading above normal queued rows')
+    assert.ok((await page.locator('.queue-item').first().boundingBox()).height <= 40, 'normal messages occupy one compact row')
     await composer().fill('unfinished draft')
     const second = page.locator('.queue-item').first()
-    await second.getByRole('button', { name: '编辑', exact: true }).click()
-    await second.locator('textarea').fill('edited second')
+    await second.getByRole('button', { name: '更多操作', exact: true }).click()
+    await page.getByRole('menuitem', { name: '编辑消息', exact: true }).click()
+    assert.equal(await composer().inputValue(), 'second')
+    assert.equal(await page.locator('.chat-message-queue textarea').count(), 0, 'editing reuses the main composer')
+    assert.ok(await composer().evaluate(el => document.activeElement === el))
+    await composer().fill('edited second')
     await finish(0, 'partial first answer')
     assert.equal(await page.evaluate(() => window.__test.requests.length), 1, 'editing holds the queue on completion')
-    await second.getByRole('button', { name: '保存', exact: true }).click(); await count(2)
+    if (mode === 'standalone') await page.getByRole('button', { name: '保存编辑', exact: true }).click()
+    else await composer().press('Enter')
+    await count(2)
     await page.locator('.queue-item').filter({ hasText: 'remove me' }).getByRole('button', { name: '删除' }).click()
     await finish(1, 'second answer'); await count(3)
     assert.equal((await history(1)).at(-1).content, 'edited second')
@@ -120,6 +201,46 @@ for (const mode of ['sidebar', 'standalone', 'library']) {
     assert.equal(await composer().inputValue(), 'unfinished draft')
     assert.equal(await page.locator('.queue-item').count(), 0)
     await finish(2)
+  })
+
+  test(`${mode}: composer edits restore draft attachments on cancel and steer the edited row once`, async () => {
+    await open(mode); await send('first'); await count(1)
+    await page.locator('input[type=file]').first().setInputFiles({name:'queued.pdf',mimeType:'application/pdf',buffer:Buffer.from('%PDF-1.4 mock')})
+    await page.locator('.composer .attachment-chip').waitFor()
+    await send('queued message')
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+afoIAAAAASUVORK5CYII=', 'base64')
+    await page.locator('input[type=file]').first().setInputFiles({name:'draft.png',mimeType:'image/png',buffer:png})
+    await page.locator('.composer .attachment-chip').filter({hasText:'draft.png'}).waitFor()
+    await composer().fill('original unfinished draft')
+    await page.waitForFunction(() => {
+      const dock = document.querySelector('.input-area') || document.querySelector('footer.composer')
+      return parseFloat(getComputedStyle(document.querySelector('.messages')).paddingBottom) > dock.getBoundingClientRect().height
+    })
+    const edit = async () => {
+      assert.ok(await page.locator('.queue-list').evaluate(el => el.scrollWidth <= el.clientWidth), 'attachment count and queue actions fit without scrolling sideways')
+      await page.locator('.queue-more').click()
+      await page.getByRole('menuitem',{name:'编辑消息',exact:true}).click()
+      assert.equal(await composer().inputValue(), 'queued message')
+      assert.match(await page.locator('.composer .attachment-chip').innerText(), /queued.pdf/)
+      assert.equal(await page.locator('.chat-message-queue textarea').count(), 0)
+    }
+    await edit()
+    await page.locator('.composer .attachment-remove').click()
+    await composer().fill('cancel this edit')
+    await page.getByRole('button',{name:'取消编辑',exact:true}).click()
+    assert.equal(await composer().inputValue(), 'original unfinished draft')
+    assert.match(await page.locator('.composer .attachment-chip').innerText(), /draft.png/)
+    assert.match(await page.locator('.queue-file-count').getAttribute('title'), /queued.pdf/)
+    await edit()
+    await page.locator('.composer .attachment-remove').click()
+    await composer().fill('edited urgent direction')
+    await composer().press('Meta+Enter'); await count(2)
+    assert.equal((await history(1)).at(-1).content, 'edited urgent direction')
+    assert.equal(await page.locator('.queue-item').count(), 0)
+    assert.equal(await composer().inputValue(), 'original unfinished draft')
+    assert.match(await page.locator('.composer .attachment-chip').innerText(), /draft.png/)
+    assert.equal(await page.getByRole('button',{name:'保存编辑',exact:true}).count(), 0)
+    await finish(1)
   })
 
   test(`${mode}: Cmd+Enter and Steer cancel the exact request and preserve partial text and tool results`, async () => {
@@ -150,7 +271,8 @@ for (const mode of ['sidebar', 'standalone', 'library']) {
     await page.locator('input[type=file]').first().setInputFiles({name:'diagram.png',mimeType:'image/png',buffer:png})
     await page.locator('.composer .attachment-chip').waitFor()
     await send('with attachment')
-    assert.match(await page.locator('.queue-item').textContent(), /diagram.png/)
+    assert.match(await page.locator('.queue-file-count').getAttribute('title'), /diagram.png/)
+    assert.equal((await page.locator('.queue-file-count').innerText()).trim(), '1')
     await page.locator('.stop-btn').click()
     await page.getByRole('button',{name:'继续发送',exact:true}).waitFor()
     assert.equal(await page.evaluate(()=>window.__test.requests.length),1)
@@ -169,12 +291,19 @@ for (const mode of ['sidebar', 'standalone', 'library']) {
 
 test('paper switching keeps queued messages with their original paper and leaves the new draft intact', async () => {
   await open('sidebar'); await send('paper one'); await count(1); await send('queued paper one')
+  await composer().fill('paper one original draft')
+  await page.locator('.queue-more').click()
+  await page.getByRole('menuitem',{name:'编辑消息',exact:true}).click()
+  await composer().fill('unsaved queued edit')
   await page.evaluate(()=>window.__test.switchPaper('other'))
   await page.waitForFunction(()=>window.__test.calls.some(c=>c.command==='get_paper_meta'&&c.args.slug==='other'))
   await composer().fill('other draft'); await finish(0); await count(2)
   assert.equal(await page.evaluate(()=>window.__test.requests[1].args.paperSlug),'paper')
+  assert.equal((await history(1)).at(-1).content, 'queued paper one', 'a paper switch cancels the unsaved edit')
   assert.equal(await composer().inputValue(),'other draft')
   assert.equal(await page.locator('.queue-item').count(),0)
+  await page.evaluate(()=>window.__test.switchPaper('paper'))
+  await page.waitForFunction(() => document.querySelector('.composer textarea')?.value === 'paper one original draft')
   await finish(1)
 })
 
@@ -216,9 +345,12 @@ test('queue controls fit a narrow sidebar, and attachment-only messages can be q
   await page.locator('.composer .attachment-chip').waitFor()
   await composer().press('Enter')
   assert.match(await page.locator('.queue-item').textContent(),/paper.pdf/)
-  await page.locator('.queue-item').getByRole('button',{name:'编辑',exact:true}).click()
-  assert.ok(await page.locator('.queue-edit').evaluate(el=>document.activeElement===el))
-  await page.locator('.queue-edit').press('Escape')
+  await page.locator('.queue-item').getByRole('button',{name:'更多操作',exact:true}).click()
+  await page.getByRole('menuitem',{name:'编辑消息',exact:true}).click()
+  assert.ok(await composer().evaluate(el=>document.activeElement===el))
+  assert.match(await page.locator('.composer .attachment-chip').innerText(), /paper.pdf/)
+  assert.equal(await page.locator('.chat-message-queue textarea').count(),0)
+  await composer().press('Escape')
   const fits=await page.locator('.composer').evaluate(el=>{
     const right=el.getBoundingClientRect().right;
     return [...el.querySelectorAll('button,textarea')].every(child=>child.getBoundingClientRect().right<=right+1);
@@ -226,5 +358,35 @@ test('queue controls fit a narrow sidebar, and attachment-only messages can be q
   assert.ok(fits,'queue and toolbar controls stay within the sidebar')
   await page.screenshot({path:'/tmp/argus-chat-queue-sidebar.png'})
   await page.locator('.stop-btn').click()
+  assert.deepEqual(errors,[])
+})
+
+test('compact queue menu supports keyboard, dismissal and removes only its own row', async () => {
+  await open('sidebar')
+  await page.locator('.test-panel').evaluate(el=>el.style.width='350px')
+  await page.evaluate(()=>document.documentElement.dataset.theme='midnight')
+  await send('first'); await count(1)
+  await send('这条消息用于引导当前回答，长内容保持单行，不挤占阅读区域。'.repeat(3))
+  await send('keep this queued')
+  const row=page.locator('.queue-item').first(), more=row.getByRole('button',{name:'更多操作',exact:true})
+  await more.focus(); await more.press('Enter')
+  assert.ok(await page.getByRole('menuitem',{name:'编辑消息',exact:true}).evaluate(el=>document.activeElement===el))
+  await page.keyboard.press('ArrowDown')
+  assert.ok(await page.getByRole('menuitem',{name:'取消排队',exact:true}).evaluate(el=>document.activeElement===el))
+  const menu=await page.locator('.queue-menu').boundingBox()
+  assert.ok(menu.x>=0&&menu.y>=0&&menu.x+menu.width<=1100&&menu.y+menu.height<=840)
+  await page.screenshot({path:'/tmp/argus-chat-queue-menu.png'})
+  await page.keyboard.press('Escape')
+  assert.equal(await page.locator('.queue-menu').count(),0)
+  assert.ok(await more.evaluate(el=>document.activeElement===el))
+  await more.click(); await composer().click({ position: { x: 8, y: 10 } })
+  assert.equal(await page.locator('.queue-menu').count(),0)
+  await more.click(); await page.getByRole('menuitem',{name:'取消排队',exact:true}).click()
+  assert.equal(await page.locator('.queue-item').count(),1)
+  assert.match(await page.locator('.queue-item').innerText(),/keep this queued/)
+  assert.equal(await page.evaluate(()=>window.__test.requests.length),1)
+  await finish(0); await count(2)
+  assert.equal((await history(1)).at(-1).content,'keep this queued')
+  await finish(1)
   assert.deepEqual(errors,[])
 })

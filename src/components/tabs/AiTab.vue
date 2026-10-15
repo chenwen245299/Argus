@@ -26,7 +26,8 @@ import ChatPageImage from '../ChatPageImage.vue'
 import ChatAnswerBody from '../ChatAnswerBody.vue'
 import GuidedReadingIcon from '../GuidedReadingIcon.vue'
 import ChatMessageQueue from '../ChatMessageQueue.vue'
-import { useChatSendQueue, type QueuedChatMessage } from '../../utils/chatSendQueue'
+import { useChatSendQueue, useChatQueueEditor, type QueuedChatMessage } from '../../utils/chatSendQueue'
+import { useFloatingChatComposer } from '../../utils/floatingChatComposer'
 import { guidedReadingPrompt, guidedReadingRequestHistory, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
@@ -571,7 +572,18 @@ const queuedMessages = computed(() => activeConversation.value
   ? messageQueue.items.value.filter(item => item.scope === conversationScope(activeConversation.value!)) : [])
 const queuePaused = computed(() => !!activeConversation.value && messageQueue.paused.has(conversationScope(activeConversation.value)))
 const composerBusy = computed(() => hasStreaming.value || (!!activeConversation.value && messageQueue.active.has(conversationScope(activeConversation.value))))
+const queueEditor = useChatQueueEditor({
+  queue: messageQueue,
+  scope: () => activeConversation.value ? conversationScope(activeConversation.value) : null,
+  input, files: attachments,
+  focus: () => { void nextTick(() => {
+    const el = textareaEl.value
+    el?.focus(); el?.setSelectionRange(el.value.length, el.value.length)
+  }) },
+})
+const editingQueueId = queueEditor.editingId
 function steerQueuedMessage(id: string) {
+  if (editingQueueId.value === id) { queueEditor.commit(true); return }
   const item = messageQueue.items.value.find(item => item.id === id)
   if (item) messageQueue.steer(item)
 }
@@ -1385,6 +1397,7 @@ function flattenConversation(conv: Conversation): ChatMessage[] {
 }
 
 async function sendMessage(immediate = false) {
+  if (queueEditor.commit(immediate)) return
   if (!canSend.value || !props.slug) return
   await ensurePaperAiSync()
   if (!canSend.value || !props.slug) return
@@ -2132,6 +2145,9 @@ function resetComposerHeight() {
 }
 
 function handleKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && !e.isComposing && e.keyCode !== 229 && editingQueueId.value) {
+    e.preventDefault(); queueEditor.cancel(); return
+  }
   // `isComposing` / keyCode 229 reliably detect an active IME composition,
   // avoiding the race-prone Date.now() heuristic that could send half-typed text.
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
@@ -2148,6 +2164,7 @@ function handleKeydown(e: KeyboardEvent) {
 // change again and yank the user back down. Once they scroll up they stay put
 // until they come back to the bottom themselves.
 const stickToBottom = ref(true)
+const { composerDock, composerClearance } = useFloatingChatComposer(messagesEl, () => stickToBottom.value)
 const STICK_THRESHOLD_PX = 120
 
 function onMessagesScroll() {
@@ -2278,6 +2295,7 @@ let sessionSlug: string | null = null
 let slugRunToken = 0
 
 watch(() => props.slug, async (slug) => {
+  queueEditor.cancel(false)
   // Snapshot the paper being left so switching back restores the same
   // conversation. Answers still generating keep streaming into that object —
   // `streamOwners` holds it, so clearing the refs below doesn't interrupt them.
@@ -2526,7 +2544,7 @@ onUnmounted(() => {
               <GuidedReadingIcon />
               <span>{{ t('guidedReading.title') }}</span>
             </button>
-            <button class="icon-btn" title="新建对话" @click="startNewConversation(true)">
+            <button v-if="!props.standalone" class="icon-btn" title="新建对话" @click="startNewConversation(true)">
               <Icon icon="fluent:add-24-regular" width="15" height="15" />
             </button>
             <button v-if="!props.standalone" class="icon-btn" title="在独立窗口打开" @click="openPopupWindow">
@@ -2592,7 +2610,7 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="messages-wrap">
+        <div class="messages-wrap" :style="{ '--composer-clearance': composerClearance }">
         <nav
           v-if="messageNav.length > 1"
           class="rail-nav"
@@ -2887,7 +2905,8 @@ onUnmounted(() => {
         </div>
         </div>
 
-        <!-- Approval for a write the agent asked for, directly above the composer. -->
+        <footer ref="composerDock" class="composer">
+        <!-- Approval stays in the dock so its height also clears the last answer. -->
         <div v-if="currentWrite" class="write-confirm-slot">
           <WriteConfirmCard
             :key="currentWrite.requestId"
@@ -2898,19 +2917,18 @@ onUnmounted(() => {
           />
         </div>
 
-        <footer class="composer">
         <ChatMessageQueue
-          :items="queuedMessages" :paused="queuePaused"
-          @edit="messageQueue.edit" @hold="messageQueue.hold"
+          :items="queuedMessages" :paused="queuePaused" :editing-id="editingQueueId"
+          @edit="queueEditor.begin"
           @remove="messageQueue.remove" @steer="steerQueuedMessage" @resume="resumeMessageQueue"
         />
+        <div class="composer-box">
         <div
           class="composer-resizer"
           title="拖动调整输入框高度（双击恢复自适应）"
           @pointerdown="onComposerResizeStart"
           @dblclick="resetComposerHeight"
         />
-        <div class="composer-box">
           <div v-if="attachmentError" class="attachment-warning">
             <Icon icon="fluent:warning-24-regular" width="13" height="13" />
             <span>{{ attachmentError }}</span>
@@ -3033,12 +3051,16 @@ onUnmounted(() => {
 
             <span class="toolbar-spacer" />
 
-            <span class="queue-shortcut" :title="t('chat.composerHint')">{{ t(composerBusy ? 'chat.queueShortcut' : 'chat.sendShortcut') }}</span>
-            <button v-if="composerBusy" class="send-btn stop-btn" title="停止生成" @click="stopAllStreaming">
+            <button v-if="editingQueueId" class="toolbar-btn" :title="t('chat.queueCancelEdit')" :aria-label="t('chat.queueCancelEdit')" @click="queueEditor.cancel()">
+              <Icon icon="fluent:dismiss-20-regular" width="15" height="15" />
+            </button>
+            <button v-if="composerBusy" class="send-btn stop-btn" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="stopAllStreaming">
               <Icon icon="fluent:stop-24-filled" width="15" height="15" />
             </button>
-            <button class="send-btn" :class="{ active: canSend }" :disabled="!canSend" :title="t(composerBusy ? 'chat.queueSend' : 'copilot.send')" @click="sendMessage(false)">
-              <Icon :icon="composerBusy ? 'fluent:stack-add-20-regular' : 'fluent:send-24-regular'" width="15" height="15" />
+            <button class="send-btn" :class="{ active: canSend }" :disabled="!canSend"
+              :title="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')"
+              :aria-label="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')" @click="sendMessage(false)">
+              <Icon :icon="editingQueueId ? 'fluent:checkmark-20-regular' : composerBusy ? 'fluent:stack-add-20-regular' : 'fluent:send-24-regular'" width="15" height="15" />
             </button>
           </div>
         </div>
@@ -3131,7 +3153,7 @@ onUnmounted(() => {
 }
 .paper-ai.standalone {
   flex-direction: row;
-  background: #ffffff;
+  background: var(--bg-primary);
 }
 
 .chat-main {
@@ -3601,13 +3623,14 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: calc(var(--content-header-height) + 18px) 12px 12px;
+  padding: calc(var(--content-header-height) + 18px) 12px calc(var(--composer-clearance, 160px) + 12px);
+  scroll-padding-bottom: calc(var(--composer-clearance, 160px) + 12px);
 }
 .messages--no-floating-model {
   padding-top: 12px;
 }
 .standalone .messages {
-  padding: 24px 20px 0;
+  padding: 24px 20px calc(var(--composer-clearance, 160px) + 16px);
 }
 .empty-chat {
   min-height: calc(100% - var(--content-header-height));
@@ -3979,31 +4002,29 @@ onUnmounted(() => {
 .error-badge { color: #ef4444; }
 
 /* Holds the agent write-approval card, aligned to the composer's inner width. */
-.write-confirm-slot { flex-shrink: 0; padding: 0 10px; }
+.write-confirm-slot { flex-shrink: 0; margin-bottom: 10px; }
 
-.queue-shortcut { color: var(--text-tertiary); font-size: 10px; white-space: nowrap; }
 .composer {
-  position: relative;
-  flex-shrink: 0;
-  padding: 6px 10px 10px;
-  border-top: 1px solid var(--border-subtle);
-  background: color-mix(in srgb, var(--bg-primary) 94%, transparent);
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 10;
+  isolation: isolate;
+  padding: 8px 10px 10px;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  pointer-events: none;
 }
+.composer > * { pointer-events: auto; }
 .standalone .composer {
   padding: 12px 20px 16px;
-  border-top: none;
-  background: #ffffff;
 }
-/* Drag the composer's top edge to set its height; the grip only shows on hover
-   so it stays out of the way. Sits above the context bar's buttons. */
+/* The resize grip belongs to the input card, leaving the queued row above it
+   free for steering, deletion and its menu. It only appears on hover. */
 .composer-resizer {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
+  top: -4px;
+  left: 18px;
+  right: 18px;
   height: 8px;
   z-index: 3;
   cursor: ns-resize;
@@ -4027,12 +4048,9 @@ onUnmounted(() => {
 .composer-resizer:hover::after { opacity: 1; }
 .standalone .composer-box {
   padding: 12px 12px 8px 14px;
-  background: #f5f5f7;
-  border-color: rgba(0, 0, 0, 0.09);
 }
 .standalone .composer-box:focus-within {
-  border-color: rgba(34, 63, 121, 0.35);
-  background: #fafafa;
+  border-color: var(--border-default);
 }
 /* Matches the sidebar's resting height (~3 lines). This used to be 24px — one
    line — which read as cramped in a window this size. Line spacing is kept in
@@ -4053,6 +4071,7 @@ onUnmounted(() => {
   height: 28px;
   border-radius: 7px;
 }
+.standalone .send-btn { width: 28px; height: 28px; }
 .standalone .send-btn.active {
   background: #22c55e;
 }
@@ -4060,18 +4079,23 @@ onUnmounted(() => {
   background: #16a34a;
 }
 .composer-box {
+  position: relative;
+  z-index: 1;
   display: flex;
   flex-direction: column;
-  border: 1.5px solid var(--border-default);
-  border-radius: 13px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 22px;
   background: var(--bg-primary);
+  background: light-dark(var(--bg-primary), var(--bg-secondary));
+  box-shadow: var(--shadow-md);
   transition: box-shadow .15s ease, border-color .15s ease;
 }
 .composer-box:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border-default));
+  border-color: var(--border-default);
 }
 .composer-input {
-  flex: 1;
+  flex: 0 0 auto;
+  box-sizing: border-box;
   min-height: 68px;
   resize: none;
   padding: 10px 12px 0;
@@ -4236,8 +4260,9 @@ onUnmounted(() => {
   padding: 0 2px;
 }
 .send-btn {
-  width: 30px;
-  height: 30px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
   border: none;
   border-radius: 8px;
   display: inline-flex;

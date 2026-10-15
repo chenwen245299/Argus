@@ -11,6 +11,7 @@ mod cancel;
 mod canvas;
 mod canvas_edit;
 mod canvas_enhance;
+mod chat_context;
 mod collections;
 mod commands;
 mod copilot;
@@ -308,6 +309,7 @@ pub fn run() {
             commands::embed_and_store_chunks,
             // ── M7: Library chat ──
             commands::chat_with_library,
+            commands::prepare_library_chat_context,
             cancel::cancel_ai_request,
             // The window's answer when the agent asks to write something.
             write_confirm::resolve_agent_write,

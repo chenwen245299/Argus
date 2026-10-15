@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { useLibraryStore } from '../../stores/library'
 import { useSettingsStore } from '../../stores/settings'
 import { setLocale, type Locale } from '../../i18n'
+import ExaSettings from './ExaSettings.vue'
 
 const { t, locale } = useI18n()
 const library = useLibraryStore()
@@ -149,6 +150,8 @@ function shortPath(p: string): string {
         </div>
       </div>
     </div>
+
+    <ExaSettings class="setting-group" />
 
     <!-- Grouped external data services (both are third-party API keys). -->
     <div class="setting-group api-card">

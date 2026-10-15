@@ -249,9 +249,20 @@ and Chrome; `ARGUS_TEST_PLAYWRIGHT` can point to a bundled runtime).
 Enter or the send button queues while busy; Cmd/Ctrl+Enter or a queued row's
 Steer action cancels that conversation's current requests, retains partial
 output and completed tool results, and starts a continuation with the new user
-message. Queue rows support inline editing and deletion above the composer.
+message. Queue rows support editing and deletion above the composer. Edit message
+loads the held row and its attachments into the main composer; there is no row
+editor. Enter/the checkmark saves it in place, Cmd/Ctrl+Enter or its Steer action
+sends the edited payload immediately, and Escape/the cancel icon restores the
+row. `useChatQueueEditor` restores the previous composer draft and attachments
+after save/cancel, row removal or scope changes; edits retain captured models.
 Editing holds the row even if generation finishes, preserving FIFO and the
 composer draft. Attachments and model selections are captured when enqueued.
+The queue is an inset strip behind the rounded input card, overlapping its top
+edge rather than sitting inside it. Both library and paper composers float over
+the conversation without a full-width divider or footer background.
+`utils/floatingChatComposer.ts` measures the whole dock with ResizeObserver and
+reserves scroll clearance for the last answer, including queue/edit/attachment
+and write-approval height, while preserving a reader's scrolled-up position.
 Each window owns its pending queue; messages are scoped to their original
 conversation/paper/library. Stop pauses the queue until Resume, a new send or
 Steer; deletion, library switches and unmount clear the relevant pending rows.
@@ -515,6 +526,33 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   orphan its `tool_calls` entry), and the loop emits phase `evicted`.
 - A failing tool is fed back as an error string rather than aborting, so the
   model can correct a bad slug or section name on the next round.
+- **Library chat context management.** `chat_context.rs` measures system/pins,
+  schemas and the active message surface. Pressure uses the latest individual
+  provider prompt sample plus an estimated surface delta, never cumulative
+  billing totals. The composer `ContextMeter.vue` shows the used percentage in
+  both its label and ring fill;
+  hover/focus reveals token counts and breakdown; clicking the ring (or Enter /
+  Space while focused) starts manual compaction when idle and useful. The
+  read-only tooltip has no explanatory footer or separate action button; output
+  reservations and automatic thresholds stay internal. Unknown model capacity is labelled as an
+  assumed 128k; media and breakdown figures are estimates. Like DeepSeek Harness,
+  pressure defaults to 80% with a balanced recent tail of 16% (small-window
+  reservations scale down). `prepare_library_chat_context` supports inspection,
+  manual and pre-send automatic compaction without starting external MCP servers.
+  The live loop also compacts at request boundaries using its complete schemas,
+  including closed earlier steps of one long turn, and retries one explicit HTTP
+  context rejection only after a useful reduction. Summary calls cannot run
+  tools/search and their usage has source `context-compaction`. Failed, empty,
+  incomplete, oversized, nonshrinking or cancelled summaries do not replace
+  context. Original chat messages remain intact; an optional conversation
+  `contextCheckpoint` stores the reduced native history and its covered UI
+  message/fingerprint. Reloads reuse it; edits, deletions, variant changes and
+  regeneration before its boundary reject stale checkpoints. Stop/Steer queues,
+  deletion, library switches and unmount apply to compaction too. Native tool
+  pairings and required reasoning survive retained checkpoints; a successful
+  in-loop checkpoint is also the exact prefix used by cache keepalive. Only
+  `LibraryChat.vue` opts into `manageContext`; paper/canvas callers keep their
+  existing behavior. No vector store is involved.
 - **Usage is summed, not emitted per round.** `stream_with_tools` returns a
   `TurnUsage` instead of emitting one; the loop folds them and calls
   `llm::emit_usage` once at the end. Emitting per round both showed a cost strip
@@ -651,8 +689,14 @@ logs report only a bare `result` and reveal nothing.
 
 **Exa web tools (`exa.rs`).** App-only `web_search` and `web_fetch` join the
 shared paper/library/canvas agent loop when Exa is enabled and has a key in the
-answer's library. 设置 → AI 随航 → Agent 与工具 owns the Exa card. The enabled
-flag lives in `.argus/exa.json`; the key uses the existing AES-GCM key store
+answer's library. 设置 → 常规 owns the Exa card. Enabling the tools is not web
+permission: the user must explicitly request web search/page reading for the
+current task, or the model must ask and wait for approval before calling either
+tool. Vague research/freshness requests, pasted URLs alone and missing library
+evidence do not authorize a call. `exa::USER_PERMISSION_RULES` is appended to
+every configured agent prompt (including custom prompts) and both tool
+descriptions; the loop, context preparation and keepalive use the same prefix.
+The enabled flag lives in `.argus/exa.json`; the key uses the existing AES-GCM key store
 under `__exa__`, never the settings JSON, tool schema or model transcript.
 `exa_get_settings` returns status only; `exa_save_settings` checks `expectedRoot`.
 Search calls Exa `/search` for bounded highlights; fetch calls `/contents` for
@@ -1223,6 +1267,12 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   and Chrome, `scripts/test-chat-queue-browser.mjs` exercises real sidebar,
   standalone and library composers, attachments, shortcuts, partial/tool history
   and library/paper changes with local desktop/provider mocks.
+- Context management: `node --test scripts/test-chat-context.mjs` checks
+  checkpoint persistence and invalidation. `scripts/test-chat-context-browser.mjs`
+  mounts the real library composer with local mocks to verify hover/keyboard,
+  manual/automatic compaction, draft preservation, reload, failures, cancellation,
+  library switches and narrow dark layout. Use the same Playwright setup as the
+  other browser regressions. Rust coverage: `cargo test --lib chat_context`.
 - Note clipboard compatibility: `node --test scripts/test-note-clipboard.mjs`
   exercises the installed Vditor copy handler and local clipboard mocks, covering
   rich-text fallback, Markdown/TeX preservation, cut behavior and listener scope.

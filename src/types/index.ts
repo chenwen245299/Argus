@@ -676,6 +676,7 @@ export interface ChatMessage {
   tool_call_id?: string
   /** Optional function name on a `tool` result. */
   name?: string
+  reasoning_content?: string
 }
 
 export interface ModelSelection {

@@ -5010,6 +5010,46 @@ pub async fn stream_with_tools(
     // and searching on those would bill again with boilerplate as the query.
     first_round: bool,
 ) -> Result<ToolTurn, String> {
+    stream_tool_request(provider, api_key, model, messages, tools, event_name, app,
+        use_reasoning, reasoning_effort, source, cancel, web_search, first_round, None).await
+}
+
+/// A bounded, cancellable summarization call. No tools or native search may run.
+pub async fn compact_completion(
+    provider: &AiProvider, api_key: &str, model: &str,
+    messages: &[serde_json::Value], tools: &[serde_json::Value], max_tokens: usize, event_name: &str,
+    app: &tauri::AppHandle, cancel: Option<Arc<AtomicBool>>,
+) -> Result<String, String> {
+    if supports_tool_calling(provider) {
+        let turn = stream_tool_request(provider, api_key, model, messages, tools, event_name,
+            app, false, None, "context-compaction", cancel, false, false, Some(max_tokens)).await?;
+        emit_usage(app, event_name, &turn.usage);
+        if !turn.tool_calls.is_empty() { return Err("Compaction returned a tool call.".into()); }
+        Ok(turn.content)
+    } else {
+        // Anthropic and Ollama use their existing cancellable, tool-free adapters.
+        let plain: Vec<ChatMessage> = messages.iter().map(|m| {
+            let mut content: ChatContent = serde_json::from_value(m["content"].clone())
+                .unwrap_or_else(|_| "".into());
+            if let Some(calls) = m.get("tool_calls") {
+                content = format!("{}\n[Recorded tool calls: {calls}]", chat_content_text(&content)).into();
+            }
+            ChatMessage { role: if m["role"] == "system" { "system" }
+                else if m["role"] == "assistant" { "assistant" } else { "user" }.into(), content }
+        }).collect();
+        chat_completion_stream(provider, api_key, model, &plain, event_name, app,
+            false, None, "context-compaction", cancel, false).await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_tool_request(
+    provider: &AiProvider, api_key: &str, model: &str,
+    messages: &[serde_json::Value], tools: &[serde_json::Value],
+    event_name: &str, app: &tauri::AppHandle, use_reasoning: bool,
+    reasoning_effort: Option<&str>, source: &str, cancel: Option<Arc<AtomicBool>>,
+    web_search: bool, first_round: bool, compact_max_tokens: Option<usize>,
+) -> Result<ToolTurn, String> {
     if !supports_tool_calling(provider) {
         return Err(format!(
             "{} does not support tool calling in Argus yet.",
@@ -5087,10 +5127,12 @@ pub async fn stream_with_tools(
         "stream": true,
         "stream_options": {"include_usage": true},
     });
+    if let Some(max) = compact_max_tokens { body["max_tokens"] = serde_json::json!(max); }
     // Argus's own tools come back as calls this loop has to run; OpenRouter's
     // server tools are run by OpenRouter and never surface as a call, so the two
     // sets sit side by side in the same array without interfering.
-    let openrouter_tools = crate::openrouter::server_tool_defs(provider, model);
+    let openrouter_tools = if compact_max_tokens.is_some() { Vec::new() }
+        else { crate::openrouter::server_tool_defs(provider, model) };
     let mut server_tools = openrouter_tools.clone();
     // MiMo runs its `web_search` tool itself and reports what it consulted as
     // annotations, exactly like OpenRouter's server tools — so it joins the same
@@ -5118,7 +5160,7 @@ pub async fn stream_with_tools(
         // with server tools alone there is nothing for it to choose between, and
         // the loop's "no more tools" signal must stay unambiguous.
         if !tools.is_empty() {
-            body["tool_choice"] = serde_json::json!("auto");
+            body["tool_choice"] = serde_json::json!(if compact_max_tokens.is_some() { "none" } else { "auto" });
             // GLM-5.3+ streams a call's arguments in fragments only when asked
             // to, and the docs pair `tool_stream` with `stream` for those
             // models. The accumulator below reads either shape, so this only
@@ -5251,6 +5293,8 @@ pub async fn stream_with_tools(
     let mut cache_hit_tokens: u64 = 0;
     let mut cost_usd: Option<f64> = None;
     let mut trace = crate::openrouter::ServerToolTrace::default();
+    let mut compact_finish: Option<String> = None;
+    let mut compact_error: Option<String> = None;
     // Same as on the plain-chat path: a client-side search's pages are citations
     // even though nothing in the response mentions them.
     for hit in &preflight_hits {
@@ -5301,6 +5345,10 @@ pub async fn stream_with_tools(
             // tools-rejected marker is applied under the same narrow test as
             // for an HTTP error, using the status the body itself names.
             if let Some((embedded, err)) = body_error(&json) {
+                if compact_max_tokens.is_some() {
+                    compact_error = Some(err);
+                    break 'outer;
+                }
                 if !accumulated.is_empty() {
                     // Commentary already on screen: keep it and end the round as
                     // an answer. A tool call cut off mid-arguments is unusable.
@@ -5340,6 +5388,11 @@ pub async fn stream_with_tools(
                 trace.absorb_usage(usage);
             }
 
+            if compact_max_tokens.is_some() {
+                if let Some(reason) = json["choices"][0]["finish_reason"].as_str() {
+                    compact_finish = Some(reason.to_string());
+                }
+            }
             let delta = &json["choices"][0]["delta"];
             trace.absorb(delta);
             // GLM reports its search results on the chunk, not the delta.
@@ -5421,6 +5474,10 @@ pub async fn stream_with_tools(
     // additive on the frontend, and a citation found in round one should not
     // wait for round five to appear.
     emit_server_tool_trace(app, event_name, &trace);
+    if let Some(error) = compact_error { return Err(error); }
+    if compact_finish.as_deref().is_some_and(|r| matches!(r, "length" | "content_filter" | "error")) {
+        return Err(format!("Compaction summary was incomplete (finish_reason={}).", compact_finish.unwrap()));
+    }
 
     let tool_calls = partial
         .into_iter()

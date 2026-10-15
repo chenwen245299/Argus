@@ -1,4 +1,4 @@
-import { computed, onScopeDispose, shallowReactive, shallowRef, watch } from 'vue'
+import { computed, onScopeDispose, ref, shallowReactive, shallowRef, watch, type Ref } from 'vue'
 import type { Attachment } from './attachments'
 
 export interface QueuedChatMessage {
@@ -116,4 +116,71 @@ export function useChatSendQueue<T extends QueuedChatMessage>(options: {
   watch(busyScopes, pump, { flush: 'post' })
   onScopeDispose(() => { disposed = true; clear() })
   return { items, active, paused, enqueue, steer, edit, hold, remove, pause, resume, clear }
+}
+
+/** Borrow the main composer to edit a held queue row. Saving replaces that row
+ * in place; cancelling leaves it untouched. Neither operation loses the draft
+ * that occupied the composer before editing, or changes captured model choices. */
+export function useChatQueueEditor<T extends QueuedChatMessage>(options: {
+  queue: ReturnType<typeof useChatSendQueue<T>>
+  scope: () => string | null
+  input: Ref<string>
+  files: Ref<Attachment[]>
+  focus: () => void
+}) {
+  const editingId = ref<string | null>(null)
+  let draft: { text: string; files: Attachment[] } | null = null
+
+  function restore() {
+    const id = editingId.value
+    editingId.value = null
+    if (draft) {
+      options.input.value = draft.text
+      options.files.value = draft.files
+      draft = null
+    }
+    return id
+  }
+  function cancel(focus = true) {
+    const id = restore()
+    if (!id) return
+    options.queue.hold(id, false)
+    if (focus) options.focus()
+  }
+  function begin(id: string) {
+    const item = options.queue.items.value.find(item => item.id === id && item.scope === options.scope())
+    if (!item) return
+    // Hold the next target before releasing a previous edit: the current
+    // generation may already have finished while the user switches rows.
+    options.queue.hold(id, true)
+    if (editingId.value !== id) {
+      cancel(false)
+      draft = { text: options.input.value, files: options.files.value }
+      editingId.value = id
+      options.input.value = item.text
+      options.files.value = item.files.map(file => ({ ...file }))
+    }
+    options.focus()
+  }
+  function commit(immediate = false): boolean {
+    const id = editingId.value
+    if (!id) return false
+    const item = options.queue.items.value.find(item => item.id === id)
+    if (!item || item.scope !== options.scope()) { cancel(); return true }
+    if (!options.input.value.trim() && !options.files.value.length) return true
+    options.queue.edit(id, options.input.value, [...options.files.value])
+    const updated = options.queue.items.value.find(item => item.id === id)!
+    restore()
+    if (immediate) options.queue.steer(updated)
+    else options.queue.hold(id, false)
+    options.focus()
+    return true
+  }
+
+  watch(options.scope, () => cancel(false), { flush: 'sync' })
+  watch(options.queue.items, items => {
+    if (editingId.value && !items.some(item => item.id === editingId.value)) cancel(false)
+  }, { flush: 'sync' })
+  onScopeDispose(() => cancel(false))
+  return { editingId, begin, cancel, commit }
 }

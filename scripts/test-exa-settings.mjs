@@ -2,6 +2,7 @@
 // ARGUS_TEST_PLAYWRIGHT may point to a bundled Playwright index.mjs.
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdir } from 'node:fs/promises'
 import { createServer } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
@@ -12,18 +13,25 @@ const mock = `export const invoke = (command, args) => window.__test.invoke(comm
 before(async () => {
   server = await createServer({ configFile: false, root: new URL('../', import.meta.url).pathname, appType: 'custom',
     plugins: [{ name: 'mock-exa-desktop', enforce: 'pre',
-      resolveId: source => source === '@tauri-apps/api/core' ? '\0desktop' : null,
-      load: id => id === '\0desktop' ? mock : null,
-    }, vue()], optimizeDeps: { entries: ['src/components/settings/AgentSettings.vue'] },
+      resolveId(source, importer) {
+        if (source === '@tauri-apps/api/core') return '\0desktop'
+        if (source === '../../stores/library' && importer?.endsWith('/GeneralSettings.vue')) return '\0library'
+      },
+      load(id) {
+        if (id === '\0desktop') return mock
+        if (id === '\0library') return `export const useLibraryStore = () => ({currentPath:'/mock-library', pickAndOpen(){}});`
+      },
+    }, vue()], optimizeDeps: { entries: ['src/components/settings/GeneralSettings.vue', 'src/components/settings/AgentSettings.vue'] },
     server: { host: '127.0.0.1', port: 0 }, logLevel: 'error' })
   server.middlewares.use(async (req, res, next) => {
     if (!req.url.startsWith('/__exa-test')) return next()
     res.setHeader('Content-Type', 'text/html; charset=utf-8')
     res.end(await server.transformIndexHtml(req.url, `<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><div id="app"></div>
       <style>body { margin: 12px; } button { border: 0; } </style><script type="module">
-      import { createApp } from 'vue'; import { createI18n } from 'vue-i18n';
+      import { createApp } from 'vue'; import { createPinia } from 'pinia';
+      import GeneralSettings from '/src/components/settings/GeneralSettings.vue';
       import AgentSettings from '/src/components/settings/AgentSettings.vue';
-      import { zh, en } from '/src/i18n/locales.ts';
+      import { i18n } from '/src/i18n/index.ts';
       import '/src/assets/main.css'; import '/src/assets/themes.css';
       import { addCollection } from '@iconify/vue'; import fluent from '@iconify-json/fluent/icons.json'; addCollection(fluent);
       const params = new URLSearchParams(location.search);
@@ -33,6 +41,8 @@ before(async () => {
         fail: '', defer: false, pending: null,
         invoke(command, args) {
           test.calls.push({command, args});
+          if (command === 'get_settings') return Promise.resolve({appearance:'light',usd_to_cny_rate:7.2});
+          if (command === 'easyscholar_key_status' || command === 'semantic_scholar_key_status') return Promise.resolve(false);
           if (command === 'agent_get_settings' || command === 'agent_save_settings') return Promise.resolve(defaults);
           if (command === 'agent_list_builtin_tools') return Promise.resolve([]);
           if (command === 'exa_get_settings') return Promise.resolve({...test.settings});
@@ -50,7 +60,8 @@ before(async () => {
           throw new Error(command);
         },
       };
-      createApp(AgentSettings).use(createI18n({legacy:false, locale:params.get('locale') || 'zh', messages:{zh,en}})).mount('#app');
+      i18n.global.locale.value = params.get('locale') || 'zh';
+      createApp(params.get('tab') === 'agent' ? AgentSettings : GeneralSettings).use(createPinia()).use(i18n).mount('#app');
       </script>`))
   })
   await server.listen(); origin = `http://127.0.0.1:${server.httpServer.address().port}`
@@ -71,9 +82,13 @@ const key = () => page.locator('#exa-api-key')
 const save = () => card().locator('.exa-save')
 const calls = () => page.evaluate(() => window.__test.calls.filter(call => call.command === 'exa_save_settings'))
 
-test('the Agent settings tab contains Exa; enabling requires a key', async () => {
+test('General settings contain Exa and explain consent; enabling requires a key', async () => {
   await open()
+  assert.equal(await page.locator('h2').innerText(), '常规')
   assert.equal(await card().getAttribute('aria-label'), 'Exa 联网搜索与网页读取')
+  assert.match(await card().locator('.exa-permission').innerText(), /只有你明确要求联网搜索或读取网页/)
+  assert.match(await card().locator('.exa-permission').innerText(), /必须先询问并得到你的同意/)
+  assert.doesNotMatch(await card().innerText(), /可按需调用/)
   assert.equal(await key().getAttribute('type'), 'password')
   await page.locator('#exa-enabled').check()
   assert.equal(await save().isDisabled(), true)
@@ -83,6 +98,13 @@ test('the Agent settings tab contains Exa; enabling requires a key', async () =>
   assert.deepEqual((await calls())[0].args, { enabled: true, apiKey: 'test-exa-credential', clearKey: false, expectedRoot: '/mock-library' })
   assert.equal(await key().inputValue(), '')
   assert.match(await key().getAttribute('placeholder'), /已保存密钥/)
+})
+
+test('Agent settings no longer mount or load Exa settings', async () => {
+  await page.goto(`${origin}/__exa-test?tab=agent`)
+  await page.waitForFunction(() => window.__test?.calls.some(call => call.command === 'agent_get_settings'))
+  assert.equal(await card().count(), 0)
+  assert.equal(await page.evaluate(() => window.__test.calls.some(call => call.command === 'exa_get_settings')), false)
 })
 
 test('blank saves keep a stored key, and removal clears it and disables Exa', async () => {
@@ -119,10 +141,18 @@ test('English copy, dashboard link and narrow layout work', async () => {
   await page.setViewportSize({ width: 400, height: 1000 })
   await open('locale=en')
   assert.equal(await card().getAttribute('aria-label'), 'Exa web search and page reading')
+  assert.match(await card().locator('.exa-permission').innerText(), /must ask and receive your permission first/)
   await card().getByRole('button', { name: 'Get an API key' }).click()
   const link = await page.evaluate(() => window.__test.calls.find(call => call.command === 'open_url'))
   assert.equal(link.args.url, 'https://dashboard.exa.ai/api-keys')
   assert.equal(await card().evaluate(el => el.scrollWidth <= el.clientWidth), true)
+  if (process.env.ARGUS_TEST_OUTPUT_DIR) {
+    await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR, { recursive: true })
+    await card().screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/exa-general-narrow.png` })
+    await page.setViewportSize({ width: 900, height: 1000 })
+    await open()
+    await card().screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/exa-general.png` })
+  }
 })
 
 test('the settings produce no browser errors', () => assert.deepEqual(errors, []))

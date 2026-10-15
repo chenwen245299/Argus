@@ -2784,6 +2784,22 @@ pub async fn embed_and_store_chunks(
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
+pub async fn prepare_library_chat_context(
+    messages: Vec<AgentMessage>, provider_id: Option<String>, model_id: Option<String>,
+    selected_paper_slugs: Option<Vec<String>>, web_search: Option<bool>,
+    mode: String, previous_usage: Option<crate::chat_context::ContextUsage>, event_name: String, request_id: Option<String>,
+    state: State<'_, LibraryRoot>, app: tauri::AppHandle,
+) -> Result<crate::chat_context::PreparedContext, String> {
+    if !matches!(mode.as_str(), "inspect" | "auto" | "manual") { return Err("Unknown context operation.".into()); }
+    let root = get_root(&state)?;
+    let (_guard, cancel) = crate::cancel::CancelGuard::new(request_id);
+    copilot::prepare_library_context(&root, messages, provider_id.as_deref(), model_id.as_deref(),
+        &selected_paper_slugs.unwrap_or_default(), web_search.unwrap_or(false), &mode, previous_usage.as_ref(),
+        &event_name, &app, cancel).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_with_library(
     // Agent-capable: an assistant turn may carry `tool_calls` and a `tool`
     // message its `tool_call_id`, so a follow-up turn can replay what earlier
@@ -2823,6 +2839,7 @@ pub async fn chat_with_library(
     // panel and the canvas chat keep failing loudly, since the canvas chat's
     // whole point is a tool.
     plain_fallback: Option<bool>,
+    manage_context: Option<bool>,
     state: State<'_, LibraryRoot>,
     // Which window asked. The cache keepalive runs until this window closes,
     // and agent mode is reachable from the main window (paper AI panel, canvas
@@ -2899,6 +2916,7 @@ pub async fn chat_with_library(
             &app,
             cancel.clone(),
             web_search,
+            manage_context.unwrap_or(false),
         )
         .await;
 

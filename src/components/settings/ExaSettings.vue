@@ -62,6 +62,7 @@ onMounted(async () => {
       <input id="exa-enabled" v-model="settings.enabled" type="checkbox" :disabled="!loaded || saving" @change="saved = false" />
     </div>
     <p class="exa-hint">{{ t('exaSettings.description') }}</p>
+    <p class="exa-permission">{{ t('exaSettings.permission') }}</p>
     <label class="exa-key-label" for="exa-api-key">Exa API Key</label>
     <input
       id="exa-api-key"
@@ -94,6 +95,7 @@ onMounted(async () => {
 .exa-heading input { accent-color: var(--accent); }
 .exa-title, .exa-key-label { font-size: 13px; font-weight: 600; color: var(--text-primary); }
 .exa-hint { margin: 0; font-size: 12px; line-height: 1.55; color: var(--text-tertiary); }
+.exa-permission { margin: 0; font-size: 12px; line-height: 1.55; color: var(--text-secondary); }
 .exa-key { width: 100%; min-width: 0; box-sizing: border-box; padding: 8px 10px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-primary); color: var(--text-primary); font-size: 12px; }
 .exa-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .exa-actions button { padding: 6px 10px; border-radius: var(--radius-sm); font-size: 12px; cursor: pointer; }

@@ -23,9 +23,89 @@ function harness() {
     send: async item => { const done = deferred(); requests.push({ item, done }); await done.promise },
     interrupt: async item => { interrupts.push(item.id); await interrupt(item) },
   }))
-  return { queue, busy, requests, interrupts, stop: () => scope.stop(),
+  return { scope, queue, busy, requests, interrupts, stop: () => scope.stop(),
     invalid: () => allowed = false, onInterrupt: callback => interrupt = callback }
 }
+
+function editorHarness(h) {
+  const input = vue.ref('original draft'), files = vue.ref([{ id: 'draft', name: 'draft.png', type: 'image' }])
+  const currentScope = vue.ref('a')
+  const editor = h.scope.run(() => exports.useChatQueueEditor({ queue: h.queue,
+    scope: () => currentScope.value, input, files, focus: () => {} }))
+  return { input, files, currentScope, editor }
+}
+
+test('main-composer editing holds FIFO and restores the draft while keeping the captured model', async () => {
+  const h = harness(), e = editorHarness(h)
+  h.busy.add('a')
+  const row = { ...message('edit'), model: 'captured-model', files: [{id:'image',name:'queued.png',type:'image'}] }
+  h.queue.enqueue(row); h.queue.enqueue(message('after'))
+  e.editor.begin('edit')
+  assert.equal(e.input.value, 'edit')
+  e.files.value[0].detail = 'low'
+  assert.equal(row.files[0].detail, undefined, 'editing attachment details must not mutate the queued payload')
+  e.input.value = 'changed'; e.files.value = []
+  h.busy.delete('a'); await turn()
+  assert.equal(h.requests.length, 0, 'generation finishing cannot send the row being edited')
+  assert.equal(e.editor.commit(), true); await turn()
+  assert.equal(h.requests[0].item.id, 'edit')
+  assert.equal(h.requests[0].item.model, 'captured-model')
+  assert.equal(h.requests[0].item.text, 'changed')
+  assert.deepEqual(h.requests[0].item.files, [])
+  assert.equal(e.input.value, 'original draft')
+  assert.equal(e.files.value[0].name, 'draft.png')
+  assert.equal(e.editor.editingId.value, null)
+  h.requests[0].done.resolve(); await turn()
+  assert.equal(h.requests[1].item.id, 'after')
+  h.requests[1].done.resolve(); h.stop()
+})
+
+test('cancelling, deleting a row and changing scope restore the draft without saving pending edits', async () => {
+  for (const action of ['cancel', 'remove', 'scope', 'clear']) {
+    const h = harness(), e = editorHarness(h)
+    h.busy.add('a'); h.queue.enqueue(message('edit'))
+    e.editor.begin('edit'); e.input.value = 'discard changes'; e.files.value = []
+    if (action === 'cancel') e.editor.cancel()
+    if (action === 'remove') h.queue.remove('edit')
+    if (action === 'scope') e.currentScope.value = 'b'
+    if (action === 'clear') h.queue.clear()
+    assert.equal(e.input.value, 'original draft', action)
+    assert.equal(e.files.value[0].name, 'draft.png', action)
+    assert.equal(e.editor.editingId.value, null, action)
+    assert.equal(h.requests.length, 0, action)
+    if (h.queue.items.value.length) assert.equal(h.queue.items.value[0].text, 'edit')
+    h.stop()
+  }
+})
+
+test('switching edit targets holds the next row before releasing a finished first row', async () => {
+  const h = harness(), e = editorHarness(h)
+  h.busy.add('a'); h.queue.enqueue(message('first')); h.queue.enqueue(message('second'))
+  e.editor.begin('first'); e.input.value = 'unsaved first changes'
+  h.busy.delete('a'); await turn()
+  e.editor.begin('second'); await turn()
+  assert.equal(h.requests[0].item.text, 'first')
+  assert.equal(e.input.value, 'second')
+  h.requests[0].done.resolve(); await turn()
+  assert.equal(h.requests.length, 1, 'the second row remains held')
+  e.editor.cancel(); await turn()
+  assert.equal(e.input.value, 'original draft')
+  assert.equal(h.requests[1].item.text, 'second')
+  h.requests[1].done.resolve(); h.stop()
+})
+
+test('empty edits remain held and cancelling after Stop does not resume a paused queue', async () => {
+  const h = harness(), e = editorHarness(h)
+  h.busy.add('a'); h.queue.enqueue(message('edit')); e.editor.begin('edit')
+  e.input.value = ''; e.files.value = []
+  assert.equal(e.editor.commit(), true)
+  assert.equal(e.editor.editingId.value, 'edit')
+  h.queue.pause('a'); h.busy.delete('a'); e.editor.cancel(); await turn()
+  assert.equal(h.requests.length, 0)
+  h.queue.resume('a'); await turn()
+  assert.equal(h.requests[0].item.text, 'edit')
+  h.requests[0].done.resolve(); h.stop()
+})
 
 test('FIFO waits for the full request, preserving captured attachments and payloads', async () => {
   const h = harness()

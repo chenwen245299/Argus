@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import ChatMessageQueue from './ChatMessageQueue.vue'
-import { useChatSendQueue, type QueuedChatMessage } from '../utils/chatSendQueue'
+import ContextMeter from './ContextMeter.vue'
+import { applyContextCheckpoint, estimateContextText, historyFingerprint,
+  type ContextCheckpoint, type ContextUsage, type PreparedContext } from '../utils/chatContext'
+import { useChatSendQueue, useChatQueueEditor, type QueuedChatMessage } from '../utils/chatSendQueue'
+import { useFloatingChatComposer } from '../utils/floatingChatComposer'
 import { storeToRefs } from 'pinia'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
@@ -257,6 +261,8 @@ interface LibraryConversation {
   id: string
   title: string
   messages: LibraryUiMessage[]
+  contextCheckpoint?: ContextCheckpoint
+  contextUsage?: ContextUsage
   /** Papers pinned to this conversation. The field predates pins: it held the
    *  old "文献库论文" mode's selection, which is exactly what a pin is now. */
   selectedPaperSlugs: string[]
@@ -403,6 +409,8 @@ function normalizeConversations(parsed: unknown): LibraryConversation[] {
       id: conv.id!,
       title: conv.title || t('libraryChat.untitled'),
       messages: conv.messages!,
+      contextCheckpoint: conv.contextCheckpoint,
+      contextUsage: conv.contextUsage,
       selectedPaperSlugs: normalizeSelectedPaperSlugs(conv.selectedPaperSlugs),
       createdAt: conv.createdAt || new Date().toISOString(),
       updatedAt: conv.updatedAt || conv.createdAt || new Date().toISOString(),
@@ -572,11 +580,12 @@ function markGenerating(convId: string | null, on: boolean) {
   generatingConvIds.value = next
 }
 function isGenerating(convId: string | null | undefined) {
-  return !!convId && generatingConvIds.value.has(convId)
+  return !!convId && (generatingConvIds.value.has(convId) || contextCompacting.value.has(convId))
 }
 /** Busy state of the conversation on screen. */
 const loading = computed(() => isGenerating(activeConvId.value))
 const messagesEl = ref<HTMLElement | null>(null)
+const { composerDock, composerClearance } = useFloatingChatComposer(messagesEl)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const selectedModel = ref<ModelSelection | null>(null)
 const modelMenuOpen = ref(false)
@@ -1599,7 +1608,104 @@ function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
 
 function buildHistoryBeforeMessage(conv: LibraryConversation, messageId: string) {
   const idx = conv.messages.findIndex(m => m.id === messageId)
-  return chatHistoryFromMessages(idx >= 0 ? conv.messages.slice(0, idx) : conv.messages)
+  return applyContextCheckpoint(idx >= 0 ? conv.messages.slice(0, idx) : conv.messages,
+    conv.contextCheckpoint, chatHistoryFromMessages, persistedChatHistory)
+}
+function persistedChatHistory(messages: LibraryUiMessage[]) {
+  return chatHistoryFromMessages(messages.map(stripTransientContext))
+}
+
+// Full chat records remain intact. Only this model-visible projection changes.
+const contextCompacting = ref(new Set<string>())
+const contextErrors = ref<Record<string, string>>({})
+const contextNotices = ref<Record<string, string>>({})
+let contextInspection = 0
+let contextInspectTimer: ReturnType<typeof setTimeout> | null = null
+const contextDisplay = computed(() => {
+  const usage = activeConv.value?.contextUsage
+  const sel = effectiveModel()
+  if (!usage || !sel || usage.providerId !== sel.providerId || usage.modelId !== sel.modelId) return null
+  const draft = estimateContextText(input.value) + attachments.value.reduce((n, a) => n + (a.type === 'image' ? (a.detail === 'low' ? 85 : 2048) : 4096), 0)
+  const used = usage.usedTokens + draft
+  return { ...usage, usedTokens: used, remainingTokens: Math.max(0, usage.contextWindow - used), estimated: usage.estimated || draft > 0 }
+})
+function markCompacting(id: string, on: boolean) {
+  const next = new Set(contextCompacting.value)
+  on ? next.add(id) : next.delete(id)
+  contextCompacting.value = next
+}
+function setContextCheckpoint(conv: LibraryConversation, throughMessageId: string, messages: ChatMessage[]) {
+  const index = conv.messages.findIndex(m => m.id === throughMessageId)
+  if (index < 0) return
+  conv.contextCheckpoint = { throughMessageId, messages,
+    fingerprint: historyFingerprint(persistedChatHistory(conv.messages.slice(0, index + 1))),
+    createdAt: new Date().toISOString() }
+}
+function contextArguments(conv: LibraryConversation, sel: ModelSelection | null, messages: ChatMessage[]) {
+  return { messages, providerId: sel?.providerId ?? null, modelId: sel?.modelId ?? null,
+    selectedPaperSlugs: livePinnedSlugs(normalizeSelectedPaperSlugs(conv.selectedPaperSlugs)),
+    webSearch: useWebSearch.value && webSearchAvailable.value, previousUsage: conv.contextUsage ?? null }
+}
+async function inspectContext() {
+  const conv = activeConv.value
+  if (!conv || loading.value || chatDisposed) return
+  const epoch = libraryEpoch, revision = ++contextInspection, sel = effectiveModel()
+  try {
+    const result = await invoke<PreparedContext>('prepare_library_chat_context', {
+      ...contextArguments(conv, sel, applyContextCheckpoint(conv.messages, conv.contextCheckpoint, chatHistoryFromMessages, persistedChatHistory)),
+      mode: 'inspect', eventName: `context-inspect-${conv.id}`, requestId: null,
+    })
+    if (result?.usage && revision === contextInspection && stillWritable(conv.id, epoch)
+      && activeConv.value === conv && !loading.value && selectionKey(effectiveModel()) === selectionKey(sel)) {
+      conv.contextUsage = result.usage
+    }
+  } catch { /* No configured model/library: capacity is not yet available. */ }
+}
+function scheduleContextInspection() {
+  contextInspection++
+  if (contextInspectTimer) clearTimeout(contextInspectTimer)
+  contextInspectTimer = setTimeout(() => { contextInspectTimer = null; void inspectContext() }, 350)
+}
+watch(() => [activeConvId.value, selectionKey(effectiveModel()), activeConv.value?.updatedAt,
+  activeConv.value?.selectedPaperSlugs.join('|'), useWebSearch.value, loading.value,
+  activeConv.value?.messages.map(m => `${m.id}:${m.activeVariantId ?? ''}`).join('|')], scheduleContextInspection)
+
+function compactContextNow() {
+  const conv = activeConv.value
+  if (!conv || composerBusy.value) return
+  const id = `context-manual-${conv.id}`
+  const task = compactIdleConversation(conv, id).finally(() => { requestTasks.delete(id) })
+  requestTasks.set(id, { convId: conv.id, task })
+}
+async function compactIdleConversation(conv: LibraryConversation, id: string) {
+  const epoch = libraryEpoch, sel = effectiveModel(), requestId = crypto.randomUUID()
+  const bound = conv.messages[conv.messages.length - 1]?.id
+  const fingerprint = historyFingerprint(persistedChatHistory(conv.messages))
+  if (!bound) return
+  markGenerating(conv.id, true); markCompacting(conv.id, true)
+  contextErrors.value[conv.id] = ''; contextNotices.value[conv.id] = ''
+  activeRequestIds.set(id, requestId); targetConvIds.set(id, conv.id)
+  try {
+    const result = await invoke<PreparedContext>('prepare_library_chat_context', {
+      ...contextArguments(conv, sel, applyContextCheckpoint(conv.messages, conv.contextCheckpoint, chatHistoryFromMessages, persistedChatHistory)),
+      mode: 'manual', eventName: id, requestId,
+    })
+    if (!stillWritable(conv.id, epoch) || chatDisposed || stoppedTargetIds.has(id)) return
+    if (fingerprint !== historyFingerprint(persistedChatHistory(conv.messages))) {
+      contextErrors.value[conv.id] = t('chatContext.changed'); return
+    }
+    conv.contextUsage = result.usage
+    if (result.compacted) {
+      setContextCheckpoint(conv, bound, result.messages)
+      contextNotices.value[conv.id] = t('chatContext.compacted')
+      persistConv(conv, epoch)
+    } else contextNotices.value[conv.id] = t('chatContext.noRange')
+  } catch (error) {
+    if (stillWritable(conv.id, epoch) && !stoppedTargetIds.has(id) && !chatDisposed) contextErrors.value[conv.id] = String(error)
+  } finally {
+    markCompacting(conv.id, false); markGenerating(conv.id, false)
+    activeRequestIds.delete(id); targetConvIds.delete(id); stoppedTargetIds.delete(id)
+  }
 }
 
 function toggleSources(msgId: string) {
@@ -1636,6 +1742,7 @@ function useSuggestion(text: string) {
 // ── Conversation management ───────────────────────────────────────────────────
 
 function resetNewConversationContext() {
+  queueEditor.cancel(false)
   input.value = ''
   paperPickerOpen.value = false
   paperPickerSearch.value = ''
@@ -1860,7 +1967,17 @@ const messageQueue = useChatSendQueue<LibraryQueuedMessage>({
 const queuedMessages = computed(() => messageQueue.items.value.filter(item => item.scope === activeConvId.value))
 const queuePaused = computed(() => !!activeConvId.value && messageQueue.paused.has(activeConvId.value))
 const composerBusy = computed(() => loading.value || (!!activeConvId.value && messageQueue.active.has(activeConvId.value)))
+const queueEditor = useChatQueueEditor({
+  queue: messageQueue, scope: () => activeConvId.value,
+  input, files: attachments,
+  focus: () => { void nextTick(() => {
+    const el = textareaEl.value
+    el?.focus(); el?.setSelectionRange(el.value.length, el.value.length)
+  }) },
+})
+const editingQueueId = queueEditor.editingId
 function steerQueuedMessage(id: string) {
+  if (editingQueueId.value === id) { queueEditor.commit(true); return }
   const item = messageQueue.items.value.find(item => item.id === id)
   if (item) messageQueue.steer(item)
 }
@@ -1888,6 +2005,10 @@ async function runAssistantRequestImpl(
   // must be cleared on the conversation this request belongs to, not whichever
   // one happens to be on screen when it finishes.
   const streamConvId = conv.id
+  const prefixFingerprint = historyFingerprint(persistedChatHistory(
+    conv.messages.slice(0, conv.messages.findIndex(m => m.id === assistantMsg.id))))
+  const prefixUnchanged = () => prefixFingerprint === historyFingerprint(persistedChatHistory(
+    conv.messages.slice(0, conv.messages.findIndex(m => m.id === assistantMsg.id))))
   const eventSafeId = target.id.replace(/[^A-Za-z0-9:_/-]/g, '-')
   const eventName = `library-chat-${eventSafeId}`
   const sourcesEventName = `${eventName}-sources`
@@ -1940,6 +2061,19 @@ async function runAssistantRequestImpl(
   targetConvIds.set(target.id, streamConvId)
   const offs: UnlistenFn[] = []
   activeUnlisteners.set(target.id, offs)
+  let pendingCheckpoint: ChatMessage[] | undefined
+  offs.push(await listen<ContextUsage>(`${eventName}-context-usage`, (e) => {
+    if (stillWritable(conv.id, streamEpoch)) conv.contextUsage = e.payload
+  }))
+  offs.push(await listen<{ messages: ChatMessage[] }>(`${eventName}-context-checkpoint`, (e) => {
+    pendingCheckpoint = e.payload.messages
+  }))
+  offs.push(await listen<{ phase: string; error?: string }>(`${eventName}-context-status`, (e) => {
+    if (!stillWritable(conv.id, streamEpoch)) return
+    markCompacting(conv.id, e.payload.phase === 'compacting')
+    if (e.payload.phase === 'error') contextErrors.value[conv.id] = e.payload.error ?? ''
+    if (e.payload.phase === 'compacted') contextNotices.value[conv.id] = t('chatContext.compacted')
+  }))
 
   offs.push(await listen<RetrievedChunk[]>(sourcesEventName, (e) => {
     pendingSources = e.payload ?? []
@@ -2063,6 +2197,14 @@ async function runAssistantRequestImpl(
     if (typeof usage.total_tokens === 'number') target.totalTokens = usage.total_tokens
     if (typeof usage.cache_hit_tokens === 'number') target.cacheHitTokens = usage.cache_hit_tokens
     if (typeof usage.cost_usd === 'number' || usage.cost_usd === null) target.costUsd = usage.cost_usd
+    // Fallbacks have one provider request. Agent totals sum several rounds and
+    // must never be used as a context-window numerator.
+    if (target.agentFallback && usage.input_tokens && conv.contextUsage) {
+      const added = estimateContextText(target.content) + 4
+      conv.contextUsage = { ...conv.contextUsage, usedTokens: usage.input_tokens + added,
+        remainingTokens: Math.max(0, conv.contextUsage.contextWindow - usage.input_tokens - added),
+        messageTokens: conv.contextUsage.messageTokens + added, estimated: true }
+    }
     persistConvSoon(conv, streamEpoch)
   }))
 
@@ -2098,6 +2240,20 @@ async function runAssistantRequestImpl(
     const effortToSend = isDeepseek
       ? (reasoningLevel.value === 'high' ? 'high' : 'medium')
       : reasoningLevel.value
+    // Also protects tool-free fallback models before sending. The live agent
+    // repeats admission against its actual external schemas and tool results.
+    contextErrors.value[conv.id] = ''; contextNotices.value[conv.id] = ''
+    const prepared = await invoke<PreparedContext>('prepare_library_chat_context', {
+      ...contextArguments(conv, sel, history), mode: 'auto', eventName, requestId,
+    })
+    if (stoppedTargetIds.has(target.id) || !stillWritable(conv.id, streamEpoch) || chatDisposed) return
+    if (prepared?.usage) conv.contextUsage = prepared.usage
+    if (prepared?.compacted) {
+      history = prepared.messages
+      const index = conv.messages.findIndex(m => m.id === assistantMsg.id)
+      if (index > 0 && prefixUnchanged()) setContextCheckpoint(conv, conv.messages[index - 1].id, history)
+      persistConv(conv, streamEpoch)
+    }
     const finalText = await invoke<string>('chat_with_library', {
       messages: history,
       providerId: sel?.providerId ?? null,
@@ -2119,6 +2275,7 @@ async function runAssistantRequestImpl(
       // A model that cannot take tools gets a tool-free answer and a notice,
       // instead of an error on every question.
       plainFallback: true,
+      manageContext: true,
     })
     // If the user pressed stop, don't refill content the backend produced anyway.
     if (!stoppedTargetIds.has(target.id)) {
@@ -2130,6 +2287,10 @@ async function runAssistantRequestImpl(
     target.endedAt = performance.now()
     assistantMsg.streaming = false
     flushStreamRender(target)
+    if (pendingCheckpoint && !stoppedTargetIds.has(target.id) && stillWritable(conv.id, streamEpoch)
+      && prefixUnchanged() && (target === assistantMsg || activeAnswer(assistantMsg).id === target.id)) {
+      setContextCheckpoint(conv, assistantMsg.id, pendingCheckpoint)
+    }
     persistConv(conv, streamEpoch)
     // Auto-generate title after the first exchange (fire-and-forget)
     if (conv.messages.filter((m: LibraryUiMessage) => m.role === 'user').length === 1) {
@@ -2146,6 +2307,7 @@ async function runAssistantRequestImpl(
     assistantMsg.streaming = false
     flushStreamRender(target)
   } finally {
+    markCompacting(conv.id, false)
     markGenerating(streamConvId, false)
     stoppedTargetIds.delete(target.id)
     activeRequestIds.delete(target.id)
@@ -2207,6 +2369,7 @@ function stopStreamingFor(convId: string | null) {
   // stream so the provider stops generating / billing).
   for (const [targetId, requestId] of [...activeRequestIds.entries()]) {
     if (targetConvIds.get(targetId) !== convId) continue
+    stoppedTargetIds.add(targetId)
     invoke('cancel_ai_request', { requestId }).catch(() => {})
   }
   for (const id of [...activeUnlisteners.keys()]) {
@@ -2250,6 +2413,7 @@ function stopStreaming() {
 }
 
 function sendMessage(immediate = false) {
+  if (queueEditor.commit(immediate)) return
   const text = input.value.trim()
   if (!canSend.value) return
 
@@ -2394,6 +2558,9 @@ async function copyMessage(msg: LibraryUiMessage) {
 function isIMEActive(e: KeyboardEvent) { return e.isComposing || e.keyCode === 229 }
 
 function handleKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && !isIMEActive(e) && editingQueueId.value) {
+    e.preventDefault(); queueEditor.cancel(); return
+  }
   if (e.key === 'Enter' && !e.shiftKey && !isIMEActive(e)) { e.preventDefault(); sendMessage(e.metaKey || e.ctrlKey) }
 }
 
@@ -2505,6 +2672,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  contextInspection++
+  if (contextInspectTimer) clearTimeout(contextInspectTimer)
   chatDisposed = true
   messageQueue.clear()
   stopAllStreaming()
@@ -2674,7 +2843,7 @@ onUnmounted(() => {
       <div class="lc-main">
 
         <!-- Messages -->
-        <div class="messages-wrap">
+        <div class="messages-wrap" :style="{ '--composer-clearance': composerClearance }">
         <nav
           v-if="messageNav.length > 1"
           class="rail-nav"
@@ -3101,7 +3270,7 @@ onUnmounted(() => {
         </div>
 
         <!-- Input area -->
-        <div class="input-area">
+        <div ref="composerDock" class="input-area">
           <!-- Approval for a write the agent asked for, directly above the
                composer and the same width as it. -->
           <WriteConfirmCard
@@ -3112,12 +3281,13 @@ onUnmounted(() => {
             @approve="answerWrite(true, $event)"
             @reject="answerWrite(false)"
           />
-          <div class="composer">
+          <div class="composer-stack">
             <ChatMessageQueue
-              :items="queuedMessages" :paused="queuePaused"
-              @edit="messageQueue.edit" @hold="messageQueue.hold"
+              :items="queuedMessages" :paused="queuePaused" :editing-id="editingQueueId"
+              @edit="queueEditor.begin"
               @remove="messageQueue.remove" @steer="steerQueuedMessage" @resume="resumeMessageQueue"
             />
+          <div class="composer">
             <div v-if="attachmentError" class="attachment-warning">
             <Icon icon="fluent:warning-24-regular" width="13" height="13" />
             <span>{{ attachmentError }}</span>
@@ -3280,17 +3450,26 @@ onUnmounted(() => {
                 </button>
               </div>
               <div class="footer-right">
-                <span class="enter-hint" :title="t('chat.composerHint')">{{ t(composerBusy ? 'chat.queueShortcut' : 'chat.sendShortcut') }}</span>
-                <button v-if="composerBusy" class="send-btn stop-btn" title="停止生成" @click="stopStreaming">
-                  <Icon icon="fluent:stop-24-filled" width="13" height="13" />
-                  停止
+                <span v-if="activeConvId && contextCompacting.has(activeConvId)" class="context-progress" role="status">{{ t('chatContext.compacting') }}</span>
+                <button v-if="editingQueueId" class="toolbar-btn" :title="t('chat.queueCancelEdit')" :aria-label="t('chat.queueCancelEdit')" @click="queueEditor.cancel()">
+                  <Icon icon="fluent:dismiss-20-regular" width="14" height="14" />
                 </button>
-                <button class="send-btn" :disabled="!canSend" :title="t('chat.composerHint')" @click="sendMessage(false)">
-                  <Icon icon="fluent:send-24-regular" width="13" height="13" />
-                  {{ t(composerBusy ? 'chat.queueSend' : 'copilot.send') }}
+                <button v-if="composerBusy" class="send-btn stop-btn" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="stopStreaming">
+                  <Icon icon="fluent:stop-24-filled" width="13" height="13" />
+                </button>
+                <ContextMeter :key="activeConvId ?? 'new'" :usage="contextDisplay" :busy="composerBusy"
+                  :compacting="!!activeConvId && contextCompacting.has(activeConvId)"
+                  :error="activeConvId ? contextErrors[activeConvId] : ''"
+                  :notice="activeConvId ? contextNotices[activeConvId] : ''"
+                  @compact="compactContextNow" @inspect="inspectContext" />
+                <button class="send-btn" :disabled="!canSend"
+                  :title="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')"
+                  :aria-label="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')" @click="sendMessage(false)">
+                  <Icon :icon="editingQueueId ? 'fluent:checkmark-20-regular' : composerBusy ? 'fluent:stack-add-20-regular' : 'fluent:send-24-regular'" width="14" height="14" />
                 </button>
               </div>
             </div>
+          </div>
           </div>
         </div>
 
@@ -3683,6 +3862,7 @@ onUnmounted(() => {
 /* ── Main area ───────────────────────────────────────────────────────────── */
 
 .lc-main {
+  position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
@@ -4028,7 +4208,8 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 24px 32px;
+  padding: 24px 32px calc(var(--composer-clearance, 160px) + 16px);
+  scroll-padding-bottom: calc(var(--composer-clearance, 160px) + 16px);
   display: flex;
   flex-direction: column;
   gap: 22px;
@@ -4976,26 +5157,35 @@ onUnmounted(() => {
 /* ── Input area ──────────────────────────────────────────────────────────── */
 
 .input-area {
-  flex-shrink: 0;
-  border-top: 1px solid var(--border-subtle);
-  padding: 14px 24px 18px;
-  background: color-mix(in srgb, var(--bg-secondary) 78%, var(--bg-primary));
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 10;
+  padding: 8px 24px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
 }
+.input-area > * { pointer-events: auto; }
+.composer-stack { position: relative; isolation: isolate; }
 
 .composer {
+  position: relative;
+  z-index: 1;
+  box-sizing: border-box;
   width: 100%;
   margin: 0 auto;
   padding: 12px 14px 10px;
-  border: 1px solid var(--border-default);
-  border-radius: 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 22px;
   background: var(--bg-primary);
-  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.07);
+  background: light-dark(var(--bg-primary), var(--bg-secondary));
+  box-shadow: var(--shadow-md);
   transition: border-color 0.15s;
 }
 
 .composer:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 50%, var(--border-default));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  border-color: var(--border-default);
 }
 
 .chat-input {
@@ -5018,6 +5208,7 @@ onUnmounted(() => {
 
 .composer-footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
@@ -5027,7 +5218,8 @@ onUnmounted(() => {
 /* Most of the space between these icons is the buttons' own padding, not the
    gap — see the note on .toolbar-btn below. Kept in step with AiTab's composer. */
 .footer-left { display: flex; align-items: center; gap: 2px; }
-.footer-right { display: flex; align-items: center; gap: 8px; }
+.footer-right { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.context-progress { font-size: 11px; color: var(--text-tertiary); }
 
 .attach-btn {
   width: 24px;
@@ -5437,24 +5629,19 @@ onUnmounted(() => {
 .reasoning-drop-enter-from,
 .reasoning-drop-leave-to { opacity: 0; transform: translateY(4px); }
 
-.enter-hint {
-  font-size: 11px;
-  color: var(--text-tertiary);
-}
-
 .send-btn {
-  height: 34px;
-  padding: 0 15px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
   background: var(--accent);
   color: #fff;
-  border-radius: var(--radius-lg);
+  border-radius: 7px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  font-size: 13px;
-  font-weight: 650;
   flex-shrink: 0;
+  cursor: pointer;
 }
 
 .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
@@ -5784,7 +5971,6 @@ onUnmounted(() => {
   .lc-model-trigger { min-width: 160px; max-width: 190px; }
   .lc-model-menu { width: 280px; }
   .empty-suggestions { grid-template-columns: 1fr; }
-  .enter-hint { display: none; }
 }
 
 /* ── Scrollbar ───────────────────────────────────────────────────────────── */

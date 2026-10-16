@@ -334,3 +334,50 @@ test('disk reconciliation removes deleted records but keeps protected streams; c
   assert.equal(answers[0].endedAt - answers[0].startedAt, 100)
   assert.ok(Math.abs(performance.now() - answers[1].startedAt - 130) < 10)
 })
+
+test('context compaction joins across windows, forwards stop, and repairs a missed final event', async t => {
+  const b = bus(); t.after(b.dispose)
+  const sidebar = await b.view('sidebar'), popup = await b.view('popup')
+  const conv = sidebar.activeConversation.value
+  conv.contextTask = 'context-task'
+  sidebar.streamOwners.set('context-task', { slug: 'paper', conv, root: 'root-a', contextOnly: true })
+  sidebar.activeRequestIds.set('context-task', 'context-request')
+  sidebar.persist('paper', conv)
+  await sidebar.paperSaves.get('paper')
+  assert.equal(popup.streamOwners.get('context-task')?.contextOnly, true)
+  popup.stop(popup.activeConversation.value)
+  await sidebar.paperSaves.get('paper')
+  assert.deepEqual(b.cancellations, ['context-request'])
+  assert.equal(popup.streamOwners.has('context-task'), false)
+
+  conv.contextTask = 'next-context-task'
+  sidebar.streamOwners.set('next-context-task', { slug: 'paper', conv, root: 'root-a', contextOnly: true })
+  sidebar.persist('paper', conv)
+  await sidebar.paperSaves.get('paper')
+  assert.equal(popup.streamOwners.has('next-context-task'), true)
+  b.dropFinal = true
+  delete conv.contextTask
+  conv.contextStates = { 'provider::model': { checkpoint: { throughMessageId: 'chat-group', fingerprint: 'saved', messages: [{ role: 'user', content: 'Summary' }] } } }
+  sidebar.streamOwners.delete('next-context-task')
+  sidebar.persist('paper', conv)
+  await sidebar.paperSaves.get('paper'); await popup.refresh()
+  assert.equal(popup.streamOwners.has('next-context-task'), false)
+  assert.equal(popup.activeConversation.value.contextStates['provider::model'].checkpoint.messages[0].content, 'Summary')
+})
+
+test('live usage patches preserve per-model checkpoints without resending native history', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const b = bus(); t.after(b.dispose)
+  const sidebar = await b.view('sidebar'), popup = await b.view('popup')
+  const conv = sidebar.activeConversation.value
+  conv.contextStates = { 'provider::model': { checkpoint: { throughMessageId: 'chat-user', fingerprint: 'saved', messages: [{ role: 'user', content: 'Summary' }] }, usage: { usedTokens: 1000 } } }
+  const answer = sidebar.own()
+  sidebar.broadcast(conv)
+  conv.contextStates['provider::model'].usage = { usedTokens: 4000 }
+  sidebar.update(answer.id); t.mock.timers.tick(PAPER_AI_SYNC_INTERVAL_MS)
+  const update = b.messages.filter(p => p.kind === 'update').at(-1)
+  assert.equal(update.contextUsage['provider::model'].usedTokens, 4000)
+  assert(!JSON.stringify(update).includes('Summary'))
+  assert.equal(popup.activeConversation.value.contextStates['provider::model'].usage.usedTokens, 4000)
+  assert.equal(popup.activeConversation.value.contextStates['provider::model'].checkpoint.messages[0].content, 'Summary')
+})

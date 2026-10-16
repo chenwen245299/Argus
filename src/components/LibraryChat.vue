@@ -766,16 +766,16 @@ const isDeepSeekSelected = computed(() => {
   return !!provider?.base_url.toLowerCase().includes('deepseek')
 })
 
-// Per-answer "思考过程" collapse state. Absence = expanded (the default, so the
-// user sees the model think); presence = the user collapsed it. Keyed by answer id.
-const collapsedReasoning = ref<Set<string>>(new Set())
+// Reasoning stays collapsed until explicitly opened, including while streaming.
+// Keep expansion local to the answer; each new generation starts collapsed.
+const expandedReasoning = ref<Set<string>>(new Set())
 function isReasoningCollapsed(id: string) {
-  return collapsedReasoning.value.has(id)
+  return !expandedReasoning.value.has(id)
 }
 function toggleReasoning(id: string) {
-  const next = new Set(collapsedReasoning.value)
+  const next = new Set(expandedReasoning.value)
   next.has(id) ? next.delete(id) : next.add(id)
-  collapsedReasoning.value = next
+  expandedReasoning.value = next
 }
 // "126 词 · 147 字符" — CJK chars count as one word each, Latin runs as one word.
 //
@@ -2001,6 +2001,12 @@ async function runAssistantRequestImpl(
   history: ChatMessage[],
   sel: ModelSelection | null,
 ) {
+  const reasoningId = target === assistantMsg ? `${target.id}:base` : target.id
+  if (expandedReasoning.value.has(reasoningId)) {
+    const next = new Set(expandedReasoning.value)
+    next.delete(reasoningId)
+    expandedReasoning.value = next
+  }
   // Captured up front: the user may switch away mid-stream, so the busy flag
   // must be cleared on the conversation this request belongs to, not whichever
   // one happens to be on screen when it finishes.
@@ -3102,6 +3108,7 @@ onUnmounted(() => {
                   <div v-if="reasoningText(activeAnswer(msg))" class="reasoning-section">
                     <button
                       class="reasoning-summary"
+                      :aria-expanded="!isReasoningCollapsed(activeAnswer(msg).id)"
                       @click="toggleReasoning(activeAnswer(msg).id)"
                     >
                       <Icon

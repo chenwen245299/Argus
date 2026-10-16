@@ -890,9 +890,13 @@ export const zh = {
   // Search
   search: {
     placeholder: '全文搜索…',
+    hint: '搜索标题、作者和全文；用双引号限定短语，按 Enter 立即搜索',
     results: '搜索结果',
     noResults: '未找到匹配论文',
     hits: '找到 {n} 篇',
+    searching: '搜索中…',
+    failed: '搜索失败',
+    retryHint: '请按 Enter 重试',
     clear: '清除',
   },
   // Extraction
@@ -2618,9 +2622,13 @@ export const en: typeof zh = {
   },
   search: {
     placeholder: 'Full-text search…',
+    hint: 'Search titles, authors and full text; use double quotes for phrases, Enter to search immediately',
     results: 'Search Results',
     noResults: 'No matching papers',
     hits: '{n} results',
+    searching: 'Searching…',
+    failed: 'Search failed',
+    retryHint: 'Press Enter to retry',
     clear: 'Clear',
   },
   extraction: {

@@ -44,10 +44,12 @@ before(async () => {
       import LibraryChat from '/src/components/LibraryChat.vue';
       import { useAiStore } from '/src/stores/ai.ts';
       import { useSettingsStore } from '/src/stores/settings.ts';
+      import { useThinkingStore } from '/src/stores/thinking.ts';
       import { zh, en } from '/src/i18n/locales.ts';
       import '/src/assets/main.css'; import '/src/assets/themes.css';
       addCollection(fluent);
       const mode = new URLSearchParams(location.search).get('mode'), slug = ref('paper');
+      const savedReasoning = new URLSearchParams(location.search).has('reasoning-history');
       const test = window.__test = { requests: [], calls: [], listeners: new Map(), saved: [], cancelAuto: true,
         emit(name, payload) { for (const cb of test.listeners.get(name) || []) cb({ payload }); },
         switchPaper: value => slug.value = value,
@@ -56,6 +58,15 @@ before(async () => {
           test.calls.push({command,args});
           if (command === 'get_current_library') return Promise.resolve('/mock-library');
           if (command === 'get_paper_meta') return Promise.resolve({title:'Example paper',abstract:'A paper'});
+          if (savedReasoning && ['get_library_conversations','get_paper_ai_conversations'].includes(command)) {
+            const createdAt='2026-10-15T00:00:00Z';
+            const user={id:'saved-user',role:'user',content:'Saved question',createdAt};
+            const answer={id:'saved-answer',content:'Saved answer',reasoningContent:'Saved reasoning',createdAt,
+              providerId:'provider',providerName:'Example',modelId:'test-vision',modelName:'Test vision'};
+            return Promise.resolve([{id:'saved-conversation',slug:'paper',title:'Saved conversation',createdAt,updatedAt:createdAt,
+              selectedPaperSlugs:[],messages:[user,{...answer,role:'assistant'}],
+              nodes:[user,{id:'saved-group',role:'assistantGroup',promptId:user.id,createdAt,answers:[answer]}]}]);
+          }
           if (['get_paper_ai_conversations','get_paper_chat','get_library_conversations','list_papers'].includes(command)) return Promise.resolve([]);
           if (command.startsWith('save_')) test.saved.push({command,args:JSON.parse(JSON.stringify(args))});
           if (command === 'chat_with_library') return new Promise((resolve,reject) => test.requests.push({args,resolve,reject}));
@@ -77,6 +88,7 @@ before(async () => {
       }]};
       ai.load=async()=>{};
       useSettingsStore(pinia).load=async()=>{};
+      test.setThinking = value => useThinkingStore(pinia).useReasoning = value;
       app.mount('#app'); test.mounted=true;
       </script></body></html>`))
   })
@@ -87,8 +99,8 @@ before(async () => {
   page = await context.newPage(); page.on('pageerror', e => { errors.push(e.message); console.error('Browser error:', e.message) })
 })
 after(async () => { await browser?.close(); await server?.close() })
-async function open(mode) {
-  await page.goto(`${origin}/__queue-test?mode=${mode}`)
+async function open(mode, reasoningHistory = false) {
+  await page.goto(`${origin}/__queue-test?mode=${mode}${reasoningHistory ? '&reasoning-history=1' : ''}`)
   await page.waitForFunction(() => window.__test?.mounted, null, { timeout: 10000 }).catch(async error => {
     console.error(await page.evaluate(() => ({ html: document.body.innerHTML.slice(0, 200), calls: window.__test?.calls, errors: window.__test?.errors })))
     throw error
@@ -390,3 +402,50 @@ test('compact queue menu supports keyboard, dismissal and removes only its own r
   await finish(1)
   assert.deepEqual(errors,[])
 })
+
+for (const mode of ['sidebar', 'standalone', 'library']) {
+  test(`${mode}: reasoning stays collapsed during streaming and resets on regeneration`, async () => {
+    await open(mode)
+    await page.evaluate(() => window.__test.setThinking(true))
+    await send('Reasoning disclosure regression'); await count(1)
+    const emitReasoning = (index, delta) => page.evaluate(({index,delta}) => {
+      const t=window.__test;t.emit(t.requests[index].args.eventName+'-reasoning',{delta,done:false})
+    }, {index,delta})
+    const waitText = text => page.waitForFunction(text => document.querySelector('.reasoning-section:last-of-type .reasoning-body')?.textContent.includes(text)
+      || [...document.querySelectorAll('.reasoning-body')].some(el=>el.textContent.includes(text)), text)
+    await emitReasoning(0, 'Initial reasoning')
+    const section=page.locator('.reasoning-section').last(), body=section.locator('.reasoning-body'), summary=section.locator('.reasoning-summary')
+    await section.waitFor()
+    assert.equal(await body.isVisible(), false, 'new reasoning starts collapsed')
+    if(mode==='library')assert.equal(await summary.getAttribute('aria-expanded'),'false')
+    await emitReasoning(0, ' streamed while collapsed'); await waitText('streamed while collapsed')
+    assert.equal(await body.isVisible(), false, 'streaming never opens it')
+    await summary.click(); assert.equal(await body.isVisible(), true)
+    await emitReasoning(0, ' streamed while open'); await waitText('streamed while open')
+    assert.equal(await body.isVisible(), true, 'streaming respects a manual expansion')
+    await summary.click(); assert.equal(await body.isVisible(), false)
+    await emitReasoning(0, ' remains folded'); await waitText('remains folded')
+    await finish(0,'Completed answer')
+    await page.getByText('Completed answer',{exact:true}).waitFor()
+    assert.equal(await body.isVisible(), false, 'completion does not expand it')
+    await summary.click(); assert.equal(await body.isVisible(), true)
+    await page.getByRole('button',{name:'重新生成',exact:true}).last().click(); await count(2)
+    await emitReasoning(1,'Fresh regenerated reasoning'); await waitText('Fresh regenerated reasoning')
+    assert.equal(await page.locator('.reasoning-body').last().isVisible(),false,'regenerating the same answer resets manual expansion')
+    await finish(1,'Regenerated answer')
+  })
+
+  test(`${mode}: saved reasoning starts collapsed every time the panel is reopened`, async () => {
+    await open(mode,true)
+    const body=page.locator('.reasoning-body').last()
+    await page.locator('.reasoning-section').last().waitFor()
+    assert.equal((await body.textContent()).trim(),'Saved reasoning')
+    assert.equal(await body.isVisible(),false)
+    await page.locator('.reasoning-summary').last().click()
+    assert.equal(await body.isVisible(),true)
+    await open(mode,true)
+    await page.locator('.reasoning-section').last().waitFor()
+    assert.equal(await page.locator('.reasoning-body').last().isVisible(),false)
+    assert.deepEqual(errors,[])
+  })
+}

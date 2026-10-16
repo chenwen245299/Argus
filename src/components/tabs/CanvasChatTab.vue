@@ -19,6 +19,8 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useAiStore, type ModelOption } from '../../stores/ai'
 import { useCanvasStore } from '../../stores/canvas'
 import ChatAnswerBody from '../ChatAnswerBody.vue'
+import ContextMeter from '../ContextMeter.vue'
+import { applyContextCheckpoint, historyFingerprint, estimateContextText, type ContextCheckpoint, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import CanvasEditConfirmCard from '../CanvasEditConfirmCard.vue'
@@ -67,6 +69,7 @@ interface CanvasConversation {
   messages: CanvasMessage[]
   createdAt: string
   updatedAt: string
+  contextStates?: Record<string, { checkpoint?: ContextCheckpoint; usage?: ContextUsage }>
 }
 
 const conversations = ref<CanvasConversation[]>([])
@@ -78,6 +81,17 @@ const model = ref<ModelSelection | null>(null)
 const messagesEl = ref<HTMLElement | null>(null)
 const errorText = ref('')
 const previewImage = ref<string | null>(null)
+const contextCompacting = ref(false)
+const contextError = ref('')
+const contextNotice = ref('')
+const libraryRoot = ref<string | null>(null)
+let canvasEpoch = 0
+let libraryRevision = 0
+let disposed = false
+let offLibrary: UnlistenFn | null = null
+let contextInspection = 0
+let contextInspectTimer: ReturnType<typeof setTimeout> | null = null
+const stoppedRequests = new Set<string>()
 
 // A write the agent asked for, waiting on the user. Two shapes share the queue:
 // a note (the same card the library chat uses) and a canvas edit (drawn on the
@@ -224,6 +238,7 @@ async function save() {
       canvasId,
       conversations: persisted,
       tombstones: deletionTombstones(canvasId, persisted),
+      expectedRoot: libraryRoot.value,
     })
   } catch (e) {
     console.error('save_canvas_ai_conversations:', e)
@@ -231,11 +246,13 @@ async function save() {
 }
 
 async function load(canvasId: string) {
+  const epoch = canvasEpoch
   conversations.value = []
   activeConvId.value = null
   errorText.value = ''
   try {
     const raw = await invoke<unknown>('get_canvas_ai_conversations', { canvasId })
+    if (disposed || epoch !== canvasEpoch || canvasId !== props.canvasId) return
     if (Array.isArray(raw)) {
       conversations.value = raw
         .filter((c): c is CanvasConversation => !!c && typeof c === 'object' && Array.isArray((c as CanvasConversation).messages))
@@ -247,13 +264,92 @@ async function load(canvasId: string) {
     console.error('get_canvas_ai_conversations:', e)
   }
   // Canvas changed under us while the read was in flight.
-  if (canvasId !== props.canvasId) return
+  if (disposed || epoch !== canvasEpoch || canvasId !== props.canvasId) return
   const conv = conversations.value[0] ?? blankConversation()
   if (!conversations.value.includes(conv)) conversations.value.unshift(conv)
   activeConvId.value = conv.id
 }
 
 // ── Sending ──────────────────────────────────────────────────────────────────
+
+function contextModelKey(sel: ModelSelection) { return `${sel.providerId}::${sel.modelId}` }
+function rawContextHistory(records: CanvasMessage[]): ChatMessage[] {
+  return records.filter(m => !m.error && !m.streaming).map(m => ({ role: m.role, content: m.content }))
+}
+function canvasHistory(conv: CanvasConversation, sel: ModelSelection, records = conv.messages): ChatMessage[] {
+  return [canvasContext(), ...applyContextCheckpoint(records, conv.contextStates?.[contextModelKey(sel)]?.checkpoint, rawContextHistory)]
+}
+function setContextUsage(conv: CanvasConversation, sel: ModelSelection, usage: ContextUsage) {
+  const states = conv.contextStates ??= {}
+  const state = states[contextModelKey(sel)] ??= {}
+  state.usage = usage
+}
+function setContextCheckpoint(conv: CanvasConversation, sel: ModelSelection, bound: string, messages: ChatMessage[]) {
+  const index = conv.messages.findIndex(m => m.id === bound)
+  if (index < 0) return
+  const states = conv.contextStates ??= {}
+  const state = states[contextModelKey(sel)] ??= {}
+  state.checkpoint = { throughMessageId: bound, messages, fingerprint: historyFingerprint(rawContextHistory(conv.messages.slice(0, index + 1))), createdAt: new Date().toISOString() }
+}
+function contextArguments(conv: CanvasConversation, sel: ModelSelection, messages: ChatMessage[]) {
+  return { messages, providerId: sel.providerId, modelId: sel.modelId, canvasId: props.canvasId, plainFallback: false,
+    selectedPaperSlugs: [], webSearch: false, expectedRoot: libraryRoot.value,
+    previousUsage: conv.contextStates?.[contextModelKey(sel)]?.usage ?? null }
+}
+const contextDisplay = computed(() => {
+  const sel = model.value
+  const usage = sel && activeConv.value?.contextStates?.[contextModelKey(sel)]?.usage
+  if (!usage) return null
+  const draft = estimateContextText(input.value), used = usage.usedTokens + draft
+  return { ...usage, usedTokens: used, remainingTokens: Math.max(0, usage.contextWindow - used), estimated: usage.estimated || draft > 0 }
+})
+async function inspectContext() {
+  const conv = activeConv.value, sel = model.value, root = libraryRoot.value
+  if (!conv || !sel || !root || loading.value || disposed) return
+  const revision = ++contextInspection, epoch = canvasEpoch, fingerprint = historyFingerprint(rawContextHistory(conv.messages))
+  try {
+    const result = await invoke<PreparedContext>('prepare_library_chat_context', {
+      ...contextArguments(conv, sel, canvasHistory(conv, sel)), mode: 'inspect', eventName: `canvas-context-${conv.id}`, requestId: null,
+    })
+    if (result?.usage && revision === contextInspection && epoch === canvasEpoch && !disposed && !loading.value
+      && activeConv.value === conv && model.value && contextModelKey(model.value) === contextModelKey(sel)
+      && fingerprint === historyFingerprint(rawContextHistory(conv.messages))) setContextUsage(conv, sel, result.usage)
+  } catch { /* No configured model/library yet. */ }
+}
+function scheduleContextInspection() {
+  contextInspection++
+  contextError.value = ''; contextNotice.value = ''
+  if (contextInspectTimer) clearTimeout(contextInspectTimer)
+  contextInspectTimer = setTimeout(() => { contextInspectTimer = null; void inspectContext() }, 350)
+}
+watch(() => [props.canvasId, activeConvId.value, activeConv.value?.updatedAt, model.value?.providerId, model.value?.modelId, libraryRoot.value, loading.value], scheduleContextInspection)
+
+async function compactContext() {
+  const conv = activeConv.value, sel = model.value
+  if (!conv || !sel || loading.value || !libraryRoot.value || !conv.messages.length) return
+  const epoch = canvasEpoch, requestId = newId(), bound = conv.messages[conv.messages.length - 1].id
+  const fingerprint = historyFingerprint(rawContextHistory(conv.messages))
+  activeRequestId = requestId; loading.value = true; contextCompacting.value = true
+  contextError.value = ''; contextNotice.value = ''
+  try {
+    const result = await invoke<PreparedContext>('prepare_library_chat_context', {
+      ...contextArguments(conv, sel, canvasHistory(conv, sel)), mode: 'manual', eventName: `canvas-context-${requestId}`, requestId,
+    })
+    if (disposed || epoch !== canvasEpoch || stoppedRequests.has(requestId) || !conversations.value.includes(conv)) return
+    if (fingerprint !== historyFingerprint(rawContextHistory(conv.messages))) { contextError.value = t('chatContext.changed'); return }
+    if (result?.usage) setContextUsage(conv, sel, result.usage)
+    if (result?.compacted) {
+      setContextCheckpoint(conv, sel, bound, result.messages)
+      conv.updatedAt = new Date().toISOString(); scheduleSave()
+      contextNotice.value = t('chatContext.compacted')
+    } else contextNotice.value = t('chatContext.noRange')
+  } catch (error) {
+    if (!disposed && epoch === canvasEpoch && !stoppedRequests.has(requestId)) contextError.value = String(error)
+  } finally {
+    stoppedRequests.delete(requestId)
+    if (activeRequestId === requestId) { activeRequestId = null; loading.value = false; contextCompacting.value = false }
+  }
+}
 
 function detachListeners() {
   for (const off of unlisteners) off()
@@ -264,7 +360,8 @@ async function send() {
   const text = input.value.trim()
   const conv = activeConv.value
   const sel = model.value
-  if (!text || !conv || !sel || loading.value) return
+  if (!text || !conv || !sel || loading.value || !libraryRoot.value) return
+  const epoch = canvasEpoch, root = libraryRoot.value, canvasId = props.canvasId
 
   input.value = ''
   errorText.value = ''
@@ -290,17 +387,28 @@ async function send() {
 
   // History as the model sees it: the canvas context, then the turns so far
   // (the empty answer we just pushed is not one of them).
-  const history: ChatMessage[] = [
-    canvasContext(),
-    ...conv.messages
-      .filter(m => m.id !== live.id && !m.error)
-      .map(m => ({ role: m.role, content: m.content })),
-  ]
+  const prefix = conv.messages.slice(0, -1), bound = prefix[prefix.length - 1].id
+  const fingerprint = historyFingerprint(rawContextHistory(prefix))
+  const prefixUnchanged = () => {
+    const index = conv.messages.findIndex(m => m.id === bound)
+    return index >= 0 && fingerprint === historyFingerprint(rawContextHistory(conv.messages.slice(0, index + 1)))
+  }
+  let history = canvasHistory(conv, sel, prefix)
 
   const eventName = `canvas-chat-${props.canvasId.replace(/[^A-Za-z0-9:_/-]/g, '-')}-${live.id}`
   const requestId = newId()
   activeRequestId = requestId
+  const current = () => !disposed && epoch === canvasEpoch && root === libraryRoot.value && activeRequestId === requestId && !stoppedRequests.has(requestId)
+  let pendingCheckpoint: ChatMessage[] | undefined
   detachListeners()
+
+  unlisteners.push(await listen<ContextUsage>(`${eventName}-context-usage`, e => { if (current()) setContextUsage(conv, sel, e.payload) }))
+  unlisteners.push(await listen<{ messages: ChatMessage[] }>(`${eventName}-context-checkpoint`, e => { if (current()) pendingCheckpoint = e.payload.messages }))
+  unlisteners.push(await listen<{ phase: string; error?: string }>(`${eventName}-context-status`, e => {
+    if (!current()) return
+    contextCompacting.value = e.payload.phase === 'compacting'
+    if (e.payload.phase === 'error') contextError.value = e.payload.error ?? ''
+  }))
 
   unlisteners.push(await listen<{ delta?: string; done?: boolean }>(eventName, (e) => {
     if (e.payload?.done) return
@@ -369,6 +477,16 @@ async function send() {
   }))
 
   try {
+    if (!current()) return
+    const prepared = await invoke<PreparedContext>('prepare_library_chat_context', {
+      ...contextArguments(conv, sel, history), mode: 'auto', eventName, requestId,
+    })
+    if (!current()) return
+    if (prepared?.usage) setContextUsage(conv, sel, prepared.usage)
+    if (prepared?.compacted) {
+      history = [canvasContext(), ...prepared.messages]
+      if (prefixUnchanged()) setContextCheckpoint(conv, sel, bound, prepared.messages)
+    }
     const final = await invoke<string>('chat_with_library', {
       messages: history,
       providerId: sel.providerId,
@@ -386,13 +504,19 @@ async function send() {
       conversationId: conv.id,
       // Anchors this answer to the canvas: it is what unlocks the `edit_canvas`
       // tool and the only canvas any edit can touch.
-      canvasId: props.canvasId,
+      canvasId,
+      manageContext: true,
+      expectedRoot: root,
     })
-    if (final && !live.content) live.content = final
+    if (current()) {
+      if (final && !live.content) live.content = final
+      live.streaming = false
+      if (pendingCheckpoint && prefixUnchanged()) setContextCheckpoint(conv, sel, live.id, pendingCheckpoint)
+    }
   } catch (e) {
     const message = String(e)
     // Stopping is the user's own doing, not a failure to report.
-    if (!/cancel/i.test(message)) {
+    if (current() && !/cancel/i.test(message)) {
       live.error = true
       live.content = live.content || message
       errorText.value = message
@@ -400,9 +524,8 @@ async function send() {
   } finally {
     flushStreamRender(live)
     live.streaming = false
-    loading.value = false
-    activeRequestId = null
-    detachListeners()
+    if (activeRequestId === requestId) { loading.value = false; contextCompacting.value = false; activeRequestId = null; detachListeners() }
+    stoppedRequests.delete(requestId)
     conv.updatedAt = new Date().toISOString()
     // An answer that produced nothing at all (stopped immediately) would leave
     // an empty bubble behind.
@@ -412,13 +535,14 @@ async function send() {
     if (!live.content.trim() && !live.error && !hasImages) {
       conv.messages = conv.messages.filter(m => m.id !== live.id)
     }
-    scheduleSave()
+    if (!disposed && epoch === canvasEpoch && root === libraryRoot.value) scheduleSave()
     scrollToBottom()
   }
 }
 
 function stop() {
   if (!activeRequestId) return
+  stoppedRequests.add(activeRequestId)
   invoke('cancel_ai_request', { requestId: activeRequestId }).catch(() => {})
 }
 
@@ -540,6 +664,8 @@ watch(() => props.canvasId, (id) => {
   // Leaving a canvas mid-answer: stop it rather than streaming into a
   // conversation the user can no longer see.
   if (loading.value) stop()
+  canvasEpoch++
+  contextCompacting.value = false
   detachListeners()
   // Any edit still parked on the canvas we are leaving is dropped, preview and all.
   for (const pending of pendingWrites.value) {
@@ -559,13 +685,28 @@ void ai.load().then(() => {
   if (!model.value) model.value = ai.defaultSelection
 })
 
-onMounted(() => {
+onMounted(async () => {
   document.addEventListener('mousedown', closeModelMenu)
+  const off = await listen<string>('library-changed', event => {
+    if (event.payload === libraryRoot.value) return
+    stop(); canvasEpoch++; libraryRevision++; loading.value = false; contextCompacting.value = false
+    libraryRoot.value = event.payload
+    knownConvIds.clear()
+    void load(props.canvasId)
+  })
+  if (disposed) off()
+  else offLibrary = off
+  const revision = libraryRevision
+  const root = await invoke<string | null>('get_current_library').catch(() => null)
+  if (!disposed && revision === libraryRevision) libraryRoot.value = root
 })
 
 onUnmounted(() => {
   document.removeEventListener('mousedown', closeModelMenu)
   if (loading.value) stop()
+  disposed = true; canvasEpoch++; contextInspection++
+  offLibrary?.()
+  if (contextInspectTimer) clearTimeout(contextInspectTimer)
   detachListeners()
   // Release any write still parked on this tab; the backend would otherwise
   // wait out its timeout before telling the model nothing was written.
@@ -744,6 +885,8 @@ onUnmounted(() => {
         />
         <div class="cc-composer-footer">
           <span class="cc-spacer" />
+          <ContextMeter :key="activeConvId ?? 'new'" :usage="contextDisplay" :busy="loading" :compacting="contextCompacting"
+            :error="contextError" :notice="contextNotice" @inspect="inspectContext" @compact="compactContext" />
           <button v-if="loading" class="cc-send stop" @click="stop">
             <Icon icon="fluent:stop-24-filled" width="13" height="13" />
             {{ t('canvasChat.stop') }}

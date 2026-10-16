@@ -1719,9 +1719,13 @@ pub async fn rebuild_search_index(state: State<'_, LibraryRoot>) -> Result<(), S
 #[tauri::command]
 pub async fn search_fulltext(
     query: String,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<Vec<SearchHit>, String> {
     let root = get_root(&state)?;
+    if expected_root.as_deref().is_some_and(|expected| expected != root) {
+        return Err("Library changed during search".to_string());
+    }
     let root_c = root.clone();
     tauri::async_runtime::spawn_blocking(move || search::search_fulltext(&root_c, &query))
         .await
@@ -2788,14 +2792,19 @@ pub async fn prepare_library_chat_context(
     messages: Vec<AgentMessage>, provider_id: Option<String>, model_id: Option<String>,
     selected_paper_slugs: Option<Vec<String>>, web_search: Option<bool>,
     mode: String, previous_usage: Option<crate::chat_context::ContextUsage>, event_name: String, request_id: Option<String>,
+    paper_slug: Option<String>, current_page: Option<u32>, canvas_id: Option<String>,
+    plain_fallback: Option<bool>, expected_root: Option<String>,
     state: State<'_, LibraryRoot>, app: tauri::AppHandle,
 ) -> Result<crate::chat_context::PreparedContext, String> {
     if !matches!(mode.as_str(), "inspect" | "auto" | "manual") { return Err("Unknown context operation.".into()); }
     let root = get_root(&state)?;
+    if expected_root.as_deref().is_some_and(|expected| expected != root) {
+        return Err("Library changed during context preparation".into());
+    }
     let (_guard, cancel) = crate::cancel::CancelGuard::new(request_id);
     copilot::prepare_library_context(&root, messages, provider_id.as_deref(), model_id.as_deref(),
         &selected_paper_slugs.unwrap_or_default(), web_search.unwrap_or(false), &mode, previous_usage.as_ref(),
-        &event_name, &app, cancel).await
+        &event_name, &app, cancel, paper_slug.as_deref(), current_page, canvas_id.as_deref(), plain_fallback.unwrap_or(true)).await
 }
 
 #[tauri::command]
@@ -2840,6 +2849,7 @@ pub async fn chat_with_library(
     // whole point is a tool.
     plain_fallback: Option<bool>,
     manage_context: Option<bool>,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
     // Which window asked. The cache keepalive runs until this window closes,
     // and agent mode is reachable from the main window (paper AI panel, canvas
@@ -2848,6 +2858,9 @@ pub async fn chat_with_library(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
+    if expected_root.as_deref().is_some_and(|expected| expected != root) {
+        return Err("Library changed during chat".into());
+    }
     let event_name = event_name.unwrap_or_else(|| "library-chat".to_string());
     // Where the tool-free path (a fallback turn, or an old non-agent caller)
     // sends the papers it answered from. The agent loop itself emits no sources.
@@ -3870,8 +3883,12 @@ pub async fn save_canvas_ai_conversations(
     canvas_id: String,
     conversations: serde_json::Value,
     tombstones: Option<serde_json::Value>,
+    expected_root: Option<String>,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
+    if expected_root.as_deref().is_some_and(|expected| expected != root) {
+        return Err("Library changed during canvas conversation save".into());
+    }
     let tombstones = tombstones.unwrap_or_else(|| serde_json::json!([]));
     canvas::write_ai_conversations(&root, &canvas_id, &conversations, &tombstones)
 }

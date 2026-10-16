@@ -17,6 +17,8 @@ export const useSelectionStore = defineStore('selection', () => {
   // Search state
   const searchQuery = ref('')
   const searchResults = ref<SearchHit[]>([])
+  const searchBusy = ref(false)
+  const searchError = ref<string | null>(null)
 
   function selectPaper(slug: string | null) {
     // Selecting a row only previews it — it is not "opening/reading", so it must
@@ -88,6 +90,7 @@ export const useSelectionStore = defineStore('selection', () => {
     navSelectionSeq.value += 1
     searchQuery.value = query
     searchResults.value = results
+    searchError.value = null
     activeNav.value = 'search'
     selectedSlug.value = null
     selectedSlugs.value = []
@@ -99,6 +102,8 @@ export const useSelectionStore = defineStore('selection', () => {
   function clearSearch() {
     searchQuery.value = ''
     searchResults.value = []
+    searchBusy.value = false
+    searchError.value = null
     if (activeNav.value === 'search') {
       activeNav.value = 'all'
     }
@@ -119,6 +124,8 @@ export const useSelectionStore = defineStore('selection', () => {
     highlightedCollectionId,
     searchQuery,
     searchResults,
+    searchBusy,
+    searchError,
     selectPaper,
     togglePaper,
     selectRange,

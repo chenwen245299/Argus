@@ -15,6 +15,9 @@ const { buildToolExchangeMessages } = await import('data:text/javascript;base64,
 const { guidedReadingRequestHistory } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
   await readFile(new URL('../src/utils/guidedReading.ts', import.meta.url), 'utf8'),
 )).toString('base64'))
+const { applyContextCheckpoint, historyFingerprint } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
+  await readFile(new URL('../src/utils/chatContext.ts', import.meta.url), 'utf8'),
+)).toString('base64'))
 
 // Execute the real regenerate -> streamAnswer -> agent-event -> save path.
 // Only desktop I/O and markdown rendering are replaced; answer state and Vue
@@ -24,6 +27,8 @@ const ast = ts.createSourceFile('AiTab.ts', source.slice(source.indexOf('>') + 1
 const functions = ['nowIso', 'findReactiveAnswer', 'isAnswerVisible', 'detachAnswerListeners',
   'activeAnswerForGroup', 'buildHistoryUntil', 'flushStreamRender', 'resetAnswerResult',
   'regenerate', 'streamAnswer', 'streamAnswerImpl', 'summarizeToolArgs', 'applyUsage', 'dismissWrite']
+  .concat(['modelKey', 'cloneConversation', 'persistableSteps', 'persistableConversation', 'paperHistoryFingerprint',
+    'paperContextHistory', 'paperContextId', 'paperContextArguments', 'setPaperContextUsage', 'setPaperCheckpoint'])
   .map(name => {
     const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name)
     assert.ok(node, `AiTab function ${name} exists`)
@@ -34,12 +39,17 @@ const eventSuffixes = ast.statements.find(n => ts.isVariableStatement(n) && n.de
 const makeRunner = new Function('env', transpile(`
   const streamTasks = new Map();
   const syncDisposed = false;
+  const contextErrors = { value: {} }, contextNotices = { value: {} };
+  const PERSIST_STEP_CHARS = 60000, PERSIST_ANSWER_CHARS = 400000;
+  const persistableServerToolTrace = value => value;
+  const t = key => key;
   const { props, activeConversation, activeAnswerTabs, expandedSteps, streamOwners,
     activeRequestIds, unlisteners, useReasoning, reasoningLevel, pendingWrites,
     streamRenderTimers, streamRenderLast, streamRenderCost, ai, reader, crypto,
     listen, invoke, persistConversationFor, scheduleStreamRender, scrollToBottom,
     mergeServerToolTrace, buildToolExchangeMessages, guidedReadingRequestHistory, syncLibraryRoot,
     broadcastConversationSnapshot, broadcastStreamUpdate } = env;
+  const { applyContextCheckpoint, historyFingerprint } = env;
   ${eventSuffixes}
   ${functions}
   return { regenerate };
@@ -90,11 +100,13 @@ function harness() {
     ai: { settings: { providers: [{ id: 'provider', base_url: 'https://example.test' }] } },
     reader: { readingStateFor: () => ({ page: 4 }) },
     syncLibraryRoot: 'library', broadcastConversationSnapshot: () => {}, broadcastStreamUpdate: () => {},
+    applyContextCheckpoint, historyFingerprint,
     listen: async (channel, callback) => {
       listeners.set(channel, callback)
       return () => listeners.delete(channel)
     },
     invoke: (command, args) => {
+      if (command === 'prepare_library_chat_context') return Promise.resolve(null)
       assert.equal(command, 'chat_with_library')
       const response = deferred()
       requests.push({ args, response })

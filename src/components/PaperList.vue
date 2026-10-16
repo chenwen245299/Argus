@@ -1553,9 +1553,14 @@ async function deleteBatch() {
     <template v-if="selection.activeNav === 'search'">
       <div class="search-header">
         <span>{{ t('search.results') }}</span>
-        <span class="search-count">{{ t('search.hits').replace('{n}', String(selection.searchResults.length)) }}</span>
+        <span class="search-count" role="status">{{ selection.searchBusy ? t('search.searching') : t('search.hits', { n: selection.searchResults.length }) }}</span>
       </div>
-      <div v-if="selection.searchResults.length === 0" class="empty-state">
+      <div v-if="selection.searchError" class="empty-state" role="alert" :title="selection.searchError">
+        <Icon icon="fluent:warning-24-regular" width="32" height="32" />
+        <p>{{ t('search.failed') }}</p>
+        <span>{{ t('search.retryHint') }}</span>
+      </div>
+      <div v-else-if="selection.searchResults.length === 0 && !selection.searchBusy" class="empty-state">
         <Icon icon="fluent:search-24-regular" width="32" height="32" />
         <p>{{ t('search.noResults') }}</p>
       </div>

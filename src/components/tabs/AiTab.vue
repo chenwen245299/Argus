@@ -10,6 +10,8 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { modelHasVision, modelHasVideo, modelHasAudio, useAiStore, type ModelOption } from '../../stores/ai'
 import ProviderBalanceTag from '../ProviderBalanceTag.vue'
+import ContextMeter from '../ContextMeter.vue'
+import { applyContextCheckpoint, historyFingerprint, estimateContextText, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
 import ServerToolTraceCard from '../ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../../utils/serverToolTrace'
 import { useSettingsStore } from '../../stores/settings'
@@ -178,7 +180,7 @@ const unlisteners = new Map<string, UnlistenFn>()
  */
 const ANSWER_EVENT_SUFFIXES = [
   '', '-reasoning', '-context', '-usage', '-audio', '-servertools',
-  '-agent', '-confirm', '-confirm-close',
+  '-agent', '-confirm', '-confirm-close', '-context-usage', '-context-checkpoint', '-context-status',
 ] as const
 
 function detachAnswerListeners(answerId: string) {
@@ -196,7 +198,7 @@ const activeRequestIds = new Map<string, string>()
 // owns them. Holding the conversation here keeps it alive and reactive after the
 // user switches to another paper, so a generation started on paper A keeps
 // streaming into A's conversation in the background instead of being dropped.
-const streamOwners = shallowReactive(new Map<string, { slug: string; conv: Conversation; origin?: string; root?: string }>())
+const streamOwners = shallowReactive(new Map<string, { slug: string; conv: Conversation; origin?: string; root?: string; contextOnly?: boolean }>())
 const streamTasks = new Map<string, { convId: string; task: Promise<void> }>()
 // History entries are saved snapshots; live owners track generations even after
 // switching conversations. Only additions/removals need to update these dots.
@@ -326,9 +328,9 @@ const audioUnsupported = computed(() =>
 )
 
 const hasStreaming = computed(() =>
-  !!activeConversation.value?.nodes.some(n =>
+  !!activeConversation.value && (activeConversation.value.nodes.some(n =>
     n.role === 'assistantGroup' && n.answers.some(a => a.streaming)
-  )
+  ) || [...streamOwners.values()].some(o => o.conv.id === activeConversation.value!.id && o.contextOnly))
 )
 
 // True if the primary selected model's provider has a DeepSeek endpoint
@@ -499,7 +501,7 @@ function normalizeConversations(value: unknown, slug: string): Conversation[] {
       // Disk cannot tell us which window still owns a request. Live status is
       // supplied by the sync handshake; a saved flag must not lock the composer.
       nodes: c.nodes.map(n => n.role === 'assistantGroup'
-        ? { ...n, answers: n.answers.map(a => ({ ...a, streaming: false })) }
+        ? { ...n, answers: n.answers.map(a => ({ ...a, streaming: false, contextCompacting: false })) }
         : n),
     }))
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
@@ -632,8 +634,8 @@ async function ensurePaperAiSync() {
 
 function localConversationStreams(conv: Conversation): PaperAiStreamInfo[] {
   return [...streamOwners.entries()]
-    .filter(([id, o]) => !o.origin && o.conv.id === conv.id && o.conv.nodes.some(n => n.role === 'assistantGroup' && n.answers.some(a => a.id === id && a.streaming)))
-    .map(([answerId]) => ({ answerId }))
+    .filter(([id, o]) => !o.origin && o.conv.id === conv.id && (o.contextOnly || o.conv.nodes.some(n => n.role === 'assistantGroup' && n.answers.some(a => a.id === id && a.streaming))))
+    .map(([answerId, o]) => o.contextOnly ? { answerId, contextOnly: true } : { answerId })
 }
 
 function broadcastConversationSnapshot(conv: Conversation, select = false, target?: string) {
@@ -659,6 +661,7 @@ function broadcastStreamUpdate(answerId: string) {
     return { kind: 'update', root: owner.root ?? syncLibraryRoot!, slug: conv.slug,
       conversationId: conv.id, title: conv.title, updatedAt: conv.updatedAt,
       answers: patch.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : []),
+      contextUsage: Object.fromEntries(Object.entries(conv.contextStates ?? {}).map(([key, state]) => [key, state.usage])),
       streams: localConversationStreams(conv) }
   })
 }
@@ -690,7 +693,7 @@ function adoptSyncedConversation(incoming: Conversation, streams: PaperAiStreamI
   const proxy = activeConversation.value?.id === adopted.id ? activeConversation.value
     : conversations.value.find(c => c.id === adopted.id) ?? adopted
   for (const [id, owner] of streamOwners) if (owner.origin && owner.conv.id === adopted.id) streamOwners.delete(id)
-  for (const { answerId } of streams) streamOwners.set(answerId, { slug: incoming.slug, conv: proxy, origin, root: syncLibraryRoot ?? undefined })
+  for (const { answerId, contextOnly } of streams) streamOwners.set(answerId, { slug: incoming.slug, conv: proxy, origin, root: syncLibraryRoot ?? undefined, contextOnly })
   if (select || activeConversation.value?.id === adopted.id) {
     activeConversation.value = proxy
     if (select) { activeAnswerTabs.value = {}; void nextTick(() => scrollToBottom(true)) }
@@ -747,6 +750,7 @@ function handlePaperAiSync(p: PaperAiSyncMessage) {
     if (ownsConversationStream(conv.id)) return
     const answers = new Map(p.answers.map(a => [a.id, a]))
     const snapshot: Conversation = { ...conv, title: p.title, updatedAt: p.updatedAt,
+      contextStates: { ...conv.contextStates, ...Object.fromEntries(Object.entries(p.contextUsage ?? {}).map(([key, usage]) => [key, { ...conv.contextStates?.[key], usage }])) },
       nodes: conv.nodes.map(n => n.role === 'assistantGroup' ? { ...n, answers: n.answers.map(a => answers.get(a.id) ?? a) } : n) }
     adoptSyncedConversation(snapshot, p.streams, p.origin)
   }
@@ -756,6 +760,11 @@ function applySyncedDiskConversations(list: Conversation[], slug: string) {
   // The durable completion notification is also a fallback if the final live
   // event was missed. A pre-request snapshot has no endedAt and cannot do this.
   for (const [id, owner] of streamOwners) if (owner.origin && owner.slug === slug) {
+    const record = list.find(c => c.id === owner.conv.id)
+    if (owner.contextOnly && record && record.updatedAt > owner.conv.updatedAt && record.contextTask !== id) {
+      streamOwners.delete(id)
+      continue
+    }
     const saved = list.find(c => c.id === owner.conv.id)?.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : []).find(a => a.id === id)
     const live = owner.conv.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : []).find(a => a.id === id)
     if (saved && typeof saved.endedAt === 'number' && saved.createdAt === live?.createdAt) streamOwners.delete(id)
@@ -1396,6 +1405,115 @@ function flattenConversation(conv: Conversation): ChatMessage[] {
   return buildHistoryUntil(conv)
 }
 
+// Context is a provider/model-specific projection of the full, visible history.
+const contextErrors = ref<Record<string, string>>({})
+const contextNotices = ref<Record<string, string>>({})
+let contextInspection = 0
+let contextInspectTimer: ReturnType<typeof setTimeout> | null = null
+
+function paperContextId(conv: Conversation, model: Pick<ModelOption, 'providerId' | 'modelId'>) {
+  return JSON.stringify([syncLibraryRoot, conv.slug, conv.id, modelKey(model)])
+}
+function paperHistoryFingerprint(conv: Conversation, nodes = conv.nodes) {
+  return historyFingerprint(guidedReadingRequestHistory(buildHistoryUntil(persistableConversation({ ...conv, nodes }))))
+}
+function paperContextHistory(conv: Conversation, model: Pick<ModelOption, 'providerId' | 'modelId'>, stopGroupId?: string) {
+  const index = stopGroupId ? conv.nodes.findIndex(n => n.id === stopGroupId) : -1
+  const nodes = index < 0 ? conv.nodes : conv.nodes.slice(0, index)
+  return applyContextCheckpoint(nodes, conv.contextStates?.[modelKey(model)]?.checkpoint,
+    records => guidedReadingRequestHistory(buildHistoryUntil({ ...conv, nodes: records })),
+    records => guidedReadingRequestHistory(buildHistoryUntil(persistableConversation({ ...conv, nodes: records }))))
+}
+function setPaperCheckpoint(conv: Conversation, model: Pick<ModelOption, 'providerId' | 'modelId'>, bound: string, messages: ChatMessage[]) {
+  const index = conv.nodes.findIndex(n => n.id === bound)
+  if (index < 0) return
+  const states = conv.contextStates ??= {}
+  const state = states[modelKey(model)] ??= {}
+  state.checkpoint = { throughMessageId: bound, messages, fingerprint: paperHistoryFingerprint(conv, conv.nodes.slice(0, index + 1)), createdAt: nowIso() }
+}
+function setPaperContextUsage(conv: Conversation, model: Pick<ModelOption, 'providerId' | 'modelId'>, usage: ContextUsage) {
+  const states = conv.contextStates ??= {}
+  const state = states[modelKey(model)] ??= {}
+  state.usage = usage
+}
+function paperContextArguments(conv: Conversation, model: Pick<ModelOption, 'providerId' | 'modelId'>, messages: ChatMessage[], root = syncLibraryRoot) {
+  return { messages, providerId: model.providerId, modelId: model.modelId, paperSlug: conv.slug,
+    currentPage: reader.readingStateFor(conv.slug)?.page ?? null, selectedPaperSlugs: [],
+    webSearch: false, plainFallback: false, expectedRoot: root,
+    previousUsage: conv.contextStates?.[modelKey(model)]?.usage ?? null }
+}
+function paperContextDisplay(model: ModelOption): ContextUsage | null {
+  const usage = activeConversation.value?.contextStates?.[modelKey(model)]?.usage
+  if (!usage || usage.providerId !== model.providerId || usage.modelId !== model.modelId) return null
+  const draft = estimateContextText(input.value) + attachments.value.reduce((n, a) => n + (a.type === 'image' ? (a.detail === 'low' ? 85 : 2048) : a.type === 'pdf' ? 4096 : 8192), 0)
+  const used = usage.usedTokens + draft
+  return { ...usage, usedTokens: used, remainingTokens: Math.max(0, usage.contextWindow - used), estimated: usage.estimated || draft > 0 }
+}
+const paperContextCompacting = computed(() => !!activeConversation.value && (
+  [...streamOwners.values()].some(o => o.conv.id === activeConversation.value!.id && o.contextOnly)
+  || activeConversation.value.nodes.some(n => n.role === 'assistantGroup' && n.answers.some(a => a.contextCompacting))))
+
+async function inspectPaperContext() {
+  const conv = activeConversation.value, root = syncLibraryRoot
+  if (!conv || !root || conv.slug !== props.slug || hasStreaming.value || syncDisposed) return
+  const revision = ++contextInspection, fingerprint = paperHistoryFingerprint(conv)
+  await Promise.all(selectedModels.value.map(async model => {
+    try {
+      const result = await invoke<PreparedContext>('prepare_library_chat_context', {
+        ...paperContextArguments(conv, model, paperContextHistory(conv, model), root),
+        mode: 'inspect', eventName: `paper-context-inspect-${conv.id}`, requestId: null,
+      })
+      if (result?.usage && revision === contextInspection && root === syncLibraryRoot && activeConversation.value === conv
+        && !syncDisposed && !hasStreaming.value && fingerprint === paperHistoryFingerprint(conv)
+        && selectedModels.value.some(m => modelKey(m) === modelKey(model))) setPaperContextUsage(conv, model, result.usage)
+    } catch { /* A model or library may not be configured yet. */ }
+  }))
+}
+function schedulePaperContextInspection() {
+  contextInspection++
+  if (contextInspectTimer) clearTimeout(contextInspectTimer)
+  contextInspectTimer = setTimeout(() => { contextInspectTimer = null; void inspectPaperContext() }, 350)
+}
+watch(() => [props.slug, activeConversation.value?.id, activeConversation.value?.updatedAt, selectedModelKeys.value.join('|'), hasStreaming.value,
+  Object.values(activeAnswerTabs.value).join('|'), ai.loaded], schedulePaperContextInspection)
+
+function compactPaperContext(model: ModelOption) {
+  const conv = activeConversation.value
+  if (!conv || composerBusy.value || !conv.nodes.length) return
+  const id = newId('context')
+  const task = compactPaperContextImpl(conv, model, id).finally(() => { streamTasks.delete(id) })
+  streamTasks.set(id, { convId: conv.id, task })
+}
+async function compactPaperContextImpl(conv: Conversation, model: ModelOption, id: string) {
+  const root = syncLibraryRoot, requestId = crypto.randomUUID(), bound = conv.nodes[conv.nodes.length - 1]?.id
+  if (!root || !bound) return
+  const fingerprint = paperHistoryFingerprint(conv), key = paperContextId(conv, model)
+  const current = () => !syncDisposed && root === syncLibraryRoot && activeRequestIds.get(id) === requestId
+  contextErrors.value[key] = ''; contextNotices.value[key] = ''
+  activeRequestIds.set(id, requestId)
+  streamOwners.set(id, { slug: conv.slug, conv, root, contextOnly: true })
+  conv.contextTask = id
+  persistConversationFor(conv.slug, conv)
+  try {
+    const result = await invoke<PreparedContext>('prepare_library_chat_context', {
+      ...paperContextArguments(conv, model, paperContextHistory(conv, model), root), mode: 'manual', eventName: id, requestId,
+    })
+    if (!current()) return
+    if (fingerprint !== paperHistoryFingerprint(conv)) { contextErrors.value[key] = t('chatContext.changed'); return }
+    if (result?.usage) setPaperContextUsage(conv, model, result.usage)
+    if (result?.compacted) {
+      setPaperCheckpoint(conv, model, bound, result.messages)
+      contextNotices.value[key] = t('chatContext.compacted')
+    } else contextNotices.value[key] = t('chatContext.noRange')
+  } catch (error) {
+    if (current()) contextErrors.value[key] = String(error)
+  } finally {
+    activeRequestIds.delete(id); streamOwners.delete(id)
+    if (conv.contextTask === id) delete conv.contextTask
+    if (!syncDisposed && root === syncLibraryRoot) persistConversationFor(conv.slug, conv)
+  }
+}
+
 async function sendMessage(immediate = false) {
   if (queueEditor.commit(immediate)) return
   if (!canSend.value || !props.slug) return
@@ -1560,7 +1678,7 @@ function stopAllStreaming() {
 function stopConversationStreaming(conv: Conversation, persist = true) {
   const answerIds = conv.nodes.flatMap(n =>
     n.role === 'assistantGroup' ? n.answers.filter(a => a.streaming).map(a => a.id) : []
-  )
+  ).concat([...streamOwners].filter(([, o]) => o.conv.id === conv.id && o.contextOnly).map(([id]) => id))
   const localAnswerIds = answerIds.filter(id => {
     const owner = streamOwners.get(id)
     return !!owner && !owner.origin
@@ -1581,6 +1699,7 @@ function stopConversationStreaming(conv: Conversation, persist = true) {
     const ra = findReactiveAnswer(answerId)
     if (ra?.streaming) {
       ra.streaming = false
+      ra.contextCompacting = false
       ra.endedAt = performance.now()
       for (const step of ra.steps ?? []) if (step.ok === undefined) {
         step.ok = false
@@ -1589,6 +1708,7 @@ function stopConversationStreaming(conv: Conversation, persist = true) {
       flushStreamRender(ra)
     }
     streamOwners.delete(answerId)
+    if (conv.contextTask === answerId) delete conv.contextTask
   }
   if (!stoppedLocal) return
   // Any write the agent was still waiting on is refused when the user stops.
@@ -1684,6 +1804,7 @@ function resetAnswerResult(ans: AssistantAnswer) {
   ans.steps = undefined
   ans.serverErrors = undefined
   ans.limitHit = undefined
+  ans.contextCompacting = false
   // Row keys reuse the answer id and index, so a new first step must not inherit
   // the previous first step's expanded details. Other answers stay as they are.
   const prefix = `${ans.id}:`
@@ -1726,6 +1847,15 @@ async function streamAnswerImpl(
   // Pin the conversation object that owns this answer.
   const owner = activeConversation.value?.id === conv.id ? activeConversation.value : conv
   const rootAtStart = syncLibraryRoot
+  const group = owner.nodes.find((n): n is AssistantGroupNode => n.role === 'assistantGroup' && n.answers.some(a => a.id === answer.id))
+  const prefix = group ? owner.nodes.slice(0, owner.nodes.indexOf(group)) : owner.nodes
+  const bound = prefix[prefix.length - 1]?.id
+  const fingerprint = paperHistoryFingerprint(owner, prefix)
+  const prefixUnchanged = () => {
+    const index = owner.nodes.findIndex(n => n.id === bound)
+    return index >= 0 && fingerprint === paperHistoryFingerprint(owner, owner.nodes.slice(0, index + 1))
+  }
+  history = paperContextHistory(owner, answer, group?.id)
   streamOwners.set(answer.id, { slug, conv: owner, root: rootAtStart ?? undefined })
   const eventName = `paper-ai-chat-${answer.id}`
   const reasoningEventName = `${eventName}-reasoning`
@@ -1733,6 +1863,10 @@ async function streamAnswerImpl(
   // stopAllStreaming to invoke `cancel_ai_request`.
   const requestId = crypto.randomUUID()
   activeRequestIds.set(answer.id, requestId)
+  const currentRequest = () => activeRequestIds.get(answer.id) === requestId && rootAtStart === syncLibraryRoot && !syncDisposed
+  let pendingCheckpoint: ChatMessage[] | undefined
+  const contextKey = paperContextId(owner, answer)
+  contextErrors.value[contextKey] = ''; contextNotices.value[contextKey] = ''
 
   // Initialize through reactive proxy chain so Vue tracks all mutations
   const ra = findReactiveAnswer(answer.id)
@@ -1743,6 +1877,23 @@ async function streamAnswerImpl(
     ra.endedAt = undefined
   }
   broadcastConversationSnapshot(owner)
+
+  unlisteners.set(`${answer.id}-context-usage`, await listen<ContextUsage>(`${eventName}-context-usage`, event => {
+    if (!currentRequest()) return
+    setPaperContextUsage(owner, answer, event.payload)
+    broadcastStreamUpdate(answer.id)
+  }))
+  unlisteners.set(`${answer.id}-context-checkpoint`, await listen<{ messages: ChatMessage[] }>(`${eventName}-context-checkpoint`, event => {
+    if (currentRequest()) pendingCheckpoint = event.payload.messages
+  }))
+  unlisteners.set(`${answer.id}-context-status`, await listen<{ phase: string; error?: string }>(`${eventName}-context-status`, event => {
+    if (!currentRequest()) return
+    const live = findReactiveAnswer(answer.id)
+    if (live) live.contextCompacting = event.payload.phase === 'compacting'
+    if (event.payload.phase === 'error') contextErrors.value[contextKey] = event.payload.error ?? ''
+    if (event.payload.phase === 'compacted') contextNotices.value[contextKey] = t('chatContext.compacted')
+    broadcastStreamUpdate(answer.id)
+  }))
 
   const unlisten = await listen<StreamPayload>(eventName, (event) => {
     if (event.payload.done) return
@@ -1880,6 +2031,16 @@ async function streamAnswerImpl(
     // Stop/steer may have arrived while the event listeners were registering,
     // before the backend knew the cancellation id.
     if (activeRequestIds.get(answer.id) !== requestId || rootAtStart !== syncLibraryRoot || syncDisposed) return
+    const prepared = await invoke<PreparedContext>('prepare_library_chat_context', {
+      ...paperContextArguments(owner, answer, history, rootAtStart), mode: 'auto', eventName, requestId,
+    })
+    if (!currentRequest()) return
+    if (prepared?.usage) setPaperContextUsage(owner, answer, prepared.usage)
+    if (prepared?.compacted) {
+      history = prepared.messages
+      if (bound && prefixUnchanged()) setPaperCheckpoint(owner, answer, bound, history)
+      persistConversationFor(slug, owner)
+    }
     // Agent mode: the model reaches for what it needs instead of being handed a
     // pre-built context. `paperSlug` puts this paper's `get_paper` card in the
     // system prompt, so it starts knowing what it is reading.
@@ -1904,10 +2065,15 @@ async function streamAnswerImpl(
       // the reader store within ~700ms); null before the paper has any reading
       // state, which the backend treats as "no page hint".
       currentPage: reader.readingStateFor(slug)?.page ?? null,
+      manageContext: true,
+      expectedRoot: rootAtStart,
     })
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns && activeRequestIds.get(answer.id) === requestId) {
       if (!reactiveAns.content && finalText) reactiveAns.content = finalText
+      if (pendingCheckpoint && group && prefixUnchanged() && activeAnswerForGroup(group)?.id === answer.id) {
+        setPaperCheckpoint(owner, answer, group.id, pendingCheckpoint)
+      }
       // A click, an API failure or a cancelled partial reply is not an experience.
       if (owner.source === 'guidedReading' && !reactiveAns.error && reactiveAns.content.trim()
         && activeRequestIds.get(answer.id) === requestId && rootAtStart === syncLibraryRoot) {
@@ -1925,6 +2091,7 @@ async function streamAnswerImpl(
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) {
       reactiveAns.streaming = false
+      reactiveAns.contextCompacting = false
       reactiveAns.endedAt = performance.now()
       flushStreamRender(reactiveAns)
     }
@@ -2440,6 +2607,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  contextInspection++
+  if (contextInspectTimer) clearTimeout(contextInspectTimer)
   messageQueue.clear()
   for (const owner of [...streamOwners.values()]) if (!owner.origin) stopConversationStreaming(owner.conv)
   paperAiSync.dispose(syncLibraryRoot && props.slug ? { root: syncLibraryRoot, slug: props.slug } : undefined)
@@ -3057,6 +3226,13 @@ onUnmounted(() => {
             <button v-if="composerBusy" class="send-btn stop-btn" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="stopAllStreaming">
               <Icon icon="fluent:stop-24-filled" width="15" height="15" />
             </button>
+            <span v-if="activeConversation" class="paper-context-meters">
+              <ContextMeter v-for="model in selectedModels" :key="`${activeConversation.id}:${modelKey(model)}`"
+                :usage="paperContextDisplay(model)" :busy="composerBusy" :compacting="paperContextCompacting"
+                :label="selectedModels.length > 1 ? model.displayName : undefined"
+                :error="contextErrors[paperContextId(activeConversation, model)]" :notice="contextNotices[paperContextId(activeConversation, model)]"
+                @inspect="inspectPaperContext" @compact="compactPaperContext(model)" />
+            </span>
             <button class="send-btn" :class="{ active: canSend }" :disabled="!canSend"
               :title="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')"
               :aria-label="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')" @click="sendMessage(false)">
@@ -4219,11 +4395,13 @@ onUnmounted(() => {
 }
 .composer-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
   padding: 5px 7px 7px;
 }
 .toolbar-spacer { flex: 1; }
+.paper-context-meters { display: flex; flex-wrap: wrap; align-items: center; max-width: calc(100% - 28px); }
 /* Most of the space between these icons was the buttons' own padding, not the
    gap: a 15px glyph in a 30px box carries 7.5px of air on each side, so even at
    gap:1 the glyphs sat ~16px apart. Shrinking the box is what actually tightens

@@ -2527,11 +2527,15 @@ pub async fn prepare_library_context(
     root: &str, messages: Vec<AgentMessage>, provider_id: Option<&str>, model_id: Option<&str>,
     pins: &[String], web_search: bool, mode: &str, previous_usage: Option<&crate::chat_context::ContextUsage>, event: &str,
     app: &tauri::AppHandle, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    paper_slug: Option<&str>, current_page: Option<u32>, canvas_id: Option<&str>, plain_fallback: bool,
 ) -> Result<crate::chat_context::PreparedContext, String> {
     let (provider, key, model, _) = ai_manager::resolve_provider_model_or_default(root, provider_id, model_id)?;
     let settings = crate::mcp::client::read_settings(app);
     let root_owned = root.to_string(); let pins = pins.to_vec();
-    let fallback = plain_fallback_reason(&provider, &model, web_search).is_some();
+    let fallback = plain_fallback && plain_fallback_reason(&provider, &model, web_search).is_some();
+    let paper_slug = paper_slug.map(str::to_string);
+    let current_page = current_page.filter(|_| paper_slug.is_some());
+    let canvas_tools = canvas_id.is_some();
     let p = provider.clone(); let m = model.clone();
     let (mut convo, tools) = tokio::task::spawn_blocking(move || {
         if fallback {
@@ -2544,23 +2548,36 @@ pub async fn prepare_library_context(
         } else {
             let system = configured_agent_system_prompt(&settings);
             let mut heads = vec![serde_json::json!({"role":"system","content":system})];
-            if let Some((block, _)) = pinned_papers_block(&root_owned, &pins) {
+            if let Some(block) = join_blocks(
+                paper_slug.as_deref().and_then(|slug| paper_context_block(&root_owned, slug)),
+                pinned_papers_block(&root_owned, &pins).map(|(block, _)| block),
+            ) {
                 heads.push(serde_json::json!({"role":"system","content":block}));
             }
             let exa = crate::exa::settings(&root_owned).is_ok_and(|s| s.enabled && s.has_key);
-            let tools = agent_tool_defs(&crate::mcp::client::ToolBridge::none(), model_sees_images(&p, &m), false, exa);
+            let tools = agent_tool_defs(&crate::mcp::client::ToolBridge::none(), model_sees_images(&p, &m), canvas_tools, exa);
             (heads, tools)
         }
     }).await.map_err(|e| e.to_string())?;
     convo.extend(messages.iter().map(agent_message_to_json));
     let policy = crate::chat_context::Policy::for_model(&provider, &model);
-    let mut before = crate::chat_context::measure(&convo, &tools, policy, &provider, &model, None);
+    let measure = |messages: &[serde_json::Value]| {
+        if current_page.is_none() {
+            return crate::chat_context::measure(messages, &tools, policy, &provider, &model, None);
+        }
+        let mut measured = messages.to_vec();
+        if let Some(page) = current_page {
+            if let Some(last) = measured.iter_mut().rev().find(|m| m["role"] == "user") { append_current_page_hint(last, page); }
+        }
+        crate::chat_context::measure(&measured, &tools, policy, &provider, &model, None)
+    };
+    let mut before = measure(&convo);
     if let Some(previous) = previous_usage { before.project_from(previous); }
     let summary = if mode == "manual" || (mode == "auto" && before.used_tokens >= policy.threshold) {
         crate::cache_keepalive::disarm_and_announce(app);
         crate::chat_context::compact(&mut convo, &tools, policy, &provider, &key, &model, event, app, cancel).await?
     } else { None };
-    let mut usage = crate::chat_context::measure(&convo, &tools, policy, &provider, &model, None);
+    let mut usage = measure(&convo);
     usage.project_from(&before);
     Ok(crate::chat_context::PreparedContext { messages: convo.into_iter().filter(|m| m["role"] != "system").collect(),
         usage, compacted: summary.is_some(), summary })

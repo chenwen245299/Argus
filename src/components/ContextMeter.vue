@@ -2,7 +2,7 @@
 import { computed, ref, nextTick, useId, watch, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { contextPercent, type ContextUsage } from '../utils/chatContext'
-const props = defineProps<{ usage: ContextUsage | null; busy: boolean; compacting: boolean; error?: string; notice?: string }>()
+const props = defineProps<{ usage: ContextUsage | null; busy: boolean; compacting: boolean; error?: string; notice?: string; label?: string }>()
 const emit = defineEmits<{ compact: []; inspect: [] }>()
 const { t } = useI18n()
 const root = ref<HTMLElement | null>(null), panel = ref<HTMLElement | null>(null)
@@ -53,7 +53,7 @@ onUnmounted(() => {
 <template>
   <span v-if="usage" ref="root" class="context-meter" @mouseenter="enter" @mouseleave="leave" @focusin="enter" @focusout="leave">
     <button type="button" class="context-trigger" :class="{ warning: percent >= 80, compacting }"
-      :aria-label="`${t('chatContext.usedPercent', { percent })}，${t(compacting ? 'chatContext.compacting' : 'chatContext.compact')}`"
+      :aria-label="`${label ? label + '，' : ''}${t('chatContext.usedPercent', { percent })}，${t(compacting ? 'chatContext.compacting' : 'chatContext.compact')}`"
       :aria-disabled="!canCompact" :aria-describedby="open ? detailId : undefined" @click="compact">
       <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
         <circle class="context-track" cx="7" cy="7" r="5.5" />
@@ -65,7 +65,7 @@ onUnmounted(() => {
     <Teleport to="body">
       <div v-if="open" :id="detailId" ref="panel" class="context-panel" :style="position" role="tooltip"
         :aria-label="t('chatContext.title')" @mouseenter="enter" @mouseleave="leave" @focusin="enter" @focusout="leave">
-        <div class="context-heading"><strong>{{ t('chatContext.title') }}</strong><span>{{ t('chatContext.usedPercent', { percent }) }}</span></div>
+        <div class="context-heading"><strong>{{ label || t('chatContext.title') }}</strong><span>{{ t('chatContext.usedPercent', { percent }) }}</span></div>
         <div class="context-total" :title="[usage.capacityEstimated ? t('chatContext.assumedCapacity') : '', usage.mediaEstimated ? t('chatContext.mediaEstimate') : ''].filter(Boolean).join('\n')">{{ usage.estimated ? '~' : '' }}{{ fmt(usage.usedTokens) }} / {{ usage.capacityEstimated ? '~' : '' }}{{ fmt(usage.contextWindow) }} tokens</div>
         <div class="context-bar"><span v-for="row in rows" :key="row.key" :class="row.key"
           :style="{ width: `${total ? percent * row.tokens / total : 0}%` }" /></div>

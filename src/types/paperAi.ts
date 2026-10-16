@@ -1,6 +1,12 @@
 import type { Attachment } from '../utils/attachments'
 import type { ServerToolTrace } from './index'
 import type { AgentStepImage } from './chatImages'
+import type { ContextCheckpoint, ContextUsage } from '../utils/chatContext'
+
+export interface PaperAiContextState {
+  checkpoint?: ContextCheckpoint
+  usage?: ContextUsage
+}
 
 export type PaperAiChatNode =
   | { id: string; role: 'user'; content: string; attachments?: Attachment[]; createdAt: string }
@@ -37,6 +43,8 @@ export interface PaperAiAnswer {
   steps?: PaperAiAgentStep[]
   serverErrors?: string[]
   limitHit?: { rounds: number; max: number }
+  /** Live status, reset on session restore. */
+  contextCompacting?: boolean
 }
 
 export interface PaperAiAgentStep {
@@ -60,4 +68,8 @@ export interface PaperAiConversation {
   updatedAt: string
   nodes: PaperAiChatNode[]
   source?: 'chat' | 'metadataExtraction' | 'guidedReading'
+  /** Each provider/model has its own capacity and native checkpoint. */
+  contextStates?: Record<string, PaperAiContextState>
+  /** Owner operation marker for durable repair of missed completion events. */
+  contextTask?: string
 }

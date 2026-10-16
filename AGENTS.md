@@ -294,6 +294,12 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `speech.ts` | Read-aloud: configured speech provider/model/options, the speech capabilities from `list_media_capabilities`, `read()` and its state — see *Media generation and read-aloud* |
 | `thinking.ts` | The user's thinking-mode switch and reasoning level, shared by paper AI and library chat, saved per device in localStorage (`argus:thinking-preference`) and synchronized across windows through storage events. Reopening panels, conversations or the app must restore the choice |
 
+**Reasoning disclosure.** The 思考过程 body is collapsed by default in every
+chat surface, including during streaming and when loading saved answers. Only
+an explicit click opens it. Streaming updates must preserve that manual choice;
+regenerating an answer starts collapsed again. Library chat keeps an opt-in
+`expandedReasoning` set per answer; paper AI uses initially closed `<details>`.
+
 `snippetLibrary.ts`, `translationHistory.ts`, and `update.ts` are reactive helper modules, not Pinia stores.
 
 ### Backend modules (Rust)
@@ -332,6 +338,22 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `path_guard.rs` | Path-segment validation against traversal attacks |
 | `security_bookmark.rs` | macOS security-scoped bookmark persistence |
 | `fsutil.rs` | Shared filesystem helpers |
+
+**Library search.** `search.rs` uses weighted FTS5 ranking with title phrases,
+then title keywords, then full-text phrases ahead of scattered body matches.
+Unquoted words use AND; double quotes require an exact phrase. A missing match
+may complete only the final unquoted word (at least three characters); `word*`
+explicitly requests a prefix. Excerpts are HTML-escaped before restoring marks.
+`search_documents` holds original text and indexed paper/slug identities; an
+external-content FTS table and triggers commit updates together. Rebuilds use one
+transaction and preserve readers' previous snapshot. SQLite `user_version` is
+the authoritative schema version (3), so missing databases rebuild even if
+`search.version` survives. First use upgrades older caches automatically.
+`utils/librarySearch.ts` debounces 180 ms, runs Enter immediately, serializes
+requests and retains only the newest pending input. Revision/root checks and
+Toolbar navigation, IME, clear and unmount handlers discard stale responses;
+the command's optional `expectedRoot` rejects dispatch against another library.
+Busy/error state lives in `selection.ts`. No embeddings or network calls are used.
 
 ### MCP server (`src-tauri/src/mcp/`)
 
@@ -526,7 +548,7 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   orphan its `tool_calls` entry), and the loop emits phase `evicted`.
 - A failing tool is fed back as an error string rather than aborting, so the
   model can correct a bad slug or section name on the next round.
-- **Library chat context management.** `chat_context.rs` measures system/pins,
+- **Chat context management.** `chat_context.rs` measures system/pins,
   schemas and the active message surface. Pressure uses the latest individual
   provider prompt sample plus an estimated surface delta, never cumulative
   billing totals. The composer `ContextMeter.vue` shows the used percentage in
@@ -551,8 +573,19 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   deletion, library switches and unmount apply to compaction too. Native tool
   pairings and required reasoning survive retained checkpoints; a successful
   in-loop checkpoint is also the exact prefix used by cache keepalive. Only
-  `LibraryChat.vue` opts into `manageContext`; paper/canvas callers keep their
-  existing behavior. No vector store is involved.
+  `LibraryChat.vue`, paper `AiTab.vue` (sidebar and standalone) and
+  `CanvasChatTab.vue` opt into `manageContext`. Preparation includes the same
+  paper card and canvas tool availability as the live request; the current-page
+  hint is counted without mutating the returned history. Paper and canvas
+  conversations keep `contextStates` per provider/model. Checkpoint fingerprints
+  cover the chosen answer branches and persisted tool payloads, so edits,
+  regeneration and model/variant changes cannot reuse an unrelated summary.
+  Paper usage travels in bounded live patches; checkpoints travel in snapshots
+  and durable saves. Manual paper compaction uses a `contextOnly` stream owner
+  so mirrors join/stop it and queues wait for cancellation. The `contextTask`
+  marker lets durable saves repair a missed completion event without restoring
+  a stale operation on app launch. Paper/canvas prepare, chat and save commands
+  validate `expectedRoot`. No vector store is involved.
 - **Usage is summed, not emitted per round.** `stream_with_tools` returns a
   `TurnUsage` instead of emitting one; the loop folds them and calls
   `llm::emit_usage` once at the end. Emitting per round both showed a cost strip
@@ -1231,6 +1264,11 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
 ## Testing instructions
 
 - **Frontend:** `vue-tsc --noEmit` runs as part of `npm run build`. Local regression scripts use Node's built-in test runner.
+- Library search: `node --test scripts/test-library-search.mjs` covers debouncing,
+  immediate Enter, request coalescing, stale successes/errors, IME and the real
+  toolbar's clear/navigation/library scope. `cargo test --lib search::tests`
+  covers relevance, phrases, prefixes, snippets, indexed updates, legacy/missing
+  caches and atomic rebuilds with concurrent readers.
 - Guided reading: `node --test scripts/test-guided-reading.mjs` with
   `ARGUS_TEST_PLAYWRIGHT` pointing to Playwright checks the real Vue sidebar,
   standalone panel and intro with desktop/model mocks: draft preservation,
@@ -1273,6 +1311,11 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   manual/automatic compaction, draft preservation, reload, failures, cancellation,
   library switches and narrow dark layout. Use the same Playwright setup as the
   other browser regressions. Rust coverage: `cargo test --lib chat_context`.
+  `scripts/test-paper-context-browser.mjs` mounts real paper sidebar, standalone
+  and canvas composers with local mocks: meter placement, draft preservation,
+  manual/automatic/native checkpoints, model capacities, regeneration, stop,
+  failure, reload and library/canvas scope. Paper sync tests also cover mirrored
+  compaction stops, missed completion repair and bounded usage-only updates.
 - Note clipboard compatibility: `node --test scripts/test-note-clipboard.mjs`
   exercises the installed Vditor copy handler and local clipboard mocks, covering
   rich-text fallback, Markdown/TeX preservation, cut behavior and listener scope.

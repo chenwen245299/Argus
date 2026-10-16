@@ -16,6 +16,7 @@ import { useAiStore } from '../stores/ai'
 import { titleInitialCaps } from '../utils/text'
 import { describePeakPeriod, type PeakPeriod } from '../utils/modelPricing'
 import { subscribeCnHolidays } from '../utils/cnHolidays'
+import { createLibrarySearch } from '../utils/librarySearch'
 import type { SearchHit, Note, PaperStatus } from '../types'
 import TokenUsageModal from './TokenUsageModal.vue'
 import ActivityLogModal from './ActivityLogModal.vue'
@@ -186,7 +187,26 @@ const baseSidebarTabs = computed((): SidebarTabDef[] => [
 ])
 
 const searchQuery = ref('')
-let searchTimer: ReturnType<typeof setTimeout> | null = null
+const librarySearch = createLibrarySearch<SearchHit>({
+  root: () => library.currentPath,
+  search: (query, expectedRoot) => invoke<SearchHit[]>('search_fulltext', { query, expectedRoot }),
+  results: (query, hits) => selection.setSearchResults(query, hits),
+  clear: () => selection.clearSearch(),
+  busy: value => {
+    selection.searchBusy = value
+    if (value) selection.searchError = null
+  },
+  error: (query, error) => {
+    selection.setSearchResults(query, [])
+    selection.searchError = String(error)
+    console.error('Search failed:', error)
+  },
+})
+
+watch(() => library.currentPath, () => clearSearch(), { flush: 'sync' })
+watch([() => selection.activeNav, () => selection.navSelectionSeq], () => {
+  if (selection.activeNav !== 'search') librarySearch.cancel()
+}, { flush: 'sync' })
 
 function shortPath(p: string): string {
   const parts = p.replace(/\\/g, '/').split('/')
@@ -406,29 +426,18 @@ function importStageLabel(status: string): string {
   }
 }
 
-function onSearchInput() {
-  if (searchTimer) clearTimeout(searchTimer)
-  const q = searchQuery.value.trim()
-  if (!q) {
-    selection.clearSearch()
-    return
-  }
-  searchTimer = setTimeout(() => runSearch(q), 300)
+function onSearchInput(event: Event) {
+  if ((event as InputEvent).isComposing) return
+  librarySearch.schedule(searchQuery.value)
 }
 
-async function runSearch(q: string) {
-  if (!library.currentPath) return
-  try {
-    const hits = await invoke<SearchHit[]>('search_fulltext', { query: q })
-    selection.setSearchResults(q, hits)
-  } catch (e) {
-    console.error('Search failed:', e)
-  }
+function onSearchEnter(event: KeyboardEvent) {
+  if (!event.isComposing) librarySearch.schedule(searchQuery.value, true)
 }
 
 function clearSearch() {
   searchQuery.value = ''
-  selection.clearSearch()
+  librarySearch.clear()
 }
 
 // ── Batch AI analysis ────────────────────────────────────────────────────────
@@ -869,7 +878,7 @@ onUnmounted(() => {
   document.removeEventListener('visibilitychange', onPriceClockVisibility)
   window.removeEventListener('focus', refreshPriceClock)
   if (unsubscribeHolidays) { unsubscribeHolidays(); unsubscribeHolidays = null }
-  if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
+  librarySearch.cancel()
   document.removeEventListener('pointerdown', onDocClick, true)
 })
 </script>
@@ -899,12 +908,17 @@ onUnmounted(() => {
 
     <!-- Center: search -->
     <div v-if="library.currentPath" class="search-box">
-      <Icon icon="fluent:search-24-regular" class="search-icon" width="14" height="14" />
+      <Icon :icon="selection.searchBusy ? 'fluent:hourglass-24-regular' : 'fluent:search-24-regular'" class="search-icon" width="14" height="14" />
       <input
         v-model="searchQuery"
         class="search-input"
         :placeholder="t('search.placeholder')"
+        :title="t('search.hint')"
+        :aria-label="t('search.placeholder')"
+        :aria-busy="selection.searchBusy"
         @input="onSearchInput"
+        @compositionstart="librarySearch.cancel()"
+        @keydown.enter="onSearchEnter"
         @keydown.escape="clearSearch"
       />
       <button v-if="searchQuery" class="search-clear" @click="clearSearch">

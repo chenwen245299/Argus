@@ -10,7 +10,7 @@ export interface PaperAiContextState {
 }
 
 export type PaperAiChatNode =
-  | { id: string; role: 'user'; content: string; attachments?: Attachment[]; createdAt: string }
+  | { id: string; role: 'user'; content: string; attachments?: Attachment[]; createdAt: string; guidedReadingName?: string }
   | { id: string; role: 'assistantGroup'; promptId: string; answers: PaperAiAnswer[]; createdAt: string }
 
 export interface PaperAiAnswer {

@@ -22,7 +22,7 @@ type Section = 'general' | 'themes' | 'ai' | 'about' | 'agent' | 'mcp'
 // still ask for them by their old names — the embedding map's "configure RAG"
 // button, the analysis entry points. Those names are mapped to the tab rather
 // than dropped, so no existing link goes nowhere.
-const QA_TABS = ['agent', 'rag', 'extraction', 'arxiv', 'speech'] as const
+const QA_TABS = ['agent', 'guided-reading', 'memory', 'rag', 'extraction', 'arxiv', 'speech'] as const
 const activeSection = ref<Section>('general')
 const initialQaTab = ref('agent')
 /** Bumped on every jump so QaSettings is rebuilt and lands on the requested sub-tab even when it is the one already named. */

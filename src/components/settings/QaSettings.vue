@@ -17,15 +17,19 @@ import RagSettings from './RagSettings.vue'
 import ExtractionSettings from './ExtractionSettings.vue'
 import ArxivSettings from './ArxivSettings.vue'
 import SpeechSettings from './SpeechSettings.vue'
+import GuidedReadingSettings from './GuidedReadingSettings.vue'
+import UserMemorySettings from './UserMemorySettings.vue'
 
 const props = defineProps<{ initialTab?: string }>()
 const { t } = useI18n()
 
-type Tab = 'agent' | 'rag' | 'extraction' | 'arxiv' | 'speech'
-const TABS: Tab[] = ['agent', 'rag', 'extraction', 'arxiv', 'speech']
+type Tab = 'agent' | 'guided-reading' | 'memory' | 'rag' | 'extraction' | 'arxiv' | 'speech'
+const TABS: Tab[] = ['agent', 'guided-reading', 'memory', 'rag', 'extraction', 'arxiv', 'speech']
 
 const tabs: { id: Tab; label: string }[] = [
   { id: 'agent', label: 'qaSettings.agentTab' },
+  { id: 'guided-reading', label: 'guidedReading.title' },
+  { id: 'memory', label: 'userMemory.title' },
   { id: 'rag', label: 'qaSettings.ragTab' },
   { id: 'extraction', label: 'qaSettings.extractionTab' },
   { id: 'arxiv', label: 'qaSettings.arxivTab' },
@@ -48,6 +52,8 @@ watch(() => props.initialTab, (tab) => {
 
 const DESCRIPTIONS: Record<Tab, string> = {
   agent: 'agentSettings.desc',
+  'guided-reading': 'guidedReadingSettings.desc',
+  memory: 'userMemory.desc',
   rag: 'ragSettings.desc',
   extraction: 'settings.extractionDesc',
   arxiv: 'arxivSettings.desc',
@@ -77,6 +83,8 @@ const description = computed(() => t(DESCRIPTIONS[activeTab.value]))
 
     <div class="qa-panel" :class="{ 'qa-panel-flush': activeTab === 'extraction' || activeTab === 'arxiv' }">
       <AgentSettings v-if="activeTab === 'agent'" />
+      <GuidedReadingSettings v-else-if="activeTab === 'guided-reading'" />
+      <UserMemorySettings v-else-if="activeTab === 'memory'" />
       <RagSettings v-else-if="activeTab === 'rag'" />
       <ExtractionSettings v-else-if="activeTab === 'extraction'" />
       <SpeechSettings v-else-if="activeTab === 'speech'" />
@@ -102,6 +110,7 @@ const description = computed(() => t(DESCRIPTIONS[activeTab.value]))
 
 .qa-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   flex-shrink: 0;
 }

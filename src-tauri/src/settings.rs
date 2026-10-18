@@ -2,6 +2,67 @@ use std::path::Path;
 
 use crate::models::AppSettings;
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct GuidedReadingPreset {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GuidedReadingSettings {
+    pub presets: Vec<GuidedReadingPreset>,
+    pub default_id: String,
+}
+
+impl Default for GuidedReadingSettings {
+    fn default() -> Self {
+        Self { presets: vec![], default_id: "builtin".into() }
+    }
+}
+
+impl GuidedReadingSettings {
+    fn validate(&self) -> Result<(), String> {
+        let mut ids = std::collections::HashSet::new();
+        for preset in &self.presets {
+            if preset.id.trim().is_empty() || preset.id == "builtin"
+                || preset.name.trim().is_empty() || preset.prompt.trim().is_empty()
+                || !ids.insert(&preset.id)
+            {
+                return Err("Each reading preset needs a unique id, a name and a nonempty prompt.".into());
+            }
+        }
+        if self.default_id != "builtin" && !ids.contains(&self.default_id) {
+            return Err("The default reading preset does not exist.".into());
+        }
+        Ok(())
+    }
+}
+
+/// Kept separately so saving general settings in another window cannot overwrite
+/// the preset collection with an older AppSettings snapshot.
+pub fn read_guided_reading_settings(root: &str) -> GuidedReadingSettings {
+    let path = Path::new(root).join(".argus").join("guided_reading.json");
+    let mut settings: GuidedReadingSettings = std::fs::read_to_string(path).ok()
+        .and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+    let mut ids = std::collections::HashSet::new();
+    settings.presets.retain(|p| !p.id.trim().is_empty() && p.id != "builtin"
+        && !p.name.trim().is_empty() && !p.prompt.trim().is_empty() && ids.insert(p.id.clone()));
+    if settings.default_id != "builtin" && !ids.contains(&settings.default_id) {
+        settings.default_id = "builtin".into();
+    }
+    settings
+}
+
+pub fn write_guided_reading_settings(root: &str, settings: &GuidedReadingSettings) -> Result<(), String> {
+    settings.validate()?;
+    let path = Path::new(root).join(".argus").join("guided_reading.json");
+    let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    crate::fsutil::atomic_write_str(&path, &text).map_err(|e| e.to_string())
+}
+
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     if !settings.usd_to_cny_rate.is_finite() || settings.usd_to_cny_rate <= 0.0 {
         settings.usd_to_cny_rate = crate::models::default_usd_to_cny_rate();
@@ -91,6 +152,43 @@ pub fn write_settings(root: &str, settings: &AppSettings) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_presets_persist_exact_text_and_do_not_touch_general_settings() {
+        let dir = std::env::temp_dir().join(format!("argus-guides-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".argus")).unwrap();
+        let root = dir.to_str().unwrap();
+        assert_eq!(read_guided_reading_settings(root).default_id, "builtin");
+        write_settings(root, &AppSettings::default()).unwrap();
+        let config = std::fs::read(dir.join(".argus/config.json")).unwrap();
+        let settings = GuidedReadingSettings {
+            presets: vec![GuidedReadingPreset { id: "math".into(), name: "公式推导".into(), prompt: "逐式解释。\n\n保留 $x$。  ".into() }],
+            default_id: "math".into(),
+        };
+        write_guided_reading_settings(root, &settings).unwrap();
+        let loaded = read_guided_reading_settings(root);
+        assert_eq!(loaded.default_id, "math");
+        assert_eq!(loaded.presets[0].prompt, settings.presets[0].prompt);
+        assert_eq!(std::fs::read(dir.join(".argus/config.json")).unwrap(), config);
+        let invalid = GuidedReadingSettings { default_id: "deleted".into(), ..settings.clone() };
+        assert!(write_guided_reading_settings(root, &invalid).is_err());
+        assert_eq!(read_guided_reading_settings(root).default_id, "math");
+        let duplicate = GuidedReadingSettings { presets: vec![settings.presets[0].clone(), settings.presets[0].clone()], ..settings };
+        assert!(write_guided_reading_settings(root, &duplicate).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reading_presets_repair_missing_defaults_without_losing_valid_prompts() {
+        let dir = std::env::temp_dir().join(format!("argus-guides-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".argus")).unwrap();
+        std::fs::write(dir.join(".argus/guided_reading.json"), r#"{"defaultId":"gone","presets":[{"id":"ok","name":"Guide","prompt":"exact"},{"id":"empty","name":"No prompt"},{"id":"ok","name":"Duplicate","prompt":"other"}]}"#).unwrap();
+        let loaded = read_guided_reading_settings(dir.to_str().unwrap());
+        assert_eq!(loaded.default_id, "builtin");
+        assert_eq!(loaded.presets.len(), 1);
+        assert_eq!(loaded.presets[0].prompt, "exact");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_blank_speech_id_is_not_configured() {

@@ -47,6 +47,7 @@ mod search;
 mod sections;
 mod security_bookmark;
 mod settings;
+mod user_memory;
 mod snippets;
 mod soclaas;
 mod speech_cache;
@@ -219,6 +220,12 @@ pub fn run() {
             // ── M4: Settings ──
             commands::get_settings,
             commands::save_settings,
+            commands::get_user_memory,
+            commands::configure_user_memory,
+            commands::edit_user_memory,
+            commands::delete_user_memory,
+            commands::get_guided_reading_settings,
+            commands::save_guided_reading_settings,
             // ── M4: Collections ──
             commands::get_collections,
             commands::create_collection,

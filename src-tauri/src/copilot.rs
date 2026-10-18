@@ -1161,6 +1161,7 @@ pub async fn chat_with_library(
         crate::mcp::client::read_settings(app).response_style,
     );
 
+    let system = crate::user_memory::personalize(system, app);
     let mut messages = messages;
     let mut extra_parts: Vec<ChatContentPart> = Vec::new();
     extra_parts.extend(pdf_attachments);
@@ -2073,7 +2074,7 @@ Reply in the language the user wrote in."#;
 /// Shared by the agent loop and the cache keepalive — they must send byte-identical
 /// system messages or the warmed prefix is not the one the next question asks for.
 fn agent_system_prompt(app: &tauri::AppHandle) -> String {
-    configured_agent_system_prompt(&crate::mcp::client::read_settings(app))
+    crate::user_memory::personalize(configured_agent_system_prompt(&crate::mcp::client::read_settings(app)), app)
 }
 
 fn configured_agent_system_prompt(settings: &crate::mcp::client::AgentSettings) -> String {
@@ -2537,6 +2538,7 @@ pub async fn prepare_library_context(
     let current_page = current_page.filter(|_| paper_slug.is_some());
     let canvas_tools = canvas_id.is_some();
     let p = provider.clone(); let m = model.clone();
+    let memory_app = app.clone();
     let (mut convo, tools) = tokio::task::spawn_blocking(move || {
         if fallback {
             let index = crate::library::scan_library(&root_owned).unwrap_or_default();
@@ -2544,9 +2546,9 @@ pub async fn prepare_library_context(
             let system = if mode == "papers" {
                 build_selected_papers_system_prompt(&root_owned, &live, &p, &m).0
             } else { build_plain_system_prompt() };
-            (vec![serde_json::json!({"role":"system","content":with_response_style(system, settings.response_style)})], vec![])
+            (vec![serde_json::json!({"role":"system","content":crate::user_memory::personalize(with_response_style(system, settings.response_style), &memory_app)})], vec![])
         } else {
-            let system = configured_agent_system_prompt(&settings);
+            let system = crate::user_memory::personalize(configured_agent_system_prompt(&settings), &memory_app);
             let mut heads = vec![serde_json::json!({"role":"system","content":system})];
             if let Some(block) = join_blocks(
                 paper_slug.as_deref().and_then(|slug| paper_context_block(&root_owned, slug)),
@@ -2642,7 +2644,7 @@ pub async fn chat_with_library_agent(
 
     let settings = crate::mcp::client::read_settings(app);
     // Freeze the prompt for this whole answer and its matching cache prefix.
-    let system_prompt = configured_agent_system_prompt(&settings);
+    let system_prompt = crate::user_memory::personalize(configured_agent_system_prompt(&settings), app);
     // The caller may override, but the round budget lives in settings so both
     // windows agree on it without having to pass it around.
     let max_rounds = clamp_agent_rounds(max_rounds.or(Some(settings.max_rounds)));

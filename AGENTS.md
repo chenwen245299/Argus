@@ -208,22 +208,71 @@ both the sidebar and `PaperAiView`. It starts a fresh conversation with
 `utils/guidedReading.ts` through the normal agent chat, and preserves unsent text
 and attachments. Later turns and regeneration use the ordinary chat path. The
 stored first question retains the complete prompt; the user bubble and history
-title show a concise localized label. The prompt requires full paginated reading,
-visual inspection of all figures/tables, concrete examples, and one coherent
-core idea per turn. Understanding is the goal: explain and repair gaps from the
-user's feedback, ending naturally by default. Ask a specific question only when
-it resolves a relevant premise/misconception or checks application at a real
-difficulty; never require a question or confirmation at every turn's end.
-Exact shipped legacy presets remain recognizable for concise bubbles/titles.
+title show a concise localized label. The built-in Chinese prompt is the user's
+complete interactive tutor preset; English follows the same rules. Read the whole
+paper and visually inspect figures/tables first; the first reply reports actual
+coverage/missing material and asks one or two starting-point questions. Teaching
+then introduces at most one core concept per turn (normally 100–250 Chinese
+characters), with prerequisites, terms, formulas and metrics explained only when
+needed. Unfamiliarity is remembered instead of triggering a background course.
+Use concrete examples, show cited material in place, and actively green-highlight
+only the current key content with short Chinese annotations, verifying saves and
+reporting failures honestly. Progress from intuition to math, training/use and
+minimal implementation as needed. Stop after each step and advance only on the
+user's “continue”; understanding checks are occasional and cover only material
+already explained. The prompt does not bypass backend write-approval controls.
+Both prior shipped preset versions remain recognizable for concise bubbles/titles.
 `guidedReadingRequestHistory` upgrades them only in outgoing model requests for
 follow-ups and regeneration; stored first questions, custom text, assistant
 replies and attachment parts remain intact.
+Settings → AI 随航 → AI 领读 (`guided-reading`) manages named custom presets and
+the default. They live in `.argus/guided_reading.json`, separately from general
+settings so another window's older AppSettings cannot overwrite them. The
+dedicated read/save commands check `expectedRoot`, validate complete unique
+presets and emit `guided-reading-settings-changed` after the atomic write.
+`GuidedReadingButton.vue` rereads the current library before each launch/menu:
+left-click starts the default, right-click or Shift+F10 selects a preset only
+for that launch. Every launch keeps the selected prompt in the first user node;
+custom nodes also retain `guidedReadingName` for concise bubbles/titles, so
+later preset edits/deletion cannot rewrite existing chats. Custom presets skip
+legacy request upgrading, even when their text matches an old built-in prompt.
+Editing the first message clears its preset label. The built-in remains
+available; new presets copy the selected prompt, and deleting the default
+returns the default to the built-in. Saving requires nonempty names and prompts.
 `GuidedReadingIntro.vue` is hosted once per main/standalone window after setup
 is ready. Its device-local announcement is suppressed only after a successful,
 nonempty, uncancelled answer in a guided conversation, or when the user checks
 不再显示 and acknowledges. Closing or acknowledging without that checkbox is
 transient. Storage and a local change event synchronize open windows. Keep
 implementation and persistence rules out of the feature announcement copy.
+
+**Automatic user memory.** `user_memory.rs` stores one device-local knowledge
+profile in app-data `user_memory.json`, shared across libraries. It is enabled
+by default; 设置 → AI 随航 → 用户记忆 (`memory`) can disable both learning and
+personalization, inspect exact supporting quotes, correct/protect entries, or
+delete/clear them. There is no manual extraction button. Successful, nonempty,
+uncancelled `chat_with_library` turns schedule a serialized background extraction
+using that turn's provider/model, outside the foreground answer. Only the latest
+user's text is evidence; the bounded previous assistant excerpt may resolve the
+topic of understanding feedback, never establish user facts. Tool output,
+attachments, quoted/code blocks and automatic first guided-reading/metadata
+prompts are excluded (including regeneration after later turns). Prefer specific
+knowledge/prerequisites with familiar / learning / new levels; questions alone
+are not ignorance, and acknowledgements are not mastery. The extractor merges
+same-topic facts, checks exact user evidence and protects manual locks. A bounded
+48-entry profile prioritizes knowledge and evicts older unprotected entries.
+Generation tickets captured before the answer invalidate queued/in-flight updates
+on any manual change, opt-out or clear; per-fact observation times prevent older
+parallel feedback overwriting newer knowledge. Processed turn fingerprints include
+the prior explanation so repeated feedback about different concepts still learns.
+Storage is atomic and serialized; malformed files are never silently overwritten.
+`personalize` supplies the same bounded profile to agent/plain answers, context
+measurement and cache-prefix checks. Changed facts disarm keepalive. Profile data
+is fallible personalization, never instructions or paper evidence; current user
+corrections win. This uses neither embeddings nor a remote memory service and is
+not exposed by the external MCP server. Background calls use source `user-memory`
+in usage accounting and can fail independently of answers. UI updates synchronize
+through `user-memory-changed`; there is no historical chat backfill.
 
 **Mermaid labels in chat.** `MermaidBlock.vue` renders with root-level
 `htmlLabels: false` and locks that key alongside Mermaid's default secure keys.
@@ -1192,6 +1241,7 @@ The library root contains:
 ├── chats/                   # 智能问答: <id>.json; viewed/sent PNGs in <conversation-stem>/ (paper AI too)
 ├── .argus/
 │   ├── config.json          # Library config, app settings, RAG/arXiv/canvas settings
+│   ├── guided_reading.json  # Named AI reading prompts and their default
 │   ├── index.json           # Rebuildable paper index cache
 │   ├── search.db            # SQLite FTS5 full-text index
 │   ├── search.version       # Index version marker
@@ -1286,8 +1336,15 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   toolbar's clear/navigation/library scope. `cargo test --lib search::tests`
   covers relevance, phrases, prefixes, snippets, indexed updates, legacy/missing
   caches and atomic rebuilds with concurrent readers.
+- User memory: `cargo test --lib user_memory::tests` checks extraction with a local
+  model fixture, evidence, knowledge updates, opt-out/forget races, protected facts,
+  bounded storage and personalization. `node --test scripts/test-user-memory.mjs`
+  (Playwright) checks the real settings UI, updates, corrections, opt-out,
+  persistence, failure/conflicts, deletion, and narrow/dark/English layouts.
 - Guided reading: `node --test scripts/test-guided-reading.mjs` with
   `ARGUS_TEST_PLAYWRIGHT` pointing to Playwright checks the real Vue sidebar,
+  preset settings (add/edit/delete/default, persistence and save failures),
+  default/one-off launches, keyboard menus and delayed library switches,
   standalone panel and intro with desktop/model mocks: draft preservation,
   immediate preset send, follow-ups, failure/cancellation, announcement choices,
   cross-window suppression, focus and narrow/wide layouts. Optional
@@ -1455,7 +1512,7 @@ xattr -cr /Applications/Argus.app
 |------|------------|
 | Add a Tauri command | `src-tauri/src/commands.rs` + register in `src-tauri/src/lib.rs` |
 | Add a frontend store | `src/stores/` following Composition API style |
-| Add a settings section | `src/components/SettingsModal.vue` + `src/components/settings/`. The nav is 常规 / 主题 / AI 供应商 / AI 随航 / MCP 接口 / 关于. AI 随航 (section `agent`) is a container (`QaSettings.vue`) with Agent 与工具 / RAG / 向量化 / 论文分析 / arXiv 爬取 / 朗读 (`speech`) sub-tabs; `initialSection: 'rag'` (the embedding map's button), `'extraction'` and `'arxiv'` still route there |
+| Add a settings section | `src/components/SettingsModal.vue` + `src/components/settings/`. The nav is 常规 / 主题 / AI 供应商 / AI 随航 / MCP 接口 / 关于. AI 随航 (section `agent`) is a container (`QaSettings.vue`) with Agent 与工具 / AI 领读 (`guided-reading`) / 用户记忆 (`memory`) / RAG / 向量化 / 论文分析 / arXiv 爬取 / 朗读 (`speech`) sub-tabs; `initialSection: 'rag'` (the embedding map's button), `'extraction'` and `'arxiv'` still route there |
 | Add a sidebar tab | `src/components/RightSidebar.vue` + `src/components/tabs/` |
 | Change PDF rendering | `src/components/PdfViewer.vue` + `src/utils/pageRenderPolicy.ts` — read *PDF page rendering* below first; the sharpness invariants are not negotiable |
 | Change cross-page highlights / page numbers, footnotes, figures and tables | `src/utils/pageFurniture.ts` (the classifier and the drop policy), `planSelectionFurniture` in `PdfViewer.vue` (the integration), `src/utils/highlightGroups.ts` + `src-tauri/src/highlight_groups.rs` (how the per-page records are shown as one) |
@@ -1535,4 +1592,4 @@ extend `LUNAR_HOLIDAYS` (HKO conversion tables) when it runs out.
 
 ---
 
-*Last updated: 2026-10-08. Keep this file in sync with major architectural changes.*
+*Last updated: 2026-10-19. Keep this file in sync with major architectural changes.*

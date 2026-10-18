@@ -28,11 +28,12 @@ import type {
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import ChatPageImage from '../ChatPageImage.vue'
 import ChatAnswerBody from '../ChatAnswerBody.vue'
-import GuidedReadingIcon from '../GuidedReadingIcon.vue'
+import GuidedReadingButton from '../GuidedReadingButton.vue'
+import { BUILTIN_GUIDED_READING_ID, type GuidedReadingPreset } from '../../types/guidedReading'
 import ChatMessageQueue from '../ChatMessageQueue.vue'
 import { useChatSendQueue, useChatQueueEditor, type QueuedChatMessage } from '../../utils/chatSendQueue'
 import { useChatScrollResize } from '../../utils/chatScrollResize'
-import { guidedReadingPrompt, guidedReadingRequestHistory, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
+import { guidedReadingRequestHistory, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
 import { askAiText } from '../../stores/translationHistory'
@@ -1150,6 +1151,7 @@ function deleteAnswer(group: ChatNode, answer: AssistantAnswer) {
 function firstUserTitle(nodes: ChatNode[]) {
   const first = nodes.find((n): n is Extract<ChatNode, { role: 'user' }> => n.role === 'user')
   if (!first) return ''
+  if (first.guidedReadingName) return `${t('guidedReading.title')} · ${first.guidedReadingName}`
   if (isGuidedReadingPrompt(first.content)) return t('guidedReading.title')
   const title = first.content.replace(/\s+/g, ' ').trim()
   return title.length > 32 ? `${title.slice(0, 32)}…` : title
@@ -1422,14 +1424,17 @@ function paperContextId(conv: Conversation, model: Pick<ModelOption, 'providerId
   return JSON.stringify([syncLibraryRoot, conv.slug, conv.id, modelKey(model)])
 }
 function paperHistoryFingerprint(conv: Conversation, nodes = conv.nodes) {
-  return historyFingerprint(guidedReadingRequestHistory(buildHistoryUntil(persistableConversation({ ...conv, nodes }))))
+  return historyFingerprint(paperGuidedReadingHistory(conv, buildHistoryUntil(persistableConversation({ ...conv, nodes }))))
+}
+function paperGuidedReadingHistory(conv: Conversation, messages: ChatMessage[]) {
+  return guidedReadingRequestHistory(messages, conv.nodes.some(n => n.role === 'user' && !!n.guidedReadingName))
 }
 function paperContextHistory(conv: Conversation, model: Pick<ModelOption, 'providerId' | 'modelId'>, stopGroupId?: string) {
   const index = stopGroupId ? conv.nodes.findIndex(n => n.id === stopGroupId) : -1
   const nodes = index < 0 ? conv.nodes : conv.nodes.slice(0, index)
   return applyContextCheckpoint(nodes, conv.contextStates?.[modelKey(model)]?.checkpoint,
-    records => guidedReadingRequestHistory(buildHistoryUntil({ ...conv, nodes: records })),
-    records => guidedReadingRequestHistory(buildHistoryUntil(persistableConversation({ ...conv, nodes: records }))))
+    records => paperGuidedReadingHistory(conv, buildHistoryUntil({ ...conv, nodes: records })),
+    records => paperGuidedReadingHistory(conv, buildHistoryUntil(persistableConversation({ ...conv, nodes: records }))))
 }
 function setPaperCheckpoint(conv: Conversation, model: Pick<ModelOption, 'providerId' | 'modelId'>, bound: string, messages: ChatMessage[]) {
   const index = conv.nodes.findIndex(n => n.id === bound)
@@ -1553,7 +1558,7 @@ async function sendMessage(immediate = false) {
   nextTick(() => { resizeTextarea(); textareaEl.value?.focus() })
 }
 
-async function startGuidedReading() {
+async function startGuidedReading(preset: GuidedReadingPreset) {
   if (!canStartGuidedReading.value || !props.slug) return
   const slug = props.slug
   guidedReadingStarting.value = true
@@ -1561,13 +1566,14 @@ async function startGuidedReading() {
     startNewConversation(true)
     activeConversation.value!.source = 'guidedReading'
     // Send the preset directly. The user's unfinished draft and files stay put.
-    await submitQuestion(slug, guidedReadingPrompt(locale.value), [])
+    await submitQuestion(slug, preset.prompt, [], undefined, selectedModels.value,
+      preset.id === BUILTIN_GUIDED_READING_ID ? undefined : preset.name)
   } finally {
     guidedReadingStarting.value = false
   }
 }
 
-async function submitQuestion(slug: string, text: string, files: Attachment[], targetConv?: Conversation, models = selectedModels.value) {
+async function submitQuestion(slug: string, text: string, files: Attachment[], targetConv?: Conversation, models = selectedModels.value, guidedReadingName?: string) {
   if (!targetConv) activeConversation.value = activeConversation.value ?? createBlankConversation(slug)
   // Read it back so `conv` is the reactive proxy, not the raw object: streaming
   // mutations (possibly from the background) must be tracked by Vue.
@@ -1577,6 +1583,7 @@ async function submitQuestion(slug: string, text: string, files: Attachment[], t
     id: newId('user'),
     role: 'user',
     content: text,
+    ...(guidedReadingName ? { guidedReadingName } : {}),
     attachments: files.length > 0 ? files : undefined,
     createdAt: nowIso(),
   }
@@ -1655,6 +1662,7 @@ async function submitEdit(node: UserNode) {
   if (hasStreaming.value) stopAllStreaming()
 
   node.content = newText
+  delete node.guidedReadingName
   editingNodeId.value = null
   editingText.value = ''
 
@@ -2088,7 +2096,9 @@ async function streamAnswerImpl(
     // pre-built context. `paperSlug` puts this paper's `get_paper` card in the
     // system prompt, so it starts knowing what it is reading.
     const finalText = await invoke<string>('chat_with_library', {
-      messages: guidedReadingRequestHistory(history),
+      messages: paperGuidedReadingHistory(owner, history),
+      learnUserProfile: !(['metadataExtraction', 'guidedReading'].includes(owner.source ?? '')
+        && prefix.filter(n => n.role === 'user').length === 1),
       providerId: answer.providerId || null,
       modelId: answer.modelId || null,
       eventName,
@@ -2747,17 +2757,12 @@ onUnmounted(() => {
           </div>
 
           <div class="header-actions">
-            <button
-              class="guided-reading-btn"
-              :class="{ compact: props.standalone ? panelWidth < 480 : panelWidth < (locale.startsWith('zh') ? 300 : 400) }"
-              :title="t('guidedReading.hint')"
-              :aria-label="t('guidedReading.title')"
+            <GuidedReadingButton
+              :key="`${syncLibraryRoot}:${props.slug}`"
+              :compact="props.standalone ? panelWidth < 480 : panelWidth < (locale.startsWith('zh') ? 300 : 400)"
               :disabled="!canStartGuidedReading"
-              @click="startGuidedReading"
-            >
-              <GuidedReadingIcon />
-              <span>{{ t('guidedReading.title') }}</span>
-            </button>
+              @start="startGuidedReading"
+            />
             <button v-if="!props.standalone" class="icon-btn" title="新建对话" @click="startNewConversation(true)">
               <Icon icon="fluent:add-24-regular" width="15" height="15" />
             </button>
@@ -2902,7 +2907,7 @@ onUnmounted(() => {
                     <span class="user-attachment-name">{{ att.name }}</span>
                   </button>
                 </div>
-                <div class="user-bubble">{{ isGuidedReadingPrompt(node.content) ? t('guidedReading.startMessage') : node.content }}</div>
+                <div class="user-bubble">{{ node.guidedReadingName ? t('guidedReadingSettings.startMessage', { name: node.guidedReadingName }) : isGuidedReadingPrompt(node.content) ? t('guidedReading.startMessage') : node.content }}</div>
                 <div class="msg-footer user-footer">
                   <div class="msg-actions">
                     <button class="action-btn" :class="{ done: copiedIds.has(node.id) }" title="复制" @click="copyText(node.id, node.content)">
@@ -3502,32 +3507,6 @@ onUnmounted(() => {
 .standalone .with-model-picker .header-actions {
   margin-right: 232px;
 }
-.guided-reading-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  height: 28px;
-  padding: 0 8px;
-  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--accent) 9%, var(--bg-primary));
-  color: var(--accent);
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: background .18s, border-color .18s;
-}
-.guided-reading-btn :deep(svg) { font-size: 21px; }
-.guided-reading-btn:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent) 16%, var(--bg-primary));
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-}
-.guided-reading-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.guided-reading-btn:disabled { opacity: .45; cursor: default; }
-.guided-reading-btn.compact { width: 30px; padding: 0; }
-.guided-reading-btn.compact span { display: none; }
 .standalone .window-history-button { display: none; }
 @media (max-width: 700px) {
   .standalone .history-sidebar { display: none; }

@@ -8,16 +8,15 @@ import { createServer } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
 const { chromium } = await import(process.env.ARGUS_TEST_PLAYWRIGHT || 'playwright')
-const promptSource = ts.createSourceFile('guidedReading.ts',
-  await readFile(new URL('../src/utils/guidedReading.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
-const legacyPresets = Object.fromEntries(['zh', 'en'].map(locale => {
-  const name = `LEGACY_PROMPT_${locale.toUpperCase()}`
-  const declaration = promptSource.statements.filter(ts.isVariableStatement)
-    .flatMap(statement => [...statement.declarationList.declarations])
-    .find(declaration => declaration.name.getText(promptSource) === name)
-  assert.ok(declaration && ts.isNoSubstitutionTemplateLiteral(declaration.initializer))
-  return [locale, declaration.initializer.text]
-}))
+const promptSource = await readFile(new URL('../src/utils/guidedReading.ts', import.meta.url), 'utf8')
+// Keep prior shipped defaults private in production, but load their exact
+// values here to verify migration without duplicating the historical prompts.
+const shipped = await import('data:text/javascript;base64,' + Buffer.from(ts.transpileModule(
+  promptSource + '\nexport { LEGACY_PROMPT_ZH, LEGACY_PROMPT_EN, LEGACY_PROMPT_ZH_V2, LEGACY_PROMPT_EN_V2 };',
+  { compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.ESNext } },
+).outputText).toString('base64'))
+const legacyPresets = { zh: shipped.LEGACY_PROMPT_ZH, en: shipped.LEGACY_PROMPT_EN,
+  'zh-v2': shipped.LEGACY_PROMPT_ZH_V2, 'en-v2': shipped.LEGACY_PROMPT_EN_V2 }
 let server, browser, context, page, origin
 const errors = []
 const mocks = {
@@ -55,6 +54,7 @@ before(async () => {
       import { addCollection } from '@iconify/vue'; import fluent from '@iconify-json/fluent/icons.json';
       import AiTab from '/src/components/tabs/AiTab.vue';
       import Intro from '/src/components/GuidedReadingIntro.vue';
+      import QaSettings from '/src/components/settings/QaSettings.vue';
       import { useAiStore } from '/src/stores/ai.ts';
       import { useSettingsStore } from '/src/stores/settings.ts';
       import { zh, en } from '/src/i18n/locales.ts';
@@ -71,10 +71,20 @@ before(async () => {
             {id:'legacy-answer',providerId:'provider',providerName:'Example',modelId:'test-vision',modelName:'Test vision',
               content:'Earlier explanation.',streaming:false,createdAt:'2026-01-01T00:00:00Z'}]},
         ]}] : [];
-      const test = window.__test = { requests: [], saved: [], listeners: new Map(), guided, legacyPresets,
+      const test = window.__test = { requests: [], saved: [], listeners: new Map(), guided, legacyPresets, root:'/mock-library', saveError:false,
         emit(name, payload) { for (const cb of test.listeners.get(name) || []) cb({ payload }); },
         invoke(command, args) {
-          if (command === 'get_current_library') return Promise.resolve('/mock-library');
+          if (command === 'get_current_library') { test.rootReads=(test.rootReads||0)+1;return Promise.resolve(test.root); }
+          if (command === 'get_guided_reading_settings') {
+            const config=JSON.parse(localStorage.getItem(test.root+':guides')||'{"presets":[],"defaultId":"builtin"}');
+            if(test.holdGuides)return new Promise(resolve=>test.pendingGuideRead={resolve,config});
+            return Promise.resolve(config);
+          }
+          if (command === 'save_guided_reading_settings') {
+            if(test.saveError || args.expectedRoot!==test.root)return Promise.reject(new Error('save failed'));
+            localStorage.setItem(test.root+':guides',JSON.stringify(args.settingsData));
+            test.emit('guided-reading-settings-changed',{root:test.root});return Promise.resolve();
+          }
           if (command === 'get_paper_meta') return Promise.resolve({ title: 'Example paper', abstract: 'A complete paper' });
           if (command === 'get_paper_ai_conversations') return Promise.resolve(structuredClone(savedGuide));
           if (command === 'get_paper_chat') return Promise.resolve([]);
@@ -89,7 +99,7 @@ before(async () => {
       test.reopenIntro = async () => { showIntro.value = false; await nextTick(); introKey.value++; showIntro.value = true; };
       test.showIntro = () => showIntro.value = true;
       const app = createApp({ setup() { return () => h('div', { class: 'test-panel' }, [
-        mode !== 'intro' ? h(AiTab, { slug: 'paper', standalone: mode === 'standalone' }) : null,
+        mode === 'settings' ? h(QaSettings, {initialTab:'guided-reading'}) : mode !== 'intro' ? h(AiTab, { slug: 'paper', standalone: mode === 'standalone' }) : null,
         showIntro.value ? h(Intro, { ready: introReady.value, key: introKey.value }) : null,
       ]); } });
       const pinia = createPinia(); app.use(pinia);
@@ -119,11 +129,13 @@ async function open(mode = 'intro', extra = '') {
   await page.waitForFunction(() => window.__test?.mounted)
   await page.evaluate(() => localStorage.clear())
   if (mode === 'intro') await page.evaluate(() => window.__test.reopenIntro())
+  else if(mode==='settings')await page.locator('.reading-settings textarea').waitFor()
   else await page.locator('.guided-reading-btn').waitFor({ state: 'visible' })
 }
 async function start() {
   await page.locator('.guided-reading-btn').click()
   await page.waitForFunction(() => window.__test.requests.length > 0)
+  assert.equal(await page.evaluate(() => window.__test.requests.at(-1).args.learnUserProfile), false)
 }
 async function finish(text = '先想象一个走迷宫的机器人。它保留几条可能的路线，走一段再判断，就能避免过早选错。') {
   await page.evaluate(text => window.__test.requests.at(-1).resolve(text), text)
@@ -136,24 +148,29 @@ async function flags() {
   }))
 }
 
-test('both prompts prioritize understanding and meaningful questions without mandatory turn-end checks', async () => {
+test('both defaults teach just in time, calibrate briefly, annotate and stop after one small step', async () => {
   await open()
   const prompts = await page.evaluate(() => ['zh', 'en'].map(locale => window.__test.guided.guidedReadingPrompt(locale)))
   for (const prompt of prompts) {
-    assert.match(prompt, /get_paper_fulltext/)
-    assert.match(prompt, /has_more=false/)
-    assert.match(prompt, /view_paper_page/)
-    assert.match(prompt, /send_paper_image/)
+    assert.match(prompt, /完整正文|complete text/)
+    assert.match(prompt, /图表必须实际查看|Actually view the figures and tables/)
     assert.match(prompt, /附录|appendices/)
-    assert.match(prompt, /图表|figures/)
-    assert.match(prompt, /自然收尾|end naturally/)
-    assert.match(prompt, /只有问题确实|only when it clarifies/)
-    assert.match(prompt, /具体误解|concrete misconception/)
-    assert.match(prompt, /主动换例子|actively use another example/)
-    assert.doesNotMatch(prompt, /每轮末尾只问|End each turn with one|Wait for my reply/)
-    assert.match(prompt, /3—6|3–6/)
-    assert.match(prompt, /例子|example/)
+    assert.match(prompt, /每轮最多引入一个新的核心概念|at most one new core concept per turn/)
+    assert.match(prompt, /100–250/)
+    assert.match(prompt, /即使我说自己不熟悉，也不要马上集中补课|Even if I say I am unfamiliar with something, do not immediately give me a background course/)
+    assert.match(prompt, /绿色高亮|in green/)
+    assert.match(prompt, /简短中文批注|brief Chinese annotations/)
+    assert.match(prompt, /操作后检查是否正确写入|check that it was saved correctly/)
+    assert.match(prompt, /不必逐次询问|do not need repeated permission requests/)
+    assert.match(prompt, /伪代码和最小实现|pseudocode and a minimal implementation/)
+    assert.match(prompt, /我说“继续”，才推进|only when I say “continue”/)
+    assert.match(prompt, /不必每轮测试我|Do not test me every turn/)
+    assert.match(prompt, /首次回复只需简短说明实际阅读范围和任何缺失，再问一两个|first reply, briefly state what you actually read and anything missing, then ask one or two/)
+    assert.doesNotMatch(prompt, /每轮末尾只问|End each turn with one|Do not create notes, annotations|不要自动创建笔记、批注/)
+    assert.ok(prompt.includes('$...$') && prompt.includes('$$...$$'))
   }
+  assert.ok(prompts[0].startsWith('请担任我的交互式论文导师，带我一步一步读懂论文'))
+  assert.ok(prompts[0].endsWith('不要输出整篇总结或集中补充背景知识。'))
 })
 
 test('request upgrades preserve stored presets, assistant quotes, custom messages and attachment data', async () => {
@@ -176,13 +193,15 @@ test('request upgrades preserve stored presets, assistant quotes, custom message
       en: updated[2].content[0].text === guided.guidedReadingPrompt('en'),
       quote: updated[1] === history[1], attachment: updated[2].content[1] === attachment,
       custom: updated[3] === history[3], normal: updated[4] === history[4],
-      recognizable: ['zh','en'].every(locale => guided.isGuidedReadingPrompt(legacyPresets[locale])),
+      recognizable: Object.values(legacyPresets).every(prompt => guided.isGuidedReadingPrompt(prompt)),
+      v2: ['zh','en'].every(locale => guided.guidedReadingRequestHistory([{role:'user',content:legacyPresets[locale+'-v2']}])[0].content === guided.guidedReadingPrompt(locale)),
+      customV2: guided.guidedReadingRequestHistory([{role:'user',content:legacyPresets['zh-v2']}], true)[0].content === legacyPresets['zh-v2'],
     }
   })
   assert.ok(Object.values(result).every(Boolean), JSON.stringify(result))
 })
 
-for (const legacy of ['zh', 'en']) {
+for (const legacy of ['zh', 'en', 'zh-v2', 'en-v2']) {
   test(`${legacy}: an existing guide follows the new rules on follow-up and regeneration without rewriting the first question`, async () => {
     await open('standalone', `&legacy=${legacy}`)
     const original = legacyPresets[legacy]
@@ -193,15 +212,21 @@ for (const legacy of ['zh', 'en']) {
     await page.waitForFunction(() => window.__test.requests.length === 1)
     const requested = await page.evaluate(() => window.__test.requests[0].args)
     assert.equal(requested.conversationId, 'legacy-guide')
-    assert.equal(requested.messages[0].content, await page.evaluate(locale => window.__test.guided.guidedReadingPrompt(locale), legacy))
+    assert.equal(requested.learnUserProfile, true)
+    assert.equal(requested.messages[0].content, await page.evaluate(locale => window.__test.guided.guidedReadingPrompt(locale), legacy.split('-')[0]))
     await finish()
     await page.locator('button[title="重新生成"]').last().click()
     await page.waitForFunction(() => window.__test.requests.length === 2)
     const regenerated = await page.evaluate(() => window.__test.requests[1].args)
+    assert.equal(regenerated.learnUserProfile, true)
     assert.equal(regenerated.messages[0].content, requested.messages[0].content)
     await finish()
     const saved = await page.evaluate(() => window.__test.saved.at(-1).conversations.find(conv => conv.id === 'legacy-guide'))
     assert.equal(saved.nodes[0].content, original)
+    await page.locator('button[title="重新生成"]').first().click()
+    await page.waitForFunction(() => window.__test.requests.length === 3)
+    assert.equal(await page.evaluate(() => window.__test.requests[2].args.learnUserProfile), false)
+    await finish()
   })
 }
 
@@ -357,4 +382,121 @@ test('intro and both header entries fit narrow, wide, light and dark layouts, wi
     }
   }
   assert.deepEqual(errors, [])
+})
+
+const customGuides = {
+  defaultId:'math',presets:[
+    {id:'math',name:'公式推导',prompt:'逐式解释这篇论文。\n\n保留 $x_t$ 的每一步推导。'},
+    {id:'experiments',name:'实验核对',prompt:'只围绕这篇论文的实验设计、图表与结论逐步讲解。'},
+  ],
+}
+const configureGuides = () => page.evaluate(data=>localStorage.setItem('/mock-library:guides',JSON.stringify(data)),customGuides)
+
+test('settings tab edits multiple prompts, persists the default and restores the built-in after deleting it',async()=>{
+  await page.setViewportSize({width:1100,height:850})
+  await open('settings')
+  assert.equal(await page.locator('.qa-tab.active').innerText(),'AI 领读')
+  assert.equal(await page.locator('.reading-settings textarea').getAttribute('readonly'),'')
+  await page.getByRole('button',{name:'新增方案',exact:true}).click()
+  await page.getByLabel('方案名称',{exact:true}).fill('公式推导')
+  await page.getByLabel('提示词',{exact:true}).fill(customGuides.presets[0].prompt)
+  await page.getByRole('button',{name:'新增方案',exact:true}).click()
+  await page.getByLabel('方案名称',{exact:true}).fill('实验核对')
+  await page.getByLabel('提示词',{exact:true}).fill(customGuides.presets[1].prompt)
+  await page.getByLabel('默认方案',{exact:true}).selectOption({label:'公式推导'})
+  await page.getByRole('button',{name:'保存更改',exact:true}).click()
+  await page.getByText('已保存',{exact:true}).waitFor()
+  await page.reload();await page.getByLabel('默认方案',{exact:true}).waitFor()
+  await page.waitForFunction(()=>document.querySelector('.default-choice select')?.selectedOptions[0]?.textContent==='公式推导')
+  await page.locator('.preset-row').filter({hasText:'公式推导'}).click()
+  assert.equal(await page.getByLabel('提示词',{exact:true}).inputValue(),customGuides.presets[0].prompt)
+  if(process.env.ARGUS_TEST_OUTPUT_DIR){await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/guided-reading-settings.png'})}
+  await page.setViewportSize({width:620,height:820})
+  await page.evaluate(()=>document.documentElement.dataset.theme='midnight')
+  assert.equal(await page.locator('.qa-settings').evaluate(el=>el.scrollWidth<=el.clientWidth),true)
+  if(process.env.ARGUS_TEST_OUTPUT_DIR)await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/guided-reading-settings-narrow-dark.png'})
+  await page.getByRole('button',{name:'删除方案',exact:true}).click()
+  assert.equal(await page.getByLabel('默认方案',{exact:true}).inputValue(),'builtin')
+  await page.getByRole('button',{name:'保存更改',exact:true}).click();await page.getByText('已保存',{exact:true}).waitFor()
+  const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem('/mock-library:guides')))
+  assert.equal(saved.defaultId,'builtin');assert.equal(saved.presets.length,1)
+})
+
+for(const mode of ['sidebar','standalone']){
+  test(`${mode}: left-click uses the saved default and right-click uses another preset only once`,async()=>{
+    await page.setViewportSize({width:1000,height:850});await open(mode);await configureGuides()
+    const composer=page.locator('.composer textarea')
+    await composer.fill('保留草稿')
+    await start()
+    assert.equal(await page.evaluate(()=>window.__test.requests[0].args.messages.at(-1).content),customGuides.presets[0].prompt)
+    assert.equal(await composer.inputValue(),'保留草稿')
+    assert.match(await page.locator('.user-bubble').innerText(),/公式推导/)
+    await finish()
+    await page.locator('.guided-reading-btn').click({button:'right'})
+    await page.getByRole('menu',{name:'选择本次领读方案'}).waitFor()
+    assert.equal(await page.evaluate(()=>window.__test.requests.length),1,'opening the menu never sends a message')
+    if(process.env.ARGUS_TEST_OUTPUT_DIR)await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/guided-reading-menu-'+mode+'.png'})
+    await page.getByRole('menuitem',{name:'实验核对',exact:true}).click()
+    await page.waitForFunction(()=>window.__test.requests.length===2)
+    assert.equal(await page.evaluate(()=>window.__test.requests[1].args.messages.at(-1).content),customGuides.presets[1].prompt)
+    await finish()
+    await page.locator('.guided-reading-btn').click();await page.waitForFunction(()=>window.__test.requests.length===3)
+    assert.equal(await page.evaluate(()=>window.__test.requests[2].args.messages.at(-1).content),customGuides.presets[0].prompt)
+    await finish()
+    const saved=await page.evaluate(()=>window.__test.saved.at(-1).conversations)
+    assert(saved.some(c=>c.nodes[0].guidedReadingName==='实验核对'&&c.nodes[0].content===customGuides.presets[1].prompt))
+    await page.evaluate(()=>{localStorage.setItem('/mock-library:guides',JSON.stringify({presets:[],defaultId:'builtin'}))})
+    await composer.fill('继续');await composer.press('Enter');await page.waitForFunction(()=>window.__test.requests.length===4)
+    assert.equal(await page.evaluate(()=>window.__test.requests[3].args.messages[0].content),customGuides.presets[0].prompt,'later configuration changes do not rewrite an existing guide')
+    await finish()
+  })
+}
+
+test('the preset menu supports keyboard selection, dismissal and narrow windows',async()=>{
+  await page.setViewportSize({width:390,height:700});await open('standalone');await configureGuides()
+  await page.locator('.guided-reading-btn').focus();await page.keyboard.press('Shift+F10')
+  await page.getByRole('menu').waitFor()
+  const bounds=await page.getByRole('menu').boundingBox()
+  assert(bounds.x>=0&&bounds.y>=0&&bounds.x+bounds.width<=390&&bounds.y+bounds.height<=700)
+  await page.keyboard.press('Escape');assert.equal(await page.getByRole('menu').count(),0)
+  assert.equal(await page.evaluate(()=>window.__test.requests.length),0)
+  await page.keyboard.press('Shift+F10');await page.getByRole('menu').waitFor()
+  await page.keyboard.press('End');await page.keyboard.press('Enter');await page.waitForFunction(()=>window.__test.requests.length===1)
+  assert.equal(await page.evaluate(()=>window.__test.requests[0].args.messages.at(-1).content),customGuides.presets[1].prompt)
+  await finish()
+})
+
+test('empty prompts cannot save and save failure preserves edits and the previous persisted configuration',async()=>{
+  await page.setViewportSize({width:1000,height:850});await open('settings')
+  await page.getByRole('button',{name:'新增方案',exact:true}).click()
+  await page.getByLabel('提示词',{exact:true}).fill('')
+  assert.equal(await page.getByRole('button',{name:'保存更改',exact:true}).isDisabled(),true)
+  await page.getByLabel('提示词',{exact:true}).fill('待保存的提示词')
+  await page.evaluate(()=>window.__test.saveError=true)
+  await page.getByRole('button',{name:'保存更改',exact:true}).click();await page.getByRole('alert').waitFor()
+  assert.equal(await page.getByLabel('提示词',{exact:true}).inputValue(),'待保存的提示词')
+  assert.equal(await page.evaluate(()=>localStorage.getItem('/mock-library:guides')),null)
+  assert.deepEqual(errors,[])
+})
+
+test('a custom preset matching a legacy prompt is replayed verbatim',async()=>{
+  await page.setViewportSize({width:1000,height:850});await open('sidebar')
+  await page.evaluate(()=>{const t=window.__test;localStorage.setItem('/mock-library:guides',JSON.stringify({defaultId:'custom',presets:[{id:'custom',name:'原始节奏',prompt:t.legacyPresets.zh}]}))})
+  await start();await finish()
+  await page.locator('.composer textarea').fill('继续');await page.locator('.composer textarea').press('Enter')
+  await page.waitForFunction(()=>window.__test.requests.length===2)
+  assert.equal(await page.evaluate(()=>window.__test.requests[1].args.messages[0].content),legacyPresets.zh)
+  await finish()
+})
+
+test('a library switch discards a delayed preset selection instead of starting in the new library',async()=>{
+  await open('sidebar');await configureGuides();await page.evaluate(()=>window.__test.holdGuides=true)
+  await page.locator('.guided-reading-btn').click()
+  await page.waitForFunction(()=>!!window.__test.pendingGuideRead)
+  const rootReads=await page.evaluate(()=>window.__test.rootReads)
+  await page.evaluate(()=>{const t=window.__test;t.root='/another-library';t.emit('library-changed',t.root);t.pendingGuideRead.resolve(t.pendingGuideRead.config)})
+  await page.waitForFunction(reads=>window.__test.rootReads>reads,rootReads)
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))))
+  assert.equal(await page.evaluate(()=>window.__test.requests.length),0)
+  assert.deepEqual(errors,[])
 })

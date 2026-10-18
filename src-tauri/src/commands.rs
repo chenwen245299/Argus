@@ -1420,6 +1420,73 @@ pub async fn rename_paper_folder(
 // ── M4: Settings ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
+pub async fn get_user_memory(
+    app: tauri::AppHandle,
+) -> Result<crate::user_memory::MemoryView, String> {
+    tokio::task::spawn_blocking(move || crate::user_memory::get(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn configure_user_memory(
+    app: tauri::AppHandle,
+    enabled: bool,
+    auto_learn: bool,
+) -> Result<crate::user_memory::MemoryView, String> {
+    tokio::task::spawn_blocking(move || crate::user_memory::configure(&app, enabled, auto_learn))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn edit_user_memory(
+    app: tauri::AppHandle,
+    edit: crate::user_memory::MemoryEdit,
+) -> Result<crate::user_memory::MemoryView, String> {
+    tokio::task::spawn_blocking(move || crate::user_memory::edit(&app, edit))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn delete_user_memory(
+    app: tauri::AppHandle,
+    id: Option<String>,
+) -> Result<crate::user_memory::MemoryView, String> {
+    tokio::task::spawn_blocking(move || crate::user_memory::remove(&app, id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_guided_reading_settings(
+    expected_root: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<settings::GuidedReadingSettings, String> {
+    let root = get_root(&state)?;
+    if root != expected_root { return Err("Library changed".into()); }
+    tokio::task::spawn_blocking(move || settings::read_guided_reading_settings(&root))
+        .await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn save_guided_reading_settings(
+    settings_data: settings::GuidedReadingSettings,
+    expected_root: String,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    if root != expected_root { return Err("Library changed".into()); }
+    let write_root = root.clone();
+    tokio::task::spawn_blocking(move || settings::write_guided_reading_settings(&write_root, &settings_data))
+        .await.map_err(|e| e.to_string())??;
+    let _ = app.emit("guided-reading-settings-changed", serde_json::json!({ "root": root }));
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn get_settings(state: State<'_, LibraryRoot>) -> Result<AppSettings, String> {
     let root = get_root(&state)?;
     Ok(settings::read_settings(&root))
@@ -2849,6 +2916,8 @@ pub async fn chat_with_library(
     // whole point is a tool.
     plain_fallback: Option<bool>,
     manage_context: Option<bool>,
+    // Synthetic guided-reading presets and metadata tasks are not user evidence.
+    learn_user_profile: Option<bool>,
     expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
     // Which window asked. The cache keepalive runs until this window closes,
@@ -2858,7 +2927,10 @@ pub async fn chat_with_library(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let root = get_root(&state)?;
-    if expected_root.as_deref().is_some_and(|expected| expected != root) {
+    if expected_root
+        .as_deref()
+        .is_some_and(|expected| expected != root)
+    {
         return Err("Library changed during chat".into());
     }
     let event_name = event_name.unwrap_or_else(|| "library-chat".to_string());
@@ -2868,130 +2940,169 @@ pub async fn chat_with_library(
         sources_event_name.unwrap_or_else(|| "library-chat-sources".to_string());
     // Register a cancel flag; the guard unregisters it on every exit path.
     let (_cancel_guard, cancel) = crate::cancel::CancelGuard::new(request_id);
-    // Agent mode drives its own retrieval through the MCP tools instead of
-    // taking a pre-built context, so it takes a different path entirely.
-    if knowledge_source.as_deref() == Some("agent") {
-        let pins = selected_paper_slugs.unwrap_or_default();
-        let web_search = web_search.unwrap_or(false);
-        let fallback_allowed = plain_fallback == Some(true);
+    let observation = if learn_user_profile.unwrap_or(true) {
+        crate::user_memory::observe(
+            &app,
+            &messages,
+            &root,
+            conversation_id.as_deref(),
+            if canvas_id.is_some() {
+                "canvas"
+            } else if paper_slug.is_some() {
+                "paper"
+            } else {
+                "library"
+            },
+        )
+    } else {
+        None
+    };
+    let completion_cancel = cancel.clone();
+    let outcome = async {
+        // Agent mode drives its own retrieval through the MCP tools instead of
+        // taking a pre-built context, so it takes a different path entirely.
+        if knowledge_source.as_deref() == Some("agent") {
+            let pins = selected_paper_slugs.unwrap_or_default();
+            let web_search = web_search.unwrap_or(false);
+            let fallback_allowed = plain_fallback == Some(true);
 
-        // Decided before any MCP server is started: a question that is going
-        // to be answered without tools should not pay for connecting them.
-        if fallback_allowed {
-            let reason = crate::ai_manager::resolve_provider_model_or_default(
-                &root,
-                provider_id.as_deref(),
-                model_id.as_deref(),
-            )
-            .ok()
-            .and_then(|(provider, _, model, _)| {
-                copilot::plain_fallback_reason(&provider, &model, web_search)
-            });
-            if let Some(reason) = reason {
-                return copilot::chat_with_library_fallback(
+            // Decided before any MCP server is started: a question that is going
+            // to be answered without tools should not pay for connecting them.
+            if fallback_allowed {
+                let reason = crate::ai_manager::resolve_provider_model_or_default(
                     &root,
-                    &messages,
                     provider_id.as_deref(),
                     model_id.as_deref(),
-                    &event_name,
-                    &sources_event_name,
-                    &pins,
-                    reason,
-                    None,
-                    use_reasoning.unwrap_or(false),
-                    reasoning_effort.as_deref(),
-                    &app,
-                    cancel,
-                    web_search,
                 )
-                .await;
+                .ok()
+                .and_then(|(provider, _, model, _)| {
+                    copilot::plain_fallback_reason(&provider, &model, web_search)
+                });
+                if let Some(reason) = reason {
+                    return copilot::chat_with_library_fallback(
+                        &root,
+                        &messages,
+                        provider_id.as_deref(),
+                        model_id.as_deref(),
+                        &event_name,
+                        &sources_event_name,
+                        &pins,
+                        reason,
+                        None,
+                        use_reasoning.unwrap_or(false),
+                        reasoning_effort.as_deref(),
+                        &app,
+                        cancel,
+                        web_search,
+                    )
+                    .await;
+                }
             }
+
+            // Kept only when a refusal could still be answered another way; the
+            // agent consumes its own copy.
+            let retry_with = fallback_allowed.then(|| messages.clone());
+            let outcome = copilot::chat_with_library_agent(
+                &root,
+                messages,
+                provider_id.as_deref(),
+                model_id.as_deref(),
+                &event_name,
+                use_reasoning.unwrap_or(false),
+                reasoning_effort.as_deref(),
+                agent_max_rounds,
+                conversation_id.as_deref(),
+                paper_slug.as_deref(),
+                current_page,
+                canvas_id.as_deref(),
+                &pins,
+                window.label(),
+                &app,
+                cancel.clone(),
+                web_search,
+                manage_context.unwrap_or(false),
+            )
+            .await;
+
+            return match outcome {
+                // The provider refused the `tools` field on the very first call, so
+                // nothing has been streamed or run yet. Nothing is remembered: the
+                // next question tries the agent again, which costs one refused
+                // request but can never leave a working model stuck without tools
+                // because of one misread error.
+                Err(e) if e.starts_with(crate::llm::TOOLS_REJECTED_PREFIX) => {
+                    let detail = crate::llm::strip_tools_rejected(&e).to_string();
+                    match retry_with {
+                        Some(msgs) => {
+                            copilot::chat_with_library_fallback(
+                                &root,
+                                &msgs,
+                                provider_id.as_deref(),
+                                model_id.as_deref(),
+                                &event_name,
+                                &sources_event_name,
+                                &pins,
+                                "rejected",
+                                Some(&detail),
+                                use_reasoning.unwrap_or(false),
+                                reasoning_effort.as_deref(),
+                                &app,
+                                cancel,
+                                web_search,
+                            )
+                            .await
+                        }
+                        None => Err(detail),
+                    }
+                }
+                other => other,
+            };
         }
 
-        // Kept only when a refusal could still be answered another way; the
-        // agent consumes its own copy.
-        let retry_with = fallback_allowed.then(|| messages.clone());
-        let outcome = copilot::chat_with_library_agent(
+        copilot::chat_with_library(
             &root,
-            messages,
+            // No tool loop here: drop any replayed tool exchange (the `tool`
+            // results and the empty assistant turn that carried the `tool_calls`),
+            // leaving the plain user/assistant/system messages it expects.
+            messages
+                .iter()
+                .filter(|m| m.role != "tool" && m.tool_calls.is_none())
+                .map(AgentMessage::to_chat_message)
+                .collect(),
             provider_id.as_deref(),
             model_id.as_deref(),
             &event_name,
+            &sources_event_name,
+            knowledge_source.as_deref(),
+            selected_paper_slugs.as_deref(),
+            attachments.as_deref(),
             use_reasoning.unwrap_or(false),
             reasoning_effort.as_deref(),
-            agent_max_rounds,
-            conversation_id.as_deref(),
-            paper_slug.as_deref(),
-            current_page,
-            canvas_id.as_deref(),
-            &pins,
-            window.label(),
             &app,
-            cancel.clone(),
-            web_search,
-            manage_context.unwrap_or(false),
+            cancel,
+            web_search.unwrap_or(false),
         )
-        .await;
-
-        return match outcome {
-            // The provider refused the `tools` field on the very first call, so
-            // nothing has been streamed or run yet. Nothing is remembered: the
-            // next question tries the agent again, which costs one refused
-            // request but can never leave a working model stuck without tools
-            // because of one misread error.
-            Err(e) if e.starts_with(crate::llm::TOOLS_REJECTED_PREFIX) => {
-                let detail = crate::llm::strip_tools_rejected(&e).to_string();
-                match retry_with {
-                    Some(msgs) => {
-                        copilot::chat_with_library_fallback(
-                            &root,
-                            &msgs,
-                            provider_id.as_deref(),
-                            model_id.as_deref(),
-                            &event_name,
-                            &sources_event_name,
-                            &pins,
-                            "rejected",
-                            Some(&detail),
-                            use_reasoning.unwrap_or(false),
-                            reasoning_effort.as_deref(),
-                            &app,
-                            cancel,
-                            web_search,
-                        )
-                        .await
-                    }
-                    None => Err(detail),
-                }
-            }
-            other => other,
-        };
+        .await
     }
-
-    copilot::chat_with_library(
-        &root,
-        // No tool loop here: drop any replayed tool exchange (the `tool`
-        // results and the empty assistant turn that carried the `tool_calls`),
-        // leaving the plain user/assistant/system messages it expects.
-        messages
-            .iter()
-            .filter(|m| m.role != "tool" && m.tool_calls.is_none())
-            .map(AgentMessage::to_chat_message)
-            .collect(),
-        provider_id.as_deref(),
-        model_id.as_deref(),
-        &event_name,
-        &sources_event_name,
-        knowledge_source.as_deref(),
-        selected_paper_slugs.as_deref(),
-        attachments.as_deref(),
-        use_reasoning.unwrap_or(false),
-        reasoning_effort.as_deref(),
-        &app,
-        cancel,
-        web_search.unwrap_or(false),
-    )
-    .await
+    .await;
+    if outcome
+        .as_ref()
+        .is_ok_and(|answer| !answer.trim().is_empty())
+        && !completion_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        if let Some(observation) = observation {
+            crate::user_memory::schedule(
+                &app,
+                &root,
+                provider_id.as_deref(),
+                model_id.as_deref(),
+                observation,
+            );
+        }
+    }
+    outcome
 }
 
 #[tauri::command]

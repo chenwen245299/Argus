@@ -113,9 +113,14 @@ async function send(text, key = 'Enter') { await composer().fill(text); await co
 const count = n => page.waitForFunction(n => window.__test.requests.length === n, n)
 const finish = (index, text) => page.evaluate(({index,text}) => window.__test.finish(index,text), {index,text})
 const history = index => page.evaluate(index => window.__test.requests[index].args.messages, index)
+const waitForComposerLayout = () => page.waitForFunction(() => {
+  const messages = document.querySelector('.messages').getBoundingClientRect()
+  const dock = (document.querySelector('.input-area') || document.querySelector('footer.composer')).getBoundingClientRect()
+  return messages.bottom <= dock.top + 1
+})
 
 for (const mode of ['sidebar', 'standalone', 'library']) {
-  test(`${mode}: composer floats over the conversation and queued rows tuck behind it`, async () => {
+  test(`${mode}: composer stays below the clipped conversation and queued rows tuck behind the input`, async () => {
     await page.setViewportSize({ width: 1100, height: 840 })
     await open(mode)
     if (mode !== 'library') await page.locator('.test-panel').evaluate((el, width) => el.style.width = width, mode === 'sidebar' ? '350px' : '100%')
@@ -126,12 +131,19 @@ for (const mode of ['sidebar', 'standalone', 'library']) {
     const dockSelector = mode === 'library' ? '.input-area' : 'footer.composer'
     const boxSelector = mode === 'library' ? '.composer' : '.composer-box'
     const messages = page.locator('.messages')
-    await page.waitForFunction(selector => parseFloat(getComputedStyle(document.querySelector('.messages')).paddingBottom)
-      > document.querySelector(selector).getBoundingClientRect().height, dockSelector)
+    await waitForComposerLayout()
     await messages.evaluate(el => el.scrollTop = el.scrollHeight)
     let dock = await page.locator(dockSelector).boundingBox()
-    assert.ok((await messages.boundingBox()).y + (await messages.boundingBox()).height > dock.y + dock.height - 2, 'conversation viewport continues behind the floating dock')
+    assert.ok((await messages.boundingBox()).y + (await messages.boundingBox()).height <= dock.y + 1, 'conversation viewport ends above the input area')
+    const initialBox = await page.locator(boxSelector).boundingBox()
+    const viewport = await messages.boundingBox()
+    assert.ok(Math.abs(viewport.y+viewport.height-initialBox.y)<1, 'text reaches the input card edge without a blank band')
     assert.ok((await last.boundingBox()).y + (await last.boundingBox()).height < dock.y, 'final answer remains readable above the composer')
+    const previousHeight = await messages.evaluate(el => el.clientHeight)
+    await composer().fill('第一行\n第二行\n第三行\n第四行\n第五行\n第六行')
+    await page.waitForFunction(height => document.querySelector('.messages').clientHeight < height - 30, previousHeight)
+    await page.waitForFunction(() => { const el=document.querySelector('.messages'); return el.scrollHeight-el.scrollTop-el.clientHeight < 2 })
+    await composer().fill('')
     assert.deepEqual(await page.locator(dockSelector).evaluate(el => {
       const style = getComputedStyle(el)
       return [style.borderTopWidth, style.backgroundColor]
@@ -152,13 +164,16 @@ for (const mode of ['sidebar', 'standalone', 'library']) {
     })
     const readingPosition = await messages.evaluate(el => el.scrollTop)
     await composer().fill('保留正在写的内容\n第二行\n第三行\n第四行\n第五行\n第六行')
-    await page.waitForFunction(selector => parseFloat(getComputedStyle(document.querySelector('.messages')).paddingBottom)
-      > document.querySelector(selector).getBoundingClientRect().height, dockSelector)
+    await waitForComposerLayout()
     await page.waitForFunction(() => {
       const input = document.querySelector('.composer textarea')
       return input.scrollHeight <= input.clientHeight + 2
     })
     assert.ok(Math.abs((await messages.evaluate(el => el.scrollTop)) - readingPosition) < 2, 'growing a draft does not move a reader who has scrolled up')
+    assert.equal(await page.locator(dockSelector).evaluate(el => {
+      const rect=el.getBoundingClientRect()
+      return document.elementsFromPoint(rect.left+4,rect.bottom-2).some(node=>node.closest('.messages'))
+    }),false,'scrolled text is clipped throughout the input area, including beside and below the rounded card')
 
     if (mode !== 'library') {
       const before = await composer().boundingBox()
@@ -171,18 +186,20 @@ for (const mode of ['sidebar', 'standalone', 'library']) {
 
     if (process.env.ARGUS_TEST_OUTPUT_DIR) {
       await composer().fill('保留正在写的内容')
-      await messages.evaluate(el => el.scrollTop = el.scrollHeight)
+      await messages.evaluate(el => el.scrollTop = 120)
+      await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))))
       await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR, { recursive: true })
-      await page.screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/${mode}-floating-light.png` })
+      await page.screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/${mode}-composer-light.png` })
       await page.evaluate(() => document.documentElement.dataset.theme = 'dark')
       await page.locator('.queue-more').click()
-      await page.screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/${mode}-floating-menu-dark.png` })
-      await page.locator(dockSelector).screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/${mode}-floating-detail.png` })
+      await page.screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/${mode}-composer-menu-dark.png` })
+      await page.locator(dockSelector).screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/${mode}-composer-detail.png` })
       await page.keyboard.press('Escape')
     }
     await page.setViewportSize({ width: 1100, height: 520 })
     dock = await page.locator(dockSelector).boundingBox()
-    assert.ok(dock.y >= 0 && dock.y + dock.height <= 521, 'floating queue and composer remain on screen in a shorter window')
+    assert.ok(dock.y >= 0 && dock.y + dock.height <= 521, 'queue and composer remain on screen in a shorter window')
+    await waitForComposerLayout()
     await page.locator('.stop-btn').click()
   })
 
@@ -224,10 +241,7 @@ for (const mode of ['sidebar', 'standalone', 'library']) {
     await page.locator('input[type=file]').first().setInputFiles({name:'draft.png',mimeType:'image/png',buffer:png})
     await page.locator('.composer .attachment-chip').filter({hasText:'draft.png'}).waitFor()
     await composer().fill('original unfinished draft')
-    await page.waitForFunction(() => {
-      const dock = document.querySelector('.input-area') || document.querySelector('footer.composer')
-      return parseFloat(getComputedStyle(document.querySelector('.messages')).paddingBottom) > dock.getBoundingClientRect().height
-    })
+    await waitForComposerLayout()
     const edit = async () => {
       assert.ok(await page.locator('.queue-list').evaluate(el => el.scrollWidth <= el.clientWidth), 'attachment count and queue actions fit without scrolling sideways')
       await page.locator('.queue-more').click()

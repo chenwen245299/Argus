@@ -3190,6 +3190,7 @@ async fn run_agent_loop(
                 estimated_tokens: estimated_prompt, input_tokens: turn.usage.input_tokens as usize });
         }
         usage.add(&turn.usage);
+        llm::emit_run_usage(app, event_name, &usage);
         if !turn.content.is_empty() {
             if !streamed.is_empty() {
                 streamed.push_str("\n\n");
@@ -3239,6 +3240,7 @@ async fn run_agent_loop(
                 Err(e) => break 'rounds Err(e),
             };
             usage.add(&final_turn.usage);
+            llm::emit_run_usage(app, event_name, &usage);
             if final_turn.usage.input_tokens > 0 {
                 context_sample = Some(crate::chat_context::PromptSample {
                     estimated_tokens: final_estimate, input_tokens: final_turn.usage.input_tokens as usize });

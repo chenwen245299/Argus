@@ -258,11 +258,14 @@ after save/cancel, row removal or scope changes; edits retain captured models.
 Editing holds the row even if generation finishes, preserving FIFO and the
 composer draft. Attachments and model selections are captured when enqueued.
 The queue is an inset strip behind the rounded input card, overlapping its top
-edge rather than sitting inside it. Both library and paper composers float over
-the conversation without a full-width divider or footer background.
-`utils/floatingChatComposer.ts` measures the whole dock with ResizeObserver and
-reserves scroll clearance for the last answer, including queue/edit/attachment
-and write-approval height, while preserving a reader's scrolled-up position.
+edge rather than sitting inside it. Both library and paper composers sit below
+a separately clipped conversation viewport, without a full-width divider or
+footer background. Text scrolling past that viewport's bottom is hidden and
+cannot show through beside or below the input card. The viewport meets the input
+area without a top padding band. `utils/chatScrollResize.ts`
+uses ResizeObserver to follow the bottom as the viewport resizes for
+queue/edit/attachment and write-approval height, while preserving a reader's
+scrolled-up position.
 Each window owns its pending queue; messages are scoped to their original
 conversation/paper/library. Stop pauses the queue until Resume, a new send or
 Steer; deletion, library switches and unmount clear the relevant pending rows.
@@ -590,6 +593,20 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   `TurnUsage` instead of emitting one; the loop folds them and calls
   `llm::emit_usage` once at the end. Emitting per round both showed a cost strip
   during the first tool call and reported only that round's figures.
+  The shared `ChatRunStats.vue` in the paper AI standalone and library chat
+  composer toolbars reads a separate cumulative `-run-usage` channel. A
+  conversation's `usageRuns` ledger
+  replaces samples by request id and retains regeneration/deletion spend; each
+  compaction batch has its own id and `-compaction-usage` sample. Model-call
+  duration excludes tool execution; cache rates are weighted by input and hidden
+  when any input sample lacks cache reporting. Paper live patches carry only the
+  current requests' accounting, with full ledgers in saved snapshots. Narrow
+  toolbars hide secondary statistics as space narrows instead of wrapping them.
+  Paper sidebars and canvas chat do not show runtime statistics; their context
+  meters remain in the toolbar, independent of cumulative billing totals.
+  Draft estimates include media and update the composition rows. Idle usage
+  calibration requires a matching system-content fingerprint, so same-size prompt
+  edits and legacy uncalibrated records are remeasured.
 - Progress is emitted on `{event_name}-agent`, phases `servers` / `thinking` /
   `tool` / `result` / `evicted` / `answering` / `limit`, plus `fallback` from the
   fallback path.

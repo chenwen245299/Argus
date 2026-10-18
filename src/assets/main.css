@@ -55,6 +55,11 @@
   --status-generating: #22c55e;
   --status-cache-warm: #3b82f6;
 
+  /* Keep context categories distinct across theme accent palettes. */
+  --context-system:   #a855f7;
+  --context-tools:    #f59e0b;
+  --context-messages: #22c55e;
+
   --input-bg: rgba(0, 0, 0, 0.07);
 
   /* Flat accent — no gradients or inner shadows */

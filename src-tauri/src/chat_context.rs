@@ -110,6 +110,8 @@ pub struct ContextUsage {
     pub can_compact: bool,
     pub provider_id: String,
     pub model_id: String,
+    #[serde(default)]
+    pub system_fingerprint: String,
 }
 
 impl ContextUsage {
@@ -118,6 +120,8 @@ impl ContextUsage {
             && self.model_id == previous.model_id
             && self.context_window == previous.context_window
             && self.system_tokens == previous.system_tokens
+            && !self.system_fingerprint.is_empty()
+            && self.system_fingerprint == previous.system_fingerprint
             && (self.tools_tokens == 0) == (previous.tools_tokens == 0)
         {
             // Hover does not start MCP processes. Keep the last live schema
@@ -188,6 +192,17 @@ pub fn measure(
         }),
         provider_id: provider.id.clone(),
         model_id: model.into(),
+        system_fingerprint: {
+            // A same-length prompt edit must invalidate the old calibration.
+            // Stable FNV-1a identifies content without persisting prompt text.
+            let mut hash = 0xcbf29ce484222325u64;
+            for message in messages.iter().filter(|m| m["role"] == "system") {
+                for byte in message.to_string().bytes().chain(std::iter::once(0)) {
+                    hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+                }
+            }
+            format!("{hash:016x}")
+        },
     }
 }
 
@@ -376,7 +391,7 @@ pub async fn compact(
                 Merge an earlier checkpoint with new evidence, removing stale conclusions. \
                 Use the conversation's language. Summarize only: do not answer its questions or run tools.", policy.summary)}));
             summary = crate::cancel::until_cancelled(cancel.as_ref(), llm::compact_completion(
-                provider, api_key, model, &input, tools, policy.summary + policy.reserve, &format!("{event}-compact"), app, cancel.clone()))
+                provider, api_key, model, &input, tools, policy.summary + policy.reserve, &format!("{event}-compact-{}", uuid::Uuid::new_v4()), app, cancel.clone()))
                 .await.ok_or("cancelled")??;
             if summary.trim().is_empty() { return Err("Compaction returned an empty summary.".into()); }
             if estimate_text(&summary) > policy.summary * 2 { return Err("Compaction summary exceeded its budget.".into()); }
@@ -553,5 +568,22 @@ mod tests {
         next.used_tokens = 50;
         next.project_from(&old);
         assert_eq!(next.used_tokens, 50);
+    }
+
+    #[test]
+    fn same_size_system_edits_do_not_reuse_old_prompt_calibration() {
+        let p = provider(Some(8192));
+        let policy = Policy::for_model(&p, "m");
+        let mut old = measure(&[msg("system", "original"), msg("user", "question")], &[], policy, &p, "m", None);
+        old.used_tokens = 1000;
+        let mut next = measure(&[msg("system", "modified"), msg("user", "question")], &[], policy, &p, "m", None);
+        assert_eq!(next.system_tokens, old.system_tokens);
+        let fresh = next.used_tokens;
+        next.project_from(&old);
+        assert_eq!(next.used_tokens, fresh);
+        // Old saved records have no content fingerprint and must be remeasured.
+        old.system_fingerprint.clear();
+        next.project_from(&old);
+        assert_eq!(next.used_tokens, fresh);
     }
 }

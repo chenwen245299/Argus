@@ -60,6 +60,7 @@ onUnmounted(() => {
         <circle class="context-fill" cx="7" cy="7" r="5.5" transform="rotate(-90 7 7)"
           :stroke-dasharray="`${circumference * percent / 100} ${circumference}`" />
       </svg>
+      <span v-if="label" class="context-model">{{ label }}</span>
       <span>{{ percent }}%</span>
     </button>
     <Teleport to="body">
@@ -82,6 +83,7 @@ onUnmounted(() => {
 
 <style scoped>
 .context-meter { display: inline-flex; flex-shrink: 0; }
+.context-model { max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .context-trigger { display: inline-flex; align-items: center; gap: 5px; padding: 4px 6px; border: 0; border-radius: 6px; background: transparent; color: var(--text-tertiary); font: inherit; font-size: 11px; font-variant-numeric: tabular-nums; cursor: pointer; }
 .context-trigger:hover { color: var(--text-secondary); background: var(--bg-hover); }
 .context-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -96,9 +98,9 @@ onUnmounted(() => {
 .context-total { margin-top: 5px; color: var(--text-primary); font-variant-numeric: tabular-nums; }
 .context-bar { display: flex; height: 4px; margin: 10px 0; overflow: hidden; border-radius: 4px; background: var(--bg-hover); }
 .context-bar span { flex-shrink: 0; }
-.system { background: var(--text-tertiary); }
-.tools { background: var(--status-cache-warm, var(--accent)); }
-.messages { background: var(--accent); }
+.system { background: var(--context-system); }
+.tools { background: var(--context-tools); }
+.messages { background: var(--context-messages); }
 .context-rows { margin: 0; }
 .context-rows > div { padding: 3px 0; }
 .context-rows dd { margin: 0; color: var(--text-primary); font-variant-numeric: tabular-nums; }

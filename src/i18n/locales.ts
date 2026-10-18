@@ -1161,6 +1161,13 @@ export const zh = {
     rebuildDoneWithFailed: '完成 {done}/{total} 篇，{failed} 篇失败',
   },
   // M7: Library Chat
+  chatStats: {
+    title: '对话运行统计', turns: '{n} 轮', steps: '{n} 步', cache: '缓存命中 {n}%',
+    activityHint: '轮：发送的用户消息；步：模型请求次数（含工具后的继续回答）。已调用 {tools} 次工具。旧记录缺少步数时只统计已知请求。',
+    speedHint: '最近一次回答的平均输出速度，含等待与思考，不含工具执行时间；缺少模型耗时记录时按总耗时估算。',
+    tokensHint: '本对话已记录请求的累计用量：输入 {input}、输出 {output} tokens，包含重新生成及上下文压缩。后台保温和标题生成在用量统计中查看。',
+    cacheHint: '缓存命中输入 tokens / 总输入 tokens，按用量加权。仅在所有已记录输入均有缓存数据时显示。',
+  },
   chatContext: {
     title: '上下文窗口', usedPercent: '已用 {percent}%',
     remaining: '剩余 token', system: '系统提示与固定文献', tools: '工具定义', messages: '对话与工具结果',
@@ -1750,6 +1757,11 @@ export const zh = {
   // Mermaid diagram block
   mermaid: {
     rendering: '渲染图表中…',
+    enlarge: '放大查看',
+    preview: '图表预览',
+    close: '关闭图表预览',
+    fit: '适应窗口',
+    hint: '滚轮缩放 · 拖动平移 · Esc 关闭',
     copyImage: '复制图片',
     copied: '图片已复制到剪贴板',
     copyFailed: '复制失败',
@@ -2890,6 +2902,13 @@ export const en: typeof zh = {
     rebuildDoneWithFailed: 'Done: {done}/{total} papers, {failed} failed',
   },
   // M7: Library Chat
+  chatStats: {
+    title: 'Conversation statistics', turns: '{n} turns', steps: '{n} steps', cache: 'Cache hit {n}%',
+    activityHint: 'Turns: sent user messages. Steps: model requests, including tool follow-ups. {tools} tool calls. Older records may lack step counts.',
+    speedHint: 'Average output speed of the latest answer, including model wait and reasoning, excluding tool execution. Without model timing, uses total elapsed time.',
+    tokensHint: 'Recorded conversation usage: {input} input and {output} output tokens, including regeneration and compaction. Background keepalive and title generation appear in the usage dashboard.',
+    cacheHint: 'Cached input tokens / total input tokens, weighted by usage. Shown only when all recorded input has cache data.',
+  },
   chatContext: {
     title: 'Context window', usedPercent: '{percent}% used',
     remaining: 'Remaining tokens', system: 'System prompt and pinned papers', tools: 'Tool definitions', messages: 'Conversation and tool results',
@@ -3470,6 +3489,11 @@ export const en: typeof zh = {
   },
   mermaid: {
     rendering: 'Rendering diagram…',
+    enlarge: 'Enlarge diagram',
+    preview: 'Diagram preview',
+    close: 'Close diagram preview',
+    fit: 'Fit to window',
+    hint: 'Scroll to zoom · Drag to pan · Esc to close',
     copyImage: 'Copy image',
     copied: 'Image copied to clipboard',
     copyFailed: 'Copy failed',

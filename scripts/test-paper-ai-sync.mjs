@@ -16,6 +16,9 @@ const { PaperAiSync, reconcilePaperAiConversations, translatePaperAiClocks, PAPE
 const { isGuidedReadingPrompt } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
   await readFile(new URL('../src/utils/guidedReading.ts', import.meta.url), 'utf8'),
 )).toString('base64'))
+const { legacyChatRun } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
+  await readFile(new URL('../src/utils/chatRunStats.ts', import.meta.url), 'utf8'),
+)).toString('base64'))
 
 const source = await readFile(new URL('../src/components/tabs/AiTab.vue', import.meta.url), 'utf8')
 const ast = ts.createSourceFile('AiTab.ts', source.slice(source.indexOf('>') + 1, source.indexOf('</script>')), ts.ScriptTarget.Latest, true)
@@ -27,7 +30,7 @@ const functions = [
   'adoptSyncedConversation', 'handlePaperAiSync', 'applySyncedDiskConversations', 'refreshSyncedConversations',
   'liveConversationById', 'restoreSession', 'openConversation', 'startNewConversation',
   'firstUserTitle', 'isMetadataExtractionConversation', 'stopConversationStreaming', 'conversationScope',
-  'detachAnswerListeners', 'findReactiveAnswer', 'flushStreamRender',
+  'detachAnswerListeners', 'findReactiveAnswer', 'flushStreamRender', 'legacyPaperRuns',
 ].map(name => {
   const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name)
   assert.ok(node, `AiTab function ${name} exists`)
@@ -42,7 +45,7 @@ const createView = new Function('env', transpile(`
     streamRenderLast, streamRenderCost, paperSaves, backgroundSaves, sessions, knownConvIds,
     input, editingNodeId, showHistory, textareaEl, nextTick, scrollToBottom,
     invoke, paperAiSync, crypto, persistableServerToolTrace, saveLegacyActiveHistory,
-    flattenConversation, reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt, t, messageQueue } = env;
+    flattenConversation, reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt, legacyChatRun, t, messageQueue } = env;
   let syncLibraryRoot = env.root, syncDisposed = false;
   let syncRefresh = null, syncRefreshPending = false;
   let selectionRevision = 0, initialSyncSelectionRevision = null;
@@ -104,7 +107,7 @@ function bus(initial = [conversation()]) {
       crypto: webcrypto, nextTick, scrollToBottom: () => {}, paperAiSync: sync,
       pausedScopes, messageQueue: { pause: scope => pausedScopes.add(scope) },
       persistableServerToolTrace: trace => trace, saveLegacyActiveHistory: async () => {}, flattenConversation: () => [],
-      reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt,
+      reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt, legacyChatRun,
       t: key => key === 'guidedReading.title' ? 'AI 领读' : key,
     }
     let readGate = null
@@ -374,9 +377,15 @@ test('live usage patches preserve per-model checkpoints without resending native
   const answer = sidebar.own()
   sidebar.broadcast(conv)
   conv.contextStates['provider::model'].usage = { usedTokens: 4000 }
+  conv.usageRuns = {
+    current: {id:'current',answerId:answer.id,providerId:'provider',modelId:'model',inputTokens:1000,outputTokens:200,modelCalls:2},
+    earlier: {id:'earlier',answerId:'old-answer',providerId:'provider',modelId:'model',inputTokens:100},
+  }
   sidebar.update(answer.id); t.mock.timers.tick(PAPER_AI_SYNC_INTERVAL_MS)
   const update = b.messages.filter(p => p.kind === 'update').at(-1)
   assert.equal(update.contextUsage['provider::model'].usedTokens, 4000)
+  assert.deepEqual(Object.keys(update.usageRuns), ['current'], 'only current accounting travels in live patches')
+  assert.equal(popup.activeConversation.value.usageRuns.current.inputTokens, 1000)
   assert(!JSON.stringify(update).includes('Summary'))
   assert.equal(popup.activeConversation.value.contextStates['provider::model'].usage.usedTokens, 4000)
   assert.equal(popup.activeConversation.value.contextStates['provider::model'].checkpoint.messages[0].content, 'Summary')

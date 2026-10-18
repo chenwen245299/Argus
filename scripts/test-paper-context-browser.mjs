@@ -198,17 +198,75 @@ test('stopping automatic preparation never starts the agent or saves its late su
   assert.equal(await page.evaluate(()=>window.__test.requests.length),0)
 })
 
-test('standalone and narrow dark sidebars place the meter beside send without clipping',async()=>{
+test('standalone and narrow dark sidebars keep the context meter in the tools row',async()=>{
   for(const mode of ['panel','standalone']){
     await open(mode);if(mode==='panel')await page.setViewportSize({width:350,height:850})
     await page.evaluate(()=>document.documentElement.dataset.theme='midnight')
     await page.locator('.context-trigger').focus();await page.locator('.context-panel').waitFor()
     const ring=await page.locator('.context-trigger').boundingBox(),send=await page.locator('.send-btn').last().boundingBox(),panel=await page.locator('.context-panel').boundingBox()
     const width=page.viewportSize().width
-    assert(ring.x>=0&&ring.x+ring.width<=send.x&&send.x+send.width<=width)
+    const card=await page.locator('.composer-box').boundingBox()
+    assert(ring.x>=0&&ring.x+ring.width<=width&&send.x+send.width<=width)
+    assert(ring.y>=card.y&&ring.y+ring.height<=card.y+card.height)
     assert(Math.abs(ring.y+ring.height/2-send.y-send.height/2)<=1)
+    assert.equal(await page.locator('.chat-run-stats').count(),mode==='standalone'?1:0)
     assert(panel.x>=0&&panel.x+panel.width<=width)
     if(process.env.ARGUS_TEST_OUTPUT_DIR){await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/paper-context-'+mode+'.png'})}
+  }
+})
+
+test('all chats retain usage, while only standalone paper chat shows statistics beside the tools',async()=>{
+  for(const mode of ['panel','standalone','canvas']){
+    await open(mode);if(mode==='panel')await page.setViewportSize({width:350,height:850})
+    await send('Show measured statistics');await requests(1)
+    await page.evaluate(()=>{const t=window.__test,r=t.requests[0],name=r.args.eventName;
+      const sample={input_tokens:1000,output_tokens:200,total_tokens:1200,cache_hit_tokens:900,cache_reported:true,model_calls:3,model_duration_ms:2000};
+      t.emit(name+'-run-usage',sample);t.emit(name+'-run-usage',sample);
+      t.emit(name+'-compaction-usage',{id:'summary',input_tokens:500,output_tokens:50,total_tokens:550,model_calls:1,cache_hit_tokens:300,cache_reported:true});
+      t.finish(0)
+    })
+    await page.waitForFunction(()=>!document.querySelector('.stop-btn,.cc-send.stop'))
+    await page.waitForFunction(()=>window.__test.saved.some(s=>s.conversations.some(c=>Object.values(c.usageRuns||{}).some(run=>run.kind==='compaction'))))
+    const runs=await page.evaluate(()=>Object.values(window.__test.saved.at(-1).conversations[0].usageRuns))
+    assert.equal(runs.reduce((sum,run)=>sum+(run.totalTokens||0),0),1750)
+    assert.equal(runs.reduce((sum,run)=>sum+(run.modelCalls||0),0),4)
+    if(mode==='standalone'){
+      const text=await page.locator('.chat-run-stats').textContent()
+      assert.match(text,/3 轮 4 步/);assert.match(text,/1.8k tok/);assert.match(text,/~100 tok\/s/);assert.match(text,/缓存命中 80%/)
+      assert.equal(await page.locator('.composer-toolbar .chat-run-stats').count(),1)
+      const stats=await page.locator('.chat-run-stats').boundingBox(),sendBox=await page.locator('.send-btn').last().boundingBox()
+      const tool=await page.locator('.composer-toolbar .toolbar-btn').first().boundingBox()
+      assert(Math.abs(stats.y+stats.height/2-sendBox.y-sendBox.height/2)<=1)
+      assert(Math.abs(stats.y+stats.height/2-tool.y-tool.height/2)<=1)
+    }else assert.equal(await page.locator('.chat-run-stats').count(),0)
+    if(process.env.ARGUS_TEST_OUTPUT_DIR){await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/context-stats-'+mode+'.png'})}
+  }
+})
+
+test('standalone statistics remain a single tools row with large totals and narrow windows',async()=>{
+  await open('standalone');await send('Long conversation statistics');await requests(1)
+  await page.evaluate(()=>{const t=window.__test,name=t.requests[0].args.eventName;
+    t.emit(name+'-run-usage',{input_tokens:1600000,output_tokens:200000,total_tokens:1800000,cache_hit_tokens:1280000,cache_reported:true,model_calls:28,model_duration_ms:1449275});t.finish(0)
+  })
+  await page.waitForFunction(()=>!document.querySelector('.stop-btn'))
+  for(const width of [1100,850,620,390]){
+    await page.setViewportSize({width,height:850})
+    await page.evaluate(()=>document.documentElement.dataset.theme='midnight')
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))))
+    const stats=await page.locator('.chat-run-stats').boundingBox(),sendBox=await page.locator('.send-btn').last().boundingBox()
+    const tool=await page.locator('.composer-toolbar .toolbar-btn').first().boundingBox()
+    const content=await page.locator('.run-stats-content').boundingBox()
+    assert(Math.abs(stats.y+stats.height/2-sendBox.y-sendBox.height/2)<=1)
+    assert(Math.abs(stats.y+stats.height/2-tool.y-tool.height/2)<=1)
+    assert(sendBox.x+sendBox.width<=width)
+    assert(content.x>=stats.x-1&&content.width<=stats.width+1, 'visible statistics fit without clipping')
+    assert.equal(await page.locator('.run-stats-content').evaluate(el=>el.scrollHeight<=20),true)
+    if(width===1100){
+      await page.locator('.run-speed').waitFor({state:'visible'})
+      await page.locator('.run-cache').waitFor({state:'visible'})
+      assert.match(await page.locator('.chat-run-stats').innerText(),/1.8M tok/)
+    }
+    if(process.env.ARGUS_TEST_OUTPUT_DIR)await page.locator('.composer-box').screenshot({animations:'disabled',path:process.env.ARGUS_TEST_OUTPUT_DIR+'/context-stats-inline-'+width+'.png'})
   }
 })
 

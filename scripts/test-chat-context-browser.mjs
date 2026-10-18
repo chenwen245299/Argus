@@ -70,6 +70,7 @@ before(async () => {
 })
 after(async () => { await browser?.close(); await server?.close() })
 async function open(reset = true) {
+  await page.setViewportSize({width:1000,height:820})
   await page.goto(`${origin}/__context`)
   if (reset) { await page.evaluate(() => localStorage.clear()); await page.reload() }
   await page.locator('.context-trigger').waitFor({ timeout: 10000 })
@@ -154,8 +155,9 @@ test('meter fits narrow and dark views, and remains keyboard accessible', async 
   const trigger=await page.locator('.context-trigger').boundingBox()
   const sendBox=await page.locator('.send-btn').last().boundingBox()
   assert(trigger.x>=0&&sendBox.x+sendBox.width<=560)
-  assert(trigger.x+trigger.width<=sendBox.x && Math.abs(trigger.y+trigger.height/2-sendBox.y-sendBox.height/2)<=1,
-    'context meter sits immediately before send on the same toolbar row')
+  const card=await page.locator('.composer').last().boundingBox()
+  assert(trigger.y>=card.y&&trigger.y+trigger.height<=card.y+card.height, 'context meter stays inside the input card')
+  assert(Math.abs(trigger.y+trigger.height/2-sendBox.y-sendBox.height/2)<=1, 'context meter shares the send row')
   const tool=await page.locator('.footer-left .toolbar-btn').first().boundingBox()
   assert.equal(sendBox.width,tool.width)
   assert.equal(sendBox.height,tool.height)
@@ -167,4 +169,47 @@ test('meter fits narrow and dark views, and remains keyboard accessible', async 
   await page.evaluate(() => window.__test.compact(0))
   await page.waitForFunction(() => window.__test.saved.at(-1)?.contextCheckpoint)
   assert.deepEqual(errors,[])
+})
+
+test('composer statistics use cumulative snapshots and survive regeneration and reload', async () => {
+  await open(); await send('Statistics question'); await waitRequests(1)
+  await page.evaluate(() => { const t=window.__test,r=t.requests[0];
+    const sample={input_tokens:1000,output_tokens:100,total_tokens:1100,cache_hit_tokens:800,cache_reported:true,model_calls:2,model_duration_ms:1000};
+    t.emit(r.args.eventName+'-run-usage',sample);t.emit(r.args.eventName+'-run-usage',sample);t.finish(0)
+  })
+  await page.waitForFunction(()=>window.__test.saved.at(-1)?.usageRuns)
+  assert.match(await page.locator('.chat-run-stats').innerText(),/3 轮 2 步/)
+  assert.match(await page.locator('.chat-run-stats').innerText(),/1.1k tok/)
+  assert.match(await page.locator('.chat-run-stats').innerText(),/缓存命中 80%/)
+  await open(false)
+  assert.match(await page.locator('.chat-run-stats').innerText(),/1.1k tok/)
+  await page.locator('.assistant-action-row').last().hover()
+  await page.locator('button[title="重新生成"]').last().click();await waitRequests(1)
+  await page.evaluate(()=>{const t=window.__test,r=t.requests[0];
+    t.emit(r.args.eventName+'-run-usage',{input_tokens:1000,output_tokens:100,total_tokens:1100,cache_hit_tokens:800,cache_reported:true,model_calls:2,model_duration_ms:1000});t.finish(0)
+  })
+  await page.waitForFunction(()=>!document.querySelector('.stop-btn'))
+  assert.match(await page.locator('.chat-run-stats').innerText(),/3 轮 4 步/)
+  assert.match(await page.locator('.chat-run-stats').innerText(),/2.2k tok/)
+  assert.equal(await page.locator('.composer-footer .chat-run-stats').count(),1)
+  const stats=await page.locator('.chat-run-stats').boundingBox()
+  const tool=await page.locator('.footer-left .toolbar-btn').first().boundingBox()
+  const sendBox=await page.locator('.send-btn').last().boundingBox()
+  assert(Math.abs(stats.y+stats.height/2-tool.y-tool.height/2)<=1, 'statistics share the tools row')
+  assert(Math.abs(stats.y+stats.height/2-sendBox.y-sendBox.height/2)<=1, 'statistics share the send row')
+  assert.equal(await page.locator('.run-stats-content').evaluate(el=>el.scrollHeight<=20),true, 'statistics occupy one line')
+  if(process.env.ARGUS_TEST_OUTPUT_DIR)await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/context-stats-library.png'})
+})
+
+test('stopping keeps final accounting listeners until the cancelled request settles',async()=>{
+  await open();await send('Stop with partial usage');await waitRequests(1)
+  await page.evaluate(()=>{const t=window.__test,name=t.requests[0].args.eventName;
+    t.emit(name+'-run-usage',{input_tokens:100,output_tokens:20,total_tokens:120,model_calls:1})
+  })
+  await page.getByRole('button',{name:'停止',exact:true}).click()
+  await page.evaluate(()=>{const t=window.__test,name=t.requests[0].args.eventName;
+    t.emit(name+'-run-usage',{input_tokens:200,output_tokens:30,total_tokens:230,model_calls:2});t.finish(0)
+  })
+  await page.waitForFunction(()=>window.__test.saved.at(-1)?.usageRuns&&Object.values(window.__test.saved.at(-1).usageRuns).some(run=>run.totalTokens===230))
+  assert.match(await page.locator('.chat-run-stats').innerText(),/230 tok/)
 })

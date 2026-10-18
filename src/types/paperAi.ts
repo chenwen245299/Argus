@@ -2,6 +2,7 @@ import type { Attachment } from '../utils/attachments'
 import type { ServerToolTrace } from './index'
 import type { AgentStepImage } from './chatImages'
 import type { ContextCheckpoint, ContextUsage } from '../utils/chatContext'
+import type { ChatRun } from '../utils/chatRunStats'
 
 export interface PaperAiContextState {
   checkpoint?: ContextCheckpoint
@@ -72,4 +73,5 @@ export interface PaperAiConversation {
   contextStates?: Record<string, PaperAiContextState>
   /** Owner operation marker for durable repair of missed completion events. */
   contextTask?: string
+  usageRuns?: Record<string, ChatRun>
 }

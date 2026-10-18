@@ -13,13 +13,19 @@ const transpile = source => ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.ESNext },
 }).outputText
 const source = await readFile(new URL('../src/components/MermaidBlock.vue', import.meta.url), 'utf8')
+const { icons } = JSON.parse(await readFile(new URL('../node_modules/@iconify-json/fluent/icons.json', import.meta.url), 'utf8'))
+const previewIcons = Object.fromEntries(['copy', 'arrow-expand', 'subtract', 'add', 'scale-fit', 'dismiss']
+  .map(name => [`${name}-24-regular`, icons[`${name}-24-regular`]]))
+const locales = transpile(await readFile(new URL('../src/i18n/locales.ts', import.meta.url), 'utf8'))
+  .replace(/export const /g, 'const ')
 const { descriptor } = parse(source)
 const compiled = compileScript(descriptor, { id: 'mermaid-label-test' })
 const script = transpile(compiled.content)
   .replace(/import \{([^}]+)\} from ['"]vue['"];?/g, (_, names) =>
     `const {${names.replace(/\bas\b/g, ':')}} = window.Vue;`)
-  .replace(/import \{ Icon \} from ['"]@iconify\/vue['"];?/g, 'const Icon = { render: () => window.Vue.h("span") };')
-  .replace(/import \{ useI18n \} from ['"]vue-i18n['"];?/g, 'const useI18n = () => ({ t: key => key });')
+  .replace(/import \{ Icon \} from ['"]@iconify\/vue['"];?/g, `const previewIcons = ${JSON.stringify(previewIcons)};
+    const Icon = { props: ['icon'], render() { return window.Vue.h('svg', { viewBox: '0 0 24 24', innerHTML: previewIcons[this.icon.replace('fluent:', '')]?.body || '' }); } };`)
+  .replace(/import \{ useI18n \} from ['"]vue-i18n['"];?/g, 'const useI18n = () => ({ t: key => key.split(".").reduce((value, part) => value?.[part], window.zh) || key });')
   .replace(/import DOMPurify from ['"]dompurify['"];?/g, 'const DOMPurify = window.DOMPurify;')
   .replace(/import \{ svgStringToPngBlob \} from ['"][^'"]+['"];?/g, 'const svgStringToPngBlob = window.svgStringToPngBlob;')
   .replace(/import \{ copyPngBlobToClipboard \} from ['"][^'"]+['"];?/g, 'const copyPngBlobToClipboard = async blob => { window.copiedDiagram = blob; };')
@@ -39,24 +45,34 @@ const files = new Map([
   ['/purify.js', await readFile(new URL('../node_modules/dompurify/dist/purify.min.js', import.meta.url))],
   ['/component.js', Buffer.from(component)],
   ['/png.js', Buffer.from(pngHelper)],
+  ['/locales.js', Buffer.from(`${locales}\nwindow.zh = zh;`)],
+  ['/main.css', await readFile(new URL('../src/assets/main.css', import.meta.url))],
+  ['/themes.css', await readFile(new URL('../src/assets/themes.css', import.meta.url))],
   ['/', Buffer.from(`<!doctype html><meta charset="utf-8"><style>
-    body { margin: 20px; font-family: Arial, sans-serif; --bg-secondary: #f4f6f8; }
-    #app { width: 850px; } ${styles}
-    </style><div id="app"></div><script src="/vue.js"></script><script src="/purify.js"></script>
+    ${styles}
+    #app { width: 850px; height: calc(100% - 40px); margin: 20px; overflow: auto; }
+    </style><link rel="stylesheet" href="/main.css"><link rel="stylesheet" href="/themes.css">
+    <div id="app"></div><script src="/vue.js"></script><script src="/purify.js"></script><script src="/locales.js"></script>
     <script src="/mermaid.js"></script><script src="/png.js"></script><script src="/component.js"></script>`)],
 ])
 let server, browser, page, origin
+const errors = []
 before(async () => {
   server = createServer((req, res) => {
     const body = files.get(req.url)
     if (!body) { res.writeHead(404); res.end(); return }
-    res.setHeader('Content-Type', req.url.endsWith('.js') ? 'text/javascript' : 'text/html')
+    res.setHeader('Content-Type', req.url.endsWith('.js') ? 'text/javascript' : req.url.endsWith('.css') ? 'text/css' : 'text/html')
     res.end(body)
   })
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
   origin = `http://127.0.0.1:${server.address().port}`
-  browser = await chromium.launch({ channel: 'chrome', headless: true })
+  browser = await chromium.launch({ channel: 'chrome', headless: true, timeout: 30_000 })
   page = await browser.newPage({ viewport: { width: 920, height: 1000 } })
+  page.setDefaultTimeout(10_000)
+  page.on('pageerror', error => errors.push(error.message))
   await page.route('**/*', route => route.request().url().startsWith(origin) ? route.continue() : route.abort())
 })
 after(async () => {
@@ -86,7 +102,7 @@ const ebt = `flowchart TD
 
 async function mount(src) {
   await page.goto(origin)
-  await page.evaluate(src => { window.Vue.createApp(window.MermaidBlock, { src }).mount('#app'); }, src)
+  await page.evaluate(src => { window.app = window.Vue.createApp(window.MermaidBlock, { src }); window.app.mount('#app'); }, src)
   await page.locator('.mermaid-inner svg, .mermaid-error').waitFor()
 }
 
@@ -143,6 +159,7 @@ test('diagram directives cannot restore the HTML labels that would be stripped',
 test('copy-as-image produces PNG text pixels, not only boxes and arrows', async () => {
   await mount('flowchart LR\nA["上下文 x"] --> B["能量 E(x,y)"]')
   await page.locator('.mermaid-copy-btn').click({ force: true })
+  assert.equal(await page.getByRole('dialog').count(), 0, 'copy does not also open the diagram')
   await page.waitForFunction(() => !!window.copiedDiagram)
   const result = await page.evaluate(async () => {
     const image = await createImageBitmap(window.copiedDiagram)
@@ -163,9 +180,133 @@ test('copy-as-image produces PNG text pixels, not only boxes and arrows', async 
   assert.ok(result.width>0 && result.height>0 && result.dark>10)
 })
 
+const wide = `flowchart LR
+  subgraph SMILES["SMILES Stream"]
+    A["L 条随机 DeepSMILES 路径"] --> B["Token Emb + Token Gaussian Basis"]
+  end
+  subgraph Fusion["Fusion Layers × 8（d=512, 8 heads）"]
+    C["各流内 Self-Attention（AdaLN 注入 c 和 t）"] --> D["SMILES 专有：Inter-Path Attention"] --> E["流间 Cross-Attention"] --> F["SwiGLU FFN"]
+  end
+  B --> C
+  G["谱峰 m/z, intensity, top-200"] --> H["Gaussian Basis 编码 + Spec 相对 m/z 位置偏置"] --> C
+  I["ECFP 向量 → FP Compress"] --> C
+  F --> J["SMILES Head → 每个位置的 token 分布"]
+  E --> K["Spectrum Head → 速度场 v_t"]
+  E --> L["FP Head → 指纹向量"]`
+
+async function waitForPreview() {
+  await page.getByRole('dialog').waitFor()
+  await page.waitForFunction(() => {
+    const image = document.querySelector('.mermaid-preview-stage img')
+    return image?.complete && image.naturalWidth > 0
+  })
+}
+const previewWidth = () => page.locator('.mermaid-preview-stage img').evaluate(image => image.getBoundingClientRect().width)
+
+test('hover reveals enlarge and copy; the enlarged vector diagram fits the window', async () => {
+  await mount(wide)
+  await page.locator('#app').evaluate(el => { el.style.width = '340px' })
+  await page.mouse.move(0, 0)
+  await page.waitForFunction(() => getComputedStyle(document.querySelector('.mermaid-actions')).opacity === '0')
+  await page.locator('.mermaid-inner').hover()
+  await page.waitForFunction(() => getComputedStyle(document.querySelector('.mermaid-actions')).opacity === '1')
+  if (process.env.ARGUS_TEST_OUTPUT_DIR) {
+    await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR, { recursive: true })
+    await page.locator('.mermaid-block').screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/mermaid-hover.png` })
+  }
+  const inlineWidth = await page.locator('.mermaid-inner svg').evaluate(svg => svg.getBoundingClientRect().width)
+  await page.getByRole('button', { name: '放大查看', exact: true }).last().click()
+  await waitForPreview()
+  assert.ok(await previewWidth() > inlineWidth * 2, 'the narrow chat diagram grows to use the window')
+  const fit = await page.locator('.mermaid-preview-viewport').evaluate(el => ({
+    width: el.clientWidth, height: el.clientHeight, scrollWidth: el.scrollWidth, scrollHeight: el.scrollHeight,
+  }))
+  assert.ok(fit.scrollWidth <= fit.width + 1 && fit.scrollHeight <= fit.height + 1, 'fit shows the whole diagram')
+  assert.equal(await page.locator('.mermaid-preview-stage img').evaluate(image => {
+    const svg = new DOMParser().parseFromString(decodeURIComponent(image.src.split(',')[1]), 'image/svg+xml')
+    return svg.querySelectorAll('foreignObject, script, parsererror').length
+  }), 0)
+  if (process.env.ARGUS_TEST_OUTPUT_DIR) {
+    await page.screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/mermaid-preview.png` })
+  }
+})
+
+test('clicking the diagram supports zoom buttons, wheel zoom, panning and fit reset', async () => {
+  await mount(wide)
+  await page.locator('.mermaid-inner svg').click()
+  await waitForPreview()
+  const fittedWidth = await previewWidth()
+  await page.getByRole('button', { name: '放大', exact: true }).click()
+  assert.ok(await previewWidth() > fittedWidth * 1.2)
+  await page.getByRole('button', { name: '缩小', exact: true }).click()
+  assert.ok(Math.abs(await previewWidth() - fittedWidth) < 1)
+  const viewport = page.locator('.mermaid-preview-viewport')
+  const bounds = await viewport.boundingBox()
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)
+  await page.mouse.wheel(0, -500)
+  await page.waitForFunction(width => document.querySelector('.mermaid-preview-stage img').getBoundingClientRect().width > width, fittedWidth)
+  for (let i = 0; i < 5; i++) await page.getByRole('button', { name: '放大', exact: true }).click()
+  const before = await viewport.evaluate(el => el.scrollLeft)
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(bounds.x + bounds.width / 2 - 100, bounds.y + bounds.height / 2 - 60, { steps: 5 })
+  await page.mouse.up()
+  assert.ok(await viewport.evaluate(el => el.scrollLeft) > before + 90, 'drag pans the enlarged diagram')
+  await page.getByRole('button', { name: '适应窗口' }).click()
+  assert.ok(Math.abs(await previewWidth() - fittedWidth) < 1)
+  assert.equal(await viewport.evaluate(el => el.scrollLeft + el.scrollTop), 0)
+  await page.getByRole('button', { name: '关闭图表预览' }).click()
+  assert.equal(await page.getByRole('dialog').count(), 0)
+})
+
+test('keyboard entry, focus loop, Escape, backdrop and unmount clean up the preview', async () => {
+  await mount(wide)
+  const opener = page.locator('.mermaid-inner')
+  await opener.focus()
+  await page.keyboard.press('Enter')
+  await waitForPreview()
+  assert.equal(await page.getByRole('button', { name: '关闭图表预览' }).evaluate(el => el === document.activeElement), true)
+  await page.keyboard.press('Tab')
+  assert.equal(await page.getByRole('button', { name: '缩小' }).evaluate(el => el === document.activeElement), true)
+  await page.keyboard.press('Shift+Tab')
+  assert.equal(await page.getByRole('button', { name: '关闭图表预览' }).evaluate(el => el === document.activeElement), true)
+  await page.keyboard.press('Escape')
+  assert.equal(await page.getByRole('dialog').count(), 0)
+  assert.equal(await opener.evaluate(el => el === document.activeElement), true)
+  await page.keyboard.press('Space')
+  await waitForPreview()
+  await page.locator('.mermaid-preview-overlay').click({ position: { x: 3, y: 3 } })
+  assert.equal(await page.getByRole('dialog').count(), 0)
+  await opener.click()
+  await waitForPreview()
+  await page.evaluate(() => window.app.unmount())
+  assert.equal(await page.locator('.mermaid-preview-overlay').count(), 0)
+})
+
+test('the preview remains usable in a narrow dark window', async () => {
+  await page.setViewportSize({ width: 390, height: 700 })
+  try {
+    await mount(wide)
+    await page.evaluate(() => { document.documentElement.dataset.theme = 'dark'; document.querySelector('#app').style.width = '340px' })
+    await page.locator('.mermaid-inner').click()
+    await waitForPreview()
+    const bounds = await page.getByRole('dialog').boundingBox()
+    assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= 390)
+    assert.ok(bounds.y >= 0 && bounds.y + bounds.height <= 700)
+    assert.equal(await page.locator('.mermaid-preview-viewport').evaluate(el => getComputedStyle(el).backgroundColor), 'rgb(255, 255, 255)')
+    if (process.env.ARGUS_TEST_OUTPUT_DIR) {
+      await page.screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/mermaid-preview-dark-narrow.png` })
+    }
+  } finally {
+    await page.setViewportSize({ width: 920, height: 1000 })
+  }
+})
+
 test('invalid Mermaid source still falls back to readable code', async () => {
   const src = 'flowchart LR\nA["unfinished'
   await mount(src)
   assert.equal(await page.locator('.mermaid-error').textContent(), src)
   assert.equal(await page.locator('.mermaid-inner svg').count(), 0)
 })
+
+test('the component produces no browser errors', () => assert.deepEqual(errors, []))

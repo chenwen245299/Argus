@@ -20,7 +20,8 @@ import { useAiStore, type ModelOption } from '../../stores/ai'
 import { useCanvasStore } from '../../stores/canvas'
 import ChatAnswerBody from '../ChatAnswerBody.vue'
 import ContextMeter from '../ContextMeter.vue'
-import { applyContextCheckpoint, historyFingerprint, estimateContextText, type ContextCheckpoint, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
+import { beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage, type ChatRun, type StreamUsagePayload } from '../../utils/chatRunStats'
+import { applyContextCheckpoint, historyFingerprint, withContextDraft, type ContextCheckpoint, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import CanvasEditConfirmCard from '../CanvasEditConfirmCard.vue'
@@ -61,6 +62,10 @@ interface CanvasMessage {
   steps?: AgentStep[]
   /** Transient: what OpenRouter's server tools contributed to this answer. */
   serverTools?: ServerToolTrace
+  inputTokens?: number
+  outputTokens?: number
+  totalTokens?: number
+  cacheHitTokens?: number
 }
 
 interface CanvasConversation {
@@ -70,8 +75,13 @@ interface CanvasConversation {
   createdAt: string
   updatedAt: string
   contextStates?: Record<string, { checkpoint?: ContextCheckpoint; usage?: ContextUsage }>
+  usageRuns?: Record<string, ChatRun>
 }
 
+function legacyCanvasRuns(conv: CanvasConversation): ChatRun[] {
+  return conv.messages.filter(m => m.role === 'assistant' && typeof m.inputTokens === 'number')
+    .map(answer => legacyChatRun(answer, '', '', answer.steps?.length))
+}
 const conversations = ref<CanvasConversation[]>([])
 const activeConvId = ref<string | null>(null)
 const input = ref('')
@@ -300,8 +310,7 @@ const contextDisplay = computed(() => {
   const sel = model.value
   const usage = sel && activeConv.value?.contextStates?.[contextModelKey(sel)]?.usage
   if (!usage) return null
-  const draft = estimateContextText(input.value), used = usage.usedTokens + draft
-  return { ...usage, usedTokens: used, remainingTokens: Math.max(0, usage.contextWindow - used), estimated: usage.estimated || draft > 0 }
+  return withContextDraft(usage, input.value)
 })
 async function inspectContext() {
   const conv = activeConv.value, sel = model.value, root = libraryRoot.value
@@ -331,6 +340,9 @@ async function compactContext() {
   const fingerprint = historyFingerprint(rawContextHistory(conv.messages))
   activeRequestId = requestId; loading.value = true; contextCompacting.value = true
   contextError.value = ''; contextNotice.value = ''
+  const offUsage = await listen<StreamUsagePayload & { id: string }>(`canvas-context-${requestId}-compaction-usage`, e => {
+    if (!disposed && epoch === canvasEpoch) recordCompactionUsage(conv, e.payload, sel.providerId, sel.modelId, legacyCanvasRuns(conv))
+  })
   try {
     const result = await invoke<PreparedContext>('prepare_library_chat_context', {
       ...contextArguments(conv, sel, canvasHistory(conv, sel)), mode: 'manual', eventName: `canvas-context-${requestId}`, requestId,
@@ -346,6 +358,8 @@ async function compactContext() {
   } catch (error) {
     if (!disposed && epoch === canvasEpoch && !stoppedRequests.has(requestId)) contextError.value = String(error)
   } finally {
+    offUsage()
+    if (!disposed && epoch === canvasEpoch) scheduleSave()
     stoppedRequests.delete(requestId)
     if (activeRequestId === requestId) { activeRequestId = null; loading.value = false; contextCompacting.value = false }
   }
@@ -397,11 +411,27 @@ async function send() {
 
   const eventName = `canvas-chat-${props.canvasId.replace(/[^A-Za-z0-9:_/-]/g, '-')}-${live.id}`
   const requestId = newId()
+  const run = beginChatRun(conv, { id: requestId, answerId: live.id, providerId: sel.providerId, modelId: sel.modelId, modelCalls: 0 }, legacyCanvasRuns(conv))
+  const runStarted = performance.now()
+  const cacheReported = !!ai.settings.providers.find(p => p.id === sel.providerId)?.base_url.toLowerCase().includes('deepseek')
   activeRequestId = requestId
   const current = () => !disposed && epoch === canvasEpoch && root === libraryRoot.value && activeRequestId === requestId && !stoppedRequests.has(requestId)
   let pendingCheckpoint: ChatMessage[] | undefined
   detachListeners()
 
+  unlisteners.push(await listen<StreamUsagePayload>(`${eventName}-run-usage`, e => {
+    if (!disposed && epoch === canvasEpoch) applyRunUsage(run, e.payload, cacheReported)
+  }))
+  unlisteners.push(await listen<StreamUsagePayload>(`${eventName}-usage`, e => {
+    if (disposed || epoch !== canvasEpoch) return
+    applyRunUsage(run, e.payload, cacheReported)
+    if (!run.modelCalls) run.modelCalls = 1
+    live.inputTokens = run.inputTokens; live.outputTokens = run.outputTokens
+    live.totalTokens = run.totalTokens; live.cacheHitTokens = run.cacheHitTokens
+  }))
+  unlisteners.push(await listen<StreamUsagePayload & { id: string }>(`${eventName}-compaction-usage`, e => {
+    if (!disposed && epoch === canvasEpoch) recordCompactionUsage(conv, e.payload, sel.providerId, sel.modelId, [], cacheReported)
+  }))
   unlisteners.push(await listen<ContextUsage>(`${eventName}-context-usage`, e => { if (current()) setContextUsage(conv, sel, e.payload) }))
   unlisteners.push(await listen<{ messages: ChatMessage[] }>(`${eventName}-context-checkpoint`, e => { if (current()) pendingCheckpoint = e.payload.messages }))
   unlisteners.push(await listen<{ phase: string; error?: string }>(`${eventName}-context-status`, e => {
@@ -425,13 +455,15 @@ async function send() {
   }))
 
   unlisteners.push(await listen<{
-    phase?: string; tool?: string; arguments?: unknown; ok?: boolean
+    phase?: string; tool?: string; arguments?: unknown; ok?: boolean; round?: number
     images?: AgentStepImage[] | null
   }>(
     `${eventName}-agent`,
     (e) => {
       const p = e.payload
       if (!p) return
+      if (typeof p.round === 'number') run.modelCalls = Math.max(run.modelCalls ?? 0, p.round)
+      if (p.phase === 'tool') run.toolCalls = (run.toolCalls ?? 0) + 1
       if (p.phase === 'tool') {
         if (!live.steps) live.steps = []
         live.steps.push({ tool: p.tool ?? '', args: summarizeArgs(p.arguments) })
@@ -523,6 +555,7 @@ async function send() {
     }
   } finally {
     flushStreamRender(live)
+    run.durationMs = performance.now() - runStarted
     live.streaming = false
     if (activeRequestId === requestId) { loading.value = false; contextCompacting.value = false; activeRequestId = null; detachListeners() }
     stoppedRequests.delete(requestId)

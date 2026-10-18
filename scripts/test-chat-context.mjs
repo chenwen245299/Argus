@@ -47,4 +47,18 @@ test('CJK, surrogate pairs and bounded context display', () => {
   assert.equal(api.estimateContextText('abcdefgh中文🦀'), 5)
   assert.equal(api.contextPercent({ usedTokens: 1200, contextWindow: 1000 }), 100)
   assert.equal(api.contextPercent({ usedTokens: 0, contextWindow: 1000 }), 0)
+  assert.equal(api.contextPercent({ usedTokens: 100, contextWindow: 0 }), 0)
+})
+
+test('draft media matches backend estimates and updates breakdown without reading base64', () => {
+  const usage = {usedTokens:100,contextWindow:10000,messageTokens:40,remainingTokens:9900,estimated:false,mediaEstimated:false}
+  const attachment = type => ({type, get dataUrl(){throw new Error('base64 must not be read')}})
+  const projected = api.withContextDraft(usage, 'abcd', [attachment('audio'),attachment('image')])
+  assert.equal(projected.usedTokens, 100 + 1 + 8 + 8192 + 2048)
+  assert.equal(projected.messageTokens, 40 + 1 + 8 + 8192 + 2048)
+  assert.equal(projected.remainingTokens,0)
+  assert(projected.estimated && projected.mediaEstimated)
+  assert.deepEqual(api.withContextDraft(usage,''),usage)
+  const low = attachment('image'); low.detail = 'low'
+  assert.equal(api.withContextDraft(usage,'',[low]).usedTokens,193)
 })

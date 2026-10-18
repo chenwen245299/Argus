@@ -1,4 +1,5 @@
 import type { ChatMessage } from '../types'
+import type { Attachment } from './attachments'
 
 export interface ContextUsage {
   usedTokens: number
@@ -15,6 +16,7 @@ export interface ContextUsage {
   canCompact: boolean
   providerId: string
   modelId: string
+  systemFingerprint?: string
 }
 
 export interface ContextCheckpoint {
@@ -49,7 +51,19 @@ export function estimateContextText(text: string): number {
 }
 
 export function contextPercent(usage: ContextUsage): number {
+  if (!Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0) return 0
   return Math.max(0, Math.min(100, Math.round(usage.usedTokens / usage.contextWindow * 100)))
+}
+
+/** Match backend media estimates without scanning inline base64 blobs. */
+export function withContextDraft(usage: ContextUsage, text: string, attachments: Attachment[] = []): ContextUsage {
+  const media = attachments.reduce((n, attachment) => n + (attachment.type === 'image'
+    ? attachment.detail === 'low' ? 85 : 2048 : attachment.type === 'pdf' ? 4096 : 8192), 0)
+  const draft = text || attachments.length ? estimateContextText(text) + 4 + (attachments.length ? 4 : 0) + media : 0
+  const usedTokens = usage.usedTokens + draft
+  return { ...usage, usedTokens, remainingTokens: Math.max(0, usage.contextWindow - usedTokens),
+    messageTokens: usage.messageTokens + draft, estimated: usage.estimated || draft > 0,
+    mediaEstimated: usage.mediaEstimated || attachments.length > 0 }
 }
 
 export function applyContextCheckpoint<T extends { id: string }>(

@@ -11,7 +11,9 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { modelHasVision, modelHasVideo, modelHasAudio, useAiStore, type ModelOption } from '../../stores/ai'
 import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import ContextMeter from '../ContextMeter.vue'
-import { applyContextCheckpoint, historyFingerprint, estimateContextText, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
+import ChatRunStats from '../ChatRunStats.vue'
+import { beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage, type ChatRun } from '../../utils/chatRunStats'
+import { applyContextCheckpoint, historyFingerprint, withContextDraft, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
 import ServerToolTraceCard from '../ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../../utils/serverToolTrace'
 import { useSettingsStore } from '../../stores/settings'
@@ -29,7 +31,7 @@ import ChatAnswerBody from '../ChatAnswerBody.vue'
 import GuidedReadingIcon from '../GuidedReadingIcon.vue'
 import ChatMessageQueue from '../ChatMessageQueue.vue'
 import { useChatSendQueue, useChatQueueEditor, type QueuedChatMessage } from '../../utils/chatSendQueue'
-import { useFloatingChatComposer } from '../../utils/floatingChatComposer'
+import { useChatScrollResize } from '../../utils/chatScrollResize'
 import { guidedReadingPrompt, guidedReadingRequestHistory, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
@@ -74,6 +76,9 @@ interface StreamUsagePayload {
   total_tokens?: number
   cost_usd?: number | null
   cache_hit_tokens?: number
+  cache_reported?: boolean
+  model_calls?: number
+  model_duration_ms?: number
 }
 
 interface ExtractionProgressPayload {
@@ -179,7 +184,7 @@ const unlisteners = new Map<string, UnlistenFn>()
  * regenerated answer. Registering a new channel means adding it here, once.
  */
 const ANSWER_EVENT_SUFFIXES = [
-  '', '-reasoning', '-context', '-usage', '-audio', '-servertools',
+  '', '-reasoning', '-context', '-usage', '-run-usage', '-compaction-usage', '-audio', '-servertools',
   '-agent', '-confirm', '-confirm-close', '-context-usage', '-context-checkpoint', '-context-status',
 ] as const
 
@@ -662,6 +667,7 @@ function broadcastStreamUpdate(answerId: string) {
       conversationId: conv.id, title: conv.title, updatedAt: conv.updatedAt,
       answers: patch.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : []),
       contextUsage: Object.fromEntries(Object.entries(conv.contextStates ?? {}).map(([key, state]) => [key, state.usage])),
+      usageRuns: Object.fromEntries(Object.entries(conv.usageRuns ?? {}).filter(([, run]) => ids.has(run.answerId))),
       streams: localConversationStreams(conv) }
   })
 }
@@ -750,6 +756,7 @@ function handlePaperAiSync(p: PaperAiSyncMessage) {
     if (ownsConversationStream(conv.id)) return
     const answers = new Map(p.answers.map(a => [a.id, a]))
     const snapshot: Conversation = { ...conv, title: p.title, updatedAt: p.updatedAt,
+      usageRuns: { ...(conv.usageRuns ?? Object.fromEntries(legacyPaperRuns(conv).map(run => [run.id, run]))), ...p.usageRuns },
       contextStates: { ...conv.contextStates, ...Object.fromEntries(Object.entries(p.contextUsage ?? {}).map(([key, usage]) => [key, { ...conv.contextStates?.[key], usage }])) },
       nodes: conv.nodes.map(n => n.role === 'assistantGroup' ? { ...n, answers: n.answers.map(a => answers.get(a.id) ?? a) } : n) }
     adoptSyncedConversation(snapshot, p.streams, p.origin)
@@ -1445,10 +1452,15 @@ function paperContextArguments(conv: Conversation, model: Pick<ModelOption, 'pro
 function paperContextDisplay(model: ModelOption): ContextUsage | null {
   const usage = activeConversation.value?.contextStates?.[modelKey(model)]?.usage
   if (!usage || usage.providerId !== model.providerId || usage.modelId !== model.modelId) return null
-  const draft = estimateContextText(input.value) + attachments.value.reduce((n, a) => n + (a.type === 'image' ? (a.detail === 'low' ? 85 : 2048) : a.type === 'pdf' ? 4096 : 8192), 0)
-  const used = usage.usedTokens + draft
-  return { ...usage, usedTokens: used, remainingTokens: Math.max(0, usage.contextWindow - used), estimated: usage.estimated || draft > 0 }
+  return withContextDraft(usage, input.value, attachments.value)
 }
+function legacyPaperRuns(conv: Conversation): ChatRun[] {
+  return conv.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : [])
+    .filter(answer => typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number')
+    .map(answer => legacyChatRun(answer, answer.providerId, answer.modelId, answer.steps?.length))
+}
+const paperRuns = computed(() => activeConversation.value ? Object.values(activeConversation.value.usageRuns
+  ?? Object.fromEntries(legacyPaperRuns(activeConversation.value).map(run => [run.id, run]))) : [])
 const paperContextCompacting = computed(() => !!activeConversation.value && (
   [...streamOwners.values()].some(o => o.conv.id === activeConversation.value!.id && o.contextOnly)
   || activeConversation.value.nodes.some(n => n.role === 'assistantGroup' && n.answers.some(a => a.contextCompacting))))
@@ -1493,6 +1505,11 @@ async function compactPaperContextImpl(conv: Conversation, model: ModelOption, i
   activeRequestIds.set(id, requestId)
   streamOwners.set(id, { slug: conv.slug, conv, root, contextOnly: true })
   conv.contextTask = id
+  const offUsage = await listen<StreamUsagePayload & { id: string }>(`${id}-compaction-usage`, e => {
+    if (root !== syncLibraryRoot || syncDisposed) return
+    recordCompactionUsage(conv, e.payload, model.providerId, model.modelId, legacyPaperRuns(conv)).answerId = id
+    broadcastStreamUpdate(id)
+  })
   persistConversationFor(conv.slug, conv)
   try {
     const result = await invoke<PreparedContext>('prepare_library_chat_context', {
@@ -1509,6 +1526,7 @@ async function compactPaperContextImpl(conv: Conversation, model: ModelOption, i
     if (current()) contextErrors.value[key] = String(error)
   } finally {
     activeRequestIds.delete(id); streamOwners.delete(id)
+    offUsage()
     if (conv.contextTask === id) delete conv.contextTask
     if (!syncDisposed && root === syncLibraryRoot) persistConversationFor(conv.slug, conv)
   }
@@ -1599,6 +1617,7 @@ async function regenerate(group: ChatNode, answer: AssistantAnswer) {
   const slug = props.slug
   const conv = activeConversation.value
   const ra = findReactiveAnswer(answer.id)
+  conv.usageRuns ??= Object.fromEntries(legacyPaperRuns(conv).map(run => [run.id, run]))
   if (ra) {
     resetAnswerResult(ra)
     ra.createdAt = nowIso()
@@ -1862,6 +1881,9 @@ async function streamAnswerImpl(
   // Backend cancellation id: sent to `chat_with_library`, used by
   // stopAllStreaming to invoke `cancel_ai_request`.
   const requestId = crypto.randomUUID()
+  const run = beginChatRun(owner, { id: requestId, answerId: answer.id, providerId: answer.providerId, modelId: answer.modelId, modelCalls: 0 }, legacyPaperRuns(owner))
+  const runStarted = performance.now()
+  const cacheReported = !!ai.settings.providers.find(p => p.id === answer.providerId)?.base_url.toLowerCase().includes('deepseek')
   activeRequestIds.set(answer.id, requestId)
   const currentRequest = () => activeRequestIds.get(answer.id) === requestId && rootAtStart === syncLibraryRoot && !syncDisposed
   let pendingCheckpoint: ChatMessage[] | undefined
@@ -1878,6 +1900,22 @@ async function streamAnswerImpl(
   }
   broadcastConversationSnapshot(owner)
 
+  const accountingOffs: UnlistenFn[] = []
+  accountingOffs.push(await listen<StreamUsagePayload>(`${eventName}-usage`, event => {
+    if (rootAtStart !== syncLibraryRoot || syncDisposed) return
+    applyRunUsage(run, event.payload, cacheReported)
+    if (!run.modelCalls) run.modelCalls = 1
+  }))
+  accountingOffs.push(await listen<StreamUsagePayload>(`${eventName}-run-usage`, event => {
+    if (rootAtStart !== syncLibraryRoot || syncDisposed) return
+    applyRunUsage(run, event.payload, cacheReported)
+    broadcastStreamUpdate(answer.id)
+  }))
+  accountingOffs.push(await listen<StreamUsagePayload & { id: string }>(`${eventName}-compaction-usage`, event => {
+    if (rootAtStart !== syncLibraryRoot || syncDisposed) return
+    recordCompactionUsage(owner, event.payload, answer.providerId, answer.modelId, [], cacheReported).answerId = answer.id
+    broadcastStreamUpdate(answer.id)
+  }))
   unlisteners.set(`${answer.id}-context-usage`, await listen<ContextUsage>(`${eventName}-context-usage`, event => {
     if (!currentRequest()) return
     setPaperContextUsage(owner, answer, event.payload)
@@ -1907,6 +1945,8 @@ async function streamAnswerImpl(
   unlisteners.set(answer.id, unlisten)
 
   const unlistenUsage = await listen<StreamUsagePayload>(`${eventName}-usage`, (event) => {
+    applyRunUsage(run, event.payload, cacheReported)
+    if (!run.modelCalls) run.modelCalls = 1
     const reactiveAns = findReactiveAnswer(answer.id)
     if (reactiveAns) applyUsage(reactiveAns, event.payload)
     broadcastStreamUpdate(answer.id)
@@ -1949,11 +1989,14 @@ async function streamAnswerImpl(
     images?: AgentStepImage[] | null
     failed?: string[]
     rounds?: number
+    round?: number
     max?: number
   }>(`${eventName}-agent`, (event) => {
     const p = event.payload
     const reactiveAns = findReactiveAnswer(answer.id)
     if (!p || !reactiveAns) return
+    if (typeof p.round === 'number') run.modelCalls = Math.max(run.modelCalls ?? 0, p.round)
+    if (p.phase === 'tool') run.toolCalls = (run.toolCalls ?? 0) + 1
     if (p.phase === 'tool') {
       if (!reactiveAns.steps) reactiveAns.steps = []
       reactiveAns.steps.push({
@@ -2089,6 +2132,8 @@ async function streamAnswerImpl(
     }
   } finally {
     const reactiveAns = findReactiveAnswer(answer.id)
+    run.durationMs = performance.now() - runStarted
+    accountingOffs.forEach(off => off())
     if (reactiveAns) {
       reactiveAns.streaming = false
       reactiveAns.contextCompacting = false
@@ -2331,7 +2376,7 @@ function handleKeydown(e: KeyboardEvent) {
 // change again and yank the user back down. Once they scroll up they stay put
 // until they come back to the bottom themselves.
 const stickToBottom = ref(true)
-const { composerDock, composerClearance } = useFloatingChatComposer(messagesEl, () => stickToBottom.value)
+useChatScrollResize(messagesEl, () => stickToBottom.value)
 const STICK_THRESHOLD_PX = 120
 
 function onMessagesScroll() {
@@ -2779,7 +2824,7 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="messages-wrap" :style="{ '--composer-clearance': composerClearance }">
+        <div class="messages-wrap">
         <nav
           v-if="messageNav.length > 1"
           class="rail-nav"
@@ -3074,8 +3119,8 @@ onUnmounted(() => {
         </div>
         </div>
 
-        <footer ref="composerDock" class="composer">
-        <!-- Approval stays in the dock so its height also clears the last answer. -->
+        <footer class="composer">
+        <!-- Approval shares the input area below the conversation viewport. -->
         <div v-if="currentWrite" class="write-confirm-slot">
           <WriteConfirmCard
             :key="currentWrite.requestId"
@@ -3218,14 +3263,9 @@ onUnmounted(() => {
               </Transition>
             </div>
 
-            <span class="toolbar-spacer" />
+            <ChatRunStats v-if="props.standalone" :turns="activeConversation?.nodes.filter(n => n.role === 'user').length ?? 0" :runs="paperRuns" />
+            <span v-else class="toolbar-spacer" />
 
-            <button v-if="editingQueueId" class="toolbar-btn" :title="t('chat.queueCancelEdit')" :aria-label="t('chat.queueCancelEdit')" @click="queueEditor.cancel()">
-              <Icon icon="fluent:dismiss-20-regular" width="15" height="15" />
-            </button>
-            <button v-if="composerBusy" class="send-btn stop-btn" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="stopAllStreaming">
-              <Icon icon="fluent:stop-24-filled" width="15" height="15" />
-            </button>
             <span v-if="activeConversation" class="paper-context-meters">
               <ContextMeter v-for="model in selectedModels" :key="`${activeConversation.id}:${modelKey(model)}`"
                 :usage="paperContextDisplay(model)" :busy="composerBusy" :compacting="paperContextCompacting"
@@ -3233,6 +3273,12 @@ onUnmounted(() => {
                 :error="contextErrors[paperContextId(activeConversation, model)]" :notice="contextNotices[paperContextId(activeConversation, model)]"
                 @inspect="inspectPaperContext" @compact="compactPaperContext(model)" />
             </span>
+            <button v-if="editingQueueId" class="toolbar-btn" :title="t('chat.queueCancelEdit')" :aria-label="t('chat.queueCancelEdit')" @click="queueEditor.cancel()">
+              <Icon icon="fluent:dismiss-20-regular" width="15" height="15" />
+            </button>
+            <button v-if="composerBusy" class="send-btn stop-btn" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="stopAllStreaming">
+              <Icon icon="fluent:stop-24-filled" width="15" height="15" />
+            </button>
             <button class="send-btn" :class="{ active: canSend }" :disabled="!canSend"
               :title="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')"
               :aria-label="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')" @click="sendMessage(false)">
@@ -3730,6 +3776,7 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 /* Left navigation rail: one tick per user message (Codex-style). */
@@ -3799,14 +3846,13 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: calc(var(--content-header-height) + 18px) 12px calc(var(--composer-clearance, 160px) + 12px);
-  scroll-padding-bottom: calc(var(--composer-clearance, 160px) + 12px);
+  padding: calc(var(--content-header-height) + 18px) 12px 0;
 }
 .messages--no-floating-model {
   padding-top: 12px;
 }
 .standalone .messages {
-  padding: 24px 20px calc(var(--composer-clearance, 160px) + 16px);
+  padding: 24px 20px 0;
 }
 .empty-chat {
   min-height: calc(100% - var(--content-header-height));
@@ -4181,18 +4227,16 @@ onUnmounted(() => {
 .write-confirm-slot { flex-shrink: 0; margin-bottom: 10px; }
 
 .composer {
-  position: absolute;
-  inset: auto 0 0;
+  position: relative;
+  flex-shrink: 0;
   z-index: 10;
   isolation: isolate;
-  padding: 8px 10px 10px;
+  padding: 0 10px 10px;
   display: flex;
   flex-direction: column;
-  pointer-events: none;
 }
-.composer > * { pointer-events: auto; }
 .standalone .composer {
-  padding: 12px 20px 16px;
+  padding: 0 20px 16px;
 }
 /* The resize grip belongs to the input card, leaving the queued row above it
    free for steering, deletion and its menu. It only appears on hover. */
@@ -4401,7 +4445,7 @@ onUnmounted(() => {
   padding: 5px 7px 7px;
 }
 .toolbar-spacer { flex: 1; }
-.paper-context-meters { display: flex; flex-wrap: wrap; align-items: center; max-width: calc(100% - 28px); }
+.paper-context-meters { display: flex; flex-wrap: wrap; align-items: center; min-width: 0; max-width: calc(100% - 28px); }
 /* Most of the space between these icons was the buttons' own padding, not the
    gap: a 15px glyph in a 30px box carries 7.5px of air on each side, so even at
    gap:1 the glyphs sat ~16px apart. Shrinking the box is what actually tightens

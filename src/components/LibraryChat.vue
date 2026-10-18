@@ -2,10 +2,12 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import ChatMessageQueue from './ChatMessageQueue.vue'
 import ContextMeter from './ContextMeter.vue'
-import { applyContextCheckpoint, estimateContextText, historyFingerprint,
+import ChatRunStats from './ChatRunStats.vue'
+import { beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage, type ChatRun } from '../utils/chatRunStats'
+import { applyContextCheckpoint, estimateContextText, withContextDraft, historyFingerprint,
   type ContextCheckpoint, type ContextUsage, type PreparedContext } from '../utils/chatContext'
 import { useChatSendQueue, useChatQueueEditor, type QueuedChatMessage } from '../utils/chatSendQueue'
-import { useFloatingChatComposer } from '../utils/floatingChatComposer'
+import { useChatScrollResize } from '../utils/chatScrollResize'
 import { storeToRefs } from 'pinia'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
@@ -263,6 +265,7 @@ interface LibraryConversation {
   messages: LibraryUiMessage[]
   contextCheckpoint?: ContextCheckpoint
   contextUsage?: ContextUsage
+  usageRuns?: Record<string, ChatRun>
   /** Papers pinned to this conversation. The field predates pins: it held the
    *  old "文献库论文" mode's selection, which is exactly what a pin is now. */
   selectedPaperSlugs: string[]
@@ -371,6 +374,9 @@ interface StreamUsagePayload {
   total_tokens?: number
   cache_hit_tokens?: number
   cost_usd?: number | null
+  cache_reported?: boolean
+  model_calls?: number
+  model_duration_ms?: number
 }
 
 // ── Storage ───────────────────────────────────────────────────────────────────
@@ -411,6 +417,7 @@ function normalizeConversations(parsed: unknown): LibraryConversation[] {
       messages: conv.messages!,
       contextCheckpoint: conv.contextCheckpoint,
       contextUsage: conv.contextUsage,
+      usageRuns: conv.usageRuns,
       selectedPaperSlugs: normalizeSelectedPaperSlugs(conv.selectedPaperSlugs),
       createdAt: conv.createdAt || new Date().toISOString(),
       updatedAt: conv.updatedAt || conv.createdAt || new Date().toISOString(),
@@ -553,6 +560,12 @@ function persistOne(conv: LibraryConversation, epoch = libraryEpoch) {
 // ── State ─────────────────────────────────────────────────────────────────────
 
 const conversations = ref<LibraryConversation[]>([])
+function legacyRuns(conv: LibraryConversation): ChatRun[] {
+  return conv.messages.flatMap(msg => msg.role === 'assistant' ? (msg.variants?.length ? msg.variants : [msg]) : [])
+    .filter(answer => typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number')
+    .map(answer => legacyChatRun(answer, answer.model?.providerId ?? '', answer.model?.modelId ?? '', answer.agentSteps?.length))
+}
+const conversationRuns = computed(() => activeConv.value ? Object.values(activeConv.value.usageRuns ?? Object.fromEntries(legacyRuns(activeConv.value).map(run => [run.id, run]))) : [])
 const activeConvId = ref<string | null>(null)
 const input = ref('')
 const attachments = ref<Attachment[]>([])
@@ -585,7 +598,7 @@ function isGenerating(convId: string | null | undefined) {
 /** Busy state of the conversation on screen. */
 const loading = computed(() => isGenerating(activeConvId.value))
 const messagesEl = ref<HTMLElement | null>(null)
-const { composerDock, composerClearance } = useFloatingChatComposer(messagesEl)
+useChatScrollResize(messagesEl)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const selectedModel = ref<ModelSelection | null>(null)
 const modelMenuOpen = ref(false)
@@ -1625,9 +1638,7 @@ const contextDisplay = computed(() => {
   const usage = activeConv.value?.contextUsage
   const sel = effectiveModel()
   if (!usage || !sel || usage.providerId !== sel.providerId || usage.modelId !== sel.modelId) return null
-  const draft = estimateContextText(input.value) + attachments.value.reduce((n, a) => n + (a.type === 'image' ? (a.detail === 'low' ? 85 : 2048) : 4096), 0)
-  const used = usage.usedTokens + draft
-  return { ...usage, usedTokens: used, remainingTokens: Math.max(0, usage.contextWindow - used), estimated: usage.estimated || draft > 0 }
+  return withContextDraft(usage, input.value, attachments.value)
 })
 function markCompacting(id: string, on: boolean) {
   const next = new Set(contextCompacting.value)
@@ -1685,6 +1696,10 @@ async function compactIdleConversation(conv: LibraryConversation, id: string) {
   markGenerating(conv.id, true); markCompacting(conv.id, true)
   contextErrors.value[conv.id] = ''; contextNotices.value[conv.id] = ''
   activeRequestIds.set(id, requestId); targetConvIds.set(id, conv.id)
+  const offUsage = await listen<StreamUsagePayload & { id: string }>(`${id}-compaction-usage`, e => {
+    if (!stillWritable(conv.id, epoch)) return
+    recordCompactionUsage(conv, e.payload, sel?.providerId ?? '', sel?.modelId ?? '', legacyRuns(conv))
+  })
   try {
     const result = await invoke<PreparedContext>('prepare_library_chat_context', {
       ...contextArguments(conv, sel, applyContextCheckpoint(conv.messages, conv.contextCheckpoint, chatHistoryFromMessages, persistedChatHistory)),
@@ -1704,6 +1719,8 @@ async function compactIdleConversation(conv: LibraryConversation, id: string) {
     if (stillWritable(conv.id, epoch) && !stoppedTargetIds.has(id) && !chatDisposed) contextErrors.value[conv.id] = String(error)
   } finally {
     markCompacting(conv.id, false); markGenerating(conv.id, false)
+    offUsage()
+    persistConv(conv, epoch)
     activeRequestIds.delete(id); targetConvIds.delete(id); stoppedTargetIds.delete(id)
   }
 }
@@ -2024,6 +2041,7 @@ async function runAssistantRequestImpl(
   // Sources are collected per-request in a closure local (was a shared
   // module-level array that concurrent requests overwrote).
   let pendingSources: RetrievedChunk[] = []
+  const legacy = legacyRuns(conv)
   target.content = ''
   target.displayContent = ''
   target.error = false
@@ -2057,6 +2075,9 @@ async function runAssistantRequestImpl(
   // Backend cancellation id: generated per request, sent to `chat_with_library`,
   // and used by stopStreaming to invoke `cancel_ai_request`.
   const requestId = crypto.randomUUID()
+  const run = beginChatRun(conv, { id: requestId, answerId: target.id, providerId: sel?.providerId ?? '', modelId: sel?.modelId ?? '', modelCalls: 0 }, legacy)
+  const runStarted = performance.now()
+  const cacheReported = !!ai.settings.providers.find(p => p.id === sel?.providerId)?.base_url.toLowerCase().includes('deepseek')
   activeRequestIds.set(target.id, requestId)
   stoppedTargetIds.delete(target.id)
   scrollToBottom()
@@ -2067,6 +2088,18 @@ async function runAssistantRequestImpl(
   targetConvIds.set(target.id, streamConvId)
   const offs: UnlistenFn[] = []
   activeUnlisteners.set(target.id, offs)
+  const accountingOffs: UnlistenFn[] = []
+  accountingOffs.push(await listen<StreamUsagePayload>(usageEventName, e => {
+    if (!stillWritable(conv.id, streamEpoch) || chatDisposed) return
+    applyRunUsage(run, e.payload, cacheReported)
+    if (!run.modelCalls) run.modelCalls = 1
+  }))
+  accountingOffs.push(await listen<StreamUsagePayload>(`${eventName}-run-usage`, e => {
+    if (stillWritable(conv.id, streamEpoch)) applyRunUsage(run, e.payload, cacheReported)
+  }))
+  accountingOffs.push(await listen<StreamUsagePayload & { id: string }>(`${eventName}-compaction-usage`, e => {
+    if (stillWritable(conv.id, streamEpoch)) recordCompactionUsage(conv, e.payload, run.providerId, run.modelId, [], cacheReported)
+  }))
   let pendingCheckpoint: ChatMessage[] | undefined
   offs.push(await listen<ContextUsage>(`${eventName}-context-usage`, (e) => {
     if (stillWritable(conv.id, streamEpoch)) conv.contextUsage = e.payload
@@ -2093,6 +2126,8 @@ async function runAssistantRequestImpl(
   offs.push(await listen<AgentEventPayload>(`${eventName}-agent`, (e) => {
     const p = e.payload
     if (!p) return
+    if (typeof p.round === 'number') run.modelCalls = Math.max(run.modelCalls ?? 0, p.round)
+    if (p.phase === 'tool') run.toolCalls = (run.toolCalls ?? 0) + 1
     if (!target.agentSteps) target.agentSteps = []
     if (p.phase === 'evicted') {
       // The run outgrew the model's window and older results were dropped. The
@@ -2198,6 +2233,8 @@ async function runAssistantRequestImpl(
 
   offs.push(await listen<StreamUsagePayload>(usageEventName, (e) => {
     const usage = e.payload
+    applyRunUsage(run, usage, cacheReported)
+    if (!run.modelCalls) run.modelCalls = 1
     if (typeof usage.input_tokens === 'number') target.inputTokens = usage.input_tokens
     if (typeof usage.output_tokens === 'number') target.outputTokens = usage.output_tokens
     if (typeof usage.total_tokens === 'number') target.totalTokens = usage.total_tokens
@@ -2313,6 +2350,8 @@ async function runAssistantRequestImpl(
     assistantMsg.streaming = false
     flushStreamRender(target)
   } finally {
+    run.durationMs = performance.now() - runStarted
+    accountingOffs.forEach(off => off())
     markCompacting(conv.id, false)
     markGenerating(streamConvId, false)
     stoppedTargetIds.delete(target.id)
@@ -2457,6 +2496,7 @@ async function regenerateAssistant(msg: LibraryUiMessage) {
   const reactiveMsg = conv.messages.find(m => m.id === msg.id) as LibraryUiMessage | undefined
   if (!reactiveMsg) return
   const sel = effectiveModel()
+  conv.usageRuns ??= Object.fromEntries(legacyRuns(conv).map(run => [run.id, run]))
   reactiveMsg.variants = []
   reactiveMsg.activeVariantId = undefined
   const history = buildHistoryBeforeMessage(conv, msg.id)
@@ -2849,7 +2889,7 @@ onUnmounted(() => {
       <div class="lc-main">
 
         <!-- Messages -->
-        <div class="messages-wrap" :style="{ '--composer-clearance': composerClearance }">
+        <div class="messages-wrap">
         <nav
           v-if="messageNav.length > 1"
           class="rail-nav"
@@ -3277,7 +3317,7 @@ onUnmounted(() => {
         </div>
 
         <!-- Input area -->
-        <div ref="composerDock" class="input-area">
+        <div class="input-area">
           <!-- Approval for a write the agent asked for, directly above the
                composer and the same width as it. -->
           <WriteConfirmCard
@@ -3456,7 +3496,12 @@ onUnmounted(() => {
                   <span v-if="selectedPapers.length > 0" class="paper-count">{{ selectedPapers.length }}</span>
                 </button>
               </div>
+              <ChatRunStats :turns="activeConv?.messages.filter(m => m.role === 'user').length ?? 0" :runs="conversationRuns" />
               <div class="footer-right">
+                <ContextMeter :key="activeConvId ?? 'new'" :usage="contextDisplay" :busy="composerBusy"
+                  :compacting="!!activeConvId && contextCompacting.has(activeConvId)"
+                  :error="activeConvId ? contextErrors[activeConvId] : ''" :notice="activeConvId ? contextNotices[activeConvId] : ''"
+                  @compact="compactContextNow" @inspect="inspectContext" />
                 <span v-if="activeConvId && contextCompacting.has(activeConvId)" class="context-progress" role="status">{{ t('chatContext.compacting') }}</span>
                 <button v-if="editingQueueId" class="toolbar-btn" :title="t('chat.queueCancelEdit')" :aria-label="t('chat.queueCancelEdit')" @click="queueEditor.cancel()">
                   <Icon icon="fluent:dismiss-20-regular" width="14" height="14" />
@@ -3464,11 +3509,6 @@ onUnmounted(() => {
                 <button v-if="composerBusy" class="send-btn stop-btn" :title="t('chat.stop')" :aria-label="t('chat.stop')" @click="stopStreaming">
                   <Icon icon="fluent:stop-24-filled" width="13" height="13" />
                 </button>
-                <ContextMeter :key="activeConvId ?? 'new'" :usage="contextDisplay" :busy="composerBusy"
-                  :compacting="!!activeConvId && contextCompacting.has(activeConvId)"
-                  :error="activeConvId ? contextErrors[activeConvId] : ''"
-                  :notice="activeConvId ? contextNotices[activeConvId] : ''"
-                  @compact="compactContextNow" @inspect="inspectContext" />
                 <button class="send-btn" :disabled="!canSend"
                   :title="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')"
                   :aria-label="t(editingQueueId ? 'chat.queueSaveEdit' : composerBusy ? 'chat.queueSend' : 'copilot.send')" @click="sendMessage(false)">
@@ -4146,6 +4186,7 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 /* Left navigation rail: one tick per user message (Codex-style). */
@@ -4215,8 +4256,7 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 24px 32px calc(var(--composer-clearance, 160px) + 16px);
-  scroll-padding-bottom: calc(var(--composer-clearance, 160px) + 16px);
+  padding: 24px 32px 0;
   display: flex;
   flex-direction: column;
   gap: 22px;
@@ -5164,16 +5204,14 @@ onUnmounted(() => {
 /* ── Input area ──────────────────────────────────────────────────────────── */
 
 .input-area {
-  position: absolute;
-  inset: auto 0 0;
+  position: relative;
+  flex-shrink: 0;
   z-index: 10;
-  padding: 8px 24px 18px;
+  padding: 0 24px 18px;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  pointer-events: none;
 }
-.input-area > * { pointer-events: auto; }
 .composer-stack { position: relative; isolation: isolate; }
 
 .composer {
@@ -5224,8 +5262,8 @@ onUnmounted(() => {
 
 /* Most of the space between these icons is the buttons' own padding, not the
    gap — see the note on .toolbar-btn below. Kept in step with AiTab's composer. */
-.footer-left { display: flex; align-items: center; gap: 2px; }
-.footer-right { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.footer-left { display: flex; flex-shrink: 0; align-items: center; gap: 2px; }
+.footer-right { display: flex; flex-shrink: 0; align-items: center; gap: 6px; margin-left: auto; }
 .context-progress { font-size: 11px; color: var(--text-tertiary); }
 
 .attach-btn {

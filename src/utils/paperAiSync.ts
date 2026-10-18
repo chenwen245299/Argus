@@ -1,6 +1,7 @@
 import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { PaperAiAnswer, PaperAiConversation } from '../types/paperAi'
 import type { ContextUsage } from './chatContext'
+import type { ChatRun } from './chatRunStats'
 
 export const PAPER_AI_SYNC_EVENT = 'argus-paper-ai-sync'
 export const PAPER_AI_SAVED_EVENT = 'paper-ai-conversations-saved'
@@ -20,7 +21,7 @@ interface Scope {
 type Content =
   | { kind: 'request'; conversationId?: string; select?: boolean }
   | { kind: 'snapshot'; conversation: PaperAiConversation; streams: PaperAiStreamInfo[]; select?: boolean }
-  | { kind: 'update'; conversationId: string; title: string; updatedAt: string; answers: PaperAiAnswer[]; streams: PaperAiStreamInfo[]; contextUsage?: Record<string, ContextUsage | undefined> }
+  | { kind: 'update'; conversationId: string; title: string; updatedAt: string; answers: PaperAiAnswer[]; streams: PaperAiStreamInfo[]; contextUsage?: Record<string, ContextUsage | undefined>; usageRuns?: Record<string, ChatRun> }
   | { kind: 'select'; conversationId: string }
   | { kind: 'stop'; conversationId: string }
   | { kind: 'closed' }

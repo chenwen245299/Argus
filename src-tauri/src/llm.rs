@@ -2653,6 +2653,12 @@ fn emit_stream_usage(
             "cache_hit_tokens": cache_hit_tokens,
         }),
     );
+    if let Some((parent, sample_id)) = event_name.rsplit_once("-compact-") {
+        let _ = app.emit(format!("{parent}-compaction-usage").as_str(), serde_json::json!({
+            "id": sample_id, "input_tokens": input_tokens, "output_tokens": output_tokens,
+            "total_tokens": total_tokens, "cache_hit_tokens": cache_hit_tokens, "model_calls": 1,
+        }));
+    }
 }
 
 fn usage_cost_usd(usage: &serde_json::Value) -> Option<f64> {
@@ -4715,12 +4721,18 @@ pub struct TurnUsage {
     pub output_tokens: u64,
     pub cache_hit_tokens: u64,
     pub cost_usd: Option<f64>,
+    pub cache_reported: bool,
+    pub model_calls: u64,
+    pub model_duration_ms: u64,
 }
 
 impl TurnUsage {
     /// Fold another round in. `cost_usd` stays `None` until some round reports
     /// one, so "the provider never told us" does not become "it was free".
     pub fn add(&mut self, other: &TurnUsage) {
+        self.cache_reported = (self.model_calls == 0 || self.cache_reported) && other.cache_reported;
+        self.model_calls = self.model_calls.saturating_add(other.model_calls);
+        self.model_duration_ms = self.model_duration_ms.saturating_add(other.model_duration_ms);
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.cache_hit_tokens = self.cache_hit_tokens.saturating_add(other.cache_hit_tokens);
@@ -4756,6 +4768,26 @@ pub fn emit_usage(app: &tauri::AppHandle, event_name: &str, usage: &TurnUsage) {
         usage.cost_usd,
         usage.cache_hit_tokens,
     );
+    emit_run_usage(app, event_name, usage);
+}
+
+/// Live totals use a separate channel so answer cost strips still receive one
+/// final total while the composer can show completed model calls as they land.
+pub fn emit_run_usage(app: &tauri::AppHandle, event_name: &str, usage: &TurnUsage) {
+    let mut payload = serde_json::json!({
+        "cache_hit_tokens": usage.cache_hit_tokens, "cache_reported": usage.cache_reported,
+        "model_calls": usage.model_calls, "model_duration_ms": usage.model_duration_ms,
+    });
+    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+        payload["input_tokens"] = serde_json::json!(usage.input_tokens);
+        payload["output_tokens"] = serde_json::json!(usage.output_tokens);
+        payload["total_tokens"] = serde_json::json!(usage.input_tokens.saturating_add(usage.output_tokens));
+    }
+    let event = if let Some((parent, sample_id)) = event_name.rsplit_once("-compact-") {
+        payload["id"] = serde_json::json!(sample_id);
+        format!("{parent}-compaction-usage")
+    } else { format!("{event_name}-run-usage") };
+    let _ = app.emit(event.as_str(), payload);
 }
 
 /// Whether this provider can take a `tools` parameter at all.
@@ -5023,7 +5055,6 @@ pub async fn compact_completion(
     if supports_tool_calling(provider) {
         let turn = stream_tool_request(provider, api_key, model, messages, tools, event_name,
             app, false, None, "context-compaction", cancel, false, false, Some(max_tokens)).await?;
-        emit_usage(app, event_name, &turn.usage);
         if !turn.tool_calls.is_empty() { return Err("Compaction returned a tool call.".into()); }
         Ok(turn.content)
     } else {
@@ -5258,6 +5289,7 @@ async fn stream_tool_request(
     let req = client
         .post(&url)
         .header("Content-Type", "application/json");
+    let request_started = std::time::Instant::now();
     let resp = crate::cancel::until_cancelled(
         cancel.as_ref(),
         send_chat_with_soclaas_retry(openai_auth(req, provider, api_key), provider, &body, !tools.is_empty()),
@@ -5291,6 +5323,7 @@ async fn stream_tool_request(
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
     let mut cache_hit_tokens: u64 = 0;
+    let mut cache_reported = false;
     let mut cost_usd: Option<f64> = None;
     let mut trace = crate::openrouter::ServerToolTrace::default();
     let mut compact_finish: Option<String> = None;
@@ -5381,6 +5414,7 @@ async fn stream_tool_request(
                     .or_else(|| usage["cached_tokens"].as_u64())
                 {
                     cache_hit_tokens = v;
+                    cache_reported = true;
                 }
                 if (is_openrouter || is_kimi) && cost_usd.is_none() {
                     cost_usd = usage_cost_usd(usage);
@@ -5474,6 +5508,13 @@ async fn stream_tool_request(
     // additive on the frontend, and a citation found in round one should not
     // wait for round five to appear.
     emit_server_tool_trace(app, event_name, &trace);
+    let usage = TurnUsage {
+        input_tokens, output_tokens, cache_hit_tokens,
+        cost_usd: if is_openrouter || is_kimi { cost_usd } else { None },
+        cache_reported, model_calls: 1,
+        model_duration_ms: request_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    };
+    if compact_max_tokens.is_some() { emit_usage(app, event_name, &usage); }
     if let Some(error) = compact_error { return Err(error); }
     if compact_finish.as_deref().is_some_and(|r| matches!(r, "length" | "content_filter" | "error")) {
         return Err(format!("Compaction summary was incomplete (finish_reason={}).", compact_finish.unwrap()));
@@ -5493,12 +5534,7 @@ async fn stream_tool_request(
         content: accumulated,
         reasoning: reasoning_text,
         tool_calls,
-        usage: TurnUsage {
-            input_tokens,
-            output_tokens,
-            cache_hit_tokens,
-            cost_usd: if is_openrouter || is_kimi { cost_usd } else { None },
-        },
+        usage,
     })
 }
 
@@ -5878,17 +5914,26 @@ mod tool_call_tests {
             output_tokens: 200,
             cache_hit_tokens: 1_000,
             cost_usd: Some(0.001),
+            cache_reported: true, model_calls: 1, model_duration_ms: 1000,
+            ..Default::default()
         });
         total.add(&TurnUsage {
             input_tokens: 5_000,
             output_tokens: 400,
             cache_hit_tokens: 2_500,
             cost_usd: Some(0.002),
+            cache_reported: true, model_calls: 1, model_duration_ms: 2000,
+            ..Default::default()
         });
         assert_eq!(total.input_tokens, 8_000);
         assert_eq!(total.output_tokens, 600);
         assert_eq!(total.cache_hit_tokens, 3_500);
         assert_eq!(total.cost_usd, Some(0.003));
+        assert_eq!(total.model_calls, 2);
+        assert_eq!(total.model_duration_ms, 3000);
+        assert!(total.cache_reported);
+        total.add(&TurnUsage { model_calls: 1, ..Default::default() });
+        assert!(!total.cache_reported, "an unknown cache sample cannot be presented as a measured miss");
     }
 
     /// A provider that reports no cost must leave it unknown, not claim zero —

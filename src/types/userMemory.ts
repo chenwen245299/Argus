@@ -20,4 +20,7 @@ export interface UserMemory {
   lastCheckedAt: string | null
   lastError: string | null
   updating: boolean
+  pendingTurns?: number
+  backgroundRuns?: number
+  liveWrites?: number
 }

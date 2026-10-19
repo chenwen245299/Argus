@@ -343,6 +343,22 @@ mod tests {
     }
 
     #[test]
+    fn same_machine_main_and_paper_windows_keep_independent_writer_cells() {
+        let tmp = TempRoot::new();
+        let popup = "machine:window:paper-ai-paper";
+        save_log(tmp.root(), "machine", &model(day_with("machine", 60_000, 1))).unwrap();
+        save_log(tmp.root(), popup, &model(day_with(popup, 90_000, 0))).unwrap();
+        // Main resumes with an old copy that never saw the popup's reading.
+        save_log(tmp.root(), "machine", &model(day_with("machine", 90_000, 1))).unwrap();
+        let disk = read_log(tmp.root());
+        assert_eq!(slot_reading(&disk, "machine"), Some(90_000));
+        assert_eq!(slot_reading(&disk, popup), Some(90_000));
+        // Re-saving a completed popup session cannot add its duration twice.
+        save_log(tmp.root(), popup, &model(day_with(popup, 90_000, 0))).unwrap();
+        assert_eq!(slot_reading(&read_log(tmp.root()), popup), Some(90_000));
+    }
+
+    #[test]
     fn stale_machine_save_does_not_clobber_the_other_machines_reading_time() {
         // The reported bug, end to end through the real read-merge-write file path.
         let tmp = TempRoot::new();

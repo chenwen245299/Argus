@@ -345,6 +345,27 @@ pub struct PreparedContext {
 }
 
 pub async fn compact(
+    root: &str,
+    messages: &mut Vec<Value>,
+    tools: &[Value],
+    policy: Policy,
+    provider: &AiProvider,
+    api_key: &str,
+    model: &str,
+    event: &str,
+    app: &tauri::AppHandle,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<Option<String>, String> {
+    // A volatile personalization block is not conversation evidence. Never
+    // summarize it into a user-role checkpoint or persist it in chat history.
+    let memory = crate::user_memory::take_context(messages);
+    let result = compact_without_memory(root, messages, tools, policy, provider, api_key, model, event, app, cancel).await;
+    if let Some(context) = memory { crate::user_memory::attach_context(messages, &context); }
+    result
+}
+
+async fn compact_without_memory(
+    root: &str,
     messages: &mut Vec<Value>,
     tools: &[Value],
     policy: Policy,
@@ -390,6 +411,7 @@ pub async fn compact(
                 unresolved questions and the next action. Keep uncertainty and failed/interrupted work explicit. \
                 Merge an earlier checkpoint with new evidence, removing stale conclusions. \
                 Use the conversation's language. Summarize only: do not answer its questions or run tools.", policy.summary)}));
+            let input = crate::chat_images::for_request(root, &input, crate::copilot::model_sees_images(provider, model)).await?;
             summary = crate::cancel::until_cancelled(cancel.as_ref(), llm::compact_completion(
                 provider, api_key, model, &input, tools, policy.summary + policy.reserve, &format!("{event}-compact-{}", uuid::Uuid::new_v4()), app, cancel.clone()))
                 .await.ok_or("cancelled")??;
@@ -415,6 +437,21 @@ mod tests {
     use super::*;
     fn msg(role: &str, text: &str) -> Value {
         json!({"role":role,"content":text})
+    }
+    #[test]
+    fn volatile_memory_never_becomes_persisted_conversation_evidence() {
+        let mut messages = vec![msg("system", "stable rules"), msg("user", &"old question".repeat(100)),
+            msg("assistant", &"old evidence".repeat(100)), msg("user", "current question")];
+        let memory = "## Argus user memory (personalization data)\nprivate unrelated background";
+        crate::user_memory::attach_context(&mut messages, memory);
+        let frame = crate::user_memory::take_context(&mut messages).unwrap();
+        let (start, end) = compact_range(&messages, 1).unwrap();
+        assert!(!transcript_text(&messages[start..end]).contains("private unrelated background"));
+        commit_summary(&mut messages, start, end, "verified old question and evidence", 1000, None).unwrap();
+        crate::user_memory::attach_context(&mut messages, &frame);
+        let saved: Vec<_> = messages.iter().filter(|message| message["role"] != "system").collect();
+        assert!(!serde_json::to_string(&saved).unwrap().contains("private unrelated background"));
+        assert!(messages.iter().any(|message| message["content"] == memory));
     }
     fn provider(window: Option<u64>) -> AiProvider {
         serde_json::from_value(json!({"id":"p","name":"test","kind":"openai_compatible",

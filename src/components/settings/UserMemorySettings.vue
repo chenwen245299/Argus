@@ -76,7 +76,9 @@ onUnmounted(() => { disposed = true; readEpoch++; off?.(); window.removeEventLis
           <input type="checkbox" :checked="profile.enabled" :disabled="busy" @change="toggle">
         </label>
         <p class="memory-note">{{ t('userMemory.privacy') }}</p>
-        <p class="memory-status" role="status">{{ !profile.enabled ? t('userMemory.disabled') : profile.updating ? t('userMemory.updating') : profile.lastError ? t('userMemory.learningFailed') : t('userMemory.automatic') }}</p>
+        <p class="memory-status" role="status">{{ !profile.enabled ? t('userMemory.disabled') : profile.updating ? t('userMemory.updating') : profile.lastError ? t('userMemory.learningFailed') : (profile.pendingTurns ?? 0) > 0 ? t('userMemory.pending', { n: profile.pendingTurns }) : t('userMemory.automatic') }}</p>
+        <p v-if="profile.enabled" class="memory-note memory-batch-hint">{{ t('userMemory.batchHint') }}</p>
+        <p class="memory-counters">{{ t('userMemory.counters', { pending: profile.pendingTurns ?? 0, runs: profile.backgroundRuns ?? 0, writes: profile.liveWrites ?? 0 }) }}</p>
       </section>
 
       <div class="memory-heading">
@@ -121,6 +123,8 @@ onUnmounted(() => { disposed = true; readEpoch++; off?.(); window.removeEventLis
 input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; flex-shrink: 0; }
 .memory-detail, .memory-note { font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
 .memory-note { margin: 14px 0 8px; }
+.memory-batch-hint { margin: 8px 0; }
+.memory-counters { color: var(--text-tertiary); font-size: 11px; line-height: 1.6; margin: 8px 0 0; }
 .memory-status { font-size: 12px; color: var(--accent); margin: 0; line-height: 1.6; }
 .memory-heading, .memory-entry-footer, .memory-entry-heading, .memory-buttons { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .memory-count { color: var(--text-secondary); font-weight: 400; margin-left: 6px; }

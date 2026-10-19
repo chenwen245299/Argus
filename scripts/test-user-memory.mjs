@@ -27,7 +27,7 @@ before(async () => {
       import {createApp,h} from 'vue'; import {createPinia} from 'pinia'; import {createI18n} from 'vue-i18n';
       import QaSettings from '/src/components/settings/QaSettings.vue'; import {zh,en} from '/src/i18n/locales.ts';
       import '/src/assets/main.css'; import '/src/assets/themes.css';
-      const initial = {enabled:true,autoLearn:true,entries:[],revision:0,lastCheckedAt:null,lastError:null,updating:false};
+      const initial = {enabled:true,autoLearn:true,entries:[],revision:0,lastCheckedAt:null,lastError:null,updating:false,pendingTurns:0,backgroundRuns:0,liveWrites:0};
       const test=window.__test={listeners:new Map(),calls:[],fail:false,readFail:false,
         profile:JSON.parse(localStorage.getItem('memory')||'null')||initial,
         emit(name,payload){ for(const cb of test.listeners.get(name)||[])cb({payload}); },
@@ -41,7 +41,7 @@ before(async () => {
             return value;
           }
           if(test.fail)throw new Error('write failed');
-          if(command==='configure_user_memory')test.publish({enabled:args.enabled,autoLearn:args.autoLearn});
+          if(command==='configure_user_memory')test.publish({enabled:args.enabled,autoLearn:args.autoLearn,pendingTurns:args.enabled?test.profile.pendingTurns:0});
           if(command==='edit_user_memory'){
             const edit=args.edit,entry=test.profile.entries.find(e=>e.id===edit.id);
             if(entry.updatedAt!==edit.expectedUpdatedAt)throw new Error('stale edit');
@@ -89,16 +89,22 @@ test('automatic background changes refresh the visible profile and show evidence
   await page.locator('.memory-evidence summary').nth(1).click()
   assert.match(await page.locator('.memory-evidence blockquote').nth(1).textContent(),/没学过 KL/)
   await page.evaluate(()=>window.__test.publish({updating:true}))
-  await page.waitForFunction(()=>document.querySelector('.memory-status')?.textContent.includes('正在根据'))
+  await page.waitForFunction(()=>document.querySelector('.memory-status')?.textContent.includes('正在合并'))
   await page.evaluate(()=>{const entry=window.__test.profile.entries[1];entry.content='正在学习 KL 散度';entry.knowledgeLevel='learning';window.__test.publish({updating:false})})
   await page.waitForFunction(()=>document.querySelectorAll('.memory-level')[1]?.textContent==='正在学习')
 })
 test('turning memory off persists across reopening and keeps existing records',async()=>{
+  await page.evaluate(()=>window.__test.publish({pendingTurns:12,backgroundRuns:2,liveWrites:4}))
+  await page.waitForFunction(()=>document.querySelector('.memory-counters')?.textContent.includes('待核对 12 轮'))
+  assert.match(await page.locator('.memory-status').textContent(),/已保留 12 轮/)
+  assert.match(await page.locator('.memory-counters').textContent(),/后台整理 2 批/)
+  assert.match(await page.locator('.memory-batch-hint').textContent(),/每小时最多 6 批/)
   await page.locator('.memory-toggle input').uncheck()
   await page.waitForFunction(()=>document.querySelector('.memory-status')?.textContent.startsWith('已关闭'))
   assert.equal(await page.locator('.memory-entry').count(),2)
   await page.reload();await page.locator('.memory-toggle input').waitFor()
   assert.equal(await page.locator('.memory-toggle input').isChecked(),false)
+  assert.match(await page.locator('.memory-counters').textContent(),/待核对 0 轮/)
   assert.deepEqual(await page.evaluate(()=>({enabled:window.__test.profile.enabled,autoLearn:window.__test.profile.autoLearn})),{enabled:false,autoLearn:false})
 })
 test('corrections can protect a fact and preserve the knowledge category',async()=>{

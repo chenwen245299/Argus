@@ -16,6 +16,7 @@ import { useAiStore } from '../stores/ai'
 import { useSelectionStore } from '../stores/selection'
 import { useCanvasStore } from '../stores/canvas'
 import { useRagStore } from '../stores/rag'
+import { useReadingWindowFocus } from '../composables/useReadingWindowFocus'
 import { useActivityStore } from '../stores/activity'
 import { switchToTranslationsTab, askAiText } from '../stores/translationHistory'
 import { pendingSnippet, initSnippetStore, libraries as snippetLibraries } from '../stores/snippetLibrary'
@@ -561,16 +562,27 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
 // ── Activity tracking ─────────────────────────────────────────────────────────
 let activityStatusReady = false
+let activityDisposed = false
 const knownReadingStatus = new Map<string, string>()
 const knownAiSummaryDone = new Map<string, boolean>()
 
+const readingWindowFocused = useReadingWindowFocus()
+function readingPaperInfo() {
+  if (rightSidebarVisible.value && sidebarTab.value === 'ai') {
+    const slug = readerStore.openSlug ?? selectionStore.selectedSlug
+    if (slug) {
+      const paper = libraryStore.papers.find(p => p.slug === slug)
+      return { slug, title: paper?.title ?? slug, fileType: paper?.file_type ?? 'pdf' }
+    }
+  }
+  return activeTabKind.value === 'paper' ? activePaperInfo() : null
+}
 function syncActivityReading() {
-  const info = activePaperInfo()
+  const info = readingPaperInfo()
   const canTrack =
     !!libraryStore.currentPath &&
     !!info &&
-    document.visibilityState !== 'hidden' &&
-    document.hasFocus()
+    readingWindowFocused.value
 
   if (canTrack && info) {
     activityStore.beginReading(info.slug, info.title, info.fileType)
@@ -579,9 +591,8 @@ function syncActivityReading() {
   }
 }
 
-function onActivityFocusChange() {
-  syncActivityReading()
-}
+watch([readingWindowFocused, rightSidebarVisible, sidebarTab,
+  () => selectionStore.selectedSlug], syncActivityReading, { flush: 'sync' })
 
 function onActivityUnload() {
   activityStore.endReading()
@@ -589,6 +600,7 @@ function onActivityUnload() {
 
 async function syncActivityLibrary(path: string | null) {
   await activityStore.load(path)
+  if (activityDisposed) return
   knownReadingStatus.clear()
   knownAiSummaryDone.clear()
   libraryStore.papers.forEach(paper => {
@@ -657,10 +669,7 @@ onMounted(async () => {
   window.addEventListener('mousemove', onMouseMove)
   window.addEventListener('mouseup', onMouseUp)
   window.addEventListener('resize', onWinResize)
-  window.addEventListener('focus', onActivityFocusChange)
-  window.addEventListener('blur', onActivityFocusChange)
   window.addEventListener('beforeunload', onActivityUnload)
-  document.addEventListener('visibilitychange', onActivityFocusChange)
   document.addEventListener('argus-paper-drag-start', onPaperDragStart)
   document.addEventListener('argus-paper-drag-end', onPaperDragEnd)
   window.addEventListener('argus-switch-sidebar-tab', onSwitchSidebarTab)
@@ -754,11 +763,10 @@ onUnmounted(() => {
   window.removeEventListener('mousemove', onMouseMove)
   window.removeEventListener('mouseup', onMouseUp)
   window.removeEventListener('resize', onWinResize)
-  window.removeEventListener('focus', onActivityFocusChange)
-  window.removeEventListener('blur', onActivityFocusChange)
   window.removeEventListener('beforeunload', onActivityUnload)
-  document.removeEventListener('visibilitychange', onActivityFocusChange)
+  activityDisposed = true
   activityStore.stopHeartbeat()
+  void activityStore.load(null)
   if (winResizeTimer) clearTimeout(winResizeTimer)
   if (mainFocusRetryTimer) clearTimeout(mainFocusRetryTimer)
   document.removeEventListener('argus-paper-drag-start', onPaperDragStart)

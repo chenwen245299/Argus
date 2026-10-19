@@ -292,3 +292,38 @@ test('canvas switching while compacting cannot attach the checkpoint to the new 
   assert.equal(await hasCheckpoint('canvas'),false)
   assert.deepEqual(errors,[])
 })
+
+test('23 paper turns keep complete early evidence and saved figure references through a real send and reload',async()=>{
+  await open('standalone')
+  await page.evaluate(()=>{
+    const stamp='2026-10-19T00:00:00Z',nodes=[]
+    const preview='complete-paper-evidence '.repeat(4000)
+    for(let i=1;i<=23;i++){
+      nodes.push({id:'u'+i,role:'user',content:'Prior question '+i,createdAt:stamp})
+      nodes.push({id:'g'+i,role:'assistantGroup',promptId:'u'+i,createdAt:stamp,answers:[{
+        id:'a'+i,providerId:'provider',providerName:'Example',modelId:'small',modelName:'Small model',content:'Prior answer '+i,createdAt:stamp,
+        steps:i===1?[{tool:'get_paper_fulltext',args:'paper',argsJson:'{"slug":"paper"}',ok:true,preview,chars:preview.length},
+          {tool:'view_paper_page',args:'page 15',argsJson:'{"pages":[15]}',ok:true,preview:'Figure 4 caption',images:[{slug:'paper',page:15,file:'saved-figure.png'}]}]:undefined,
+      }]})
+    }
+    localStorage.setItem('/mock-library:paper:paper',JSON.stringify([{id:'paper-chat',slug:'paper',title:'23-turn reading',createdAt:stamp,updatedAt:stamp,nodes}]))
+  })
+  await page.reload();await page.locator('.context-trigger').waitFor()
+  await send('Question 24');await requests(1)
+  const validate=async()=>{
+    const messages=await page.evaluate(()=>window.__test.requests[0].args.messages)
+    for(let i=1;i<=23;i++){
+      assert(messages.some(m=>m.role==='user'&&m.content==='Prior question '+i))
+      assert(messages.some(m=>m.role==='assistant'&&m.content==='Prior answer '+i))
+    }
+    const paper=messages.find(m=>m.role==='tool'&&m.content.startsWith('complete-paper-evidence'))
+    assert.equal(paper.content.length,'complete-paper-evidence '.repeat(4000).length)
+    const images=messages.flatMap(m=>Array.isArray(m.content)?m.content:[]).filter(p=>p.type==='image_url')
+    assert.equal(images.length,1);assert.match(images[0].image_url.url,/^argus-chat-image:/)
+  }
+  await validate();await page.evaluate(()=>window.__test.finish(0))
+  await page.waitForFunction(()=>window.__test.saved.some(s=>s.kind==='paper'&&s.conversations.some(c=>c.nodes.length>=48)))
+  await page.reload();await page.locator('.context-trigger').waitFor()
+  await send('Question 25');await requests(1);await validate()
+  await page.evaluate(()=>window.__test.finish(0))
+})

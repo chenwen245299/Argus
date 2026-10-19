@@ -8,10 +8,12 @@ import { useAiStore } from '../stores/ai'
 import AiTab from '../components/tabs/AiTab.vue'
 import GuidedReadingIntro from '../components/GuidedReadingIntro.vue'
 import type { PaperMeta } from '../types'
+import { usePaperAiReading } from '../composables/usePaperAiReading'
 import { paperAiWindowSlug } from '../utils/paperAiWindow'
 
 const ai = useAiStore()
 const slug = ref(paperAiWindowSlug(getCurrentWebviewWindow().label))
+usePaperAiReading(slug)
 const paperTitle = ref('论文 AI')
 const isMac = navigator.userAgent.toLowerCase().includes('macintosh')
 let unlistenResize: UnlistenFn | null = null

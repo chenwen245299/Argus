@@ -1,4 +1,5 @@
-import type { ChatMessage } from '../types'
+import type { ChatMessage, ChatContentPart } from '../types'
+import type { AgentStepImage } from '../types/chatImages'
 
 // One tool call from a chat answer's agent trail — only the fields needed to
 // replay it into a later turn's context. Both AiTab's `AgentStep` and
@@ -13,6 +14,9 @@ export interface ReplayStep {
   ok?: boolean
   /** The result the model got back (as persisted; not further truncated here). */
   preview?: string
+  chars?: number
+  previewClipped?: boolean
+  images?: AgentStepImage[]
 }
 
 /**
@@ -26,8 +30,8 @@ export interface ReplayStep {
  * model re-fetches what it already had. Replaying the real calls and their
  * **full** results — as native tool messages the model is trained to read —
  * lets it reuse them instead of calling the same tool with the same arguments
- * again. (Results are already bounded upstream: the live call truncates to the
- * model's context budget, and the trail persists a capped slice.)
+ * again. Results are bounded only by the live model context budget. Persisted
+ * text stays complete; saved images travel as references resolved before HTTP.
  *
  * Tool-call ids are synthesised as `call_<answerId>_<i>` and paired between the
  * assistant turn and its results; providers only require the pairing to line up
@@ -39,11 +43,13 @@ export interface ReplayStep {
 export function buildToolExchangeMessages(
   steps: ReplayStep[] | undefined,
   answerId: string,
+  conversationId?: string,
 ): ChatMessage[] {
   if (!steps?.length) return []
 
   const calls: { id: string; name: string; args: string }[] = []
   const results: ChatMessage[] = []
+  const images: ChatContentPart[] = []
 
   steps.forEach((step, i) => {
     if (!step.tool) return
@@ -57,8 +63,23 @@ export function buildToolExchangeMessages(
 
     // The full result, verbatim — a follow-up turn should see exactly what the
     // model already fetched so it can reuse it rather than re-calling the tool.
-    let content = (step.preview ?? '').trim()
+    let content = step.preview ?? ''
     if (!content && step.ok === false) content = '{"error":"tool call failed"}'
+    if (step.previewClipped || (typeof step.chars === 'number' && content.length < step.chars)) {
+      content += '\n[This legacy saved result is incomplete; read the missing source again rather than assuming it is complete.]'
+    }
+    if (step.ok !== false) for (const image of step.images ?? []) {
+      let url = image.dataUrl
+      if (image.file && conversationId) {
+        const bytes = new TextEncoder().encode(JSON.stringify({ conversationId, file: image.file }))
+        const encoded = btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''))
+          .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+        url = 'argus-chat-image:' + encoded
+      }
+      if (!url) continue
+      images.push({ type: 'text', text: `Previously inspected paper '${image.slug}', PDF page index ${image.page}; ${image.crop ? 'CROP from full-page fractions ' + JSON.stringify(image.crop) : 'FULL PAGE'}. ${image.caption ?? ''} Inspect the actual figure, axes, legend and caption.` })
+      images.push({ type: 'image_url', image_url: { url } })
+    }
     results.push({ role: 'tool', tool_call_id: id, content })
   })
 
@@ -73,5 +94,5 @@ export function buildToolExchangeMessages(
       function: { name: c.name, arguments: c.args },
     })),
   }
-  return [assistant, ...results]
+  return [assistant, ...results, ...(images.length ? [{ role: 'user' as const, content: images }] : [])]
 }

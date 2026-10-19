@@ -456,40 +456,15 @@ async function loadConversations(): Promise<LibraryConversation[]> {
   return convs
 }
 
-// ── Persisting the agent trail ────────────────────────────────────────────────
-// These are runaway guards, not space savings. With one file per conversation a
-// large trail is paid for by the conversation holding it and nothing else, so
-// the caps only exist to stop a single pathological run — 500 rounds against a
-// million-token model, each result up to half a megabyte — from producing a file
-// that is slow to rewrite while it is being streamed into.
-//
-// Both sit far above real usage: the 90th percentile of measured tool results is
-// about 24k characters, so nothing anyone would actually open gets clipped.
-
-/** Per tool result. */
-const PERSIST_STEP_CHARS = 200_000
-/** Per answer, across all its tool calls. */
-const PERSIST_ANSWER_CHARS = 2_000_000
-
-/** Trim an answer's tool payloads to what is worth writing to disk. */
+// Keep the exact text the model read across saves, reloads and window sync.
+// Context capacity is managed at request boundaries, never by clipping storage.
+// Immutable page images remain on disk; only their references are persisted.
 function persistableSteps(steps?: AgentStep[]): AgentStep[] | undefined {
   if (!steps) return undefined
-  let budget = PERSIST_ANSWER_CHARS
-  return steps.map(step => {
-    // Page images live on disk under `file`; drop the base64 `dataUrl` so the
-    // conversation JSON stays small and reloads the PNG by name instead.
-    const images = step.images?.map(({ dataUrl: _drop, ...img }) => img)
-    const base: AgentStep = images ? { ...step, images } : step
-    if (!base.preview) return base
-    const room = Math.min(PERSIST_STEP_CHARS, budget)
-    if (room <= 0) {
-      const { preview, ...rest } = base
-      return { ...rest, previewClipped: true }
-    }
-    budget -= Math.min(base.preview.length, room)
-    if (base.preview.length <= room) return base
-    return { ...base, preview: base.preview.slice(0, room), previewClipped: true }
-  })
+  return steps.map(step => ({
+    ...step,
+    images: step.images?.map(({ dataUrl: _liveOnly, ...image }) => image),
+  }))
 }
 
 function stripTransientContext(msg: LibraryUiMessage): LibraryUiMessage {
@@ -1595,7 +1570,7 @@ function answerSpeed(answer: LibraryAnswerVariant) {
   return speed > 0 ? `~${speed} tok/s` : ''
 }
 
-function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
+function chatHistoryFromMessages(messages: LibraryUiMessage[], conversationId?: string): ChatMessage[] {
   const history: ChatMessage[] = []
   for (const m of messages) {
     if (m.role === 'user') {
@@ -1612,7 +1587,7 @@ function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
       if (ans.streaming || ans.error) continue
       // Replay this turn's tool calls + results (as native tool messages) before
       // its answer, so a follow-up reuses them instead of re-fetching.
-      history.push(...buildToolExchangeMessages(ans.agentSteps, m.id))
+      history.push(...buildToolExchangeMessages(ans.agentSteps, m.id, conversationId))
       if (ans.content.trim()) history.push({ role: 'assistant', content: ans.content })
     }
   }
@@ -1622,10 +1597,10 @@ function chatHistoryFromMessages(messages: LibraryUiMessage[]): ChatMessage[] {
 function buildHistoryBeforeMessage(conv: LibraryConversation, messageId: string) {
   const idx = conv.messages.findIndex(m => m.id === messageId)
   return applyContextCheckpoint(idx >= 0 ? conv.messages.slice(0, idx) : conv.messages,
-    conv.contextCheckpoint, chatHistoryFromMessages, persistedChatHistory)
+    conv.contextCheckpoint, records => chatHistoryFromMessages(records, conv.id), records => persistedChatHistory(records, conv.id))
 }
-function persistedChatHistory(messages: LibraryUiMessage[]) {
-  return chatHistoryFromMessages(messages.map(stripTransientContext))
+function persistedChatHistory(messages: LibraryUiMessage[], conversationId?: string) {
+  return chatHistoryFromMessages(messages.map(stripTransientContext), conversationId)
 }
 
 // Full chat records remain intact. Only this model-visible projection changes.
@@ -1649,7 +1624,7 @@ function setContextCheckpoint(conv: LibraryConversation, throughMessageId: strin
   const index = conv.messages.findIndex(m => m.id === throughMessageId)
   if (index < 0) return
   conv.contextCheckpoint = { throughMessageId, messages,
-    fingerprint: historyFingerprint(persistedChatHistory(conv.messages.slice(0, index + 1))),
+    fingerprint: historyFingerprint(persistedChatHistory(conv.messages.slice(0, index + 1), conv.id)),
     createdAt: new Date().toISOString() }
 }
 function contextArguments(conv: LibraryConversation, sel: ModelSelection | null, messages: ChatMessage[]) {
@@ -1663,7 +1638,7 @@ async function inspectContext() {
   const epoch = libraryEpoch, revision = ++contextInspection, sel = effectiveModel()
   try {
     const result = await invoke<PreparedContext>('prepare_library_chat_context', {
-      ...contextArguments(conv, sel, applyContextCheckpoint(conv.messages, conv.contextCheckpoint, chatHistoryFromMessages, persistedChatHistory)),
+      ...contextArguments(conv, sel, applyContextCheckpoint(conv.messages, conv.contextCheckpoint, records => chatHistoryFromMessages(records, conv.id), records => persistedChatHistory(records, conv.id))),
       mode: 'inspect', eventName: `context-inspect-${conv.id}`, requestId: null,
     })
     if (result?.usage && revision === contextInspection && stillWritable(conv.id, epoch)
@@ -1691,7 +1666,7 @@ function compactContextNow() {
 async function compactIdleConversation(conv: LibraryConversation, id: string) {
   const epoch = libraryEpoch, sel = effectiveModel(), requestId = crypto.randomUUID()
   const bound = conv.messages[conv.messages.length - 1]?.id
-  const fingerprint = historyFingerprint(persistedChatHistory(conv.messages))
+  const fingerprint = historyFingerprint(persistedChatHistory(conv.messages, conv.id))
   if (!bound) return
   markGenerating(conv.id, true); markCompacting(conv.id, true)
   contextErrors.value[conv.id] = ''; contextNotices.value[conv.id] = ''
@@ -1702,11 +1677,11 @@ async function compactIdleConversation(conv: LibraryConversation, id: string) {
   })
   try {
     const result = await invoke<PreparedContext>('prepare_library_chat_context', {
-      ...contextArguments(conv, sel, applyContextCheckpoint(conv.messages, conv.contextCheckpoint, chatHistoryFromMessages, persistedChatHistory)),
+      ...contextArguments(conv, sel, applyContextCheckpoint(conv.messages, conv.contextCheckpoint, records => chatHistoryFromMessages(records, conv.id), records => persistedChatHistory(records, conv.id))),
       mode: 'manual', eventName: id, requestId,
     })
     if (!stillWritable(conv.id, epoch) || chatDisposed || stoppedTargetIds.has(id)) return
-    if (fingerprint !== historyFingerprint(persistedChatHistory(conv.messages))) {
+    if (fingerprint !== historyFingerprint(persistedChatHistory(conv.messages, conv.id))) {
       contextErrors.value[conv.id] = t('chatContext.changed'); return
     }
     conv.contextUsage = result.usage
@@ -2029,9 +2004,9 @@ async function runAssistantRequestImpl(
   // one happens to be on screen when it finishes.
   const streamConvId = conv.id
   const prefixFingerprint = historyFingerprint(persistedChatHistory(
-    conv.messages.slice(0, conv.messages.findIndex(m => m.id === assistantMsg.id))))
+    conv.messages.slice(0, conv.messages.findIndex(m => m.id === assistantMsg.id)), conv.id))
   const prefixUnchanged = () => prefixFingerprint === historyFingerprint(persistedChatHistory(
-    conv.messages.slice(0, conv.messages.findIndex(m => m.id === assistantMsg.id))))
+    conv.messages.slice(0, conv.messages.findIndex(m => m.id === assistantMsg.id)), conv.id))
   const eventSafeId = target.id.replace(/[^A-Za-z0-9:_/-]/g, '-')
   const eventName = `library-chat-${eventSafeId}`
   const sourcesEventName = `${eventName}-sources`

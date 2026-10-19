@@ -36,7 +36,7 @@ const functions = [
   assert.ok(node, `AiTab function ${name} exists`)
   return node.getText(ast)
 }).join('\n')
-const constants = ['PERSIST_STEP_CHARS', 'PERSIST_ANSWER_CHARS', 'ANSWER_EVENT_SUFFIXES'].map(name =>
+const constants = ['ANSWER_EVENT_SUFFIXES'].map(name =>
   ast.statements.find(n => ts.isVariableStatement(n) && n.declarationList.declarations.some(d =>
     ts.isIdentifier(d.name) && d.name.text === name)).getText(ast)).join('\n')
 const createView = new Function('env', transpile(`

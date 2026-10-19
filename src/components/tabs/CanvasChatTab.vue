@@ -22,6 +22,7 @@ import ChatAnswerBody from '../ChatAnswerBody.vue'
 import ContextMeter from '../ContextMeter.vue'
 import { beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage, type ChatRun, type StreamUsagePayload } from '../../utils/chatRunStats'
 import { applyContextCheckpoint, historyFingerprint, withContextDraft, type ContextCheckpoint, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
+import { buildToolExchangeMessages } from '../../utils/agentHistory'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import CanvasEditConfirmCard from '../CanvasEditConfirmCard.vue'
@@ -43,7 +44,11 @@ const canvasStore = useCanvasStore()
 interface AgentStep {
   tool: string
   args: string
+  argsJson?: string
   ok?: boolean
+  preview?: string
+  chars?: number
+  truncated?: boolean
   images?: AgentStepImage[]
 }
 
@@ -283,11 +288,16 @@ async function load(canvasId: string) {
 // ── Sending ──────────────────────────────────────────────────────────────────
 
 function contextModelKey(sel: ModelSelection) { return `${sel.providerId}::${sel.modelId}` }
-function rawContextHistory(records: CanvasMessage[]): ChatMessage[] {
-  return records.filter(m => !m.error && !m.streaming).map(m => ({ role: m.role, content: m.content }))
+function rawContextHistory(records: CanvasMessage[], conversationId?: string): ChatMessage[] {
+  return records.filter(m => !m.streaming).flatMap(m => {
+    if (m.role === 'user') return [{ role: m.role, content: m.content }]
+    const result = buildToolExchangeMessages(m.steps, m.id, conversationId)
+    if (m.content.trim()) result.push({ role: 'assistant', content: m.content })
+    return result
+  })
 }
 function canvasHistory(conv: CanvasConversation, sel: ModelSelection, records = conv.messages): ChatMessage[] {
-  return [canvasContext(), ...applyContextCheckpoint(records, conv.contextStates?.[contextModelKey(sel)]?.checkpoint, rawContextHistory)]
+  return [canvasContext(), ...applyContextCheckpoint(records, conv.contextStates?.[contextModelKey(sel)]?.checkpoint, records => rawContextHistory(records, conv.id))]
 }
 function setContextUsage(conv: CanvasConversation, sel: ModelSelection, usage: ContextUsage) {
   const states = conv.contextStates ??= {}
@@ -299,7 +309,7 @@ function setContextCheckpoint(conv: CanvasConversation, sel: ModelSelection, bou
   if (index < 0) return
   const states = conv.contextStates ??= {}
   const state = states[contextModelKey(sel)] ??= {}
-  state.checkpoint = { throughMessageId: bound, messages, fingerprint: historyFingerprint(rawContextHistory(conv.messages.slice(0, index + 1))), createdAt: new Date().toISOString() }
+  state.checkpoint = { throughMessageId: bound, messages, fingerprint: historyFingerprint(rawContextHistory(conv.messages.slice(0, index + 1), conv.id)), createdAt: new Date().toISOString() }
 }
 function contextArguments(conv: CanvasConversation, sel: ModelSelection, messages: ChatMessage[]) {
   return { messages, providerId: sel.providerId, modelId: sel.modelId, canvasId: props.canvasId, plainFallback: false,
@@ -315,14 +325,14 @@ const contextDisplay = computed(() => {
 async function inspectContext() {
   const conv = activeConv.value, sel = model.value, root = libraryRoot.value
   if (!conv || !sel || !root || loading.value || disposed) return
-  const revision = ++contextInspection, epoch = canvasEpoch, fingerprint = historyFingerprint(rawContextHistory(conv.messages))
+  const revision = ++contextInspection, epoch = canvasEpoch, fingerprint = historyFingerprint(rawContextHistory(conv.messages, conv.id))
   try {
     const result = await invoke<PreparedContext>('prepare_library_chat_context', {
       ...contextArguments(conv, sel, canvasHistory(conv, sel)), mode: 'inspect', eventName: `canvas-context-${conv.id}`, requestId: null,
     })
     if (result?.usage && revision === contextInspection && epoch === canvasEpoch && !disposed && !loading.value
       && activeConv.value === conv && model.value && contextModelKey(model.value) === contextModelKey(sel)
-      && fingerprint === historyFingerprint(rawContextHistory(conv.messages))) setContextUsage(conv, sel, result.usage)
+      && fingerprint === historyFingerprint(rawContextHistory(conv.messages, conv.id))) setContextUsage(conv, sel, result.usage)
   } catch { /* No configured model/library yet. */ }
 }
 function scheduleContextInspection() {
@@ -337,7 +347,7 @@ async function compactContext() {
   const conv = activeConv.value, sel = model.value
   if (!conv || !sel || loading.value || !libraryRoot.value || !conv.messages.length) return
   const epoch = canvasEpoch, requestId = newId(), bound = conv.messages[conv.messages.length - 1].id
-  const fingerprint = historyFingerprint(rawContextHistory(conv.messages))
+  const fingerprint = historyFingerprint(rawContextHistory(conv.messages, conv.id))
   activeRequestId = requestId; loading.value = true; contextCompacting.value = true
   contextError.value = ''; contextNotice.value = ''
   const offUsage = await listen<StreamUsagePayload & { id: string }>(`canvas-context-${requestId}-compaction-usage`, e => {
@@ -348,7 +358,7 @@ async function compactContext() {
       ...contextArguments(conv, sel, canvasHistory(conv, sel)), mode: 'manual', eventName: `canvas-context-${requestId}`, requestId,
     })
     if (disposed || epoch !== canvasEpoch || stoppedRequests.has(requestId) || !conversations.value.includes(conv)) return
-    if (fingerprint !== historyFingerprint(rawContextHistory(conv.messages))) { contextError.value = t('chatContext.changed'); return }
+    if (fingerprint !== historyFingerprint(rawContextHistory(conv.messages, conv.id))) { contextError.value = t('chatContext.changed'); return }
     if (result?.usage) setContextUsage(conv, sel, result.usage)
     if (result?.compacted) {
       setContextCheckpoint(conv, sel, bound, result.messages)
@@ -402,10 +412,10 @@ async function send() {
   // History as the model sees it: the canvas context, then the turns so far
   // (the empty answer we just pushed is not one of them).
   const prefix = conv.messages.slice(0, -1), bound = prefix[prefix.length - 1].id
-  const fingerprint = historyFingerprint(rawContextHistory(prefix))
+  const fingerprint = historyFingerprint(rawContextHistory(prefix, conv.id))
   const prefixUnchanged = () => {
     const index = conv.messages.findIndex(m => m.id === bound)
-    return index >= 0 && fingerprint === historyFingerprint(rawContextHistory(conv.messages.slice(0, index + 1)))
+    return index >= 0 && fingerprint === historyFingerprint(rawContextHistory(conv.messages.slice(0, index + 1), conv.id))
   }
   let history = canvasHistory(conv, sel, prefix)
 
@@ -456,6 +466,7 @@ async function send() {
 
   unlisteners.push(await listen<{
     phase?: string; tool?: string; arguments?: unknown; ok?: boolean; round?: number
+    preview?: string; chars?: number; truncated?: boolean
     images?: AgentStepImage[] | null
   }>(
     `${eventName}-agent`,
@@ -466,12 +477,15 @@ async function send() {
       if (p.phase === 'tool') run.toolCalls = (run.toolCalls ?? 0) + 1
       if (p.phase === 'tool') {
         if (!live.steps) live.steps = []
-        live.steps.push({ tool: p.tool ?? '', args: summarizeArgs(p.arguments) })
+        live.steps.push({ tool: p.tool ?? '', args: summarizeArgs(p.arguments), argsJson: JSON.stringify(p.arguments ?? {}) })
         scrollToBottom()
       } else if (p.phase === 'result') {
         const step = [...(live.steps ?? [])].reverse().find(s => s.tool === p.tool && s.ok === undefined)
         if (step) {
           step.ok = p.ok ?? true
+          step.preview = p.preview
+          step.chars = p.chars
+          step.truncated = p.truncated
           if (p.images?.length) {
             step.images = p.images
             scheduleSave()

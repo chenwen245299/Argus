@@ -2957,6 +2957,12 @@ pub async fn chat_with_library(
     } else {
         None
     };
+    // Pin the answer's provider/model now. Later changes to the default must
+    // not redirect a queued memory job to a different (possibly costly) model.
+    let memory_model = observation.as_ref().and_then(|_| {
+        crate::ai_manager::resolve_provider_model_or_default(&root, provider_id.as_deref(), model_id.as_deref())
+            .ok().map(|(provider, _, model, _)| (provider.id, model))
+    });
     let completion_cancel = cancel.clone();
     let outcome = async {
         // Agent mode drives its own retrieval through the MCP tools instead of
@@ -3021,6 +3027,7 @@ pub async fn chat_with_library(
                 cancel.clone(),
                 web_search,
                 manage_context.unwrap_or(false),
+                observation.as_ref(),
             )
             .await;
 
@@ -3092,14 +3099,8 @@ pub async fn chat_with_library(
             .as_ref()
             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
     {
-        if let Some(observation) = observation {
-            crate::user_memory::schedule(
-                &app,
-                &root,
-                provider_id.as_deref(),
-                model_id.as_deref(),
-                observation,
-            );
+        if let (Some(observation), Some((provider, model))) = (observation, memory_model) {
+            crate::user_memory::schedule(&app, &root, Some(&provider), Some(&model), observation);
         }
     }
     outcome
@@ -4191,8 +4192,11 @@ pub fn save_activity_log(
     root: String,
     device_id: String,
     data: serde_json::Value,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    crate::activity::save_log(&root, &device_id, &data)
+    crate::activity::save_log(&root, &device_id, &data)?;
+    let _ = app.emit("activity-log-saved", serde_json::json!({"root":root,"writer":device_id}));
+    Ok(())
 }
 
 /// A stable, machine-local id used to slot this device's activity so a synced

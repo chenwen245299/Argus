@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 export type ActivityRange = 'today' | 'week' | 'month' | 'year'
 
@@ -30,7 +31,7 @@ export interface ActivitySession {
   duration_ms: number
 }
 
-/** One machine's contribution to a day. Each device only ever writes its own. */
+/** One writer's contribution: main keeps the device slot; popups use device+window. */
 export interface DeviceDay {
   opened: Record<string, ActivityPaperStat>
   completed: Record<string, ActivityPaperStat>
@@ -79,6 +80,10 @@ interface ActiveReadingSession {
 
 /** Reserved slot for pre-CRDT history migrated from a flat file. */
 const LEGACY_SLOT = 'legacy'
+
+function activityStorageKey(root: string, writer: string) {
+  return `argus:activity:${root}${writer === 'main' ? '' : `:window:${writer}`}`
+}
 
 function dayKey(ts = Date.now()) {
   const d = new Date(ts)
@@ -228,12 +233,17 @@ export const useActivityStore = defineStore('activity', () => {
   const activeSession = ref<ActiveReadingSession | null>(null)
   const activeNow = ref(Date.now())
   const deviceId = ref<string>('')
+  const writer = ref('main')
+  let loadEpoch = 0
+  let reloadEpoch = 0
+  let unlistenSaved: UnlistenFn | null = null
+  let syncEpoch = 0
   let deviceIdPromise: Promise<string> | null = null
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null
   let saveChain: Promise<unknown> = Promise.resolve()
 
   const storageKey = computed(() =>
-    libraryPath.value ? `argus:activity:${libraryPath.value}` : null
+    libraryPath.value ? activityStorageKey(libraryPath.value, writer.value) : null
   )
 
   /** This machine's stable id (from the OS app-config dir), fetched once. */
@@ -255,7 +265,10 @@ export const useActivityStore = defineStore('activity', () => {
   }
 
   function myDevice() {
-    return deviceId.value || 'unknown'
+    // A stale main/popup copy must never replace the other window's counters.
+    // Existing main history keeps its original bare device id.
+    const base = deviceId.value || 'unknown'
+    return writer.value === 'main' ? base : `${base}:window:${writer.value}`
   }
 
   function pruneOldDays(days: Record<string, DayV2>): Record<string, DayV2> {
@@ -281,36 +294,36 @@ export const useActivityStore = defineStore('activity', () => {
     } catch {}
   }
 
-  async function load(path: string | null) {
+  async function load(path: string | null, source = 'main') {
+    const epoch = ++loadEpoch
     endReading()
+    libraryPath.value = null
     await ensureDeviceId()
-    libraryPath.value = path
+    await saveChain
+    if (epoch !== loadEpoch) return
+    writer.value = source
     if (!path) {
       data.value = { version: 2, days: {} }
       return
     }
     let legacyData: ActivityData | null = null
     try {
-      // Local (localStorage) history is this machine's own — slot it under this
-      // device so a first save persists it, rather than the reserved legacy slot.
-      legacyData = normalizeData(
-        JSON.parse(localStorage.getItem(`argus:activity:${path}`) || 'null'),
-        myDevice(),
-      )
+      legacyData = normalizeData(JSON.parse(localStorage.getItem(activityStorageKey(path, source)) || 'null'), myDevice())
     } catch {}
-
+    let next: ActivityData
+    let migrate = false
     try {
       const fileData = normalizeData(await invoke('get_activity_log', { root: path }))
-      if (hasActivityData(fileData) || !legacyData || !hasActivityData(legacyData)) {
-        data.value = fileData
-      } else {
-        data.value = legacyData
-        save()
-      }
+      migrate = !hasActivityData(fileData) && !!legacyData && hasActivityData(legacyData)
+      next = migrate ? legacyData! : fileData
     } catch (e) {
       console.error('[activity] load activity.json failed:', e)
-      data.value = legacyData ?? { version: 2, days: {} }
+      next = legacyData ?? { version: 2, days: {} }
     }
+    if (epoch !== loadEpoch) return
+    data.value = next
+    libraryPath.value = path
+    if (migrate) save()
   }
 
   /**
@@ -321,9 +334,10 @@ export const useActivityStore = defineStore('activity', () => {
   async function reloadFromDisk() {
     const root = libraryPath.value
     if (!root) return
-    const device = myDevice()
+    const device = myDevice(), epoch = loadEpoch, refresh = ++reloadEpoch
     try {
       const disk = normalizeData(await invoke('get_activity_log', { root }))
+      if (epoch !== loadEpoch || refresh !== reloadEpoch || root !== libraryPath.value) return
       const nextDays: Record<string, DayV2> = { ...data.value.days }
       for (const [date, day] of Object.entries(disk.days)) {
         const mine = nextDays[date]?.devices?.[device]
@@ -473,6 +487,13 @@ export const useActivityStore = defineStore('activity', () => {
 
   function startHeartbeat() {
     if (heartbeatTimer) return
+    const epoch = ++syncEpoch
+    void listen<{ root: string; writer: string }>('activity-log-saved', event => {
+      if (event.payload.root === libraryPath.value && event.payload.writer !== myDevice()) void reloadFromDisk()
+    }).then(off => {
+      if (epoch !== syncEpoch || !heartbeatTimer) off()
+      else unlistenSaved = off
+    }).catch(e => console.error('[activity] activity synchronization failed:', e))
     heartbeatTimer = setInterval(() => {
       activeNow.value = Date.now()
       checkpoint()
@@ -480,6 +501,8 @@ export const useActivityStore = defineStore('activity', () => {
   }
 
   function stopHeartbeat() {
+    syncEpoch++
+    unlistenSaved?.(); unlistenSaved = null
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer)
       heartbeatTimer = null

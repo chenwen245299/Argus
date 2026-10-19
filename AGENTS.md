@@ -250,29 +250,66 @@ implementation and persistence rules out of the feature announcement copy.
 profile in app-data `user_memory.json`, shared across libraries. It is enabled
 by default; 设置 → AI 随航 → 用户记忆 (`memory`) can disable both learning and
 personalization, inspect exact supporting quotes, correct/protect entries, or
-delete/clear them. There is no manual extraction button. Successful, nonempty,
-uncancelled `chat_with_library` turns schedule a serialized background extraction
-using that turn's provider/model, outside the foreground answer. Only the latest
-user's text is evidence; the bounded previous assistant excerpt may resolve the
-topic of understanding feedback, never establish user facts. Tool output,
-attachments, quoted/code blocks and automatic first guided-reading/metadata
-prompts are excluded (including regeneration after later turns). Prefer specific
-knowledge/prerequisites with familiar / learning / new levels; questions alone
-are not ignorance, and acknowledgements are not mastery. The extractor merges
-same-topic facts, checks exact user evidence and protects manual locks. A bounded
-48-entry profile prioritizes knowledge and evicts older unprotected entries.
-Generation tickets captured before the answer invalidate queued/in-flight updates
-on any manual change, opt-out or clear; per-fact observation times prevent older
-parallel feedback overwriting newer knowledge. Processed turn fingerprints include
-the prior explanation so repeated feedback about different concepts still learns.
-Storage is atomic and serialized; malformed files are never silently overwritten.
-`personalize` supplies the same bounded profile to agent/plain answers, context
-measurement and cache-prefix checks. Changed facts disarm keepalive. Profile data
-is fallible personalization, never instructions or paper evidence; current user
-corrections win. This uses neither embeddings nor a remote memory service and is
-not exposed by the external MCP server. Background calls use source `user-memory`
-in usage accounting and can fail independently of answers. UI updates synchronize
-through `user-memory-changed`; there is no historical chat backfill.
+delete/clear them. There is no manual extraction button. Two paths complement
+each other, with no per-turn extraction/classification model request:
+
+- Agent answers offer the app-only `update_user_memory` tool. The answering
+  model automatically saves explicit durable background/understanding feedback
+  grounded in the latest user's own words, up to eight changes per call and two
+  calls per answer. Only memory calls with complete accompanying answer prose,
+  `answerComplete: true`, and verified successful writes can finish without
+  another model round. Empty/incomplete answers, failed writes and mixed tools
+  continue normally. The normal write-approval rules for papers/canvases remain.
+- Successful, nonempty, uncancelled `chat_with_library` turns enqueue observations
+  in app-data `user_memory_pending.json`. `user_memory_queue.rs` serializes
+  background consolidation after six eligible turns or three idle minutes,
+  at least three minutes apart and at most six attempts per hour. Pending turns
+  survive restarts and rate limits; errors back off and rotate failed providers.
+  Each batch retains all selected user text and the bounded preceding assistant
+  excerpt, sorted chronologically, with at most 16 observations / 24,000 input
+  characters before model-context fitting. Smaller contexts split whole
+  observations, leaving overflow queued; failed batches shrink on retry. The
+  original provider/model is pinned, with no silent default-model substitution.
+
+Only user text is evidence; the previous assistant excerpt (up to 2,500
+characters, retaining both its beginning and end) may resolve understanding
+feedback, never establish user facts. Tool output, attachments, quoted/code
+blocks and automatic first guided-reading/metadata prompts are excluded,
+including regeneration after later turns. Short substantive replies such as
+“不懂” are retained with their topic. Questions alone are not ignorance, and
+acknowledgements are not mastery. Both paths prefer specific prerequisites with
+familiar / learning / new levels, merge same-topic facts, validate exact evidence,
+and protect manual locks. The 48-entry profile prioritizes knowledge and evicts
+older unprotected entries. Live writes do not suppress the later batch review.
+Per-fact observation times stop older feedback overwriting newer knowledge;
+revision checks requeue a background snapshot overtaken by a live write. Manual
+edits rebase pending observations onto a new generation; deletion, clear and
+opt-out invalidate/discard old jobs so deleted data cannot be resurrected.
+Fingerprints include the prior explanation to distinguish repeated feedback
+about different concepts. Storage is atomic; malformed files are not silently
+replaced (explicit clear/opt-out may reset a broken pending file).
+
+Static memory guidance and tool declarations remain in the stable agent prefix.
+The current profile is a separate late system message before the newest user
+turn, for agent/plain answers and context measurement. Compaction temporarily
+removes this volatile frame; checkpoints, saved history and keepalive warming
+exclude it. Automatic updates no longer invalidate the paper/history cache
+prefix; manual controls still disarm keepalive, with generation checks against
+rearming an old request. Disabled memory supplies no profile, guidance or tool.
+Profile data is fallible personalization, never instructions or paper evidence;
+current user corrections win. No embeddings, remote memory service or external
+MCP memory exposure are added. Background usage is recorded as `user-memory`
+against the originating library via task-local attribution. The settings show
+pending turns, background attempts and immediate writes; updates synchronize
+through `user-memory-changed`. There is no historical chat backfill.
+
+Design references checked on 2026-10-19: Codex's idle-rollout extraction plus
+consolidation (`openai/codex`, `70b3bb6d8814ab3f2045238b4ae14c43da99783b`,
+`codex-rs/memories/README.md`), and DeepSeek Harness's optional MCP-memory tools
+(`deepseek-ai/deepseek-harness`, `687f282e8625c6b8d11ff58211a90524be2e4317`,
+`docs/user/guide/mcp-memory.md`). DSH has no bundled automatic profile extractor;
+Argus's combined live-write/batch approach and scheduling limits are adaptations,
+not claims that either reference uses this exact design.
 
 **Mermaid labels in chat.** `MermaidBlock.vue` renders with root-level
 `htmlLabels: false` and locks that key alongside Mermaid's default secure keys.
@@ -325,6 +362,28 @@ refused only for stopped requests, never granted by a queue action.
 `cancel::until_cancelled` makes pending HTTP headers and SSE reads cancellable
 without waiting for another chunk; stream finalization still records partial
 usage and the agent still shuts its MCP connections down normally.
+
+**Reading time includes paper AI.** `MainView.vue` uses one activity session
+for the active PDF/ebook or a visible AI sidebar's paper (including a selected
+paper with no PDF tab open). PDF and sidebar never run separate clocks. The
+standalone `PaperAiView` installs `usePaperAiReading`: focused, visible time
+reading/replying/waiting in that paper's AI window is attributed to its own slug;
+background generation alone does not count. `useReadingWindowFocus` combines
+native Tauri window focus with DOM focus/visibility, rejects stale initial focus
+reads, and releases listeners on unmount. Blur/hide pauses; closing, switching
+paper/library and unmount flush the active session. The existing 15-second
+checkpoint and activity statistics/timeline are reused, with no historical
+backfill from message timestamps.
+
+Activity remains schema v2. Main retains the original device-id writer cell;
+each standalone paper window uses `<device>:window:<window-label>` under the
+same `devices` map. This prevents two windows' stale snapshots overwriting each
+other, while the existing cross-device merge and flattened totals sum both.
+Popup fallback caches are window-scoped and cannot migrate/duplicate main's
+legacy local history. `save_activity_log` emits `activity-log-saved` after a
+successful atomic merge; other writers in the same library refresh peer cells
+while preserving their own unsaved contributions. Loads/reloads have generation
+and root guards; pending writes settle before loading a library's counters.
 
 ### Frontend state management (Pinia stores)
 
@@ -595,9 +654,11 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   token, anything else at one), so a Chinese result is not under-counted
   fourfold. `truncate_tool_result` cuts an oversized result and appends a note
   telling the model it was cut, so it narrows or pages with `offset`/`limit`;
-  `evict_old_tool_results` then replaces the oldest earlier-round results with a
-  stub that says to call the tool again (a stub, not a deletion, which would
-  orphan its `tool_calls` entry), and the loop emits phase `evicted`.
+  For legacy callers without `manageContext`, `evict_old_tool_results` replaces
+  older results past the half-window transcript budget with paired stubs.
+  Managed paper/library/canvas chats skip that separate quota: complete evidence
+  is retained until actual total context pressure triggers normal compaction.
+  Tool-call/result pairs are never orphaned.
 - A failing tool is fed back as an error string rather than aborting, so the
   model can correct a bad slug or section name on the next round.
 - **Chat context management.** `chat_context.rs` measures system/pins,
@@ -638,6 +699,22 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   marker lets durable saves repair a missed completion event without restoring
   a stale operation on app launch. Paper/canvas prepare, chat and save commands
   validate `expectedRoot`. No vector store is involved.
+- **Complete evidence across turns and reloads.** Shared `utils/agentHistory.ts`
+  replays all completed native tool-call/result pairs before each chosen answer.
+  Paper/library persistence keeps complete tool text, without per-step/per-answer
+  storage clipping; legacy incomplete results carry a warning to reread missing
+  source. Canvas also stores/replays tool arguments/results. Saved figure/page
+  images are restored as labelled image parts after the paired tool results,
+  with conversation-scoped `argus-chat-image:` references. `chat_images.rs`
+  resolves these into PNG data URLs only in outgoing requests (agent, plain,
+  compaction and keepalive), off the async runtime. Native checkpoints retain
+  references rather than base64. New live page images use the same references
+  within the loop. Reads reuse the existing chat-image path, symlink, file-size
+  and PNG guards. Missing images and models without vision get explicit text
+  notices instead of invented pixels or provider-invalid URLs. References and
+  exact text are stable across window sync/save/reload and included in checkpoint
+  fingerprints. These changes do not backfill missing old tool payloads or
+  automatically read paper sections the model never fetched.
 - **Usage is summed, not emitted per round.** `stream_with_tools` returns a
   `TurnUsage` instead of emitting one; the loop folds them and calls
   `llm::emit_usage` once at the end. Emitting per round both showed a cost strip
@@ -688,10 +765,25 @@ the end when streaming finishes. `ChatPageImage.vue` reloads via
 are declared in `mcp/agent.rs`, parsed in `mcp/app_tools.rs`, and executed only
 through the existing write-confirmation handshake. Their descriptions and the
 default prompt forbid proactive use: the user must explicitly request marking
-or annotations. A batch has 1–30 original excerpts with 1-based PDF page indices;
+or annotations. A batch has 1–30 passages with 1-based PDF page indices;
 annotations require a `note`, and the highlight tool cannot attach comments.
-Both tools accept a batch `color` and per-passage overrides: yellow, green, blue,
-pink, orange, purple (the reader palette) or #RRGGBB. Omission defaults to yellow.
+The app's `view_paper_page` returns `annotation_targets` from the same PDFium
+text/geometry used for marking (the reading text uses another extractor).
+Prefer an `anchor` ID and optional inclusive `end_anchor` for consecutive source
+lines, omitting `text` to preserve exact formula glyphs. Optional `text` narrows
+the selected range and must match uniquely within it; the legacy text-only path
+still requires a unique original excerpt. `mcp/passage_anchors.rs` binds IDs to
+page text and geometry; stale/forged/wrong-page IDs, reversed/oversized ranges,
+conflicting quotes and unreliable geometry fail without guessing. Selectors are
+resolved to canonical text/rectangles before preview; the UI sees no selectors.
+Unavailable targets are reported without breaking page images. The provider's
+`page_image_summary` retains target IDs and diagnostics while removing base64.
+Batch validation reports every failed 1-based passage index, requested PDF page,
+and quote preview, plus valid indices to retain. Exact matches on adjacent PDF
+pages provide correction hints only; marks never move pages automatically.
+A failed batch saves nothing. Both tools accept a batch `color` and per-passage
+overrides: yellow, green, blue, pink, orange, purple (the reader palette), red
+(`#FF0000`, also 红色), or #RRGGBB. Omission defaults to yellow.
 `WriteConfirmCard` lets the user adjust every passage's palette/custom color
 before approving; `resolve_agent_write` binds the color list to that request's
 passage count and validates it, then `PendingWrite::apply_passage_colors` applies
@@ -734,9 +826,9 @@ re-sends the same prefix every 5 minutes with `max_tokens: 1`.
 
 - The warmed prefix is *not* the loop's internal transcript. It is what the next
   question will send: system + the paper-card/pins block + the clean
-  user/assistant history + the answer just given. The loop's `tool` messages
-  never reappear in a later request, so warming them would refresh a prefix
-  nothing asks for. The `tools` array is snapshotted verbatim from the turn
+  canonical history (including replayed prior tool evidence and restored image
+  pixels) + the answer just given. An in-loop checkpoint supplies its exact
+  retained transcript. The volatile memory frame is excluded. The `tools` array is snapshotted verbatim from the turn
   (external servers included) for the same reason —
   `agent_tool_defs(bridge, vision, canvas_edit)` is shared, and the
   loop and the keepalive must pass it identical flags or they warm a different
@@ -1336,9 +1428,14 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   toolbar's clear/navigation/library scope. `cargo test --lib search::tests`
   covers relevance, phrases, prefixes, snippets, indexed updates, legacy/missing
   caches and atomic rebuilds with concurrent readers.
-- User memory: `cargo test --lib user_memory::tests` checks extraction with a local
-  model fixture, evidence, knowledge updates, opt-out/forget races, protected facts,
-  bounded storage and personalization. `node --test scripts/test-user-memory.mjs`
+- User memory: `cargo test --lib user_memory` checks full-batch extraction with a
+  local model fixture, short contextual feedback, evidence, latest-understanding
+  updates, stale-snapshot/opt-out/forget guards, protected facts, bounded storage,
+  cache-prefix stability, model-context splitting, durable queue recovery,
+  throttling and retries without dropping turns. Agent tests also cover completing
+  memory-only writes without another model round and removing the disabled tool;
+  context tests keep profile data out of persisted checkpoints. Task-local usage
+  tests verify attribution across concurrent libraries. `node --test scripts/test-user-memory.mjs`
   (Playwright) checks the real settings UI, updates, corrections, opt-out,
   persistence, failure/conflicts, deletion, and narrow/dark/English layouts.
 - Guided reading: `node --test scripts/test-guided-reading.mjs` with
@@ -1379,6 +1476,20 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   and Chrome, `scripts/test-chat-queue-browser.mjs` exercises real sidebar,
   standalone and library composers, attachments, shortcuts, partial/tool history
   and library/paper changes with local desktop/provider mocks.
+- Reading activity: `node --test scripts/test-reading-activity.mjs` runs the real
+  Pinia store with controlled clocks/IPC: main/popup handoffs, writer-cell merge,
+  peer refresh, distinct papers, reopening, background pause, root/load races and
+  cache migration isolation. `scripts/test-reading-activity-browser.mjs` uses
+  real focus/standalone hooks and main's real target-selection functions in
+  separate local browser windows, covering sidebar-only reading, focus handoff,
+  hidden/background pause, standalone without main, library changes and unmount.
+  Rust `activity::tests` also checks same-machine window cells through real files.
+- Agent history: `node --test scripts/test-agent-history.mjs` exercises real
+  paper/library/canvas history helpers: all 23 turns plus full initial paper,
+  labelled figure references, exact text beyond the former storage caps, reload
+  stability, tool pairings and incomplete/failed/interrupted results. Rust
+  `chat_images::tests` verifies original pixels return on follow-ups without
+  entering saved checkpoints, plus missing-file/non-vision/traversal handling.
 - Context management: `node --test scripts/test-chat-context.mjs` checks
   checkpoint persistence and invalidation. `scripts/test-chat-context-browser.mjs`
   mounts the real library composer with local mocks to verify hover/keyboard,

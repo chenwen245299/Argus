@@ -12,6 +12,9 @@ const transpile = source => ts.transpileModule(source, {
 const { buildToolExchangeMessages } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
   await readFile(new URL('../src/utils/agentHistory.ts', import.meta.url), 'utf8'),
 )).toString('base64'))
+const { beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
+  await readFile(new URL('../src/utils/chatRunStats.ts', import.meta.url), 'utf8'),
+)).toString('base64'))
 const { guidedReadingRequestHistory } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
   await readFile(new URL('../src/utils/guidedReading.ts', import.meta.url), 'utf8'),
 )).toString('base64'))
@@ -25,10 +28,10 @@ const { applyContextCheckpoint, historyFingerprint } = await import('data:text/j
 const source = await readFile(new URL('../src/components/tabs/AiTab.vue', import.meta.url), 'utf8')
 const ast = ts.createSourceFile('AiTab.ts', source.slice(source.indexOf('>') + 1, source.indexOf('</script>')), ts.ScriptTarget.Latest, true)
 const functions = ['nowIso', 'findReactiveAnswer', 'isAnswerVisible', 'detachAnswerListeners',
-  'activeAnswerForGroup', 'buildHistoryUntil', 'flushStreamRender', 'resetAnswerResult',
+  'activeAnswerForGroup', 'legacyPaperRuns', 'buildHistoryUntil', 'flushStreamRender', 'resetAnswerResult',
   'regenerate', 'streamAnswer', 'streamAnswerImpl', 'summarizeToolArgs', 'applyUsage', 'dismissWrite']
   .concat(['modelKey', 'cloneConversation', 'persistableSteps', 'persistableConversation', 'paperHistoryFingerprint',
-    'paperContextHistory', 'paperContextId', 'paperContextArguments', 'setPaperContextUsage', 'setPaperCheckpoint'])
+    'paperGuidedReadingHistory', 'paperContextHistory', 'paperContextId', 'paperContextArguments', 'setPaperContextUsage', 'setPaperCheckpoint'])
   .map(name => {
     const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name)
     assert.ok(node, `AiTab function ${name} exists`)
@@ -40,7 +43,6 @@ const makeRunner = new Function('env', transpile(`
   const streamTasks = new Map();
   const syncDisposed = false;
   const contextErrors = { value: {} }, contextNotices = { value: {} };
-  const PERSIST_STEP_CHARS = 60000, PERSIST_ANSWER_CHARS = 400000;
   const persistableServerToolTrace = value => value;
   const t = key => key;
   const { props, activeConversation, activeAnswerTabs, expandedSteps, streamOwners,
@@ -48,6 +50,7 @@ const makeRunner = new Function('env', transpile(`
     streamRenderTimers, streamRenderLast, streamRenderCost, ai, reader, crypto,
     listen, invoke, persistConversationFor, scheduleStreamRender, scrollToBottom,
     mergeServerToolTrace, buildToolExchangeMessages, guidedReadingRequestHistory, syncLibraryRoot,
+    beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage,
     broadcastConversationSnapshot, broadcastStreamUpdate } = env;
   const { applyContextCheckpoint, historyFingerprint } = env;
   ${eventSuffixes}
@@ -117,6 +120,7 @@ function harness() {
     scheduleStreamRender: a => { a.displayContent = a.content; a.displayReasoning = a.reasoningContent },
     scrollToBottom: () => {}, mergeServerToolTrace: (prior, next) => ({ ...prior, ...next }),
     buildToolExchangeMessages, guidedReadingRequestHistory,
+    beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage,
   }
   const runner = makeRunner(env)
   const begin = () => {

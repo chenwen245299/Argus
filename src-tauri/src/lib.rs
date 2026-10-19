@@ -12,6 +12,7 @@ mod canvas;
 mod canvas_edit;
 mod canvas_enhance;
 mod chat_context;
+mod chat_images;
 mod collections;
 mod commands;
 mod copilot;
@@ -48,6 +49,7 @@ mod sections;
 mod security_bookmark;
 mod settings;
 mod user_memory;
+mod user_memory_queue;
 mod snippets;
 mod soclaas;
 mod speech_cache;
@@ -133,6 +135,7 @@ pub fn run() {
             // Start background scheduler
             arxiv_scheduler::start_scheduler(app.handle().clone());
             arxiv_pdf_cache::spawn(app.handle());
+            user_memory_queue::spawn(app.handle());
 
             // Re-read model prices well after launch, so a free tier that has
             // been withdrawn stops advertising itself. Returns immediately.

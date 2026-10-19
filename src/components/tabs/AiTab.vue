@@ -431,38 +431,15 @@ function cloneConversation(conv: Conversation): Conversation {
   return JSON.parse(JSON.stringify(conv)) as Conversation
 }
 
-// ── Persisting the agent trail ──────────────────────────────────────────────
-// Tool results are kept so an old answer can still be audited after a reload —
-// opening a step then shows what the model actually got, not an empty box. The
-// caps below are runaway guards rather than savings: every conversation for a
-// paper shares one file, so one pathological run (hundreds of rounds, each
-// result half a megabyte) would make that file slow to rewrite while the next
-// answer is still streaming into it. Real results sit far below these.
-
-/** Per tool result. */
-const PERSIST_STEP_CHARS = 60_000
-/** Per answer, across all of its tool calls. */
-const PERSIST_ANSWER_CHARS = 400_000
-
-/** Trim one answer's tool payloads down to what is worth writing to disk. */
+// Keep the exact text the model read across saves, reloads and window sync.
+// Context capacity is managed at request boundaries, never by clipping storage.
+// Immutable page images remain on disk; only their references are persisted.
 function persistableSteps(steps?: AgentStep[]): AgentStep[] | undefined {
   if (!steps) return undefined
-  let budget = PERSIST_ANSWER_CHARS
-  return steps.map(step => {
-    // Page images live on disk under `file`; drop the base64 `dataUrl` so the
-    // conversation JSON stays small and reloads the PNG by name instead.
-    const images = step.images?.map(({ dataUrl: _drop, ...img }) => img)
-    const base: AgentStep = images ? { ...step, images } : step
-    if (!base.preview) return base
-    const room = Math.min(PERSIST_STEP_CHARS, budget)
-    if (room <= 0) {
-      const { preview: _drop, ...rest } = base
-      return rest
-    }
-    budget -= Math.min(base.preview.length, room)
-    if (base.preview.length <= room) return base
-    return { ...base, preview: base.preview.slice(0, room) }
-  })
+  return steps.map(step => ({
+    ...step,
+    images: step.images?.map(({ dataUrl: _liveOnly, ...image }) => image),
+  }))
 }
 
 /** A conversation as it goes to disk: no throttled render copies, tool payloads
@@ -1396,7 +1373,7 @@ function buildHistoryUntil(conv: Conversation, stopGroupId?: string): ChatMessag
       if (answer) {
         // Replay this turn's tool calls + results (as native tool messages)
         // before its answer, so a follow-up reuses them instead of re-fetching.
-        messages.push(...buildToolExchangeMessages(answer.steps, answer.id))
+        messages.push(...buildToolExchangeMessages(answer.steps, answer.id, conv.id))
         if (answer.content.trim()) messages.push({ role: 'assistant', content: answer.content })
       }
     } else if (node.role === 'user') {
@@ -3075,7 +3052,7 @@ onUnmounted(() => {
                     <Icon icon="fluent:edit-24-regular" width="10" height="10" />
                     {{ formatTokenCount(currentTurnInputTokens(answer)) }}
                   </span>
-                  <span v-if="typeof answer.inputTokens === 'number'" class="usage-tokens" title="上下文输入 tokens（含历史与全文）">↑{{ formatTokenCount(answer.inputTokens) }}</span>
+                  <span v-if="typeof answer.inputTokens === 'number'" class="usage-tokens" title="本次回答累计输入 tokens（含历史、工具和缓存输入；多次模型调用相加）">↑{{ formatTokenCount(answer.inputTokens) }}</span>
                   <span v-if="typeof answer.outputTokens === 'number'" class="usage-tokens" title="本次输出 tokens">↓{{ formatTokenCount(answer.outputTokens) }}</span>
                   <span
                     v-if="cacheHitPercent(answer) !== null"

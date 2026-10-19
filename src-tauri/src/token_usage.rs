@@ -37,7 +37,18 @@ pub fn set_root(root: &str) {
     *root_mutex().lock().unwrap_or_else(|e| e.into_inner()) = root.to_string();
 }
 
+tokio::task_local! { static RECORD_ROOT: String; }
+
+/// Background work records against its original library without changing the
+/// foreground window's global library or interfering with concurrent jobs.
+pub async fn with_root<F: std::future::Future>(root: &str, work: F) -> F::Output {
+    RECORD_ROOT.scope(root.to_string(), work).await
+}
+
 fn current_root() -> Option<String> {
+    if let Ok(root) = RECORD_ROOT.try_with(Clone::clone) {
+        return Some(root);
+    }
     let s = root_mutex()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -67,7 +78,15 @@ pub fn record_with_cost(
     output_tokens: u64,
     cost_usd: Option<f64>,
 ) {
-    record_full(source, provider, model, input_tokens, output_tokens, cost_usd, 0);
+    record_full(
+        source,
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        cost_usd,
+        0,
+    );
 }
 
 /// Like `record_with_cost` but also records how many input tokens were served
@@ -132,4 +151,37 @@ pub fn clear(root: &str) -> Result<(), String> {
         std::fs::write(&path, "").map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod scoped_tests {
+    use super::*;
+    #[tokio::test]
+    async fn concurrent_background_calls_record_in_their_original_library_after_yielding() {
+        let root = std::env::temp_dir().join(format!("argus-usage-scope-{}", uuid::Uuid::new_v4()));
+        let one = root.join("one").to_string_lossy().to_string();
+        let two = root.join("two").to_string_lossy().to_string();
+        let record = |library: String, amount| async move {
+            with_root(&library, async {
+                tokio::task::yield_now().await;
+                assert_eq!(current_root().as_deref(), Some(library.as_str()));
+                record_full(
+                    "user-memory",
+                    "provider",
+                    "model",
+                    amount,
+                    12,
+                    None,
+                    amount / 2,
+                );
+            })
+            .await;
+        };
+        tokio::join!(record(one.clone(), 100), record(two.clone(), 200));
+        assert_eq!(get_all(&one)[0].input_tokens, 100);
+        assert_eq!(get_all(&two)[0].input_tokens, 200);
+        assert_eq!(get_all(&one)[0].cache_hit_tokens, 50);
+        assert_eq!(get_all(&two)[0].cache_hit_tokens, 100);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

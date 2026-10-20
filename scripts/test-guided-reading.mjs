@@ -75,6 +75,7 @@ before(async () => {
         emit(name, payload) { for (const cb of test.listeners.get(name) || []) cb({ payload }); },
         invoke(command, args) {
           if (command === 'get_current_library') { test.rootReads=(test.rootReads||0)+1;return Promise.resolve(test.root); }
+          if (command === 'get_ai_settings') return Promise.resolve(JSON.parse(JSON.stringify(test.aiSettings)));
           if (command === 'get_guided_reading_settings') {
             const config=JSON.parse(localStorage.getItem(test.root+':guides')||'{"presets":[],"defaultId":"builtin"}');
             if(test.holdGuides)return new Promise(resolve=>test.pendingGuideRead={resolve,config});
@@ -109,6 +110,7 @@ before(async () => {
         id: 'provider', name: 'Example', enabled: true, kind: 'custom', base_url: 'https://example.test/v1',
         models: [{ id: 'test-vision', display_name: 'Test vision', capabilities: ['vision', 'tool_calling'] }],
       }] };
+      test.aiSettings=JSON.parse(JSON.stringify(ai.settings));
       useSettingsStore(pinia).load = async () => {};
       app.mount('#app'); test.mounted = true;
       </script>`

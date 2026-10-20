@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, onScopeDispose } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   AiModel, AiProviderInfo, AiProviderInput, AiSettingsInfo, BalanceResult,
   ModelSelection, ProviderBalance,
@@ -75,18 +75,60 @@ export function providerSupportsBalance(
 export const useAiStore = defineStore('ai', () => {
   const settings = ref<AiSettingsInfo>({ providers: [] })
   const loaded = ref(false)
+  let disposed = false
+  let loadRevision = 0
+  let libraryRevision = 0
+  let settingsRoot: string | null = null
+  const unlisteners: UnlistenFn[] = []
 
-  // The backend re-reads model prices in the background a while after launch.
-  // Reloading here is what makes a withdrawn free tier stop showing FREE in an
-  // already-open window, rather than waiting for the next restart. Registered
-  // once per window, for as long as the window lives.
-  listen('ai-models-refreshed', () => {
-    if (loaded.value) load()
-  }).catch(() => {})
+  function keepListener(pending: Promise<UnlistenFn>) {
+    return pending.then(off => {
+      if (disposed) off()
+      else unlisteners.push(off)
+    }).catch(() => {})
+  }
+
+  // Each Tauri window has its own Pinia store. Subscribe before the first read,
+  // then reload canonical settings after a successful edit in any window.
+  const listenersReady = Promise.all([
+    keepListener(listen<{ root?: string }>('ai-settings-changed', event => {
+      if (event.payload?.root && settingsRoot && event.payload.root !== settingsRoot) return
+      if (loaded.value || loadRevision > 0) void load()
+    })),
+    keepListener(listen('ai-models-refreshed', () => {
+      if (loaded.value || loadRevision > 0) void load()
+    })),
+    keepListener(listen('library-changed', () => {
+      const wasRequested = loaded.value || loadRevision > 0
+      loadRevision++
+      libraryRevision++
+      settingsRoot = null
+      settings.value = { providers: [] }
+      loaded.value = false
+      balances.value = {}; balanceErrors.value = {}
+      balancesLoading.value = false; balancesRetryAfter = 0
+      if (wasRequested) void load()
+    })),
+  ])
+
+  onScopeDispose(() => {
+    disposed = true
+    loadRevision++
+    libraryRevision++
+    unlisteners.forEach(off => off())
+  })
 
   async function load() {
+    const revision = ++loadRevision
     try {
-      settings.value = await invoke<AiSettingsInfo>('get_ai_settings')
+      await listenersReady
+      if (disposed || revision !== loadRevision) return
+      const root = await invoke<string | null>('get_current_library')
+      if (disposed || revision !== loadRevision) return
+      const next = await invoke<AiSettingsInfo>('get_ai_settings', { expectedRoot: root })
+      if (disposed || revision !== loadRevision) return
+      settingsRoot = root
+      settings.value = next
       loaded.value = true
       // Warm the balances here rather than in each caller: every window that
       // shows a model picker loads settings first, so this is what makes the
@@ -95,7 +137,7 @@ export const useAiStore = defineStore('ai', () => {
       // the last answer is still fresh.
       void loadBalances()
     } catch (e) {
-      console.error('Failed to load AI settings:', e)
+      if (!disposed && revision === loadRevision) console.error('Failed to load AI settings:', e)
     }
   }
 
@@ -198,8 +240,10 @@ export const useAiStore = defineStore('ai', () => {
     if (balancesLoading.value) return
     if (!force && Date.now() < balancesRetryAfter) return
     balancesLoading.value = true
+    const revision = libraryRevision
     try {
       const results = await invoke<BalanceResult[]>('fetch_provider_balances')
+      if (disposed || revision !== libraryRevision) return
       const nextBalances: Record<string, ProviderBalance> = {}
       const nextErrors: Record<string, string> = {}
       for (const r of results) {
@@ -212,9 +256,9 @@ export const useAiStore = defineStore('ai', () => {
     } catch {
       // The command itself failing (no library open, say) is not worth a
       // message in the picker — the tags simply stay hidden.
-      balancesRetryAfter = Date.now() + BALANCE_RETRY_MS
+      if (!disposed && revision === libraryRevision) balancesRetryAfter = Date.now() + BALANCE_RETRY_MS
     } finally {
-      balancesLoading.value = false
+      if (!disposed && revision === libraryRevision) balancesLoading.value = false
     }
   }
 
@@ -281,8 +325,7 @@ export const useAiStore = defineStore('ai', () => {
 
   async function setProviderEnabled(id: string, enabled: boolean) {
     await invoke('set_provider_enabled', { id, enabled })
-    const p = settings.value.providers.find(x => x.id === id)
-    if (p) p.enabled = enabled
+    await load()
   }
 
   async function fetchModels(id: string): Promise<AiModel[]> {
@@ -291,14 +334,12 @@ export const useAiStore = defineStore('ai', () => {
 
   async function saveModels(id: string, models: AiModel[]) {
     await invoke('save_provider_models', { id, models })
-    const p = settings.value.providers.find(x => x.id === id)
-    if (p) p.models = models
+    await load()
   }
 
   async function setDefault(sel: ModelSelection) {
     await invoke('set_default_model', { providerId: sel.providerId, modelId: sel.modelId })
-    settings.value.default_provider_id = sel.providerId
-    settings.value.default_model_id = sel.modelId
+    await load()
   }
 
   async function testProvider(id: string): Promise<string> {

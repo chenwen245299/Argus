@@ -748,6 +748,7 @@ async fn stream_with_pdf_injected(
     }
 
     if is_openrouter {
+        crate::openrouter::apply_reasoning_off(&mut body, model, use_reasoning);
         let order: Vec<&str> = provider
             .models
             .iter()
@@ -1076,6 +1077,7 @@ async fn chat_openai_compat(
     }
 
     if is_openrouter {
+        crate::openrouter::apply_reasoning_off(&mut body, model, false);
         let order: Vec<&str> = provider
             .models
             .iter()
@@ -1289,6 +1291,9 @@ async fn stream_openai_compat(
         }
     }
 
+    if is_openrouter {
+        crate::openrouter::apply_reasoning_off(&mut body, model, use_reasoning);
+    }
     if use_reasoning || is_kimi_k2 {
         if is_deepseek {
             body["thinking"] = serde_json::json!({"type": "enabled"});
@@ -3847,7 +3852,7 @@ fn strip_leading_think(s: &str) -> &str {
     }
 }
 
-/// Why a successful non-streaming reply carried no text, as an error message.
+/// Why a completed reply carried no text, as an error message.
 ///
 /// Every message here is per-request ([`ErrorClass::Request`]): none contains
 /// a status, a vendor code, or quota / network wording.
@@ -3878,6 +3883,10 @@ fn empty_reply_error(json: &serde_json::Value, text: &str, reasoning: &str) -> S
     }
     if !reasoning.trim().is_empty() {
         return "模型只返回了思考过程、没有正文。可换用不思考的模型或调高输出长度后重试".to_string();
+    }
+    if text.trim().is_empty() {
+        let detail = if finish.is_empty() { String::new() } else { format!("（finish_reason={finish}）") };
+        return format!("模型结束了生成，但没有返回回答正文{detail}。请重试，或关闭思考模式后重试");
     }
     format!("Unexpected response format from API: {}", char_prefix(text, 200))
 }
@@ -4477,6 +4486,30 @@ mod provider_error_tests {
     }
 
     #[test]
+    fn terminal_agent_replies_cannot_succeed_with_only_whitespace_or_reasoning() {
+        for (finish, reasoning, expected) in [
+            (Some("stop"), "Let me think", "只返回了思考过程"),
+            (Some("length"), "Long reasoning", "finish_reason=length"),
+            (Some("content_filter"), "", "安全策略"),
+            (Some("stop"), "", "没有返回回答正文（finish_reason=stop）"),
+            (None, "", "没有返回回答正文"),
+        ] {
+            let turn = ToolTurn { content: "\n\n\n".into(), reasoning: reasoning.into(),
+                finish_reason: finish.map(str::to_string), ..Default::default() };
+            let error = turn.require_answer_content(&turn.content).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(classify_error(&error), ErrorClass::Request, "{error}");
+        }
+    }
+
+    #[test]
+    fn an_empty_final_round_retains_prose_from_earlier_tool_rounds() {
+        let turn = ToolTurn { content: "\n\n".into(), finish_reason: Some("stop".into()), ..Default::default() };
+        assert!(turn.require_answer_content("An earlier round already answered.\n\n").is_ok());
+        assert!(turn.require_answer_content("\n\n答案是 42。\n").is_ok());
+    }
+
+    #[test]
     fn reasoning_is_read_from_every_field_providers_use() {
         assert_eq!(reply_reasoning(&json!({"reasoning_content": "a"})), "a");
         assert_eq!(reply_reasoning(&json!({"reasoning": "b"})), "b");
@@ -4752,6 +4785,20 @@ pub struct ToolTurn {
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: TurnUsage,
+    pub finish_reason: Option<String>,
+}
+
+impl ToolTurn {
+    /// Call only when the agent is finishing its answer. Tool-only intermediate
+    /// rounds are valid; a finished answer consisting of Dots-style newlines or
+    /// reasoning alone is not. Earlier visible prose still counts as an answer.
+    pub fn require_answer_content(&self, accumulated: &str) -> Result<(), String> {
+        if !accumulated.trim().is_empty() {
+            return Ok(());
+        }
+        let reply = serde_json::json!({ "choices": [{ "finish_reason": self.finish_reason }] });
+        Err(empty_reply_error(&reply, "", &self.reasoning))
+    }
 }
 
 /// Send a usage figure to the front-end for `event_name`.
@@ -4777,6 +4824,7 @@ pub fn emit_run_usage(app: &tauri::AppHandle, event_name: &str, usage: &TurnUsag
     let mut payload = serde_json::json!({
         "cache_hit_tokens": usage.cache_hit_tokens, "cache_reported": usage.cache_reported,
         "model_calls": usage.model_calls, "model_duration_ms": usage.model_duration_ms,
+        "cost_usd": usage.cost_usd,
     });
     if usage.input_tokens > 0 || usage.output_tokens > 0 {
         payload["input_tokens"] = serde_json::json!(usage.input_tokens);
@@ -5213,6 +5261,7 @@ async fn stream_tool_request(
         body["search_options"] = serde_json::json!({ "forced_search": true, "enable_source": true });
     }
     if is_openrouter {
+        crate::openrouter::apply_reasoning_off(&mut body, model, use_reasoning);
         let order: Vec<&str> = provider
             .models
             .iter()
@@ -5326,7 +5375,7 @@ async fn stream_tool_request(
     let mut cache_reported = false;
     let mut cost_usd: Option<f64> = None;
     let mut trace = crate::openrouter::ServerToolTrace::default();
-    let mut compact_finish: Option<String> = None;
+    let mut finish_reason: Option<String> = None;
     let mut compact_error: Option<String> = None;
     // Same as on the plain-chat path: a client-side search's pages are citations
     // even though nothing in the response mentions them.
@@ -5422,10 +5471,8 @@ async fn stream_tool_request(
                 trace.absorb_usage(usage);
             }
 
-            if compact_max_tokens.is_some() {
-                if let Some(reason) = json["choices"][0]["finish_reason"].as_str() {
-                    compact_finish = Some(reason.to_string());
-                }
+            if let Some(reason) = json["choices"][0]["finish_reason"].as_str() {
+                finish_reason = Some(reason.to_string());
             }
             let delta = &json["choices"][0]["delta"];
             trace.absorb(delta);
@@ -5516,8 +5563,9 @@ async fn stream_tool_request(
     };
     if compact_max_tokens.is_some() { emit_usage(app, event_name, &usage); }
     if let Some(error) = compact_error { return Err(error); }
-    if compact_finish.as_deref().is_some_and(|r| matches!(r, "length" | "content_filter" | "error")) {
-        return Err(format!("Compaction summary was incomplete (finish_reason={}).", compact_finish.unwrap()));
+    if compact_max_tokens.is_some()
+        && finish_reason.as_deref().is_some_and(|r| matches!(r, "length" | "content_filter" | "error")) {
+        return Err(format!("Compaction summary was incomplete (finish_reason={}).", finish_reason.unwrap()));
     }
 
     let tool_calls = partial
@@ -5535,6 +5583,7 @@ async fn stream_tool_request(
         reasoning: reasoning_text,
         tool_calls,
         usage,
+        finish_reason,
     })
 }
 

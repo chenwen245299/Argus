@@ -1146,7 +1146,11 @@ pub async fn regen_ebook_sections(
 
 /// Delete a paper by removing its entire directory from the library.
 #[tauri::command]
-pub async fn delete_paper(slug: String, state: State<'_, LibraryRoot>) -> Result<(), String> {
+pub async fn delete_paper(
+    slug: String,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let root = get_root(&state)?;
     let dir = paper::paper_dir(&root, &slug);
     if !dir.exists() {
@@ -1186,7 +1190,11 @@ pub async fn delete_paper(slug: String, state: State<'_, LibraryRoot>) -> Result
     // Removing the folder also deletes the paper's per-paper conversation
     // history (chat.json, ai_conversations.json), notes, highlights, sections,
     // reading state and extracted fulltext.
-    std::fs::remove_dir_all(&dir).map_err(|e| format!("Cannot delete paper: {e}"))
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("Cannot delete paper: {e}"))?;
+    // All deletion entry points (including batch deletion) share this command.
+    // Close only this paper's AI window, and only after deletion succeeds.
+    copilot::close_paper_ai_window(&app, &slug);
+    Ok(())
 }
 
 /// Open the paper's actual folder in the system file manager.
@@ -1801,9 +1809,19 @@ pub async fn search_fulltext(
 
 // ── M5: AI Service Center ─────────────────────────────────────────────────────
 
+fn emit_ai_settings_changed(app: &tauri::AppHandle, root: &str) {
+    let _ = app.emit("ai-settings-changed", serde_json::json!({ "root": root }));
+}
+
 #[tauri::command]
-pub async fn get_ai_settings(state: State<'_, LibraryRoot>) -> Result<AiSettingsInfo, String> {
+pub async fn get_ai_settings(
+    expected_root: Option<String>,
+    state: State<'_, LibraryRoot>,
+) -> Result<AiSettingsInfo, String> {
     let root = get_root(&state)?;
+    if expected_root.as_deref().is_some_and(|expected| expected != root) {
+        return Err("Library changed while loading AI settings".into());
+    }
     Ok(ai_manager::to_info(
         &root,
         &ai_manager::read_ai_settings(&root),
@@ -1815,9 +1833,11 @@ pub async fn add_ai_provider(
     provider: AiProviderInput,
     api_key: String,
     state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
 ) -> Result<AiProviderInfo, String> {
     let root = get_root(&state)?;
     let p = ai_manager::add_provider(&root, provider, &api_key)?;
+    emit_ai_settings_changed(&app, &root);
     Ok(AiProviderInfo {
         has_key: ai_manager::has_api_key(&root, &p.id),
         has_access_token: false,
@@ -1837,15 +1857,24 @@ pub async fn update_ai_provider(
     provider: AiProviderInput,
     api_key: Option<String>,
     state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
-    ai_manager::update_provider(&root, provider, api_key.as_deref())
+    ai_manager::update_provider(&root, provider, api_key.as_deref())?;
+    emit_ai_settings_changed(&app, &root);
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn delete_ai_provider(id: String, state: State<'_, LibraryRoot>) -> Result<(), String> {
+pub async fn delete_ai_provider(
+    id: String,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let root = get_root(&state)?;
-    ai_manager::delete_provider(&root, &id)
+    ai_manager::delete_provider(&root, &id)?;
+    emit_ai_settings_changed(&app, &root);
+    Ok(())
 }
 
 /// Store (or clear, when empty) a provider's account-level access token,
@@ -1873,9 +1902,12 @@ pub async fn set_provider_enabled(
     id: String,
     enabled: bool,
     state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
-    ai_manager::set_provider_enabled(&root, &id, enabled)
+    ai_manager::set_provider_enabled(&root, &id, enabled)?;
+    emit_ai_settings_changed(&app, &root);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1924,6 +1956,7 @@ pub async fn save_provider_models(
 ) -> Result<(), String> {
     let root = get_root(&state)?;
     ai_manager::save_provider_models(&root, &id, models)?;
+    emit_ai_settings_changed(&app, &root);
     // Newly added models arrive without their promotion badges — those are not
     // in the list the fetch dialog reads. Fill them in shortly.
     crate::offer_sync::spawn_after_edit(&app);
@@ -2003,9 +2036,12 @@ pub async fn set_default_model(
     provider_id: String,
     model_id: String,
     state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
-    ai_manager::set_default_model(&root, &provider_id, &model_id)
+    ai_manager::set_default_model(&root, &provider_id, &model_id)?;
+    emit_ai_settings_changed(&app, &root);
+    Ok(())
 }
 
 // ── Account balances ──────────────────────────────────────────────────────────

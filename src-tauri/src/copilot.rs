@@ -1302,6 +1302,17 @@ fn paper_ai_window_label(slug: &str) -> String {
     format!("paper-ai-{}", URL_SAFE_NO_PAD.encode(slug))
 }
 
+pub fn close_paper_ai_window(app: &tauri::AppHandle, slug: &str) {
+    use tauri::Manager;
+
+    if let Some(win) = app.get_webview_window(&paper_ai_window_label(slug)) {
+        // Window cleanup must not turn a completed deletion into an error.
+        if let Err(e) = win.close() {
+            eprintln!("Close deleted paper's AI window: {e}");
+        }
+    }
+}
+
 pub fn open_paper_ai_window(app: &tauri::AppHandle, slug: &str) -> Result<(), String> {
     use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
@@ -3250,6 +3261,11 @@ async fn run_agent_loop(
 
         // No tool calls means the model is done looking and this is the answer.
         if turn.tool_calls.is_empty() {
+            if !cancelled() {
+                if let Err(error) = turn.require_answer_content(&streamed) {
+                    break 'rounds Err(error);
+                }
+            }
             convo.push(serde_json::json!({"role":"assistant","content":turn.content}));
             break 'rounds Ok(());
         }
@@ -3302,6 +3318,11 @@ async fn run_agent_loop(
                     streamed.push_str("\n\n");
                 }
                 streamed.push_str(&final_turn.content);
+            }
+            if !cancelled() {
+                if let Err(error) = final_turn.require_answer_content(&streamed) {
+                    break 'rounds Err(error);
+                }
             }
             break 'rounds Ok(());
         }

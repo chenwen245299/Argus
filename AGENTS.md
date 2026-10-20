@@ -359,6 +359,11 @@ Steering waits for cancelled local requests to settle and forwards mirrored
 paper-AI stops to the owning window. Incomplete tools are marked interrupted;
 tool-only completed results also enter follow-up history. Write approvals are
 refused only for stopped requests, never granted by a queue action.
+`utils/chatAnswerVisibility.ts` hides finished empty answer cards and their
+group spacing, including after steering or restoring saved conversations.
+Pending replies, partial text, reasoning, tools/media and errors remain visible;
+stored messages and billing are retained. Empty model variants fall back to a
+visible sibling, preserving access to completed results.
 `cancel::until_cancelled` makes pending HTTP headers and SSE reads cancellable
 without waiting for another chunk; stream finalization still records partial
 usage and the agent still shuts its MCP connections down normally.
@@ -412,6 +417,14 @@ regenerating an answer starts collapsed again. Library chat keeps an opt-in
 `expandedReasoning` set per answer; paper AI uses initially closed `<details>`.
 
 `snippetLibrary.ts`, `translationHistory.ts`, and `update.ts` are reactive helper modules, not Pinia stores.
+
+**AI model settings across windows.** Successful provider/model/default edits
+emit `ai-settings-changed` with the library root after persistence. Each window's
+`ai.ts` subscribes before its first load and rereads canonical settings; existing
+model selection, drafts and live answers stay with their components. Load
+revisions and `get_ai_settings.expectedRoot` reject stale reads; library changes
+also discard old model/balance results. Store disposal releases event listeners.
+The background `ai-models-refreshed` price notification remains supported.
 
 ### Backend modules (Rust)
 
@@ -564,6 +577,12 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   and its `reasoning_content` is replayed on assistant turns that carried tool
   calls (`llm::replays_reasoning_with_tool_calls` — Kimi K2 only; DeepSeek's
   reasoner has rejected the field on input).
+- Agent completion rejects an answer containing only whitespace or thinking,
+  including the final turn after the tool budget is spent. Streamed finish
+  reasons distinguish output limits and filtering; earlier visible prose and
+  usage accounting survive. OpenRouter Dots3-Note Preview defaults to thinking,
+  so `openrouter::apply_reasoning_off` sends `reasoning.enabled: false` when the
+  user disables it (and for one-shot jobs). Other models keep their defaults.
 - `chat_with_library_agent` connects the external servers, then runs
   `run_agent_loop`; the split exists so the child processes are torn down on
   every exit path, cancellation included.
@@ -728,6 +747,12 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   when any input sample lacks cache reporting. Paper live patches carry only the
   current requests' accounting, with full ledgers in saved snapshots. Narrow
   toolbars hide secondary statistics as space narrows instead of wrapping them.
+  Their final statistic before the context ring is cumulative conversation cost
+  in CNY: provider-reported USD bills take priority, otherwise configured prices
+  estimate token/cache/peak costs with an approximation marker. Unknown prices
+  show an unavailable total, never a misleading zero or partial sum. The ledger
+  retains bills and request dates across regeneration/deletion and compaction;
+  older visible bills repair only a uniquely matching request for an answer.
   Paper sidebars and canvas chat do not show runtime statistics; their context
   meters remain in the toolbar, independent of cumulative billing totals.
   Draft estimates include media and update the composition rows. Idle usage
@@ -1423,6 +1448,12 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
 ## Testing instructions
 
 - **Frontend:** `vue-tsc --noEmit` runs as part of `npm run build`. Local regression scripts use Node's built-in test runner.
+- AI model synchronization: `node --test scripts/test-ai-settings-sync.mjs`
+  exercises separate Pinia stores, saved edits, failures, stale loads, library
+  switches and listener cleanup. `scripts/test-ai-settings-sync-browser.mjs`
+  uses real settings plus standalone/sidebar composers in separate browser
+  pages to verify immediate model availability, selected-model fallback,
+  preserved drafts and uninterrupted generation with local desktop mocks.
 - Library search: `node --test scripts/test-library-search.mjs` covers debouncing,
   immediate Enter, request coalescing, stale successes/errors, IME and the real
   toolbar's clear/navigation/library scope. `cargo test --lib search::tests`

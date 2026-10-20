@@ -12,7 +12,8 @@ import { modelHasVision, modelHasVideo, modelHasAudio, useAiStore, type ModelOpt
 import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import ContextMeter from '../ContextMeter.vue'
 import ChatRunStats from '../ChatRunStats.vue'
-import { beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage, type ChatRun } from '../../utils/chatRunStats'
+import ChatConversationCost from '../ChatConversationCost.vue'
+import { beginChatRun, applyRunUsage, conversationChatRuns, legacyChatRun, recordCompactionUsage, type ChatRun } from '../../utils/chatRunStats'
 import { applyContextCheckpoint, historyFingerprint, withContextDraft, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
 import ServerToolTraceCard from '../ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../../utils/serverToolTrace'
@@ -36,6 +37,7 @@ import { useChatScrollResize } from '../../utils/chatScrollResize'
 import { guidedReadingRequestHistory, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
+import { hasVisibleChatAnswer } from '../../utils/chatAnswerVisibility'
 import { askAiText } from '../../stores/translationHistory'
 import { estimateCostCny } from '../../utils/modelPricing'
 import type {
@@ -1140,9 +1142,13 @@ function activeAnswerForGroup(group: AssistantGroupNode) {
 }
 
 function activeAnswersForGroup(group: AssistantGroupNode) {
-  const answer = activeAnswerForGroup(group)
+  const selected = activeAnswerForGroup(group)
+  const answer = selected && hasVisibleChatAnswer(selected) ? selected : group.answers.find(hasVisibleChatAnswer)
   return answer ? [answer] : []
 }
+
+const visibleNodes = computed(() => (activeConversation.value?.nodes ?? []).filter(node =>
+  node.role === 'user' || activeAnswersForGroup(node).length > 0))
 
 function setActiveAnswer(groupId: string, answerId: string) {
   activeAnswerTabs.value = { ...activeAnswerTabs.value, [groupId]: answerId }
@@ -1438,11 +1444,10 @@ function paperContextDisplay(model: ModelOption): ContextUsage | null {
 }
 function legacyPaperRuns(conv: Conversation): ChatRun[] {
   return conv.nodes.flatMap(n => n.role === 'assistantGroup' ? n.answers : [])
-    .filter(answer => typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number')
+    .filter(answer => typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number' || typeof answer.costUsd === 'number')
     .map(answer => legacyChatRun(answer, answer.providerId, answer.modelId, answer.steps?.length))
 }
-const paperRuns = computed(() => activeConversation.value ? Object.values(activeConversation.value.usageRuns
-  ?? Object.fromEntries(legacyPaperRuns(activeConversation.value).map(run => [run.id, run]))) : [])
+const paperRuns = computed(() => activeConversation.value ? conversationChatRuns(activeConversation.value, legacyPaperRuns(activeConversation.value)) : [])
 const paperContextCompacting = computed(() => !!activeConversation.value && (
   [...streamOwners.values()].some(o => o.conv.id === activeConversation.value!.id && o.contextOnly)
   || activeConversation.value.nodes.some(n => n.role === 'assistantGroup' && n.answers.some(a => a.contextCompacting))))
@@ -2848,7 +2853,7 @@ onUnmounted(() => {
           <span>问它任何问题，它会自己去翻这篇论文。</span>
         </div>
 
-        <template v-for="node in activeConversation?.nodes ?? []" :key="node.id">
+        <template v-for="node in visibleNodes" :key="node.id">
           <div v-if="node.role === 'user'" class="user-row" :data-node-id="node.id">
             <div class="user-msg-wrap">
               <!-- Edit mode -->
@@ -3249,6 +3254,7 @@ onUnmounted(() => {
             <span v-else class="toolbar-spacer" />
 
             <span v-if="activeConversation" class="paper-context-meters">
+              <ChatConversationCost v-if="props.standalone" :runs="paperRuns" />
               <ContextMeter v-for="model in selectedModels" :key="`${activeConversation.id}:${modelKey(model)}`"
                 :usage="paperContextDisplay(model)" :busy="composerBusy" :compacting="paperContextCompacting"
                 :label="selectedModels.length > 1 ? model.displayName : undefined"

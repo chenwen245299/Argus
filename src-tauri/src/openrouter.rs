@@ -25,6 +25,15 @@ pub fn is_openrouter(provider: &AiProvider) -> bool {
     provider.kind == "openrouter" || provider.base_url.to_lowercase().contains("openrouter")
 }
 
+/// Dots3 thinks by default. Omitting `reasoning` only hides its thoughts in the
+/// UI; OpenRouter needs an explicit disable to actually request a direct reply.
+/// Keep this scoped to the model verified to accept `enabled: false`.
+pub fn apply_reasoning_off(body: &mut serde_json::Value, model: &str, use_reasoning: bool) {
+    if !use_reasoning && model.split(':').next() == Some("dots-studio/dots-3-note-preview") {
+        body["reasoning"] = serde_json::json!({ "enabled": false });
+    }
+}
+
 /// Whether attaching server tools to `model` is safe.
 ///
 /// A model that cannot emit a tool call cannot reach for a server tool either,
@@ -293,6 +302,25 @@ impl ServerToolTrace {
 mod tests {
     use super::*;
     use crate::models::ServerTools;
+
+    #[test]
+    fn dots_reasoning_off_is_explicit_and_scoped_to_the_verified_model() {
+        for model in ["dots-studio/dots-3-note-preview", "dots-studio/dots-3-note-preview:free"] {
+            let mut body = serde_json::json!({ "model": model });
+            apply_reasoning_off(&mut body, model, false);
+            assert_eq!(body["reasoning"], serde_json::json!({ "enabled": false }));
+            let mut thinking = serde_json::json!({ "reasoning": { "effort": "high", "exclude": false } });
+            let original = thinking.clone();
+            apply_reasoning_off(&mut thinking, model, true);
+            assert_eq!(thinking, original);
+        }
+        for model in ["deepseek/deepseek-r1", "dots-studio/other-model", "custom/dots-3-note-preview"] {
+            let mut body = serde_json::json!({ "model": model });
+            let original = body.clone();
+            apply_reasoning_off(&mut body, model, false);
+            assert_eq!(body, original);
+        }
+    }
 
     fn provider(kind: &str, url: &str, tools: ServerTools) -> AiProvider {
         AiProvider {

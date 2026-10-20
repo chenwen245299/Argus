@@ -52,6 +52,7 @@ before(async () => {
         return{messages,usage:t.usage(args,messages),compacted,summary:compacted?'Goal and evidence':null}},
       invoke(name,args){t.calls.push({name,args});
         if(name==='get_current_library')return Promise.resolve(t.root);
+        if(name==='get_ai_settings')return Promise.resolve(JSON.parse(JSON.stringify(t.aiSettings)));
         if(name==='get_paper_ai_conversations')return Promise.resolve(JSON.parse(localStorage.getItem(t.root+':paper:'+args.slug)||'null')||(args.slug==='paper'?[seed]:[]));
         if(name==='get_canvas_ai_conversations')return Promise.resolve(JSON.parse(localStorage.getItem(t.root+':canvas:'+args.canvasId)||'null')||[canvasSeed]);
         if(name==='get_paper_meta')return Promise.resolve({title:'Paper title',abstract:'A complete abstract'});
@@ -76,6 +77,7 @@ before(async () => {
     const ai=useAiStore(pinia);ai.loaded=true;ai.settings={default_provider_id:'provider',default_model_id:'small',providers:[{id:'provider',name:'Example',enabled:true,kind:'custom',base_url:'https://example.test/v1',models:[
       {id:'small',display_name:'Small model',context_length:10000,capabilities:['vision','tool_calling']},
       {id:'large',display_name:'Large model',context_length:20000,capabilities:['vision','tool_calling']}]}]};ai.load=async()=>{};
+    t.aiSettings=JSON.parse(JSON.stringify(ai.settings));
     useSettingsStore(pinia).load=async()=>{};useReaderStore(pinia).readingStateFor=()=>({page:4});
     app.mount('#app');t.mounted=true;
     </script>`))

@@ -57,7 +57,12 @@ before(async () => {
         invoke(command, args) {
           test.calls.push({command,args});
           if (command === 'get_current_library') return Promise.resolve('/mock-library');
+          if (command === 'get_ai_settings') return Promise.resolve(JSON.parse(JSON.stringify(test.aiSettings)));
+          if (command === 'prepare_library_chat_context' && test.costContext) return Promise.resolve({messages:args.messages,compacted:false,usage:{
+            usedTokens:6000,contextWindow:100000,remainingTokens:94000,systemTokens:1000,toolsTokens:1000,messageTokens:4000,
+            reservedTokens:1000,thresholdTokens:80000,estimated:true,capacityEstimated:false,mediaEstimated:false,canCompact:true,providerId:args.providerId,modelId:args.modelId}});
           if (command === 'get_paper_meta') return Promise.resolve({title:'Example paper',abstract:'A paper'});
+          if (new URLSearchParams(location.search).has('replay-steered') && ['get_library_conversations','get_paper_ai_conversations'].includes(command)) return Promise.resolve(JSON.parse(sessionStorage.getItem('steered-conversation')||'[]'));
           if (savedReasoning && ['get_library_conversations','get_paper_ai_conversations'].includes(command)) {
             const createdAt='2026-10-15T00:00:00Z';
             const user={id:'saved-user',role:'user',content:'Saved question',createdAt};
@@ -86,6 +91,8 @@ before(async () => {
         id:'provider',name:'Example',enabled:true,kind:'custom',base_url:'https://example.test/v1',
         models:[{id:'test-vision',display_name:'Test vision',capabilities:['vision','tool_calling']}],
       }]};
+      test.aiSettings=JSON.parse(JSON.stringify(ai.settings));
+      test.setModelPrices = prices => Object.assign(ai.settings.providers[0].models[0], prices);
       ai.load=async()=>{};
       useSettingsStore(pinia).load=async()=>{};
       test.setThinking = value => useThinkingStore(pinia).useReasoning = value;
@@ -279,12 +286,15 @@ for (const mode of ['sidebar', 'standalone', 'library']) {
     })
     await send('later'); await send('change direction','Meta+Enter'); await count(2)
     const messages = await history(1)
+    await page.getByText('already written',{exact:true}).waitFor()
+    assert.equal(await page.locator(mode==='library'?'.msg-row.assistant':'.answer-card').count(),2)
     assert.ok(messages.some(m => m.role === 'assistant' && m.content === 'already written'))
     assert.ok(messages.some(m => m.role === 'tool' && m.content === 'cached paper result'))
     assert.equal(messages.at(-1).content, 'change direction')
     assert.equal(await page.locator('.queue-item').count(), 1)
     await page.locator('.queue-item').getByRole('button',{name:'引导',exact:true}).click(); await count(3)
     assert.equal((await history(2)).at(-1).content,'later')
+    assert.equal(await page.locator(mode==='library'?'.msg-row.assistant':'.answer-card').count(),2,'The blank interrupted continuation must disappear while the partial answer remains')
     const cancellations = await page.evaluate(() => window.__test.calls.filter(c => c.command==='cancel_ai_request').map(c => c.args.requestId))
     assert.deepEqual(cancellations, await page.evaluate(() => window.__test.requests.slice(0,2).map(r=>r.args.requestId)))
     assert.equal(await page.locator('.queue-item').count(),0)
@@ -460,6 +470,92 @@ for (const mode of ['sidebar', 'standalone', 'library']) {
     await open(mode,true)
     await page.locator('.reasoning-section').last().waitFor()
     assert.equal(await page.locator('.reasoning-body').last().isVisible(),false)
+    assert.deepEqual(errors,[])
+  })
+}
+
+for (const mode of ['standalone','library']) {
+  test(`${mode}: conversation cost sits before the context ring and retains paid regeneration and compaction`,async()=>{
+    await page.setViewportSize({width:1100,height:840});await open(mode)
+    if(mode==='standalone')await page.locator('.test-panel').evaluate(el=>el.style.width='100%')
+    await page.evaluate(()=>window.__test.costContext=true)
+    const cost=page.locator('.run-cost')
+    assert.equal((await cost.innerText()).trim(),'¥0.00')
+    await send('Account for this conversation');await count(1)
+    await page.evaluate(()=>{const t=window.__test,e=t.requests[0].args.eventName;
+      t.emit(e+'-run-usage',{input_tokens:1000,output_tokens:100,cost_usd:0.1});
+      t.emit(e+'-run-usage',{input_tokens:2000,output_tokens:200,cost_usd:0.2});
+      t.emit(e+'-compaction-usage',{id:'cost-batch',input_tokens:500,output_tokens:50,cost_usd:0.05});
+    })
+    await page.waitForFunction(()=>document.querySelector('.run-cost')?.textContent.trim()==='¥1.8')
+    await finish(0,'First paid answer')
+    await page.getByText('First paid answer',{exact:true}).waitFor()
+    await page.getByText('First paid answer',{exact:true}).hover()
+    await page.getByRole('button',{name:'重新生成',exact:true}).last().click();await count(2)
+    await page.evaluate(()=>{const t=window.__test;t.emit(t.requests[1].args.eventName+'-run-usage',{input_tokens:1000,output_tokens:100,cost_usd:0.1})})
+    await page.waitForFunction(()=>document.querySelector('.run-cost')?.textContent.trim()==='¥2.52')
+    await finish(1,'Regenerated answer')
+    for(const width of [1100,420]){
+      await page.setViewportSize({width,height:840})
+      const bill=await cost.boundingBox(),ring=await page.locator('.context-trigger').boundingBox(),stats=await page.locator('.composer').last().boundingBox()
+      if(process.env.ARGUS_TEST_OUTPUT_DIR)await page.locator('.composer').last().screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/'+mode+'-cost-layout-'+width+'.png'})
+      assert(bill.x+bill.width<=ring.x+1,JSON.stringify({mode,width,bill,ring,stats}))
+      assert(bill.x>=stats.x-1&&bill.x+bill.width<=stats.x+stats.width+1,'Cost must stay visible in narrow toolbars')
+      assert(Math.abs(bill.y+bill.height/2-ring.y-ring.height/2)<3)
+    }
+    assert.deepEqual(errors,[])
+  })
+  test(`${mode}: conversation cost distinguishes zero bills, unavailable prices and configured cache-aware estimates`,async()=>{
+    await page.setViewportSize({width:1100,height:840});await open(mode)
+    if(mode==='standalone')await page.locator('.test-panel').evaluate(el=>el.style.width='100%')
+    await page.evaluate(()=>window.__test.costContext=true)
+    await send('Check zero and estimated costs');await count(1)
+    await page.evaluate(()=>{const t=window.__test;t.emit(t.requests[0].args.eventName+'-run-usage',{input_tokens:1000000,output_tokens:500000,cache_hit_tokens:800000,cache_reported:true,cost_usd:0})})
+    await page.waitForFunction(()=>document.querySelector('.run-cost')?.textContent.trim()==='¥0.00')
+    await page.evaluate(()=>{const t=window.__test;t.emit(t.requests[0].args.eventName+'-run-usage',{input_tokens:1000000,output_tokens:500000,cache_hit_tokens:800000,cache_reported:true,cost_usd:null})})
+    await page.waitForFunction(()=>document.querySelector('.run-cost')?.textContent.trim()==='¥—')
+    await page.evaluate(()=>window.__test.setModelPrices({input_price_per_million:10,output_price_per_million:20,cache_hit_input_price_per_million:1}))
+    await page.waitForFunction(()=>document.querySelector('.run-cost')?.textContent.trim()==='≈¥12.8')
+    assert.match(await page.locator('.run-cost').getAttribute('title'),/估算/)
+    if(process.env.ARGUS_TEST_OUTPUT_DIR)await page.locator('.composer').last().screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/'+mode+'-conversation-cost.png'})
+    await finish(0,'An estimated answer')
+    assert.deepEqual(errors,[])
+  })
+}
+
+for(const mode of ['sidebar','standalone','library']){
+  test(`${mode}: steering removes empty stopped cards while retaining questions, spend and saved history`,async()=>{
+    await page.setViewportSize({width:1100,height:840});await open(mode)
+    const cards=()=>page.locator(mode==='library'?'.msg-row.assistant':'.answer-card')
+    await send('Original question');await count(1)
+    assert.equal(await cards().count(),1,'A pending answer must still be visible')
+    await page.evaluate(()=>{const t=window.__test,e=t.requests[0].args.eventName;
+      t.emit(e,{delta:'\n \n',done:false});
+      t.emit(e+'-run-usage',{input_tokens:1000,output_tokens:10,cost_usd:0.1});
+    })
+    await send('New direction');await page.locator('.queue-item').getByRole('button',{name:'引导',exact:true}).click();await count(2)
+    assert.equal(await cards().count(),1,'Only the new pending answer should be displayed')
+    assert.equal(await page.locator('.answer-group:empty').count(),0,'No empty group should leave a layout gap')
+    await page.evaluate(()=>{const t=window.__test;t.emit(t.requests[0].args.eventName,{delta:'Late cancelled text',done:false})})
+    assert.equal(await page.getByText('Late cancelled text',{exact:true}).count(),0)
+    await finish(1,'Steered response')
+    await page.getByText('Steered response',{exact:true}).waitFor()
+    assert.equal(await cards().count(),1)
+    if(mode!=='sidebar')assert.equal((await page.locator('.run-cost').innerText()).trim(),'¥0.72')
+    await page.waitForFunction(()=>window.__test.saved.some(s=>['save_library_conversation','save_paper_ai_conversations'].includes(s.command)&&JSON.stringify(s.args).includes('Steered response')))
+    const original=await page.evaluate(mode=>{
+      const saves=window.__test.saved.filter(s=>s.command===(mode==='library'?'save_library_conversation':'save_paper_ai_conversations'))
+      const saved=[...saves].reverse().find(s=>JSON.stringify(s.args).includes('Steered response'))
+      const conversations=mode==='library'?[saved.args.conversation]:saved.args.conversations
+      sessionStorage.setItem('steered-conversation',JSON.stringify(conversations))
+      const conv=conversations[0],users=(mode==='library'?conv.messages:conv.nodes).filter(n=>n.role==='user')
+      return {questions:users.map(n=>n.content),cost:Object.values(conv.usageRuns||{}).reduce((n,r)=>n+(r.costUsd||0),0)}
+    },mode)
+    assert.deepEqual(original.questions,['Original question','New direction']);assert.equal(original.cost,0.1)
+    await page.goto(`${origin}/__queue-test?mode=${mode}&replay-steered=1`)
+    await page.getByText('Steered response',{exact:true}).waitFor()
+    assert.equal(await cards().count(),1,'Saved empty placeholders must remain hidden after reopening')
+    if(mode!=='sidebar')assert.equal((await page.locator('.run-cost').innerText()).trim(),'¥0.72')
     assert.deepEqual(errors,[])
   })
 }

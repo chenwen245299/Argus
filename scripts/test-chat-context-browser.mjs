@@ -44,6 +44,7 @@ before(async () => {
       invoke(command,args){test.calls.push({command,args});
         if(command==='get_library_conversations')return Promise.resolve(JSON.parse(localStorage.getItem('context-test-saved')||'null')||[seed]);
         if(command==='get_current_library')return Promise.resolve('/mock-library');
+        if(command==='get_ai_settings')return Promise.resolve(JSON.parse(JSON.stringify(test.aiSettings)));
         if(command==='list_papers')return Promise.resolve([]);
         if(command==='prepare_library_chat_context') {
           if(args.mode==='manual')return new Promise((resolve,reject)=>test.manual.push({args,resolve,reject}));
@@ -59,6 +60,7 @@ before(async () => {
     const app=createApp(LibraryChat),pinia=createPinia();app.use(pinia);app.use(createI18n({legacy:false,locale:'zh',messages:{zh,en}}));
     const ai=useAiStore(pinia);ai.loaded=true;ai.settings={default_provider_id:'provider',default_model_id:'test-vision',providers:[{
       id:'provider',name:'Example',enabled:true,kind:'custom',base_url:'https://example.test/v1',models:[{id:'test-vision',display_name:'Test vision',context_length:10000,capabilities:['vision','tool_calling']}]}]};
+    test.aiSettings=JSON.parse(JSON.stringify(ai.settings));
     ai.load=async()=>{};useSettingsStore(pinia).load=async()=>{};app.mount('#app');test.mounted=true;
     </script></body></html>`))
   })

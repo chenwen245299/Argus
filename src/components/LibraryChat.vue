@@ -3,7 +3,9 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import ChatMessageQueue from './ChatMessageQueue.vue'
 import ContextMeter from './ContextMeter.vue'
 import ChatRunStats from './ChatRunStats.vue'
-import { beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage, type ChatRun } from '../utils/chatRunStats'
+import ChatConversationCost from './ChatConversationCost.vue'
+import { hasVisibleChatAnswer } from '../utils/chatAnswerVisibility'
+import { beginChatRun, applyRunUsage, conversationChatRuns, legacyChatRun, recordCompactionUsage, type ChatRun } from '../utils/chatRunStats'
 import { applyContextCheckpoint, estimateContextText, withContextDraft, historyFingerprint,
   type ContextCheckpoint, type ContextUsage, type PreparedContext } from '../utils/chatContext'
 import { useChatSendQueue, useChatQueueEditor, type QueuedChatMessage } from '../utils/chatSendQueue'
@@ -537,10 +539,10 @@ function persistOne(conv: LibraryConversation, epoch = libraryEpoch) {
 const conversations = ref<LibraryConversation[]>([])
 function legacyRuns(conv: LibraryConversation): ChatRun[] {
   return conv.messages.flatMap(msg => msg.role === 'assistant' ? (msg.variants?.length ? msg.variants : [msg]) : [])
-    .filter(answer => typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number')
+    .filter(answer => typeof answer.inputTokens === 'number' || typeof answer.outputTokens === 'number' || typeof answer.costUsd === 'number')
     .map(answer => legacyChatRun(answer, answer.model?.providerId ?? '', answer.model?.modelId ?? '', answer.agentSteps?.length))
 }
-const conversationRuns = computed(() => activeConv.value ? Object.values(activeConv.value.usageRuns ?? Object.fromEntries(legacyRuns(activeConv.value).map(run => [run.id, run]))) : [])
+const conversationRuns = computed(() => activeConv.value ? conversationChatRuns(activeConv.value, legacyRuns(activeConv.value)) : [])
 const activeConvId = ref<string | null>(null)
 const input = ref('')
 const attachments = ref<Attachment[]>([])
@@ -1108,6 +1110,8 @@ const activeConv = computed(() =>
   conversations.value.find(c => c.id === activeConvId.value) ?? null
 )
 const activeMessages = computed(() => activeConv.value?.messages ?? [])
+const visibleMessages = computed(() => activeMessages.value.filter(msg =>
+  msg.role === 'user' || hasVisibleChatAnswer(activeAnswer(msg))))
 
 /** id -> position in `activeMessages`. Built once per list change so the
  *  per-message lookups below stay O(1) instead of scanning the list. */
@@ -1394,7 +1398,7 @@ const baseAnswerViews = new WeakMap<LibraryUiMessage, LibraryAnswerVariant>()
 function activeAnswer(msg: LibraryUiMessage): LibraryAnswerVariant {
   const variants = msg.variants ?? []
   const active = variants.find(v => v.id === msg.activeVariantId) ?? variants[variants.length - 1]
-  if (active) return active
+  if (active) return hasVisibleChatAnswer(active) ? active : variants.find(hasVisibleChatAnswer) ?? active
   const cached = baseAnswerViews.get(msg)
   if (cached) return cached
   const baseId = `${msg.id}:base`
@@ -2911,7 +2915,7 @@ onUnmounted(() => {
           </div>
 
           <!-- Message list -->
-          <template v-for="msg in activeMessages" :key="msg.id">
+          <template v-for="msg in visibleMessages" :key="msg.id">
 
             <!-- User -->
             <div v-if="msg.role === 'user'" class="msg-row user" :data-msg-id="msg.id">
@@ -3473,6 +3477,7 @@ onUnmounted(() => {
               </div>
               <ChatRunStats :turns="activeConv?.messages.filter(m => m.role === 'user').length ?? 0" :runs="conversationRuns" />
               <div class="footer-right">
+                <ChatConversationCost :runs="conversationRuns" />
                 <ContextMeter :key="activeConvId ?? 'new'" :usage="contextDisplay" :busy="composerBusy"
                   :compacting="!!activeConvId && contextCompacting.has(activeConvId)"
                   :error="activeConvId ? contextErrors[activeConvId] : ''" :notice="activeConvId ? contextNotices[activeConvId] : ''"

@@ -1195,6 +1195,10 @@ export const zh = {
     speedHint: '最近一次回答的平均输出速度，含等待与思考，不含工具执行时间；缺少模型耗时记录时按总耗时估算。',
     tokensHint: '本对话已记录请求的累计用量：输入 {input}、输出 {output} tokens，包含重新生成及上下文压缩。后台保温和标题生成在用量统计中查看。',
     cacheHint: '缓存命中输入 tokens / 总输入 tokens，按用量加权。仅在所有已记录输入均有缓存数据时显示。',
+    cost: '当前会话总花费',
+    costHint: '当前会话已记录请求的累计花费：¥{amount}，包含重新生成和上下文压缩，按设置中的汇率换算。',
+    costEstimateHint: '当前会话累计约 ¥{amount}；未返回费用的请求按配置单价估算，包含缓存命中、峰谷价格、重新生成和上下文压缩。',
+    costMissing: '{n} 次请求缺少费用或价格，无法计算完整总花费。已知部分为 ¥{known}。',
   },
   chatContext: {
     title: '上下文窗口', usedPercent: '已用 {percent}%',
@@ -2964,6 +2968,10 @@ export const en: typeof zh = {
     speedHint: 'Average output speed of the latest answer, including model wait and reasoning, excluding tool execution. Without model timing, uses total elapsed time.',
     tokensHint: 'Recorded conversation usage: {input} input and {output} output tokens, including regeneration and compaction. Background keepalive and title generation appear in the usage dashboard.',
     cacheHint: 'Cached input tokens / total input tokens, weighted by usage. Shown only when all recorded input has cache data.',
+    cost: 'Total conversation cost',
+    costHint: 'Recorded conversation cost: ¥{amount}, including regeneration and compaction, converted at the configured exchange rate.',
+    costEstimateHint: 'Estimated conversation total: ¥{amount}. Requests without reported costs use configured prices, including caching, peak rates, regeneration and compaction.',
+    costMissing: '{n} requests lack cost or price data, so the complete total is unavailable. Known subtotal: ¥{known}.',
   },
   chatContext: {
     title: 'Context window', usedPercent: '{percent}% used',

@@ -14,6 +14,8 @@ export interface ChatRun {
   modelDurationMs?: number
   durationMs?: number
   toolCalls?: number
+  costUsd?: number
+  createdAt?: string
 }
 
 export interface StreamUsagePayload {
@@ -29,11 +31,30 @@ export interface StreamUsagePayload {
 
 export interface ChatRunOwner { usageRuns?: Record<string, ChatRun> }
 
+/** Older ledgers did not retain billed costs, although the visible answer did.
+ * Repair only a uniquely identifiable request: saved object-key order cannot
+ * identify which regeneration produced that answer. */
+export function conversationChatRuns(owner: ChatRunOwner, legacy: ChatRun[]): ChatRun[] {
+  if (!owner.usageRuns) return legacy
+  const runs = Object.values(owner.usageRuns)
+  const bills = new Map<string, number>()
+  for (const bill of legacy) {
+    if (!count(bill.costUsd)) continue
+    const candidates = runs.filter(run => run.answerId === bill.answerId)
+    const matches = candidates.length === 1 ? candidates : candidates.filter(run =>
+      count(bill.inputTokens) && count(bill.outputTokens)
+      && run.inputTokens === bill.inputTokens && run.outputTokens === bill.outputTokens)
+    if (matches.length === 1) bills.set(matches[0].id, bill.costUsd)
+  }
+  return runs.map(run => !count(run.costUsd) && bills.has(run.id) ? { ...run, costUsd: bills.get(run.id) } : run)
+}
+
 export function legacyChatRun(answer: {
   id: string; inputTokens?: number; outputTokens?: number; totalTokens?: number; cacheHitTokens?: number;
-  startedAt?: number; endedAt?: number;
+  startedAt?: number; endedAt?: number; costUsd?: number | null; createdAt?: string;
 }, providerId: string, modelId: string, toolCalls = 0): ChatRun {
   return { id: `legacy:${answer.id}`, answerId: answer.id, providerId, modelId,
+    costUsd: count(answer.costUsd ?? undefined) ? answer.costUsd! : undefined, createdAt: answer.createdAt,
     inputTokens: answer.inputTokens, outputTokens: answer.outputTokens, totalTokens: answer.totalTokens,
     // Old adapters emitted zero even without a provider cache field.
     cacheHitTokens: answer.cacheHitTokens && answer.cacheHitTokens > 0 ? answer.cacheHitTokens : undefined,
@@ -54,6 +75,8 @@ const count = (value: number | undefined): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0
 
 export function applyRunUsage(run: ChatRun, usage: StreamUsagePayload, legacyCacheReported = false) {
+  if (count(usage.cost_usd ?? undefined)) run.costUsd = usage.cost_usd!
+  else if (usage.cost_usd === null) run.costUsd = undefined
   if (count(usage.input_tokens)) run.inputTokens = usage.input_tokens
   if (count(usage.output_tokens)) run.outputTokens = usage.output_tokens
   if (count(usage.total_tokens)) run.totalTokens = usage.total_tokens
@@ -68,8 +91,32 @@ export function applyRunUsage(run: ChatRun, usage: StreamUsagePayload, legacyCac
  * branch changes and regeneration; active samples never add to themselves. */
 export function beginChatRun(owner: ChatRunOwner, run: ChatRun, legacy: ChatRun[] = []): ChatRun {
   owner.usageRuns ??= Object.fromEntries(legacy.map(sample => [sample.id, sample]))
+  run.createdAt ??= new Date().toISOString()
   owner.usageRuns[run.id] = run
   return owner.usageRuns[run.id]
+}
+
+/** Prefer the provider's bill; otherwise use the same configured pricing as
+ * individual answers. Missing prices must not turn a partial sum into a total. */
+export function summarizeChatCost(runs: ChatRun[], usdToCnyRate: number,
+  estimateCny: (run: ChatRun) => number | null) {
+  let knownCny = 0, estimated = false, missing = 0
+  for (const run of runs) {
+    if (count(run.costUsd)) {
+      knownCny += run.costUsd * usdToCnyRate
+    } else if (count(run.inputTokens) || count(run.outputTokens) || count(run.totalTokens)) {
+      const value = estimateCny(run)
+      if (value !== null && count(value)) { knownCny += value; estimated = true }
+      else missing++
+    }
+  }
+  return { cny: missing ? null : knownCny, knownCny, estimated, missing }
+}
+
+export function formatChatCost(cny: number): string {
+  if (cny === 0) return '0.00'
+  if (cny < 0.0001) return '<0.0001'
+  return cny.toFixed(cny < 1 ? 4 : 2).replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1')
 }
 
 export function summarizeChatRuns(runs: ChatRun[]) {

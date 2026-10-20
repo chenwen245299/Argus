@@ -258,6 +258,7 @@ onMounted(refresh)
             <li>{{ t('mcpSettings.allowCanvas') }}</li>
             <li>{{ t('mcpSettings.allowSnippets') }}</li>
             <li>{{ t('mcpSettings.allowChats') }}</li>
+            <li>{{ t('mcpSettings.allowUsage') }}</li>
           </ul>
         </div>
         <div class="scope-col deny">
@@ -268,7 +269,6 @@ onMounted(refresh)
           <ul>
             <li>{{ t('mcpSettings.denyKeys') }}</li>
             <li>{{ t('mcpSettings.denyProviders') }}</li>
-            <li>{{ t('mcpSettings.denyCost') }}</li>
             <li>{{ t('mcpSettings.denyWrite') }}</li>
           </ul>
         </div>

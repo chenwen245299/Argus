@@ -511,8 +511,22 @@ for *remote* servers reached from Anthropic's infrastructure. Local servers go i
 **Read-only, by construction.** No tool accepts a filesystem path; callers pass a
 slug or id, and path building goes through `paper::paper_dir` + `path_guard`.
 There is therefore no reachable path from an MCP request to `api_keys.json`,
-`.keymaster`, `ai_providers.json`, `config.json` or `token_usage.jsonl`. See the
+`.keymaster`, `ai_providers.json` or `config.json`. See the
 table in `mcp/tools.rs`.
+
+`get_token_usage` is the explicit read-only accounting surface for the current
+library's `token_usage.jsonl`, shared by external MCP and the in-app agent. It
+accepts inclusive `start_time` / exclusive `end_time` (RFC3339 with timezone),
+exact logged provider-id/model/source filters, and paged records (100 default,
+1000 maximum, timestamp order). Totals and provider/model/source breakdowns cover
+all matches regardless of pagination; optional hour/day/month buckets use a
+fixed UTC offset in minutes (UTC default, 480 for Singapore/China). Costs are
+recorded USD only, with explicit missing-cost counts; never load provider config
+to estimate prices. Cache hits are a subset of input tokens; legacy absent cache
+counts remain zero known hits. Queries stream one length-bounded snapshot, skip
+and count malformed/incomplete lines, and never modify the log. Missing logs are
+empty; other I/O errors surface. Tests: `cargo test --lib token_usage` plus
+`cargo test --lib mcp` (includes structured MCP round trips and schema guards).
 
 **Conversations are exposed, but redacted.** `library_chats.json` and the
 per-paper `ai_conversations.json` are readable; `redact_answer` drops provider

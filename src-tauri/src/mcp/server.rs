@@ -28,7 +28,8 @@ use super::tools;
 /// paged (not dumped), and PDFs are opened by path (not returned as bytes).
 const INSTRUCTIONS: &str = "\
 Read-only access to the user's Argus literature library: papers, extracted full \
-text, notes, highlights, collections, relationship canvases and snippet libraries.
+text, notes, highlights, collections, relationship canvases, snippet libraries \
+and recorded AI usage.
 
 Every paper is identified by its `slug`. Start with `find_papers` to find one — \
 its `query` matches title/author metadata and its `content` searches the full \
@@ -50,7 +51,13 @@ extracted text.
 conversations about this library — useful for picking up a line of thought they \
 already started. Both are paged.
 
-This server is read-only and exposes literature content only. It cannot read \
+`get_token_usage` queries this library's logged AI usage with optional RFC3339 \
+start_time (inclusive) and end_time (exclusive), exact provider/model/source \
+filters, full-range token/cache/cost summaries and paged records. Costs may be \
+missing; only recorded costs are returned, never price estimates. Timeline \
+buckets default to UTC days; set timezone_offset_minutes for local days.
+
+This server is read-only. It cannot read \
 the user's AI provider settings or API keys.";
 
 fn bad_request(e: String) -> ErrorData {
@@ -561,6 +568,19 @@ impl ArgusMcpServer {
         blocking(move || tools::library_stats(&root)).await.map(Json)
     }
 
+    #[tool(
+        name = "get_token_usage",
+        description = "Query recorded AI token usage and costs in the current Argus library. Optional start_time (inclusive) / end_time (exclusive) must be RFC3339 with a timezone. Filter by exact logged provider ID, model or task source; omit filters to discover identifiers in by_provider/by_model/by_source. Returns full-range input/output/total tokens, cached/uncached input, cache hit rate, recorded USD cost with missing-cost counts, breakdowns, and an hour/day/month timeline (UTC by default; timezone_offset_minutes=480 for Singapore/China). Individual records are paged with offset/limit (default 100, max 1000), newest first; include_records=false returns summaries only. Summary totals always cover every match, not just the page. No account balance, price estimates, provider settings or API keys are read.",
+        annotations(title = "AI token usage", read_only_hint = true)
+    )]
+    async fn get_token_usage(
+        &self,
+        Parameters(p): Parameters<crate::token_usage::query::UsageQuery>,
+    ) -> Result<Json<crate::token_usage::query::UsageReport>, ErrorData> {
+        let root = self.root()?;
+        blocking(move || tools::get_token_usage(&root, p)).await.map(Json)
+    }
+
     /// The user's collection tree.
     #[tool(
         name = "list_collections",
@@ -709,6 +729,7 @@ mod tests {
         "get_paper",
         "get_paper_file_path",
         "get_paper_fulltext",
+        "get_token_usage",
         "list_canvases",
         "list_collections",
         "list_conversations",

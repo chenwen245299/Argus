@@ -431,6 +431,10 @@ pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_js
             ok(tools::ItemList::from(tools::get_highlights(root, &p.slug)?))
         }
         "get_library_stats" => ok(tools::library_stats(root)?),
+        "get_token_usage" => {
+            let query: crate::token_usage::query::UsageQuery = params(args)?;
+            ok(tools::get_token_usage(root, query)?)
+        }
         "list_collections" => ok(tools::ItemList::from(tools::list_collections(root)?)),
         "list_canvases" => ok(tools::ItemList::from(tools::list_canvases(root)?)),
         "get_canvas" => {

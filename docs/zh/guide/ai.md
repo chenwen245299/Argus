@@ -48,7 +48,29 @@ Argus是**AI原生**的：AI不是外挂功能，不需要通过插件实现，�
 
 <Media src="/media/1783334422846.png" caption="查看AI花费（统计→AI用量）" />
 
+### 通过 MCP 查询用量
 
+外部 App 的连接配置和调用示例见[Token 用量工具连接说明](/integrations/token-usage-mcp-api)。
+
+在设置 → MCP 接口中启用并连接客户端后，Codex、Claude Code 和其他程序可以调用只读工具 `get_token_usage`，应用内 AI 随航也可以调用。例如查询新加坡时间 10 月 20 日全天：
+
+```json
+{
+  "start_time": "2026-10-20T00:00:00+08:00",
+  "end_time": "2026-10-21T00:00:00+08:00",
+  "timezone_offset_minutes": 480,
+  "granularity": "day",
+  "order": "asc",
+  "limit": 100,
+  "offset": 0
+}
+```
+
+开始时间包含在内，结束时间不包含；省略时间范围可查全部历史。`provider`、`model`、`source` 按日志里的标识精确筛选，首次可不填，从 `by_provider`、`by_model`、`by_source` 中查看可用标识。`granularity` 支持 `hour` / `day` / `month` / `none`；时间桶默认 UTC，`timezone_offset_minutes: 480` 表示 UTC+8。
+
+返回 `summary`、三个维度的汇总、`timeline` 和分页 `records`。数据包括输入、输出、总 token、缓存命中/未命中的输入 token、缓存命中比例，以及已记录的美元费用和费用缺失条数。缓存命中已包含在输入 token 内。汇总始终覆盖全部匹配记录；明细默认每页 100 条、最多 1000 条，按 `next_offset` 翻页，`include_records: false` 可只取汇总。默认明细按时间倒序；日志持续追加时可固定结束时间并使用 `order: "asc"` 翻页。
+
+查询范围是当前文献库已经写入磁盘的日志。时间戳表示用量入账时间；一条记录不一定对应一条用户消息。该工具只返回日志中已有的费用，不加载模型价格来估算：缺失费用是 `null`，已知免费是 `0`。历史记录缺少缓存数据时，已知缓存命中按 0 计。损坏或未写完的记录会跳过，并在 `skipped_records` 中计数。
 
 ## 相关
 

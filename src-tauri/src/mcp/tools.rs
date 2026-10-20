@@ -19,11 +19,11 @@
 //! | `.argus/ai_providers.json` | AI provider endpoints and model config |
 //! | `.argus/api_keys.json`, `.argus/.keymaster` | encrypted API keys + the key that decrypts them |
 //! | `.argus/config.json` | carries AI / RAG / arXiv settings |
-//! | `.argus/token_usage.jsonl` | spend history |
 //!
 //! Papers, notes, highlights, sections, collections, canvases, snippets and AI
-//! conversations are exposed. AI *configuration* is not: the agent may read what
-//! the user discussed, never the credentials or endpoints used to discuss it.
+//! conversations are exposed. `get_token_usage` additionally exposes the current
+//! library's logged token counts, provider/model identifiers and recorded costs.
+//! AI *configuration* is not exposed: no credentials or provider endpoints.
 //!
 //! Conversation records interleave content with things that fall on the wrong
 //! side of that line, so `redact_answer` strips them field by field — provider
@@ -52,14 +52,13 @@ pub const DENIED_ARTIFACTS: &[&str] = &[
     "api_keys.json",
     ".keymaster",
     "config.json",
-    "token_usage.jsonl",
 ];
 
 /// Fields inside a conversation record that are dropped before it leaves this
 /// module. They are colocated with conversation content but are not content:
-/// provider identity is configuration, cost and token counts are the spend
-/// history that `token_usage.jsonl` is denied for, and `dataUrl` is a base64
-/// blob that would flood the caller's context.
+/// provider identity, costs and tokens are omitted here (usage is available
+/// separately through `get_token_usage`), and `dataUrl` is a base64 blob that
+/// would flood the caller's context.
 #[allow(dead_code)]
 pub const REDACTED_CONVERSATION_FIELDS: &[&str] = &[
     "providerId",
@@ -645,6 +644,14 @@ fn matches_query(entry: &crate::models::PaperIndexEntry, needle: &str) -> bool {
 }
 
 // ── Tool implementations ─────────────────────────────────────────────────────
+
+/// The sole usage read: the library's fixed accounting log, never AI settings.
+pub fn get_token_usage(
+    root: &str,
+    query: crate::token_usage::query::UsageQuery,
+) -> Result<crate::token_usage::query::UsageReport, String> {
+    crate::token_usage::query::read(root, query)
+}
 
 pub struct FindPapersArgs<'a> {
     /// Case-insensitive substring over title/authors/tags/venue — matches all
@@ -1436,9 +1443,9 @@ fn str_field(v: &serde_json::Value, key: &str) -> String {
 
 /// Keep an answer's content and which model produced it; drop everything else.
 ///
-/// The dropped fields are listed in `REDACTED_CONVERSATION_FIELDS`: provider
-/// identity is configuration, and cost/token counts are the spend history the
-/// endpoint is not allowed to expose. `contextContent` and `reasoningContent`
+/// The dropped fields are listed in `REDACTED_CONVERSATION_FIELDS`: conversation
+/// reads keep provider/cost/token details separate from the explicit usage tool.
+/// `contextContent` and `reasoningContent`
 /// are dropped for size — the first duplicates text available via
 /// `get_paper_fulltext`, the second is chain-of-thought that can dwarf the
 /// answer itself.

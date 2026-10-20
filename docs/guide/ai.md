@@ -59,6 +59,28 @@ kept in the library folder.
 
 <Media src="/media/1783334422846.png" caption="View AI spending (Statistics → AI Usage)" />
 
+### Query usage over MCP
+
+Enable and connect the endpoint in Settings → MCP Endpoint. Codex, Claude Code and other clients can then call the read-only `get_token_usage` tool, also available to the in-app copilot. For one full day in Singapore time:
+
+```json
+{
+  "start_time": "2026-10-20T00:00:00+08:00",
+  "end_time": "2026-10-21T00:00:00+08:00",
+  "timezone_offset_minutes": 480,
+  "granularity": "day",
+  "order": "asc",
+  "limit": 100,
+  "offset": 0
+}
+```
+
+The start is inclusive and the end exclusive; omit both for all history. Optional `provider`, `model` and `source` filters match logged identifiers exactly. Discover identifiers in `by_provider`, `by_model` and `by_source` first. Timeline `granularity` accepts `hour`, `day`, `month` or `none`; buckets default to UTC, with `timezone_offset_minutes: 480` selecting UTC+8.
+
+The result contains `summary`, all three breakdowns, `timeline` and paged `records`: input/output/total tokens, cached and uncached input, cache hit rate, recorded USD cost, and counts of records with/without costs. Cached tokens are already included in input tokens. Summaries cover every matching record, regardless of pagination. Details default to 100 records, capped at 1000; continue with `next_offset`, or set `include_records: false` for summaries only. Details default to newest first; use a fixed end time and `order: "asc"` while paging an append-only log.
+
+Only the current library's on-disk log is queried. Timestamps represent accounting time; one record is not necessarily one user message. This tool returns recorded costs without loading model prices to estimate them: missing cost is `null`, known zero cost is `0`. Older records lacking cache data contribute zero known cache hits. Invalid or incomplete records are skipped and counted in `skipped_records`.
+
 ## Related
 
 - [RAG & Library Q&A](/guide/rag)

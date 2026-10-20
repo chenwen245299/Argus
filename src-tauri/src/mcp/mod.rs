@@ -618,7 +618,7 @@ mod protocol_tests {
             .find(|m| m["id"] == 1)
             .unwrap_or_else(|| panic!("no tools/list response: {out:?}"));
         let tools = listing["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 14, "unexpected tool count");
+        assert_eq!(tools.len(), 15, "unexpected tool count");
 
         // The two schema rules that made every tool vanish when broken.
         let wire = listing["result"].to_string();
@@ -675,6 +675,52 @@ mod protocol_tests {
         let text = &slice["result"]["structuredContent"];
         assert_eq!(text["returned"], 20, "limit was not honoured: {text}");
         assert_eq!(text["has_more"], true);
+    }
+
+    #[tokio::test]
+    async fn usage_query_survives_the_wire_with_full_totals_and_paged_records() {
+        let lib = TempLibrary::new("usage");
+        let path = lib.0.join(".argus").join("token_usage.jsonl");
+        let records = [
+            serde_json::json!({"ts":"2026-10-19T16:00:00Z", "provider":"p1", "model":"m1",
+                "source":"paper-chat", "input_tokens":100, "output_tokens":20,
+                "cache_hit_tokens":40, "cost_usd":0.1}),
+            serde_json::json!({"ts":"2026-10-20T15:59:59Z", "provider":"p1", "model":"m1",
+                "source":"library-chat", "input_tokens":200, "output_tokens":30}),
+            serde_json::json!({"ts":"2026-10-20T16:00:00Z", "provider":"p1", "model":"m1",
+                "source":"library-chat", "input_tokens":999, "output_tokens":1}),
+        ];
+        let log = records.iter().map(|r| format!("{r}\n")).collect::<String>();
+        std::fs::write(&path, &log).unwrap();
+        // Usage must work without consulting provider settings at all.
+        std::fs::write(lib.0.join(".argus").join("ai_providers.json"), "invalid config").unwrap();
+        let out = exchange(Some(lib.path()), vec![
+            initialize(), initialized(),
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params": {
+                "name":"get_token_usage", "arguments": {
+                    "start_time":"2026-10-20T00:00:00+08:00",
+                    "end_time":"2026-10-21T00:00:00+08:00",
+                    "timezone_offset_minutes":480, "limit":1, "provider":"p1"
+                }
+            }}),
+            serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params": {
+                "name":"get_token_usage", "arguments":{"start_time":"bad"}
+            }}),
+        ]).await;
+        let response = out.iter().find(|m| m["id"] == 1).unwrap();
+        let report = &response["result"]["structuredContent"];
+        assert_eq!(report["summary"]["records"], 2, "{response}");
+        assert_eq!(report["summary"]["total_tokens"], 350);
+        assert_eq!(report["summary"]["records_without_cost"], 1);
+        assert_eq!(report["timeline"][0]["bucket"], "2026-10-20");
+        assert_eq!(report["returned"], 1);
+        assert_eq!(report["next_offset"], 1);
+        assert_eq!(report["records"][0]["input_tokens"], 200);
+        assert!(report["records"][0]["cost_usd"].is_null());
+        let invalid = out.iter().find(|m| m["id"] == 2).unwrap();
+        assert!(invalid.to_string().contains("RFC3339"), "{invalid}");
+        assert!(invalid.get("error").is_some() || invalid["result"]["isError"] == true);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), log);
     }
 
     #[tokio::test]

@@ -3,6 +3,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod query;
+
 fn is_zero(v: &u64) -> bool {
     *v == 0
 }

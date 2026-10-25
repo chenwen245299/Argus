@@ -4,7 +4,9 @@
 // the screen, so the request reads as part of the conversation you are in.
 //
 // It shows exactly what would be written: which paper, the note's title, and
-// the body rendered as markdown, read-only and scrollable past ~10 lines.
+// the body rendered as markdown, read-only and scrollable past ~10 lines. A
+// change to existing marks shows each one before and after (or, for a
+// retraction, what disappears), and whose mark it is.
 // Nothing is written unless the user presses the confirm button; closing the
 // window, stopping the answer or simply ignoring it all leave the library
 // untouched (the backend treats silence as a refusal after its timeout).
@@ -24,20 +26,44 @@ const props = defineProps<{
 const emit = defineEmits<{ approve: [colors?: string[]]; reject: [] }>()
 
 const { t } = useI18n()
-const selectedColors = ref(props.preview.passages?.map(p => p.color) ?? [])
 const recommendationAction = computed(() => props.preview.recommendations?.length
   ? (props.preview.tool === 'delete_arxiv_recommendations' ? 'delete' : 'import') : null)
+const changeAction = computed(() => props.preview.changes?.length
+  ? (props.preview.tool === 'remove_paper_highlights' ? 'remove' : 'update') : null)
+const marking = computed(() => !!props.preview.passages?.length || !!changeAction.value)
+// One choice per new passage, or per changed mark's new color. A retraction
+// has nothing to choose.
+const selectedColors = ref(props.preview.passages?.length
+  ? props.preview.passages.map(p => p.color)
+  : props.preview.changes?.map(c => c.after?.color ?? c.before.color) ?? [])
+
+const sameColor = (a?: string | null, b?: string | null) => (a ?? '').toUpperCase() === (b ?? '').toUpperCase()
+function colorName(color: string) {
+  const known = HIGHLIGHT_COLORS.find(c => sameColor(c.value, color))
+  return known ? t(known.labelKey) : color.toUpperCase()
+}
+function changeDiff(index: number) {
+  const change = props.preview.changes![index]
+  const after = change.after!
+  return {
+    color: !sameColor(selectedColors.value[index], change.before.color),
+    style: after.style !== change.before.style,
+    note: (after.note ?? '') !== (change.before.note ?? ''),
+  }
+}
+const styleName = (style: string) => t(style === 'underline' ? 'writeConfirm.underline' : 'writeConfirm.highlight')
 
 function approve() {
-  emit('approve', props.preview.passages?.length ? [...selectedColors.value] : undefined)
+  const recolorable = !!props.preview.passages?.length || changeAction.value === 'update'
+  emit('approve', recolorable ? [...selectedColors.value] : undefined)
 }
 </script>
 
 <template>
   <div class="write-confirm">
     <div class="wc-head">
-      <Icon class="wc-icon" :icon="recommendationAction ? (recommendationAction === 'delete' ? 'fluent:delete-24-regular' : 'fluent:library-24-regular') : preview.passages?.length ? 'fluent:highlight-24-regular' : 'doodle:notebook'" width="20" height="20" />
-      <span class="wc-title">{{ t(recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Title` : preview.passages?.length ? 'writeConfirm.markTitle' : 'writeConfirm.title') }}</span>
+      <Icon class="wc-icon" :icon="recommendationAction ? (recommendationAction === 'delete' ? 'fluent:delete-24-regular' : 'fluent:library-24-regular') : changeAction === 'remove' ? 'fluent:delete-24-regular' : changeAction ? 'fluent:edit-24-regular' : preview.passages?.length ? 'fluent:highlight-24-regular' : 'doodle:notebook'" width="20" height="20" />
+      <span class="wc-title">{{ t(recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Title` : changeAction ? `writeConfirm.mark${changeAction === 'remove' ? 'Remove' : 'Update'}Title` : preview.passages?.length ? 'writeConfirm.markTitle' : 'writeConfirm.title') }}</span>
       <span v-if="props.queued" class="wc-queued">{{ t('writeConfirm.queued', { n: props.queued }) }}</span>
     </div>
 
@@ -50,14 +76,14 @@ function approve() {
         <dt>{{ t('writeConfirm.paper') }}</dt>
         <dd :title="preview.slug">{{ preview.paperTitle }}</dd>
       </div>
-      <div v-if="!preview.passages?.length" class="wc-field">
+      <div v-if="!marking" class="wc-field">
         <dt>{{ t('writeConfirm.noteTitle') }}</dt>
         <dd :title="preview.noteTitle">{{ preview.noteTitle }}</dd>
       </div>
       <div class="wc-field">
         <dt>{{ t('writeConfirm.location') }}</dt>
         <dd class="wc-location">
-          {{ preview.passages?.length ? preview.slug : t('writeConfirm.locationValue', { paper: preview.paperTitle }) }}
+          {{ marking ? preview.slug : t('writeConfirm.locationValue', { paper: preview.paperTitle }) }}
         </dd>
       </div>
     </dl>
@@ -75,6 +101,64 @@ function approve() {
         <p v-if="paper.existingSlug" class="wc-warn">{{ t(preview.keepDuplicateCopies ? 'writeConfirm.arxivKeepDuplicate' : 'writeConfirm.arxivSkipDuplicate', { title: paper.existingTitle || paper.existingSlug }) }}</p>
       </div>
       <p v-if="recommendationAction === 'import'" class="wc-page">{{ t(preview.keepDuplicateCopies ? 'writeConfirm.arxivKeepPolicy' : 'writeConfirm.arxivSkipPolicy') }}</p>
+    </div>
+    <div v-else-if="changeAction" class="wc-body">
+      <div v-for="(change, index) in preview.changes" :key="change.id" class="wc-passage wc-change">
+        <div class="wc-page">
+          {{ change.pageEnd && change.pageEnd !== change.page ? t('writeConfirm.pageRange', { n: change.page, m: change.pageEnd }) : t('writeConfirm.page', { n: change.page }) }}
+          · {{ styleName(change.before.style) }}
+          · <span class="wc-origin" :class="`wc-origin-${change.origin}`">{{ t(`writeConfirm.origin.${change.origin}`) }}</span>
+        </div>
+        <template v-if="change.after">
+          <div class="wc-colors" :aria-label="t('writeConfirm.color')" role="group">
+            <span>{{ t('writeConfirm.color') }}</span>
+            <button v-for="color in HIGHLIGHT_COLORS" :key="color.value" type="button" class="wc-color"
+              :title="t(color.labelKey)" :aria-label="t(color.labelKey)"
+              :aria-pressed="selectedColors[index]?.toUpperCase() === color.value"
+              :style="{ background: color.value }" @click="selectedColors[index] = color.value">
+              <Icon v-if="selectedColors[index]?.toUpperCase() === color.value" icon="fluent:checkmark-16-regular" width="12" height="12" />
+            </button>
+            <label class="wc-custom-color" :title="t('writeConfirm.customColor')">
+              <input v-model="selectedColors[index]" type="color" :aria-label="t('writeConfirm.customColor')" />
+            </label>
+          </div>
+          <blockquote :style="{ borderColor: selectedColors[index] }">{{ change.text }}</blockquote>
+          <dl class="wc-diff">
+            <div v-if="changeDiff(index).color" class="wc-diff-row">
+              <dt>{{ t('writeConfirm.color') }}</dt>
+              <dd>
+                <span class="wc-swatch" :style="{ background: change.before.color }" />{{ colorName(change.before.color) }}
+                <span class="wc-arrow">→</span>
+                <span class="wc-swatch" :style="{ background: selectedColors[index] }" />{{ colorName(selectedColors[index]) }}
+              </dd>
+            </div>
+            <div v-if="changeDiff(index).style" class="wc-diff-row">
+              <dt>{{ t('writeConfirm.style') }}</dt>
+              <dd>{{ styleName(change.before.style) }}<span class="wc-arrow">→</span>{{ styleName(change.after.style) }}</dd>
+            </div>
+            <div v-if="changeDiff(index).note" class="wc-diff-row wc-diff-note">
+              <dt>{{ t('writeConfirm.note') }}</dt>
+              <dd>
+                <div class="wc-note-before">
+                  <span class="wc-tag">{{ t('writeConfirm.before') }}</span>
+                  <MarkdownBody v-if="change.before.note" :content="change.before.note" />
+                  <span v-else class="wc-empty">{{ t('writeConfirm.noNote') }}</span>
+                </div>
+                <div class="wc-note-after">
+                  <span class="wc-tag">{{ t('writeConfirm.after') }}</span>
+                  <MarkdownBody v-if="change.after.note" :content="change.after.note" />
+                  <span v-else class="wc-empty">{{ t('writeConfirm.noteRemoved') }}</span>
+                </div>
+              </dd>
+            </div>
+          </dl>
+          <p v-if="!changeDiff(index).color && !changeDiff(index).style && !changeDiff(index).note" class="wc-page">{{ t('writeConfirm.noChange') }}</p>
+        </template>
+        <template v-else>
+          <blockquote :style="{ borderColor: change.before.color }">{{ change.text }}</blockquote>
+          <MarkdownBody v-if="change.before.note" :content="change.before.note" />
+        </template>
+      </div>
     </div>
     <div v-else-if="preview.passages?.length" class="wc-body">
       <div v-for="(passage, index) in preview.passages" :key="index" class="wc-passage">
@@ -100,11 +184,11 @@ function approve() {
     </div>
 
     <div class="wc-actions">
-      <span class="wc-hint">{{ t(recommendationAction ? 'writeConfirm.arxivHint' : 'writeConfirm.hint') }}</span>
-      <button class="wc-btn" @click="emit('reject')">{{ t(recommendationAction ? 'writeConfirm.arxivReject' : 'writeConfirm.reject') }}</button>
-      <button class="wc-btn primary" :class="{ danger: recommendationAction === 'delete' }" @click="approve">
+      <span class="wc-hint">{{ t(recommendationAction ? 'writeConfirm.arxivHint' : changeAction ? `writeConfirm.${changeAction}Hint` : 'writeConfirm.hint') }}</span>
+      <button class="wc-btn" @click="emit('reject')">{{ t(recommendationAction ? 'writeConfirm.arxivReject' : changeAction ? `writeConfirm.${changeAction}Reject` : 'writeConfirm.reject') }}</button>
+      <button class="wc-btn primary" :class="{ danger: recommendationAction === 'delete' || changeAction === 'remove' }" @click="approve">
         <Icon icon="fluent:checkmark-24-regular" width="13" height="13" />
-        {{ t(recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Approve` : 'writeConfirm.approve') }}
+        {{ t(recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Approve` : changeAction ? `writeConfirm.${changeAction}Approve` : 'writeConfirm.approve') }}
       </button>
     </div>
   </div>
@@ -198,6 +282,20 @@ function approve() {
 .wc-custom-color { display: flex; align-items: center; width: 24px; height: 22px; margin-left: 2px; }
 .wc-custom-color input { width: 24px; height: 22px; padding: 1px; border: 1px solid var(--border-default); border-radius: 5px; background: var(--bg-primary); cursor: pointer; }
 .wc-passage blockquote { border-left: 4px solid; padding: 3px 9px; margin: 5px 0; white-space: pre-wrap; }
+.wc-origin { color: var(--text-secondary); }
+.wc-origin-user, .wc-origin-ai_user_edited { color: #b45309; }
+.wc-diff { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 0; }
+.wc-diff-row { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.wc-diff-row dt { flex-shrink: 0; width: 40px; font-size: 11px; color: var(--text-tertiary); }
+.wc-diff-row dd { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 0; min-width: 0; }
+.wc-diff-note dd { display: block; flex: 1; }
+.wc-swatch { display: inline-block; width: 11px; height: 11px; border: 1px solid rgba(0,0,0,.12); border-radius: 50%; }
+.wc-arrow { margin: 0 4px; color: var(--text-tertiary); }
+.wc-note-before, .wc-note-after { padding: 2px 0 2px 8px; border-left: 2px solid var(--border-subtle); }
+.wc-note-before { color: var(--text-secondary); opacity: .8; }
+.wc-note-after { margin-top: 4px; border-left-color: var(--accent); }
+.wc-tag { display: block; font-size: 10.5px; color: var(--text-tertiary); }
+.wc-empty { color: var(--text-tertiary); font-style: italic; }
 
 .wc-actions { display: flex; align-items: center; gap: 8px; }
 .wc-hint { flex: 1; min-width: 0; font-size: 11px; color: var(--text-tertiary); }

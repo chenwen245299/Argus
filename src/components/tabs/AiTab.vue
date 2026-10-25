@@ -2101,6 +2101,8 @@ async function streamAnswerImpl(
       // state, which the backend treats as "no page hint".
       currentPage: reader.readingStateFor(slug)?.page ?? null,
       manageContext: true,
+      // The calibrated count prepare admitted, for the agent's first round.
+      previousUsage: prepared?.usage ?? null,
       expectedRoot: rootAtStart,
     })
     const reactiveAns = findReactiveAnswer(answer.id)

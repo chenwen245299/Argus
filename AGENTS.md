@@ -110,6 +110,12 @@ npm run tauri dev
 
 Vite dev server runs on `http://localhost:1420` (HMR on `1421` when `TAURI_DEV_HOST` is set).
 
+The app uses `node_modules/.vite-argus-dev`, separate from browser regression
+harnesses' default Vite cache. Dev responses use `Cache-Control: no-store`:
+Tauri retains its HTTP cache across launches, and forcing dependency optimization
+can replace chunks without changing their version query. Keep these settings
+so a cached module cannot refer to a removed chunk after a rebuild.
+
 ### Production build
 
 ```bash
@@ -209,19 +215,26 @@ both the sidebar and `PaperAiView`. It starts a fresh conversation with
 and attachments. Later turns and regeneration use the ordinary chat path. The
 stored first question retains the complete prompt; the user bubble and history
 title show a concise localized label. The built-in Chinese prompt is the user's
-complete interactive tutor preset; English follows the same rules. Read the whole
-paper and visually inspect figures/tables first; the first reply reports actual
-coverage/missing material and asks one or two starting-point questions. Teaching
-then introduces at most one core concept per turn (normally 100–250 Chinese
-characters), with prerequisites, terms, formulas and metrics explained only when
-needed. Unfamiliarity is remembered instead of triggering a background course.
-Use concrete examples, show cited material in place, and actively green-highlight
-only the current key content with short Chinese annotations, verifying saves and
-reporting failures honestly. Progress from intuition to math, training/use and
-minimal implementation as needed. Stop after each step and advance only on the
-user's “continue”; understanding checks are occasional and cover only material
-already explained. The prompt does not bypass backend write-approval controls.
-Both prior shipped preset versions remain recognizable for concise bubbles/titles.
+complete interactive tutor preset (verbatim); English follows the same rules.
+Read the whole paper and visually inspect figures/tables first; the first reply
+reports actual coverage/missing material, then opens on the background/problem
+with a concrete scenario, with no routine starting-point questions. Teaching
+follows background and task → existing methods and their problems → core idea
+and overall method (a plain-language skeleton first) → evaluation design →
+results and conclusions; within the method, whole before modules before math
+and code. One small step per turn: at most one core concept (normally 100–250
+Chinese characters), prerequisites/terms/formulas/metrics only when needed, a
+concrete data example carried through, “continue” advancing at the current
+level. Annotations are proactive with fixed colors: yellow = key method parts,
+green = paragraph summaries, purple = only innovations the user designates,
+red = problems/limitations the paper itself states, blue = to study later.
+They prefer the main text, avoid duplicate content and overlapping selections,
+are checked after writing and verified before retrying. Shown code has a
+Chinese comment per line and a Chinese docstring per function. Formulas use
+`$...$` / `$$...$$` in replies and annotations. Stop after each step and
+advance only on the user's “continue”. The prompt does not bypass backend
+write-approval controls. All three prior shipped preset versions
+(`LEGACY_PROMPT_*`, `_V2`, `_V3`) remain recognizable for concise bubbles/titles.
 `guidedReadingRequestHistory` upgrades them only in outgoing model requests for
 follow-ups and regeneration; stored first questions, custom text, assistant
 replies and attachment parts remain intact.
@@ -435,6 +448,7 @@ The background `ai-models-refreshed` price notification remains supported.
 | `library.rs` | Library initialization and incremental scan |
 | `paper.rs` | Per-paper directory/file I/O with path validation and atomic writes |
 | `metadata.rs` | PDF text extraction and external metadata fetching (arXiv, Crossref, Semantic Scholar) |
+| `publication.rs` | Distinguishes submission/preprint venues from publication; preserves explicit first-page review notices and suppresses their venue ranks |
 | `extraction.rs` | Full-text extraction pipeline with OCR fallback |
 | `ocr.rs` | OCR via macOS Vision, tesseract, pdftoppm |
 | `collections.rs` | Collection CRUD and nested moves |
@@ -457,7 +471,7 @@ The background `ai-models-refreshed` price notification remains supported.
 | `mcp/` | Read-only MCP server for external agents, run as a stdio subprocess — see below |
 | `offer_sync.rs` | Background re-read of model prices on launch, so a withdrawn free tier stops advertising itself |
 | `holidays.rs` | China public-holiday calendar (holiday-cn) refreshed in the background into an app-local cache; `get_cn_holidays` + the `cn-holidays-updated` event feed `src/utils/cnHolidays.ts`, which decides DeepSeek's peak window — see the model-badge notes below |
-| `highlight_groups.rs` | Derived view that stitches the per-page records of one cross-page PDF selection back into a single highlight (same `created_at` + `text`, >= 2 pages). Read-only consumers (export, MCP, vectorize) call `read_grouped`; the raw read / save path must stay uncollapsed. TS twin: `src/utils/highlightGroups.ts` |
+| `highlight_groups.rs` | Derived view that stitches the per-page records of one cross-page PDF selection back into a single highlight (same `created_at` + `text`, >= 2 pages). Read-only consumers (export, MCP, vectorize) call `read_grouped`; the raw read / save path must stay uncollapsed. Also derives each selection's `MarkOrigin` (agent-made and unedited, or the user's) for the agent's mark-changing tools. TS twin: `src/utils/highlightGroups.ts` |
 | `highlight_text.rs` | A highlight's display text: the PDF's per-line breaks merged into one paragraph unless `keep_line_breaks` is set (ebook records untouched). `Highlight.text` itself is never rewritten. TS twin: `src/utils/highlightText.ts` — the two must stay identical |
 | `path_guard.rs` | Path-segment validation against traversal attacks |
 | `security_bookmark.rs` | macOS security-scoped bookmark persistence |
@@ -680,7 +694,7 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   one final tool-less turn to answer with what it has.
 - **Tool output is budgeted in tokens, from the model's window.**
   `ContextBudget::for_model` (`copilot.rs`) reads the model's `context_length`
-  (`ASSUMED_CONTEXT_TOKENS` = 128k when unset) and derives two caps: one result
+  (`chat_context::ASSUMED_CONTEXT_TOKENS` = 256k when unset) and derives two caps: one result
   may be `tokens / 4` (`single_result`, floor `MIN_RESULT_TOKENS` = 2 000), all
   results together `tokens / 2` (`transcript`, floor twice that). Tokens are
   estimated per script (`estimate_tokens`: ASCII at four characters to the
@@ -697,13 +711,19 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
 - **Chat context management.** `chat_context.rs` measures system/pins,
   schemas and the active message surface. Pressure uses the latest individual
   provider prompt sample plus an estimated surface delta, never cumulative
-  billing totals. The composer `ContextMeter.vue` shows the used percentage in
+  billing totals. Before its first response the agent loop has no sample of
+  its own, so the three managed chats pass the usage `prepare_library_chat_context`
+  just returned as `previousUsage` on `chat_with_library`;
+  `chat_context::carried_sample` reuses that calibration only for the same
+  provider/model/window, system fingerprint and tool route (otherwise raw
+  estimates), so the first round cannot compact history prepare kept.
+  The composer `ContextMeter.vue` shows the used percentage in
   both its label and ring fill;
   hover/focus reveals token counts and breakdown; clicking the ring (or Enter /
   Space while focused) starts manual compaction when idle and useful. The
   read-only tooltip has no explanatory footer or separate action button; output
   reservations and automatic thresholds stay internal. Unknown model capacity is labelled as an
-  assumed 128k; media and breakdown figures are estimates. Like DeepSeek Harness,
+  assumed 256k; media and breakdown figures are estimates. Like DeepSeek Harness,
   pressure defaults to 80% with a balanced recent tail of 16% (small-window
   reservations scale down). `prepare_library_chat_context` supports inspection,
   manual and pre-send automatic compaction without starting external MCP servers.
@@ -834,6 +854,39 @@ under the highlights lock, preserve user edits/tombstones, and reuse identical
 records on retry. `paper-highlights-added` carries root/slug/records to the open
 reader; merge them without replacing unsaved local edits. Only ids/pages/colors reach
 the model's result transcript. External MCP remains read-only.
+
+**Changing existing marks.** Two more app-only tools go through the same
+handshake. `update_paper_highlights` takes `{slug, changes: [{id, color?,
+style?, note?}]}` (1–30, at least one field each; an omitted field stays, `note`
+replaces the whole text and `""` clears it). `remove_paper_highlights` takes
+`{slug, ids}` and retracts only marks the agent created and nobody edited since.
+Ids are `get_highlights` ids; any member id names its whole selection, and a
+cross-page highlight (`highlight_groups`) is one entry whose records all change
+with one shared stamp, the group's line-break choice kept, like the reader's own
+group edits. Text, page and geometry never change. Provenance: records the
+creation tools write carry `agent: {revision}` equal to their edit time
+(`updated_at`, else `created_at`); `MarkOrigin` reports `ai` while every member
+still matches, `ai_user_edited` once a user edit stamps a newer time, else
+`user`. `get_highlights` (in-app and external) exposes it as `origin`. An agent
+update re-stamps `revision` only on an `ai` mark, so a user's mark never becomes
+removable. The field is optional and older builds ignore it; their next whole-file
+save drops it and the marks count as the user's (fail-safe). Validation reports
+every failed entry, refuses no-ops and duplicate selections, and refuses removal
+of `user`/`ai_user_edited` marks. Preview (`WritePreview.changes`) shows each
+mark's origin, before and (for updates) after; the card lists changed color,
+style and note, lets the user pick each update's new color (`color_choice_count`
+binds the list; retractions take none) and says when a reverted color leaves a
+mark unchanged. Execution (`paper::change_highlights`) holds the highlights lock,
+requires every member exactly as previewed (and still `ai` for removal), stamps
+`stamp_after` — `toISOString` form, later than every member — and writes through
+the normal merge: tombstones for retractions, so deletes propagate across synced
+copies. `paper-highlights-changed` carries root/slug/records/tombstones;
+`reader.mergeAgentHighlights` (shared with `paper-highlights-added`) keeps newer
+local edits and pending deletions, and a retraction loses only to a local edit
+made after it. The model sees only ids/pages/new values. Coverage:
+`mcp::app_tools::tests`, `mcp::agent::tests`, `highlight_groups::tests`,
+`write_confirm::tests`, `scripts/test-paper-marking.mjs`,
+`scripts/test-write-confirm.mjs`.
 
 **Duplicate imports.** Local PDFs, ebooks and URL imports let the user keep an
 independent copy or skip it; an accepted URL duplicate retries with `force` and
@@ -1122,6 +1175,55 @@ Dragging from the foot of one page into the next also selects, in DOM order, the
 - The report (`items`, `counts`) describes only spans that are in the selection (nothing in the popup shows it now; keep it that way for any notice that comes back).
 - Both viewers anchor the selection toolbar to the last visible selected text run (`selectionPopupAnchor` in `utils/popupFit.ts`). An unchanged selection keeps its existing position when another non-selectable pane is clicked; a mouse release alone must not move it. PDF also restores the skipped-span tint for that unchanged selection.
 - Verified on 6977 pages of 310 PDFs (precision first: no false positive found in the audits; recall roughly 83–95 % depending on the kind). Known misses fail towards the old behaviour. Scanned/OCR pages and `/Rotate` pages are a no-op by design. Floats were audited on the same corpus (7101 pages, ~4100 floats): body text next to a float, tables at body size and every first-page float were checked by hand; simulated cross-page selections (6011 page pairs) drop a float on 1503 of them. Single-page selections are untouched, floats included.
+
+### Citation hover previews
+
+Hovering an internal PDF link for 500 ms shows the bibliography entry it points at, read off the
+PDF's own text, in a small `.ref-popup` below the link (above it when there is no room). The
+pointer has a 250 ms grace to move onto it; its text is selectable and a 复制 button copies the
+whole entry. A press inside pins it (a selection drag may end anywhere; the page's text layers are
+unselectable meanwhile, or the drag would run on into them). Releasing the press ends that pin as
+well, so a finished selection does not keep it open, and a release outside it closes it. Copying releases that pin before the
+clipboard write, so moving away closes it again even after selecting text or while copying is
+pending. A press elsewhere, Escape, a click on the link, zoom or switching tabs closes it.
+It follows the page on scroll like the other popups.
+pdf.js's native `title` tooltip (the link's own text) is removed on hover.
+
+`src/utils/citationPreview.ts` is pure: `findReferenceEntry({ target, destinations, pages })`
+works on `furniturePageFromTextContent` geometry. `PdfViewer.vue` resolves the link's destination
+(`destinationPoint`), reads the target page and the next one (reusing `pageTextSources`), and the
+named destinations on both, all cached per document and started on hover so the text is ready at
+500 ms. Rules learned on 339 local PDFs (11 005 `cite.` anchors, 99.99 % extracted; all 3 524
+numbered entries agree with their link's number):
+
+- The anchor is not the text. natbib puts it in the label box up to ~2.5 em left of the entry,
+  on top of margin line numbers, raised ~1.15 em (sibling anchors calibrate other producers;
+  hyperref sometimes raises a full line onto the previous entry's last baseline). The start is
+  the leftmost line start at/after the anchor's x near that raise; a span continuing a line
+  (stream-adjacent) is never a start. `FitH`/`XYZ null` and page-wide `FitR` boxes have no x:
+  every column is tried, preferring a line that is not indented.
+- Columns come from aligned line starts that no line's text runs across, judged by content
+  stream adjacency, never by widths (italic spans can report a third too wide) or gaps (some
+  producers write every word as a span, so justified lines are rows of 1-em gaps).
+- The next named destination in the column ends the entry; so do a sequence label at the flush x
+  (`2.` after `1.`, not `[CrossRef]`), or a flush line after this entry's own indented second
+  line. Without boundaries, also the gap between entries (leading = lower quartile of the gaps
+  between lines of the entry's own size). Bare-number lines (page/line numbers) are skipped;
+  larger type, smaller type, or a line starting mid-column at an x no other line shares (centred
+  running heads; wide `[MKM+94]` labels keep their aligned continuation) end the column.
+- An entry running off its column continues above the next same-family anchor in the next
+  column/page, walking up while the leading stays even (the first step may cross one
+  inter-entry space). Groups that belong to an entry in between are dropped, and a sibling
+  anchor left below the last line (hyperref's page-break quirk) means the entry ended here.
+- Lines are rejoined with `mergeWrappedLines`, after URLs broken at a line end and words
+  hyphenated across lines whose whole form the page spells elsewhere ("Com-"+"putational").
+  Separately drawn accents are composed by geometry (OT1 `\"o`, `\AA`).
+- Only references preview. `destinationFamily` excludes hyperref's figure/section/equation/page
+  families and publisher figure anchors (`bm_Fig1`, `fig9005`). `cite.` is trusted; other
+  families (ACL Anthology `PAX@…`, Springer `bm_CR`, `ref`, `bib`, explicit arrays) also need
+  `looksLikeReference` and a target at/after a References heading (`referencesHeading`, small
+  caps included). `labelAgrees` drops an entry whose number contradicts the link's ("45" → "16.").
+  Failure gives no preview, never a wrong one. Text over 4 000 characters is cut with "…".
 
 ### Media generation and read-aloud
 
@@ -1462,6 +1564,20 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
 ## Testing instructions
 
 - **Frontend:** `vue-tsc --noEmit` runs as part of `npm run build`. Local regression scripts use Node's built-in test runner.
+- Publication metadata: `cargo test --lib publication::tests` and `cargo test --lib metadata::`
+  cover first-page review notices, old incorrect venue repair, final decisions,
+  prompt rules and backend rank rejection. `node --test scripts/test-publication-status.mjs`
+  checks status-aware badges and the real Pinia rank cache (including stale CCF
+  results and forced lookups). Keep the Rust/TS status predicates aligned.
+  In-review/submitted/rejected/withdrawn/preprint venues retain their qualifier
+  and carry no publication rank. Metadata re-fetch and citation enrichment repair
+  stripped review notices from the PDF/cached front matter; an explicit final
+  decision takes precedence over an old submission-version PDF.
+  OpenReview imports also check the matching API note's `venueid` and acceptance
+  `pdate` (API 2 wrappers / API 1 strings). A public posting date alone does not
+  prove acceptance; withdrawal/rejection wins over a stale `pdate`. Confirmed
+  acceptance is kept explicitly in the venue so later PDF/AI enrichment retains
+  it. Coverage: `cargo test --lib url_import::openreview::publication_tests`.
 - AI model synchronization: `node --test scripts/test-ai-settings-sync.mjs`
   exercises separate Pinia stores, saved edits, failures, stale loads, library
   switches and listener cleanup. `scripts/test-ai-settings-sync-browser.mjs`
@@ -1503,6 +1619,14 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
 - PDF selection regression checks: `node --test scripts/test-page-furniture.mjs`
   exercises cross-page copy/save entry points, trimmed text and rects, and the
   single-page / other-viewer / text-mismatch fail safes without accessing a library.
+- Citation previews: `node --test scripts/test-citation-preview.mjs` covers the extraction rules
+  on synthetic layouts (margin line numbers, raised anchors, word-per-span lines, columns, page
+  and column continuation, a left-behind anchor, x-less anchors, unanchored numbered entries,
+  wide labels, rejoined words/URLs/accents, families, destination points, heading and labels).
+  `scripts/test-citation-preview-browser.mjs` (same Playwright/Chrome setup as the Mermaid test)
+  mounts the real PdfViewer with App.vue's selection rules, pdf_viewer.css and the markdown copy
+  handler on a generated PDF: the 500 ms delay, no native tooltip, reaching the preview, a
+  contained selection and its copy, the copy button, closing, a figure link and a narrow window.
 - PDF text-layer recovery: `node --test scripts/test-pdf-text-layer.mjs` covers
   normal layers, font/layout rejection, zero boxes, timeout, cancellation,
   hidden/image-only pages, PDF coordinates, zoom, rotation and vertical text.
@@ -1556,7 +1680,7 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   diagram screenshot. It mounts the real component and checks sanitized labels,
   directive overrides, PNG text pixels and invalid-source fallback, using a fresh
   headless profile and localhost only (no library or system clipboard access).
-- **Paper marking / duplicate import:** `node --test scripts/test-duplicate-import.mjs scripts/test-paper-marking.mjs` exercises the real import store and reader merge with command/dialog mocks. `scripts/test-write-confirm.mjs` uses the same Playwright setup as the Mermaid test to check batch previews and approval/rejection with actual Chinese translations. Rust tests in `mcp/app_tools.rs`, `mcp/agent.rs`, `render.rs` and `paper.rs` cover exact quote matching, write isolation, idempotent retries, app-only exposure, explicit-request descriptions, crop/rotation/UserUnit and concurrent directory reservations.
+- **Paper marking / duplicate import:** `node --test scripts/test-duplicate-import.mjs scripts/test-paper-marking.mjs` exercises the real import store and reader merge with command/dialog mocks. `scripts/test-write-confirm.mjs` uses the same Playwright setup as the Mermaid test to check batch previews and approval/rejection with actual Chinese translations, including before/after previews of changes to existing marks and AI-only retractions. Rust tests in `mcp/app_tools.rs`, `mcp/agent.rs`, `render.rs` and `paper.rs` cover exact quote matching, write isolation, idempotent retries, provenance, whole-selection changes, stale previews, app-only exposure, explicit-request descriptions, crop/rotation/UserUnit and concurrent directory reservations.
   Duplicate tests also verify real native-dialog command/button mapping,
   asynchronous choices and failures across local/URL/ebook/arXiv imports;
   `arxiv` tests cover title-only advisories and exact-id precedence. Marking
@@ -1671,6 +1795,7 @@ xattr -cr /Applications/Argus.app
 | Add a settings section | `src/components/SettingsModal.vue` + `src/components/settings/`. The nav is 常规 / 主题 / AI 供应商 / AI 随航 / MCP 接口 / 关于. AI 随航 (section `agent`) is a container (`QaSettings.vue`) with Agent 与工具 / AI 领读 (`guided-reading`) / 用户记忆 (`memory`) / RAG / 向量化 / 论文分析 / arXiv 爬取 / 朗读 (`speech`) sub-tabs; `initialSection: 'rag'` (the embedding map's button), `'extraction'` and `'arxiv'` still route there |
 | Add a sidebar tab | `src/components/RightSidebar.vue` + `src/components/tabs/` |
 | Change PDF rendering | `src/components/PdfViewer.vue` + `src/utils/pageRenderPolicy.ts` — read *PDF page rendering* below first; the sharpness invariants are not negotiable |
+| Change citation hover previews | `src/utils/citationPreview.ts` (finding the entry), the *Citation preview* block in `PdfViewer.vue` (hover, lookup cache, popup) — read *Citation hover previews* first |
 | Change cross-page highlights / page numbers, footnotes, figures and tables | `src/utils/pageFurniture.ts` (the classifier and the drop policy), `planSelectionFurniture` in `PdfViewer.vue` (the integration), `src/utils/highlightGroups.ts` + `src-tauri/src/highlight_groups.rs` (how the per-page records are shown as one) |
 | Change RAG / vectorizing | `src-tauri/src/rag.rs`, `src/stores/rag.ts`, `settings/RagSettings.vue`; vectorizing is papers only and is started from `PaperList.vue` / `LeftSidebar.vue` (collection menu) / 设置 → AI 随航 → RAG / 向量化, not the chat window. Snippets are not vectorized. The vectors serve the embedding map only — chat (agent loop and plain fallback) does not use RAG. The 同步缺失 / 完整重建 run lives in `stores/rag.ts`, not the panel, so it keeps going after the settings modal is closed; `RagSettings.vue` only starts it and shows its progress |
 | Change model badges (FREE / 折扣) | `src-tauri/src/llm.rs` (`quotes_free`, `parse_time_discount`, `fetch_openrouter_discount`) → `AiModel` → `stores/ai.ts` → `utils/modelOffers.ts`, rendered in `LibraryChat.vue`, `tabs/AiTab.vue`, `settings/AiSettings.vue`; refreshed by `offer_sync.rs` |

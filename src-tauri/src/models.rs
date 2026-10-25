@@ -228,6 +228,21 @@ pub struct Highlight {
     /// drops the field merely merges again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_line_breaks: Option<bool>,
+    /// Present only on a record the app's own agent created through an approved
+    /// marking tool (`mcp::app_tools`). The agent may retract such a mark only
+    /// while nobody else has edited it, i.e. while its edit time (`updated_at`,
+    /// else `created_at`) still equals `revision`. A user edit moves that time
+    /// on and the mark becomes theirs. An older build drops the field on its
+    /// next save, which also makes the mark the user's — the safe direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentMark>,
+}
+
+/// Provenance of an agent-created highlight; see [`Highlight::agent`].
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AgentMark {
+    /// The edit time the agent's last approved write left on the record.
+    pub revision: String,
 }
 
 fn default_highlight_style() -> String {
@@ -532,7 +547,7 @@ File name: {filename}
 
 Text:
 {text}"#
-        .to_string()
+        .replace("Rules:\n", &format!("Rules:\n{}\n", crate::publication::METADATA_PUBLICATION_RULES))
 }
 
 /// The metadata prompt shipped before the document-identity rules were added.

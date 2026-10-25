@@ -505,7 +505,12 @@ export const useReaderStore = defineStore('reader', () => {
     highlightsBySlug.value = { ...highlightsBySlug.value, [slug]: hl }
   }
 
-  function mergeAddedHighlights(slug: string, incoming: Highlight[]) {
+  /** Fold records an approved agent write already saved (new, changed or
+   *  retracted marks) into an open reader. Same rule as the disk merge: a
+   *  local copy edited later than the agent's write wins, a pending local
+   *  delete stays deleted, and a retraction loses only to a later local edit,
+   *  so nothing unsaved is overwritten. Closed papers load from disk instead. */
+  function mergeAgentHighlights(slug: string, incoming: Highlight[], removed: readonly HighlightTombstone[] = []) {
     if (!tabs.value.some(t => t.slug === slug)) return
     const deleted = new Set((highlightTombstones.value[slug] ?? []).map(t => t.id))
     const merged = new Map((highlightsBySlug.value[slug] ?? []).map(h => [h.id, h]))
@@ -513,6 +518,18 @@ export const useReaderStore = defineStore('reader', () => {
       const local = merged.get(h.id)
       if (!deleted.has(h.id) && (!local || (h.updated_at ?? h.created_at) > (local.updated_at ?? local.created_at))) {
         merged.set(h.id, h)
+      }
+    }
+    const retracted = removed.filter(t => {
+      const local = merged.get(t.id)
+      return !local || (local.updated_at ?? local.created_at) <= t.deleted_at
+    })
+    if (retracted.length) {
+      const ids = new Set(retracted.map(t => t.id))
+      for (const id of ids) merged.delete(id)
+      highlightTombstones.value = {
+        ...highlightTombstones.value,
+        [slug]: [...(highlightTombstones.value[slug] ?? []).filter(t => !ids.has(t.id)), ...retracted],
       }
     }
     setHighlights(slug, [...merged.values()])
@@ -696,6 +713,6 @@ export const useReaderStore = defineStore('reader', () => {
     jumpToHighlight,
     persistReadingState,
     reloadFromDisk,
-    mergeAddedHighlights,
+    mergeAgentHighlights,
   }
 })

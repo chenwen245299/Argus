@@ -2298,6 +2298,8 @@ async function runAssistantRequestImpl(
       // instead of an error on every question.
       plainFallback: true,
       manageContext: true,
+      // The calibrated count prepare admitted, for the agent's first round.
+      previousUsage: prepared?.usage ?? null,
     })
     // If the user pressed stop, don't refill content the backend produced anyway.
     if (!stoppedTargetIds.has(target.id)) {

@@ -115,7 +115,7 @@ pub async fn request(
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = oneshot::channel();
     if let Ok(mut map) = registry().lock() {
-        let passage_count = preview.get("passages").and_then(|p| p.as_array()).map(Vec::len).filter(|n| *n > 0);
+        let passage_count = color_choice_count(&preview);
         map.insert(id.clone(), PendingConfirmation { sender: tx, passage_count });
     }
     // Undoes the registration on every exit path below.
@@ -160,6 +160,18 @@ pub async fn request(
         serde_json::json!({ "requestId": id }),
     );
     decision
+}
+
+/// How many colors the card may send back with an approval: one per new
+/// passage, or one per changed mark's new color. A retraction, a note and
+/// everything else take none.
+fn color_choice_count(preview: &serde_json::Value) -> Option<usize> {
+    let list = |key: &str| preview.get(key).and_then(|p| p.as_array()).filter(|p| !p.is_empty());
+    if let Some(passages) = list("passages") {
+        return Some(passages.len());
+    }
+    let changes = list("changes")?;
+    changes.iter().all(|c| c.get("after").is_some()).then_some(changes.len())
 }
 
 /// Removes a pending request from the registry however the wait ended.
@@ -256,6 +268,18 @@ mod tests {
         let choice = rx.await.unwrap();
         assert!(choice.approved());
         assert_eq!(choice.passage_colors, Some(vec!["#90CAF9".into(), "#12AB34".into()]));
+    }
+
+    #[test]
+    fn only_new_passages_and_recolorable_changes_accept_colors() {
+        let passages = serde_json::json!({"passages": [{"color": "#FFEB3B"}, {"color": "#90CAF9"}]});
+        assert_eq!(color_choice_count(&passages), Some(2));
+        let update = serde_json::json!({"tool": "update_paper_highlights", "changes": [
+            {"before": {"color": "#FFEB3B"}, "after": {"color": "#CE93D8"}}]});
+        assert_eq!(color_choice_count(&update), Some(1));
+        let removal = serde_json::json!({"tool": "remove_paper_highlights", "changes": [{"before": {"color": "#FFEB3B"}}]});
+        assert_eq!(color_choice_count(&removal), None);
+        assert_eq!(color_choice_count(&serde_json::json!({"content": "note", "passages": []})), None);
     }
 
     #[tokio::test]

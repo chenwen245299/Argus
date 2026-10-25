@@ -98,6 +98,11 @@ export interface Highlight {
   end_offset?: number
   anchor_prefix?: string
   anchor_suffix?: string
+  /** Set only on a mark the in-app agent created through an approved marking
+   *  tool. Carry it along untouched: an edit here stamps `updated_at`, which no
+   *  longer equals `revision`, and that alone makes the mark the user's (the
+   *  agent may then no longer retract it). */
+  agent?: { revision: string }
 }
 
 /** Records a highlight deletion so it propagates across a synced library instead
@@ -1051,6 +1056,22 @@ export interface AgentWritePreview {
   passages?: { page: number; text: string; note?: string | null; color: string; style: string }[]
   recommendations?: { arxivId: string; title: string; source: string; existingSlug?: string | null; existingTitle?: string | null }[]
   keepDuplicateCopies?: boolean
+  /** Existing marks the agent wants to change (`after`) or retract (no `after`),
+   *  one entry per selection, with what they look like now. */
+  changes?: AgentMarkChange[]
+}
+
+export interface AgentMarkState { color: string; style: string; note?: string | null }
+
+export interface AgentMarkChange {
+  id: string
+  page: number
+  pageEnd?: number
+  text: string
+  /** `ai`: the agent's own, unedited mark; `ai_user_edited`: the user changed it; `user`: theirs. */
+  origin: 'ai' | 'ai_user_edited' | 'user'
+  before: AgentMarkState
+  after?: AgentMarkState
 }
 
 /** One validated canvas edit, as the panel applies it. Mirrors `CanvasOp` in

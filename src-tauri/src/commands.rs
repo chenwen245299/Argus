@@ -1248,11 +1248,14 @@ pub async fn fetch_citation_count(
     let root = get_root(&state)?;
     let update = metadata::fetch_semantic_scholar_meta(&root, &slug).await?;
     let mut meta = crate::paper::read_meta(&root, &slug)?;
+    let mut changed = false;
     if let Some(u) = update {
-        if metadata::backfill_meta(&mut meta, &u) {
-            crate::paper::write_meta(&root, &slug, &meta)?;
-            refresh_search_index(&root, &slug);
-        }
+        changed |= metadata::backfill_meta(&mut meta, &u);
+    }
+    changed |= crate::publication::apply_cached_review_notice(&root, &slug, &mut meta);
+    if changed {
+        crate::paper::write_meta(&root, &slug, &meta)?;
+        refresh_search_index(&root, &slug);
     }
     Ok(meta)
 }
@@ -2952,6 +2955,10 @@ pub async fn chat_with_library(
     // whole point is a tool.
     plain_fallback: Option<bool>,
     manage_context: Option<bool>,
+    // The usage `prepare_library_chat_context` just returned for these
+    // messages, calibrated by the last live request; the agent's first round
+    // measures against it instead of raw estimates.
+    previous_usage: Option<crate::chat_context::ContextUsage>,
     // Synthetic guided-reading presets and metadata tasks are not user evidence.
     learn_user_profile: Option<bool>,
     expected_root: Option<String>,
@@ -3063,6 +3070,7 @@ pub async fn chat_with_library(
                 cancel.clone(),
                 web_search,
                 manage_context.unwrap_or(false),
+                previous_usage.as_ref(),
                 observation.as_ref(),
             )
             .await;

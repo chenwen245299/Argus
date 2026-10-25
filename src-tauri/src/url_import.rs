@@ -903,6 +903,63 @@ mod openreview {
         )
     }
 
+    /// API 1 uses strings; API 2 wraps content fields in { value: ... }.
+    fn note_field<'a>(note: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+        let field = &note["content"][name];
+        field["value"].as_str().or_else(|| field.as_str()).map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    fn publication_venue(note: &serde_json::Value, fallback: Option<&str>) -> Option<String> {
+        let venue = note_field(note, "venue").or(fallback)?;
+        let venue_id = note_field(note, "venueid").unwrap_or("").to_ascii_lowercase();
+        let lower = venue.to_ascii_lowercase();
+        // A withdrawn/rejected paper may retain an earlier pdate. Its current
+        // decision must win over both that date and the PDF's old review banner.
+        for status in ["withdrawn", "rejected"] {
+            if venue_id.contains(status) || lower.contains(status) {
+                return Some(if lower.contains(status) { venue.to_string() } else { format!("{venue} ({status})") });
+            }
+        }
+        // OpenReview documents pdate as the date the submission was marked
+        // accepted. citation_online_date alone is only a public posting date.
+        // https://docs.openreview.net/reference/api-v2/entities/note/fields
+        if note["pdate"].as_i64().is_some_and(|date| date > 0) {
+            let prefix = regex::Regex::new(r"(?i)^(?:submitted\s+to\s+|under\s+review\s+(?:at|for)\s+)").unwrap();
+            let suffix = regex::Regex::new(r"(?i)(?:\s+(?:conference\s+)?submission|\s*\((?:under review|submitted|submission)\))$").unwrap();
+            let base = prefix.replace(venue, "");
+            let base = suffix.replace(&base, "");
+            return Some(format!("{} (accepted)", base.trim()));
+        }
+        if crate::publication::is_unpublished_venue(venue) {
+            return Some(venue.to_string());
+        }
+        if crate::publication::is_unpublished_venue(&venue_id) {
+            return Some(format!("{venue} (submitted)"));
+        }
+        None
+    }
+
+    async fn fetch_publication_venue(client: &reqwest::Client, id: &str, fallback: Option<&str>) -> Option<String> {
+        // API 2 covers current venues, API 1 covers older ones. Failure leaves
+        // the PDF notice as the available evidence; it never implies acceptance.
+        for host in ["api2.openreview.net", "api.openreview.net"] {
+            let response = match client.get(format!("https://{host}/notes"))
+                .query(&[("id", id)])
+                .timeout(std::time::Duration::from_secs(5))
+                .send().await {
+                Ok(response) if response.status().is_success() => response,
+                _ => continue,
+            };
+            let Ok(body) = crate::net::fetch_text_capped(response, 1024 * 1024).await else { continue };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
+            let Some(notes) = json["notes"].as_array() else { continue };
+            if let Some(note) = notes.iter().find(|note| note["id"].as_str() == Some(id)) {
+                return publication_venue(note, fallback);
+            }
+        }
+        None
+    }
+
     async fn fetch_meta(client: &reqwest::Client, id: &str) -> Result<Meta, String> {
         let forum_url = format!("https://openreview.net/forum?id={id}");
         let html = client
@@ -924,6 +981,7 @@ mod openreview {
         let pdf_url = meta_content(&html, "citation_pdf_url")
             .unwrap_or_else(|| format!("https://openreview.net/pdf?id={id}"));
         let venue = meta_content(&html, "citation_conference_title");
+        let venue = fetch_publication_venue(client, id, venue.as_deref()).await.or(venue);
         let abstract_text = meta_content(&html, "citation_abstract")
             .or_else(|| meta_content(&html, "description"))
             .filter(|s| !s.is_empty());
@@ -1028,6 +1086,16 @@ mod openreview {
             journal_rank: None,
         };
 
+        // The conference meta tag may name only a submission destination. Read
+        // the PDF's own notice before this venue reaches ranking/enrichment.
+        let review_text = tauri::async_runtime::spawn_blocking(move || {
+            crate::metadata::extract_text_from_bytes(&pdf_bytes).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        let mut paper_meta = paper_meta;
+        crate::publication::apply_review_notice(&mut paper_meta, &review_text);
+
         match super::finalize_paper(
             root, &final_dir, &final_slug, paper_meta, collection_id, app, "openreview", force,
         )
@@ -1041,6 +1109,45 @@ mod openreview {
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&final_dir);
                 Err(e)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod publication_tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn submission_destination_is_not_acceptance_in_either_api_version() {
+            let v2 = json!({"content":{"venue":{"value":"ICLR 2027"},"venueid":{"value":"ICLR.cc/2027/Conference/Submission"}},"odate":123,"pdate":null});
+            assert_eq!(publication_venue(&v2, None).as_deref(), Some("ICLR 2027 (submitted)"));
+            let v1 = json!({"content":{"venue":"ICLR 2027 Conference Submission"}});
+            assert_eq!(publication_venue(&v1, None).as_deref(), Some("ICLR 2027 Conference Submission"));
+            // A public posting date and conference tag alone are insufficient.
+            assert!(publication_venue(&json!({"odate":123}), Some("ICLR 2027")).is_none());
+        }
+
+        #[test]
+        fn confirmed_acceptance_survives_the_old_submission_pdf_and_later_enrichment() {
+            let note = json!({"content":{"venue":{"value":"ICLR 2025"},"venueid":{"value":"ICLR.cc/2025/Conference"}},"pdate":123});
+            let venue = publication_venue(&note, None).unwrap();
+            assert_eq!(venue, "ICLR 2025 (accepted)");
+            let mut meta: PaperMeta = serde_json::from_value(json!({"id":"test", "title":"A Paper", "venue":venue})).unwrap();
+            crate::publication::apply_metadata_venue(&mut meta, Some("ICLR 2025".into()), "Under review as a conference paper at ICLR 2025");
+            assert_eq!(meta.venue.as_deref(), Some("ICLR 2025 (accepted)"));
+            assert!(!crate::publication::is_unpublished_venue(meta.venue.as_deref().unwrap()));
+            let v1 = json!({"content":{"venue":"Submitted to ICLR 2025"},"pdate":123});
+            assert_eq!(publication_venue(&v1, None).as_deref(), Some("ICLR 2025 (accepted)"));
+        }
+
+        #[test]
+        fn final_nonacceptance_takes_priority_over_a_stale_acceptance_date() {
+            for status in ["Withdrawn", "Rejected", "Desk_Rejected"] {
+                let note = json!({"content":{"venue":{"value":"ICLR 2025"},"venueid":{"value":format!("ICLR.cc/2025/Conference/{status}_Submission")}},"pdate":123});
+                let venue = publication_venue(&note, None).unwrap();
+                assert!(crate::publication::is_unpublished_venue(&venue));
+                assert!(!venue.contains("accepted"));
             }
         }
     }

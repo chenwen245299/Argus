@@ -69,17 +69,63 @@ pub struct HighlightGroup {
     /// plain highlight (and a serialized export of one) carries no extra field.
     pub page_end: Option<u32>,
     /// Every record the entry stands for, in member order (`rep.id` first).
-    /// A single element for a plain highlight. No read-only consumer needs it
-    /// yet — they all key on `rep.id` — but it is the group's identity (the
-    /// TypeScript twin exposes it as `ids`) and what the tests check membership
-    /// against.
-    #[allow(dead_code)]
+    /// A single element for a plain highlight. It is the group's identity (the
+    /// TypeScript twin exposes it as `ids`): the agent's mark-changing tools
+    /// resolve any member id to its whole selection through it.
     pub member_ids: Vec<String>,
+    /// Who the selection belongs to; see [`MarkOrigin`].
+    pub origin: MarkOrigin,
+}
+
+/// Who a mark belongs to, as far as the agent's tools are concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkOrigin {
+    /// Created by the app's agent and edited by nobody since — every record
+    /// of the selection. Only such a mark may the agent retract.
+    Ai,
+    /// Created by the agent, then edited by the user. It is theirs now.
+    AiUserEdited,
+    /// The user's own mark, or one whose provenance an older build dropped.
+    User,
+}
+
+impl MarkOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarkOrigin::Ai => "ai",
+            MarkOrigin::AiUserEdited => "ai_user_edited",
+            MarkOrigin::User => "user",
+        }
+    }
+
+    /// One record's origin: agent-made and untouched while its edit time is
+    /// still the one the agent's last write left (see `Highlight::agent`).
+    fn of(h: &Highlight) -> Self {
+        match &h.agent {
+            Some(agent) if agent.revision == edit_time(h) => MarkOrigin::Ai,
+            Some(_) => MarkOrigin::AiUserEdited,
+            None => MarkOrigin::User,
+        }
+    }
+
+    /// A selection is the agent's only when every record is; any agent
+    /// record in it otherwise means the user changed something.
+    fn of_members(members: &[Highlight]) -> Self {
+        let origins: Vec<_> = members.iter().map(MarkOrigin::of).collect();
+        if origins.iter().all(|o| *o == MarkOrigin::Ai) {
+            MarkOrigin::Ai
+        } else if origins.iter().any(|o| *o != MarkOrigin::User) {
+            MarkOrigin::AiUserEdited
+        } else {
+            MarkOrigin::User
+        }
+    }
 }
 
 impl HighlightGroup {
     fn single(h: Highlight) -> Self {
-        HighlightGroup { member_ids: vec![h.id.clone()], rep: h, page_end: None }
+        HighlightGroup { member_ids: vec![h.id.clone()], origin: MarkOrigin::of(&h), rep: h, page_end: None }
     }
 
     /// The text this highlight shows and exports: the canonical member's text as
@@ -110,13 +156,14 @@ impl HighlightGroup {
         let page_end = members.iter().map(|m| m.page).max();
         let note = merge_notes(&members);
         let member_ids = members.iter().map(|m| m.id.clone()).collect();
+        let origin = MarkOrigin::of_members(&members);
 
         let mut rep = members.swap_remove(0);
         rep.note = note;
         rep.color = color;
         rep.style = style;
         rep.keep_line_breaks = keep_line_breaks;
-        HighlightGroup { rep, page_end, member_ids }
+        HighlightGroup { rep, page_end, member_ids, origin }
     }
 }
 
@@ -257,6 +304,7 @@ pub(crate) mod fixtures {
             anchor_prefix: None,
             anchor_suffix: None,
             keep_line_breaks: None,
+            agent: None,
         }
     }
 
@@ -337,6 +385,7 @@ mod tests {
             anchor_prefix: None,
             anchor_suffix: None,
             keep_line_breaks: None,
+            agent: None,
         }
     }
 
@@ -773,6 +822,23 @@ mod tests {
         assert_eq!(groups[0].rep.note, solo.note);
         assert_eq!(groups[0].rep.color, solo.color);
         assert_eq!(groups[0].rep.updated_at, solo.updated_at);
+    }
+
+    #[test]
+    fn origin_is_the_agents_only_while_every_member_is_untouched() {
+        let agent = |mut h: Highlight| { h.agent = Some(crate::models::AgentMark { revision: edit_time(&h).to_string() }); h };
+        assert_eq!(collapse_highlights(vec![hl("u", 3)])[0].origin, MarkOrigin::User);
+        assert_eq!(collapse_highlights(vec![agent(hl("a", 3))])[0].origin, MarkOrigin::Ai);
+        // A user edit moves the edit time past the agent's revision.
+        let touched = edited(agent(hl("t", 3)), "2026-03-05T00:00:00Z", "#00ff00", "highlight");
+        assert_eq!(collapse_highlights(vec![touched.clone()])[0].origin, MarkOrigin::AiUserEdited);
+        // A pair is the agent's only when both halves are.
+        assert_eq!(collapse_highlights(vec![agent(hl("a", 10)), agent(hl("b", 11))])[0].origin, MarkOrigin::Ai);
+        let mut half = touched;
+        half.page = 11;
+        assert_eq!(collapse_highlights(vec![agent(hl("a", 10)), half])[0].origin, MarkOrigin::AiUserEdited);
+        assert_eq!(collapse_highlights(vec![agent(hl("a", 10)), hl("b", 11)])[0].origin, MarkOrigin::AiUserEdited);
+        assert_eq!(MarkOrigin::AiUserEdited.as_str(), "ai_user_edited");
     }
 
     #[test]

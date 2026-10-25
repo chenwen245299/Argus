@@ -10,7 +10,7 @@ import { useReaderStore } from '../../stores/reader'
 import { useSelectionStore } from '../../stores/selection'
 import { useRanksStore } from '../../stores/ranks'
 import { usePaperTasksStore } from '../../stores/paperTasks'
-import { badgesFromRank, isWithdrawnVenue, type DisplayBadge } from '../../utils/rankBadges'
+import { badgesFromRank, isUnpublishedVenue, type DisplayBadge } from '../../utils/rankBadges'
 
 const props = defineProps<{
   slug: string | null
@@ -101,9 +101,9 @@ function openReference(r: CitationRef) {
 // ── Journal rank (easyScholar) ──────────────────────────────────────────────────
 // Ranks live in the library-wide, venue-keyed cache (ranks store), so a venue
 // looked up once is reused by every paper with that venue — no repeat API calls.
-const venueWithdrawn = computed(() => isWithdrawnVenue(props.meta?.venue))
+const venueUnpublished = computed(() => isUnpublishedVenue(props.meta?.venue))
 const journalBadges = computed<DisplayBadge[]>(() =>
-  venueWithdrawn.value ? [] : badgesFromRank(ranks.get(props.meta?.venue)))
+  venueUnpublished.value ? [] : badgesFromRank(ranks.get(props.meta?.venue)))
 
 const journalRankFetching = ref(false)
 // Result feedback for a manual "查询等级" click (so the user sees what happened).
@@ -114,7 +114,7 @@ const s2AutoAttempted = new Set<string>()
 
 async function fetchJournalRank(manual = false) {
   const venue = props.meta?.venue?.trim()
-  if (!venue) return
+  if (!venue || isUnpublishedVenue(venue)) return
   journalRankFetching.value = true
   if (manual) rankStatus.value = ''
   try {
@@ -141,7 +141,7 @@ async function fetchJournalRank(manual = false) {
 async function maybeAutoFetchRank() {
   const venue = props.meta?.venue?.trim()
   if (!venue) return
-  if (isWithdrawnVenue(venue)) return   // withdrawn papers carry no venue rank
+  if (isUnpublishedVenue(venue)) return
   if (!ranks.loaded) await ranks.load()
   if (ranks.has(venue)) return
   if (journalRankFetching.value) return
@@ -643,7 +643,7 @@ async function extractAbstract() {
           <div class="label venue-label-row">
             <span>{{ t('meta.venue') }}</span>
             <button
-              v-if="meta.venue && settings.easyscholarConfigured && !venueWithdrawn"
+              v-if="meta.venue && settings.easyscholarConfigured && !venueUnpublished"
               class="copy-section-btn"
               :disabled="journalRankFetching"
               @click="fetchJournalRank(true)"
@@ -667,7 +667,7 @@ async function extractAbstract() {
           <div v-if="rankStatus" class="rank-status" :class="'rank-status-' + rankStatusKind">
             {{ rankStatus }}
           </div>
-          <div v-if="meta.venue && settings.loaded && !settings.easyscholarConfigured && !venueWithdrawn" class="rank-hint">
+          <div v-if="meta.venue && settings.loaded && !settings.easyscholarConfigured && !venueUnpublished" class="rank-hint">
             {{ t('meta.rankNoKey') }}
             <a class="rank-hint-link" @click.stop.prevent="openEasyScholarSettings">{{ t('meta.rankNoKeyAction') }}</a>
           </div>

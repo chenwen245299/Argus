@@ -1621,7 +1621,7 @@ function toggleCapability(form: ModelForm, cap: string) {
               </label>
               <label class="model-form-field model-form-context">
                 <span>{{ t('aiService.contextLength') }}</span>
-                <input v-model="newModel.context_length" class="text-input sm" placeholder="128K" />
+                <input v-model="newModel.context_length" class="text-input sm" placeholder="256K" />
               </label>
             </div>
             <div class="model-form-price-row">
@@ -1720,7 +1720,7 @@ function toggleCapability(form: ModelForm, cap: string) {
                       </label>
                       <label class="model-form-field model-form-context">
                         <span>{{ t('aiService.contextLength') }}</span>
-                        <input v-model="editModelForm.context_length" class="text-input sm" placeholder="128K" />
+                        <input v-model="editModelForm.context_length" class="text-input sm" placeholder="256K" />
                       </label>
                     </div>
                     <div class="model-form-price-row">

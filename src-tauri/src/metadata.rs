@@ -85,7 +85,7 @@ pub fn extract_text_sync(root: &str, slug: &str) -> Result<String, String> {
     extract_text_from_bytes(&bytes)
 }
 
-fn extract_text_from_bytes(bytes: &[u8]) -> Result<String, String> {
+pub(crate) fn extract_text_from_bytes(bytes: &[u8]) -> Result<String, String> {
     let doc = lopdf::Document::load_mem(bytes).map_err(|e| format!("lopdf: {e}"))?;
     let pages = doc.get_pages();
     // Take first 2 pages only (fast and sufficient for metadata)
@@ -867,6 +867,11 @@ fn render_metadata_prompt(template: &str, text: &str, filename: &str) -> String 
     } else {
         template.to_string()
     };
+    // Apply to saved/custom templates too; old prompts otherwise keep silently
+    // stripping "under review" from a submission destination.
+    if !prompt.contains(crate::publication::METADATA_PUBLICATION_RULES) {
+        prompt = format!("{}\n\n{prompt}", crate::publication::METADATA_PUBLICATION_RULES);
+    }
     let filename = filename.trim();
     prompt = prompt.replace(
         "{filename}",
@@ -1006,9 +1011,6 @@ pub async fn fetch_and_apply(
         } else if arxiv_id.is_some() {
             meta.arxiv_id = arxiv_id;
         }
-        if u.venue.is_some() {
-            meta.venue = u.venue;
-        }
         if u.paper_abstract.is_some() {
             meta.paper_abstract = u.paper_abstract;
         }
@@ -1016,6 +1018,8 @@ pub async fn fetch_and_apply(
         if meta.cite_count.is_none() && u.cite_count.is_some() {
             meta.cite_count = u.cite_count;
         }
+
+        crate::publication::apply_metadata_venue(&mut meta, u.venue, identity);
 
         crate::paper::write_meta(root, slug, &meta)?;
 
@@ -1036,6 +1040,7 @@ pub async fn fetch_and_apply(
             meta.doi = doi;
             changed = true;
         }
+        changed |= crate::publication::apply_review_notice(&mut meta, identity);
         if changed {
             crate::paper::write_meta(root, slug, &meta)?;
         }
@@ -1228,22 +1233,23 @@ pub async fn fetch_venue_rank(
     secret_key: &str,
     force: bool,
 ) -> Result<JournalRank, String> {
-    let secret_key = secret_key.trim();
-    if secret_key.is_empty() {
-        return Err("未配置 easyScholar 密钥".to_string());
-    }
     let venue = venue.trim();
     if venue.is_empty() {
         return Err("这篇论文没有期刊/会议信息".to_string());
     }
-    // A withdrawn submission wasn't accepted — never attribute a venue rank to it.
-    if venue.to_lowercase().contains("withdrawn") {
+    // Check before credentials/cache/network so an old cached CCF result cannot
+    // make an in-review, rejected or withdrawn submission look published.
+    if crate::publication::is_unpublished_venue(venue) {
         return Ok(JournalRank {
             official: Default::default(),
             custom: Vec::new(),
             venue: venue.to_string(),
             fetched_at: chrono::Utc::now().to_rfc3339(),
         });
+    }
+    let secret_key = secret_key.trim();
+    if secret_key.is_empty() {
+        return Err("未配置 easyScholar 密钥".to_string());
     }
     let key = normalize_venue_key(venue);
 
@@ -1982,15 +1988,15 @@ pub async fn fetch_metadata_with_ai(
         if let Some(y) = update.year {
             meta.year = Some(y);
         }
-        if update.venue.is_some() {
-            meta.venue = update.venue;
-        }
         if update.doi.is_some() {
             meta.doi = update.doi;
         }
         if update.arxiv_id.is_some() {
             meta.arxiv_id = update.arxiv_id;
         }
+        // Deterministic protection even if the model ignores the prompt or
+        // returns null (which otherwise leaves an old incorrect venue intact).
+        crate::publication::apply_metadata_venue(&mut meta, update.venue, &snippet);
     }
 
     crate::paper::write_meta(root, slug, &meta)?;
@@ -2155,6 +2161,18 @@ mod journal_rank_tests {
         );
         assert!(has(&c, "International Conference on Machine Learning"));
         assert!(has(&c, "ICML"));
+    }
+
+    #[tokio::test]
+    async fn unpublished_venues_are_never_ranked_even_without_credentials() {
+        // Empty key guarantees this test cannot make a network request even if
+        // the status guard regresses. These must short-circuit before key/cache.
+        for venue in ["ICLR 2027 (under review)", "ICLR 2027 Conference Submission", "Submitted to TMLR", "ICLR 2025 (rejected)", "ICLR 2025 Withdrawn Submission", "ICLR 2027（在审）"] {
+            let rank = super::fetch_venue_rank("/unused-fixture-library", venue, "", true).await.unwrap();
+            assert!(rank.official.is_empty(), "{venue}");
+            assert!(rank.custom.is_empty(), "{venue}");
+        }
+        assert!(super::fetch_venue_rank("/unused-fixture-library", "ICLR 2025", "", false).await.is_err());
     }
 }
 
@@ -2380,15 +2398,29 @@ References
     #[test]
     fn the_filename_hint_is_optional() {
         let with = render_metadata_prompt("File name: {filename}\nText:\n{text}", "body", "cv.pdf");
-        assert_eq!(with, "File name: cv.pdf\nText:\nbody");
+        assert!(with.ends_with("File name: cv.pdf\nText:\nbody"));
+        assert!(with.starts_with(crate::publication::METADATA_PUBLICATION_RULES));
 
         // An unknown name is said out loud rather than left as a bare label.
         let unknown = render_metadata_prompt("File name: {filename}\n{text}", "body", "   ");
-        assert!(unknown.starts_with("File name: (unknown)"));
+        assert!(unknown.contains("File name: (unknown)"));
 
         // A template from before the hint existed is untouched, and still gets
         // its text appended when it carries no placeholder at all.
         let old = render_metadata_prompt("Extract metadata.", "body", "cv.pdf");
-        assert_eq!(old, "Extract metadata.\n\nText:\nbody");
+        assert!(old.ends_with("Extract metadata.\n\nText:\nbody"));
+        assert!(old.contains(crate::publication::METADATA_PUBLICATION_RULES));
+    }
+
+    #[test]
+    fn publication_rules_apply_once_to_default_and_saved_custom_prompts() {
+        let rules = crate::publication::METADATA_PUBLICATION_RULES;
+        let default = crate::models::default_metadata_ai_prompt();
+        assert!(default.contains(rules));
+        assert_eq!(render_metadata_prompt(&default, "Body", "paper.pdf").matches(rules).count(), 1);
+        let custom = "Extract just title, year and venue.\n{text}";
+        let rendered = render_metadata_prompt(custom, "Under review as a conference paper at ICLR 2027", "paper.pdf");
+        assert!(rendered.contains(rules));
+        assert!(rendered.contains("Extract just title, year and venue."));
     }
 }

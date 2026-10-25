@@ -502,6 +502,7 @@ impl PendingArxivWrite {
             passages: vec![],
             recommendations: self.preview.clone(),
             keep_duplicate_copies: self.keep_duplicate_copies,
+            changes: vec![],
         }
     }
 

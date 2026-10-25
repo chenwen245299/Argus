@@ -485,7 +485,7 @@ fn highlights_path(root: &str, slug: &str) -> PathBuf {
 
 /// The effective time of a highlight for conflict resolution: its last edit, or
 /// its creation time when it has never been edited.
-fn highlight_time(h: &Highlight) -> &str {
+pub fn highlight_time(h: &Highlight) -> &str {
     h.updated_at.as_deref().unwrap_or(&h.created_at)
 }
 
@@ -510,7 +510,10 @@ pub fn read_highlights_doc(root: &str, slug: &str) -> HighlightsDoc {
 
 /// Effective (non-deleted) highlights — what the UI, RAG and search consume.
 pub fn read_highlights(root: &str, slug: &str) -> Vec<Highlight> {
-    let doc = read_highlights_doc(root, slug);
+    effective_highlights(&read_highlights_doc(root, slug))
+}
+
+fn effective_highlights(doc: &HighlightsDoc) -> Vec<Highlight> {
     let deleted: std::collections::HashMap<&str, &str> = doc
         .tombstones
         .iter()
@@ -614,6 +617,28 @@ pub fn append_highlights(root: &str, slug: &str, incoming: Vec<Highlight>) -> Re
     }
     let merged = merge_highlights(disk, Vec::new(), Vec::new());
     let content = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
+    atomic_write(&highlights_path(root, slug), &content)?;
+    Ok(result)
+}
+
+/// Apply an approved agent change to existing highlights under the per-paper
+/// lock. `change` sees the effective records as they are on disk now and
+/// returns replacement records and tombstones, which go through the same merge
+/// as every save: each must be stamped newer than what it replaces, and a newer
+/// edit or delete from elsewhere still wins. An error writes nothing.
+pub fn change_highlights<T>(
+    root: &str,
+    slug: &str,
+    change: impl FnOnce(&[Highlight]) -> Result<(Vec<Highlight>, Vec<HighlightTombstone>, T), String>,
+) -> Result<T, String> {
+    validate_slug(slug)?;
+    let lock = highlights_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let disk = read_highlights_doc(root, slug);
+    let (highlights, tombstones, result) = change(&effective_highlights(&disk))?;
+    let merged = merge_highlights(disk, highlights, tombstones);
+    let content = serde_json::to_string_pretty(&merged)
+        .map_err(|e| format!("Failed to serialize highlights: {e}"))?;
     atomic_write(&highlights_path(root, slug), &content)?;
     Ok(result)
 }
@@ -738,6 +763,7 @@ mod highlight_tests {
             anchor_prefix: None,
             anchor_suffix: None,
             keep_line_breaks: None,
+            agent: None,
         }
     }
 

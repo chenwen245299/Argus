@@ -155,6 +155,8 @@ test('models keep separate capacities and checkpoints; regenerating before a bou
   await send('Use another model');await requests(1)
   let args=await page.evaluate(()=>window.__test.requests[0].args)
   assert.equal(args.modelId,'large');assert.equal(args.messages[0].content,'Original paper goal')
+  // The agent's first round measures against the count prepare just admitted.
+  assert.deepEqual(args.previousUsage,await page.evaluate(a=>window.__test.usage(a,a.messages.filter(m=>m.role!=='system')),args))
   await page.evaluate(()=>window.__test.finish(0));await page.getByRole('button',{name:'重新生成',exact:true}).last().waitFor()
   await chooseModel('Small model')
   await page.getByRole('button',{name:'重新生成',exact:true}).first().click();await requests(2)
@@ -281,6 +283,7 @@ test('canvas meter compacts without changing the draft and retains its scoped in
   await send('Continue canvas');await requests(1)
   const request=await page.evaluate(()=>window.__test.requests[0].args)
   assert.equal(request.canvasId,'canvas');assert.equal(request.manageContext,true)
+  assert.deepEqual(request.previousUsage,await page.evaluate(a=>window.__test.usage(a,a.messages.filter(m=>m.role!=='system')),request))
   assert.equal(request.messages[0].role,'system');assert.match(request.messages[0].content,/canvas/)
   assert.match(request.messages[1].content,/compacted-summary/)
   await page.evaluate(()=>window.__test.finish(0))

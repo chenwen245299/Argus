@@ -63,6 +63,10 @@ import {
   estimateBodyFontSize, furniturePageFromTextContent, preferContentGeometry,
   type FurniturePage, type FurnitureDropReport, type SpanReading, type TextContentLike,
 } from '../utils/pageFurniture'
+import {
+  findReferenceEntry, destinationFamily, destinationPoint, looksLikeReference, referencesHeading, labelAgrees,
+  type RefDestination,
+} from '../utils/citationPreview'
 import * as pdfjsLib from 'pdfjs-dist'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { EventBus, PDFLinkService } from 'pdfjs-dist/web/pdf_viewer.mjs'
@@ -803,7 +807,10 @@ let pressInPopup = false
 
 function onWindowMouseDown(e: MouseEvent) {
   noteDragOrigin = !!(e.target as HTMLElement).closest?.('.hl-note-popup')
-  pressInPopup = !!(e.target as HTMLElement).closest?.('.hl-note-popup, .hl-color-popup, .sel-popup')
+  pressInRefPopup = !!(e.target as HTMLElement).closest?.('.ref-popup')
+  refSelecting.value = pressInRefPopup
+  if (!pressInRefPopup && refPopup.value) hideRefPopup()
+  pressInPopup = !!(e.target as HTMLElement).closest?.('.hl-note-popup, .hl-color-popup, .sel-popup, .ref-popup')
   // A press on the page starts over: the spans the last selection left out are plain text again.
   if (!pressInPopup) clearSkippedSpans()
   // Mouse side buttons: 3 = back, 4 = forward.
@@ -859,6 +866,7 @@ watch(isActiveTab, (active) => {
     }
     removeGlobalListeners()
     hideJumpHint() // don't let it reappear when this tab comes back
+    hideRefPopup()
     // Persist the scroll position before this tab goes to the background, and drop the pending
     // save: it would fire with the container hidden (and the page it reports is whatever the
     // tab hidden at, not where the reader is).
@@ -908,6 +916,8 @@ onUnmounted(() => {
   if (scrollThumbHideTimer) clearTimeout(scrollThumbHideTimer)
   if (searchDebounce) clearTimeout(searchDebounce)
   clearJumpHintTimer()
+  hideRefPopup()
+  if (refCopiedTimer) clearTimeout(refCopiedTimer)
   selPopupObserver?.disconnect()
   pageTextCache.clear()
   pageTextSources.clear()
@@ -1186,6 +1196,7 @@ function addHighlightToSnippetLibrary(hlId: string) {
 }
 
 function onAnnotationLayerClick(e: MouseEvent) {
+  hideRefPopup()
   const target = e.target as HTMLElement
   const link = target.closest('a')
   if (!link) return
@@ -1229,6 +1240,277 @@ function destOffsetY(viewport: any, explicitDest: any[]): number {
     return Math.max(0, vy)
   } catch {
     return 0
+  }
+}
+
+// ── Citation preview ─────────────────────────────────────────────────────────
+// Hovering a citation link for half a second shows the reference it points at, read off the PDF
+// itself (utils/citationPreview.ts), so checking "(Li et al., 2025)" does not mean scrolling to
+// the bibliography and back. The pointer can move onto the preview to select or copy its text; a
+// press inside it keeps it open for selection; copying restores hover dismissal.
+// Releasing the press restores it as well, so a finished selection does not keep it open.
+const REF_HOVER_DELAY = 500
+const REF_HIDE_DELAY = 250
+
+interface LinkTarget { dest: unknown; text: string }
+// An internal link's destination and the text it covers, by its <a>: pdf.js keeps both only in
+// the annotation data.
+const linkTargets = new WeakMap<HTMLElement, LinkTarget>()
+
+const refPopup = ref<{ x: number; y: number; anchorTop: number; text: string; pinned: boolean } | null>(null)
+const refPopupRef = ref<HTMLElement | null>(null)
+const refCopied = ref(false)
+let refPopupLink: HTMLElement | null = null
+let refPopupHovered = false
+let refHoverLink: HTMLElement | null = null
+let refHoverToken = 0
+let refShowTimer: ReturnType<typeof setTimeout> | null = null
+let refHideTimer: ReturnType<typeof setTimeout> | null = null
+let refCopiedTimer: ReturnType<typeof setTimeout> | null = null
+/** The current press began inside the preview: a selection drag there may end anywhere. */
+let pressInRefPopup = false
+// While it lasts the page's text is not selectable, or a drag past the preview's edge would carry
+// the selection on into the text layers.
+const refSelecting = ref(false)
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function registerLinkTargets(layer: HTMLElement, annotations: any[]) {
+  for (const a of annotations) {
+    if (a.subtype !== 'Link' || !a.id || a.dest === undefined || a.dest === null) continue
+    const el = layer.querySelector<HTMLElement>(`a[data-element-id="${CSS.escape(String(a.id))}"]`)
+    if (el) linkTargets.set(el, { dest: a.dest, text: a.overlaidText ?? '' })
+  }
+}
+
+// What the lookups of one document share, released with the document.
+interface RefLookupState {
+  entries: Map<string, Promise<string | null>>
+  named: Promise<Record<string, unknown> | null> | null
+  pageDests: Map<number, Promise<RefDestination[]>>
+  geometry: Map<number, Promise<FurniturePage | null>>
+  headings: Map<number, Promise<boolean>>
+}
+const refLookups = new WeakMap<PDFDocumentProxy, RefLookupState>()
+
+function refLookupState(doc: PDFDocumentProxy): RefLookupState {
+  let state = refLookups.get(doc)
+  if (!state) {
+    state = { entries: new Map(), named: null, pageDests: new Map(), geometry: new Map(), headings: new Map() }
+    refLookups.set(doc, state)
+  }
+  return state
+}
+
+/** A page's text geometry, from the text the viewer already read when it rendered the page. */
+function refPageGeometry(doc: PDFDocumentProxy, state: RefLookupState, idx: number): Promise<FurniturePage | null> {
+  let geometry = state.geometry.get(idx)
+  if (!geometry) {
+    geometry = (async () => {
+      const kept = pageTextSources.get(idx)
+      if (kept) return furniturePageFromTextContent(kept.content, kept.view, kept.rotate)
+      const page = await doc.getPage(idx + 1)
+      const content = (await page.getTextContent()) as unknown as TextContentLike
+      return furniturePageFromTextContent(content, Array.from(page.view), page.rotate)
+    })().catch(() => null)
+    state.geometry.set(idx, geometry)
+  }
+  return geometry
+}
+
+/** The named destinations on a page: the other entries' anchors bound the one looked up. */
+function refPageDestinations(doc: PDFDocumentProxy, state: RefLookupState, idx: number): Promise<RefDestination[]> {
+  let dests = state.pageDests.get(idx)
+  if (!dests) {
+    dests = (async () => {
+      state.named ??= doc.getDestinations().catch(() => null) as Promise<Record<string, unknown> | null>
+      const named = await state.named
+      if (!named) return []
+      const page = await doc.getPage(idx + 1)
+      const out: RefDestination[] = []
+      for (const [name, d] of Object.entries(named)) {
+        if (!Array.isArray(d)) continue
+        const r = d[0] as { num?: number; gen?: number } | number | null
+        const onPage = typeof r === 'number' ? r === idx : !!r && r.num === page.ref?.num && r.gen === page.ref?.gen
+        if (onPage) out.push({ page: idx, ...destinationPoint(d, page.view), name })
+      }
+      return out
+    })().catch(() => [])
+    state.pageDests.set(idx, dests)
+  }
+  return dests
+}
+
+/**
+ * Whether `idx` lies at or after the heading of the reference list. Only links outside hyperref's
+ * `cite.` family ask: theirs may point at sections and figures too, whose text can quote years
+ * and "et al." as well. With no heading near, the text's own form decides alone.
+ */
+async function refAfterReferencesHeading(doc: PDFDocumentProxy, state: RefLookupState, idx: number): Promise<boolean> {
+  const hasHeading = (k: number) => {
+    let found = state.headings.get(k)
+    if (!found) {
+      found = refPageGeometry(doc, state, k).then(g => !!g && referencesHeading(g))
+      state.headings.set(k, found)
+    }
+    return found
+  }
+  for (let k = idx; k >= Math.max(0, idx - 40); k--) if (await hasHeading(k)) return true
+  for (let k = idx + 1; k < Math.min(doc.numPages, idx + 41); k++) if (await hasHeading(k)) return false
+  return true
+}
+
+async function readReference(doc: PDFDocumentProxy, state: RefLookupState, dest: unknown): Promise<string | null> {
+  const name = typeof dest === 'string' ? dest : undefined
+  const family = destinationFamily(name)
+  if (family === false) return null
+  const explicit = name ? await doc.getDestination(name) : dest
+  if (!Array.isArray(explicit)) return null
+  const ref = explicit[0]
+  const pageIndex = typeof ref === 'number' ? ref
+    : ref && typeof ref === 'object' ? await doc.getPageIndex(ref) : -1
+  if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= doc.numPages) return null
+  // An entry can run on to the next page.
+  const next = pageIndex + 1 < doc.numPages ? pageIndex + 1 : null
+  const [here, after, dests, nextDests, page] = await Promise.all([
+    refPageGeometry(doc, state, pageIndex),
+    next === null ? null : refPageGeometry(doc, state, next),
+    refPageDestinations(doc, state, pageIndex),
+    next === null ? [] : refPageDestinations(doc, state, next),
+    doc.getPage(pageIndex + 1),
+  ])
+  if (!here) return null
+  const pages = new Map<number, FurniturePage>([[pageIndex, here]])
+  if (after && next !== null) pages.set(next, after)
+  const target = (name && dests.find(d => d.name === name))
+    || { page: pageIndex, ...destinationPoint(explicit, page.view), name }
+  const entry = findReferenceEntry({ target, destinations: [...dests, ...nextDests], pages })
+  if (!entry) return null
+  if (family !== 'cite.'
+    && (!looksLikeReference(entry.text) || !(await refAfterReferencesHeading(doc, state, pageIndex)))) return null
+  return entry.text
+}
+
+/** The reference a link points at, or null when it does not point at one. Cached per destination. */
+function lookupReference(link: LinkTarget): Promise<string | null> {
+  const doc = pdfDoc.value
+  if (!doc) return Promise.resolve(null)
+  const state = refLookupState(doc)
+  const key = typeof link.dest === 'string' ? link.dest : JSON.stringify(link.dest)
+  let entry = state.entries.get(key)
+  if (!entry) {
+    entry = readReference(doc, state, link.dest).catch(() => null)
+    state.entries.set(key, entry)
+  }
+  return entry.then(text => (text && labelAgrees(link.text, text) ? text : null))
+}
+
+function onAnnotationLayerOver(e: MouseEvent) {
+  const a = (e.target as HTMLElement).closest?.('a')
+  const link = a ? linkTargets.get(a) : undefined
+  if (!a || !link) return
+  // pdf.js titles an internal link with the text under it: the browser's tooltip only repeats
+  // what is printed there, on top of the preview.
+  a.removeAttribute('title')
+  if (a === refPopupLink) cancelRefHide()
+  if (a === refHoverLink) return
+  refHoverLink = a
+  const token = ++refHoverToken
+  if (refShowTimer) clearTimeout(refShowTimer)
+  refShowTimer = null
+  // A drag passing over the link (a text selection) is not a hover.
+  if (e.buttons) return
+  // Started now, so the text is usually ready when the delay is over.
+  const lookup = lookupReference(link)
+  refShowTimer = setTimeout(async () => {
+    refShowTimer = null
+    const text = await lookup
+    if (token === refHoverToken && refHoverLink === a && a.isConnected && text) showRefPopup(a, text)
+  }, REF_HOVER_DELAY)
+}
+
+function onAnnotationLayerOut(e: MouseEvent) {
+  const a = (e.target as HTMLElement).closest?.('a')
+  if (!a || a !== refHoverLink) return
+  if (e.relatedTarget instanceof Node && a.contains(e.relatedTarget)) return
+  refHoverLink = null
+  refHoverToken++
+  if (refShowTimer) { clearTimeout(refShowTimer); refShowTimer = null }
+  scheduleRefHide()
+}
+
+function showRefPopup(a: HTMLElement, text: string) {
+  const r = a.getBoundingClientRect()
+  cancelRefHide()
+  refPopupLink = a
+  refCopied.value = false
+  refPopup.value = { x: r.left, y: r.bottom + 6, anchorTop: r.top, text, pinned: false }
+  void nextTick(fitRefPopup)
+}
+
+/** Below the link, or above it when there is no room; never past the window's sides. */
+function fitRefPopup() {
+  const el = refPopupRef.value
+  const open = refPopup.value
+  if (!el || !open) return
+  const { width, height } = el.getBoundingClientRect()
+  let { x, y } = open
+  if (y + height > window.innerHeight - 8) y = Math.max(8, open.anchorTop - 6 - height)
+  x = Math.max(8, Math.min(x, window.innerWidth - 8 - width))
+  if (x !== open.x || y !== open.y) refPopup.value = { ...open, x, y }
+}
+
+function cancelRefHide() {
+  if (refHideTimer) { clearTimeout(refHideTimer); refHideTimer = null }
+}
+
+/** A short grace, so the pointer can travel from the link to the preview. */
+function scheduleRefHide() {
+  cancelRefHide()
+  refHideTimer = setTimeout(() => {
+    refHideTimer = null
+    if (refPopup.value && !refPopup.value.pinned && !refPopupHovered) hideRefPopup()
+  }, REF_HIDE_DELAY)
+}
+
+function hideRefPopup() {
+  cancelRefHide()
+  if (refShowTimer) { clearTimeout(refShowTimer); refShowTimer = null }
+  refHoverToken++
+  refHoverLink = null
+  refPopupLink = null
+  refPopupHovered = false
+  refPopup.value = null
+}
+
+function onRefPopupEnter() {
+  refPopupHovered = true
+  cancelRefHide()
+}
+
+function onRefPopupLeave() {
+  refPopupHovered = false
+  if (!refPopup.value?.pinned) scheduleRefHide()
+}
+
+/** A press inside the preview (selecting its text, the copy button) keeps it open. */
+function pinRefPopup() {
+  if (refPopup.value && !refPopup.value.pinned) refPopup.value = { ...refPopup.value, pinned: true }
+}
+
+async function copyReference() {
+  const preview = refPopup.value
+  if (!preview?.text) return
+  // The button's mousedown (or a prior text selection) pinned the preview.
+  // Release it before the async copy so leaving also closes it while copying.
+  refPopup.value = { ...preview, pinned: false }
+  if (!refPopupHovered) scheduleRefHide()
+  try {
+    await writeTextToClipboard(preview.text)
+    refCopied.value = true
+    if (refCopiedTimer) clearTimeout(refCopiedTimer)
+    refCopiedTimer = setTimeout(() => { refCopied.value = false }, 1500)
+  } catch (e) {
+    console.error('Copy reference failed:', e)
   }
 }
 
@@ -2189,6 +2471,7 @@ async function renderPage(idx: number) {
           linkService,
           renderForms: false,
         } as any)
+        registerLinkTargets(annotationLayerDiv, annotations)
       }
     } catch (e) {
       console.warn('AnnotationLayer render failed:', e)
@@ -2198,6 +2481,8 @@ async function renderPage(idx: number) {
     if (superseded()) { bail(); return }
 
     annotationLayerDiv.addEventListener('click', onAnnotationLayerClick)
+    annotationLayerDiv.addEventListener('mouseover', onAnnotationLayerOver)
+    annotationLayerDiv.addEventListener('mouseout', onAnnotationLayerOut)
 
     // Linkify plain-text URLs in the text layer (many PDFs render URLs as text)
     const linkifyDiv = document.createElement('div')
@@ -2290,6 +2575,7 @@ function rescalePageDom(idx: number, newScale: number) {
 // ── Re-render on scale change ─────────────────────────────────────────────────
 watch(scale, async (newScale) => {
   saveZoom()
+  hideRefPopup()
   // Mark every in-flight render stale and cancel the running pdfjs tasks so
   // none of them lands a canvas sized for the previous scale.
   renderGeneration++
@@ -2491,6 +2777,10 @@ function repositionAnchoredPopups() {
   }
   if (hlColorPopup.value) {
     hlColorPopup.value = { ...hlColorPopup.value, x: hlColorPopup.value.x - dx, y: hlColorPopup.value.y - dy }
+  }
+  if (refPopup.value) {
+    const r = refPopup.value
+    refPopup.value = { ...r, x: r.x - dx, y: r.y - dy, anchorTop: r.anchorTop - dy }
   }
 }
 
@@ -2954,6 +3244,7 @@ function onKeyDown(e: KeyboardEvent) {
   }
   if (e.key === 'Escape') {
     if (searchOpen.value) { closeSearch(); return }
+    hideRefPopup()
     hlNotePopup.value = null; hlColorPopup.value = null; selectionPopup.value = null
   }
 }
@@ -3293,11 +3584,21 @@ function onWindowMouseUp(e: MouseEvent) {
   // release often lands outside, and dismissing there would tear down the very
   // text the user is selecting (and with it the selection they meant to copy).
   if (noteDragOrigin) { noteDragOrigin = false; return }
+  // The same for the citation preview: its text is selectable, and copied from there.
+  if (pressInRefPopup) {
+    pressInRefPopup = false
+    refSelecting.value = false
+    // The pin lasts only while the press is held (a selection drag may run past the preview's
+    // edge). Released, leaving closes the preview again, and a release outside it closes it now.
+    if (refPopup.value?.pinned) refPopup.value = { ...refPopup.value, pinned: false }
+    if (!refPopupHovered) scheduleRefHide()
+    return
+  }
   // A click inside a popup (a colour, a button) belongs to it. But a drag that began on the page
   // and ends over the selection popup — it sits right under the last selection's end, so a second
   // drag across the same lines lands on it — is a new selection: it must replace the popup, not
   // leave the previous selection's text and actions under the new one.
-  const overPopup = (e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup')
+  const overPopup = (e.target as HTMLElement).closest('.hl-note-popup, .hl-color-popup, .sel-popup, .ref-popup')
   if (overPopup && (pressInPopup || !overPopup.classList.contains('sel-popup'))) return
   hlNotePopup.value = null
   // Right-click releases the contextmenu that just opened hlColorPopup — don't dismiss it
@@ -3438,7 +3739,7 @@ function triggerInitialRender() {
 </script>
 
 <template>
-  <div class="pdf-viewer">
+  <div class="pdf-viewer" :class="{ 'ref-selecting': refSelecting }">
     <!-- Toolbar -->
     <div class="pdf-toolbar">
       <div class="toolbar-title" :title="displayOpenTitle">{{ displayOpenTitle }}</div>
@@ -3701,6 +4002,27 @@ function triggerInitialRender() {
       <button class="hl-action-btn" @click="addHighlightToSnippetLibrary(hlColorPopup!.hlId)">{{ t('pdf.snippet') }}</button>
       <button class="hl-action-btn" @click="translateHighlight(hlColorPopup!.hlId)">{{ t('pdf.translate') }}</button>
       <button class="hl-action-btn danger" @click="deleteHighlight(hlColorPopup!.hlId)">{{ t('pdf.delete') }}</button>
+    </div>
+
+    <!-- Citation preview: hovering a citation link for 0.5 s shows the entry it points at -->
+    <div
+      v-if="refPopup"
+      ref="refPopupRef"
+      class="ref-popup"
+      role="tooltip"
+      :aria-label="t('pdf.refPreview')"
+      :style="{ left: `${refPopup.x}px`, top: `${refPopup.y}px` }"
+      @mouseenter="onRefPopupEnter"
+      @mouseleave="onRefPopupLeave"
+      @mousedown="pinRefPopup"
+    >
+      <div class="ref-popup-text selectable-text">{{ refPopup.text }}</div>
+      <div class="ref-popup-actions">
+        <button class="ref-popup-copy" :class="{ done: refCopied }" @click="copyReference">
+          <Icon :icon="refCopied ? 'fluent:checkmark-20-regular' : 'fluent:copy-20-regular'" width="13" height="13" />
+          <span>{{ refCopied ? t('pdf.refCopied') : t('pdf.copy') }}</span>
+        </button>
+      </div>
     </div>
 
     <!-- OCR progress overlay -->
@@ -4333,6 +4655,59 @@ function triggerInitialRender() {
   font-weight: 500;
   white-space: nowrap;
 }
+
+/* ── Citation preview ── */
+.pdf-viewer.ref-selecting .pdf-container :deep(*) {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
+.ref-popup {
+  position: fixed;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: min(460px, calc(100vw - 16px));
+  padding: 10px 12px 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+.ref-popup-text {
+  max-height: min(240px, 40vh);
+  overflow-y: auto;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  cursor: text;
+}
+
+.ref-popup-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.ref-popup-copy {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  transition: background 0.1s, color 0.1s;
+}
+.ref-popup-copy:hover { background: var(--bg-hover); color: var(--accent); }
+.ref-popup-copy.done { color: var(--accent); }
 
 /* ── Highlight popups ── */
 /* The note popup is a resizable window, driven by the .hl-note-resizer grabber

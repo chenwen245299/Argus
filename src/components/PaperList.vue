@@ -24,7 +24,7 @@ import CollectionCascadeMenu from './CollectionCascadeMenu.vue'
 import { titleInitialCaps } from '../utils/text'
 import { noteBadgeStyle } from '../utils/noteBadges'
 import { filterRecentlyRead, recentPapersVersion } from '../utils/recentPapers'
-import { badgesFromRank, isWithdrawnVenue } from '../utils/rankBadges'
+import { badgesFromRank, isUnpublishedVenue } from '../utils/rankBadges'
 import { useRanksStore } from '../stores/ranks'
 import type { Collection, Note, PaperIndexEntry, PaperMeta, SortField, SortDir } from '../types'
 
@@ -32,7 +32,7 @@ const { t } = useI18n()
 const library = useLibraryStore()
 const ranks = useRanksStore()
 function venueBadges(venue?: string | null) {
-  if (isWithdrawnVenue(venue)) return []   // withdrawn papers carry no venue rank
+  if (isUnpublishedVenue(venue)) return []
   return badgesFromRank(ranks.get(venue))
 }
 const selection = useSelectionStore()

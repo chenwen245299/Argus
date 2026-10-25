@@ -22,11 +22,25 @@
 //! again. What the dialog showed is therefore what lands on disk, even if the
 //! model's arguments were odd, ambiguous, or re-sent differently later.
 //! The only editable fields in a marking preview are the colors: choices from
-//! the user's approval are validated and applied to the captured passages;
-//! paper identity, excerpts, comments, pages and geometry cannot be changed.
+//! the user's approval are validated and applied to the captured passages (or,
+//! for a change to existing marks, to their new color); paper identity,
+//! excerpts, comments, pages and geometry cannot be changed.
+//!
+//! # Changing marks that already exist
+//!
+//! `update_paper_highlights` recolors, restyles or rewrites the note of existing
+//! marks — the user's too, since they approve each change with its before and
+//! after. `remove_paper_highlights` retracts only marks the agent created and
+//! nobody has edited since ([`MarkOrigin::Ai`]); the user's own marks cannot be
+//! deleted through it at all. Both address a whole selection: a highlight that
+//! crosses a page break is several records (see `highlight_groups`), and every
+//! one of them changes together, with one shared stamp. The records exactly as
+//! previewed are captured, and the write refuses if any changed meanwhile.
 
 use serde::{Deserialize, Serialize};
 
+use crate::highlight_groups::{collapse_highlights, MarkOrigin};
+use crate::models::{AgentMark, Highlight, HighlightTombstone};
 use crate::paper;
 use super::passage_anchors::{locate_anchor, locate_passage};
 
@@ -35,6 +49,8 @@ use super::passage_anchors::{locate_anchor, locate_passage};
 pub const CREATE_NOTE_TOOL: &str = "create_paper_note";
 pub const CREATE_HIGHLIGHTS_TOOL: &str = "create_paper_highlights";
 pub const CREATE_ANNOTATIONS_TOOL: &str = "create_paper_annotations";
+pub const UPDATE_MARKS_TOOL: &str = "update_paper_highlights";
+pub const REMOVE_MARKS_TOOL: &str = "remove_paper_highlights";
 
 /// Whether `name` is a tool that changes the library.
 ///
@@ -44,7 +60,8 @@ pub const CREATE_ANNOTATIONS_TOOL: &str = "create_paper_annotations";
 /// [`crate::canvas_edit`]): it never runs read-only either, and lives behind the
 /// same confirmation.
 pub fn is_write_tool(name: &str) -> bool {
-    matches!(name, CREATE_NOTE_TOOL | CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL)
+    matches!(name, CREATE_NOTE_TOOL | CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL
+        | UPDATE_MARKS_TOOL | REMOVE_MARKS_TOOL)
         || super::arxiv_tools::is_write(name)
         || crate::canvas_edit::is_edit_tool(name)
 }
@@ -81,6 +98,56 @@ pub enum PendingWrite {
         revision: crate::render::PdfRevision,
         highlights: Vec<crate::models::Highlight>,
     },
+    /// Changes to existing marks, one entry per selection. An entry without
+    /// `after` retracts that mark.
+    ChangeMarks {
+        tool: String,
+        slug: String,
+        paper_id: String,
+        paper_title: String,
+        changes: Vec<MarkChange>,
+    },
+}
+
+/// One existing mark as the confirmation shows it: before and after.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkChange {
+    /// The selection's canonical id, as `get_highlights` reports it.
+    pub id: String,
+    pub page: u32,
+    /// Last page of a selection across a page break.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_end: Option<u32>,
+    /// The display text (one paragraph unless the user keeps line breaks).
+    pub text: String,
+    pub origin: MarkOrigin,
+    pub before: MarkState,
+    /// What the mark becomes; absent when it is retracted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<MarkState>,
+    /// Every record of the selection exactly as previewed. Nothing is written
+    /// if any of them changed or vanished before the approval arrived.
+    #[serde(skip)]
+    members: Vec<Highlight>,
+}
+
+/// The parts of a mark the agent may change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MarkState {
+    pub color: String,
+    pub style: String,
+    pub note: Option<String>,
+}
+
+/// One entry of `update_paper_highlights`; an omitted field stays as it is.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarkEditArgs {
+    id: String,
+    color: Option<String>,
+    style: Option<String>,
+    note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +210,8 @@ pub struct WritePreview {
     pub recommendations: Vec<super::arxiv_tools::RecommendationPreview>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub keep_duplicate_copies: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<MarkChange>,
 }
 
 impl PendingWrite {
@@ -207,10 +276,12 @@ impl PendingWrite {
                             Some(anchor) => locate_anchor(p.page, glyphs, anchor, p.end_anchor.as_deref(), &p.text),
                             None => locate_passage(glyphs, &p.text),
                         }?;
+                        let created_at = chrono::Utc::now().to_rfc3339();
                         Ok(crate::models::Highlight {
                             id: uuid::Uuid::new_v4().to_string(), page: p.page, text, rects,
                             color: p.color, style: p.style, note: p.note,
-                            created_at: chrono::Utc::now().to_rfc3339(), updated_at: None,
+                            agent: Some(AgentMark { revision: created_at.clone() }),
+                            created_at, updated_at: None,
                             start_offset: None, end_offset: None, anchor_prefix: None,
                             anchor_suffix: None, keep_line_breaks: None,
                         })
@@ -248,6 +319,7 @@ impl PendingWrite {
                 Ok(Self::MarkPassages { tool: name.into(), slug, paper_id: meta.id,
                     paper_title: meta.title, pdf_path, revision, highlights })
             }
+            UPDATE_MARKS_TOOL | REMOVE_MARKS_TOOL => parse_mark_changes(root, name, args),
             CREATE_NOTE_TOOL => {
                 let slug = str_arg(args, "slug")?;
                 let title = str_arg(args, "title")?;
@@ -312,15 +384,21 @@ impl PendingWrite {
                 content: content.clone(),
                 duplicate_title: paper::list_notes(root, slug).iter().any(|n| &n.title == title),
                 passages: Vec::new(),
-                recommendations: Vec::new(), keep_duplicate_copies: false,
+                recommendations: Vec::new(), keep_duplicate_copies: false, changes: Vec::new(),
             },
             Self::MarkPassages { tool, slug, paper_title, highlights, .. } => WritePreview {
                 tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
                 note_title: String::new(), content: String::new(), duplicate_title: false,
-                recommendations: Vec::new(), keep_duplicate_copies: false,
+                recommendations: Vec::new(), keep_duplicate_copies: false, changes: Vec::new(),
                 passages: highlights.iter().map(|h| Passage { page: h.page, text: h.text.clone(),
                     color: h.color.clone(), style: h.style.clone(), note: h.note.clone(),
                     anchor: None, end_anchor: None }).collect(),
+            },
+            Self::ChangeMarks { tool, slug, paper_title, changes, .. } => WritePreview {
+                tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
+                note_title: String::new(), content: String::new(), duplicate_title: false,
+                recommendations: Vec::new(), keep_duplicate_copies: false,
+                passages: Vec::new(), changes: changes.clone(),
             },
         }
     }
@@ -339,6 +417,12 @@ impl PendingWrite {
                 }
                 let saved = paper::append_highlights(root, slug, highlights.clone())?;
                 Ok(serde_json::json!({"saved": true, "slug": slug, "highlights": saved}))
+            }
+            Self::ChangeMarks { slug, paper_id, changes, .. } => {
+                if paper::read_meta(root, slug)?.id != *paper_id {
+                    return Err("Paper changed since the preview. Nothing was saved; inspect it again.".into());
+                }
+                execute_mark_changes(root, slug, changes)
             }
             PendingWrite::CreateNote {
                 slug,
@@ -362,14 +446,184 @@ impl PendingWrite {
     /// comment, geometry and paper identity stay bound to the validated write.
     pub fn apply_passage_colors(&mut self, colors: Option<&[String]>) -> Result<(), String> {
         let Some(colors) = colors else { return Ok(()); };
-        let Self::MarkPassages { highlights, .. } = self else {
-            return Err("Color choices only apply to PDF marking.".into());
-        };
-        if colors.len() != highlights.len() { return Err("Color choices must match the previewed passages.".into()); }
         let normalized = colors.iter().map(|c| normalize_mark_color(c)).collect::<Result<Vec<_>, _>>()?;
-        for (highlight, color) in highlights.iter_mut().zip(normalized) { highlight.color = color; }
+        match self {
+            Self::MarkPassages { highlights, .. } => {
+                if colors.len() != highlights.len() { return Err("Color choices must match the previewed passages.".into()); }
+                for (highlight, color) in highlights.iter_mut().zip(normalized) { highlight.color = color; }
+            }
+            // A retraction has no color to choose; only an update's new color.
+            Self::ChangeMarks { changes, .. } if changes.iter().all(|c| c.after.is_some()) => {
+                if colors.len() != changes.len() { return Err("Color choices must match the previewed marks.".into()); }
+                for (change, color) in changes.iter_mut().zip(normalized) {
+                    if let Some(after) = change.after.as_mut() { after.color = color; }
+                }
+            }
+            _ => return Err("Color choices only apply to PDF marking.".into()),
+        }
         Ok(())
     }
+}
+
+/// Most marks one change call may touch, like a creation batch.
+const MAX_MARK_CHANGES: usize = 30;
+
+/// Validate `update_paper_highlights` / `remove_paper_highlights` against the
+/// marks on disk now. Every entry is checked and every failure reported, so
+/// the model fixes the batch in one round; nothing is shown to the user
+/// until all of it is valid.
+fn parse_mark_changes(root: &str, name: &str, args: &serde_json::Value) -> Result<PendingWrite, String> {
+    let remove = name == REMOVE_MARKS_TOOL;
+    let slug = str_arg(args, "slug")?;
+    let key = if remove { "ids" } else { "changes" };
+    let items = args.get(key).and_then(|v| v.as_array())
+        .ok_or_else(|| format!("`{key}` must be an array."))?;
+    if items.is_empty() || items.len() > MAX_MARK_CHANGES {
+        return Err(format!("Provide 1–{MAX_MARK_CHANGES} {key} in one call."));
+    }
+    let meta = paper::read_meta(root, &slug)?;
+    if meta.file_type.as_deref().is_some_and(|t| t != "pdf") {
+        return Err("These tools currently change PDF marks only.".into());
+    }
+    let records = paper::read_highlights(root, &slug);
+    let groups = collapse_highlights(records.clone());
+    let mut seen = std::collections::HashSet::new();
+    let (mut changes, mut failures, mut valid) = (Vec::new(), Vec::new(), Vec::new());
+    for (index, raw) in items.iter().enumerate() {
+        let id = if remove { raw.as_str() } else { raw.get("id").and_then(|v| v.as_str()) };
+        let result = (|| -> Result<MarkChange, String> {
+            let edit = if remove {
+                None
+            } else {
+                Some(serde_json::from_value::<MarkEditArgs>(raw.clone()).map_err(|e| format!("Invalid change: {e}"))?)
+            };
+            let id = edit.as_ref().map_or(id, |e| Some(e.id.as_str()))
+                .ok_or("Each entry needs a highlight `id` string from get_highlights.")?;
+            // Any member id names the whole selection.
+            let group = groups.iter().find(|g| g.member_ids.iter().any(|m| m == id))
+                .ok_or("No highlight with this id exists on this paper; call get_highlights for current ids.")?;
+            let before = MarkState { color: group.rep.color.clone(), style: group.rep.style.clone(), note: group.rep.note.clone() };
+            let after = match edit {
+                None => match group.origin {
+                    MarkOrigin::Ai => None,
+                    MarkOrigin::AiUserEdited => return Err("The user edited this mark after you created it, so it is theirs; do not remove it. Explain in the conversation instead.".into()),
+                    MarkOrigin::User => return Err("This is the user's own mark (or its origin is unknown). Only marks you created can be removed; never delete the user's marks. Explain in the conversation instead.".into()),
+                },
+                Some(edit) => {
+                    if edit.color.is_none() && edit.style.is_none() && edit.note.is_none() {
+                        return Err("Give at least one of `color`, `style` or `note` to change.".into());
+                    }
+                    let mut after = before.clone();
+                    if let Some(color) = edit.color { after.color = normalize_mark_color(&color)?; }
+                    if let Some(style) = edit.style {
+                        if !["highlight", "underline"].contains(&style.as_str()) {
+                            return Err("`style` must be highlight or underline.".into());
+                        }
+                        after.style = style;
+                    }
+                    if let Some(note) = edit.note {
+                        if note.chars().count() > 10_000 {
+                            return Err("`note` exceeds 10,000 characters.".into());
+                        }
+                        // An empty note removes the comment and keeps the mark.
+                        after.note = (!note.trim().is_empty()).then_some(note);
+                    }
+                    if after == before {
+                        return Err("This mark already has these values; leave it out.".into());
+                    }
+                    Some(after)
+                }
+            };
+            if !seen.insert(group.rep.id.clone()) {
+                return Err("This highlight is already listed in this call (a cross-page highlight is one entry).".into());
+            }
+            let members = group.member_ids.iter()
+                .filter_map(|m| records.iter().find(|r| &r.id == m).cloned()).collect();
+            Ok(MarkChange { id: group.rep.id.clone(), page: group.rep.page, page_end: group.page_end,
+                text: group.display_text(), origin: group.origin, before, after, members })
+        })();
+        match result {
+            Ok(change) => { changes.push(change); valid.push(index + 1); }
+            Err(error) => failures.push(format!("Entry #{} (id {}): {error}", index + 1,
+                serde_json::json!(id.unwrap_or("missing")))),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!("Nothing was changed; the entire batch needs correction. Valid entry indices: {valid:?}. Keep those unchanged.\n{}", failures.join("\n")));
+    }
+    Ok(PendingWrite::ChangeMarks { tool: name.into(), slug, paper_id: meta.id, paper_title: meta.title, changes })
+}
+
+/// Apply approved changes under the highlights lock. The selection must still
+/// be exactly the records the user reviewed; a mark edited, deleted or
+/// regrouped meanwhile fails the whole batch rather than being half applied.
+fn execute_mark_changes(root: &str, slug: &str, changes: &[MarkChange]) -> Result<serde_json::Value, String> {
+    let same = |a: &Highlight, b: &Highlight| serde_json::to_value(a).ok() == serde_json::to_value(b).ok();
+    paper::change_highlights(root, slug, |current| {
+        let groups = collapse_highlights(current.to_vec());
+        let (mut records, mut tombstones) = (Vec::new(), Vec::new());
+        let (mut updated, mut removed, mut unchanged) = (Vec::new(), Vec::new(), Vec::new());
+        for change in changes {
+            let group = groups.iter().find(|g| g.rep.id == change.id).filter(|g|
+                g.member_ids.len() == change.members.len()
+                    && change.members.iter().all(|m| current.iter().any(|c| c.id == m.id && same(c, m))));
+            let Some(group) = group else {
+                return Err(format!("The highlight {} changed since the preview. Nothing was saved; call get_highlights and try again.",
+                    serde_json::json!(change.id)));
+            };
+            // Newer than every record it replaces, so the change wins the
+            // newest-edit merge; one stamp for the whole selection.
+            let stamp = stamp_after(change.members.iter().map(paper::highlight_time));
+            match &change.after {
+                None => {
+                    if group.origin != MarkOrigin::Ai {
+                        return Err("Only marks the AI created and nobody edited can be removed. Nothing was saved.".into());
+                    }
+                    tombstones.extend(change.members.iter().map(|m| HighlightTombstone { id: m.id.clone(), deleted_at: stamp.clone() }));
+                    removed.push(serde_json::json!({"id": change.id, "page": change.page}));
+                }
+                // The user picked the old color back in the card.
+                Some(after) if *after == change.before => unchanged.push(change.id.clone()),
+                Some(after) => {
+                    for member in &change.members {
+                        let mut h = member.clone();
+                        h.color = after.color.clone();
+                        h.style = after.style.clone();
+                        h.note = after.note.clone();
+                        // What the group shows, written to every member, as the
+                        // reader's own group edits do (`groupAppearance`).
+                        h.keep_line_breaks = group.rep.keep_line_breaks;
+                        h.updated_at = Some(stamp.clone());
+                        // An untouched agent mark stays retractable; a user's
+                        // mark does not become the agent's by being changed.
+                        if group.origin == MarkOrigin::Ai {
+                            h.agent = Some(AgentMark { revision: stamp.clone() });
+                        }
+                        records.push(h);
+                    }
+                    updated.push(serde_json::json!({"id": change.id, "page": change.page,
+                        "color": after.color, "style": after.style, "has_note": after.note.is_some()}));
+                }
+            }
+        }
+        let result = serde_json::json!({"saved": true, "slug": slug, "updated": updated,
+            "removed": removed, "unchanged": unchanged, "highlights": records, "tombstones": tombstones});
+        Ok((records, tombstones, result))
+    })
+}
+
+/// A timestamp in the frontend's `toISOString` form, strictly later than every
+/// edit time given — so a change wins the newest-edit merge even against a
+/// clock that ran ahead on another machine.
+fn stamp_after<'a>(times: impl IntoIterator<Item = &'a str>) -> String {
+    let mut stamp = chrono::Utc::now();
+    for time in times {
+        if let Ok(time) = chrono::DateTime::parse_from_rfc3339(time) {
+            let next = time.with_timezone(&chrono::Utc) + chrono::Duration::milliseconds(1);
+            if next > stamp { stamp = next; }
+        }
+    }
+    stamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn load_marking_page<'a>(pdf: &std::path::Path, units: &std::collections::HashMap<u32, f32>,
@@ -696,6 +950,247 @@ mod tests {
         assert!(pending.execute(&root).unwrap_err().contains("changed"));
         assert!(paper::read_highlights(&root, "copy-b").is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn stored_mark(id: &str, page: u32, text: &str, agent: bool) -> Highlight {
+        let created_at = "2026-10-01T08:00:00.000Z".to_string();
+        Highlight {
+            id: id.into(), page, text: text.into(), rects: Vec::new(), color: "#FFEB3B".into(),
+            style: "highlight".into(), note: None, updated_at: None,
+            agent: agent.then(|| AgentMark { revision: created_at.clone() }), created_at,
+            start_offset: None, end_offset: None, anchor_prefix: None, anchor_suffix: None,
+            keep_line_breaks: None,
+        }
+    }
+
+    fn library_with_marks(slug: &str, marks: Vec<Highlight>) -> String {
+        let root = library_with_paper(slug, "Marked paper");
+        paper::save_highlights_merged(&root, slug, marks, Vec::new()).unwrap();
+        root
+    }
+
+    /// Records with the same page and creation time come back in no fixed order.
+    fn stored(root: &str, slug: &str, id: &str) -> Highlight {
+        paper::read_highlights(root, slug).into_iter().find(|h| h.id == id).unwrap()
+    }
+
+    fn origins(root: &str, slug: &str) -> Vec<(String, String)> {
+        let mut list: Vec<_> = super::super::tools::get_highlights(root, slug).unwrap()
+            .into_iter().map(|h| (h.id, h.origin)).collect();
+        list.sort();
+        list
+    }
+
+    #[test]
+    fn agent_marks_carry_provenance_and_can_be_recolored_revised_and_retracted() {
+        let root = library_with_paper("guided", "Guided paper");
+        let pdf = paper::paper_dir(&root, "guided").join("paper.pdf");
+        crate::render::annotation_fixture(&pdf, "Alpha beta. A second sentence.", 0, 1.0, false);
+        PendingWrite::parse(&root, CREATE_ANNOTATIONS_TOOL,
+            &mark_args("guided", "Alpha beta.", Some("Yellow method note"))).unwrap().execute(&root).unwrap();
+        let created = paper::read_highlights(&root, "guided").remove(0);
+        assert_eq!(created.agent.as_ref().unwrap().revision, created.created_at, "the agent's own write is its revision");
+        let id = created.id.clone();
+        assert_eq!(origins(&root, "guided"), vec![(id.clone(), "ai".into())]);
+
+        // The user designates it an innovation and the annotation gains an example.
+        let args = serde_json::json!({"slug": "guided", "changes": [{"id": id, "color": "purple",
+            "note": "Yellow method note\n\nExample: $x_1 = 2$."}]});
+        let pending = PendingWrite::parse(&root, UPDATE_MARKS_TOOL, &args).unwrap();
+        let preview = serde_json::to_value(pending.preview(&root)).unwrap();
+        let change = &preview["changes"][0];
+        assert_eq!(change["origin"], "ai");
+        assert_eq!(change["before"], serde_json::json!({"color": "#FFEB3B", "style": "highlight", "note": "Yellow method note"}));
+        assert_eq!(change["after"]["color"], "#CE93D8");
+        assert_eq!(change["after"]["note"], "Yellow method note\n\nExample: $x_1 = 2$.");
+        assert_eq!(change["text"], "Alpha beta.");
+        assert!(preview.get("passages").is_none() && change.get("members").is_none());
+        assert_eq!(paper::read_highlights(&root, "guided")[0].color, "#FFEB3B", "preview must not write");
+
+        let result = pending.execute(&root).unwrap();
+        assert_eq!(result["updated"][0]["id"], id.as_str());
+        assert_eq!(result["tombstones"], serde_json::json!([]));
+        let updated = paper::read_highlights(&root, "guided").remove(0);
+        assert_eq!((updated.color.as_str(), updated.note.as_deref()), ("#CE93D8", Some("Yellow method note\n\nExample: $x_1 = 2$.")));
+        let stamp = updated.updated_at.clone().unwrap();
+        assert!(stamp.as_str() > created.created_at.as_str() && stamp.ends_with('Z'), "{stamp}");
+        assert_eq!(updated.agent.unwrap().revision, stamp, "an untouched agent mark stays retractable");
+        assert_eq!((updated.text, updated.page), (created.text, created.page), "excerpt and page are never changed");
+        assert_eq!(origins(&root, "guided")[0].1, "ai");
+
+        let pending = PendingWrite::parse(&root, REMOVE_MARKS_TOOL, &serde_json::json!({"slug": "guided", "ids": [id]})).unwrap();
+        let preview = serde_json::to_value(pending.preview(&root)).unwrap();
+        assert_eq!(preview["changes"][0]["before"]["color"], "#CE93D8");
+        assert!(preview["changes"][0].get("after").is_none());
+        let result = pending.execute(&root).unwrap();
+        assert_eq!(result["removed"][0]["id"], id.as_str());
+        assert_eq!(result["tombstones"][0]["id"], id.as_str());
+        assert!(paper::read_highlights(&root, "guided").is_empty());
+        assert_eq!(paper::read_highlights_doc(&root, "guided").tombstones.len(), 1, "the delete propagates to synced copies");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn user_marks_can_be_changed_with_approval_but_never_removed() {
+        let root = library_with_marks("users", vec![stored_mark("mine", 1, "User passage.", false)]);
+        assert_eq!(origins(&root, "users"), vec![("mine".into(), "user".into())]);
+        let error = PendingWrite::parse(&root, REMOVE_MARKS_TOOL, &serde_json::json!({"slug": "users", "ids": ["mine"]})).unwrap_err();
+        assert!(error.contains("user's own mark") && error.contains("Entry #1"), "{error}");
+
+        let pending = PendingWrite::parse(&root, UPDATE_MARKS_TOOL,
+            &serde_json::json!({"slug": "users", "changes": [{"id": "mine", "color": "紫色", "style": "underline"}]})).unwrap();
+        assert_eq!(serde_json::to_value(pending.preview(&root)).unwrap()["changes"][0]["origin"], "user");
+        pending.execute(&root).unwrap();
+        let mark = paper::read_highlights(&root, "users").remove(0);
+        assert_eq!((mark.color.as_str(), mark.style.as_str()), ("#CE93D8", "underline"));
+        assert!(mark.agent.is_none(), "changing a user's mark never makes it the agent's");
+        assert!(PendingWrite::parse(&root, REMOVE_MARKS_TOOL, &serde_json::json!({"slug": "users", "ids": ["mine"]})).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_agent_mark_the_user_edited_or_an_older_build_saved_is_no_longer_retractable() {
+        let root = library_with_marks("edited", vec![stored_mark("ai-1", 1, "First.", true), stored_mark("ai-2", 1, "Second.", true)]);
+        // The reader's own edit: a newer stamp, provenance carried along untouched.
+        let mut edited = stored(&root, "edited", "ai-1");
+        edited.note = Some("My own words".into());
+        edited.updated_at = Some("2026-10-02T08:00:00.000Z".into());
+        paper::save_highlights_merged(&root, "edited", vec![edited], Vec::new()).unwrap();
+        assert_eq!(origins(&root, "edited")[0], ("ai-1".into(), "ai_user_edited".into()));
+        let error = PendingWrite::parse(&root, REMOVE_MARKS_TOOL, &serde_json::json!({"slug": "edited", "ids": ["ai-1"]})).unwrap_err();
+        assert!(error.contains("edited this mark"), "{error}");
+        // Updating it is still allowed, and does not make it retractable again.
+        PendingWrite::parse(&root, UPDATE_MARKS_TOOL, &serde_json::json!({"slug": "edited",
+            "changes": [{"id": "ai-1", "color": "green"}]})).unwrap().execute(&root).unwrap();
+        assert_eq!(origins(&root, "edited")[0].1, "ai_user_edited");
+
+        // An older build reads the file into a struct without `agent` and writes
+        // it back whole: the field is gone, and the mark counts as the user's —
+        // even a removal approved before that save.
+        let pending = PendingWrite::parse(&root, REMOVE_MARKS_TOOL, &serde_json::json!({"slug": "edited", "ids": ["ai-2"]})).unwrap();
+        let file = paper::paper_dir(&root, "edited").join("highlights.json");
+        let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        for h in doc["highlights"].as_array_mut().unwrap() { h.as_object_mut().unwrap().remove("agent"); }
+        std::fs::write(&file, doc.to_string()).unwrap();
+        assert!(pending.execute(&root).unwrap_err().contains("changed since the preview"));
+        assert_eq!(paper::read_highlights(&root, "edited").len(), 2);
+        assert!(origins(&root, "edited").iter().all(|(_, o)| o == "user"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_cross_page_highlight_changes_and_retracts_as_one_selection() {
+        let mut first = stored_mark("half-a", 3, "A sentence over the break", true);
+        let mut second = stored_mark("half-b", 4, "A sentence over the break", true);
+        first.note = Some("Old note".into());
+        second.keep_line_breaks = Some(true);
+        second.updated_at = Some("2026-10-01T09:00:00.000Z".into());
+        second.agent = Some(AgentMark { revision: "2026-10-01T09:00:00.000Z".into() });
+        let root = library_with_marks("groups", vec![first, second]);
+        assert_eq!(origins(&root, "groups"), vec![("half-a".into(), "ai".into())], "one entry for the selection");
+
+        // Either half's id names the whole; listing both halves is a mistake.
+        let twice = serde_json::json!({"slug": "groups", "changes": [{"id": "half-a", "color": "red"}, {"id": "half-b", "color": "red"}]});
+        assert!(PendingWrite::parse(&root, UPDATE_MARKS_TOOL, &twice).unwrap_err().contains("already listed"));
+        let pending = PendingWrite::parse(&root, UPDATE_MARKS_TOOL, &serde_json::json!({"slug": "groups",
+            "changes": [{"id": "half-b", "color": "red", "note": "New note"}]})).unwrap();
+        let preview = serde_json::to_value(pending.preview(&root)).unwrap();
+        assert_eq!((preview["changes"][0]["id"].as_str(), preview["changes"][0]["pageEnd"].as_u64()), (Some("half-a"), Some(4)));
+        let result = pending.execute(&root).unwrap();
+        assert_eq!(result["highlights"].as_array().unwrap().len(), 2, "the reader receives every record");
+        let marks = paper::read_highlights(&root, "groups");
+        assert_eq!(marks.len(), 2);
+        let stamp = marks[0].updated_at.clone();
+        for mark in &marks {
+            assert_eq!((mark.color.as_str(), mark.note.as_deref()), ("#FF0000", Some("New note")));
+            assert_eq!(mark.updated_at, stamp, "one shared stamp for the selection");
+            assert_eq!(mark.keep_line_breaks, Some(true), "the group's line-break choice is kept on every half");
+        }
+        assert_eq!(origins(&root, "groups")[0].1, "ai");
+
+        let result = PendingWrite::parse(&root, REMOVE_MARKS_TOOL, &serde_json::json!({"slug": "groups", "ids": ["half-b"]}))
+            .unwrap().execute(&root).unwrap();
+        assert_eq!(result["tombstones"].as_array().unwrap().len(), 2);
+        assert!(paper::read_highlights(&root, "groups").is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_change_batches_report_every_entry_and_stale_previews_write_nothing() {
+        let root = library_with_marks("checks", vec![stored_mark("one", 1, "One.", true), stored_mark("two", 1, "Two.", false)]);
+        let before = std::fs::read_to_string(paper::paper_dir(&root, "checks").join("highlights.json")).unwrap();
+        let args = serde_json::json!({"slug": "checks", "changes": [
+            {"id": "one", "color": "blue"}, {"id": "missing", "color": "blue"}, {"id": "two"},
+            {"id": "two", "color": "yellow"}, {"id": "two", "color": "url(x)"}, {"id": "two", "text": "rewritten"}
+        ]});
+        let error = PendingWrite::parse(&root, UPDATE_MARKS_TOOL, &args).unwrap_err();
+        assert!(error.contains("Valid entry indices: [1]"), "{error}");
+        for index in 2..=6 { assert!(error.contains(&format!("Entry #{index} (")), "{error}"); }
+        assert!(error.contains("already has these values") && error.contains("unknown field"), "{error}");
+        for bad in [serde_json::json!({"slug": "checks", "changes": []}), serde_json::json!({"slug": "checks", "ids": "one"}),
+            serde_json::json!({"slug": "checks", "changes": (0..31).map(|_| serde_json::json!({"id": "one", "color": "red"})).collect::<Vec<_>>()})] {
+            assert!(PendingWrite::parse(&root, UPDATE_MARKS_TOOL, &bad).is_err() || PendingWrite::parse(&root, REMOVE_MARKS_TOOL, &bad).is_err());
+        }
+
+        let pending = PendingWrite::parse(&root, UPDATE_MARKS_TOOL,
+            &serde_json::json!({"slug": "checks", "changes": [{"id": "one", "color": "blue"}]})).unwrap();
+        let removal = PendingWrite::parse(&root, REMOVE_MARKS_TOOL, &serde_json::json!({"slug": "checks", "ids": ["one"]})).unwrap();
+        // The user edits the mark while the card is open.
+        let mut mark = stored(&root, "checks", "one");
+        mark.color = "#A5D6A7".into();
+        mark.updated_at = Some("2026-10-03T00:00:00.000Z".into());
+        paper::save_highlights_merged(&root, "checks", vec![mark], Vec::new()).unwrap();
+        let edited = std::fs::read_to_string(paper::paper_dir(&root, "checks").join("highlights.json")).unwrap();
+        assert_ne!(edited, before);
+        for stale in [pending, removal] {
+            assert!(stale.execute(&root).unwrap_err().contains("changed since the preview"));
+        }
+        assert_eq!(std::fs::read_to_string(paper::paper_dir(&root, "checks").join("highlights.json")).unwrap(), edited);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reviewed_colors_apply_to_updates_and_never_to_retractions() {
+        let root = library_with_marks("colors", vec![stored_mark("a", 1, "A.", true), stored_mark("b", 1, "B.", true)]);
+        let mut pending = PendingWrite::parse(&root, UPDATE_MARKS_TOOL, &serde_json::json!({"slug": "colors", "changes": [
+            {"id": "a", "color": "purple"}, {"id": "b", "note": "Explained"}]})).unwrap();
+        assert!(pending.apply_passage_colors(Some(&["blue".into()])).is_err());
+        assert!(pending.apply_passage_colors(Some(&["blue".into(), "bad".into()])).is_err());
+        // The user keeps a's old yellow and also recolors b in the card.
+        pending.apply_passage_colors(Some(&["#ffeb3b".into(), "green".into()])).unwrap();
+        let result = pending.execute(&root).unwrap();
+        assert_eq!(result["unchanged"], serde_json::json!(["a"]));
+        assert!(stored(&root, "colors", "a").updated_at.is_none(), "a reverted change writes nothing");
+        let b = stored(&root, "colors", "b");
+        assert_eq!((b.color.as_str(), b.note.as_deref()), ("#A5D6A7", Some("Explained")));
+
+        let mut removal = PendingWrite::parse(&root, REMOVE_MARKS_TOOL, &serde_json::json!({"slug": "colors", "ids": ["a"]})).unwrap();
+        assert!(removal.apply_passage_colors(Some(&["blue".into()])).is_err());
+        removal.apply_passage_colors(None).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provenance_is_optional_on_disk_so_older_files_and_builds_keep_working() {
+        // A record written before provenance existed loads as the user's.
+        let legacy: Highlight = serde_json::from_value(serde_json::json!({"id": "old", "page": 1, "rects": [],
+            "text": "t", "color": "#FFEB3B", "note": null, "created_at": "2026-01-01"})).unwrap();
+        assert!(legacy.agent.is_none());
+        // A user's mark serializes exactly as before: no new key at all.
+        assert!(serde_json::to_value(&legacy).unwrap().get("agent").is_none());
+        // The provenance is a plain extra key, which serde in older builds ignores.
+        let agent = serde_json::to_value(stored_mark("new", 1, "t", true)).unwrap();
+        assert_eq!(agent["agent"], serde_json::json!({"revision": "2026-10-01T08:00:00.000Z"}));
+    }
+
+    #[test]
+    fn stamps_use_the_frontend_format_and_outrun_existing_edit_times() {
+        let now = stamp_after(std::iter::empty());
+        assert_eq!(now.len(), "2026-10-25T08:00:00.000Z".len());
+        assert!(now.ends_with('Z'));
+        let future = "2099-01-01T00:00:00.999999999+00:00";
+        assert_eq!(stamp_after([future, "2026-01-01"]), "2099-01-01T00:00:01.000Z");
+        assert!(stamp_after(["2099-01-01T00:00:00.000Z"]).as_str() > "2099-01-01T00:00:00.000Z");
     }
 
     #[test]

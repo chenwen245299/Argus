@@ -282,6 +282,10 @@ pub struct HighlightEntry {
     /// first). Absent for a highlight that stays on one page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_end: Option<u32>,
+    /// Whose mark this is: "user"; "ai" when Argus's in-app AI created it and
+    /// nobody has edited it since; "ai_user_edited" when the user changed an
+    /// AI-created mark (it is theirs now).
+    pub origin: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -527,7 +531,13 @@ fn file_type_of(meta: &PaperMeta) -> String {
 }
 
 fn venue_rank_of(meta: &PaperMeta) -> Option<VenueRank> {
+    if meta.venue.as_deref().is_some_and(crate::publication::is_unpublished_venue) {
+        return None;
+    }
     let rank = meta.journal_rank.as_ref()?;
+    if crate::publication::is_unpublished_venue(&rank.venue) {
+        return None;
+    }
     if rank.official.is_empty() && rank.custom.is_empty() {
         return None;
     }
@@ -1060,6 +1070,7 @@ pub fn get_highlights(root: &str, slug: &str) -> Result<Vec<HighlightEntry>, Str
                 note: g.rep.note.unwrap_or_default(),
                 created_at: g.rep.created_at,
                 page_end: g.page_end,
+                origin: g.origin.as_str().into(),
             }
         })
         .collect())

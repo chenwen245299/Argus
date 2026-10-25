@@ -634,6 +634,7 @@ let unlistenOpenPaper: UnlistenFn | null = null
 let unlistenLibraryPaperAdded: UnlistenFn | null = null
 let unlistenRagSettingsChanged: UnlistenFn | null = null
 let unlistenHighlightsAdded: UnlistenFn | null = null
+let unlistenHighlightsChanged: UnlistenFn | null = null
 let mainFocusRetryTimer: number | null = null
 
 async function focusMainWindowNow() {
@@ -690,7 +691,12 @@ onMounted(async () => {
   })
 
   unlistenHighlightsAdded = await listen<{ root: string; slug: string; highlights: import('../types').Highlight[] }>('paper-highlights-added', ({ payload }) => {
-    if (payload.root === libraryStore.currentPath) readerStore.mergeAddedHighlights(payload.slug, payload.highlights)
+    if (payload.root === libraryStore.currentPath) readerStore.mergeAgentHighlights(payload.slug, payload.highlights)
+  })
+  // An approved agent change to existing marks: recolored / revised records
+  // plus tombstones for the marks it retracted.
+  unlistenHighlightsChanged = await listen<{ root: string; slug: string; highlights: import('../types').Highlight[]; tombstones: import('../types').HighlightTombstone[] }>('paper-highlights-changed', ({ payload }) => {
+    if (payload.root === libraryStore.currentPath) readerStore.mergeAgentHighlights(payload.slug, payload.highlights, payload.tombstones)
   })
 
   // RAG settings can be saved from another window (the embedding map opens its
@@ -779,6 +785,7 @@ onUnmounted(() => {
   unlistenLibraryPaperAdded?.()
   unlistenRagSettingsChanged?.()
   unlistenHighlightsAdded?.()
+  unlistenHighlightsChanged?.()
 })
 
 // ── Resizable columns ─────────────────────────────────────────────────────────

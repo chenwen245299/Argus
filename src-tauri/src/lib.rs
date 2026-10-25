@@ -42,6 +42,7 @@ mod offer_sync;
 mod openrouter;
 mod paper;
 mod path_guard;
+mod publication;
 mod rag;
 mod render;
 mod search;

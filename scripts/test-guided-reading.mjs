@@ -12,11 +12,12 @@ const promptSource = await readFile(new URL('../src/utils/guidedReading.ts', imp
 // Keep prior shipped defaults private in production, but load their exact
 // values here to verify migration without duplicating the historical prompts.
 const shipped = await import('data:text/javascript;base64,' + Buffer.from(ts.transpileModule(
-  promptSource + '\nexport { LEGACY_PROMPT_ZH, LEGACY_PROMPT_EN, LEGACY_PROMPT_ZH_V2, LEGACY_PROMPT_EN_V2 };',
+  promptSource + '\nexport { LEGACY_PROMPT_ZH, LEGACY_PROMPT_EN, LEGACY_PROMPT_ZH_V2, LEGACY_PROMPT_EN_V2, LEGACY_PROMPT_ZH_V3, LEGACY_PROMPT_EN_V3 };',
   { compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.ESNext } },
 ).outputText).toString('base64'))
 const legacyPresets = { zh: shipped.LEGACY_PROMPT_ZH, en: shipped.LEGACY_PROMPT_EN,
-  'zh-v2': shipped.LEGACY_PROMPT_ZH_V2, 'en-v2': shipped.LEGACY_PROMPT_EN_V2 }
+  'zh-v2': shipped.LEGACY_PROMPT_ZH_V2, 'en-v2': shipped.LEGACY_PROMPT_EN_V2,
+  'zh-v3': shipped.LEGACY_PROMPT_ZH_V3, 'en-v3': shipped.LEGACY_PROMPT_EN_V3 }
 let server, browser, context, page, origin
 const errors = []
 const mocks = {
@@ -150,29 +151,38 @@ async function flags() {
   }))
 }
 
-test('both defaults teach just in time, calibrate briefly, annotate and stop after one small step', async () => {
+test('both defaults follow the research order, teach just in time, annotate by fixed colors and stop after one small step', async () => {
   await open()
   const prompts = await page.evaluate(() => ['zh', 'en'].map(locale => window.__test.guided.guidedReadingPrompt(locale)))
   for (const prompt of prompts) {
     assert.match(prompt, /完整正文|complete text/)
     assert.match(prompt, /图表必须实际查看|Actually view the figures and tables/)
     assert.match(prompt, /附录|appendices/)
+    assert.match(prompt, /背景与任务 → 现有方法及其问题 → 作者的核心思路与整体方法 → 评测设计 → 结果与结论|background and task → existing methods and their problems → the authors' core idea and overall method → evaluation design → results and conclusions/)
+    assert.match(prompt, /不要把“先问两个问题”当作固定开场|Do not treat "ask two questions first" as a fixed opening/)
     assert.match(prompt, /每轮最多引入一个新的核心概念|at most one new core concept per turn/)
     assert.match(prompt, /100–250/)
     assert.match(prompt, /即使我说自己不熟悉，也不要马上集中补课|Even if I say I am unfamiliar with something, do not immediately give me a background course/)
-    assert.match(prompt, /绿色高亮|in green/)
-    assert.match(prompt, /简短中文批注|brief Chinese annotations/)
-    assert.match(prompt, /操作后检查是否正确写入|check that it was saved correctly/)
-    assert.match(prompt, /不必逐次询问|do not need repeated permission requests/)
+    assert.match(prompt, /黄色：Method 的重点部分|Yellow: the key parts of the Method/)
+    assert.match(prompt, /绿色：段落总结与理解说明|Green: paragraph summaries and explanations/)
+    assert.match(prompt, /紫色：我明确指定的最重要创新点|Purple: the most important innovations I explicitly designate/)
+    assert.match(prompt, /红色：论文明确指出的方法问题与局限|Red: problems and limitations of methods that the paper explicitly states/)
+    assert.match(prompt, /蓝色：需要以后深入了解的内容|Blue: material to study in more depth later/)
+    assert.match(prompt, /内容去重和选区避让|Content de-duplication and selection avoidance/)
+    assert.match(prompt, /写入后检查，重试前核实|Check after writing; verify before retrying/)
+    assert.match(prompt, /不必逐次询问|do not ask for permission each time/)
     assert.match(prompt, /伪代码和最小实现|pseudocode and a minimal implementation/)
-    assert.match(prompt, /我说“继续”，才推进|only when I say “continue”/)
+    assert.match(prompt, /每一行有实际代码的内容都要配中文注释|Every line of actual code you show or provide must carry a Chinese comment/)
+    assert.match(prompt, /我说“继续”，才推进|only when I say "continue"/)
     assert.match(prompt, /不必每轮测试我|Do not test me every turn/)
-    assert.match(prompt, /首次回复只需简短说明实际阅读范围和任何缺失，再问一两个|first reply, briefly state what you actually read and anything missing, then ask one or two/)
-    assert.doesNotMatch(prompt, /每轮末尾只问|End each turn with one|Do not create notes, annotations|不要自动创建笔记、批注/)
+    assert.match(prompt, /首次回复简短说明实际阅读范围和任何缺失，然后从一个具体场景开始|first reply, briefly state what you actually read and anything missing, then start from a concrete scenario/)
+    assert.doesNotMatch(prompt, /每轮末尾只问|End each turn with one|Do not create notes, annotations|不要自动创建笔记、批注|再问一两个了解我起点的问题|then ask one or two questions/)
     assert.ok(prompt.includes('$...$') && prompt.includes('$$...$$'))
+    // LaTeX in the examples survives the template literal: backslashes, not tabs or line breaks.
+    assert.ok(prompt.includes('`$\\nabla_x E_\\theta(x)$`') && prompt.includes('`\\n`'))
   }
   assert.ok(prompts[0].startsWith('请担任我的交互式论文导师，带我一步一步读懂论文'))
-  assert.ok(prompts[0].endsWith('不要输出整篇总结或集中补充背景知识。'))
+  assert.ok(prompts[0].endsWith('不要一次输出整篇总结或集中补充背景知识。'))
 })
 
 test('request upgrades preserve stored presets, assistant quotes, custom messages and attachment data', async () => {
@@ -197,13 +207,14 @@ test('request upgrades preserve stored presets, assistant quotes, custom message
       custom: updated[3] === history[3], normal: updated[4] === history[4],
       recognizable: Object.values(legacyPresets).every(prompt => guided.isGuidedReadingPrompt(prompt)),
       v2: ['zh','en'].every(locale => guided.guidedReadingRequestHistory([{role:'user',content:legacyPresets[locale+'-v2']}])[0].content === guided.guidedReadingPrompt(locale)),
+      v3: ['zh','en'].every(locale => guided.guidedReadingRequestHistory([{role:'user',content:legacyPresets[locale+'-v3']}])[0].content === guided.guidedReadingPrompt(locale)),
       customV2: guided.guidedReadingRequestHistory([{role:'user',content:legacyPresets['zh-v2']}], true)[0].content === legacyPresets['zh-v2'],
     }
   })
   assert.ok(Object.values(result).every(Boolean), JSON.stringify(result))
 })
 
-for (const legacy of ['zh', 'en', 'zh-v2', 'en-v2']) {
+for (const legacy of ['zh', 'en', 'zh-v2', 'en-v2', 'zh-v3', 'en-v3']) {
   test(`${legacy}: an existing guide follows the new rules on follow-up and regeneration without rewriting the first question`, async () => {
     await open('standalone', `&legacy=${legacy}`)
     const original = legacyPresets[legacy]

@@ -541,7 +541,7 @@ impl ArgusMcpServer {
     /// Passages the user marked while reading.
     #[tool(
         name = "get_highlights",
-        description = "Get the passages the user marked in a paper, with page numbers, exact stored colors, marking styles (highlight or underline), and any annotation they attached. Preserve the returned color and style when copying marks. Reader palette: yellow #FFEB3B, green #A5D6A7, blue #90CAF9, pink #F48FB1, orange #FFCC80, purple #CE93D8; custom colors are returned unchanged. These are the parts of the paper the user personally cared about.",
+        description = "Get the passages the user marked in a paper, with page numbers, exact stored colors, marking styles (highlight or underline), and any annotation they attached. Preserve the returned color and style when copying marks. Reader palette: yellow #FFEB3B, green #A5D6A7, blue #90CAF9, pink #F48FB1, orange #FFCC80, purple #CE93D8; custom colors are returned unchanged. These are the parts of the paper the user personally cared about. Each entry's `origin` says whose mark it is: \"user\", \"ai\" (created by Argus's in-app AI and unedited since) or \"ai_user_edited\" (an AI mark the user changed, now theirs).",
         annotations(title = "Get highlights", read_only_hint = true)
     )]
     async fn get_highlights(

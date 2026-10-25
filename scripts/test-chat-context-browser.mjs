@@ -108,6 +108,9 @@ test('hover details, compact, draft preservation and persisted effective history
   assert.match(messages[0].content, /compacted-summary/)
   assert.equal(messages.at(-1).content, 'continue')
   assert(!messages.some(m => m.content === 'Original research goal'))
+  // The agent's first round measures against the count prepare just admitted.
+  assert.deepEqual(await page.evaluate(() => window.__test.requests[0].args.previousUsage),
+    await page.evaluate(messages => window.__test.usage(messages), messages))
   await page.evaluate(() => window.__test.finish(0))
 })
 test('summary failure and stopping never replace history, and stop pauses queued sends', async () => {
@@ -126,6 +129,8 @@ test('summary failure and stopping never replace history, and stop pauses queued
 test('automatic preparation and an in-loop checkpoint are persisted without duplicating later turns', async () => {
   await open(); await page.evaluate(() => window.__test.autoCompact=true)
   await send('new question'); await waitRequests(1)
+  const prepared = await page.evaluate(() => window.__test.requests[0].args)
+  assert.deepEqual(prepared.previousUsage, await page.evaluate(messages => window.__test.usage(messages), prepared.messages))
   const native = [{role:'user',content:'<compacted-summary>Loop evidence</compacted-summary>'},
     {role:'user',content:'new question'},{role:'assistant',content:'new answer'}]
   await page.evaluate(messages => { const t=window.__test,r=t.requests[0];

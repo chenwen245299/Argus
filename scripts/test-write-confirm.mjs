@@ -153,3 +153,76 @@ test('rejecting a color-edited batch does not send color choices or an approval'
   assert.deepEqual(await page.evaluate(() => window.decisions), ['rejected'])
   assert.deepEqual(await page.evaluate(() => window.approvedColors), [])
 })
+
+const changePreview = (tool, changes) => ({ tool, slug: 'paper-copy-2', paperTitle: 'Paper', noteTitle: '', content: '',
+  duplicateTitle: false, changes })
+
+test('changing existing marks shows whose each one is, with its color, style and note before and after', async () => {
+  await mount(changePreview('update_paper_highlights', [
+    { id: 'ai-mark', page: 4, text: 'The core update rule.', origin: 'ai',
+      before: { color: '#FFEB3B', style: 'highlight', note: 'Old explanation' },
+      after: { color: '#CE93D8', style: 'highlight', note: 'Old explanation\n\nExample: $x_1 = 2$.' } },
+    { id: 'user-mark', page: 3, pageEnd: 4, text: 'A sentence over the page break.', origin: 'user',
+      before: { color: '#A5D6A7', style: 'highlight', note: null },
+      after: { color: '#A5D6A7', style: 'underline', note: null } },
+  ]))
+  assert.match(await page.locator('.wc-title').innerText(), /修改已有/)
+  assert.match(await page.locator('.wc-location').innerText(), /paper-copy-2/)
+  const [first, second] = [page.locator('.wc-change').nth(0), page.locator('.wc-change').nth(1)]
+  assert.match(await first.locator('.wc-page').first().innerText(), /PDF 第 4 页.*AI 添加/)
+  assert.match(await second.locator('.wc-page').first().innerText(), /PDF 第 3–4 页.*你的标注/)
+  assert.match(await first.locator('.wc-diff').innerText(), /黄色\s*→\s*紫色/)
+  assert.match(await first.locator('.wc-note-before').innerText(), /修改前[\s\S]*Old explanation/)
+  assert.match(await first.locator('.wc-note-after').innerText(), /修改后[\s\S]*Example: \$x_1 = 2\$\./)
+  assert.match(await second.locator('.wc-diff').innerText(), /样式\s*高亮\s*→\s*下划线/)
+  assert.equal(await second.locator('.wc-diff-note').count(), 0, 'unchanged notes are not listed')
+  assert.equal(await second.locator('.wc-diff-row').count(), 1, 'an unchanged color is not listed')
+  assert.equal(await first.locator('blockquote').evaluate(el => getComputedStyle(el).borderLeftColor), 'rgb(206, 147, 216)')
+  if (process.env.ARGUS_TEST_OUTPUT_DIR) await page.locator('#app').screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/mark-update-confirm.png` })
+
+  // The new color stays the user's choice, exactly as for new marks.
+  await second.getByRole('button', { name: '蓝色', exact: true }).click()
+  assert.match(await second.locator('.wc-diff').innerText(), /绿色\s*→\s*蓝色/)
+  await first.getByRole('button', { name: '黄色', exact: true }).click()
+  assert.doesNotMatch(await first.locator('.wc-diff').innerText(), /→\s*紫色/)
+  assert.deepEqual(await page.evaluate(() => window.decisions), [], 'choosing a color never approves')
+  assert.deepEqual(await page.evaluate(() => window.originalPreview.changes.map(c => c.after.color)), ['#CE93D8', '#A5D6A7'])
+  await page.getByRole('button', { name: '确认修改', exact: true }).click()
+  assert.deepEqual(await page.evaluate(() => window.decisions), ['approved'])
+  assert.deepEqual(await page.evaluate(() => window.approvedColors), [['#FFEB3B', '#90CAF9']])
+})
+
+test('picking a change\'s old color back says the mark stays as it is; rejecting sends nothing', async () => {
+  await mount(changePreview('update_paper_highlights', [{ id: 'm', page: 2, text: 'Recolor only.', origin: 'ai_user_edited',
+    before: { color: '#FFEB3B', style: 'highlight', note: null }, after: { color: '#CE93D8', style: 'highlight', note: null } }]))
+  assert.match(await page.locator('.wc-change .wc-page').first().innerText(), /你改过/)
+  assert.equal(await page.locator('.wc-change').getByText('保持原样').count(), 0)
+  await page.getByRole('button', { name: '黄色', exact: true }).click()
+  assert.equal(await page.locator('.wc-change').getByText('保持原样').count(), 1)
+  await page.getByRole('button', { name: '不改', exact: true }).click()
+  assert.deepEqual(await page.evaluate(() => window.decisions), ['rejected'])
+  assert.deepEqual(await page.evaluate(() => window.approvedColors), [])
+})
+
+test('retracting the AI\'s own marks lists exactly what disappears, offers no colors, and only an explicit click approves', async () => {
+  await mount(changePreview('remove_paper_highlights', [
+    { id: 'overlap', page: 5, text: 'An overlapping <b>new</b> mark.', origin: 'ai',
+      before: { color: '#A5D6A7', style: 'underline', note: 'Summary that duplicated another note' } },
+  ]))
+  assert.match(await page.locator('.wc-title').innerText(), /撤回/)
+  assert.match(await page.locator('.wc-change .wc-page').first().innerText(), /PDF 第 5 页.*下划线.*AI 添加/)
+  assert.match(await page.locator('.wc-change').innerText(), /Summary that duplicated another note/)
+  assert.equal(await page.locator('.wc-change blockquote b').count(), 0, 'quotes are text, not HTML')
+  assert.equal(await page.locator('.wc-colors').count(), 0)
+  assert.equal(await page.locator('.wc-diff').count(), 0)
+  assert.match(await page.locator('.wc-hint').innerText(), /你自己的标注不会被删除/)
+  assert.ok(await page.locator('.wc-btn.primary.danger').count())
+  if (process.env.ARGUS_TEST_OUTPUT_DIR) await page.locator('#app').screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/mark-remove-confirm.png` })
+  await page.getByRole('button', { name: '保留', exact: true }).click()
+  assert.deepEqual(await page.evaluate(() => window.decisions), ['rejected'])
+  await mount(changePreview('remove_paper_highlights', [{ id: 'overlap', page: 5, text: 'Mark.', origin: 'ai',
+    before: { color: '#A5D6A7', style: 'highlight', note: null } }]))
+  await page.getByRole('button', { name: '确认撤回', exact: true }).click()
+  assert.deepEqual(await page.evaluate(() => window.decisions), ['approved'])
+  assert.deepEqual(await page.evaluate(() => window.approvedColors), [undefined])
+})

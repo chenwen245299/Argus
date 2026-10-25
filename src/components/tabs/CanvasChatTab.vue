@@ -552,6 +552,8 @@ async function send() {
       // tool and the only canvas any edit can touch.
       canvasId,
       manageContext: true,
+      // The calibrated count prepare admitted, for the agent's first round.
+      previousUsage: prepared?.usage ?? null,
       expectedRoot: root,
     })
     if (current()) {

@@ -355,6 +355,7 @@ mod tests {
             anchor_prefix: None,
             anchor_suffix: None,
             keep_line_breaks: None,
+            agent: None,
         }
     }
 

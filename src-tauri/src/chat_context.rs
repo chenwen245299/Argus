@@ -54,6 +54,11 @@ pub fn message_tokens(message: &Value) -> usize {
             .map_or(0, estimate_text)
 }
 
+/// Assumed window when a model's `context_length` is not configured. Current
+/// chat models mostly offer 256K or more; a smaller real window should be
+/// declared in the model's settings. Also the tool-result budget in `copilot.rs`.
+pub const ASSUMED_CONTEXT_TOKENS: u64 = 256_000;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Policy {
     pub window: usize,
@@ -71,7 +76,7 @@ impl Policy {
             .find(|m| m.id == model)
             .and_then(|m| m.context_length)
             .filter(|n| *n > 0);
-        let window = declared.unwrap_or(128_000) as usize;
+        let window = declared.unwrap_or(ASSUMED_CONTEXT_TOKENS) as usize;
         // Scale reservations to small models too; never inherit a 65K reserve
         // into an 8K window. Leave both answer space and compaction headroom.
         let reserve = (window / 10).clamp(1, 16_384);
@@ -204,6 +209,29 @@ pub fn measure(
             format!("{hash:016x}")
         },
     }
+}
+
+/// The provider sample a request inherits before it has measured one of its
+/// own. `previous` is the calibrated usage of the context this request was
+/// prepared from (or the last live request); `current` is this request's raw
+/// estimate. Without it, the loop's first admission check fell back to raw
+/// estimates and could compact history that `prepare` had just kept.
+///
+/// The carried offset (real count minus estimate) applies only to an identical
+/// route and system content, as in `ContextUsage::project_from`; schema and
+/// message changes since then are added at their estimated size.
+pub fn carried_sample(previous: Option<&ContextUsage>, current: &ContextUsage) -> Option<PromptSample> {
+    let previous = previous?;
+    let same = previous.provider_id == current.provider_id
+        && previous.model_id == current.model_id
+        && previous.context_window == current.context_window
+        && !previous.system_fingerprint.is_empty()
+        && previous.system_fingerprint == current.system_fingerprint
+        && (previous.tools_tokens == 0) == (current.tools_tokens == 0);
+    (same && previous.used_tokens > 0).then(|| PromptSample {
+        estimated_tokens: previous.system_tokens + previous.tools_tokens + previous.message_tokens,
+        input_tokens: previous.used_tokens,
+    })
 }
 
 /// Whole assistant-call/result groups must stay on the same side of a cut.
@@ -529,7 +557,7 @@ mod tests {
             assert!(!policy.capacity_estimated);
         }
         let unknown = Policy::for_model(&provider(None), "m");
-        assert_eq!(unknown.window, 128_000);
+        assert_eq!(unknown.window, ASSUMED_CONTEXT_TOKENS as usize);
         assert!(unknown.capacity_estimated);
     }
     #[test]
@@ -605,6 +633,77 @@ mod tests {
         next.used_tokens = 50;
         next.project_from(&old);
         assert_eq!(next.used_tokens, 50);
+    }
+
+    /// A guided-reading follow-up: one turn read a long paper and inspected
+    /// twelve pages, and the provider counted those images far below the flat
+    /// per-image estimate. `prepare` projects the live count and keeps the
+    /// history; the loop's first round has to reach the same verdict.
+    #[test]
+    fn first_loop_round_reuses_the_calibration_prepare_used() {
+        let p = provider(Some(128_000));
+        let policy = Policy::for_model(&p, "m");
+        let tools = vec![json!({"type":"function","function":{"name":"get_paper_fulltext","parameters":{}}})];
+        let pages: Vec<_> = (0..12)
+            .map(|i| json!({"type":"image_url","image_url":{"url":format!("argus-chat-image:{i}")}}))
+            .collect();
+        let mut messages = vec![
+            msg("system", "instructions and paper card"),
+            msg("user", "guided reading preset"),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"read","type":"function","function":{"name":"get_paper_fulltext","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"read","content":"paper text ".repeat(30_000)}),
+            json!({"role":"user","content":pages}),
+            msg("assistant", "first step of the reading"),
+        ];
+        let estimated = measure(&messages, &tools, policy, &p, "m", None);
+        // The provider billed each page at ~800 tokens, not the 2048 estimate.
+        let live = PromptSample { estimated_tokens: estimated.used_tokens, input_tokens: estimated.used_tokens - 12 * 1248 };
+        let previous = measure(&messages, &tools, policy, &p, "m", Some(&live));
+        messages.push(msg("user", "继续"));
+
+        let raw = measure(&messages, &tools, policy, &p, "m", None);
+        let mut prepared = raw.clone();
+        prepared.project_from(&previous);
+        assert!(raw.used_tokens >= policy.threshold, "the scenario must cross the raw-estimate threshold");
+        assert!(prepared.used_tokens < policy.threshold, "prepare keeps this history");
+
+        // What the loop measures before its first request, from what prepare returned.
+        let first_round = measure(&messages, &tools, policy, &p, "m", carried_sample(Some(&prepared), &raw).as_ref());
+        assert_eq!(first_round.used_tokens, prepared.used_tokens);
+        assert!(first_round.used_tokens < policy.threshold, "the first loop round must not compact what prepare kept");
+        // Directly from the last live usage (no prepare step) gives the same count.
+        let direct = measure(&messages, &tools, policy, &p, "m", carried_sample(Some(&previous), &raw).as_ref());
+        assert_eq!(direct.used_tokens, prepared.used_tokens);
+    }
+
+    #[test]
+    fn carried_calibration_never_crosses_routes_or_prompts() {
+        let p = provider(Some(8192));
+        let policy = Policy::for_model(&p, "m");
+        let tools = vec![json!({"type":"function","function":{"name":"find_papers","parameters":{}}})];
+        let messages = vec![msg("system", "instructions"), msg("user", "question")];
+        let current = measure(&messages, &tools, policy, &p, "m", None);
+        let mut previous = current.clone();
+        previous.used_tokens = current.used_tokens / 2;
+        assert!(carried_sample(None, &current).is_none());
+        assert!(carried_sample(Some(&previous), &current).is_some());
+        let changes: [fn(&mut ContextUsage); 7] = [
+            |u: &mut ContextUsage| u.model_id = "other".into(),
+            |u: &mut ContextUsage| u.provider_id = "other".into(),
+            |u: &mut ContextUsage| u.context_window = 4096,
+            |u: &mut ContextUsage| u.system_fingerprint = "edited".into(),
+            |u: &mut ContextUsage| u.system_fingerprint.clear(),
+            |u: &mut ContextUsage| u.tools_tokens = 0,
+            |u: &mut ContextUsage| u.used_tokens = 0,
+        ];
+        for change in changes {
+            let mut stale = previous.clone();
+            change(&mut stale);
+            assert!(carried_sample(Some(&stale), &current).is_none());
+        }
+        // An uncalibrated estimate carries no correction at all.
+        let same = measure(&messages, &tools, policy, &p, "m", carried_sample(Some(&current), &current).as_ref());
+        assert_eq!(same.used_tokens, current.used_tokens);
     }
 
     #[test]

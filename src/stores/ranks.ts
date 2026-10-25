@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { JournalRank } from '../types'
+import { isUnpublishedVenue } from '../utils/rankBadges'
 
 /** Normalize a venue into a cache key. Must match the Rust `normalize_venue_key`:
  *  drop 4-digit year tokens so different years of a venue share one entry. */
@@ -33,20 +34,23 @@ export const useRanksStore = defineStore('ranks', () => {
 
   function get(venue?: string | null): JournalRank | undefined {
     const v = venue?.trim()
-    if (!v) return undefined
+    if (!v || isUnpublishedVenue(v)) return undefined
     return venueRanks.value[normVenue(v)]
   }
 
   /** Whether we already have a (positive or negative) cached result for a venue. */
   function has(venue?: string | null): boolean {
     const v = venue?.trim()
-    if (!v) return false
+    if (!v || isUnpublishedVenue(v)) return false
     return normVenue(v) in venueRanks.value
   }
 
   /** Fetch a venue's rank (reusing the cache unless `force`). Throws on error. */
   async function fetchRank(venue: string, force = false): Promise<JournalRank> {
     const v = venue.trim()
+    if (isUnpublishedVenue(v)) {
+      return { official: {}, custom: [], venue: v, fetched_at: '' }
+    }
     const key = normVenue(v)
     if (!force && key in venueRanks.value) return venueRanks.value[key]
     if (inflight.has(key)) {

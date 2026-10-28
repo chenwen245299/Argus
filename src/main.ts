@@ -1,3 +1,5 @@
+import { installReadableStreamAsyncIterator } from './utils/readableStreamAsyncIterator'
+
 // Promise.withResolvers is not available in WebKit < Safari 17.4 (macOS Ventura and below)
 if (typeof (Promise as any).withResolvers === 'undefined') {
   (Promise as any).withResolvers = function <T>() {
@@ -7,6 +9,9 @@ if (typeof (Promise as any).withResolvers === 'undefined') {
     return { promise, resolve, reject }
   }
 }
+// ReadableStream async iteration is missing from WebKit through Safari 26.5; pdf.js's
+// getTextContent() needs it, or PDF pages get no selectable text layer.
+installReadableStreamAsyncIterator()
 
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'

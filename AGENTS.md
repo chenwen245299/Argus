@@ -61,7 +61,7 @@ Argus/
 | Build tool | Vite 6 |
 | State | Pinia 2 |
 | i18n | vue-i18n 9 (locales: `zh` default, `en`) |
-| PDF | pdfjs-dist v5 (legacy worker for older macOS) |
+| PDF | pdfjs-dist v5, legacy build for both main thread and worker (the system WebKit differs per Mac) |
 | Markdown / math | marked, katex, mermaid, highlight.js, dompurify |
 | Editors | vditor (notes), @milkdown packages also present |
 | Graph canvas | @vue-flow/core + background/controls/minimap |
@@ -216,25 +216,32 @@ and attachments. Later turns and regeneration use the ordinary chat path. The
 stored first question retains the complete prompt; the user bubble and history
 title show a concise localized label. The built-in Chinese prompt is the user's
 complete interactive tutor preset (verbatim); English follows the same rules.
-Read the whole paper and visually inspect figures/tables first; the first reply
-reports actual coverage/missing material, then opens on the background/problem
-with a concrete scenario, with no routine starting-point questions. Teaching
-follows background and task → existing methods and their problems → core idea
-and overall method (a plain-language skeleton first) → evaluation design →
-results and conclusions; within the method, whole before modules before math
-and code. One small step per turn: at most one core concept (normally 100–250
-Chinese characters), prerequisites/terms/formulas/metrics only when needed, a
-concrete data example carried through, “continue” advancing at the current
-level. Annotations are proactive with fixed colors: yellow = key method parts,
-green = paragraph summaries, purple = only innovations the user designates,
-red = problems/limitations the paper itself states, blue = to study later.
-They prefer the main text, avoid duplicate content and overlapping selections,
-are checked after writing and verified before retrying. Shown code has a
+Read the whole accessible paper and visually inspect figures/tables first; the
+first reply reports actual coverage/missing material, then opens on one small
+background/task question from the Abstract and Introduction with a concrete
+scenario, no method/experiments/summary and no routine background questions.
+Six stages in strict order: background and task (Abstract/Introduction) →
+existing methods and their stated shortcomings → the method (a complete
+plain-language skeleton and training/use split first, then key modules along
+the data flow, math/code as needed) → experimental setup (claims, comparability,
+each metric defined before its first use) → results (one experimental question
+at a time, absolute vs relative gains) → conclusion, limitations and scope.
+“Continue” advances within the stage until its main line is clear, then moves
+on. One small step per turn: at most one core concept (normally 100–250 Chinese
+characters), every symbol of a formula explained when it is used, one concrete
+example carried through. Annotation happens in the same turn as the teaching,
+from the first Abstract/Introduction turn: locate, check existing marks, add or
+reuse, verify after writing. Fixed colors: yellow = key method designs/steps/
+formulas, green = paragraph summaries and explanations (background, setup,
+results), purple = only innovations the user designates, red = problems/
+limitations the paper itself states for existing methods or its own method,
+blue = to study later. Marks prefer the main text, avoid duplicate content and
+overlapping selections, and are verified before retrying. Shown code has a
 Chinese comment per line and a Chinese docstring per function. Formulas use
-`$...$` / `$$...$$` in replies and annotations. Stop after each step and
-advance only on the user's “continue”. The prompt does not bypass backend
-write-approval controls. All three prior shipped preset versions
-(`LEGACY_PROMPT_*`, `_V2`, `_V3`) remain recognizable for concise bubbles/titles.
+`$...$` / `$$...$$` in replies and annotations. Stop after each step and its
+annotations. The prompt does not bypass backend write-approval controls. All
+four prior shipped preset versions (`LEGACY_PROMPT_*`, `_V2`, `_V3`, `_V4`)
+remain recognizable for concise bubbles/titles.
 `guidedReadingRequestHistory` upgrades them only in outgoing model requests for
 follow-ups and regeneration; stored first questions, custom text, assistant
 replies and attachment parts remain intact.
@@ -1159,6 +1166,16 @@ Two engines draw a page, and **a page's bitmap is always derived from its CSS bo
 - The render zone is measured in viewports and leans in the direction of travel; a wider keep zone plus a pixel budget (100 MP for the visible viewer, 64 MP for all background tabs together) decides eviction. Pages are rendered by priority (visible, then ahead, then behind) through a queue of two, work that has not started is dropped when its page leaves the zone, running pdf.js tasks are cancelled outside the keep zone, and **a page whose render is in flight is never evicted** (it would finish into an empty wrapper and be marked fresh).
 - A hidden viewer plans nothing and keeps its canvases. On show it restores the scroll position first, then re-checks every mounted page against `(scale, dpr)` (a zoom while hidden leaves a stretched stale bitmap otherwise) and renders only what is missing. A tab that finishes loading while hidden defers `fitWidth` / `restorePosition` until it is shown (`scrollTop` cannot be set on a `display:none` box).
 - `renderingPages`, `inflightRenders` and the generation counter keep their meaning; never clear `renderingPages`.
+- **pdf.js must run on whatever WebKit the Mac has.** A Tauri window is the system WKWebView, so
+  two Macs on different macOS/Safari versions run the same build differently. `PdfViewer.vue` and
+  `sections.ts` import `pdfjs-dist/legacy/build/pdf.mjs` (and `legacy/web/pdf_viewer.mjs`), never
+  the modern build: the modern one calls built-ins such as `Map#getOrInsertComputed` (Safari 26.2+)
+  with no polyfill, so `page.render` throws on older WebKit. Neither build polyfills `for await` over
+  a `ReadableStream`, which WebKit lacks through Safari 26.5, yet `getTextContent()` uses it: pages
+  drew but had no text layer at all, unselectable like a picture (seen on a macOS 26 Mac while
+  macOS 27 worked). `main.ts` therefore installs `utils/readableStreamAsyncIterator.ts` in every
+  window. When upgrading pdf.js, keep both and rerun
+  `node --test scripts/test-readable-stream-iterator.mjs`.
 - `PDF_ENABLE_HWA` (next to `getDocument`) makes pdf.js use accelerated canvases: far less main-thread compositing per page, text pixel-identical, vector line art antialiased slightly differently. Set it to `false` for bit-identical output with the old software canvases.
 - A visible page must retain selectable text even if PDF.js's font/layout path
   fails. `utils/pdfTextLayer.ts` keeps the normal layer when its text and boxes
@@ -1642,6 +1659,9 @@ The command surface is large (~100+ commands). See `src-tauri/src/commands.rs` f
   mounts the real PdfViewer with App.vue's selection rules, pdf_viewer.css and the markdown copy
   handler on a generated PDF: the 500 ms delay, no native tooltip, reaching the preview, a
   contained selection and its copy, the copy button, closing, a figure link and a narrow window.
+- Stream iteration polyfill: `node --test scripts/test-readable-stream-iterator.mjs` strips Node's
+  native `ReadableStream` iteration (as WebKit through Safari 26.5) and checks the polyfill's
+  spec behaviour plus pdf.js's real `getTextContent()` failing without it and working with it.
 - PDF text-layer recovery: `node --test scripts/test-pdf-text-layer.mjs` covers
   normal layers, font/layout rejection, zero boxes, timeout, cancellation,
   hidden/image-only pages, PDF coordinates, zoom, rotation and vertical text.

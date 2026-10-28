@@ -67,9 +67,12 @@ import {
   findReferenceEntry, destinationFamily, destinationPoint, looksLikeReference, referencesHeading, labelAgrees,
   type RefDestination,
 } from '../utils/citationPreview'
-import * as pdfjsLib from 'pdfjs-dist'
+// The legacy build, like the worker below: the modern one calls JS built-ins newer than
+// many Macs' system WebKit (Map#getOrInsertComputed needs Safari 26.2, and without it
+// page.render throws), and the legacy build polyfills them only where they are missing.
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
-import { EventBus, PDFLinkService } from 'pdfjs-dist/web/pdf_viewer.mjs'
+import { EventBus, PDFLinkService } from 'pdfjs-dist/legacy/web/pdf_viewer.mjs'
 import { useReaderStore } from '../stores/reader'
 import { useLibraryStore } from '../stores/library'
 import { titleInitialCaps } from '../utils/text'

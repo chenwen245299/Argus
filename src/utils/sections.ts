@@ -224,7 +224,8 @@ export async function computeSections(doc: PDFDocumentProxy): Promise<PaperSecti
  */
 export async function detectSectionsForSlug(slug: string): Promise<PaperSections | null> {
   const { invoke } = await import('@tauri-apps/api/core')
-  const pdfjsLib = await import('pdfjs-dist')
+  // The legacy build, as in PdfViewer (one pdf.js copy, polyfilled for older WebKit).
+  const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs')
   if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
     const workerUrl = (await import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url')).default
     pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl

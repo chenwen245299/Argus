@@ -24,7 +24,8 @@ export default defineConfig({
   },
   optimizeDeps: {
     include: [
-      'pdfjs-dist',
+      'pdfjs-dist/legacy/build/pdf.mjs',
+      'pdfjs-dist/legacy/web/pdf_viewer.mjs',
       'highlight.js/lib/common',
       'katex',
       'dompurify',

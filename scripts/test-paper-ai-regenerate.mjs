@@ -22,6 +22,13 @@ const { applyContextCheckpoint, historyFingerprint } = await import('data:text/j
   await readFile(new URL('../src/utils/chatContext.ts', import.meta.url), 'utf8'),
 )).toString('base64'))
 
+const soclaasModule = 'data:text/javascript;base64,' + Buffer.from(transpile(
+  (await readFile(new URL('../src/utils/soclaas.ts', import.meta.url), 'utf8')).replace(/^import nusIcon.*$/m, "const nusIcon = ''"),
+)).toString('base64')
+const { standardReasoningLevel, soclaasReasoningEfforts } = await import('data:text/javascript;base64,' + Buffer.from(transpile(
+  (await readFile(new URL('../src/utils/reasoning.ts', import.meta.url), 'utf8')).replace("'./soclaas'", JSON.stringify(soclaasModule)),
+)).toString('base64'))
+
 // Execute the real regenerate -> streamAnswer -> agent-event -> save path.
 // Only desktop I/O and markdown rendering are replaced; answer state and Vue
 // proxies stay real, including the snapshot saved before the request begins.
@@ -44,6 +51,7 @@ const makeRunner = new Function('env', transpile(`
   const syncDisposed = false;
   const contextErrors = { value: {} }, contextNotices = { value: {} };
   const persistableServerToolTrace = value => value;
+  const { standardReasoningLevel, soclaasReasoningEfforts } = env;
   const t = key => key;
   const { props, activeConversation, activeAnswerTabs, expandedSteps, streamOwners,
     activeRequestIds, unlisteners, useReasoning, reasoningLevel, pendingWrites,
@@ -99,6 +107,7 @@ function harness() {
     props: { slug: 'paper' }, activeConversation, activeAnswerTabs: ref({}), expandedSteps,
     streamOwners: shallowReactive(new Map()), activeRequestIds: new Map(), unlisteners,
     streamRenderTimers: new Map(), streamRenderLast: new Map(), streamRenderCost: new Map(),
+    standardReasoningLevel, soclaasReasoningEfforts,
     useReasoning: ref(true), reasoningLevel: ref('medium'), pendingWrites: ref([]), crypto: webcrypto,
     ai: { settings: { providers: [{ id: 'provider', base_url: 'https://example.test' }] } },
     reader: { readingStateFor: () => ({ page: 4 }) },

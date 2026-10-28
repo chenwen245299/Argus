@@ -3,6 +3,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import ts from 'typescript'
+import { createPinia, defineStore } from 'pinia'
+import { ref, watch, onScopeDispose } from 'vue'
 
 async function moduleBody(path) {
   const source = await readFile(new URL(path, import.meta.url), 'utf8')
@@ -15,7 +17,9 @@ function run(source, env) {
     compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.ESNext },
   }).outputText)(...Object.values(env))
 }
-const { soclaasLogo, SOCLAAS_BASE_URL } = run(`${await moduleBody('../src/utils/soclaas.ts')}\nreturn { soclaasLogo, SOCLAAS_BASE_URL };`, { nusIcon: 'nus.png' })
+const { soclaasLogo, SOCLAAS_BASE_URL, isSoclaas } = run(`${await moduleBody('../src/utils/soclaas.ts')}\nreturn { soclaasLogo, SOCLAAS_BASE_URL, isSoclaas };`, { nusIcon: 'nus.png' })
+const { soclaasReasoningEfforts, resolveReasoningEffort, standardReasoningLevel } = run(
+  `${await moduleBody('../src/utils/reasoning.ts')}\nreturn { soclaasReasoningEfforts, resolveReasoningEffort, standardReasoningLevel };`, { isSoclaas })
 const assetGlob = () => ({
   '/src/assets/providers/openai.svg': { default: 'openai.svg' },
   '/src/assets/providers/deepseek.svg': { default: 'deepseek.svg' },
@@ -49,4 +53,51 @@ test('the SoCLaaS preset uses the documented public gateway', async () => {
   const preset = presets.find(p => p.kind === 'soclaas')
   assert.equal(preset.base_url, SOCLAAS_BASE_URL)
   assert.match(preset.label, /NUS/)
+})
+
+test('discovered options use actual values, survive alias changes, and leave other providers alone', () => {
+  const provider = { name: 'Research', kind: 'soclaas', models: [{ id: 'alias', reasoning_efforts: ['max', 'high', 'low', 'none'] }] }
+  assert.deepEqual(soclaasReasoningEfforts(provider, 'alias'), ['none', 'low', 'high', 'max'])
+  provider.models[0].reasoning_efforts = ['xhigh', 'medium', 'low', 'low']
+  assert.deepEqual(soclaasReasoningEfforts(provider, 'alias'), ['low', 'medium', 'xhigh'])
+  assert.deepEqual(soclaasReasoningEfforts(provider, 'new-model'), [])
+  assert.equal(soclaasReasoningEfforts({ ...provider, kind: 'openai_compatible' }, 'alias'), null)
+})
+
+test('visible effort resolves to the same valid selection as the backend', () => {
+  for (const [supported, preferred, enabled, expected] of [
+    [['max', 'high', 'low'], 'max', true, 'max'],
+    [['max', 'high', 'low'], 'medium', true, 'high'],
+    [['max', 'high', 'low'], 'xhigh', true, 'max'],
+    [['xhigh', 'medium', 'low'], 'high', true, 'xhigh'],
+    [['max', 'xhigh', 'high', 'medium', 'low'], 'xhigh', true, 'xhigh'],
+    [['max', 'high', 'low'], 'max', false, 'low'],
+    [['max', 'high', 'low', 'none'], 'max', false, 'none'],
+    [[], 'high', true, undefined],
+    [['none'], 'high', true, undefined],
+  ]) assert.equal(resolveReasoningEffort(supported, enabled, preferred), expected)
+  assert.equal(standardReasoningLevel('max'), 'high')
+  assert.equal(standardReasoningLevel('xhigh'), 'high')
+  assert.equal(standardReasoningLevel('minimal'), 'low')
+  assert.equal(standardReasoningLevel('medium'), 'medium')
+})
+
+test('thinking preferences persist provider-declared efforts and follow other windows', async t => {
+  const stored = new Map([['argus:thinking-preference', JSON.stringify({ enabled: true, level: 'max' })]])
+  const callbacks = new Map()
+  const storage = { getItem: k => stored.get(k) ?? null, setItem: (k, v) => stored.set(k, v) }
+  const window = { addEventListener: (k, cb) => callbacks.set(k, cb), removeEventListener: k => callbacks.delete(k) }
+  const useStore = run(`${await moduleBody('../src/stores/thinking.ts')}\nreturn useThinkingStore;`,
+    { ref, watch, onScopeDispose, defineStore, window, localStorage: storage })
+  const store = useStore(createPinia())
+  t.after(() => store.$dispose())
+  assert.equal(store.reasoningLevel, 'max')
+  store.reasoningLevel = 'xhigh'
+  assert.equal(JSON.parse(stored.get('argus:thinking-preference')).level, 'xhigh')
+  callbacks.get('storage')({ key: 'argus:thinking-preference', newValue: JSON.stringify({ enabled: false, level: 'medium' }) })
+  assert.equal(store.useReasoning, false)
+  assert.equal(store.reasoningLevel, 'medium')
+  // Malformed storage never becomes an arbitrary request parameter.
+  callbacks.get('storage')({ key: 'argus:thinking-preference', newValue: JSON.stringify({ level: 'not an effort' }) })
+  assert.equal(store.reasoningLevel, 'high')
 })

@@ -578,6 +578,7 @@ mod tests {
             cache_hit_input_price_per_million: None,
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
+            reasoning_efforts: None,
             provider_order: vec![],
             is_free: false,
             param_billions: None,

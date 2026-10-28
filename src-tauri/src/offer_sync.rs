@@ -8,8 +8,8 @@
 //! quietly bills someone who believed it.
 //!
 //! So on launch this re-reads the catalogue in the background and refreshes
-//! only the price-derived fields. It is deliberately unhurried: a delay before
-//! it starts, one provider at a time, and any failure is dropped silently. The
+//! price-derived fields, plus SoCLaaS effort/context declarations. It starts
+//! after a delay, one provider at a time; any failure is dropped silently. The
 //! badges being a few minutes late costs nothing; a slow launch costs the user
 //! every time.
 //!
@@ -19,6 +19,8 @@
 //! `capabilities` and `provider_order` are the user's, and several of them are
 //! routinely hand-edited — overwriting those from the catalogue would undo work
 //! nobody asked to have undone.
+//! SoCLaaS also refreshes effort declarations and context windows because its
+//! public aliases can switch to a different upstream model.
 
 use std::time::Duration;
 
@@ -54,12 +56,13 @@ const CHANGED_EVENT: &str = "ai-models-refreshed";
 /// Whether this provider's catalogue carries prices worth re-reading.
 ///
 /// OpenRouter publishes per-model pricing, free tiers and time-of-day
-/// discounts; MoleAPI publishes per-model rates in its price list. Everyone
+/// discounts; MoleAPI publishes per-model rates in its price list; SoCLaaS
+/// includes rates and reasoning declarations in its authenticated models. Everyone
 /// else either has no public `/models` at all (Kimi, Anthropic), or returns
 /// bare ids with no prices — and running this against them would spend a
 /// request to learn nothing.
 fn publishes_prices(provider: &AiProvider) -> bool {
-    is_openrouter(provider) || crate::moleapi::is_moleapi(provider)
+    is_openrouter(provider) || crate::moleapi::is_moleapi(provider) || crate::soclaas::is_soclaas(provider)
 }
 
 /// The per-model promotion lookups below exist only on OpenRouter.
@@ -143,10 +146,16 @@ async fn refresh_provider(root: &str, provider_id: &str) -> usize {
     // Re-read rather than reusing the snapshot above: the fetch was a network
     // round-trip, and the user may have edited their models while it was in
     // flight. Whatever they just saved must win.
+    let fetched_base_url = provider.base_url.clone();
+    let fetched_kind = provider.kind.clone();
     let mut settings = crate::ai_manager::read_ai_settings(root);
     let Some(provider) = settings.providers.iter_mut().find(|p| p.id == provider_id) else {
         return 0;
     };
+    if provider.base_url != fetched_base_url || provider.kind != fetched_kind {
+        return 0;
+    }
+    let is_soclaas = crate::soclaas::is_soclaas(provider);
 
     let by_id: std::collections::HashMap<&str, &AiModel> =
         fresh.iter().map(|m| (m.id.as_str(), m)).collect();
@@ -154,7 +163,11 @@ async fn refresh_provider(root: &str, provider_id: &str) -> usize {
     let mut changed = 0usize;
     for saved in provider.models.iter_mut() {
         let touched = match by_id.get(saved.id.as_str()) {
-            Some(current) => apply_offer(saved, current),
+            Some(current) => {
+                let offer_changed = apply_offer(saved, current);
+                let metadata_changed = is_soclaas && crate::soclaas::refresh_model(saved, current);
+                offer_changed || metadata_changed
+            }
             None => clear_offer(saved),
         };
         if touched {
@@ -392,8 +405,7 @@ mod tests {
         assert!(saved.discount_windows.is_empty());
     }
 
-    /// Only OpenRouter publishes the prices this reads. Running it elsewhere
-    /// spends a request to learn nothing.
+    /// Only poll catalogues whose published facts can refresh saved models.
     #[test]
     fn only_providers_that_publish_prices_are_polled() {
         let provider = |url: &str| AiProvider {
@@ -409,6 +421,7 @@ mod tests {
         };
         assert!(publishes_prices(&provider("https://openrouter.ai/api/v1")));
         assert!(publishes_prices(&provider("https://api.moleapi.com/v1")));
+        assert!(publishes_prices(&provider("https://soclaas-api.comp.nus.edu.sg/v1")));
         assert!(!publishes_prices(&provider("https://api.deepseek.com/v1")));
         assert!(!publishes_prices(&provider("http://localhost:11434/v1")));
     }

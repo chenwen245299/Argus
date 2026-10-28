@@ -4,7 +4,11 @@ import nusIcon from '../assets/providers/nus.png'
 
 export const SOCLAAS_BASE_URL = 'https://soclaas-api.comp.nus.edu.sg/v1'
 
-export function soclaasLogo(name = '', baseUrl = '', kind = ''): string {
+export function isSoclaas(name = '', baseUrl = '', kind = ''): boolean {
   const text = `${name} ${baseUrl}`.toLowerCase()
-  return kind === 'soclaas' || text.includes('soclaas') || text.includes('soclass') ? nusIcon : ''
+  return kind === 'soclaas' || text.includes('soclaas') || text.includes('soclass')
+}
+
+export function soclaasLogo(name = '', baseUrl = '', kind = ''): string {
+  return isSoclaas(name, baseUrl, kind) ? nusIcon : ''
 }

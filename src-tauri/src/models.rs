@@ -760,6 +760,9 @@ pub struct AiModel {
     pub display_name: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Provider-declared effort values. None = not discovered; [] = no control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
     pub context_length: Option<u64>,
     #[serde(default = "bool_true")]
     pub enabled: bool,

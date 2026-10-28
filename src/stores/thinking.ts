@@ -1,10 +1,9 @@
 import { defineStore } from 'pinia'
 import { onScopeDispose, ref, watch } from 'vue'
 
-type ReasoningLevel = 'low' | 'medium' | 'high'
 interface ThinkingPreference {
   enabled: boolean
-  level: ReasoningLevel
+  level: string
 }
 
 // A per-device preference shared by the paper AI panel/window and library chat.
@@ -16,7 +15,7 @@ function parsePreference(raw: string | null): ThinkingPreference {
     const value = raw ? JSON.parse(raw) : null
     return {
       enabled: value?.enabled === true,
-      level: value?.level === 'low' || value?.level === 'medium' || value?.level === 'high'
+      level: typeof value?.level === 'string' && /^[a-z][a-z0-9_-]{0,31}$/.test(value.level)
         ? value.level : 'high',
     }
   } catch {
@@ -32,7 +31,7 @@ function loadPreference(): ThinkingPreference {
 export const useThinkingStore = defineStore('thinking', () => {
   const saved = loadPreference()
   const useReasoning = ref(saved.enabled)
-  const reasoningLevel = ref<ReasoningLevel>(saved.level)
+  const reasoningLevel = ref(saved.level)
   let applyingStoredPreference = false
 
   watch([useReasoning, reasoningLevel], ([enabled, level]) => {

@@ -575,6 +575,7 @@ fn model_from(spec: &Spec) -> AiModel {
         cache_hit_input_price_per_million: cache_hit,
         input_price_usd_per_million: None,
         output_price_usd_per_million: None,
+        reasoning_efforts: None,
         provider_order: vec![],
         param_billions: spec.params,
         is_free: spec.free,

@@ -315,6 +315,7 @@ export interface AiModel {
   id: string
   display_name: string
   capabilities: string[]
+  reasoning_efforts?: string[]       // provider-declared values; [] = no adjustable reasoning
   context_length?: number
   enabled: boolean
   input_price_per_million?: number   // CNY per 1M input tokens (off-peak/standard)

@@ -21,6 +21,7 @@ import ServerToolTraceCard from './ServerToolTraceCard.vue'
 import { mergeServerToolTrace, persistableServerToolTrace } from '../utils/serverToolTrace'
 import { useSettingsStore } from '../stores/settings'
 import { useThinkingStore } from '../stores/thinking'
+import { soclaasReasoningEfforts, resolveReasoningEffort, standardReasoningLevel } from '../utils/reasoning'
 import WriteConfirmCard from './WriteConfirmCard.vue'
 import { buildToolExchangeMessages } from '../utils/agentHistory'
 import WindowControls from './WindowControls.vue'
@@ -755,6 +756,22 @@ const isDeepSeekSelected = computed(() => {
   const provider = ai.settings.providers.find(p => p.id === sel.providerId)
   return !!provider?.base_url.toLowerCase().includes('deepseek')
 })
+const soclaasEfforts = computed(() => {
+  const model = effectiveModel()
+  const provider = ai.settings.providers.find(p => p.id === model?.providerId)
+  return soclaasReasoningEfforts(provider, model?.modelId)
+})
+const soclaasThinkingEfforts = computed(() => soclaasEfforts.value?.filter(s => s !== 'none') ?? [])
+const soclaasSelectedEffort = computed(() => resolveReasoningEffort(soclaasEfforts.value ?? [], true, reasoningLevel.value))
+const soclaasReasoningHint = computed(() => {
+  const efforts = soclaasEfforts.value
+  if (efforts === null) return ''
+  if (!soclaasThinkingEfforts.value.length) return t('aiService.reasoningNotAdjustable')
+  return efforts.includes('none') ? '' : t('aiService.reasoningMinimum', {
+    effort: resolveReasoningEffort(efforts, false, reasoningLevel.value),
+  })
+})
+const standardLevel = computed(() => standardReasoningLevel(reasoningLevel.value))
 
 // Reasoning stays collapsed until explicitly opened, including while streaming.
 // Keep expansion local to the answer; each new generation starts collapsed.
@@ -2260,8 +2277,8 @@ async function runAssistantRequestImpl(
     const provider = ai.settings.providers.find(p => p.id === sel?.providerId)
     const isDeepseek = !!provider?.base_url.toLowerCase().includes('deepseek')
     const effortToSend = isDeepseek
-      ? (reasoningLevel.value === 'high' ? 'high' : 'medium')
-      : reasoningLevel.value
+      ? (standardReasoningLevel(reasoningLevel.value) === 'high' ? 'high' : 'medium')
+      : (soclaasReasoningEfforts(provider, sel?.modelId) !== null ? reasoningLevel.value : standardReasoningLevel(reasoningLevel.value))
     // Also protects tool-free fallback models before sending. The live agent
     // repeats admission against its actual external schemas and tool results.
     contextErrors.value[conv.id] = ''; contextNotices.value[conv.id] = ''
@@ -3411,10 +3428,10 @@ onUnmounted(() => {
                     @click="reasoningOpen = !reasoningOpen"
                   >
                     <Icon icon="fluent:brain-circuit-24-regular" width="15" height="15" />
-                    <span v-if="useReasoning" class="reasoning-badge">
-                      {{ isDeepSeekSelected
-                          ? (reasoningLevel === 'high' ? 'max' : 'high')
-                          : (reasoningLevel === 'low' ? '低' : reasoningLevel === 'medium' ? '中' : '高') }}
+                    <span v-if="useReasoning && (soclaasEfforts === null || soclaasSelectedEffort)" class="reasoning-badge">
+                      {{ soclaasEfforts !== null ? soclaasSelectedEffort : isDeepSeekSelected
+                          ? (standardLevel === 'high' ? 'max' : 'high')
+                          : (standardLevel === 'low' ? '低' : standardLevel === 'medium' ? '中' : '高') }}
                     </span>
                   </button>
                   <Transition name="reasoning-drop">
@@ -3424,18 +3441,28 @@ onUnmounted(() => {
                         <button
                           class="reasoning-toggle"
                           :class="{ on: useReasoning }"
+                          :disabled="soclaasEfforts !== null && !soclaasThinkingEfforts.length"
                           @click="useReasoning = !useReasoning"
                         >
                           <span class="toggle-knob" />
                         </button>
                       </div>
                       <div v-if="useReasoning" class="reasoning-levels">
-                        <template v-if="isDeepSeekSelected">
+                        <template v-if="soclaasEfforts !== null">
+                          <button
+                            v-for="lv in soclaasThinkingEfforts"
+                            :key="lv"
+                            class="level-btn"
+                            :class="{ active: soclaasSelectedEffort === lv }"
+                            @click="reasoningLevel = lv"
+                          >{{ lv }}</button>
+                        </template>
+                        <template v-else-if="isDeepSeekSelected">
                           <button
                             v-for="lv in (['high', 'max'] as const)"
                             :key="lv"
                             class="level-btn"
-                            :class="{ active: lv === 'high' ? reasoningLevel === 'medium' : reasoningLevel === 'high' }"
+                            :class="{ active: lv === 'high' ? standardLevel === 'medium' : standardLevel === 'high' }"
                             @click="reasoningLevel = lv === 'max' ? 'high' : 'medium'"
                           >{{ lv }}</button>
                         </template>
@@ -3444,11 +3471,12 @@ onUnmounted(() => {
                             v-for="lv in (['low', 'medium', 'high'] as const)"
                             :key="lv"
                             class="level-btn"
-                            :class="{ active: reasoningLevel === lv }"
+                            :class="{ active: standardLevel === lv }"
                             @click="reasoningLevel = lv"
                           >{{ lv === 'low' ? '低' : lv === 'medium' ? '中' : '高' }}</button>
                         </template>
                       </div>
+                      <p v-if="soclaasReasoningHint" class="reasoning-hint">{{ soclaasReasoningHint }}</p>
                     </div>
                   </Transition>
                 </div>
@@ -6073,4 +6101,6 @@ onUnmounted(() => {
   border-radius: 10px;
   background: #000;
 }
+.reasoning-hint { max-width: 240px; margin: 8px 0 0; color: var(--text-secondary); font-size: 11px; line-height: 1.5; }
+.reasoning-toggle:disabled { opacity: .5; cursor: default; }
 </style>

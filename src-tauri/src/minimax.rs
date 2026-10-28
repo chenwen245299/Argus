@@ -153,6 +153,7 @@ fn model(id: &str, ctx: u64, params: Option<f64>) -> AiModel {
         cache_hit_input_price_per_million: None,
         input_price_usd_per_million: None,
         output_price_usd_per_million: None,
+        reasoning_efforts: None,
         provider_order: vec![],
         param_billions: params,
         is_free: false,

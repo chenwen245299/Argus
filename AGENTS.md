@@ -1002,18 +1002,33 @@ NUS's gateway uses OpenAI-compatible Chat Completions and Embeddings at
 `https://soclaas-api.comp.nus.edu.sg/v1`. Detect it by kind, host or provider
 name so existing generic configurations work. Use only the public model ids
 returned for that API key; `soclaas.display_name` / `description` supply display
-metadata, and all four documented context-length aliases are recognized.
+metadata, and context-length aliases (including `max_context_length`) are recognized.
 Do not substitute private upstream ids or add a hardcoded model catalogue.
-The app's high setting maps to `xhigh` for `x-test-1`; off maps to its lowest
-supported setting, `low`. Other models receive `none` when thinking is off,
-as documented in the quickstart. Streaming requests may repair one explicit
-HTTP 400 effort-validation refusal that lists accepted values, before any
-stream or client tool is consumed. Other errors and providers do not retry.
+`reasoning.supported_efforts` is persisted as optional `AiModel.reasoning_efforts`:
+missing means not yet discovered; an empty array means no adjustable reasoning.
+All chat paths use only declared effort values, with no per-alias rules. Exact
+choices win; incompatible saved choices use the nearest declared level (ties
+upward). Off uses `none` only when declared, otherwise the lowest valid level;
+unknown/no-control models omit reasoning parameters. Paper/sidebar/standalone
+and library controls show actual effort values and explain the lowest-level
+fallback. Provider-specific levels persist across windows; other providers
+still receive their own low/medium/high mapping. `utils/reasoning.ts` mirrors
+the backend resolver. The catalogue also supplies nested capabilities and input
+modalities, and microdollars per million tokens convert to USD per million by
+dividing by 1,000,000. Billed audio transcription is not free or a chat model.
+The background catalogue/price refresh includes SoCLaaS, updates saved efforts
+and context windows along with USD prices, and preserves user labels, capability
+edits and CNY prices. Confirming a fetched catalogue refreshes existing models'
+metadata too. An explicit HTTP 400 effort-validation refusal listing accepted
+values may be repaired once, before consuming a stream or client tool, including
+probes and one-shot jobs. Other errors and providers do not retry.
 Gateway string errors (`{"error":"message"}`), including SSE and HTTP 200
 error bodies, fail visibly rather than ending with an empty successful answer.
 The NUS Computing favicon is bundled locally for provider and model rows.
 Backend coverage lives in `soclaas::tests` and `llm::soclaas_request_tests`;
-`node --test scripts/test-soclaas.mjs` checks provider branding and presets.
+`node --test scripts/test-soclaas.mjs` checks branding, presets, effort resolution
+and persistence; `scripts/test-soclaas-browser.mjs` checks all three real chat
+surfaces with local desktop/provider mocks.
 
 ### arXiv batch analysis (`arxiv.rs`)
 

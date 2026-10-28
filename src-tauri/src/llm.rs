@@ -402,7 +402,7 @@ pub async fn test_connection(provider: &AiProvider, api_key: &str) -> Result<Str
 
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
     if crate::soclaas::is_soclaas(provider) {
-        crate::soclaas::apply_reasoning(&mut body, model, false, None);
+        crate::soclaas::apply_reasoning(&mut body, provider, model, false, None);
     }
     let mut req = client
         .post(&url)
@@ -413,7 +413,7 @@ pub async fn test_connection(provider: &AiProvider, api_key: &str) -> Result<Str
         // Pretend to be a whitelisted coding agent so ordinary API keys work.
         req = req.header("User-Agent", "KimiCLI/1.5");
     }
-    let resp = req.json(&body).send().await.map_err(|e| describe_stream_error(&e))?;
+    let resp = send_chat_with_soclaas_retry(req, provider, &body, false).await?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -789,7 +789,7 @@ async fn stream_with_pdf_injected(
     }
 
     if crate::soclaas::is_soclaas(provider) {
-        crate::soclaas::apply_reasoning(&mut body, model, use_reasoning, reasoning_effort);
+        crate::soclaas::apply_reasoning(&mut body, provider, model, use_reasoning, reasoning_effort);
     }
 
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
@@ -1118,7 +1118,7 @@ async fn chat_openai_compat(
         crate::stepfun::apply_reasoning(&mut body, model, false, None);
     }
     if crate::soclaas::is_soclaas(provider) {
-        crate::soclaas::apply_reasoning(&mut body, model, false, None);
+        crate::soclaas::apply_reasoning(&mut body, provider, model, false, None);
     }
 
     let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
@@ -1130,11 +1130,11 @@ async fn chat_openai_compat(
     if is_kimi_coding_endpoint {
         req = req.header("User-Agent", "KimiCLI/1.5");
     }
-    let resp = req
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| describe_reqwest_error(&e))?;
+    let resp = if crate::soclaas::is_soclaas(provider) {
+        send_chat_with_soclaas_retry(req, provider, &body, false).await?
+    } else {
+        req.json(&body).send().await.map_err(|e| describe_reqwest_error(&e))?
+    };
 
     let status = resp.status().as_u16();
     let text = match resp.text().await {
@@ -1362,7 +1362,7 @@ async fn stream_openai_compat(
     }
 
     if crate::soclaas::is_soclaas(provider) {
-        crate::soclaas::apply_reasoning(&mut body, model, use_reasoning, reasoning_effort);
+        crate::soclaas::apply_reasoning(&mut body, provider, model, use_reasoning, reasoning_effort);
     }
 
     // OpenRouter's server-side tools ride along on every chat request. They are
@@ -2295,6 +2295,7 @@ async fn fetch_ollama_models(provider: &AiProvider, api_key: &str) -> Result<Vec
                 cache_hit_input_price_per_million: None,
                 input_price_usd_per_million: None,
                 output_price_usd_per_million: None,
+                reasoning_efforts: None,
                 provider_order: vec![],
                 // Ollama tags carry the size directly ("qwen3.6:35b").
                 param_billions: scan_param_size(&id_for_size),
@@ -2713,7 +2714,10 @@ async fn fetch_openai_models(provider: &AiProvider, api_key: &str) -> Result<Vec
         .iter()
         .filter_map(|item| {
             if crate::soclaas::is_soclaas(provider) {
-                parse_model_item(&crate::soclaas::catalogue_item(item))
+                parse_model_item(&crate::soclaas::catalogue_item(item)).map(|mut model| {
+                    crate::soclaas::enrich_model(&mut model, item);
+                    model
+                })
             } else {
                 parse_model_item(item)
             }
@@ -2790,6 +2794,7 @@ fn parse_model_item(item: &serde_json::Value) -> Option<AiModel> {
         cache_hit_input_price_per_million: None,
         input_price_usd_per_million,
         output_price_usd_per_million,
+        reasoning_efforts: None,
         provider_order: vec![],
         is_free,
         param_billions,
@@ -3233,6 +3238,7 @@ pub fn kimi_known_models() -> Vec<AiModel> {
             cache_hit_input_price_per_million: None,
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
+            reasoning_efforts: None,
             provider_order: vec![],
             param_billions: None,
             is_free: false,
@@ -3310,6 +3316,7 @@ fn anthropic_known_models() -> Vec<AiModel> {
             cache_hit_input_price_per_million: None,
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
+            reasoning_efforts: None,
             provider_order: vec![],
             param_billions: None,
             is_free: false,
@@ -3330,6 +3337,7 @@ fn anthropic_known_models() -> Vec<AiModel> {
             cache_hit_input_price_per_million: None,
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
+            reasoning_efforts: None,
             provider_order: vec![],
             param_billions: None,
             is_free: false,
@@ -3350,6 +3358,7 @@ fn anthropic_known_models() -> Vec<AiModel> {
             cache_hit_input_price_per_million: None,
             input_price_usd_per_million: None,
             output_price_usd_per_million: None,
+            reasoning_efforts: None,
             provider_order: vec![],
             param_billions: None,
             is_free: false,
@@ -5009,17 +5018,13 @@ pub async fn touch_prompt_cache(
         body["tool_choice"] = serde_json::json!("auto");
     }
     if crate::soclaas::is_soclaas(provider) {
-        crate::soclaas::apply_reasoning(&mut body, model, false, None);
+        crate::soclaas::apply_reasoning(&mut body, provider, model, false, None);
     }
 
     let req = client
         .post(&url)
         .header("Content-Type", "application/json");
-    let resp = openai_auth(req, provider, api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| describe_stream_error(&e))?;
+    let resp = send_chat_with_soclaas_retry(openai_auth(req, provider, api_key), provider, &body, false).await?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -5332,7 +5337,7 @@ async fn stream_tool_request(
     }
 
     if crate::soclaas::is_soclaas(provider) {
-        crate::soclaas::apply_reasoning(&mut body, model, use_reasoning, reasoning_effort);
+        crate::soclaas::apply_reasoning(&mut body, provider, model, use_reasoning, reasoning_effort);
     }
 
     let req = client
@@ -5604,6 +5609,51 @@ mod offer_tests {
         assert_eq!(model.context_length, Some(65536));
         assert!(model.capabilities.contains(&"tool_calling".to_string()));
         assert!(model.capabilities.contains(&"reasoning".to_string()));
+    }
+
+    #[test]
+    fn soclaas_catalogue_reads_live_efforts_modalities_and_microdollar_prices() {
+        let item = serde_json::json!({
+            "id": "x-test-1", "max_context_length": 1048576,
+            "reasoning": {"supported_efforts": ["max", "high", "low", "max", "", null]},
+            "supported_parameters": ["reasoning", "reasoning_effort"],
+            "soclaas": {"display_name": "Test GLM 5.3 Flash", "capabilities": ["chat"],
+                "input_microdollars_per_million_tokens": 157332,
+                "output_microdollars_per_million_tokens": 511989,
+                "input_modalities": ["text", "vision"]},
+        });
+        let mut model = parse_model_item(&crate::soclaas::catalogue_item(&item)).unwrap();
+        crate::soclaas::enrich_model(&mut model, &item);
+        assert_eq!(model.id, "x-test-1");
+        assert_eq!(model.context_length, Some(1048576));
+        assert_eq!(model.reasoning_efforts, Some(vec!["max".into(), "high".into(), "low".into()]));
+        assert_eq!(model.input_price_usd_per_million, Some(0.157332));
+        assert_eq!(model.output_price_usd_per_million, Some(0.511989));
+        assert!(model.capabilities.contains(&"vision".into()));
+        assert!(model.capabilities.contains(&"reasoning".into()));
+        assert!(!model.is_free);
+    }
+
+    #[test]
+    fn soclaas_embeddings_and_billed_transcription_are_not_plain_chat_or_free() {
+        for (id, cap, expected, input, audio) in [
+            ("bge-m3", "embeddings", "embedding", 10000, 0),
+            ("whisper-large-v3", "audio-transcription", "audio", 0, 6000),
+        ] {
+            let item = serde_json::json!({"id": id, "soclaas": {"capabilities": [cap],
+                "input_microdollars_per_million_tokens": input, "output_microdollars_per_million_tokens": 0,
+                "audio_microdollars_per_minute": audio}});
+            let mut model = parse_model_item(&crate::soclaas::catalogue_item(&item)).unwrap();
+            crate::soclaas::enrich_model(&mut model, &item);
+            assert_eq!(model.reasoning_efforts, Some(vec![]));
+            assert_eq!(model.capabilities, vec![expected.to_string()]);
+            assert!(!model.is_free);
+        }
+        // Explicit text-only metadata also prevents a model-name vision guess.
+        let item = serde_json::json!({"id": "gemini-alias", "soclaas": {"input_modalities": ["text"]}});
+        let mut model = parse_model_item(&item).unwrap();
+        crate::soclaas::enrich_model(&mut model, &item);
+        assert!(!model.capabilities.contains(&"vision".into()));
     }
 
     /// Both directions must be zero. A model free to read but charging to
@@ -6085,6 +6135,42 @@ mod soclaas_request_tests {
         let mut expected = body.clone();
         expected["reasoning_effort"] = json!("xhigh");
         assert_eq!(requests[1], expected);
+    }
+
+    #[tokio::test]
+    async fn repointed_alias_repairs_xhigh_to_the_declared_max() {
+        let rejection = json!({"error": "Unexpected reasoning effort xhigh. Supported types are max (default), high, and low."});
+        let (url, server) = gateway(vec![(400, rejection), (200, json!({"choices": []}))]).await;
+        let body = json!({"model": "x-test-1", "reasoning_effort": "xhigh", "stream": true,
+            "messages": [{"role": "user", "content": "Question"}]});
+        assert_eq!(send("soclaas", &url, &body, false).await.unwrap().status(), 200);
+        let requests = server.await.unwrap();
+        assert_eq!(requests[0], body);
+        assert_eq!(requests[1]["model"], "x-test-1");
+        assert_eq!(requests[1]["reasoning_effort"], "max");
+    }
+
+    #[tokio::test]
+    async fn probes_and_one_shot_jobs_use_discovered_off_or_lowest_effort() {
+        for (efforts, expected) in [
+            (vec!["max", "high", "low"], "low"),
+            (vec!["max", "high", "low", "none"], "none"),
+        ] {
+            let answer = json!({"choices": [{"message": {"content": "OK"}}]});
+            let (url, server) = gateway(vec![(200, answer.clone()), (200, answer)]).await;
+            let mut p = provider("soclaas", &url);
+            p.models = serde_json::from_value(json!([{"id": "operator-alias", "display_name": "Alias", "reasoning_efforts": efforts}])).unwrap();
+            test_connection(&p, "test-key").await.unwrap();
+            let messages = vec![ChatMessage { role: "user".into(), content: "Question".into() }];
+            assert_eq!(chat_openai_compat(&p, "test-key", "operator-alias", &messages, "test").await.unwrap(), "OK");
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 2);
+            for request in requests {
+                assert_eq!(request["model"], "operator-alias");
+                assert_eq!(request["reasoning_effort"], expected);
+                assert!(request.get("thinking").is_none());
+            }
+        }
     }
 
     #[tokio::test]

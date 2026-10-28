@@ -8,7 +8,7 @@ import { useAiStore } from '../../stores/ai'
 import { useSettingsStore } from '../../stores/settings'
 import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import { providerLogo } from '../../utils/providerLogo'
-import { SOCLAAS_BASE_URL } from '../../utils/soclaas'
+import { isSoclaas, SOCLAAS_BASE_URL } from '../../utils/soclaas'
 import type {
   AiModel, AiProviderInfo, AiProviderInput, DeepSeekFile, DeepSeekFileList,
   DeepSeekVisionLimits, ModelSelection, ServerTools, SpeechOutput,
@@ -117,6 +117,17 @@ const loadingDiscounts = ref(false)
 const fetchSelected    = ref<Set<string>>(new Set())
 const fetchSearch      = ref('')
 const fetchCapability  = ref<'all' | FetchGroupId>('all')
+const fetchedSoclaasUpdates = computed(() => {
+  if (!isSoclaas(editName.value, editUrl.value, editKind.value)) return false
+  return fetchedModels.value.some(fresh => {
+    const saved = editModels.value.find(m => m.id === fresh.id)
+    return saved && (JSON.stringify(saved.reasoning_efforts) !== JSON.stringify(fresh.reasoning_efforts)
+      || saved.context_length !== fresh.context_length
+      || saved.input_price_usd_per_million !== fresh.input_price_usd_per_million
+      || saved.output_price_usd_per_million !== fresh.output_price_usd_per_million
+      || saved.is_free !== fresh.is_free)
+  })
+})
 
 // Add manual model form
 const showAddModel  = ref(false)
@@ -754,6 +765,16 @@ function deselectAllFetched() {
 function confirmFetchedSelection() {
   const existingIds = new Set(editModels.value.map(m => m.id))
   for (const m of fetchedModels.value) {
+    if (isSoclaas(editName.value, editUrl.value, editKind.value)) {
+      const saved = editModels.value.find(s => s.id === m.id)
+      if (saved) {
+        saved.reasoning_efforts = m.reasoning_efforts
+        saved.context_length = m.context_length
+        saved.input_price_usd_per_million = m.input_price_usd_per_million
+        saved.output_price_usd_per_million = m.output_price_usd_per_million
+        saved.is_free = m.is_free
+      }
+    }
     if (fetchSelected.value.has(m.id) && !existingIds.has(m.id)) {
       editModels.value.push({ ...m, enabled: true })
     }
@@ -1584,8 +1605,8 @@ function toggleCapability(form: ModelForm, cap: string) {
                   {{ t('aiService.fetchAvailableCount', { n: fetchAvailableVisibleCount }) }}
                 </span>
                 <button class="btn-ghost sm" @click="showFetchDialog = false">{{ t('aiService.cancel') }}</button>
-                <button class="btn-primary sm" @click="confirmFetchedSelection" :disabled="fetchSelected.size === 0">
-                  {{ t('aiService.confirmAdd') }}
+                <button class="btn-primary sm" @click="confirmFetchedSelection" :disabled="fetchSelected.size === 0 && !fetchedSoclaasUpdates">
+                  {{ t(fetchSelected.size === 0 && fetchedSoclaasUpdates ? 'aiService.applyModelUpdates' : 'aiService.confirmAdd') }}
                 </button>
               </div>
             </div>

@@ -33,9 +33,9 @@ use tokio::sync::oneshot;
 
 /// How long a pending write waits for an answer before giving up.
 ///
-/// Long enough to read a page of markdown and think about it, short enough that
-/// an agent left running against a closed window does not hang forever.
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(180);
+/// Allow 30 minutes to review annotations and other writes, while still bounding
+/// how long an agent left running against a closed window can wait.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// How often the wait re-checks the generation's cancel flag, so pressing stop
 /// takes the dialog down instead of leaving it stranded.
@@ -135,7 +135,7 @@ pub async fn request(
     let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
     let decision = loop {
         // Poll rather than a bare `timeout`, so a stopped generation takes the
-        // dialog down promptly instead of holding the loop for three minutes.
+        // dialog down promptly instead of waiting for the confirmation deadline.
         tokio::select! {
             answer = &mut rx => break match answer {
                 Ok(resolution) => resolution,

@@ -503,6 +503,7 @@ impl PendingArxivWrite {
             recommendations: self.preview.clone(),
             keep_duplicate_copies: self.keep_duplicate_copies,
             changes: vec![],
+            note_before: None,
         }
     }
 

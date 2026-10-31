@@ -7,6 +7,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { Window as TauriWindow } from '@tauri-apps/api/window'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { LogicalSize } from '@tauri-apps/api/dpi'
+import { onNotesChanged } from '../utils/noteSync'
 import { useLibraryStore } from '../stores/library'
 import { useReaderStore, featureTabKey } from '../stores/reader'
 import { useImportStore } from '../stores/import'
@@ -633,6 +634,7 @@ let unlistenDragDrop: (() => void) | null = null
 let unlistenOpenPaper: UnlistenFn | null = null
 let unlistenLibraryPaperAdded: UnlistenFn | null = null
 let unlistenRagSettingsChanged: UnlistenFn | null = null
+let unlistenNotesChanged: UnlistenFn | null = null
 let unlistenHighlightsAdded: UnlistenFn | null = null
 let unlistenHighlightsChanged: UnlistenFn | null = null
 let mainFocusRetryTimer: number | null = null
@@ -688,6 +690,12 @@ onMounted(async () => {
     // import so they end up with equivalent metadata coverage.
     const slug = event.payload?.slug
     if (slug) importStore.processAddedPaper(slug, event.payload?.title)
+  })
+
+  unlistenNotesChanged = await onNotesChanged(payload => {
+    if (payload.root !== libraryStore.currentPath) return
+    window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', { detail: { slug: payload.slug } }))
+    if (payload.action !== 'expired') void libraryStore.refresh()
   })
 
   unlistenHighlightsAdded = await listen<{ root: string; slug: string; highlights: import('../types').Highlight[] }>('paper-highlights-added', ({ payload }) => {
@@ -785,6 +793,7 @@ onUnmounted(() => {
   unlistenLibraryPaperAdded?.()
   unlistenRagSettingsChanged?.()
   unlistenHighlightsAdded?.()
+  unlistenNotesChanged?.()
   unlistenHighlightsChanged?.()
 })
 

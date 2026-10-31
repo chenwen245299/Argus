@@ -334,12 +334,27 @@ pub struct IndexFile {
 
 // ── Multi-Notes ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Note {
     pub id: String,
     pub title: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct NoteSnapshot {
+    #[serde(flatten)]
+    pub note: Note,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DeletedNote {
+    #[serde(flatten)]
+    pub snapshot: NoteSnapshot,
+    pub deleted_at: String,
+    pub expires_at: String,
 }
 
 // ── M4: Collections ───────────────────────────────────────────────────────────
@@ -348,6 +363,8 @@ pub struct Note {
 pub struct Collection {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emoji: Option<String>,
     pub parent_id: Option<String>,

@@ -1,4 +1,5 @@
-//! Device-local user knowledge profile. Only the user's own statements and
+//! User knowledge profile, shared locally across libraries and replicated with
+//! each opened library. Only the user's own statements and
 //! understanding feedback can create memories; paper/tool text is never input.
 use crate::models::{AgentMessage, ChatContent, ChatContentPart, ChatMessage};
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use tauri::{Emitter, Manager};
+use crate::user_memory_sync::{SyncState, WriteKind};
 
 const MAX_ENTRIES: usize = 48;
 const MAX_PROCESSED: usize = 256;
@@ -51,7 +53,7 @@ pub struct MemoryEntry {
     pub locked: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 struct Profile {
     enabled: bool,
@@ -64,6 +66,9 @@ struct Profile {
     last_checked_at: Option<String>,
     last_error: Option<String>,
     live_writes: u64,
+    sync: SyncState,
+    sync_root: Option<String>,
+    sync_error: Option<String>,
 }
 
 impl Default for Profile {
@@ -78,6 +83,9 @@ impl Default for Profile {
             last_checked_at: None,
             last_error: None,
             live_writes: 0,
+            sync: SyncState::default(),
+            sync_root: None,
+            sync_error: None,
         }
     }
 }
@@ -95,6 +103,8 @@ pub struct MemoryView {
     pub pending_turns: usize,
     pub background_runs: u64,
     pub live_writes: u64,
+    pub sync_root: Option<String>,
+    pub sync_error: Option<String>,
 }
 
 fn io_lock() -> &'static Mutex<()> {
@@ -117,6 +127,8 @@ fn read_at(path: &Path) -> Result<Profile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let profile: Profile =
         serde_json::from_str(&text).map_err(|e| format!("Read user profile: {e}"))?;
+    profile.sync.validate()?;
+    if profile.entries.iter().any(|entry| !valid_sync_entry(entry)) { return Err("Invalid user memory entry; the profile was not replaced.".into()); }
     Ok(profile)
 }
 fn write_at(path: &Path, profile: &Profile) -> Result<(), String> {
@@ -129,6 +141,101 @@ fn write_at(path: &Path, profile: &Profile) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())
 }
+fn current_root(app: &tauri::AppHandle) -> Option<String> {
+    app.try_state::<crate::LibraryRoot>().and_then(|state| state.0.lock().ok().and_then(|root| root.clone()))
+}
+
+pub(crate) fn valid_sync_entry(entry: &MemoryEntry) -> bool {
+    valid_content(&entry.content) && entry.id.len() <= 160 && entry.key.len() <= 160
+        && entry.evidence.chars().count() <= 160 && !contains_secret(&entry.evidence)
+}
+
+/// A filesystem mirror is not an iCloud upload acknowledgement. Keep local
+/// memory usable on sync errors, retain every writer cell, and expose the error.
+fn reconcile_files(profile: &mut Profile, root: Option<&str>, device: &str) -> (bool, bool) {
+    profile.sync.seed(&profile.entries, device);
+    let before_sync = profile.sync.clone();
+    let before_entries = profile.entries.clone();
+    profile.sync_error = None;
+    profile.sync_root = root.map(str::to_string);
+    if let Some(root) = root {
+        if let Err(error) = crate::user_memory_sync::import(root, &mut profile.sync) { profile.sync_error = Some(error); }
+    }
+    let controls = profile.sync.controls_changed(&before_sync);
+    let discard = profile.sync.discarded_work(&before_sync);
+    profile.entries = profile.sync.entries(MAX_ENTRIES);
+    if controls { profile.generation = profile.generation.saturating_add(1); }
+    if controls || profile.entries != before_entries { profile.revision = profile.revision.saturating_add(1); }
+    (controls, discard)
+}
+
+fn refresh(app: &tauri::AppHandle, preferred_root: Option<&str>) -> Result<(), String> {
+    let root = preferred_root.map(str::to_string).or_else(|| current_root(app));
+    let device = crate::activity::device_id(app);
+    let (controls, discard, generation, changed) = {
+        let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let path = path(app)?;
+        let mut profile = read_at(&path)?;
+        let before = profile.clone();
+        let (controls, discard) = if let Ok(device) = &device {
+            reconcile_files(&mut profile, root.as_deref(), device)
+        } else { profile.sync_error = device.as_ref().err().cloned(); (false, false) };
+        // Persist the merged state before exporting it: a read-only/unavailable
+        // cloud folder must never discard a local correction or tombstone.
+        if profile != before { write_at(&path, &profile)?; }
+        if let (Some(root), Ok(device)) = (&root, &device) {
+            if let Err(error) = crate::user_memory_sync::publish(root, device, &profile.sync) { profile.sync_error = Some(error); }
+        }
+        if profile != before { write_at(&path, &profile)?; }
+        let changed = profile.entries != before.entries || profile.sync_root != before.sync_root || profile.sync_error != before.sync_error;
+        (controls, discard, profile.generation, changed)
+    };
+    // Queue locking always happens AFTER profile I/O, including remote edits.
+    // The queue's eligibility check reads the cache only, avoiding lock reversal.
+    if controls { crate::user_memory_queue::invalidate(app, generation, !discard); }
+    if changed || controls { announce(app, controls); }
+    Ok(())
+}
+
+fn save_profile(app: &tauri::AppHandle, path: &Path, before: &Profile, profile: &mut Profile,
+    kind: WriteKind, preferred_root: Option<&str>) -> Result<(), String> {
+    let device = crate::activity::device_id(app);
+    profile.sync.record(&before.entries, &profile.entries, device.as_deref().unwrap_or("local"), kind);
+    if matches!(kind, WriteKind::Forget) && profile.sync.discarded_work(&before.sync) {
+        profile.generation = profile.generation.saturating_add(1);
+    }
+    profile.entries = profile.sync.entries(MAX_ENTRIES);
+    profile.sync_root = preferred_root.map(str::to_string).or_else(|| current_root(app));
+    profile.sync_error = device.as_ref().err().cloned();
+    write_at(path, profile)?;
+    if let (Some(root), Ok(device)) = (&profile.sync_root, &device) {
+        if let Err(error) = crate::user_memory_sync::publish(root, device, &profile.sync) { profile.sync_error = Some(error); }
+    }
+    write_at(path, profile)
+}
+
+pub(crate) fn spawn_sync(app: &tauri::AppHandle) {
+    use tauri::Listener;
+    use std::sync::Arc;
+    fn run(app: tauri::AppHandle, gate: Arc<tokio::sync::Semaphore>) {
+        let Ok(permit) = gate.try_acquire_owned() else { return; };
+        tauri::async_runtime::spawn_blocking(move || {
+            let _permit = permit;
+            if let Err(error) = refresh(&app, None) { eprintln!("[user-memory] sync: {error}"); }
+        });
+    }
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let handle = app.clone();
+    let on_change_gate = gate.clone();
+    app.listen("library-changed", move |_| run(handle.clone(), on_change_gate.clone()));
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop { interval.tick().await; run(handle.clone(), gate.clone()); }
+    });
+}
+
 fn view(profile: Profile) -> MemoryView {
     let status = crate::user_memory_queue::status();
     MemoryView {
@@ -142,9 +249,12 @@ fn view(profile: Profile) -> MemoryView {
         pending_turns: status.pending,
         background_runs: status.runs,
         live_writes: profile.live_writes,
+        sync_root: profile.sync_root,
+        sync_error: profile.sync_error,
     }
 }
 pub fn get(app: &tauri::AppHandle) -> Result<MemoryView, String> {
+    refresh(app, None)?;
     let profile = {
         let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
         read_at(&path(app)?)?
@@ -160,17 +270,20 @@ fn announce(app: &tauri::AppHandle, context_changed: bool) {
 fn mutate(
     app: &tauri::AppHandle,
     preserve_pending: bool,
+    kind: WriteKind,
     update: impl FnOnce(&mut Profile) -> Result<(), String>,
 ) -> Result<MemoryView, String> {
+    refresh(app, None)?;
     let output = {
         let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
         let path = path(app)?;
         let mut profile = read_at(&path)?;
+        let before = profile.clone();
         update(&mut profile)?;
         profile.generation = profile.generation.saturating_add(1);
         profile.revision = profile.revision.saturating_add(1);
         profile.last_error = None;
-        write_at(&path, &profile)?;
+        save_profile(app, &path, &before, &mut profile, kind, None)?;
         profile
     };
     crate::user_memory_queue::invalidate(app, output.generation, preserve_pending);
@@ -182,7 +295,7 @@ pub fn configure(
     enabled: bool,
     auto_learn: bool,
 ) -> Result<MemoryView, String> {
-    mutate(app, false, |p| {
+    mutate(app, false, WriteKind::Manual, |p| {
         p.enabled = enabled;
         p.auto_learn = auto_learn;
         Ok(())
@@ -217,7 +330,7 @@ pub fn edit(app: &tauri::AppHandle, edit: MemoryEdit) -> Result<MemoryView, Stri
     if !valid_content(&edit.content) {
         return Err("Memory must contain 1–300 characters and no credentials.".into());
     }
-    mutate(app, true, |p| {
+    mutate(app, true, WriteKind::Manual, |p| {
         let stamp = now();
         if let Some(id) = edit.id {
             let entry = p
@@ -259,8 +372,10 @@ pub fn edit(app: &tauri::AppHandle, edit: MemoryEdit) -> Result<MemoryView, Stri
     })
 }
 pub fn remove(app: &tauri::AppHandle, id: Option<String>) -> Result<MemoryView, String> {
-    mutate(app, false, |p| {
+    let kind = if id.is_none() { WriteKind::Clear } else { WriteKind::Manual };
+    mutate(app, false, kind, |p| {
         if let Some(id) = id {
+            if !p.entries.iter().any(|entry| entry.id == id) { return Err("Memory no longer exists; refresh before deleting".into()); }
             p.entries.retain(|entry| entry.id != id);
         } else {
             p.entries.clear();
@@ -282,7 +397,7 @@ pub fn with_guidance(prompt: String, tools: bool) -> String {
 }
 fn profile_context(profile: &Profile) -> String {
     let facts: Vec<_> = if profile.enabled {
-        profile.entries.iter().take(MAX_ENTRIES).map(|entry| serde_json::json!({
+        profile.entries.iter().map(|entry| serde_json::json!({
         "key":entry.key,"category":entry.category,"knowledgeLevel":entry.knowledge_level,
         "fact":entry.content,"protected":entry.locked,
     })).collect()
@@ -295,6 +410,7 @@ fn profile_context(profile: &Profile) -> String {
     )
 }
 pub fn is_enabled(app: &tauri::AppHandle) -> bool {
+    let _ = refresh(app, None);
     let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
     path(app)
         .and_then(|path| read_at(&path))
@@ -304,6 +420,7 @@ pub fn context(app: &tauri::AppHandle) -> String {
     context_for_turn(app, true)
 }
 pub fn context_for_turn(app: &tauri::AppHandle, learn: bool) -> String {
+    let _ = refresh(app, None);
     let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
     path(app)
         .and_then(|path| read_at(&path))
@@ -356,6 +473,7 @@ pub fn strip_context(messages: &mut Vec<serde_json::Value>) {
     });
 }
 pub fn generation(app: &tauri::AppHandle) -> Option<u64> {
+    let _ = refresh(app, None);
     let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
     path(app)
         .and_then(|path| read_at(&path))
@@ -408,6 +526,7 @@ pub fn observe(
     conversation: Option<&str>,
     source: &str,
 ) -> Option<Observation> {
+    refresh(app, Some(root)).ok()?;
     let generation = {
         let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
         let profile = read_at(&path(app).ok()?).ok()?;
@@ -561,6 +680,7 @@ fn apply_changes(profile: &mut Profile, changes: &[Change], observation: &Observ
                     .iter()
                     .position(|e| !change.key.is_empty() && e.key == change.key)
             });
+        if existing.is_none() && !profile.sync.allows_observation(&change.key, &observation.observed_at) { continue; }
         if profile
             .entries
             .iter()
@@ -706,6 +826,7 @@ pub(crate) async fn process_batch(
     app: &tauri::AppHandle,
     batch: &[crate::user_memory_queue::PendingTurn],
 ) -> Result<Vec<String>, String> {
+    refresh(app, batch.first().map(|turn| turn.root.as_str()))?;
     let snapshot = {
         let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
         read_at(&path(app)?)?
@@ -745,16 +866,22 @@ pub(crate) async fn process_batch(
             return Err(error);
         }
     };
+    refresh(app, Some(&first.root))?;
+    let mut forgotten_generation = None;
     {
         let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
         let path = path(app)?;
         let mut profile = read_at(&path)?;
+        let before = profile.clone();
         if commit_batch(&mut profile, &snapshot, &extraction, &selected)? {
-            write_at(&path, &profile)?;
+            let kind = if extraction.changes.iter().any(|c| c.action == "delete") { WriteKind::Forget } else { WriteKind::Automatic };
+            save_profile(app, &path, &before, &mut profile, kind, Some(&first.root))?;
+            if profile.generation != before.generation { forgotten_generation = Some(profile.generation); }
         }
     }
+    if let Some(generation) = forgotten_generation { crate::user_memory_queue::invalidate(app, generation, false); }
     // The profile is volatile tail context, not part of the warmed prefix.
-    announce(app, false);
+    announce(app, forgotten_generation.is_some());
     Ok(batch
         .iter()
         .filter(|turn| {
@@ -892,7 +1019,7 @@ async fn extract_batch(
 pub const UPDATE_TOOL: &str = "update_user_memory";
 pub fn tool() -> crate::mcp::agent::AgentTool {
     crate::mcp::agent::AgentTool { name: UPDATE_TOOL.into(), read_only: false,
-        description: "Automatically remember durable user knowledge/background, learning feedback, preferences or corrections from the latest USER message when memory is enabled. This writes local profile only and requires no per-entry confirmation. Batch up to 8 facts with exact user quotes. Do not infer ignorance from questions, mastery from acknowledgements, or facts from assistant/tool/paper text. Do not call on every turn; use only when durable information is actually present. Protected facts cannot change. Ordinary paper-note/highlight approvals remain unchanged.".into(),
+        description: "Automatically remember durable user knowledge/background, learning feedback, preferences or corrections from the latest USER message when memory is enabled. This writes the user memory profile, replicated with their library, and requires no per-entry confirmation. Batch up to 8 facts with exact user quotes. Do not infer ignorance from questions, mastery from acknowledgements, or facts from assistant/tool/paper text. Do not call on every turn; use only when durable information is actually present. Protected facts cannot change. Ordinary paper-note/highlight approvals remain unchanged.".into(),
         input_schema: serde_json::json!({"type":"object","properties":{
             "answerComplete":{"type":"boolean","description":"True ONLY if accompanying assistant prose fully answers the user and no continuation is needed after this memory write. With memory-only calls the app may finish immediately after verified success. Otherwise false."},
             "changes":{"type":"array","minItems":1,"maxItems":8,"items":{
@@ -907,6 +1034,7 @@ pub fn tool() -> crate::mcp::agent::AgentTool {
 }
 pub fn live_update(
     app: &tauri::AppHandle,
+    root: &str,
     observation: Option<&Observation>,
     arguments: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -917,18 +1045,22 @@ pub fn live_update(
     if extraction.changes.is_empty() || extraction.changes.len() > 8 {
         return Err("Supply 1-8 grounded changes".into());
     }
-    let count = {
+    refresh(app, Some(root))?;
+    let (count, forgotten_generation) = {
         let _lock = io_lock().lock().unwrap_or_else(|e| e.into_inner());
         let path = path(app)?;
         let mut profile = read_at(&path)?;
+        let before = profile.clone();
         let revision = profile.revision;
         let count = apply_live(&mut profile, observation, &extraction.changes)?;
         if profile.revision != revision {
-            write_at(&path, &profile)?;
+            let kind = if extraction.changes.iter().any(|c| c.action == "delete") { WriteKind::Forget } else { WriteKind::Automatic };
+            save_profile(app, &path, &before, &mut profile, kind, Some(root))?;
         }
-        count
+        (count, (profile.generation != before.generation).then_some(profile.generation))
     };
-    announce(app, false);
+    if let Some(generation) = forgotten_generation { crate::user_memory_queue::invalidate(app, generation, false); }
+    announce(app, forgotten_generation.is_some());
     Ok(
         serde_json::json!({"updated":count,"detail":"Saved locally. Continue the user's actual task; no need to repeat these facts or ask for confirmation."}),
     )
@@ -1674,4 +1806,105 @@ mod tests {
             .is_empty());
         assert!(!valid_content("token sk-123456789012345678901"));
     }
+    fn sync_test_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("argus-profile-sync-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".argus")).unwrap(); root
+    }
+    fn seed_sync_profile() -> Profile {
+        let mut profile = Profile::default();
+        let observation = sample("线性代数我已经系统学过");
+        apply_changes(&mut profile, &[change("add", "algebra", "熟悉线性代数", &observation.text, "familiar")], &observation);
+        profile
+    }
+
+    #[test]
+    fn legacy_profile_migrates_without_exporting_learning_switches_pending_data_or_counters() {
+        let root = sync_test_root();
+        let local = root.join("legacy-device-profile.json");
+        let mut profile = seed_sync_profile(); profile.enabled = false; profile.auto_learn = false;
+        profile.processed = vec!["local-processing-ticket".into()]; profile.live_writes = 9;
+        let mut legacy = serde_json::to_value(&profile).unwrap();
+        for field in ["sync", "syncRoot", "syncError"] { legacy.as_object_mut().unwrap().remove(field); }
+        std::fs::write(&local, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut upgraded = read_at(&local).unwrap();
+        let generation = upgraded.generation;
+        let root_str = root.to_string_lossy();
+        let (controls, discard) = reconcile_files(&mut upgraded, Some(&root_str), "original-device");
+        assert!(!controls && !discard, "local migration does not invalidate queued observations");
+        assert_eq!(upgraded.generation, generation);
+        crate::user_memory_sync::publish(&root_str, "original-device", &upgraded.sync).unwrap();
+        write_at(&local, &upgraded).unwrap();
+        let reopened = read_at(&local).unwrap();
+        assert_eq!(reopened.entries, profile.entries); assert!(!reopened.enabled); assert!(!reopened.auto_learn);
+        assert_eq!(reopened.processed, profile.processed); assert_eq!(reopened.live_writes, 9);
+        let mut other = Profile::default(); reconcile_files(&mut other, Some(&root_str), "new-device");
+        assert_eq!(other.entries, profile.entries); assert!(other.enabled && other.auto_learn);
+        assert_eq!(other.live_writes, 0); assert!(other.processed.is_empty());
+        assert!(profile_context(&other).contains("熟悉线性代数"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn memory_remains_shared_across_libraries_and_bridges_synced_updates_between_them() {
+        let a = sync_test_root(); let b = sync_test_root();
+        let a_path = a.to_string_lossy(); let b_path = b.to_string_lossy();
+        let mut original = seed_sync_profile();
+        reconcile_files(&mut original, Some(&a_path), "a");
+        crate::user_memory_sync::publish(&a_path, "a", &original.sync).unwrap();
+        reconcile_files(&mut original, Some(&b_path), "a");
+        crate::user_memory_sync::publish(&b_path, "a", &original.sync).unwrap();
+        let mut peer = Profile::default(); reconcile_files(&mut peer, Some(&b_path), "b");
+        assert_eq!(peer.entries, original.entries);
+        let before = peer.entries.clone(); let observation = sample("我没学过 KL 散度");
+        apply_changes(&mut peer, &[change("add", "kl", "尚未学过 KL 散度", &observation.text, "new")], &observation);
+        peer.sync.record(&before, &peer.entries, "b", WriteKind::Automatic);
+        crate::user_memory_sync::publish(&b_path, "b", &peer.sync).unwrap();
+        let generation = original.generation;
+        let (controls, _) = reconcile_files(&mut original, Some(&b_path), "a");
+        assert!(!controls); assert_eq!(original.generation, generation, "automatic sync keeps pending turns and cache generations intact");
+        assert_eq!(original.entries.len(), 2);
+        reconcile_files(&mut original, Some(&a_path), "a");
+        crate::user_memory_sync::publish(&a_path, "a", &original.sync).unwrap();
+        let mut third = Profile::default(); reconcile_files(&mut third, Some(&a_path), "c");
+        assert_eq!(third.entries, original.entries);
+        reconcile_files(&mut original, None, "a"); assert_eq!(original.entries.len(), 2);
+        std::fs::remove_dir_all(a).unwrap(); std::fs::remove_dir_all(b).unwrap();
+    }
+
+    #[test]
+    fn remote_manual_edits_rebase_work_while_remote_clear_invalidates_inflight_learning() {
+        let root = sync_test_root(); let root_path = root.to_string_lossy();
+        let mut local = seed_sync_profile(); reconcile_files(&mut local, Some(&root_path), "a");
+        let mut peer = local.clone(); let before = peer.entries.clone();
+        peer.entries[0].content = "我正在补习线性代数".into(); peer.entries[0].source = "manual".into(); peer.entries[0].locked = true;
+        peer.sync.record(&before, &peer.entries, "b", WriteKind::Manual);
+        crate::user_memory_sync::publish(&root_path, "b", &peer.sync).unwrap();
+        let generation = local.generation;
+        let (controls, discard) = reconcile_files(&mut local, Some(&root_path), "a");
+        assert!(controls && !discard); assert_eq!(local.generation, generation + 1); assert!(local.entries[0].locked);
+        let snapshot = local.clone();
+        peer.sync.record(&peer.entries, &[], "b", WriteKind::Clear);
+        crate::user_memory_sync::publish(&root_path, "b", &peer.sync).unwrap();
+        let (controls, discard) = reconcile_files(&mut local, Some(&root_path), "a");
+        assert!(controls && discard); assert!(local.entries.is_empty());
+        let mut stale = sample("线性代数我已经系统学过"); stale.generation = snapshot.generation;
+        assert!(!can_learn(&local, &stale));
+        let extraction = Extraction { changes: vec![change("add", "algebra", "熟悉线性代数", &stale.text, "familiar")] };
+        assert!(!commit_batch(&mut local, &snapshot, &extraction, &[stale]).unwrap());
+        assert!(local.entries.is_empty(), "a completion from before the cloud clear cannot resurrect memory");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_peer_records_do_not_disable_or_erase_the_local_profile() {
+        let root = sync_test_root(); let dir = root.join(".argus/user_memory"); std::fs::create_dir(&dir).unwrap();
+        let broken = dir.join("broken.json"); std::fs::write(&broken, "broken json").unwrap();
+        let mut local = seed_sync_profile(); let before = local.entries.clone();
+        reconcile_files(&mut local, Some(&root.to_string_lossy()), "a");
+        assert_eq!(local.entries, before); assert!(local.sync_error.is_some()); assert!(local.enabled);
+        assert!(profile_context(&local).contains("熟悉线性代数"));
+        assert_eq!(std::fs::read_to_string(broken).unwrap(), "broken json");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

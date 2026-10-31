@@ -208,6 +208,28 @@ rich-text applications such as PowerPoint consume the text instead of pasting
 nothing. Keep Vditor's original Markdown/TeX conversion and cut deletion; do not
 replace these with flattened selection text or an asynchronous clipboard write.
 
+**Note changes and Recently Deleted.** The app-only `update_paper_note`,
+`delete_paper_note` and `restore_paper_note` use the existing write-approval
+handshake. Updates preview the complete saved before/after; deletion and restore
+preview the exact note. Paper identity and the saved note snapshot are checked
+again under the per-paper notes lock after approval. `list_deleted_paper_notes`
+is an app-only read; external MCP remains read-only and sees only live notes.
+Both manual and AI deletes store a complete record in `notes/.trash/<id>.json`,
+then remove the live index entry/body. Restore retains the original id, creation
+time, title, Markdown and relative `assets/` references, refusing to overwrite
+live notes. Retention is exactly deletion time + 30 days: expired notes cannot
+be restored; `note_trash.rs` purges on startup/library changes and hourly, while
+the trash-list command also purges before reading. Shared image assets are kept
+because live notes may reference them. Malformed records are never reset.
+`NotesTab.vue` hosts a collapsed bottom “最近删除” section with previews, expiry
+countdowns and restore actions. `paper-notes-changed` carries root/slug/id/action
+after successful writes and refreshes lists, clean editors, search and canvas
+badges. Dirty sidebar/standalone drafts remain visible; deletion pauses their
+autosave until restore. Saves require a live indexed note, support an expected
+body and root, and cannot resurrect deleted notes or overwrite newer AI edits.
+Regressions: Rust `notes_lifecycle_tests` / `mcp` / `write_confirm`, plus
+`scripts/test-note-trash-browser.mjs` and `scripts/test-write-confirm.mjs`.
+
 **Paper AI guided reading.** The shared `AiTab.vue` header exposes AI 领读 in
 both the sidebar and `PaperAiView`. It starts a fresh conversation with
 `source: "guidedReading"`, immediately sends the localized preset from
@@ -266,8 +288,11 @@ nonempty, uncancelled answer in a guided conversation, or when the user checks
 transient. Storage and a local change event synchronize open windows. Keep
 implementation and persistence rules out of the feature announcement copy.
 
-**Automatic user memory.** `user_memory.rs` stores one device-local knowledge
-profile in app-data `user_memory.json`, shared across libraries. It is enabled
+**Automatic user memory.** `user_memory.rs` keeps one knowledge profile shared
+across libraries, with a durable app-data `user_memory.json` cache. Memory facts,
+evidence, manual corrections/protection and deletions also travel with the
+opened library in `.argus/user_memory/device-<id-hash>.json`, so the user's
+existing iCloud/other file sync carries them across devices. It is enabled
 by default; 设置 → AI 随航 → 用户记忆 (`memory`) can disable both learning and
 personalization, inspect exact supporting quotes, correct/protect entries, or
 delete/clear them. There is no manual extraction button. Two paths complement
@@ -308,6 +333,30 @@ opt-out invalidate/discard old jobs so deleted data cannot be resurrected.
 Fingerprints include the prior explanation to distinguish repeated feedback
 about different concepts. Storage is atomic; malformed files are not silently
 replaced (explicit clear/opt-out may reset a broken pending file).
+
+`user_memory_sync.rs` merges independent device writer cells; a device never
+rewrites another device's file. Existing app-data profiles migrate automatically
+using their original evidence times, and the local merged replica repairs stale
+cloud replacements. Same-topic entries merge by stable key; latest user
+observations win, with explicit manual controls taking precedence over offline
+automatic writes that have not seen them. Reviewed unlocks permit later learning.
+Per-key tombstones and a clear epoch prevent deleted/cleared memories from
+returning via stale files or old pending work, including a late-upgrading device.
+Unprotected overflow remains in the replica; concurrent protected facts are
+never silently discarded. Automatic sync keeps the generation/cache prefix
+stable; remote manual corrections rebase pending observations, while deletion
+and clear invalidate them. The current profile is refreshed before reads/writes
+and batch commit; startup, library changes and a serialized 10-second poll also
+merge incoming files and notify open settings. Profile writes are atomic and
+unchanged polls do not rewrite cloud files. Invalid/unsupported/symlinked writer
+files are preserved and reported; usable local/peer facts remain available and
+sync retries automatically. Learning switches, pending excerpts, provider/root
+paths, processed-turn fingerprints and usage counters stay device-local. The
+settings describe this scope and show library/local-only/sync-error status.
+Regressions: `user_memory_sync::tests`, user-memory profile/queue tests, and
+`scripts/test-user-memory.mjs` cover migration, offline concurrent additions,
+latest understanding, controls/tombstones/reset, multiple libraries, corrupt
+files, local-only data, pending generations, preserved edits and narrow layouts.
 
 Static memory guidance and tool declarations remain in the stable agent prefix.
 The current profile is a separate late system message before the newest user
@@ -388,6 +437,30 @@ visible sibling, preserving access to completed results.
 without waiting for another chunk; stream finalization still records partial
 usage and the agent still shuts its MCP connections down normally.
 
+**Conversation branches.** Paper AI (sidebar and standalone) and library chat
+offer “在新对话中分支” beneath completed answers. A branch owns an independent
+copy of the full prefix through that answer, including attachments, the selected
+model answer at each turn and complete tool evidence. Message/answer ids are new;
+live operations and context checkpoints are discarded, and its usage ledger
+starts empty. `copy_chat_branch_images` copies only retained PNG evidence under
+the new conversation id with the existing image guards and `expectedRoot`;
+missing legacy images stay unavailable. Optional `branch` metadata records the
+parent id/title, source message and turn. `utils/chatBranches.ts` groups each
+family by recent activity, with indented children; absent parents/cycles never
+hide records. Parents have an independent branch fold toggle in every history
+surface, with a hidden-descendant count when folded. The history action row
+keeps the chevron at the far right; hover/focus reveals Delete to its left,
+with a smooth width/gap transition so the chevron's click target never moves.
+Rows use compact symmetric padding; the standalone list overrides the generic
+list padding to avoid doubling its horizontal inset. `useConversationBranches`
+keeps folding local, scoped by library and paper; reloading retains nested fold
+choices without changing messages or the current chat. Opening a hidden chat or
+creating a branch reveals its ancestors. `ChatBranchOrigin.vue` links back to the source message. Deleting
+a parent leaves children usable. Paper branches use the existing save/snapshot
+synchronization without changing another window's selection or draft.
+Regressions: `scripts/test-chat-branches.mjs`,
+`scripts/test-chat-branches-browser.mjs`, and Rust `conversation_store_tests`.
+
 **Reading time includes paper AI.** `MainView.vue` uses one activity session
 for the active PDF/ebook or a visible AI sidebar's paper (including a selected
 paper with no PDF tab open). PDF and sidebar never run separate clocks. The
@@ -437,6 +510,19 @@ regenerating an answer starts collapsed again. Library chat keeps an opt-in
 `expandedReasoning` set per answer; paper AI uses initially closed `<details>`.
 
 `snippetLibrary.ts`, `translationHistory.ts`, and `update.ts` are reactive helper modules, not Pinia stores.
+
+**Pinned collections.** `Collection.pinned` (default false for older libraries)
+is stored alongside the tree in `.argus/collections.json`. `LeftSidebar` shows
+shortcuts below Recent Reading, with ancestor paths for nested collections, and
+keeps a pin toggle in the original tree row and its context menu. Shortcuts use
+the same collection identity/count/navigation/drop behavior; pinning never moves
+folders or changes assignments. Opening a shortcut reveals its ancestors in the
+tree. A bounded scrolling shortcut section preserves room for the tree. The
+root-checked setter writes atomically under the collections lock and emits
+`collections-changed`; sidebar focus also refreshes library data synced from
+another device. Load revisions discard outdated reads after a save/library
+switch. Regressions: `collections::tests` and
+`scripts/test-collection-pins-browser.mjs` (local mocked library).
 
 **AI model settings across windows.** Successful provider/model/default edits
 emit `ai-settings-changed` with the library root after persistence. Each window's
@@ -1507,6 +1593,7 @@ The library root contains:
 ├── .argus/
 │   ├── config.json          # Library config, app settings, RAG/arXiv/canvas settings
 │   ├── guided_reading.json  # Named AI reading prompts and their default
+│   ├── user_memory/         # Per-device user-memory facts/control replicas (synced)
 │   ├── index.json           # Rebuildable paper index cache
 │   ├── search.db            # SQLite FTS5 full-text index
 │   ├── search.version       # Index version marker
@@ -1908,4 +1995,4 @@ extend `LUNAR_HOLIDAYS` (HKO conversion tables) when it runs out.
 
 ---
 
-*Last updated: 2026-10-19. Keep this file in sync with major architectural changes.*
+*Last updated: 2026-10-31. Keep this file in sync with major architectural changes.*

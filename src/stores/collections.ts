@@ -7,6 +7,46 @@ import type { Collection, CollectionsFile, PaperIndexEntry } from '../types'
 export const useCollectionsStore = defineStore('collections', () => {
   const file = ref<CollectionsFile>({ collections: [], assignments: [] })
   const library = useLibraryStore()
+  const pendingPins = ref(new Set<string>())
+  let loadRevision = 0
+
+  const pinnedCollections = computed(() => file.value.collections.filter(c => c.pinned)
+    .slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })))
+
+  function collectionAncestors(id: string): Collection[] {
+    const ancestors: Collection[] = []
+    const seen = new Set([id])
+    let parentId = collectionById(id)?.parent_id
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId)
+      const parent = collectionById(parentId)
+      if (!parent) break
+      ancestors.unshift(parent)
+      parentId = parent.parent_id
+    }
+    return ancestors
+  }
+
+  function isPinPending(id: string) {
+    return pendingPins.value.has(`${library.currentPath}:${id}`)
+  }
+
+  async function setPinned(id: string, pinned: boolean) {
+    const root = library.currentPath
+    if (!root || isPinPending(id)) return
+    const key = `${root}:${id}`
+    pendingPins.value.add(key)
+    try {
+      await invoke('set_collection_pinned', { id, pinned, expectedRoot: root })
+      if (library.currentPath !== root) return
+      // A read started before this commit must not undo the new shortcut.
+      loadRevision++
+      const col = collectionById(id)
+      if (col) col.pinned = pinned
+    } finally {
+      pendingPins.value.delete(key)
+    }
+  }
 
   // A virtual staging list, not a collection. Assigning a recommendation to a
   // collection removes it immediately; the source metadata survives restarts.
@@ -128,8 +168,11 @@ export const useCollectionsStore = defineStore('collections', () => {
   }
 
   async function load() {
+    const root = library.currentPath
+    const revision = ++loadRevision
     try {
-      file.value = await invoke<CollectionsFile>('get_collections')
+      const loaded = await invoke<CollectionsFile>('get_collections', { expectedRoot: root })
+      if (root === library.currentPath && revision === loadRevision) file.value = loaded
     } catch (e) {
       console.error('Failed to load collections:', e)
     }
@@ -237,6 +280,10 @@ export const useCollectionsStore = defineStore('collections', () => {
 
   return {
     file,
+    pinnedCollections,
+    collectionAncestors,
+    setPinned,
+    isPinPending,
     arxivPapers,
     topLevel,
     childrenOf,

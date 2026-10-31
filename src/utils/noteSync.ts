@@ -12,6 +12,7 @@ import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event'
 const NOTE_SAVED_EVENT = 'argus-note-saved'
 
 export interface NoteSavedPayload {
+  root?: string | null
   slug: string
   noteId: string
   content: string
@@ -22,15 +23,29 @@ export interface NoteSavedPayload {
 /** Stable per-webview id for `origin`. */
 export const NOTE_SYNC_ORIGIN = `note-sync-${Math.random().toString(36).slice(2, 10)}`
 
-export function broadcastNoteSaved(slug: string, noteId: string, content: string) {
+export function broadcastNoteSaved(slug: string, noteId: string, content: string, root?: string | null) {
   void emit(NOTE_SAVED_EVENT, {
     slug,
     noteId,
     content,
     origin: NOTE_SYNC_ORIGIN,
+    root,
   } satisfies NoteSavedPayload).catch(() => {
     // Not running under Tauri (or the event bridge is down) — local editing is
     // unaffected, the two views just won't mirror each other.
+  })
+}
+
+export interface NoteChangedPayload {
+  root: string
+  slug: string
+  noteId: string
+  action: 'created' | 'updated' | 'deleted' | 'restored' | 'expired'
+}
+
+export function onNotesChanged(handler: (payload: NoteChangedPayload) => void): Promise<UnlistenFn> {
+  return listen<NoteChangedPayload>('paper-notes-changed', event => {
+    if (event.payload?.root && event.payload.slug) handler(event.payload)
   })
 }
 

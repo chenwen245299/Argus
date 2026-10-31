@@ -47,6 +47,10 @@ use super::passage_anchors::{locate_anchor, locate_passage};
 /// The write tool's name, shared by the declaration, the dispatcher and the
 /// confirmation UI so they cannot drift apart.
 pub const CREATE_NOTE_TOOL: &str = "create_paper_note";
+pub const UPDATE_NOTE_TOOL: &str = "update_paper_note";
+pub const DELETE_NOTE_TOOL: &str = "delete_paper_note";
+pub const RESTORE_NOTE_TOOL: &str = "restore_paper_note";
+pub const LIST_DELETED_NOTES_TOOL: &str = "list_deleted_paper_notes";
 pub const CREATE_HIGHLIGHTS_TOOL: &str = "create_paper_highlights";
 pub const CREATE_ANNOTATIONS_TOOL: &str = "create_paper_annotations";
 pub const UPDATE_MARKS_TOOL: &str = "update_paper_highlights";
@@ -60,7 +64,7 @@ pub const REMOVE_MARKS_TOOL: &str = "remove_paper_highlights";
 /// [`crate::canvas_edit`]): it never runs read-only either, and lives behind the
 /// same confirmation.
 pub fn is_write_tool(name: &str) -> bool {
-    matches!(name, CREATE_NOTE_TOOL | CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL
+    matches!(name, CREATE_NOTE_TOOL | UPDATE_NOTE_TOOL | DELETE_NOTE_TOOL | RESTORE_NOTE_TOOL | CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL
         | UPDATE_MARKS_TOOL | REMOVE_MARKS_TOOL)
         || super::arxiv_tools::is_write(name)
         || crate::canvas_edit::is_edit_tool(name)
@@ -81,6 +85,15 @@ const MAX_CONTENT_CHARS: usize = 50_000;
 #[derive(Debug, Clone)]
 pub enum PendingWrite {
     Arxiv(super::arxiv_tools::PendingArxivWrite),
+    ChangeNote {
+        tool: String, slug: String, paper_id: String, paper_title: String,
+        before: crate::models::NoteSnapshot,
+        after: Option<(String, String)>,
+    },
+    RestoreNote {
+        slug: String, paper_id: String, paper_title: String,
+        deleted: crate::models::DeletedNote,
+    },
     CreateNote {
         slug: String,
         /// Resolved from the library at parse time, for the dialog. The user
@@ -212,6 +225,8 @@ pub struct WritePreview {
     pub keep_duplicate_copies: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<MarkChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_before: Option<crate::models::NoteSnapshot>,
 }
 
 impl PendingWrite {
@@ -225,6 +240,35 @@ impl PendingWrite {
             return super::arxiv_tools::PendingArxivWrite::parse(root, name, args).map(Self::Arxiv);
         }
         match name {
+            UPDATE_NOTE_TOOL | DELETE_NOTE_TOOL | RESTORE_NOTE_TOOL => {
+                let slug = str_arg(args, "slug")?;
+                let id = str_arg(args, "note_id")?;
+                let meta = paper::read_meta(root, &slug)?;
+                if name == RESTORE_NOTE_TOOL {
+                    let deleted = paper::list_deleted_notes(root, &slug)?.into_iter()
+                        .find(|n| n.snapshot.note.id == id).ok_or("Deleted note was not found or has expired.")?;
+                    return Ok(Self::RestoreNote { slug, paper_id: meta.id, paper_title: meta.title, deleted });
+                }
+                let before = paper::note_snapshot(root, &slug, &id)?;
+                let after = if name == UPDATE_NOTE_TOOL {
+                    if args.get("title").is_none() && args.get("content").is_none() { return Err("Provide title and/or content to update.".into()); }
+                    let title = match args.get("title") {
+                        Some(value) => value.as_str().ok_or("title must be a string.")?.replace(['\r', '\n', '\t'], " ").trim().to_string(),
+                        None => before.note.title.clone(),
+                    };
+                    let content = match args.get("content") {
+                        Some(value) => value.as_str().ok_or("content must be a string.")?.to_string(),
+                        None => before.content.clone(),
+                    };
+                    if (args.get("title").is_some() && (title.is_empty() || title.chars().count() > MAX_TITLE_CHARS))
+                        || (args.get("content").is_some() && content.chars().count() > MAX_CONTENT_CHARS) {
+                        return Err("Use a nonempty title (at most 120 characters) and content of at most 50,000 characters.".into());
+                    }
+                    if title == before.note.title && content == before.content { return Err("The note is unchanged.".into()); }
+                    Some((title, content))
+                } else { None };
+                Ok(Self::ChangeNote { tool: name.into(), slug, paper_id: meta.id, paper_title: meta.title, before, after })
+            }
             CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL => {
                 let slug = str_arg(args, "slug")?;
                 let batch_color = match args.get("color") {
@@ -371,6 +415,18 @@ impl PendingWrite {
     pub fn preview(&self, root: &str) -> WritePreview {
         match self {
             Self::Arxiv(pending) => pending.preview(),
+            Self::ChangeNote { tool, slug, paper_title, before, after, .. } => WritePreview {
+                tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
+                note_title: after.as_ref().map(|a| a.0.clone()).unwrap_or_else(|| before.note.title.clone()),
+                content: after.as_ref().map(|a| a.1.clone()).unwrap_or_else(|| before.content.clone()),
+                note_before: after.as_ref().map(|_| before.clone()), duplicate_title: false,
+                passages: vec![], recommendations: vec![], keep_duplicate_copies: false, changes: vec![],
+            },
+            Self::RestoreNote { slug, paper_title, deleted, .. } => WritePreview {
+                tool: RESTORE_NOTE_TOOL.into(), slug: slug.clone(), paper_title: paper_title.clone(),
+                note_title: deleted.snapshot.note.title.clone(), content: deleted.snapshot.content.clone(),
+                note_before: None, duplicate_title: false, passages: vec![], recommendations: vec![], keep_duplicate_copies: false, changes: vec![],
+            },
             PendingWrite::CreateNote {
                 slug,
                 paper_title,
@@ -384,12 +440,12 @@ impl PendingWrite {
                 content: content.clone(),
                 duplicate_title: paper::list_notes(root, slug).iter().any(|n| &n.title == title),
                 passages: Vec::new(),
-                recommendations: Vec::new(), keep_duplicate_copies: false, changes: Vec::new(),
+                recommendations: Vec::new(), keep_duplicate_copies: false, changes: Vec::new(), note_before: None,
             },
             Self::MarkPassages { tool, slug, paper_title, highlights, .. } => WritePreview {
                 tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
                 note_title: String::new(), content: String::new(), duplicate_title: false,
-                recommendations: Vec::new(), keep_duplicate_copies: false, changes: Vec::new(),
+                recommendations: Vec::new(), keep_duplicate_copies: false, changes: Vec::new(), note_before: None,
                 passages: highlights.iter().map(|h| Passage { page: h.page, text: h.text.clone(),
                     color: h.color.clone(), style: h.style.clone(), note: h.note.clone(),
                     anchor: None, end_anchor: None }).collect(),
@@ -398,7 +454,7 @@ impl PendingWrite {
                 tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
                 note_title: String::new(), content: String::new(), duplicate_title: false,
                 recommendations: Vec::new(), keep_duplicate_copies: false,
-                passages: Vec::new(), changes: changes.clone(),
+                passages: Vec::new(), changes: changes.clone(), note_before: None,
             },
         }
     }
@@ -410,6 +466,22 @@ impl PendingWrite {
     pub fn execute(&self, root: &str) -> Result<serde_json::Value, String> {
         match self {
             Self::Arxiv(_) => Err("Recommendation writes require the approved async import/delete dispatcher.".into()),
+            Self::ChangeNote { slug, paper_id, before, after, .. } => {
+                if paper::read_meta(root, slug)?.id != *paper_id { return Err("Paper changed since the preview.".into()); }
+                if let Some((title, content)) = after {
+                    let note = paper::update_note_checked(root, slug, before, title, content)?;
+                    Ok(serde_json::json!({"updated": true, "slug": slug, "note_id": note.id, "title": note.title}))
+                } else {
+                    let deleted = paper::delete_note_checked(root, slug, before)?;
+                    Ok(serde_json::json!({"deleted": true, "slug": slug, "note_id": before.note.id,
+                        "title": before.note.title, "expires_at": deleted.expires_at, "recoverable_days": 30}))
+                }
+            },
+            Self::RestoreNote { slug, paper_id, deleted, .. } => {
+                if paper::read_meta(root, slug)?.id != *paper_id { return Err("Paper changed since the preview.".into()); }
+                let note = paper::restore_note(root, slug, &deleted.snapshot.note.id, Some(deleted))?;
+                Ok(serde_json::json!({"restored": true, "slug": slug, "note_id": note.id, "title": note.title}))
+            },
             Self::MarkPassages { slug, paper_id, pdf_path, revision, highlights, .. } => {
                 if paper::read_meta(root, slug)?.id != *paper_id
                     || crate::render::pdf_revision(pdf_path)? != *revision {
@@ -769,6 +841,51 @@ mod tests {
             preview.note_title,
             "the title written is the title shown"
         );
+    }
+
+    #[test]
+    fn existing_note_tools_preview_exact_changes_and_only_execute_the_reviewed_snapshot() {
+        let root = library_with_paper("notebook", "Paper title");
+        let note = paper::create_note_with(&root, "notebook", "Original title", "Original words").unwrap();
+        let args = serde_json::json!({"slug":"notebook","note_id":note.id,"title":"New title","content":"New words"});
+        let update = PendingWrite::parse(&root, UPDATE_NOTE_TOOL, &args).unwrap();
+        let preview = update.preview(&root);
+        assert_eq!(preview.note_before.as_ref().unwrap().content, "Original words");
+        assert_eq!(preview.note_before.as_ref().unwrap().note.title, "Original title");
+        assert_eq!(preview.content, "New words");
+        assert_eq!(paper::get_note(&root, "notebook", &note.id), "Original words", "validation and preview never write");
+        update.execute(&root).unwrap();
+        assert_eq!(paper::get_note(&root, "notebook", &note.id), "New words");
+        assert_eq!(paper::list_notes(&root, "notebook")[0].title, "New title");
+        let deletion = PendingWrite::parse(&root, DELETE_NOTE_TOOL, &serde_json::json!({"slug":"notebook","note_id":note.id})).unwrap();
+        assert_eq!(deletion.preview(&root).content, "New words");
+        deletion.execute(&root).unwrap();
+        assert!(paper::list_notes(&root, "notebook").is_empty());
+        let restoration = PendingWrite::parse(&root, RESTORE_NOTE_TOOL, &serde_json::json!({"slug":"notebook","note_id":note.id})).unwrap();
+        assert_eq!(restoration.preview(&root).content, "New words");
+        restoration.execute(&root).unwrap();
+        assert_eq!(paper::get_note(&root, "notebook", &note.id), "New words");
+        assert_eq!(paper::list_notes(&root, "notebook")[0].id, note.id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn note_tools_reject_stale_approval_invalid_ids_and_empty_updates() {
+        let root = library_with_paper("notebook-check", "Paper");
+        let note = paper::create_note_with(&root, "notebook-check", "Title", "Body").unwrap();
+        let args = serde_json::json!({"slug":"notebook-check","note_id":note.id});
+        assert!(PendingWrite::parse(&root, UPDATE_NOTE_TOOL, &args).is_err());
+        for tool in [UPDATE_NOTE_TOOL, DELETE_NOTE_TOOL, RESTORE_NOTE_TOOL] {
+            assert!(is_write_tool(tool));
+            assert!(PendingWrite::parse(&root, tool, &serde_json::json!({"slug":"notebook-check","note_id":"../escape","content":"X"})).is_err());
+        }
+        let update = PendingWrite::parse(&root, UPDATE_NOTE_TOOL, &serde_json::json!({"slug":"notebook-check","note_id":note.id,"content":"AI replacement"})).unwrap();
+        let deletion = PendingWrite::parse(&root, DELETE_NOTE_TOOL, &args).unwrap();
+        paper::save_note(&root, "notebook-check", &note.id, "User changed it").unwrap();
+        assert!(update.execute(&root).unwrap_err().contains("changed since"));
+        assert!(deletion.execute(&root).unwrap_err().contains("changed since"));
+        assert_eq!(paper::get_note(&root, "notebook-check", &note.id), "User changed it");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn mark_args(slug: &str, text: &str, note: Option<&str>) -> serde_json::Value {

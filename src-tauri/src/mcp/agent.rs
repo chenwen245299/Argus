@@ -166,7 +166,37 @@ fn app_only_tools() -> Vec<AgentTool> {
             "required": ["slug", "title", "content"],
             "additionalProperties": false,
         }),
-    }, passage_tool(false), passage_tool(true), update_marks_tool(), remove_marks_tool()]
+    }, passage_tool(false), passage_tool(true), update_marks_tool(), remove_marks_tool(),
+        note_change_tool(app_tools::UPDATE_NOTE_TOOL), note_change_tool(app_tools::DELETE_NOTE_TOOL),
+        note_change_tool(app_tools::RESTORE_NOTE_TOOL), deleted_notes_tool()]
+}
+
+fn note_change_tool(name: &str) -> AgentTool {
+    let updating = name == app_tools::UPDATE_NOTE_TOOL;
+    let restoring = name == app_tools::RESTORE_NOTE_TOOL;
+    let mut properties = serde_json::json!({
+        "slug": {"type":"string", "description":"Paper slug from get_paper."},
+        "note_id": {"type":"string", "description":"Exact note id from get_paper/get_note, or list_deleted_paper_notes for restoration."}
+    });
+    if updating {
+        properties["title"] = serde_json::json!({"type":"string","minLength":1,"maxLength":120,"description":"Optional complete new title; omission preserves it."});
+        properties["content"] = serde_json::json!({"type":"string","maxLength":50000,"description":"Optional COMPLETE replacement Markdown; repeat existing content when extending it. Empty clears the body; omission preserves it."});
+    }
+    let mut schema = serde_json::json!({"type":"object", "properties":properties,"required":["slug","note_id"],"additionalProperties":false});
+    if updating { schema["anyOf"] = serde_json::json!([{"required":["title"]},{"required":["content"]}]); }
+    AgentTool { name: name.into(), read_only: false, input_schema: schema,
+        description: format!("{} Call only when the user explicitly asks for this change. {} The user must approve this exact preview before execution. A refusal means stop; never retry automatically. Concurrent edits invalidate approval, so read again rather than overwriting them.",
+            if updating { "Modify an EXISTING paper note's title and/or full Markdown body. Read get_note first; preserve content the user did not ask you to change." }
+            else if restoring { "Restore a paper note from Recently Deleted. List list_deleted_paper_notes first; restores its original id, title, Markdown and image links without overwriting existing notes." }
+            else { "Move an EXISTING paper note to Recently Deleted. Read get_note first and identify the exact note. User and AI notes are both eligible. It remains recoverable for 30 days, then is permanently deleted." },
+            if updating { "The review shows its saved before/after title and content." } else { "The review shows the exact note's title and content." }),
+    }
+}
+
+fn deleted_notes_tool() -> AgentTool {
+    AgentTool { name: app_tools::LIST_DELETED_NOTES_TOOL.into(), read_only: true,
+        description: "List a paper's recoverable notes in Recently Deleted, including their original note ids, titles, full Markdown, deletion time and expiry. Expired notes are excluded. Use restore_paper_note, with user approval, to recover one. This read never modifies files.".into(),
+        input_schema: serde_json::json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"],"additionalProperties":false}) }
 }
 
 /// Changing marks that exist. Shared by the user's marks and the agent's own,
@@ -416,6 +446,10 @@ pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_js
         return super::arxiv_tools::call(root, name, args);
     }
     match name {
+        app_tools::LIST_DELETED_NOTES_TOOL => {
+            let slug = args.get("slug").and_then(|s| s.as_str()).ok_or("slug must be a string")?;
+            ok(serde_json::json!({"notes": crate::paper::list_deleted_notes(root, slug)?}))
+        }
         "find_papers" => {
             let p: server::FindPapersParams = params(args)?;
             ok(tools::find_papers(
@@ -812,6 +846,20 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(required, ["slug", "title", "content"]);
+    }
+
+    #[test]
+    fn note_mutation_and_restore_tools_require_confirmation_and_remain_app_only() {
+        for name in [app_tools::UPDATE_NOTE_TOOL, app_tools::DELETE_NOTE_TOOL, app_tools::RESTORE_NOTE_TOOL] {
+            let tool = tools().into_iter().find(|t| t.name == name).unwrap();
+            assert!(!tool.read_only);
+            assert!(tool.description.contains("approve"));
+            assert!(call("/nonexistent", name, &serde_json::json!({})).unwrap_err().contains("confirmation"));
+            assert!(!server::tool_declarations().iter().any(|t| t.name == name));
+        }
+        let list = tools().into_iter().find(|t| t.name == app_tools::LIST_DELETED_NOTES_TOOL).unwrap();
+        assert!(list.read_only);
+        assert!(!server::tool_declarations().iter().any(|t| t.name == list.name));
     }
 
     #[test]

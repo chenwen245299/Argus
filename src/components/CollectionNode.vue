@@ -29,6 +29,7 @@ const emit = defineEmits<{
   submitRename: [id: string]
   delete: [col: Collection]
   startNew: [parentId: string]
+  togglePin: [col: Collection]
   collectionDragStart: [e: MouseEvent, col: Collection]
   submitNew: []
   'update:renameValue': [val: string]
@@ -112,6 +113,18 @@ function onCollectionMouseDown(e: MouseEvent) {
       </template>
       <template v-else>
         <span class="coll-name" :class="{ 'coll-name--top': depth === 0 }">{{ collection.name }}</span>
+        <button
+          class="collection-pin-btn"
+          :class="{ pinned: collection.pinned }"
+          :title="t(collection.pinned ? 'collections.unpin' : 'collections.pin')"
+          :aria-label="t(collection.pinned ? 'collections.unpinNamed' : 'collections.pinNamed', { name: collection.name })"
+          :aria-pressed="!!collection.pinned"
+          :disabled="cStore.isPinPending(collection.id)"
+          @mousedown.stop
+          @click.stop="$emit('togglePin', collection)"
+        >
+          <Icon :icon="collection.pinned ? 'fluent:pin-16-filled' : 'fluent:pin-16-regular'" width="13" height="13" />
+        </button>
       </template>
 
       <!-- Expand toggle if has children -->
@@ -174,6 +187,7 @@ function onCollectionMouseDown(e: MouseEvent) {
         @submit-rename="(id: string) => $emit('submitRename', id)"
         @delete="(col: Collection) => $emit('delete', col)"
         @start-new="(id: string) => $emit('startNew', id)"
+        @toggle-pin="(col: Collection) => $emit('togglePin', col)"
         @collection-drag-start="(e: MouseEvent, col: Collection) => $emit('collectionDragStart', e, col)"
         @submit-new="() => $emit('submitNew')"
         @update:renameValue="(v: string) => $emit('update:renameValue', v)"
@@ -186,6 +200,27 @@ function onCollectionMouseDown(e: MouseEvent) {
 
 <style scoped>
 .coll-node { display: flex; flex-direction: column; }
+
+.collection-pin-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 20px;
+  height: 20px;
+  margin: -2px -3px;
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+.coll-item:hover .collection-pin-btn,
+.coll-item:focus-within .collection-pin-btn,
+.collection-pin-btn.pinned { opacity: 1; }
+.collection-pin-btn.pinned { color: var(--accent); }
+.collection-pin-btn:hover { color: var(--accent); background: var(--bg-active); }
+.collection-pin-btn:focus-visible { opacity: 1; outline: 2px solid var(--accent); outline-offset: 1px; }
+.collection-pin-btn:disabled { cursor: wait; opacity: 0.45; }
+@media (hover: none) { .collection-pin-btn { opacity: 1; } }
 
 .nav-item {
   display: flex;

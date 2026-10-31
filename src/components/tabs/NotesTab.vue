@@ -4,10 +4,12 @@ import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
 import VditorEditor from '../VditorEditor.vue'
+import MarkdownBody from '../MarkdownBody.vue'
+import { confirm } from '@tauri-apps/plugin-dialog'
 import { useLibraryStore } from '../../stores/library'
-import { broadcastNoteSaved, onNoteSavedElsewhere } from '../../utils/noteSync'
+import { broadcastNoteSaved, onNoteSavedElsewhere, onNotesChanged, type NoteChangedPayload } from '../../utils/noteSync'
 import { toDisplayMarkdown, toStoredMarkdown, savePastedImage } from '../../utils/noteAssets'
-import type { Note } from '../../types'
+import type { Note, DeletedNote } from '../../types'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 
 const library = useLibraryStore()
@@ -43,6 +45,18 @@ const view = ref<View>('list')
 // ── List state ────────────────────────────────────────────────────────────────
 const notes = ref<Note[]>([])
 const loadingList = ref(false)
+const deletedNotes = ref<DeletedNote[]>([])
+const trashExpanded = ref(false)
+const previewDeletedId = ref<string | null>(null)
+const deletedPreview = ref('')
+const operationError = ref('')
+const busyNoteId = ref<string | null>(null)
+const activeNoteDeleted = ref(false)
+let listRevision = 0
+let editorRoot: string | null = null
+let editorSlug: string | null = null
+let unlistenNotesChanged: UnlistenFn | null = null
+let retentionTimer: ReturnType<typeof setInterval> | null = null
 
 // ── Editor state ──────────────────────────────────────────────────────────────
 const activeNote = ref<Note | null>(null)
@@ -92,33 +106,75 @@ function readOpenNote(slug: string): string | null {
 
 // ── Load note list ─────────────────────────────────────────────────────────────
 async function loadList(slug: string) {
+  const revision = ++listRevision, root = library.currentPath
   loadingList.value = true
   try {
-    notes.value = await invoke<Note[]>('list_notes', { slug })
-  } catch {
-    notes.value = []
+    const [live, deleted] = await Promise.all([
+      invoke<Note[]>('list_notes', { slug, expectedRoot: root }),
+      invoke<DeletedNote[]>('list_deleted_notes', { slug, expectedRoot: root }),
+    ])
+    if (revision !== listRevision || props.slug !== slug || library.currentPath !== root) return
+    notes.value = live
+    deletedNotes.value = deleted
+    if (!deleted.some(n => n.id === previewDeletedId.value)) previewDeletedId.value = null
+  } catch (error) {
+    if (revision === listRevision) operationError.value = String(error)
   } finally {
-    loadingList.value = false
+    if (revision === listRevision) loadingList.value = false
   }
+}
+
+function daysRemaining(note: DeletedNote) {
+  return Math.max(0, Math.ceil((Date.parse(note.expires_at) - Date.now()) / 86400000))
+}
+
+async function previewDeleted(note: DeletedNote) {
+  if (previewDeletedId.value === note.id) { previewDeletedId.value = null; return }
+  const slug = props.slug, root = library.currentPath
+  previewDeletedId.value = note.id
+  deletedPreview.value = ''
+  const content = slug ? await toDisplayMarkdown(slug, note.content) : note.content
+  if (props.slug === slug && library.currentPath === root && previewDeletedId.value === note.id) deletedPreview.value = content
+}
+
+async function restoreNote(note: Note) {
+  const slug = props.slug, root = library.currentPath
+  if (!slug || busyNoteId.value) return
+  busyNoteId.value = note.id
+  operationError.value = ''
+  try {
+    await invoke('restore_note', { slug, noteId: note.id, expectedRoot: root })
+    if (props.slug !== slug || library.currentPath !== root) return
+    activeNoteDeleted.value = false
+    await loadList(slug)
+    window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', { detail: { slug } }))
+    if (activeNote.value?.id === note.id) await maybeSave()
+  } catch (error) {
+    if (props.slug === slug && library.currentPath === root) operationError.value = String(error)
+  } finally { busyNoteId.value = null }
 }
 
 // ── Open a note in the editor ─────────────────────────────────────────────────
 async function openNote(note: Note) {
-  const seq = ++openNoteSeq
+  const seq = ++openNoteSeq, slug = props.slug, root = library.currentPath
   // Flush any pending save first
   await maybeSave()
-  if (seq !== openNoteSeq) return
+  if (seq !== openNoteSeq || (saveError.value && currentContent.value !== loadedContent.value)) return
 
   let md = ''
   try {
-    const stored = await invoke<string>('get_note', { slug: props.slug, noteId: note.id })
+    const stored = await invoke<string>('get_note', { slug, noteId: note.id, expectedRoot: root })
     // Swap `assets/…` for renderable blob URLs; `flushSave` swaps them back.
-    md = props.slug ? await toDisplayMarkdown(props.slug, stored) : stored
-  } catch {
-    md = ''
+    md = slug ? await toDisplayMarkdown(slug, stored) : stored
+  } catch (error) {
+    if (seq === openNoteSeq) operationError.value = String(error)
+    return
   }
-  if (seq !== openNoteSeq) return
+  if (seq !== openNoteSeq || props.slug !== slug || library.currentPath !== root) return
 
+  editorRoot = root
+  editorSlug = slug
+  activeNoteDeleted.value = false
   activeNote.value = note
   titleDraft.value = note.title
   editingTitle.value = false
@@ -131,6 +187,7 @@ async function openNote(note: Note) {
 
 // ── Back to list ──────────────────────────────────────────────────────────────
 async function goBack() {
+  if (activeNoteDeleted.value && currentContent.value !== loadedContent.value) { operationError.value = t('notes.deletedWhileEditing'); return }
   openNoteSeq++
   const slug = props.slug
   const note = activeNote.value
@@ -164,9 +221,11 @@ async function goBack() {
 
 // ── Create a new note ─────────────────────────────────────────────────────────
 async function createNote() {
-  if (!props.slug) return
+  const slug = props.slug, root = library.currentPath
+  if (!slug) return
   try {
-    const note = await invoke<Note>('create_note', { slug: props.slug })
+    const note = await invoke<Note>('create_note', { slug, expectedRoot: root })
+    if (props.slug !== slug || library.currentPath !== root) return
     notes.value.push(note)
     await openNote(note)
   } catch (e) {
@@ -177,64 +236,62 @@ async function createNote() {
 // ── Delete a note ─────────────────────────────────────────────────────────────
 async function deleteNote(note: Note, e: MouseEvent) {
   e.stopPropagation()
-  if (!props.slug) return
-  if (!confirm(t('notes.deleteConfirm'))) return
+  const slug = props.slug, root = library.currentPath
+  if (!slug || busyNoteId.value) return
+  operationError.value = ''
+  busyNoteId.value = note.id
   try {
-    const wasCanvasNote = isPinned(note.id)
-    await invoke('delete_note', { slug: props.slug, noteId: note.id })
+    if (!await confirm(t('notes.deleteConfirm'), { title: t('notes.deleteNote'), kind: 'warning', okLabel: t('notes.moveToTrash'), cancelLabel: t('notes.cancel') })) return
+    if (props.slug !== slug || library.currentPath !== root) return
+    await invoke('delete_note', { slug, noteId: note.id, expectedRoot: root })
+    if (props.slug !== slug || library.currentPath !== root) return
     notes.value = notes.value.filter(n => n.id !== note.id)
-    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: props.slug } }))
-    if (wasCanvasNote) {
-      window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', { detail: { slug: props.slug } }))
-    }
-    library.refresh()
-    if (activeNote.value?.id === note.id) {
-      activeNote.value = null
-      view.value = 'list'
-      persistOpenNote(null)
-    }
-  } catch (e) {
-    console.error('Failed to delete note:', e)
-  }
+    await loadList(slug)
+    window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', { detail: { slug } }))
+    void library.refresh()
+  } catch (error) {
+    if (props.slug === slug && library.currentPath === root) operationError.value = String(error)
+  } finally { busyNoteId.value = null }
 }
 
 // ── Save title ────────────────────────────────────────────────────────────────
 async function commitTitle() {
   editingTitle.value = false
-  if (!props.slug || !activeNote.value) return
+  const note = activeNote.value, slug = editorSlug, root = editorRoot
+  if (!slug || !note || activeNoteDeleted.value) return
   const trimmed = titleDraft.value.trim() || t('notes.untitled')
-  if (trimmed === activeNote.value.title) return
-  activeNote.value.title = trimmed
+  if (trimmed === note.title) return
   try {
-    await invoke('rename_note', { slug: props.slug, noteId: activeNote.value.id, title: trimmed })
-    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug: props.slug } }))
-    if (isPinned(activeNote.value.id)) {
-      window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', { detail: { slug: props.slug } }))
-    }
-  } catch (e) {
-    console.error('Failed to rename note:', e)
+    await invoke('rename_note', { slug, noteId: note.id, title: trimmed, expectedRoot: root })
+    if (editorRoot !== root || editorSlug !== slug || activeNote.value?.id !== note.id) return
+    activeNote.value.title = trimmed
+    window.dispatchEvent(new CustomEvent('argus-notes-updated', { detail: { slug } }))
+    if (isPinned(note.id)) window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', { detail: { slug } }))
+  } catch (error) {
+    if (editorRoot === root && editorSlug === slug) operationError.value = String(error)
   }
 }
 
 // ── Editor save ───────────────────────────────────────────────────────────────
 async function maybeSave() {
-  if (!props.slug || !activeNote.value) return
+  if (!editorSlug || !activeNote.value || activeNoteDeleted.value) return
   if (currentContent.value === loadedContent.value) return
   clearTimeout(debounceTimer!)
   debounceTimer = null
-  await flushSave(props.slug, activeNote.value.id, currentContent.value)
+  await flushSave(editorSlug, activeNote.value.id, currentContent.value)
 }
 
-async function flushSave(slug: string, noteId: string, content: string) {
+async function flushSave(slug: string, noteId: string, content: string, root = editorRoot, expectedContent = toStoredMarkdown(loadedContent.value)) {
+  if (activeNoteDeleted.value) return
   saving.value = true
   saveError.value = ''
   try {
     // Only relative asset paths go to disk — and to the other window, whose blob
     // URLs are its own and would be meaningless there.
     const stored = toStoredMarkdown(content)
-    await invoke('save_note', { slug, noteId, content: stored })
-    loadedContent.value = content
-    broadcastNoteSaved(slug, noteId, stored)
+    await invoke('save_note', { slug, noteId, content: stored, expectedRoot: root, expectedContent })
+    if (editorSlug === slug && editorRoot === root && activeNote.value?.id === noteId) loadedContent.value = content
+    broadcastNoteSaved(slug, noteId, stored, root)
   } catch (e) {
     saveError.value = String(e)
   } finally {
@@ -250,22 +307,29 @@ async function uploadNoteImage(file: File): Promise<string | null> {
 
 function onContentChange(markdown: string) {
   currentContent.value = markdown
-  if (!props.slug || !activeNote.value) return
+  if (!editorSlug || !activeNote.value || activeNoteDeleted.value) return
   clearTimeout(debounceTimer!)
-  const slug = props.slug
+  const slug = editorSlug, root = editorRoot
   const noteId = activeNote.value.id
-  debounceTimer = setTimeout(() => flushSave(slug, noteId, markdown), 1500)
+  debounceTimer = setTimeout(() => flushSave(slug, noteId, markdown, root), 1500)
 }
 
 // ── Watch slug changes ────────────────────────────────────────────────────────
-watch(() => props.slug, async (newSlug) => {
-  openNoteSeq++
+watch(() => [props.slug, library.currentPath] as const, async ([newSlug]) => {
+  const revision = ++openNoteSeq, root = library.currentPath
   await maybeSave()
+  if (revision !== openNoteSeq || props.slug !== newSlug || library.currentPath !== root) return
   activeNote.value = null
   view.value = 'list'
   notes.value = []
+  deletedNotes.value = []
+  trashExpanded.value = false
+  operationError.value = ''
+  previewDeletedId.value = null
+  activeNoteDeleted.value = false
   if (newSlug) {
     await loadList(newSlug)
+    if (props.slug !== newSlug || library.currentPath !== root) return
     // Restore the note that was open before the tab was switched away (or the
     // paper reopened), so the user isn't dumped back on the list every time.
     const savedId = readOpenNote(newSlug)
@@ -296,8 +360,8 @@ async function handleNotesUpdated(event: Event) {
 // A note edited in its standalone window autosaves there; without this the
 // sidebar would keep showing the stale copy AND overwrite the window's work on
 // its next flush (tab switch, unmount, opening another note).
-async function handleNoteSavedElsewhere(payload: { slug: string; noteId: string; content: string }) {
-  if (payload.slug !== props.slug) return
+async function handleNoteSavedElsewhere(payload: { root?: string | null; slug: string; noteId: string; content: string }) {
+  if (payload.slug !== props.slug || (payload.root && payload.root !== library.currentPath) || activeNoteDeleted.value) return
   // Only worth re-reading while the list is on screen; the editor view refreshes
   // it on the way back out, and this fires on every autosave over there.
   if (view.value === 'list') void loadList(payload.slug)
@@ -307,11 +371,36 @@ async function handleNoteSavedElsewhere(payload: { slug: string; noteId: string;
   if (currentContent.value !== loadedContent.value) return
   // The payload holds relative asset paths; resolve them for this webview.
   const display = await toDisplayMarkdown(payload.slug, payload.content)
-  if (activeNote.value?.id !== payload.noteId) return
+  if (activeNote.value?.id !== payload.noteId || (payload.root && payload.root !== library.currentPath) || currentContent.value !== loadedContent.value || activeNoteDeleted.value) return
   loadedContent.value = display
   currentContent.value = display
   // A remount is the fallback when the editor hasn't finished initialising.
   if (!editorRef.value?.setContent(display)) editorKey.value++
+}
+
+async function handleNotesChanged(payload: NoteChangedPayload) {
+  if (payload.root !== library.currentPath || payload.slug !== props.slug) return
+  const editingId = activeNote.value?.id
+  if (payload.action === 'deleted' && editingId === payload.noteId) {
+    clearTimeout(debounceTimer!)
+    debounceTimer = null
+    activeNoteDeleted.value = true
+    if (currentContent.value === loadedContent.value) {
+      activeNote.value = null
+      view.value = 'list'
+      persistOpenNote(null)
+    }
+  }
+  await loadList(payload.slug)
+  if (payload.root !== library.currentPath || payload.slug !== props.slug || activeNote.value?.id !== payload.noteId) return
+  const note = notes.value.find(n => n.id === payload.noteId)
+  if (!note) return
+  if (payload.action === 'restored') activeNoteDeleted.value = false
+  if (currentContent.value !== loadedContent.value || editingTitle.value) return
+  activeNote.value = note
+  titleDraft.value = note.title
+  const content = await invoke<string>('get_note', { slug: payload.slug, noteId: note.id, expectedRoot: payload.root })
+  await handleNoteSavedElsewhere({ ...payload, content })
 }
 
 let noteSyncDisposed = false
@@ -322,25 +411,35 @@ onMounted(async () => {
   // The subscription can resolve after a fast unmount — drop it right away.
   if (noteSyncDisposed) unlisten()
   else unlistenNoteSaved = unlisten
+  const offChanged = await onNotesChanged(payload => { void handleNotesChanged(payload).catch(error => { operationError.value = String(error) }) })
+  if (noteSyncDisposed) { offChanged(); return }
+  unlistenNotesChanged = offChanged
+  retentionTimer = setInterval(() => { if (props.slug && view.value === 'list') void loadList(props.slug) }, 60_000)
 })
 
 onBeforeUnmount(async () => {
   noteSyncDisposed = true
   window.removeEventListener('argus-notes-updated', handleNotesUpdated)
   unlistenNoteSaved?.()
+  unlistenNotesChanged?.()
+  clearInterval(retentionTimer!)
   await maybeSave()
 })
 
 // ── Open note in standalone window ────────────────────────────────────────────
 async function openInWindow() {
-  if (!props.slug || !activeNote.value) return
+  const note = activeNote.value, slug = editorSlug, root = editorRoot
+  if (!slug || !note || activeNoteDeleted.value) return
   await maybeSave()
+  if (activeNote.value?.id !== note.id || props.slug !== slug || library.currentPath !== root
+    || (saveError.value && currentContent.value !== loadedContent.value)) return
   const windowLabel = createNoteWindowLabel()
-  const data = { slug: props.slug, noteId: activeNote.value.id, title: activeNote.value.title }
+  const data = { slug, noteId: note.id, title: note.title, root }
   localStorage.setItem(`argus:note-window:${windowLabel}`, JSON.stringify(data))
   try {
     await invoke('open_note_window', {
       ...data,
+      expectedRoot: root,
       windowLabel,
     })
   } catch (e) {
@@ -357,8 +456,11 @@ function fmtDate(iso: string) {
 
 <template>
   <div class="notes-tab">
+    <div v-if="operationError" class="notes-error" role="alert">{{ operationError }}</div>
+
     <!-- No paper selected -->
     <div v-if="!slug" class="empty">{{ t('notes.selectHint') }}</div>
+
 
     <!-- Note list -->
     <template v-else-if="view === 'list'">
@@ -422,6 +524,7 @@ function fmtDate(iso: string) {
               </button>
               <button
                 class="note-delete-btn"
+                :disabled="!!busyNoteId"
                 :title="t('notes.deleteNote')"
                 @click="deleteNote(note, $event)"
               >
@@ -431,6 +534,33 @@ function fmtDate(iso: string) {
           </div>
         </li>
       </ul>
+
+      <section class="recently-deleted" :class="{ expanded: trashExpanded }">
+        <button class="trash-toggle" type="button" :aria-expanded="trashExpanded" @click="trashExpanded = !trashExpanded">
+          <Icon icon="fluent:delete-24-regular" width="15" height="15" />
+          <span>{{ t('notes.recentlyDeleted') }}</span>
+          <span v-if="deletedNotes.length" class="trash-count">{{ deletedNotes.length }}</span>
+          <Icon class="trash-chevron" :class="{ expanded: trashExpanded }" icon="fluent:chevron-right-24-regular" width="13" height="13" />
+        </button>
+        <div v-if="trashExpanded" class="trash-content">
+          <p class="trash-hint">{{ t('notes.trashHint') }}</p>
+          <div v-if="!deletedNotes.length" class="trash-empty">{{ t('notes.trashEmpty') }}</div>
+          <ul v-else class="trash-list">
+            <li v-for="note in deletedNotes" :key="note.id" class="trash-item">
+              <div class="trash-item-head">
+                <button class="trash-note-title" type="button" :title="note.title" :aria-expanded="previewDeletedId === note.id" @click="previewDeleted(note)">
+                  {{ note.title || t('notes.untitled') }}
+                </button>
+                <button class="restore-btn" type="button" :disabled="!!busyNoteId" :aria-label="t('notes.restoreNamed', { title: note.title })" @click="restoreNote(note)">
+                  <Icon icon="fluent:arrow-counterclockwise-24-regular" width="13" height="13" />{{ t('notes.restore') }}
+                </button>
+              </div>
+              <div class="trash-meta"><span>{{ t('notes.deletedOn', { date: fmtDate(note.deleted_at) }) }}</span><span>{{ t('notes.daysRemaining', { days: daysRemaining(note) }) }}</span></div>
+              <div v-if="previewDeletedId === note.id" class="trash-preview"><MarkdownBody v-if="deletedPreview" :content="deletedPreview" /><span v-else>{{ t('notes.emptyContent') }}</span></div>
+            </li>
+          </ul>
+        </div>
+      </section>
     </template>
 
     <!-- Note editor -->
@@ -460,13 +590,17 @@ function fmtDate(iso: string) {
         >{{ activeNote.title || t('notes.untitled') }}</span>
 
         <span v-if="saving" class="status">{{ t('notes.saving') }}</span>
-        <span v-else-if="saveError" class="status error">{{ saveError }}</span>
+        <span v-else-if="saveError" class="status error" :title="saveError">{{ saveError }}</span>
 
         <button class="popout-btn" :title="t('notes.openInWindow')" @click="openInWindow">
           <Icon icon="fluent:open-24-regular" width="14" height="14" />
         </button>
       </div>
 
+      <div v-if="activeNoteDeleted" class="deleted-editor-banner" role="status">
+        <span>{{ t('notes.deletedWhileEditing') }}</span>
+        <button class="restore-btn" :disabled="!!busyNoteId" @click="restoreNote(activeNote)">{{ t('notes.restore') }}</button>
+      </div>
       <div class="editor-wrap">
         <VditorEditor
           ref="editorRef"
@@ -489,6 +623,30 @@ function fmtDate(iso: string) {
   position: relative;
 }
 
+.notes-error { flex-shrink: 0; padding: 8px 12px; color: var(--text-primary); background: var(--bg-secondary); font-size: 11px; border-bottom: 1px solid var(--border-subtle); overflow-wrap: anywhere; }
+.recently-deleted { flex-shrink: 0; display: flex; flex-direction: column; max-height: 50%; min-height: 38px; border-top: 1px solid var(--border-subtle); background: color-mix(in srgb, var(--bg-secondary) 50%, var(--bg-primary)); }
+.trash-toggle { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 38px; padding: 8px 12px; color: var(--text-secondary); font-size: 12px; text-align: left; flex-shrink: 0; }
+.trash-toggle:focus-visible, .trash-note-title:focus-visible, .restore-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.trash-toggle:hover { background: var(--bg-hover); color: var(--text-primary); }
+.trash-count { padding: 1px 6px; border-radius: var(--radius-pill); background: var(--bg-tertiary); color: var(--text-tertiary); font-size: 10px; }
+.trash-chevron { margin-left: auto; transition: transform .15s; }
+.trash-chevron.expanded { transform: rotate(90deg); }
+.trash-content { min-height: 0; overflow-y: auto; padding: 0 8px 8px; }
+.trash-hint { padding: 0 4px 8px; margin: 0; color: var(--text-tertiary); font-size: 10px; line-height: 1.5; }
+.trash-empty { padding: 16px 8px 20px; text-align: center; font-size: 12px; color: var(--text-tertiary); }
+.trash-list { list-style: none; margin: 0; padding: 0; }
+.trash-item { padding: 8px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-primary); margin-bottom: 6px; }
+.trash-item:last-child { margin-bottom: 0; }
+.trash-item-head { display: flex; align-items: center; gap: 8px; }
+.trash-note-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; font-size: 12px; color: var(--text-secondary); }
+.trash-note-title:hover { color: var(--accent); }
+.restore-btn { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; padding: 4px 7px; font-size: 11px; color: var(--accent); background: var(--accent-light); border-radius: var(--radius-sm); }
+.restore-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.restore-btn:disabled { opacity: .5; cursor: default; }
+.trash-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 5px; font-size: 10px; color: var(--text-tertiary); }
+.trash-preview { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-subtle); font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.deleted-editor-banner { display: flex; gap: 8px; align-items: center; padding: 8px 12px; font-size: 11px; color: var(--text-secondary); background: var(--bg-secondary); }
+.note-item:focus-within .note-delete-btn, .note-item:focus-within .note-pin-btn { opacity: 1; }
 /* ── First-run pin guide ── */
 .pin-guide-card {
   width: 100%;
@@ -773,7 +931,7 @@ function fmtDate(iso: string) {
 }
 
 .status { font-size: var(--font-size-xs); color: var(--text-tertiary); flex-shrink: 0; }
-.status.error { color: #cc3333; }
+.status.error { color: #cc3333; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .popout-btn {
   display: flex;

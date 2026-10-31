@@ -26,6 +26,7 @@ const props = defineProps<{
 const emit = defineEmits<{ approve: [colors?: string[]]; reject: [] }>()
 
 const { t } = useI18n()
+const noteAction = computed(() => ({ update_paper_note: 'Update', delete_paper_note: 'Delete', restore_paper_note: 'Restore' } as Record<string, string>)[props.preview.tool])
 const recommendationAction = computed(() => props.preview.recommendations?.length
   ? (props.preview.tool === 'delete_arxiv_recommendations' ? 'delete' : 'import') : null)
 const changeAction = computed(() => props.preview.changes?.length
@@ -62,8 +63,8 @@ function approve() {
 <template>
   <div class="write-confirm">
     <div class="wc-head">
-      <Icon class="wc-icon" :icon="recommendationAction ? (recommendationAction === 'delete' ? 'fluent:delete-24-regular' : 'fluent:library-24-regular') : changeAction === 'remove' ? 'fluent:delete-24-regular' : changeAction ? 'fluent:edit-24-regular' : preview.passages?.length ? 'fluent:highlight-24-regular' : 'doodle:notebook'" width="20" height="20" />
-      <span class="wc-title">{{ t(recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Title` : changeAction ? `writeConfirm.mark${changeAction === 'remove' ? 'Remove' : 'Update'}Title` : preview.passages?.length ? 'writeConfirm.markTitle' : 'writeConfirm.title') }}</span>
+      <Icon class="wc-icon" :icon="noteAction ? (noteAction === 'Delete' ? 'fluent:delete-24-regular' : noteAction === 'Restore' ? 'fluent:arrow-counterclockwise-24-regular' : 'fluent:edit-24-regular') : recommendationAction ? (recommendationAction === 'delete' ? 'fluent:delete-24-regular' : 'fluent:library-24-regular') : changeAction === 'remove' ? 'fluent:delete-24-regular' : changeAction ? 'fluent:edit-24-regular' : preview.passages?.length ? 'fluent:highlight-24-regular' : 'doodle:notebook'" width="20" height="20" />
+      <span class="wc-title">{{ t(noteAction ? `writeConfirm.note${noteAction}Title` : recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Title` : changeAction ? `writeConfirm.mark${changeAction === 'remove' ? 'Remove' : 'Update'}Title` : preview.passages?.length ? 'writeConfirm.markTitle' : 'writeConfirm.title') }}</span>
       <span v-if="props.queued" class="wc-queued">{{ t('writeConfirm.queued', { n: props.queued }) }}</span>
     </div>
 
@@ -83,7 +84,7 @@ function approve() {
       <div class="wc-field">
         <dt>{{ t('writeConfirm.location') }}</dt>
         <dd class="wc-location">
-          {{ marking ? preview.slug : t('writeConfirm.locationValue', { paper: preview.paperTitle }) }}
+          {{ marking ? preview.slug : noteAction ? t(noteAction === 'Delete' ? 'writeConfirm.noteTrashLocation' : 'writeConfirm.noteExistingLocation') : t('writeConfirm.locationValue', { paper: preview.paperTitle }) }}
         </dd>
       </div>
     </dl>
@@ -180,15 +181,32 @@ function approve() {
       </div>
     </div>
     <div v-else class="wc-body">
-      <MarkdownBody :content="preview.content" />
+      <template v-if="noteAction === 'Update' && preview.noteBefore">
+        <div class="wc-note-version wc-note-before">
+          <span class="wc-version-label">{{ t('writeConfirm.before') }}</span>
+          <strong>{{ preview.noteBefore.title }}</strong>
+          <MarkdownBody v-if="preview.noteBefore.content" :content="preview.noteBefore.content" />
+          <span v-else class="wc-empty">{{ t('writeConfirm.emptyNote') }}</span>
+        </div>
+        <div class="wc-note-version wc-note-after">
+          <span class="wc-version-label">{{ t('writeConfirm.after') }}</span>
+          <strong>{{ preview.noteTitle }}</strong>
+          <MarkdownBody v-if="preview.content" :content="preview.content" />
+          <span v-else class="wc-empty">{{ t('writeConfirm.emptyNote') }}</span>
+        </div>
+      </template>
+      <template v-else>
+        <MarkdownBody v-if="preview.content" :content="preview.content" />
+        <span v-else class="wc-empty">{{ t('writeConfirm.emptyNote') }}</span>
+      </template>
     </div>
 
     <div class="wc-actions">
-      <span class="wc-hint">{{ t(recommendationAction ? 'writeConfirm.arxivHint' : changeAction ? `writeConfirm.${changeAction}Hint` : 'writeConfirm.hint') }}</span>
-      <button class="wc-btn" @click="emit('reject')">{{ t(recommendationAction ? 'writeConfirm.arxivReject' : changeAction ? `writeConfirm.${changeAction}Reject` : 'writeConfirm.reject') }}</button>
-      <button class="wc-btn primary" :class="{ danger: recommendationAction === 'delete' || changeAction === 'remove' }" @click="approve">
+      <span class="wc-hint">{{ t(noteAction ? `writeConfirm.note${noteAction}Hint` : recommendationAction ? 'writeConfirm.arxivHint' : changeAction ? `writeConfirm.${changeAction}Hint` : 'writeConfirm.hint') }}</span>
+      <button class="wc-btn" @click="emit('reject')">{{ t(noteAction || recommendationAction ? 'writeConfirm.arxivReject' : changeAction ? `writeConfirm.${changeAction}Reject` : 'writeConfirm.reject') }}</button>
+      <button class="wc-btn primary" :class="{ danger: noteAction === 'Delete' || recommendationAction === 'delete' || changeAction === 'remove' }" @click="approve">
         <Icon icon="fluent:checkmark-24-regular" width="13" height="13" />
-        {{ t(recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Approve` : changeAction ? `writeConfirm.${changeAction}Approve` : 'writeConfirm.approve') }}
+        {{ t(noteAction ? `writeConfirm.note${noteAction}Approve` : recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Approve` : changeAction ? `writeConfirm.${changeAction}Approve` : 'writeConfirm.approve') }}
       </button>
     </div>
   </div>
@@ -291,6 +309,8 @@ function approve() {
 .wc-diff-note dd { display: block; flex: 1; }
 .wc-swatch { display: inline-block; width: 11px; height: 11px; border: 1px solid rgba(0,0,0,.12); border-radius: 50%; }
 .wc-arrow { margin: 0 4px; color: var(--text-tertiary); }
+.wc-note-version { display: flex; flex-direction: column; gap: 5px; }
+.wc-version-label { color: var(--text-tertiary); font-size: 11px; }
 .wc-note-before, .wc-note-after { padding: 2px 0 2px 8px; border-left: 2px solid var(--border-subtle); }
 .wc-note-before { color: var(--text-secondary); opacity: .8; }
 .wc-note-after { margin-top: 4px; border-left-color: var(--accent); }

@@ -119,6 +119,12 @@ export interface Note {
   updated_at: string
 }
 
+export interface DeletedNote extends Note {
+  content: string
+  deleted_at: string
+  expires_at: string
+}
+
 /** One section heading in a paper's chapter structure. */
 export interface PaperSection {
   title: string
@@ -238,6 +244,7 @@ export interface Collection {
   id: string
   name: string
   emoji?: string
+  pinned?: boolean
   parent_id?: string
   created_at: string
 }
@@ -1054,6 +1061,7 @@ export interface AgentWritePreview {
   content: string
   /** A note with this title already exists — nothing is overwritten either way. */
   duplicateTitle: boolean
+  noteBefore?: Note & { content: string }
   passages?: { page: number; text: string; note?: string | null; color: string; style: string }[]
   recommendations?: { arxivId: string; title: string; source: string; existingSlug?: string | null; existingTitle?: string | null }[]
   keepDuplicateCopies?: boolean

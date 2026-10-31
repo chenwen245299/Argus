@@ -123,7 +123,7 @@ fn all_notes_text(root: &str, slug: &str) -> String {
             parts.push(format!("{}\n{}", note.title, body));
         }
     }
-    if parts.is_empty() {
+    if parts.is_empty() && !paper::paper_dir(root, slug).join("notes/index.json").exists() {
         let legacy = paper::read_notes(root, slug);
         if !legacy.trim().is_empty() {
             parts.push(legacy);

@@ -273,10 +273,36 @@ pub async fn save_notes(
     Ok(())
 }
 
+fn note_root(state: &State<'_, LibraryRoot>, expected_root: Option<&str>) -> Result<String, String> {
+    let root = get_root(state)?;
+    if expected_root.is_some_and(|expected| expected != root) { return Err("Library changed".into()); }
+    Ok(root)
+}
+
 #[tauri::command]
-pub async fn list_notes(slug: String, state: State<'_, LibraryRoot>) -> Result<Vec<Note>, String> {
-    let root = get_root(&state)?;
-    Ok(paper::list_notes(&root, &slug))
+pub async fn list_notes(slug: String, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<Vec<Note>, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || paper::list_notes(&root, &slug)).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_deleted_notes(slug: String, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<Vec<models::DeletedNote>, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        paper::prune_deleted_notes(&root, &slug, chrono::Utc::now())?;
+        paper::list_deleted_notes(&root, &slug)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn restore_note(slug: String, note_id: String, expected_root: Option<String>, state: State<'_, LibraryRoot>, app: tauri::AppHandle) -> Result<Note, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        let note = paper::restore_note(&root, &slug, &note_id, None)?;
+        refresh_search_index(&root, &slug);
+        crate::note_trash::notify(&app, &root, &slug, &note_id, "restored");
+        Ok(note)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -332,34 +358,31 @@ pub async fn get_canvas_note_titles_map(
 }
 
 #[tauri::command]
-pub async fn get_note(
-    slug: String,
-    note_id: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<String, String> {
-    let root = get_root(&state)?;
-    Ok(paper::get_note(&root, &slug, &note_id))
+pub async fn get_note(slug: String, note_id: String, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<String, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || paper::note_snapshot(&root, &slug, &note_id).map(|n| n.content))
+        .await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn create_note(slug: String, state: State<'_, LibraryRoot>) -> Result<Note, String> {
-    let root = get_root(&state)?;
-    let note = paper::create_note(&root, &slug)?;
-    refresh_search_index(&root, &slug);
-    Ok(note)
+pub async fn create_note(slug: String, expected_root: Option<String>, state: State<'_, LibraryRoot>, app: tauri::AppHandle) -> Result<Note, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        let note = paper::create_note(&root, &slug)?;
+        refresh_search_index(&root, &slug);
+        crate::note_trash::notify(&app, &root, &slug, &note.id, "created");
+        Ok(note)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn save_note(
-    slug: String,
-    note_id: String,
-    content: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<(), String> {
-    let root = get_root(&state)?;
-    paper::save_note(&root, &slug, &note_id, &content)?;
-    refresh_search_index(&root, &slug);
-    Ok(())
+pub async fn save_note(slug: String, note_id: String, content: String, expected_content: Option<String>, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<(), String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        paper::save_note_if_current(&root, &slug, &note_id, &content, expected_content.as_deref())?;
+        refresh_search_index(&root, &slug);
+        Ok(())
+    }).await.map_err(|e| e.to_string())?
 }
 
 /// Store an image pasted into a note. `data` is base64 (the clipboard bytes go
@@ -431,28 +454,25 @@ pub async fn read_note_asset(
 }
 
 #[tauri::command]
-pub async fn rename_note(
-    slug: String,
-    note_id: String,
-    title: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<(), String> {
-    let root = get_root(&state)?;
-    paper::rename_note(&root, &slug, &note_id, &title)?;
-    refresh_search_index(&root, &slug);
-    Ok(())
+pub async fn rename_note(slug: String, note_id: String, title: String, expected_root: Option<String>, state: State<'_, LibraryRoot>, app: tauri::AppHandle) -> Result<(), String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        paper::rename_note(&root, &slug, &note_id, &title)?;
+        refresh_search_index(&root, &slug);
+        crate::note_trash::notify(&app, &root, &slug, &note_id, "updated");
+        Ok(())
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn delete_note(
-    slug: String,
-    note_id: String,
-    state: State<'_, LibraryRoot>,
-) -> Result<(), String> {
-    let root = get_root(&state)?;
-    paper::delete_note(&root, &slug, &note_id)?;
-    refresh_search_index(&root, &slug);
-    Ok(())
+pub async fn delete_note(slug: String, note_id: String, expected_root: Option<String>, state: State<'_, LibraryRoot>, app: tauri::AppHandle) -> Result<(), String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        paper::delete_note(&root, &slug, &note_id)?;
+        refresh_search_index(&root, &slug);
+        crate::note_trash::notify(&app, &root, &slug, &note_id, "deleted");
+        Ok(())
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1515,9 +1535,30 @@ pub async fn save_settings(
 // ── M4: Collections ───────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn get_collections(state: State<'_, LibraryRoot>) -> Result<CollectionsFile, String> {
+pub async fn get_collections(expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<CollectionsFile, String> {
     let root = get_root(&state)?;
-    collections::get_collections(&root)
+    if expected_root.as_deref().is_some_and(|expected| expected != root) {
+        return Err("Library changed".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || collections::get_collections(&root))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn set_collection_pinned(
+    id: String,
+    pinned: bool,
+    expected_root: String,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    if expected_root != root { return Err("Library changed".into()); }
+    let root_c = root.clone();
+    tauri::async_runtime::spawn_blocking(move || collections::set_collection_pinned(&root_c, &id, pinned))
+        .await.map_err(|e| e.to_string())??;
+    let _ = app.emit("collections-changed", serde_json::json!({ "root": root }));
+    Ok(())
 }
 
 #[tauri::command]
@@ -2740,9 +2781,13 @@ pub async fn get_library_conversations(
 #[tauri::command]
 pub async fn save_library_conversation(
     conversation: serde_json::Value,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
+    if expected_root.as_deref().is_some_and(|expected| expected != root) {
+        return Err("Library changed".into());
+    }
     copilot::write_library_conversation(&root, &conversation)
 }
 
@@ -2767,6 +2812,21 @@ pub async fn read_chat_image(
     tokio::task::spawn_blocking(move || copilot::read_conversation_image(&root, &conversation_id, &file))
         .await
         .map_err(|e| format!("Read chat image task: {e}"))?
+}
+
+/// Give a branch independent copies of the immutable images in its context.
+#[tauri::command]
+pub async fn copy_chat_branch_images(
+    source_id: String,
+    target_id: String,
+    files: Vec<String>,
+    expected_root: String,
+    state: State<'_, LibraryRoot>,
+) -> Result<(), String> {
+    let root = get_root(&state)?;
+    if root != expected_root { return Err("Library changed".into()); }
+    tokio::task::spawn_blocking(move || copilot::copy_chat_branch_images(&root, &source_id, &target_id, &files))
+        .await.map_err(|e| format!("Copy branch images task: {e}"))?
 }
 
 // ── M7: RAG Settings ─────────────────────────────────────────────────────────
@@ -3153,12 +3213,15 @@ pub async fn chat_with_library(
 #[tauri::command]
 pub async fn open_note_window(
     app: tauri::AppHandle,
+    state: State<'_, LibraryRoot>,
     slug: String,
     note_id: String,
     title: String,
     window_label: Option<String>,
+    expected_root: Option<String>,
 ) -> Result<(), String> {
     use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+    let root = note_root(&state, expected_root.as_deref())?;
 
     let (width, height) =
         load_note_window_size(&app).unwrap_or((NOTE_DEFAULT_WINDOW_W, NOTE_DEFAULT_WINDOW_H));
@@ -3208,7 +3271,7 @@ pub async fn open_note_window(
     let app_c = app.clone();
     let window_label_c = window_label.clone();
     let data_event = note_window_data_event(&window_label_c);
-    let data = serde_json::json!({ "slug": slug, "noteId": note_id, "title": title });
+    let data = serde_json::json!({ "root": root, "slug": slug, "noteId": note_id, "title": title });
     tauri::async_runtime::spawn(async move {
         // Wait for macOS frame restoration to settle, then re-apply the saved size.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

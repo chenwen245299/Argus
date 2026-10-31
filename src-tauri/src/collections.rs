@@ -240,6 +240,7 @@ pub fn create_collection(
     let col = Collection {
         id: uuid::Uuid::new_v4().to_string(),
         name,
+        pinned: false,
         emoji: Some(random_collection_emoji()),
         parent_id,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -280,6 +281,17 @@ pub fn rename_collection(root: &str, id: &str, new_name: String) -> Result<(), S
             .map_err(|e| format!("Create collection folder: {e}"))?;
     }
 
+    write_collections(root, &file)
+}
+
+/// A shortcut flag only: pinning never changes the tree or paper assignments.
+pub fn set_collection_pinned(root: &str, id: &str, pinned: bool) -> Result<(), String> {
+    let _g = lock_collections();
+    let mut file = read_collections(root);
+    let col = file.collections.iter_mut().find(|c| c.id == id)
+        .ok_or_else(|| format!("Collection {id} not found"))?;
+    if col.pinned == pinned { return Ok(()); }
+    col.pinned = pinned;
     write_collections(root, &file)
 }
 
@@ -667,6 +679,42 @@ mod tests {
     use super::*;
     use crate::models::PaperMeta;
 
+    #[test]
+    fn pins_survive_collection_edits_without_changing_membership() {
+        let root = test_root();
+        std::fs::create_dir_all(root.join(".argus")).unwrap();
+        let root_str = root.to_str().unwrap();
+        let top = create_collection(root_str, "Top".into(), None).unwrap();
+        let child = create_collection(root_str, "Child".into(), Some(top.id.clone())).unwrap();
+        add_paper_to_collection(root_str, "paper-1", &child.id).unwrap();
+
+        // Existing library files from older versions remain readable.
+        let legacy: Collection = serde_json::from_value(serde_json::json!({
+            "id": "legacy", "name": "Legacy", "parent_id": null, "created_at": ""
+        })).unwrap();
+        assert!(!legacy.pinned);
+        set_collection_pinned(root_str, &top.id, true).unwrap();
+        set_collection_pinned(root_str, &child.id, true).unwrap();
+        set_collection_pinned(root_str, &child.id, true).unwrap();
+        rename_collection(root_str, &child.id, "Renamed".into()).unwrap();
+        let other = create_collection(root_str, "Other".into(), None).unwrap();
+        move_collection(root_str, &child.id, Some(other.id.clone())).unwrap();
+        let file = get_collections(root_str).unwrap();
+        let saved = file.collections.iter().find(|c| c.id == child.id).unwrap();
+        assert!(saved.pinned);
+        assert_eq!(saved.name, "Renamed");
+        assert_eq!(saved.parent_id.as_deref(), Some(other.id.as_str()));
+        assert_eq!(file.assignments.len(), 1);
+        assert_eq!(file.assignments[0].collection_id, child.id);
+
+        set_collection_pinned(root_str, &top.id, false).unwrap();
+        assert!(!get_collections(root_str).unwrap().collections.iter().find(|c| c.id == top.id).unwrap().pinned);
+        assert!(set_collection_pinned(root_str, "missing", true).is_err());
+        delete_collection(root_str, &other.id).unwrap();
+        assert!(!get_collections(root_str).unwrap().collections.iter().any(|c| c.id == child.id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!(
             "argus-collections-test-{}",
@@ -714,6 +762,7 @@ mod tests {
         let collection = Collection {
             id: "collection-1".to_string(),
             name: "Topic".to_string(),
+            pinned: false,
             emoji: None,
             parent_id: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -754,6 +803,7 @@ mod tests {
                     Collection {
                         id: "top".to_string(),
                         name: "Top".to_string(),
+                        pinned: false,
                         emoji: None,
                         parent_id: None,
                         created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -761,6 +811,7 @@ mod tests {
                     Collection {
                         id: "child".to_string(),
                         name: "Child".to_string(),
+                        pinned: false,
                         emoji: None,
                         parent_id: Some("top".to_string()),
                         created_at: "2026-01-01T00:00:00Z".to_string(),

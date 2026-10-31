@@ -3,6 +3,7 @@ import { computed, ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useLibraryStore } from '../stores/library'
 import { useSelectionStore } from '../stores/selection'
 import { useCollectionsStore } from '../stores/collections'
@@ -10,6 +11,7 @@ import { useCanvasStore } from '../stores/canvas'
 import { useReaderStore } from '../stores/reader'
 import { useRagStore } from '../stores/rag'
 import CollectionNode from './CollectionNode.vue'
+import CollectionShortcut from './CollectionShortcut.vue'
 import type { CanvasIndexEntry, Collection, NavItem } from '../types'
 import { updateStore } from '../stores/update'
 import { filterRecentlyRead, recentPapersVersion } from '../utils/recentPapers'
@@ -57,6 +59,41 @@ const sidebarMode = ref<SidebarMode>(loadSidebarMode())
 const showWorkspaceMenu = ref(false)
 const sidebarScrollRef = ref<HTMLElement | null>(null)
 const collectionScrollRef = ref<HTMLElement | null>(null)
+const pinError = ref('')
+let unlistenCollections: UnlistenFn | null = null
+let sidebarDisposed = false
+
+async function toggleCollectionPin(col: Collection) {
+  const root = library.currentPath
+  pinError.value = ''
+  try {
+    await collectionsStore.setPinned(col.id, !col.pinned)
+  } catch (error) {
+    if (root === library.currentPath) pinError.value = t('collections.pinFailed')
+    console.error('set_collection_pinned:', error)
+  }
+}
+
+function openPinnedCollection(col: Collection) {
+  select(`collection:${col.id}`)
+  for (const ancestor of collectionsStore.collectionAncestors(col.id)) expanded.value.add(ancestor.id)
+  saveExpandedCollections()
+  void scrollToCollection(col.id)
+}
+
+function refreshCollectionsOnFocus() {
+  if (library.currentPath) void collectionsStore.load()
+}
+
+onMounted(() => {
+  window.addEventListener('focus', refreshCollectionsOnFocus)
+  void listen<{ root: string }>('collections-changed', ({ payload }) => {
+    if (payload.root === library.currentPath) void collectionsStore.load()
+  }).then(unlisten => {
+    if (sidebarDisposed) unlisten()
+    else unlistenCollections = unlisten
+  }).catch(error => console.error('collections-changed:', error))
+})
 
 function loadSidebarMode(): SidebarMode {
   try {
@@ -223,6 +260,7 @@ watch(
   () => library.currentPath,
   (path) => {
     expanded.value = path ? loadExpandedCollections(path) : new Set()
+    pinError.value = ''
   },
   { immediate: true }
 )
@@ -978,6 +1016,9 @@ function stopResizeTags() {
 }
 
 onUnmounted(() => {
+  sidebarDisposed = true
+  unlistenCollections?.()
+  window.removeEventListener('focus', refreshCollectionsOnFocus)
   collectionDragCleanup?.()
   collectionDragCleanup = null
   clearCollectionDragState()
@@ -1174,6 +1215,26 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <section v-if="collectionsStore.pinnedCollections.length" class="pinned-collections" :aria-label="t('collections.pinned')">
+            <div class="pinned-collections-heading">
+              <Icon icon="fluent:pin-16-regular" width="12" height="12" />
+              <span>{{ t('collections.pinned') }}</span>
+            </div>
+            <div class="pinned-collections-list">
+              <CollectionShortcut
+                v-for="col in collectionsStore.pinnedCollections"
+                :key="col.id"
+                :collection="col"
+                :active="(selection.highlightedCollectionId ?? selection.activeCollectionId) === col.id"
+                :drag-over="dragOverId === col.id || collectionDragOverId === col.id"
+                @select="openPinnedCollection"
+                @toggle-pin="toggleCollectionPin"
+                @open-ctx="openCtx"
+              />
+            </div>
+          </section>
+          <p v-if="pinError" class="collection-pin-error" role="alert">{{ pinError }}</p>
+
           <div
             ref="collectionScrollRef"
             class="library-main-scroll"
@@ -1222,6 +1283,7 @@ onUnmounted(() => {
                 @submit-rename="submitRename"
                 @delete="deleteCollection"
                 @start-new="startNew"
+                @toggle-pin="toggleCollectionPin"
                 @collection-drag-start="startCollectionDrag"
                 @submit-new="submitNew"
                 @update:renameValue="renameValue = $event"
@@ -1470,6 +1532,15 @@ onUnmounted(() => {
         :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
         @click.stop
       >
+        <button
+          class="ctx-item"
+          :disabled="collectionsStore.isPinPending(ctxMenu.col.id)"
+          @click="toggleCollectionPin(ctxMenu!.col); closeCtx()"
+        >
+          <Icon :icon="ctxMenu.col.pinned ? 'fluent:pin-off-16-regular' : 'fluent:pin-16-regular'" width="14" height="14" />
+          {{ t(ctxMenu.col.pinned ? 'collections.unpin' : 'collections.pin') }}
+        </button>
+        <div class="ctx-sep" />
         <button class="ctx-item" @click="startRename(ctxMenu!.col); closeCtx()">
           {{ t('collections.rename') }}
         </button>
@@ -1878,6 +1949,11 @@ onUnmounted(() => {
   overflow-x: hidden;
   padding-bottom: 8px;
 }
+
+.pinned-collections { flex-shrink: 0; padding: 4px 0 6px; border-bottom: 1px solid var(--border-subtle); }
+.pinned-collections-heading { display: flex; align-items: center; gap: 5px; padding: 2px 15px 4px; font-size: 10px; font-weight: 500; color: var(--text-tertiary); }
+.pinned-collections-list { max-height: min(28vh, 210px); overflow-y: auto; overflow-x: hidden; }
+.collection-pin-error { flex-shrink: 0; margin: 5px 15px; font-size: 11px; color: var(--text-secondary); }
 
 .coll-list {
   padding-left: 0;

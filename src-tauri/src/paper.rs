@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::models::{
-    Highlight, HighlightTombstone, HighlightsDoc, Note, PaperMeta, PaperStatus, ReadingState,
+    Highlight, HighlightTombstone, HighlightsDoc, Note, NoteSnapshot, DeletedNote, PaperMeta, PaperStatus, ReadingState,
 };
 
 /// Write `content` to `path` atomically (temp file + rename), preventing
@@ -174,18 +174,35 @@ fn notes_dir(root: &str, slug: &str) -> PathBuf {
     paper_dir(root, slug).join("notes")
 }
 
-fn read_notes_index(root: &str, slug: &str) -> Vec<Note> {
-    if validate_slug(slug).is_err() {
-        return Vec::new();
-    }
+fn read_notes_index_checked(root: &str, slug: &str) -> Result<Vec<Note>, String> {
+    validate_slug(slug)?;
     let path = notes_dir(root, slug).join("index.json");
-    if !path.exists() {
-        return Vec::new();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("Invalid notes index: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("Read notes index: {e}")),
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+}
+
+fn read_notes_index(root: &str, slug: &str) -> Vec<Note> {
+    read_notes_index_checked(root, slug).unwrap_or_default()
+}
+
+fn notes_lock(root: &str, slug: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<LockMap> = std::sync::OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    locks.entry(format!("{root}\0{slug}")).or_default().clone()
+}
+
+fn check_notes_dir(root: &str, slug: &str) -> Result<(), String> {
+    validate_slug(slug)?;
+    if find_paper_dir(root, slug).is_none() { return Err("Paper no longer exists.".into()); }
+    match std::fs::symlink_metadata(notes_dir(root, slug)) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err("Notes folder must be a real directory.".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Read notes folder: {e}")),
+    }
 }
 
 fn write_notes_index(root: &str, slug: &str, notes: &[Note]) -> Result<(), String> {
@@ -226,20 +243,22 @@ fn maybe_migrate_legacy_note(root: &str, slug: &str) {
         created_at: now.clone(),
         updated_at: now,
     };
-    let _ = std::fs::write(dir.join(format!("{id}.md")), &content);
-    let _ = write_notes_index(root, slug, &[note]);
+    if atomic_write(&dir.join(format!("{id}.md")), &content).is_ok()
+        && write_notes_index(root, slug, &[note]).is_ok() {
+        let _ = std::fs::remove_file(legacy);
+    }
 }
 
 pub fn list_notes(root: &str, slug: &str) -> Vec<Note> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if check_notes_dir(root, slug).is_err() { return vec![]; }
     maybe_migrate_legacy_note(root, slug);
     read_notes_index(root, slug)
 }
 
 pub fn get_note(root: &str, slug: &str, note_id: &str) -> String {
-    let Ok(path) = note_file_path(root, slug, note_id) else {
-        return String::new();
-    };
-    std::fs::read_to_string(&path).unwrap_or_default()
+    note_snapshot(root, slug, note_id).map(|s| s.content).unwrap_or_default()
 }
 
 pub fn get_note_by_title(root: &str, slug: &str, title: &str) -> Option<String> {
@@ -251,6 +270,9 @@ pub fn get_note_by_title(root: &str, slug: &str, title: &str) -> Option<String> 
 }
 
 pub fn create_note(root: &str, slug: &str) -> Result<Note, String> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    check_notes_dir(root, slug)?;
     validate_slug(slug)?;
     maybe_migrate_legacy_note(root, slug);
     let id = uuid::Uuid::new_v4().to_string();
@@ -265,7 +287,7 @@ pub fn create_note(root: &str, slug: &str) -> Result<Note, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create notes dir: {e}"))?;
     std::fs::write(dir.join(format!("{id}.md")), "")
         .map_err(|e| format!("Failed to create note file: {e}"))?;
-    let mut notes = read_notes_index(root, slug);
+    let mut notes = read_notes_index_checked(root, slug)?;
     notes.push(note.clone());
     write_notes_index(root, slug, &notes)?;
     Ok(note)
@@ -282,6 +304,9 @@ pub fn create_note(root: &str, slug: &str) -> Result<Note, String> {
 /// The title only ever lands in `index.json`; the file on disk is named after a
 /// fresh uuid, so nothing here can be steered at another path.
 pub fn create_note_with(root: &str, slug: &str, title: &str, content: &str) -> Result<Note, String> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    check_notes_dir(root, slug)?;
     validate_slug(slug)?;
     maybe_migrate_legacy_note(root, slug);
     let dir = notes_dir(root, slug);
@@ -297,7 +322,7 @@ pub fn create_note_with(root: &str, slug: &str, title: &str, content: &str) -> R
     };
     atomic_write(&dir.join(format!("{id}.md")), content)
         .map_err(|e| format!("Failed to create note file: {e}"))?;
-    let mut notes = read_notes_index(root, slug);
+    let mut notes = read_notes_index_checked(root, slug)?;
     notes.push(note.clone());
     write_notes_index(root, slug, &notes)?;
     Ok(note)
@@ -309,12 +334,15 @@ pub fn upsert_note_by_title(
     title: &str,
     content: &str,
 ) -> Result<Note, String> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    check_notes_dir(root, slug)?;
     validate_slug(slug)?;
     maybe_migrate_legacy_note(root, slug);
     let dir = notes_dir(root, slug);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create notes dir: {e}"))?;
 
-    let mut notes = read_notes_index(root, slug);
+    let mut notes = read_notes_index_checked(root, slug)?;
     let now = chrono::Utc::now().to_rfc3339();
 
     if let Some(note) = notes.iter_mut().find(|n| n.title == title) {
@@ -341,50 +369,212 @@ pub fn upsert_note_by_title(
 }
 
 pub fn save_note(root: &str, slug: &str, note_id: &str, content: &str) -> Result<(), String> {
-    validate_slug(slug)?;
-    validate_note_id(note_id)?;
-    let dir = notes_dir(root, slug);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create notes dir: {e}"))?;
-    atomic_write(&note_file_path(root, slug, note_id)?, content)
-        .map_err(|e| format!("Failed to write note: {e}"))?;
-    let mut notes = read_notes_index(root, slug);
-    let now = chrono::Utc::now().to_rfc3339();
-    if let Some(n) = notes.iter_mut().find(|n| n.id == note_id) {
-        n.updated_at = now;
+    save_note_if_current(root, slug, note_id, content, None)
+}
+
+pub fn save_note_if_current(root: &str, slug: &str, note_id: &str, content: &str, expected_content: Option<&str>) -> Result<(), String> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let before = note_snapshot_unlocked(root, slug, note_id)?;
+    if expected_content.is_some_and(|expected| expected != before.content) {
+        return Err("Note changed in another window or by AI. Your draft is preserved; reopen the note to review the saved version.".into());
     }
-    write_notes_index(root, slug, &notes)
+    update_note_unlocked(root, slug, &before, &before.note.title, content).map(|_| ())
 }
 
 pub fn rename_note(root: &str, slug: &str, note_id: &str, title: &str) -> Result<(), String> {
-    validate_slug(slug)?;
-    validate_note_id(note_id)?;
-    let mut notes = read_notes_index(root, slug);
-    let now = chrono::Utc::now().to_rfc3339();
-    if let Some(n) = notes.iter_mut().find(|n| n.id == note_id) {
-        n.title = title.to_string();
-        n.updated_at = now;
-    }
-    write_notes_index(root, slug, &notes)
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let before = note_snapshot_unlocked(root, slug, note_id)?;
+    update_note_unlocked(root, slug, &before, title, &before.content).map(|_| ())
 }
 
 pub fn delete_note(root: &str, slug: &str, note_id: &str) -> Result<(), String> {
-    validate_slug(slug)?;
-    validate_note_id(note_id)?;
-    let note_file = note_file_path(root, slug, note_id)?;
-    if note_file.exists() {
-        std::fs::remove_file(&note_file).map_err(|e| format!("Failed to delete note file: {e}"))?;
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let before = note_snapshot_unlocked(root, slug, note_id)?;
+    trash_note_unlocked(root, slug, &before).map(|_| ())
+}
+
+fn note_snapshot_unlocked(root: &str, slug: &str, note_id: &str) -> Result<NoteSnapshot, String> {
+    check_notes_dir(root, slug)?;
+    let path = note_file_path(root, slug, note_id)?;
+    let note = read_notes_index_checked(root, slug)?.into_iter().find(|n| n.id == note_id)
+        .ok_or("Note no longer exists or is in Recently Deleted.")?;
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("Read note: {e}"))?;
+    if !meta.is_file() || meta.file_type().is_symlink() { return Err("Note must be a regular file.".into()); }
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("Read note: {e}"))?;
+    Ok(NoteSnapshot { note, content })
+}
+
+pub fn note_snapshot(root: &str, slug: &str, note_id: &str) -> Result<NoteSnapshot, String> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    note_snapshot_unlocked(root, slug, note_id)
+}
+
+fn stamp_after(time: &str) -> String {
+    let now = chrono::Utc::now();
+    let stamp = chrono::DateTime::parse_from_rfc3339(time).ok()
+        .map(|t| t.with_timezone(&chrono::Utc) + chrono::Duration::milliseconds(1))
+        .map(|t| t.max(now)).unwrap_or(now);
+    stamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn update_note_unlocked(root: &str, slug: &str, before: &NoteSnapshot, title: &str, content: &str) -> Result<Note, String> {
+    let mut notes = read_notes_index_checked(root, slug)?;
+    let note = notes.iter_mut().find(|n| n.id == before.note.id).ok_or("Note no longer exists.")?;
+    note.title = title.to_string();
+    note.updated_at = stamp_after(&before.note.updated_at);
+    let updated = note.clone();
+    atomic_write(&note_file_path(root, slug, &before.note.id)?, content)?;
+    if let Err(error) = write_notes_index(root, slug, &notes) {
+        let _ = atomic_write(&note_file_path(root, slug, &before.note.id)?, &before.content);
+        return Err(error);
     }
-    let mut notes = read_notes_index(root, slug);
-    let was_ai_summary = notes.iter().any(|n| n.id == note_id && n.title == "AI总结");
-    notes.retain(|n| n.id != note_id);
-    write_notes_index(root, slug, &notes)?;
-    if was_ai_summary {
+    Ok(updated)
+}
+
+pub fn update_note_checked(root: &str, slug: &str, before: &NoteSnapshot, title: &str, content: &str) -> Result<Note, String> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if note_snapshot_unlocked(root, slug, &before.note.id)? != *before {
+        return Err("Note changed since the preview. Nothing was saved; read it again.".into());
+    }
+    update_note_unlocked(root, slug, before, title, content)
+}
+
+fn trash_dir(root: &str, slug: &str, create: bool) -> Result<PathBuf, String> {
+    check_notes_dir(root, slug)?;
+    let dir = notes_dir(root, slug).join(".trash");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => return Err("Recently Deleted must be a real directory.".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
+            std::fs::create_dir(&dir).map_err(|e| format!("Create Recently Deleted: {e}"))?;
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("Read Recently Deleted: {e}")),
+        _ => {}
+    }
+    Ok(dir)
+}
+
+pub const NOTE_RETENTION_DAYS: i64 = 30;
+fn note_expired(note: &DeletedNote, now: chrono::DateTime<chrono::Utc>) -> Result<bool, String> {
+    let deleted = chrono::DateTime::parse_from_rfc3339(&note.deleted_at).map_err(|e| format!("Invalid deletion time: {e}"))?;
+    Ok(now >= deleted + chrono::Duration::days(NOTE_RETENTION_DAYS))
+}
+
+fn deleted_notes_unlocked(root: &str, slug: &str) -> Result<Vec<DeletedNote>, String> {
+    let dir = trash_dir(root, slug, false)?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("Read Recently Deleted: {e}")),
+    };
+    let mut notes = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.path().extension().map_or(true, |ext| ext != "json") { continue; }
+        let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.file_type().is_symlink() { return Err("Deleted note must be a regular file.".into()); }
+        let note: DeletedNote = serde_json::from_str(&std::fs::read_to_string(entry.path()).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("Invalid deleted note: {e}"))?;
+        validate_note_id(&note.snapshot.note.id)?;
+        if entry.file_name() != std::ffi::OsString::from(format!("{}.json", note.snapshot.note.id)) { return Err("Deleted note identity does not match its file.".into()); }
+        notes.push(note);
+    }
+    Ok(notes)
+}
+
+pub fn list_deleted_notes(root: &str, slug: &str) -> Result<Vec<DeletedNote>, String> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let active = read_notes_index_checked(root, slug)?;
+    let now = chrono::Utc::now();
+    let mut notes = deleted_notes_unlocked(root, slug)?;
+    notes.retain(|n| !active.iter().any(|a| a.id == n.snapshot.note.id) && !note_expired(n, now).unwrap_or(true));
+    notes.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+    Ok(notes)
+}
+
+fn trash_note_unlocked(root: &str, slug: &str, before: &NoteSnapshot) -> Result<DeletedNote, String> {
+    let now = chrono::Utc::now();
+    let deleted = DeletedNote { snapshot: before.clone(), deleted_at: now.to_rfc3339(),
+        expires_at: (now + chrono::Duration::days(NOTE_RETENTION_DAYS)).to_rfc3339() };
+    let dir = trash_dir(root, slug, true)?;
+    let path = dir.join(format!("{}.json", before.note.id));
+    if std::fs::symlink_metadata(&path).is_ok() { return Err("A deleted copy with this id already exists. Resolve it before deleting again.".into()); }
+    atomic_write(&path, &serde_json::to_string_pretty(&deleted).map_err(|e| e.to_string())?)?;
+    let mut notes = read_notes_index_checked(root, slug)?;
+    notes.retain(|n| n.id != before.note.id);
+    if let Err(error) = write_notes_index(root, slug, &notes) {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    // The index is authoritative. A stale editor cannot recreate this file.
+    let _ = std::fs::remove_file(note_file_path(root, slug, &before.note.id)?);
+    if before.note.title == "AI总结" {
         let mut status = read_status_for(root, slug);
         status.ai_summary_done = false;
-        status.last_updated = chrono::Utc::now().to_rfc3339();
-        write_status(root, slug, &status)?;
+        let _ = write_status(root, slug, &status);
     }
-    Ok(())
+    Ok(deleted)
+}
+
+pub fn delete_note_checked(root: &str, slug: &str, before: &NoteSnapshot) -> Result<DeletedNote, String> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if note_snapshot_unlocked(root, slug, &before.note.id)? != *before {
+        return Err("Note changed since the preview. Nothing was deleted; read it again.".into());
+    }
+    trash_note_unlocked(root, slug, before)
+}
+
+pub fn restore_note(root: &str, slug: &str, note_id: &str, expected: Option<&DeletedNote>) -> Result<Note, String> {
+    validate_note_id(note_id)?;
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let deleted = deleted_notes_unlocked(root, slug)?.into_iter().find(|n| n.snapshot.note.id == note_id)
+        .ok_or("Deleted note was not found.")?;
+    if note_expired(&deleted, chrono::Utc::now())? { return Err("This note's 30-day recovery period has expired.".into()); }
+    if expected.is_some_and(|old| old != &deleted) { return Err("Deleted note changed since the preview. Read it again.".into()); }
+    let mut notes = read_notes_index_checked(root, slug)?;
+    if notes.iter().any(|n| n.id == note_id) { return Err("This note has already been restored; no existing note was overwritten.".into()); }
+    let mut note = deleted.snapshot.note.clone();
+    note.updated_at = stamp_after(&note.updated_at);
+    let path = note_file_path(root, slug, note_id)?;
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) { return Err("Note must not be a link.".into()); }
+    atomic_write(&path, &deleted.snapshot.content)?;
+    notes.push(note.clone());
+    write_notes_index(root, slug, &notes)?;
+    let _ = std::fs::remove_file(trash_dir(root, slug, false)?.join(format!("{note_id}.json")));
+    if note.title == "AI总结" {
+        let mut status = read_status_for(root, slug);
+        status.ai_summary_done = true;
+        let _ = write_status(root, slug, &status);
+    }
+    Ok(note)
+}
+
+pub fn prune_deleted_notes(root: &str, slug: &str, now: chrono::DateTime<chrono::Utc>) -> Result<usize, String> {
+    let lock = notes_lock(root, slug);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = trash_dir(root, slug, false)?;
+    let active = read_notes_index_checked(root, slug)?;
+    let mut count = 0;
+    for deleted in deleted_notes_unlocked(root, slug)? {
+        if note_expired(&deleted, now)? {
+            if !active.iter().any(|n| n.id == deleted.snapshot.note.id) {
+                match std::fs::remove_file(note_file_path(root, slug, &deleted.snapshot.note.id)?) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+                    _ => {}
+                }
+            }
+            std::fs::remove_file(dir.join(format!("{}.json", deleted.snapshot.note.id))).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 // ── Note assets (pasted images) ───────────────────────────────────────────────
@@ -915,5 +1105,135 @@ pub fn ensure_paper_files(root: &str, slug: &str) {
         if let Ok(s) = serde_json::to_string_pretty(&PaperStatus::default()) {
             let _ = std::fs::write(&status, s);
         }
+    }
+}
+
+#[cfg(test)]
+mod notes_lifecycle_tests {
+    use super::*;
+    struct Library(String);
+    impl Library {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("argus-notes-{}", uuid::Uuid::new_v4()));
+            let dir = root.join("papers/paper");
+            std::fs::create_dir_all(root.join(".argus")).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("meta.json"), serde_json::json!({"id":"paper-id","title":"Paper","authors":[],"added_at":"2026-01-01","reading_status":"unread"}).to_string()).unwrap();
+            Self(root.to_string_lossy().to_string())
+        }
+    }
+    impl Drop for Library { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+    #[test]
+    fn deleting_and_restoring_preserves_exact_note_identity_content_and_image_links() {
+        let lib = Library::new();
+        let note = create_note_with(&lib.0, "paper", "AI总结", "# Full note\n\n$x^2$\n\n![](assets/figure.png)").unwrap();
+        let assets = notes_dir(&lib.0, "paper").join("assets");
+        std::fs::create_dir(&assets).unwrap(); std::fs::write(assets.join("figure.png"), b"unchanged pixels").unwrap();
+        let original = note_snapshot(&lib.0, "paper", &note.id).unwrap();
+        delete_note(&lib.0, "paper", &note.id).unwrap();
+        assert!(list_notes(&lib.0, "paper").is_empty());
+        assert!(!note_file_path(&lib.0, "paper", &note.id).unwrap().exists());
+        let deleted = list_deleted_notes(&lib.0, "paper").unwrap().pop().unwrap();
+        assert_eq!(deleted.snapshot, original);
+        let expiry = chrono::DateTime::parse_from_rfc3339(&deleted.expires_at).unwrap();
+        let start = chrono::DateTime::parse_from_rfc3339(&deleted.deleted_at).unwrap();
+        assert_eq!(expiry - start, chrono::Duration::days(30));
+        assert!(save_note(&lib.0, "paper", &note.id, "late autosave").is_err());
+        let restored = restore_note(&lib.0, "paper", &note.id, Some(&deleted)).unwrap();
+        assert_eq!(restored.id, note.id); assert_eq!(restored.title, note.title); assert_eq!(restored.created_at, note.created_at);
+        assert_eq!(get_note(&lib.0, "paper", &note.id), original.content);
+        assert!(list_deleted_notes(&lib.0, "paper").unwrap().is_empty());
+        assert_eq!(std::fs::read(assets.join("figure.png")).unwrap(), b"unchanged pixels");
+        assert!(restore_note(&lib.0, "paper", &note.id, Some(&deleted)).is_err());
+        delete_note(&lib.0, "paper", &note.id).unwrap();
+        assert_eq!(list_deleted_notes(&lib.0, "paper").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retention_uses_exact_deletion_time_and_never_erases_live_notes() {
+        let lib = Library::new();
+        let note = create_note_with(&lib.0, "paper", "Deleted", "private text").unwrap();
+        let live = create_note_with(&lib.0, "paper", "Keep", "live text").unwrap();
+        delete_note(&lib.0, "paper", &note.id).unwrap();
+        let deleted = list_deleted_notes(&lib.0, "paper").unwrap().pop().unwrap();
+        let expiry = chrono::DateTime::parse_from_rfc3339(&deleted.expires_at).unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(prune_deleted_notes(&lib.0, "paper", expiry - chrono::Duration::milliseconds(1)).unwrap(), 0);
+        assert_eq!(prune_deleted_notes(&lib.0, "paper", expiry).unwrap(), 1);
+        assert!(list_deleted_notes(&lib.0, "paper").unwrap().is_empty());
+        assert!(save_note(&lib.0, "paper", &note.id, "resurrection").is_err());
+        assert_eq!(get_note(&lib.0, "paper", &live.id), "live text");
+        assert!(restore_note(&lib.0, "paper", &note.id, None).is_err());
+    }
+
+    #[test]
+    fn stale_approved_writes_and_editor_buffers_cannot_replace_newer_content() {
+        let lib = Library::new();
+        let note = create_note_with(&lib.0, "paper", "Title", "before").unwrap();
+        let reviewed = note_snapshot(&lib.0, "paper", &note.id).unwrap();
+        save_note(&lib.0, "paper", &note.id, "user's newer words").unwrap();
+        assert!(update_note_checked(&lib.0, "paper", &reviewed, "AI title", "AI content").is_err());
+        assert!(delete_note_checked(&lib.0, "paper", &reviewed).is_err());
+        assert!(save_note_if_current(&lib.0, "paper", &note.id, "stale autosave", Some("before")).is_err());
+        assert_eq!(get_note(&lib.0, "paper", &note.id), "user's newer words");
+        assert!(list_deleted_notes(&lib.0, "paper").unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_note_creation_and_deletion_cannot_drop_sibling_records() {
+        let lib = Library::new();
+        let workers: Vec<_> = (0..12).map(|i| { let root = lib.0.clone(); std::thread::spawn(move || create_note_with(&root, "paper", &format!("Note {i}"), "Body").unwrap()) }).collect();
+        let notes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(list_notes(&lib.0, "paper").len(), 12);
+        let workers: Vec<_> = notes.into_iter().map(|note| { let root = lib.0.clone(); std::thread::spawn(move || delete_note(&root, "paper", &note.id).unwrap()) }).collect();
+        for w in workers { w.join().unwrap(); }
+        assert!(list_notes(&lib.0, "paper").is_empty());
+        assert_eq!(list_deleted_notes(&lib.0, "paper").unwrap().len(), 12);
+    }
+
+    #[test]
+    fn expired_and_malformed_archives_are_not_restored_or_silently_replaced() {
+        let lib = Library::new();
+        let note = create_note_with(&lib.0, "paper", "Title", "Words").unwrap();
+        delete_note(&lib.0, "paper", &note.id).unwrap();
+        let mut deleted = list_deleted_notes(&lib.0, "paper").unwrap().pop().unwrap();
+        deleted.deleted_at = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        // A forged future expiry cannot extend retention beyond deletion + 30d.
+        deleted.expires_at = (chrono::Utc::now() + chrono::Duration::days(200)).to_rfc3339();
+        let path = trash_dir(&lib.0, "paper", false).unwrap().join(format!("{}.json", note.id));
+        std::fs::write(&path, serde_json::to_vec(&deleted).unwrap()).unwrap();
+        assert!(list_deleted_notes(&lib.0, "paper").unwrap().is_empty());
+        assert!(restore_note(&lib.0, "paper", &note.id, None).is_err());
+        std::fs::write(&path, "broken json").unwrap();
+        assert!(prune_deleted_notes(&lib.0, "paper", chrono::Utc::now()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken json");
+        assert!(restore_note(&lib.0, "paper", "../escape", None).is_err());
+    }
+
+    #[test]
+    fn deletion_does_not_reindex_the_old_legacy_note_as_live_content() {
+        let lib = Library::new();
+        let dir = paper_dir(&lib.0, "paper");
+        std::fs::write(dir.join("notes.md"), "uniquelegacysecret").unwrap();
+        let note = list_notes(&lib.0, "paper").pop().unwrap();
+        crate::search::index_paper(&lib.0, "paper").unwrap();
+        assert_eq!(crate::search::search_fulltext(&lib.0, "uniquelegacysecret").unwrap().len(), 1);
+        delete_note(&lib.0, "paper", &note.id).unwrap();
+        // Also covers files migrated by older app versions that retained notes.md.
+        std::fs::write(dir.join("notes.md"), "uniquelegacysecret").unwrap();
+        crate::search::index_paper(&lib.0, "paper").unwrap();
+        assert!(crate::search::search_fulltext(&lib.0, "uniquelegacysecret").unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_and_note_symlinks_never_target_files_outside_the_paper() {
+        let lib = Library::new();
+        let note = create_note_with(&lib.0, "paper", "Title", "Body").unwrap();
+        let external = std::path::Path::new(&lib.0).join("outside"); std::fs::create_dir(&external).unwrap();
+        std::os::unix::fs::symlink(&external, notes_dir(&lib.0, "paper").join(".trash")).unwrap();
+        assert!(delete_note(&lib.0, "paper", &note.id).is_err());
+        assert_eq!(get_note(&lib.0, "paper", &note.id), "Body");
+        assert_eq!(std::fs::read_dir(&external).unwrap().count(), 0);
     }
 }

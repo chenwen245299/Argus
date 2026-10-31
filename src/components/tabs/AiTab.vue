@@ -13,6 +13,10 @@ import ProviderBalanceTag from '../ProviderBalanceTag.vue'
 import ContextMeter from '../ContextMeter.vue'
 import ChatRunStats from '../ChatRunStats.vue'
 import ChatConversationCost from '../ChatConversationCost.vue'
+import ChatBranchOrigin from '../ChatBranchOrigin.vue'
+import ChatBranchToggle from '../ChatBranchToggle.vue'
+import { useConversationBranches } from '../../composables/useConversationBranches'
+import { cloneBranchRecords, branchImageFiles } from '../../utils/chatBranches'
 import { beginChatRun, applyRunUsage, conversationChatRuns, legacyChatRun, recordCompactionUsage, type ChatRun } from '../../utils/chatRunStats'
 import { applyContextCheckpoint, historyFingerprint, withContextDraft, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
 import ServerToolTraceCard from '../ServerToolTraceCard.vue'
@@ -99,6 +103,13 @@ const allSelectableModels = computed<ModelOption[]>(() =>
 
 const conversations = ref<Conversation[]>([])
 const activeConversation = ref<Conversation | null>(null)
+const branchHistoryRoot = ref<string | null>(null)
+const { conversationRows, collapsedBranches, toggleBranch, revealBranch } = useConversationBranches(conversations,
+  () => branchHistoryRoot.value && props.slug ? JSON.stringify(['paper', branchHistoryRoot.value, props.slug]) : null)
+const branchParent = computed(() => conversations.value.find(c => c.id === activeConversation.value?.branch?.parentId))
+const branching = ref(false)
+const branchError = ref('')
+watch(() => activeConversation.value?.id, () => { branchError.value = '' })
 const input = ref('')
 const attachments = ref<Attachment[]>([])
 const fileInputRef = ref<HTMLInputElement | null>(null)
@@ -409,6 +420,7 @@ function chatContentText(content: string | ChatContentPart[]): string {
 
 function isMetadataExtractionConversation(conv: Conversation | null) {
   if (!conv) return false
+  if (conv.branch) return false // A branch is an ordinary, independently editable chat.
   if (conv.source === 'metadataExtraction' || conv.title === 'AI 元数据提取') return true
   const firstUser = conv.nodes.find((node): node is Extract<ChatNode, { role: 'user' }> => node.role === 'user')
   const prompt = firstUser?.content.trim() ?? ''
@@ -617,6 +629,7 @@ async function ensurePaperAiSync() {
         sessions.clear()
         knownConvIds.clear()
         syncLibraryRoot = event.payload
+        branchHistoryRoot.value = syncLibraryRoot
         activeConversation.value = null
         conversations.value = []
         void refreshSyncedConversations()
@@ -629,7 +642,10 @@ async function ensurePaperAiSync() {
     }
     const revision = syncLibraryRevision
     const root = await invoke<string | null>('get_current_library')
-    if (syncLibraryRevision === revision && !syncDisposed) syncLibraryRoot = root
+    if (syncLibraryRevision === revision && !syncDisposed) {
+      syncLibraryRoot = root
+      branchHistoryRoot.value = root
+    }
   })().catch(() => { syncReady = null })
   return syncReady
 }
@@ -997,19 +1013,82 @@ watch(askAiText, (text) => {
   })
 }, { flush: 'post' })
 
-function openConversation(id: string) {
+function openConversation(id: string, messageId?: string) {
   const conv = conversations.value.find(c => c.id === id)
   if (!conv) return
+  revealBranch(id)
   selectionRevision++
   // If this conversation still has a live generation, reopen the streaming
   // object itself — a snapshot would stop updating.
   activeConversation.value = liveConversationById(id) ?? cloneConversation(conv)
   activeAnswerTabs.value = {}
   showHistory.value = false
+  if (messageId) stickToBottom.value = false
   nextTick(() => {
-    scrollToBottom(true)
+    if (messageId) scrollToMessage(messageId)
+    else scrollToBottom(true)
     textareaEl.value?.focus()
   })
+}
+
+async function branchConversation(group: AssistantGroupNode, selected: AssistantAnswer) {
+  const source = activeConversation.value
+  if (!source || !syncLibraryRoot || selected.streaming || branching.value) return
+  const index = source.nodes.findIndex(n => n.id === group.id)
+  if (index < 0) return
+  branching.value = true
+  branchError.value = ''
+  const root = syncLibraryRoot, revision = syncLibraryRevision
+  const child = createBlankConversation(source.slug)
+  child.source = source.source
+  child.branch = { parentId: source.id, parentTitle: source.title, messageId: group.id,
+    turn: source.nodes.slice(0, index + 1).filter(n => n.role === 'user').length }
+  child.title = t('chat.branchTitle', { title: source.title, number: conversations.value.filter(c => c.branch?.parentId === source.id).length + 1 })
+  child.usageRuns = {}
+  const ids = new Map<string, string>()
+  child.nodes = cloneBranchRecords(source.nodes.slice(0, index + 1).map(node => node.role === 'user' ? node : {
+    ...node, answers: [node.id === group.id ? selected : activeAnswersForGroup(node)[0] ?? node.answers[0]].filter(Boolean),
+  }))
+  for (const node of child.nodes) {
+    ids.set(node.id, newId(node.role === 'user' ? 'user' : 'group'))
+    if (node.role === 'assistantGroup') for (const answer of node.answers) answer.id = newId('answer')
+  }
+  for (const node of child.nodes) {
+    node.id = ids.get(node.id)!
+    if (node.role === 'assistantGroup') node.promptId = ids.get(node.promptId) ?? node.promptId
+  }
+  try {
+    await invoke('copy_chat_branch_images', { sourceId: source.id, targetId: child.id,
+      files: branchImageFiles(child.nodes), expectedRoot: root })
+    if (syncLibraryRevision !== revision || syncLibraryRoot !== root || props.slug !== source.slug) return
+    conversations.value.unshift(child)
+    // Save before selecting or broadcasting the new branch.
+    try { await saveConversationsToPaper(source.slug) }
+    catch (error) {
+      if (syncLibraryRoot === root && props.slug === source.slug) conversations.value = conversations.value.filter(c => c.id !== child.id)
+      throw error
+    }
+    if (syncLibraryRevision !== revision || syncLibraryRoot !== root || props.slug !== source.slug) return
+    broadcastConversationSnapshot(child)
+    revealBranch(child.id)
+    if (activeConversation.value?.id === source.id) {
+      selectionRevision++
+      activeConversation.value = child
+      activeAnswerTabs.value = {}
+      showHistory.value = false
+      await nextTick()
+      scrollToBottom(true)
+      textareaEl.value?.focus()
+    }
+  } catch (error) {
+    if (syncLibraryRevision === revision && activeConversation.value?.id === source.id) branchError.value = t('chat.branchFailed', { error: String(error) })
+  } finally { branching.value = false }
+}
+
+function openBranchParent() {
+  const branch = activeConversation.value?.branch
+  if (!branch || !branchParent.value) return
+  openConversation(branch.parentId, branch.messageId)
 }
 
 function deleteConversation(id: string, event?: MouseEvent) {
@@ -1037,7 +1116,7 @@ function persistConversationFor(slug: string, conv: Conversation) {
   // Several model variants may finish within the same millisecond. CRDT ties
   // keep the disk copy, so every local mutation needs a strictly newer time.
   conv.updatedAt = new Date(Math.max(Date.now(), (Date.parse(conv.updatedAt) || 0) + 1)).toISOString()
-  conv.title = isMetadataExtractionConversation(conv)
+  conv.title = conv.branch ? conv.title : isMetadataExtractionConversation(conv)
     ? 'AI 元数据提取'
     : firstUserTitle(conv.nodes) || conv.title || '新对话'
   if (slug !== props.slug) {
@@ -2728,21 +2807,31 @@ onUnmounted(() => {
 
         <div class="history-list sidebar-history-list">
           <div
-            v-for="conv in conversations"
+            v-for="{ conversation: conv, depth, branchCount } in conversationRows"
             :key="conv.id"
             class="history-item"
-            :class="{ active: conv.id === activeConversation?.id }"
+            :class="{ active: conv.id === activeConversation?.id, 'is-branch': depth > 0, 'has-branches': branchCount > 0 }"
+            :style="{ marginLeft: `${Math.min(depth, 3) * 14}px`, width: `calc(100% - ${Math.min(depth, 3) * 14}px)` }"
+            :title="conv.branch ? t('chat.branchFrom', { title: conv.branch.parentTitle, turn: conv.branch.turn }) : conv.title"
+            role="button" tabindex="0" @keydown.enter.self="openConversation(conv.id)" @keydown.space.self.prevent="openConversation(conv.id)"
             @click="openConversation(conv.id)"
           >
-            <span class="history-title">
-              <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" title="正在生成" />
-              <span v-else-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
-              {{ conv.title }}
-            </span>
-            <span class="history-meta">{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
-            <button class="history-delete" title="删除" :disabled="generatingConvIds.has(conv.id)" @click="deleteConversation(conv.id, $event)">
-              <Icon icon="fluent:delete-24-regular" width="13" height="13" />
-            </button>
+            <div class="history-title-row">
+              <span class="history-title">
+                <Icon v-if="conv.branch" class="history-branch-icon" icon="fluent:branch-fork-24-regular" width="12" height="12" />
+                <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" title="正在生成" />
+                <span v-else-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
+                {{ conv.title }}
+              </span>
+              <span v-if="branchCount && collapsedBranches.has(conv.id)" class="history-branch-count">{{ t('chat.hiddenBranches', { count: branchCount }) }}</span>
+              <span class="history-row-actions">
+                <button class="history-delete" title="删除" :disabled="generatingConvIds.has(conv.id)" @click="deleteConversation(conv.id, $event)">
+                  <Icon icon="fluent:delete-24-regular" width="13" height="13" />
+                </button>
+                <ChatBranchToggle v-if="branchCount" :collapsed="collapsedBranches.has(conv.id)" :title="conv.title" @toggle="toggleBranch(conv.id)" />
+              </span>
+            </div>
+            <span class="history-meta"><span v-if="conv.branch" class="branch-label">{{ t('chat.branchLabel', { turn: conv.branch.turn }) }} · </span>{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
           </div>
           <div v-if="conversations.length === 0" class="history-empty">暂无历史对话</div>
         </div>
@@ -2863,6 +2952,8 @@ onUnmounted(() => {
           @scroll.passive="onMessagesScroll"
           @wheel.passive="onMessagesWheel"
         >
+        <ChatBranchOrigin v-if="activeConversation?.branch" :branch="activeConversation.branch"
+          :parent-available="!!branchParent" :parent-title="branchParent?.title" @open="openBranchParent" />
         <div v-if="!activeConversation?.nodes.length" class="empty-chat">
           <!-- A hand-drawn reader rather than a glyph: this panel is someone
                sitting down with a paper, and the drawing says that faster than
@@ -2927,7 +3018,7 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div v-else class="answer-group">
+          <div v-else class="answer-group" :data-node-id="node.id">
             <div
               v-for="answer in activeAnswersForGroup(node)"
               :key="answer.id"
@@ -3067,6 +3158,9 @@ onUnmounted(() => {
                   <button class="action-btn" :disabled="answer.streaming || hasStreaming" title="重新生成" @click="regenerate(node, answer)">
                     <Icon icon="fluent:arrow-sync-24-regular" width="12" height="12" />
                   </button>
+                  <button class="action-btn branch-action" :disabled="answer.streaming || branching" :title="t('chat.branchAction')" :aria-label="t('chat.branchAction')" @click="branchConversation(node, answer)">
+                    <Icon icon="fluent:branch-fork-24-regular" width="13" height="13" />
+                  </button>
                   <button class="action-btn danger" :disabled="answer.streaming || hasStreaming" title="删除该回答" @click="deleteAnswer(node, answer)">
                     <Icon icon="fluent:delete-24-regular" width="12" height="12" />
                   </button>
@@ -3126,6 +3220,8 @@ onUnmounted(() => {
         </div>
 
         <footer class="composer">
+        <div v-if="branchError" class="branch-error" role="alert">{{ branchError }}</div>
+
         <!-- Approval shares the input area below the conversation viewport. -->
         <div v-if="currentWrite" class="write-confirm-slot">
           <WriteConfirmCard
@@ -3325,21 +3421,31 @@ onUnmounted(() => {
 
             <div class="history-list">
               <div
-                v-for="conv in conversations"
+                v-for="{ conversation: conv, depth, branchCount } in conversationRows"
                 :key="conv.id"
                 class="history-item"
-                :class="{ active: conv.id === activeConversation?.id }"
+                :class="{ active: conv.id === activeConversation?.id, 'is-branch': depth > 0, 'has-branches': branchCount > 0 }"
+                :style="{ marginLeft: `${Math.min(depth, 3) * 14}px`, width: `calc(100% - ${Math.min(depth, 3) * 14}px)` }"
+                :title="conv.branch ? t('chat.branchFrom', { title: conv.branch.parentTitle, turn: conv.branch.turn }) : conv.title"
+                role="button" tabindex="0" @keydown.enter.self="openConversation(conv.id)" @keydown.space.self.prevent="openConversation(conv.id)"
                 @click="openConversation(conv.id)"
               >
-                <span class="history-title">
-                  <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" title="正在生成" />
-                  <span v-else-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
-                  {{ conv.title }}
-                </span>
-                <span class="history-meta">{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
-                <button class="history-delete" title="删除" :disabled="generatingConvIds.has(conv.id)" @click="deleteConversation(conv.id, $event)">
-                  <Icon icon="fluent:delete-24-regular" width="13" height="13" />
-                </button>
+                <div class="history-title-row">
+                  <span class="history-title">
+                    <Icon v-if="conv.branch" class="history-branch-icon" icon="fluent:branch-fork-24-regular" width="12" height="12" />
+                    <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" title="正在生成" />
+                    <span v-else-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
+                    {{ conv.title }}
+                  </span>
+                  <span v-if="branchCount && collapsedBranches.has(conv.id)" class="history-branch-count">{{ t('chat.hiddenBranches', { count: branchCount }) }}</span>
+                  <span class="history-row-actions">
+                    <button class="history-delete" title="删除" :disabled="generatingConvIds.has(conv.id)" @click="deleteConversation(conv.id, $event)">
+                      <Icon icon="fluent:delete-24-regular" width="13" height="13" />
+                    </button>
+                    <ChatBranchToggle v-if="branchCount" :collapsed="collapsedBranches.has(conv.id)" :title="conv.title" @toggle="toggleBranch(conv.id)" />
+                  </span>
+                </div>
+                <span class="history-meta"><span v-if="conv.branch" class="branch-label">{{ t('chat.branchLabel', { turn: conv.branch.turn }) }} · </span>{{ conv.nodes.filter(n => n.role === 'user').length }} 问 · {{ formatTime(conv.updatedAt) }}</span>
               </div>
               <div v-if="conversations.length === 0" class="history-empty">暂无历史对话</div>
             </div>
@@ -3415,8 +3521,8 @@ onUnmounted(() => {
   flex-direction: column;
   min-height: 0;
   padding: 12px 8px;
-  border-right: 1px solid rgba(0, 0, 0, 0.08);
-  background: #f5f5f7;
+  border-right: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
 }
 
 .history-sidebar-head {
@@ -3425,7 +3531,7 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   padding: 0 8px;
-  color: #6e6e73;
+  color: var(--text-secondary);
   font-size: 12px;
   font-weight: 650;
 }
@@ -3437,8 +3543,8 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   border-radius: 10px;
-  color: #8a8a8e;
-  background: rgba(0, 0, 0, 0.05);
+  color: var(--text-tertiary);
+  background: var(--bg-tertiary);
   font-size: 11px;
 }
 
@@ -3446,7 +3552,7 @@ onUnmounted(() => {
   margin: 8px 4px 10px;
 }
 
-.sidebar-history-list {
+.history-sidebar .sidebar-history-list {
   padding: 0 0 6px;
 }
 
@@ -3478,8 +3584,8 @@ onUnmounted(() => {
 .standalone .ai-header {
   height: 46px;
   padding: 0 20px;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
-  background: #ffffff;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-primary);
 }
 
 .header-main {
@@ -3505,7 +3611,7 @@ onUnmounted(() => {
 }
 .standalone .header-title {
   font-size: 14px;
-  color: #1c1c1e;
+  color: var(--text-primary);
 }
 .header-actions {
   position: relative;
@@ -3561,7 +3667,7 @@ onUnmounted(() => {
   width: min(220px, calc(100vw - 180px));
   border-radius: 10px;
   box-shadow: none;
-  background: #ffffff;
+  background: var(--bg-primary);
 }
 .standalone .model-menu {
   left: auto;
@@ -4823,13 +4929,25 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 9px 32px 9px 10px;
+  padding: 9px 10px;
   border-radius: 10px;
   text-align: left;
   cursor: pointer;
 }
+.history-item.is-branch::before {
+  content: ''; position: absolute; left: -7px; top: -4px; width: 7px; height: 24px;
+  border-left: 1px solid var(--border-default); border-bottom: 1px solid var(--border-default); border-bottom-left-radius: 6px;
+}
+.history-branch-icon { color: var(--accent); vertical-align: -2px; margin-right: 4px; }
+.branch-label { color: var(--accent); }
+.branch-error { color: var(--text-primary); font-size: 12px; padding: 8px 12px; margin-bottom: 8px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-secondary); }
+.history-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .history-item:hover { background: var(--bg-hover); }
 .history-item.active { background: color-mix(in srgb, var(--accent) 11%, transparent); }
+.history-title-row { display: flex; align-items: center; gap: 4px; min-width: 0; min-height: 20px; }
+.history-title-row .history-title { flex: 1; min-width: 0; }
+.history-row-actions { display: inline-flex; align-items: center; flex-shrink: 0; column-gap: 0; transition: column-gap 0.18s cubic-bezier(0.22, 1, 0.36, 1); }
+.history-branch-count { flex-shrink: 0; font-size: 9px; font-weight: 500; padding: 2px 5px; border-radius: var(--radius-pill); background: var(--bg-active); color: var(--accent); white-space: nowrap; }
 .history-title {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4843,22 +4961,32 @@ onUnmounted(() => {
   color: var(--text-tertiary);
 }
 .history-delete {
-  position: absolute;
-  top: 50%;
-  right: 8px;
-  width: 22px;
-  height: 22px;
-  transform: translateY(-50%);
-  border-radius: 7px;
+  width: 0;
+  min-width: 0;
+  height: 20px;
+  flex-shrink: 0;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
   color: var(--text-tertiary);
   display: flex;
   align-items: center;
   justify-content: center;
   opacity: 0;
+  pointer-events: none;
+  transition: width 0.18s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.12s ease;
 }
-.history-item:hover .history-delete { opacity: 1; }
+.history-delete :deep(svg) { flex-shrink: 0; }
+.history-item:hover .history-delete,
+.history-item:focus-within .history-delete { width: 20px; opacity: 1; pointer-events: auto; }
+.history-item:hover .history-row-actions,
+.history-item:focus-within .history-row-actions { column-gap: 4px; }
 .history-delete:hover { color: #ff3b30; background: color-mix(in srgb, #ff3b30 9%, transparent); }
 .history-delete:disabled { opacity: 0.35; cursor: default; }
+@media (hover: none) {
+  .history-item .history-delete { width: 20px; opacity: 1; pointer-events: auto; }
+  .history-row-actions { column-gap: 4px; }
+}
+@media (prefers-reduced-motion: reduce) { .history-delete, .history-row-actions { transition: none; } }
 .history-empty {
   padding: 28px 8px;
   text-align: center;

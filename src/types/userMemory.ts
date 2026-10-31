@@ -23,4 +23,6 @@ export interface UserMemory {
   pendingTurns?: number
   backgroundRuns?: number
   liveWrites?: number
+  syncRoot?: string | null
+  syncError?: string | null
 }

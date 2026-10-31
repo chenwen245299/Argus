@@ -4,10 +4,11 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import VditorEditor from '../components/VditorEditor.vue'
-import { broadcastNoteSaved, onNoteSavedElsewhere } from '../utils/noteSync'
+import { useI18n } from 'vue-i18n'
+import { broadcastNoteSaved, onNoteSavedElsewhere, onNotesChanged } from '../utils/noteSync'
 import { toDisplayMarkdown, toStoredMarkdown, savePastedImage } from '../utils/noteAssets'
 
-interface NoteWindowData { slug: string; noteId: string; title: string }
+interface NoteWindowData { slug: string; noteId: string; title: string; root?: string | null }
 
 function getWindowLabel() {
   try {
@@ -17,7 +18,14 @@ function getWindowLabel() {
   }
 }
 
+const { t } = useI18n()
 const windowLabel = getWindowLabel()
+const noteRoot = ref<string | null>(null)
+const noteDeleted = ref(false)
+const restoring = ref(false)
+let unlistenNotesChanged: UnlistenFn | null = null
+let loadRevision = 0
+let disposed = false
 const slug = ref<string | null>(null)
 const noteId = ref<string | null>(null)
 const noteTitle = ref('笔记')
@@ -56,11 +64,16 @@ async function setWindowTitle(title: string) {
   try { await getCurrentWebviewWindow().setTitle(`${title} — Argus 笔记`) } catch {}
 }
 
-async function loadNote(data: NoteWindowData) {
+async function loadNote(data: NoteWindowData, preserveEdits = false) {
+  const revision = ++loadRevision
   try {
-    const stored = await invoke<string>('get_note', { slug: data.slug, noteId: data.noteId })
+    const root = data.root ?? noteRoot.value ?? await invoke<string | null>('get_current_library')
+    const stored = await invoke<string>('get_note', { slug: data.slug, noteId: data.noteId, expectedRoot: root })
     // Swap `assets/…` for renderable blob URLs; `flushSave` swaps them back.
     const md = await toDisplayMarkdown(data.slug, stored)
+    if (revision !== loadRevision || disposed || (preserveEdits && hasUnsavedEdits())) return
+    noteRoot.value = root
+    noteDeleted.value = false
     slug.value = data.slug
     noteId.value = data.noteId
     noteTitle.value = data.title || '笔记'
@@ -76,16 +89,17 @@ async function loadNote(data: NoteWindowData) {
 }
 
 async function flushSave(markdown: string) {
-  if (!slug.value || !noteId.value) return
+  if (!slug.value || !noteId.value || noteDeleted.value) return
+  const root = noteRoot.value, s = slug.value, id = noteId.value
   saving.value = true
   saveError.value = ''
   try {
     // Only relative asset paths go to disk — and to the sidebar, whose blob URLs
     // are its own and would be meaningless there.
     const stored = toStoredMarkdown(markdown)
-    await invoke('save_note', { slug: slug.value, noteId: noteId.value, content: stored })
-    savedContent.value = markdown
-    broadcastNoteSaved(slug.value, noteId.value, stored)
+    await invoke('save_note', { slug: s, noteId: id, content: stored, expectedRoot: root, expectedContent: savedContent.value === null ? undefined : toStoredMarkdown(savedContent.value) })
+    if (noteRoot.value === root && slug.value === s && noteId.value === id) savedContent.value = markdown
+    broadcastNoteSaved(s, id, stored, root)
   } catch (e) {
     saveError.value = String(e)
   } finally {
@@ -104,13 +118,13 @@ function onContentChange(markdown: string) {
   latestContent.value = markdown
   const s = slug.value
   const nid = noteId.value
-  if (!s || !nid) return
+  if (!s || !nid || noteDeleted.value) return
   debounceTimer = setTimeout(() => flushSave(markdown), 1500)
 }
 
 // Best-effort synchronous-ish save of the newest content (used before unload/close).
 async function flushPendingSave() {
-  if (latestContent.value === null) return
+  if (latestContent.value === null || noteDeleted.value) return
   clearTimeout(debounceTimer!)
   debounceTimer = null
   const md = latestContent.value
@@ -118,27 +132,57 @@ async function flushPendingSave() {
   await flushSave(md)
 }
 
+async function restoreDeletedNote() {
+  if (!slug.value || !noteId.value || restoring.value) return
+  restoring.value = true
+  try {
+    await invoke('restore_note', { slug: slug.value, noteId: noteId.value, expectedRoot: noteRoot.value })
+    noteDeleted.value = false
+    if (hasUnsavedEdits() && latestContent.value !== null) await flushSave(latestContent.value)
+  } catch (error) { saveError.value = String(error) }
+  finally { restoring.value = false }
+}
+
 onMounted(async () => {
   unlisten = await listen<NoteWindowData>(noteWindowDataEvent(), async (event) => {
-    await loadNote(event.payload)
+    await loadNote(event.payload, slug.value === event.payload.slug && noteId.value === event.payload.noteId)
   })
 
   // Mirror saves made in the sidebar, so this window doesn't sit on a stale copy
   // and overwrite them on its next autosave.
   unlistenNoteSaved = await onNoteSavedElsewhere(async (payload) => {
-    if (payload.slug !== slug.value || payload.noteId !== noteId.value) return
+    if (payload.slug !== slug.value || payload.noteId !== noteId.value || noteDeleted.value || (payload.root && payload.root !== noteRoot.value)) return
     // Local unsaved edits win — silently replacing what someone is typing is
     // worse than the two copies diverging until the next explicit save.
     if (hasUnsavedEdits()) return
     // The payload holds relative asset paths; resolve them for this webview.
     const display = await toDisplayMarkdown(payload.slug, payload.content)
-    if (payload.noteId !== noteId.value || hasUnsavedEdits()) return
+    if (payload.noteId !== noteId.value || (payload.root && payload.root !== noteRoot.value) || hasUnsavedEdits() || noteDeleted.value) return
     content.value = display
     savedContent.value = display
     latestContent.value = null
     // A remount is the fallback when the editor hasn't finished initialising.
     if (!editorRef.value?.setContent(display)) editorKey.value++
   })
+
+  const offChanged = await onNotesChanged(async payload => {
+    if (payload.root !== noteRoot.value || payload.slug !== slug.value || payload.noteId !== noteId.value) return
+    if (payload.action === 'deleted') {
+      noteDeleted.value = true
+      clearTimeout(debounceTimer!)
+      return
+    }
+    if (payload.action !== 'updated' && payload.action !== 'restored') return
+    if (payload.action === 'restored') noteDeleted.value = false
+    if (hasUnsavedEdits()) return
+    try {
+      const notes = await invoke<import('../types').Note[]>('list_notes', { slug: payload.slug, expectedRoot: payload.root })
+      const note = notes.find(n => n.id === payload.noteId)
+      if (note && !hasUnsavedEdits() && payload.root === noteRoot.value) await loadNote({ root: payload.root, slug: payload.slug, noteId: note.id, title: note.title }, true)
+    } catch (error) { saveError.value = String(error) }
+  })
+  if (disposed) offChanged()
+  else unlistenNotesChanged = offChanged
 
   // The main window writes per-window initial data before calling open_note_window.
   try {
@@ -161,6 +205,9 @@ onMounted(async () => {
 window.addEventListener('beforeunload', () => { void flushPendingSave() })
 
 onBeforeUnmount(async () => {
+  disposed = true
+  loadRevision++
+  unlistenNotesChanged?.()
   unlisten?.()
   unlistenClose?.()
   unlistenNoteSaved?.()
@@ -176,6 +223,10 @@ onBeforeUnmount(async () => {
       <span class="drag-title" data-tauri-drag-region>{{ noteTitle }}</span>
     </div>
 
+    <div v-if="noteDeleted" class="nw-deleted" role="status">
+      <span>{{ t('notes.deletedWhileEditing') }}</span>
+      <button type="button" :disabled="restoring" @click="restoreDeletedNote">{{ t('notes.restore') }}</button>
+    </div>
     <div class="nw-editor" v-if="loaded">
       <VditorEditor
         ref="editorRef"
@@ -245,6 +296,8 @@ onBeforeUnmount(async () => {
 }
 .nw-status-badge.error { color: #cc3333; }
 
+.nw-deleted { display: flex; align-items: center; gap: 12px; padding: 10px 16px; font-size: 12px; color: var(--text-secondary); background: var(--bg-secondary); border-bottom: 1px solid var(--border-subtle); }
+.nw-deleted button { color: var(--accent); flex-shrink: 0; padding: 5px 8px; border-radius: var(--radius-sm); background: var(--accent-light); }
 .nw-editor {
   flex: 1;
   min-height: 0;

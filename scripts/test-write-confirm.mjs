@@ -226,3 +226,29 @@ test('retracting the AI\'s own marks lists exactly what disappears, offers no co
   assert.deepEqual(await page.evaluate(() => window.decisions), ['approved'])
   assert.deepEqual(await page.evaluate(() => window.approvedColors), [undefined])
 })
+
+test('updating a note reviews the full before/after title and body without writing or approving implicitly', async () => {
+  const created_at='2026-10-01T00:00:00Z'
+  await mount({tool:'update_paper_note',slug:'paper',paperTitle:'A paper',noteTitle:'Revised title',content:'New full body',duplicateTitle:false,
+    noteBefore:{id:'note-id',title:'Original title',content:'Original full body',created_at,updated_at:created_at}})
+  assert.match(await page.locator('.wc-title').innerText(),/修改这篇笔记/)
+  assert.match(await page.locator('.wc-note-before').innerText(),/Original title.*Original full body/s)
+  assert.match(await page.locator('.wc-note-after').innerText(),/Revised title.*New full body/s)
+  assert.equal(await page.locator('.wc-colors').count(),0)
+  assert.deepEqual(await page.evaluate(()=>window.decisions),[])
+  await page.getByRole('button',{name:'取消',exact:true}).click()
+  assert.deepEqual(await page.evaluate(()=>window.decisions),['rejected'])
+})
+
+for(const [tool,label] of [['delete_paper_note','移至最近删除'],['restore_paper_note','确认恢复']]) {
+  test(tool+' shows the exact note and its retention/recovery behavior and requires an explicit click',async()=>{
+    await mount({tool,slug:'paper',paperTitle:'A paper',noteTitle:'Important user note',content:'The exact saved body',duplicateTitle:false})
+    assert.match(await page.locator('.wc-body').innerText(),/The exact saved body/)
+    assert.match(await page.locator('.wc-fields').innerText(),/Important user note/)
+    assert.deepEqual(await page.evaluate(()=>window.decisions),[])
+    if(tool==='delete_paper_note') assert.match(await page.locator('.wc-hint').innerText(),/30 天/)
+    await page.getByRole('button',{name:label,exact:true}).click()
+    assert.deepEqual(await page.evaluate(()=>window.decisions),['approved'])
+    assert.deepEqual(await page.evaluate(()=>window.approvedColors),[undefined])
+  })
+}

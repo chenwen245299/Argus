@@ -1910,6 +1910,7 @@ mod tests {
         crate::models::Collection {
             id: id.into(),
             name: name.into(),
+            pinned: false,
             emoji: None,
             parent_id: parent.map(|p| p.into()),
             created_at: String::new(),

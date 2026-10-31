@@ -43,7 +43,7 @@ const createView = new Function('env', transpile(`
   const { props, activeConversation, conversations, activeAnswerTabs, expandedSteps,
     streamOwners, activeRequestIds, unlisteners, pendingWrites, streamRenderTimers,
     streamRenderLast, streamRenderCost, paperSaves, backgroundSaves, sessions, knownConvIds,
-    input, editingNodeId, showHistory, textareaEl, nextTick, scrollToBottom,
+    input, editingNodeId, showHistory, textareaEl, nextTick, scrollToBottom, revealBranch,
     invoke, paperAiSync, crypto, persistableServerToolTrace, saveLegacyActiveHistory,
     flattenConversation, reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt, legacyChatRun, t, messageQueue } = env;
   let syncLibraryRoot = env.root, syncDisposed = false;
@@ -104,7 +104,7 @@ function bus(initial = [conversation()]) {
       pendingWrites: ref([]), streamRenderTimers: new Map(), streamRenderLast: new Map(), streamRenderCost: new Map(),
       paperSaves: new Map(), backgroundSaves: new Map(), sessions: new Map(), knownConvIds: new Map([[slug, new Set(current.map(c => c.id))]]),
       input: ref(''), editingNodeId: ref(null), showHistory: ref(false), textareaEl: ref(null),
-      crypto: webcrypto, nextTick, scrollToBottom: () => {}, paperAiSync: sync,
+      crypto: webcrypto, nextTick, scrollToBottom: () => {}, revealBranch: () => {}, paperAiSync: sync,
       pausedScopes, messageQueue: { pause: scope => pausedScopes.add(scope) },
       persistableServerToolTrace: trace => trace, saveLegacyActiveHistory: async () => {}, flattenConversation: () => [],
       reconcilePaperAiConversations, translatePaperAiClocks, isGuidedReadingPrompt, legacyChatRun,
@@ -389,4 +389,31 @@ test('live usage patches preserve per-model checkpoints without resending native
   assert(!JSON.stringify(update).includes('Summary'))
   assert.equal(popup.activeConversation.value.contextStates['provider::model'].usage.usedTokens, 4000)
   assert.equal(popup.activeConversation.value.contextStates['provider::model'].checkpoint.messages[0].content, 'Summary')
+})
+
+test('branch provenance and its independent snapshot synchronize without selecting it in the other window', async () => {
+  const b = bus()
+  const sidebar = await b.view('branch-sidebar')
+  const popup = await b.view('branch-popup')
+  popup.input.value = 'Keep my draft'
+  const child = conversation('child', 'Independent inherited context')
+  child.title = 'Question · Branch 1'
+  child.branch = { parentId: 'chat', parentTitle: 'Question', messageId: 'chat-group', turn: 1 }
+  child.usageRuns = {}
+  sidebar.persist('paper', child)
+  await sidebar.paperSaves.get('paper')
+  await popup.refresh()
+  const received = popup.conversations.value.find(c => c.id === 'child')
+  assert.deepEqual(received.branch, child.branch)
+  assert.equal(received.title, 'Question · Branch 1')
+  assert.equal(popup.activeConversation.value.id, 'chat')
+  assert.equal(popup.input.value, 'Keep my draft')
+  popup.choose('child')
+  assert.equal(popup.activeConversation.value.nodes.at(-1).answers[0].content, 'Independent inherited context')
+  popup.activeConversation.value.nodes.at(-1).answers[0].content = 'Only the child changes'
+  popup.persist('paper', popup.activeConversation.value)
+  await popup.paperSaves.get('paper')
+  assert.equal(b.disk.find(c => c.id === 'chat').nodes.at(-1).answers[0].content, 'Saved answer')
+  assert.equal(b.disk.find(c => c.id === 'child').branch.parentId, 'chat')
+  b.dispose()
 })

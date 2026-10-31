@@ -13,6 +13,7 @@ mod canvas_edit;
 mod canvas_enhance;
 mod chat_context;
 mod chat_images;
+mod note_trash;
 mod collections;
 mod commands;
 mod copilot;
@@ -50,6 +51,7 @@ mod sections;
 mod security_bookmark;
 mod settings;
 mod user_memory;
+mod user_memory_sync;
 mod user_memory_queue;
 mod snippets;
 mod soclaas;
@@ -137,6 +139,8 @@ pub fn run() {
             arxiv_scheduler::start_scheduler(app.handle().clone());
             arxiv_pdf_cache::spawn(app.handle());
             user_memory_queue::spawn(app.handle());
+            user_memory::spawn_sync(app.handle());
+            note_trash::spawn(app.handle());
 
             // Re-read model prices well after launch, so a free tier that has
             // been withdrawn stops advertising itself. Returns immediately.
@@ -176,6 +180,8 @@ pub fn run() {
             commands::save_speech_audio,
             commands::rename_note,
             commands::delete_note,
+            commands::list_deleted_notes,
+            commands::restore_note,
             commands::get_highlights,
             commands::save_highlights,
             commands::get_reading_state,
@@ -236,6 +242,7 @@ pub fn run() {
             commands::rename_collection,
             commands::move_collection,
             commands::set_collection_emoji,
+            commands::set_collection_pinned,
             commands::delete_collection,
             commands::add_paper_to_collection,
             commands::move_paper_to_collection,
@@ -305,6 +312,7 @@ pub fn run() {
             commands::save_library_conversation,
             commands::delete_library_conversation,
             commands::read_chat_image,
+            commands::copy_chat_branch_images,
             // ── M7: RAG Settings ──
             commands::get_rag_settings,
             commands::save_rag_settings,

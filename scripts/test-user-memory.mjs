@@ -161,3 +161,31 @@ test('narrow dark and English layouts remain usable without horizontal overflow'
   await page.screenshot({path:'/private/tmp/argus-memory/settings-english.png'})
   assert.deepEqual(errors,[])
 })
+
+
+test('library sync status is clear and a sync failure preserves visible local memories',async()=>{
+  await open(); await seed()
+  await page.evaluate(()=>window.__test.publish({syncRoot:'/mock-library',syncError:null}))
+  await page.waitForFunction(()=>document.querySelector('.memory-sync')?.textContent.includes('iCloud'))
+  assert.match(await page.locator('.memory-note').first().textContent(),/学习开关.*保留在本机/)
+  await page.evaluate(()=>window.__test.publish({syncError:'Cloud folder temporarily unavailable'}))
+  await page.waitForFunction(()=>document.querySelector('.memory-sync')?.classList.contains('warning'))
+  assert.match(await page.locator('.memory-sync').textContent(),/本机记忆已保留/)
+  assert.equal(await page.locator('.memory-entry').count(),2)
+  await page.evaluate(()=>window.__test.publish({syncError:null,syncRoot:null}))
+  await page.waitForFunction(()=>document.querySelector('.memory-sync')?.textContent.includes('当前未打开文献库'))
+})
+
+test('synced profile updates keep an open correction draft and English narrow layout readable',async()=>{
+  await page.setViewportSize({width:360,height:800})
+  await open('?locale=en&theme=dark');await seed()
+  await page.evaluate(()=>window.__test.publish({syncRoot:'/mock-library',syncError:null}))
+  await page.locator('.memory-entry').first().getByRole('button',{name:'Correct',exact:true}).click()
+  await page.locator('textarea').fill('Preserve this unsaved correction')
+  await page.evaluate(()=>{window.__test.profile.entries[0].content='Updated on the other device';window.__test.publish({})})
+  assert.equal(await page.locator('textarea').inputValue(),'Preserve this unsaved correction')
+  assert.match(await page.locator('.memory-sync').textContent(),/iCloud/)
+  assert.ok(await page.locator('.memory-settings').evaluate(el=>el.scrollWidth<=el.clientWidth+1))
+  if(process.env.ARGUS_TEST_OUTPUT_DIR){await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/memory-sync-dark.png'})}
+  assert.deepEqual(errors,[])
+})

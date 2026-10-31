@@ -76,6 +76,9 @@ onUnmounted(() => { disposed = true; readEpoch++; off?.(); window.removeEventLis
           <input type="checkbox" :checked="profile.enabled" :disabled="busy" @change="toggle">
         </label>
         <p class="memory-note">{{ t('userMemory.privacy') }}</p>
+        <p class="memory-sync" :class="{ warning: !!profile.syncError }" role="status">
+          {{ t(profile.syncError ? 'userMemory.syncFailed' : profile.syncRoot ? 'userMemory.syncReady' : 'userMemory.syncLocal') }}
+        </p>
         <p class="memory-status" role="status">{{ !profile.enabled ? t('userMemory.disabled') : profile.updating ? t('userMemory.updating') : profile.lastError ? t('userMemory.learningFailed') : (profile.pendingTurns ?? 0) > 0 ? t('userMemory.pending', { n: profile.pendingTurns }) : t('userMemory.automatic') }}</p>
         <p v-if="profile.enabled" class="memory-note memory-batch-hint">{{ t('userMemory.batchHint') }}</p>
         <p class="memory-counters">{{ t('userMemory.counters', { pending: profile.pendingTurns ?? 0, runs: profile.backgroundRuns ?? 0, writes: profile.liveWrites ?? 0 }) }}</p>
@@ -140,6 +143,8 @@ input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; f
 .memory-entry-footer { color: var(--text-tertiary); font-size: 11px; margin-top: 6px; flex-wrap: wrap; }
 .memory-action { color: var(--text-secondary); padding: 6px 8px; border-radius: 5px; font-size: 12px; }
 .memory-action:hover { color: var(--text-primary); background: var(--bg-hover); }
+.memory-sync { margin: 8px 0 0; color: var(--text-secondary); font-size: 11px; line-height: 1.6; }
+.memory-sync.warning { color: var(--danger, #c85555); }
 .memory-action.danger, .memory-error { color: var(--danger, #c85555); }
 .memory-empty { color: var(--text-secondary); text-align: center; line-height: 1.8; padding: 25px 12px; }
 .memory-confirm { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 10px 0; font-size: 12px; }

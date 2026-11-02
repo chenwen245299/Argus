@@ -913,6 +913,53 @@ references inside code fences as text, and retain unreferenced/legacy images at
 the end when streaming finishes. `ChatPageImage.vue` reloads via
 `read_chat_image`. Saving failures are tool errors rather than successful sends.
 
+Enlarged chat images share `ImagePreviewActions.vue` in paper AI, library chat
+and canvas chat. Its copy button uses `utils/copyImage.ts` at the image's natural
+resolution: native Tauri RGBA clipboard writes (with `allow-write-image`) release
+their image resource on success/failure; browser writes pass a promised PNG to
+`ClipboardItem` before awaiting decoding, preserving WebKit's click gesture.
+Copy feedback and retry stay in the preview; paper AI retains its panel-scoped
+overlay. `scripts/test-image-preview-copy.mjs` checks real overlay templates,
+original pixels/dimensions, busy/failure/retry, browser PNGs and narrow layouts
+with clipboard mocks, without touching the system clipboard.
+
+**Model-controlled image layouts.** Models arrange figures with image-only GFM
+tables: the first row already contains images, followed by the usual Markdown
+separator, then any further image rows. Dimensions mean rows × columns (1×2 =
+side by side; 2×2 = four panels), with 1–4 columns / at most 8 cells per grid.
+`IMAGE_LAYOUT_GUIDANCE` is shared by chat image tools/results, text-only sends
+and note tools. `chatImageContent.ts` resolves only successful sent references
+from that answer, preserving blank cells and refusing mixed/malformed tables,
+unknown files and fenced examples. `ChatAnswerBody.vue` renders equal-width
+cells with contained previews; every original still opens/copies independently.
+Notes use the same tables with `argus-note-image://id` markers; saved Markdown
+retains its grid and portable assets. `renderMarkdown.ts` styles image-only
+tables without turning the first image row into labels; Vditor keeps image
+columns within the note, including after editing. No separate layout state or
+image collage is stored. Regressions: `test-chat-images.mjs`,
+`test-image-grid-browser.mjs`, `test-note-images-browser.mjs` and Rust
+`mcp::note_images` cover dimensions/order, mixed aspect ratios, reload, Markdown
+round trips, narrow layouts and per-image enlarge/copy.
+
+**PDF images in notes.** App-only `create_paper_note` and `update_paper_note`
+accept up to eight `images: [{id, slug?, page, crop?, dpi?}]`. The source slug
+defaults to the note's paper; another library paper is allowed. In the complete
+Markdown body, `![caption](argus-note-image://id)` places each image beside its
+explanation. Crops use the same earlier-round exact preview/vision check as
+`send_paper_image`; non-vision models can embed full pages only. `mcp/note_images.rs`
+renders clean PNGs before approval and holds the exact pixels in `PendingWrite`.
+The confirmation card resolves pending pixels through `NoteWriteBody.vue` and
+existing assets through `noteAssets.ts`, using transient blob URLs. Only after
+approval do notes and images commit under the paper's notes lock, with paper
+identity, source PDF revision and existing-note snapshot checks. New immutable
+files live in the destination paper's `notes/assets/`; Markdown contains only
+portable `assets/ai-<uuid>.png` links, independent of conversation files. Refusal
+does not save images; failed note commits remove only newly created assets,
+never shared files. Existing image links survive updates and Recently Deleted.
+External MCP remains read-only. Regressions: Rust `mcp::note_images`, the agent
+schema/vision tests, and `scripts/test-note-images-browser.mjs` (real approval,
+Markdown, asset resolver and Vditor with a local mocked library).
+
 **App-only PDF marking.** `create_paper_highlights` and `create_paper_annotations`
 are declared in `mcp/agent.rs`, parsed in `mcp/app_tools.rs`, and executed only
 through the existing write-confirmation handshake. Their descriptions and the
@@ -1037,7 +1084,15 @@ re-sends the same prefix every 5 minutes with `max_tokens: 1`.
   replace its predecessor, and announcing there would blink the badge between
   every question; explicit stops go through `disarm_and_announce`.
   Generating conversations pulse green; an idle conversation whose cache is held
-  warm pulses blue (shared `--status-generating` / `--status-cache-warm` tokens).
+  warm pulses blue. A conversation with any pending write approval breathes
+  orange (`--status-awaiting-approval`), taking precedence over green; approving,
+  rejecting, timing out or stopping clears it only when no approvals remain.
+  Library chat binds requests to their original conversation. Paper AI derives
+  local waiting state from pending requests and carries only the transient
+  `PaperAiStreamInfo.awaitingApproval` flag to mirrors, including late joins;
+  approval controls remain with the owning window and the flag is never saved
+  in conversation history. Shared generating/cache tokens remain
+  `--status-generating` / `--status-cache-warm`.
   Both paper AI history lists track live stream owners rather than their saved snapshots.
 
 **External MCP servers (`mcp/client.rs`).** Users can point agent mode at other

@@ -304,14 +304,23 @@ pub fn create_note(root: &str, slug: &str) -> Result<Note, String> {
 /// The title only ever lands in `index.json`; the file on disk is named after a
 /// fresh uuid, so nothing here can be steered at another path.
 pub fn create_note_with(root: &str, slug: &str, title: &str, content: &str) -> Result<Note, String> {
+    create_note_with_assets(root, slug, None, title, content, &[])
+}
+
+/// Persist the reviewed pixels before publishing the note's relative links.
+pub fn create_note_with_assets(root: &str, slug: &str, expected_paper_id: Option<&str>, title: &str, content: &str, assets: &[NoteImageAsset]) -> Result<Note, String> {
     let lock = notes_lock(root, slug);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     check_notes_dir(root, slug)?;
+    if expected_paper_id.is_some_and(|id| read_meta(root, slug).map_or(true, |m| m.id != id)) {
+        return Err("Paper changed since the preview. Nothing was saved.".into());
+    }
     validate_slug(slug)?;
     maybe_migrate_legacy_note(root, slug);
     let dir = notes_dir(root, slug);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create notes dir: {e}"))?;
-
+    let mut notes = read_notes_index_checked(root, slug)?;
+    let mut saved_assets = save_reviewed_note_assets(root, slug, assets)?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let note = Note {
@@ -322,9 +331,12 @@ pub fn create_note_with(root: &str, slug: &str, title: &str, content: &str) -> R
     };
     atomic_write(&dir.join(format!("{id}.md")), content)
         .map_err(|e| format!("Failed to create note file: {e}"))?;
-    let mut notes = read_notes_index_checked(root, slug)?;
     notes.push(note.clone());
-    write_notes_index(root, slug, &notes)?;
+    if let Err(error) = write_notes_index(root, slug, &notes) {
+        let _ = std::fs::remove_file(dir.join(format!("{id}.md")));
+        return Err(error);
+    }
+    saved_assets.commit();
     Ok(note)
 }
 
@@ -436,12 +448,22 @@ fn update_note_unlocked(root: &str, slug: &str, before: &NoteSnapshot, title: &s
 }
 
 pub fn update_note_checked(root: &str, slug: &str, before: &NoteSnapshot, title: &str, content: &str) -> Result<Note, String> {
+    update_note_checked_with_assets(root, slug, None, before, title, content, &[])
+}
+
+pub fn update_note_checked_with_assets(root: &str, slug: &str, expected_paper_id: Option<&str>, before: &NoteSnapshot, title: &str, content: &str, assets: &[NoteImageAsset]) -> Result<Note, String> {
     let lock = notes_lock(root, slug);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if expected_paper_id.is_some_and(|id| read_meta(root, slug).map_or(true, |m| m.id != id)) {
+        return Err("Paper changed since the preview. Nothing was saved.".into());
+    }
     if note_snapshot_unlocked(root, slug, &before.note.id)? != *before {
         return Err("Note changed since the preview. Nothing was saved; read it again.".into());
     }
-    update_note_unlocked(root, slug, before, title, content)
+    let mut saved_assets = save_reviewed_note_assets(root, slug, assets)?;
+    let note = update_note_unlocked(root, slug, before, title, content)?;
+    saved_assets.commit();
+    Ok(note)
 }
 
 fn trash_dir(root: &str, slug: &str, create: bool) -> Result<PathBuf, String> {
@@ -592,6 +614,55 @@ const NOTE_ASSET_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 /// Cap on a single pasted image. Large enough for a retina screenshot, small
 /// enough that a stray paste can't wedge the editor or bloat the library.
 const NOTE_ASSET_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct NoteImageAsset {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Roll back only files this write created if the note cannot be committed.
+struct SavedNoteAssets(Vec<PathBuf>);
+impl SavedNoteAssets {
+    fn commit(&mut self) { self.0.clear(); }
+}
+impl Drop for SavedNoteAssets {
+    fn drop(&mut self) {
+        for path in &self.0 { let _ = std::fs::remove_file(path); }
+    }
+}
+
+/// Called under the per-paper notes lock, after identity/snapshot validation.
+fn save_reviewed_note_assets(root: &str, slug: &str, assets: &[NoteImageAsset]) -> Result<SavedNoteAssets, String> {
+    use std::io::Write;
+    let mut saved = SavedNoteAssets(vec![]);
+    if assets.is_empty() { return Ok(saved); }
+    check_notes_dir(root, slug)?;
+    let dir = note_assets_dir(root, slug);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {},
+        Ok(_) => return Err("Note assets must be a real directory.".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::fsutil::note_self_write(&dir);
+            std::fs::create_dir(&dir).map_err(|e| format!("Create note assets: {e}"))?;
+        },
+        Err(e) => return Err(format!("Read note assets: {e}")),
+    }
+    for asset in assets {
+        if asset.bytes.is_empty() || asset.bytes.len() > NOTE_ASSET_MAX_BYTES {
+            return Err("Note image is empty or exceeds 20 MB.".into());
+        }
+        let path = note_asset_path(root, slug, &asset.name)?;
+        crate::fsutil::note_self_write(&path);
+        // Never replace an existing/shared image, including symlinks.
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+            .map_err(|e| format!("Create note image: {e}"))?;
+        saved.0.push(path);
+        file.write_all(&asset.bytes).map_err(|e| format!("Write note image: {e}"))?;
+        file.sync_all().map_err(|e| format!("Save note image: {e}"))?;
+    }
+    Ok(saved)
+}
 
 fn note_assets_dir(root: &str, slug: &str) -> PathBuf {
     notes_dir(root, slug).join("assets")

@@ -478,14 +478,14 @@ fn page_image_summary(
                 .collect()
         })
         .unwrap_or_default();
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "slug": value.get("slug").and_then(|s| s.as_str()).unwrap_or(""),
         "note": if value.get("arxiv_id").is_some() {
             "These are clean PDF page images from a screened recommendation, identified by arxiv_id (not a library slug). They accompany this result for visual inspection; extracted text can omit figures, equations and tables. Page numbers are 1-based PDF indices, not printed labels or figure numbers."
         } else if sent {
             "The image was saved with this conversation and sent into your answer. \
              The user can click it to enlarge. Copy each page's markdown reference EXACTLY, \
-             on its own line beside the paragraph discussing it, interleaving images and \
+             as a standalone image or image-only table cell beside the paragraph discussing it, interleaving images and \
              explanation. Never invent references or substitute a local path/base64."
         } else {
             "The requested page(s) accompany this result as labelled images. Full pages have \
@@ -497,7 +497,9 @@ fn page_image_summary(
              below comes from the FULL page and is NOT evidence that a crop contains it."
         },
         "pages": pages,
-    })
+    });
+    if sent { result["image_layout"] = serde_json::json!(crate::mcp::agent::IMAGE_LAYOUT_GUIDANCE); }
+    result
 }
 
 /// Label EACH image immediately before its pixels. A batch of unlabelled pages
@@ -2150,6 +2152,8 @@ Recommendations are separate from the library. Use `list_arxiv_recommendations`:
 
 ## Writing a note
 
+For notes with PDF figures, create_paper_note and update_paper_note accept images:[{id,slug?,page,crop?,dpi?}]. Place ![caption](argus-note-image://id) beside the relevant explanation in content. The app freezes the PDF pixels for approval and saves portable assets in that note's paper, independently of chat history. Inspect the full page and preview each exact crop with view_paper_page in an earlier round before writing; never guess a crop or put chat-only argus-image references into notes. Preserve existing assets/ links when updating. Text-only models can embed full pages only.
+
 `create_paper_note` adds a new note to a paper; it cannot edit, overwrite or delete a note that already exists, so everything you want kept goes in `content`.
 
 Use `update_paper_note` to change an existing note's title and/or complete Markdown body; read `get_note` first, keep content the user did not ask to change, and include the existing text when extending it. Use `delete_paper_note` to move the exact requested note to Recently Deleted. Both the user's notes and AI notes can be changed with explicit user approval. Deletion preserves the original note for 30 days, then it is permanently removed. `list_deleted_paper_notes` reads recoverable notes; `restore_paper_note` restores the chosen id/title/content/image links after approval, without overwriting live notes.
@@ -3013,7 +3017,13 @@ fn agent_tool_defs(
                 if let Some(props) = t.input_schema["properties"].as_object_mut() {
                     props.remove("crop");
                 }
-                t.description = "Send a FULL PDF page into the answer, using slug and a 1-based PDF page index. This model cannot inspect images, so cropping is unavailable; do not guess a figure's location. Optional caption labels the page; dpi is 72–300 (default 150). Copy the successful result's markdown reference exactly on its own line beside the relevant explanation, interleaving text and images. Never invent references or embed base64/local paths.".into();
+                t.description = "Send a FULL PDF page into the answer, using slug and a 1-based PDF page index. This model cannot inspect images, so cropping is unavailable; do not guess a figure's location. Optional caption labels the page; dpi is 72–300 (default 150). Copy the successful result's markdown reference exactly as a standalone image or image-only table cell beside the relevant explanation, interleaving text and images. Never invent references or embed base64/local paths.".into();
+                t.description.push_str(crate::mcp::agent::IMAGE_LAYOUT_GUIDANCE);
+            }
+            if !vision && matches!(t.name.as_str(), crate::mcp::app_tools::CREATE_NOTE_TOOL | crate::mcp::app_tools::UPDATE_NOTE_TOOL) {
+                if let Some(properties) = t.input_schema["properties"]["images"]["items"]["properties"].as_object_mut() {
+                    properties.remove("crop");
+                }
             }
             serde_json::json!({
                 "type": "function",
@@ -3480,6 +3490,8 @@ async fn run_agent_loop(
                 || call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL;
             let crop_check = if call.name == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL {
                 crop_previews.check_send(&call.arguments, model_sees_images, rounds)
+            } else if matches!(call.name.as_str(), crate::mcp::app_tools::CREATE_NOTE_TOOL | crate::mcp::app_tools::UPDATE_NOTE_TOOL) {
+                crate::mcp::note_images::check_previews(&crop_previews, &call.arguments, model_sees_images, rounds)
             } else {
                 Ok(())
             };
@@ -4092,6 +4104,11 @@ mod agent_tests {
             let send = agent_tool_defs(&bridge, vision, false, false, false).into_iter()
                 .find(|tool| tool["function"]["name"] == crate::mcp::agent::SEND_PAPER_IMAGE_TOOL).unwrap();
             assert_eq!(send["function"]["parameters"]["properties"].get("crop").is_some(), vision);
+            for name in [crate::mcp::app_tools::CREATE_NOTE_TOOL, crate::mcp::app_tools::UPDATE_NOTE_TOOL] {
+                let note = agent_tool_defs(&bridge, vision, false, false, false).into_iter()
+                    .find(|tool| tool["function"]["name"] == name).unwrap();
+                assert_eq!(note["function"]["parameters"]["properties"]["images"]["items"]["properties"].get("crop").is_some(), vision);
+            }
         }
         // The recommendation reader stays available with text mode only.
         assert_eq!(with_vision.len(), text_only.len() + 1);

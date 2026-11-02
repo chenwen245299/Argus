@@ -24,6 +24,7 @@ const script = ts.transpileModule(compiled.content, { compilerOptions: { target:
   .replace(/import \{ useI18n \} from ['"]vue-i18n['"];?/g, String.raw`const useI18n = () => ({ t: (key, args = {}) => (key.split('.').reduce((value, name) => value?.[name], window.translations) || key).replace(/\{(\w+)\}/g, (_, name) => args[name] ?? '') });`)
   .replace(/import \{ HIGHLIGHT_COLORS \} from ['"][^'"]+['"];?/g, `const HIGHLIGHT_COLORS = ${JSON.stringify(HIGHLIGHT_COLORS)};`)
   .replace(/import MarkdownBody from ['"][^'"]+['"];?/g, `const MarkdownBody = { props: ['content'], render() { return window.Vue.h('div', this.content) } };`)
+  .replace(/import NoteWriteBody from ['"][^'"]+['"];?/g, `const NoteWriteBody = { props: ['content'], render() { return window.Vue.h('div', this.content) } };`)
   .replace('export default', 'const component =')
 const template = compileTemplate({ source: descriptor.template.content, filename: 'WriteConfirmCard.vue', id: 'write-preview-test',
   compilerOptions: { bindingMetadata: compiled.bindings } }).code

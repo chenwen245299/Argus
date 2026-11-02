@@ -25,7 +25,7 @@ use super::tools;
 /// under the conversation folder, and — for a vision model — fed back as a
 /// separate image message. Kept here so both sides name it the same thing.
 pub const VIEW_PAGE_TOOL: &str = "view_paper_page";
-pub use super::paper_images::{CropPreviews, SEND_PAPER_IMAGE_TOOL};
+pub use super::paper_images::{CropPreviews, IMAGE_LAYOUT_GUIDANCE, SEND_PAPER_IMAGE_TOOL};
 
 /// A tool as the LLM needs to see it: name, purpose, and argument schema.
 #[derive(Debug, Clone, Serialize)]
@@ -82,7 +82,7 @@ pub fn tools() -> Vec<AgentTool> {
 /// not edit the paper and needs no note/canvas confirmation. Only the app's
 /// chat loop can persist and display it; it is not an external MCP tool.
 fn send_paper_image_tool() -> AgentTool {
-    AgentTool {
+    let mut tool = AgentTool {
         name: SEND_PAPER_IMAGE_TOOL.into(),
         read_only: true,
         description: "Send an image from a library paper's PDF directly into this chat answer. \
@@ -95,8 +95,8 @@ fn send_paper_image_tool() -> AgentTool {
             the figure number/content, axes, legends and caption. Only then send EXACTLY \
             that crop. An unpreviewed crop is rejected. If you cannot see images, send the \
             full page; do not guess a crop. dpi (72–300, default 150) controls clarity. \
-            A successful result supplies a markdown reference. Copy that reference on its \
-            own line beside the paragraph explaining this image, interleaving images and \
+            A successful result supplies a markdown reference. Copy that reference as a \
+            standalone image or an image-only table cell beside its explanation, interleaving images and \
             explanation throughout the answer. Do not collect them at the end, invent \
             references, or embed base64/local paths. Repeat for multiple figures."
             .into(),
@@ -123,7 +123,9 @@ fn send_paper_image_tool() -> AgentTool {
             "required": ["slug", "page"],
             "additionalProperties": false
         }),
-    }
+    };
+    tool.description.push_str(IMAGE_LAYOUT_GUIDANCE);
+    tool
 }
 
 /// Tools the in-app agent has and the MCP endpoint does not.
@@ -136,7 +138,7 @@ fn send_paper_image_tool() -> AgentTool {
 /// macro is what publishes a tool to the MCP router, and using it here would
 /// hand the write tool to external clients too.
 fn app_only_tools() -> Vec<AgentTool> {
-    vec![AgentTool {
+    let mut tools = vec![AgentTool {
         name: app_tools::CREATE_NOTE_TOOL.to_string(),
         read_only: false,
         description: "Create a NEW note on a paper in the user's library, holding markdown you \
@@ -168,7 +170,22 @@ fn app_only_tools() -> Vec<AgentTool> {
         }),
     }, passage_tool(false), passage_tool(true), update_marks_tool(), remove_marks_tool(),
         note_change_tool(app_tools::UPDATE_NOTE_TOOL), note_change_tool(app_tools::DELETE_NOTE_TOOL),
-        note_change_tool(app_tools::RESTORE_NOTE_TOOL), deleted_notes_tool()]
+        note_change_tool(app_tools::RESTORE_NOTE_TOOL), deleted_notes_tool()];
+    for tool in &mut tools {
+        if matches!(tool.name.as_str(), app_tools::CREATE_NOTE_TOOL | app_tools::UPDATE_NOTE_TOOL) {
+            tool.description.push_str(super::note_images::INSTRUCTIONS);
+            tool.description.push_str(IMAGE_LAYOUT_GUIDANCE);
+            let mut image = send_paper_image_tool().input_schema;
+            image["properties"].as_object_mut().unwrap().remove("caption");
+            image["properties"]["id"] = serde_json::json!({"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$",
+                "description":"Unique image id used in ![caption](argus-note-image://id) in content."});
+            image["properties"]["slug"]["description"] = serde_json::json!("Source library paper slug; omit for the note's paper.");
+            image["required"] = serde_json::json!(["id", "page"]);
+            tool.input_schema["properties"]["images"] = serde_json::json!({"type":"array","maxItems":8,"items":image,
+                "description":"PDF pages/crops to save as permanent note images. Each id must be referenced in content. Requires content when updating."});
+        }
+    }
+    tools
 }
 
 fn note_change_tool(name: &str) -> AgentTool {
@@ -846,6 +863,15 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(required, ["slug", "title", "content"]);
+        for name in [app_tools::CREATE_NOTE_TOOL, app_tools::UPDATE_NOTE_TOOL] {
+            let tool = tools().into_iter().find(|t| t.name == name).unwrap();
+            let images = &tool.input_schema["properties"]["images"];
+            assert_eq!(images["maxItems"], 8);
+            assert_eq!(images["items"]["required"], serde_json::json!(["id", "page"]));
+            assert!(images["items"]["properties"].get("crop").is_some());
+            assert!(tool.description.contains("argus-note-image://id"));
+            assert!(!server::tool_declarations().iter().any(|t| t.name == name));
+        }
     }
 
     #[test]

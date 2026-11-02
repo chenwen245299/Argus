@@ -1062,6 +1062,8 @@ export interface AgentWritePreview {
   /** A note with this title already exists — nothing is overwritten either way. */
   duplicateTitle: boolean
   noteBefore?: Note & { content: string }
+  /** Frozen pending images, used only by the write approval preview. */
+  noteImages?: { path: string; dataUrl: string }[]
   passages?: { page: number; text: string; note?: string | null; color: string; style: string }[]
   recommendations?: { arxivId: string; title: string; source: string; existingSlug?: string | null; existingTitle?: string | null }[]
   keepDuplicateCopies?: boolean

@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 pub const SEND_PAPER_IMAGE_TOOL: &str = "send_paper_image";
 
+pub const IMAGE_LAYOUT_GUIDANCE: &str = " For requested image layouts, use an image-only Markdown table (rows x columns): 1x2 is two images side by side; 2x2 is four images in two rows. Example 1x2: `| IMAGE_A | IMAGE_B |` followed by `| --- | --- |` on the next line. For 2x2 append `| IMAGE_C | IMAGE_D |` on a third line. Replace IMAGE_A etc. with the complete actual Markdown image references, never literal placeholders. The first row contains images, not header labels. Each cell contains exactly one image reference or is empty; put explanations before/after the table. Use 1-4 columns and at most 8 cells per grid. Do not wrap the table in a code fence. In chat use only references returned by successful send_paper_image calls in this answer; in notes use the declared argus-note-image ids. Grids preserve order and each image can still be opened separately.";
+
 /// Fractions of the displayed, rotated page, measured from its top-left corner.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -71,7 +73,7 @@ pub struct SendImageArgs {
 }
 
 impl SendImageArgs {
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         crate::path_guard::validate_segment("paper slug", &self.slug)?;
         if self.page == 0 {
             return Err("Page numbers are 1-based.".into());

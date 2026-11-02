@@ -19,6 +19,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useAiStore, type ModelOption } from '../../stores/ai'
 import { useCanvasStore } from '../../stores/canvas'
 import ChatAnswerBody from '../ChatAnswerBody.vue'
+import ImagePreviewActions from '../ImagePreviewActions.vue'
 import ContextMeter from '../ContextMeter.vue'
 import { beginChatRun, applyRunUsage, legacyChatRun, recordCompactionUsage, type ChatRun, type StreamUsagePayload } from '../../utils/chatRunStats'
 import { applyContextCheckpoint, historyFingerprint, withContextDraft, type ContextCheckpoint, type ContextUsage, type PreparedContext } from '../../utils/chatContext'
@@ -951,9 +952,7 @@ onUnmounted(() => {
   <Teleport to="body">
     <div v-if="previewImage" class="cc-image-lightbox" @click.self="previewImage = null">
       <img :src="previewImage" :alt="t('chat.imageEnlarge')" />
-      <button type="button" :title="t('chat.imageClose')" @click="previewImage = null">
-        <Icon icon="fluent:dismiss-24-regular" width="20" height="20" />
-      </button>
+      <ImagePreviewActions :src="previewImage" @close="previewImage = null" />
     </div>
   </Teleport>
 </template>
@@ -974,19 +973,6 @@ onUnmounted(() => {
   max-height: 100%;
   object-fit: contain;
   border-radius: var(--radius-md);
-}
-.cc-image-lightbox button {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: var(--bg-secondary);
-  color: var(--text-primary);
 }
 .cc-root {
   position: relative;

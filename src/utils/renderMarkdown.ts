@@ -122,6 +122,15 @@ function renderMathCode(text: string): string | null {
 marked.use({
   breaks: true,
   renderer: {
+    table(token: Tokens.Table): string | false {
+      const rows = [token.header, ...token.rows]
+      const cells = rows.flat()
+      // Keep image grids as editable Markdown; normal tables retain headers.
+      const imageCell = (cell: Tokens.TableCell) => cell.tokens.length === 1 && cell.tokens[0]?.type === 'image'
+      if (!token.header.length || token.header.length > 4 || cells.length > 8
+        || !cells.some(imageCell) || !cells.every(cell => !cell.text.trim() || imageCell(cell))) return false
+      return `<table class="md-image-grid"><tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${this.parser.parseInline(cell.tokens)}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+    },
     code(token: Tokens.Code): string {
       const { text, lang } = token
       if (lang === 'svg') {

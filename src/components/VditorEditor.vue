@@ -445,6 +445,11 @@ function onFindKeydown(e: KeyboardEvent) {
 
 <!-- CSS Custom Highlight API — global, not scoped -->
 <style>
+/* Keep image table columns within the note instead of their intrinsic widths. */
+.vditor-wrapper .vditor-reset table:has(img) { display: table; width: 100%; table-layout: fixed; }
+.vditor-wrapper .vditor-reset table:has(img) th,
+.vditor-wrapper .vditor-reset table:has(img) td { min-width: 0; vertical-align: top; }
+.vditor-wrapper .vditor-reset table:has(img) img { width: 100%; max-width: 100%; height: auto; object-fit: contain; }
 ::highlight(vditor-find-all) {
   background-color: rgba(255, 200, 0, 0.4);
   color: inherit;

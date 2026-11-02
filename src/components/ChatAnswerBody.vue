@@ -20,8 +20,15 @@ const body = computed(() => chatImageContent(props.content, props.steps))
 <template>
   <template v-for="(part, index) in body.parts" :key="index">
     <MarkdownBody v-if="part.type === 'text'" :content="part.content" :streaming="streaming" />
-    <div v-else class="chat-answer-image">
+    <div v-else-if="part.type === 'image'" class="chat-answer-image">
       <ChatPageImage :conversation-id="conversationId" :image="part.image" presentation="message" @open="$emit('open', $event)" />
+    </div>
+    <div v-else class="chat-answer-image-grid" role="group"
+      :style="{ gridTemplateColumns: `repeat(${part.columns}, minmax(0, 1fr))` }">
+      <template v-for="(image, cell) in part.cells" :key="cell">
+        <ChatPageImage v-if="image" :conversation-id="conversationId" :image="image" presentation="message" @open="$emit('open', $event)" />
+        <div v-else aria-hidden="true" />
+      </template>
     </div>
   </template>
   <!-- Old answers have no inline references. Keep their sent images visible,
@@ -39,6 +46,10 @@ const body = computed(() => chatImageContent(props.content, props.steps))
 </template>
 
 <style scoped>
-.chat-answer-image, .chat-answer-images { margin: 12px 0; min-width: 0; }
+.chat-answer-image, .chat-answer-images, .chat-answer-image-grid { margin: 12px 0; min-width: 0; }
 .chat-answer-images { display: flex; flex-direction: column; gap: 12px; }
+.chat-answer-image-grid { display: grid; gap: 10px; }
+.chat-answer-image-grid :deep(.chat-image-message) { display: flex; flex-direction: column; }
+.chat-answer-image-grid :deep(.chat-image-open) { position: relative; aspect-ratio: 4 / 3; flex-shrink: 0; overflow: hidden; }
+.chat-answer-image-grid :deep(.chat-image-open img) { position: absolute; inset: 0; width: 100%; height: 100%; max-height: none; object-fit: contain; }
 </style>

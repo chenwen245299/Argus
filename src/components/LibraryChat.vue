@@ -31,6 +31,7 @@ import { buildToolExchangeMessages } from '../utils/agentHistory'
 import WindowControls from './WindowControls.vue'
 import ChatPageImage from './ChatPageImage.vue'
 import ChatAnswerBody from './ChatAnswerBody.vue'
+import ImagePreviewActions from './ImagePreviewActions.vue'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../types/chatImages'
 import { svgStringToPngBlob } from '../utils/svgToPng'
 import { copyPngBlobToClipboard } from '../utils/clipboard'
@@ -651,9 +652,10 @@ function fallbackTitle(f: AgentFallback): string {
 // it, since two conversations can be generating at once. Nothing is written
 // until `answerWrite` sends an approval back — the backend defaults every other
 // outcome (timeout, stop, this window closing) to "do not write".
-interface PendingWrite { requestId: string; preview: AgentWritePreview; targetId: string }
+interface PendingWrite { requestId: string; preview: AgentWritePreview; targetId: string; convId: string }
 const pendingWrites = ref<PendingWrite[]>([])
 const currentWrite = computed<PendingWrite | null>(() => pendingWrites.value[0] ?? null)
+const awaitingApprovalConvIds = computed(() => new Set(pendingWrites.value.map(write => write.convId)))
 
 function answerWrite(approved: boolean, passageColors?: string[]) {
   const pending = currentWrite.value
@@ -2252,7 +2254,7 @@ async function runAssistantRequestImpl(
     (e) => {
       const p = e.payload
       if (!p?.requestId || !p.preview) return
-      pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview, targetId: target.id }]
+      pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview, targetId: target.id, convId: conv.id }]
     },
   ))
   offs.push(await listen<{ requestId: string }>(`${eventName}-confirm-close`, (e) => {
@@ -2934,7 +2936,8 @@ onUnmounted(() => {
               <div class="conv-title-row">
                 <div class="conv-title-text">
                   <Icon v-if="conv.branch" class="history-branch-icon" icon="fluent:branch-fork-24-regular" width="13" height="13" />
-                  <span v-if="isGenerating(conv.id)" class="conv-pulse" title="正在生成" />
+                  <span v-if="isGenerating(conv.id)" class="conv-pulse" :class="{ 'awaiting-approval': awaitingApprovalConvIds.has(conv.id) }"
+                    :title="t(awaitingApprovalConvIds.has(conv.id) ? 'chat.statusAwaitingApproval' : 'chat.statusGenerating')" />
                   <!-- Only when idle: a conversation that is generating obviously
                        still has a live context, and two dots would say the same
                        thing twice. -->
@@ -3732,9 +3735,7 @@ onUnmounted(() => {
   <Teleport to="body">
     <div v-if="previewImage" class="attachment-lightbox" @click.self="closePreview">
       <img :src="previewImage" class="lightbox-image" alt="" />
-      <button class="lightbox-close" @click="closePreview">
-        <Icon icon="fluent:dismiss-24-regular" width="18" height="18" />
-      </button>
+      <ImagePreviewActions :src="previewImage" @close="closePreview" />
     </div>
     <div v-if="previewVideo" class="attachment-lightbox" @click.self="closePreview">
       <video :src="previewVideo" class="lightbox-video" controls autoplay></video>
@@ -3941,12 +3942,14 @@ onUnmounted(() => {
   height: 6px;
   margin-right: 5px;
   border-radius: 50%;
-  background: var(--status-generating);
+  --conv-pulse-color: var(--status-generating);
+  background: var(--conv-pulse-color);
   vertical-align: middle;
   animation: conv-breathe 1.5s ease-in-out infinite;
 }
+.conv-pulse.awaiting-approval { --conv-pulse-color: var(--status-awaiting-approval); }
 @keyframes conv-breathe {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--status-generating) 55%, transparent); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--conv-pulse-color) 55%, transparent); }
   50% { opacity: 0.45; box-shadow: 0 0 0 4px transparent; }
 }
 

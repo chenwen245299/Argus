@@ -14,6 +14,7 @@ import { useI18n } from 'vue-i18n'
 import { computed, ref } from 'vue'
 import { Icon } from '@iconify/vue'
 import MarkdownBody from './MarkdownBody.vue'
+import NoteWriteBody from './NoteWriteBody.vue'
 import type { AgentWritePreview } from '../types'
 import { HIGHLIGHT_COLORS } from '../utils/highlightColors'
 
@@ -185,18 +186,18 @@ function approve() {
         <div class="wc-note-version wc-note-before">
           <span class="wc-version-label">{{ t('writeConfirm.before') }}</span>
           <strong>{{ preview.noteBefore.title }}</strong>
-          <MarkdownBody v-if="preview.noteBefore.content" :content="preview.noteBefore.content" />
+          <NoteWriteBody v-if="preview.noteBefore.content" :slug="preview.slug" :content="preview.noteBefore.content" />
           <span v-else class="wc-empty">{{ t('writeConfirm.emptyNote') }}</span>
         </div>
         <div class="wc-note-version wc-note-after">
           <span class="wc-version-label">{{ t('writeConfirm.after') }}</span>
           <strong>{{ preview.noteTitle }}</strong>
-          <MarkdownBody v-if="preview.content" :content="preview.content" />
+          <NoteWriteBody v-if="preview.content" :slug="preview.slug" :content="preview.content" :images="preview.noteImages" />
           <span v-else class="wc-empty">{{ t('writeConfirm.emptyNote') }}</span>
         </div>
       </template>
       <template v-else>
-        <MarkdownBody v-if="preview.content" :content="preview.content" />
+        <NoteWriteBody v-if="preview.content" :slug="preview.slug" :content="preview.content" :images="preview.noteImages" />
         <span v-else class="wc-empty">{{ t('writeConfirm.emptyNote') }}</span>
       </template>
     </div>

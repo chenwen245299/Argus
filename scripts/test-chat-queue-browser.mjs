@@ -354,6 +354,48 @@ test('switching libraries clears queued messages and refuses late completion', a
   assert.deepEqual(errors,[])
 })
 
+for (const mode of ['sidebar','standalone','library']) {
+  test(`${mode}: approval breathing dots are orange per conversation and recover after approval, rejection, timeout and stop`, async () => {
+    await open(mode); await send('awaiting conversation'); await count(1)
+    const confirm = async (index,id,annotation=false) => page.evaluate(({index,id,annotation}) => {
+      const preview={tool:annotation?'create_paper_annotations':'create_paper_note',slug:'paper',paperTitle:'Paper',noteTitle:'Review',content:'Body',duplicateTitle:false,
+        ...(annotation?{passages:[{page:1,text:'Exact source text',note:'解释',color:'#FFEB3B',style:'highlight'}]}:{})}
+      window.__test.emit(window.__test.requests[index].args.eventName+'-confirm',{requestId:id,preview})
+    }, {index,id,annotation})
+    const showHistory=async()=>{if(mode==='sidebar')await page.getByTitle('对话历史',{exact:true}).click()}
+    const hideHistory=async()=>{if(mode==='sidebar')await page.locator('.history-head .icon-btn').click()}
+    const colors=()=>page.locator('.conv-pulse').evaluateAll(dots=>dots.map(dot=>({color:getComputedStyle(dot).backgroundColor,title:dot.title})))
+    await confirm(0,'first-note'); await confirm(0,'second-annotation',true)
+    // A different conversation remains green while the first waits for approval.
+    await page.locator('.composer .toolbar-btn[title="新建对话"]').click()
+    await send('still generating'); await count(2)
+    await showHistory()
+    await page.locator('.conv-pulse.awaiting-approval').waitFor()
+    let dots=await colors()
+    assert.equal(dots.filter(dot=>dot.color==='rgb(249, 115, 22)'&&dot.title==='等待批准').length,1)
+    assert.equal(dots.filter(dot=>dot.color==='rgb(34, 197, 94)'&&dot.title==='正在生成').length,1)
+    if(process.env.ARGUS_TEST_OUTPUT_DIR){await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/approval-status-'+mode+'.png'})}
+    await hideHistory()
+    await page.locator('.write-confirm .wc-actions .primary').click()
+    await showHistory(); assert.equal(await page.locator('.conv-pulse.awaiting-approval').count(),1); await hideHistory()
+    await page.locator('.write-confirm .wc-actions .wc-btn:not(.primary)').click()
+    await showHistory(); assert.equal(await page.locator('.conv-pulse.awaiting-approval').count(),0)
+    assert.equal((await colors()).filter(dot=>dot.color==='rgb(34, 197, 94)').length,2); await hideHistory()
+    await confirm(1,'timed-out')
+    await showHistory(); assert.equal(await page.locator('.conv-pulse.awaiting-approval').count(),1); await hideHistory()
+    await page.evaluate(()=>window.__test.emit(window.__test.requests[1].args.eventName+'-confirm-close',{requestId:'timed-out'}))
+    await showHistory(); assert.equal(await page.locator('.conv-pulse.awaiting-approval').count(),0); await hideHistory()
+    await confirm(1,'stopped')
+    await page.locator('.stop-btn').click()
+    await showHistory(); assert.equal(await page.locator('.conv-pulse.awaiting-approval').count(),0)
+    assert.equal(await page.locator('.conv-pulse').count(),1); await hideHistory()
+    await finish(0)
+    assert.deepEqual(await page.evaluate(()=>window.__test.calls.filter(c=>c.command==='resolve_agent_write').map(c=>({id:c.args.requestId,approved:c.args.approved}))),[
+      {id:'first-note',approved:true},{id:'second-annotation',approved:false},{id:'stopped',approved:false},
+    ])
+  })
+}
+
 test('steering refuses only approvals belonging to the stopped conversation', async () => {
   for (const mode of ['sidebar','library']) {
     await open(mode); await send('first conversation'); await count(1)

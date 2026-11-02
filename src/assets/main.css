@@ -53,6 +53,7 @@
   --accent-light:   rgba(0, 122, 255, 0.10);
 
   --status-generating: #22c55e;
+  --status-awaiting-approval: #f97316;
   --status-cache-warm: #3b82f6;
 
   /* Keep context categories distinct across theme accent palettes. */
@@ -186,6 +187,15 @@ input, textarea, select {
 .markdown-body table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: .9em; }
 .markdown-body th, .markdown-body td { border: 1px solid var(--border-default); padding: 5px 8px; }
 .markdown-body th { background: var(--bg-secondary); font-weight: 650; }
+table.md-image-grid {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 8px;
+  margin: 8px 0;
+}
+table.md-image-grid > tbody > tr > td { border: 0; padding: 0; vertical-align: top; background: transparent; }
+table.md-image-grid img { width: 100%; max-width: 100%; height: auto; object-fit: contain; }
 .markdown-body a.md-link { color: var(--accent); text-decoration: underline; }
 
 /* Code blocks */

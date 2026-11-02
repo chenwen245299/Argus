@@ -31,6 +31,7 @@ const functions = [
   'liveConversationById', 'restoreSession', 'openConversation', 'startNewConversation',
   'firstUserTitle', 'isMetadataExtractionConversation', 'stopConversationStreaming', 'conversationScope',
   'detachAnswerListeners', 'findReactiveAnswer', 'flushStreamRender', 'legacyPaperRuns',
+  'answerWrite', 'dismissWrite',
 ].map(name => {
   const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name)
   assert.ok(node, `AiTab function ${name} exists`)
@@ -49,6 +50,7 @@ const createView = new Function('env', transpile(`
   let syncLibraryRoot = env.root, syncDisposed = false;
   let syncRefresh = null, syncRefreshPending = false;
   let selectionRevision = 0, initialSyncSelectionRevision = null;
+  const currentWrite = { get value() { return pendingWrites.value[0] ?? null; } };
   ${constants}
   ${functions}
   return {
@@ -57,6 +59,7 @@ const createView = new Function('env', transpile(`
     refresh: refreshSyncedConversations, restore: restoreSession,
     stop: stopConversationStreaming, normalize: normalizeConversations,
     choose: openConversation,
+    answerWrite, dismissWrite,
     initialRequest: () => { initialSyncSelectionRevision = selectionRevision; },
     dispose: () => { syncDisposed = true; },
   };
@@ -132,6 +135,7 @@ function bus(initial = [conversation()]) {
         return
       }
       if (command === 'cancel_ai_request') { cancellations.push(args.requestId); return }
+      if (command === 'resolve_agent_write') return
       if (command === 'save_chat_history') return
       throw new Error(`Unexpected command ${command}`)
     }
@@ -206,6 +210,36 @@ test('a popup opened during generation joins the current answer and sees bounded
   assert.equal(b.messages.filter(p => p.kind === 'update').length, 1)
   assert.equal(popup.activeConversation.value.nodes.at(-1).answers[0].content, 'Latest part')
   assert.equal(b.writes.length, 0, 'streaming is synchronized without repeated file writes')
+})
+
+test('approval status joins and clears across paper windows without mirroring approval controls or persisting it', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const b = bus(); t.after(b.dispose)
+  const owner = await b.view('popup')
+  const answer = owner.own()
+  const pending = id => ({ requestId: id, answerId: answer.id, preview: { tool: 'create_paper_note' } })
+  owner.pendingWrites.value = [pending('first'), pending('second')]
+  const mirror = await b.view('sidebar')
+  await mirror.client.send({ kind: 'request', root: 'root-a', slug: 'paper' })
+  assert.equal(mirror.streamOwners.get(answer.id).awaitingApproval, true)
+  assert.deepEqual(mirror.pendingWrites.value, [], 'status does not duplicate approval controls')
+  owner.answerWrite(true)
+  t.mock.timers.tick(PAPER_AI_SYNC_INTERVAL_MS)
+  assert.equal(mirror.streamOwners.get(answer.id).awaitingApproval, true, 'another approval still waits')
+  owner.dismissWrite('second')
+  t.mock.timers.tick(PAPER_AI_SYNC_INTERVAL_MS)
+  assert.equal(mirror.streamOwners.get(answer.id).awaitingApproval, undefined)
+  owner.pendingWrites.value = [pending('rejected')]
+  owner.update(answer.id); t.mock.timers.tick(PAPER_AI_SYNC_INTERVAL_MS)
+  assert.equal(mirror.streamOwners.get(answer.id).awaitingApproval, true)
+  owner.answerWrite(false); t.mock.timers.tick(PAPER_AI_SYNC_INTERVAL_MS)
+  assert.equal(mirror.streamOwners.get(answer.id).awaitingApproval, undefined)
+  owner.pendingWrites.value = [pending('stopped')]
+  owner.update(answer.id); t.mock.timers.tick(PAPER_AI_SYNC_INTERVAL_MS)
+  owner.stop(owner.activeConversation.value)
+  assert.equal(mirror.streamOwners.size, 0)
+  await owner.paperSaves.get('paper')
+  assert.ok(!JSON.stringify(b.disk).includes('awaitingApproval'), 'pending status never enters saved history')
 })
 
 test('a delayed disk read cannot overwrite a newer live answer; durable completion repairs a missed final event', async t => {

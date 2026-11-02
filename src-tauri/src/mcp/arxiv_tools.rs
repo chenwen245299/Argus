@@ -504,6 +504,7 @@ impl PendingArxivWrite {
             keep_duplicate_copies: self.keep_duplicate_copies,
             changes: vec![],
             note_before: None,
+            note_images: vec![],
         }
     }
 

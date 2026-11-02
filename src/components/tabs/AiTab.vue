@@ -34,6 +34,7 @@ import type {
 import WriteConfirmCard from '../WriteConfirmCard.vue'
 import ChatPageImage from '../ChatPageImage.vue'
 import ChatAnswerBody from '../ChatAnswerBody.vue'
+import ImagePreviewActions from '../ImagePreviewActions.vue'
 import GuidedReadingButton from '../GuidedReadingButton.vue'
 import { BUILTIN_GUIDED_READING_ID, type GuidedReadingPreset } from '../../types/guidedReading'
 import ChatMessageQueue from '../ChatMessageQueue.vue'
@@ -218,7 +219,7 @@ const activeRequestIds = new Map<string, string>()
 // owns them. Holding the conversation here keeps it alive and reactive after the
 // user switches to another paper, so a generation started on paper A keeps
 // streaming into A's conversation in the background instead of being dropped.
-const streamOwners = shallowReactive(new Map<string, { slug: string; conv: Conversation; origin?: string; root?: string; contextOnly?: boolean }>())
+const streamOwners = shallowReactive(new Map<string, { slug: string; conv: Conversation; origin?: string; root?: string; contextOnly?: boolean; awaitingApproval?: boolean }>())
 const streamTasks = new Map<string, { convId: string; task: Promise<void> }>()
 // History entries are saved snapshots; live owners track generations even after
 // switching conversations. Only additions/removals need to update these dots.
@@ -274,19 +275,27 @@ const editingText = ref('')
 interface PendingWrite { requestId: string; preview: AgentWritePreview; answerId: string }
 const pendingWrites = ref<PendingWrite[]>([])
 const currentWrite = computed<PendingWrite | null>(() => pendingWrites.value[0] ?? null)
+const awaitingApprovalConvIds = computed(() => {
+  const pendingAnswers = new Set(pendingWrites.value.map(write => write.answerId))
+  return new Set([...streamOwners].filter(([id, owner]) => owner.origin ? owner.awaitingApproval : pendingAnswers.has(id))
+    .map(([, owner]) => owner.conv.id))
+})
 
 function answerWrite(approved: boolean, passageColors?: string[]) {
   const pending = currentWrite.value
   if (!pending) return
   // Drop it from the queue first so the button can't answer the same request twice.
   pendingWrites.value = pendingWrites.value.slice(1)
+  broadcastStreamUpdate(pending.answerId)
   invoke('resolve_agent_write', { requestId: pending.requestId, approved, passageColors: approved ? passageColors ?? null : null }).catch(() => {})
 }
 
 /** Take a request off the queue without answering — the backend already stopped
  *  waiting for it (timeout, or the generation was stopped). */
 function dismissWrite(requestId: string) {
+  const answerId = pendingWrites.value.find(write => write.requestId === requestId)?.answerId
   pendingWrites.value = pendingWrites.value.filter(w => w.requestId !== requestId)
+  if (answerId) broadcastStreamUpdate(answerId)
 }
 
 async function copyText(id: string, text: string) {
@@ -653,7 +662,8 @@ async function ensurePaperAiSync() {
 function localConversationStreams(conv: Conversation): PaperAiStreamInfo[] {
   return [...streamOwners.entries()]
     .filter(([id, o]) => !o.origin && o.conv.id === conv.id && (o.contextOnly || o.conv.nodes.some(n => n.role === 'assistantGroup' && n.answers.some(a => a.id === id && a.streaming))))
-    .map(([answerId, o]) => o.contextOnly ? { answerId, contextOnly: true } : { answerId })
+    .map(([answerId, o]) => ({ answerId, ...(o.contextOnly ? { contextOnly: true } : {}),
+      ...(pendingWrites.value.some(write => write.answerId === answerId) ? { awaitingApproval: true } : {}) }))
 }
 
 function broadcastConversationSnapshot(conv: Conversation, select = false, target?: string) {
@@ -712,7 +722,7 @@ function adoptSyncedConversation(incoming: Conversation, streams: PaperAiStreamI
   const proxy = activeConversation.value?.id === adopted.id ? activeConversation.value
     : conversations.value.find(c => c.id === adopted.id) ?? adopted
   for (const [id, owner] of streamOwners) if (owner.origin && owner.conv.id === adopted.id) streamOwners.delete(id)
-  for (const { answerId, contextOnly } of streams) streamOwners.set(answerId, { slug: incoming.slug, conv: proxy, origin, root: syncLibraryRoot ?? undefined, contextOnly })
+  for (const { answerId, contextOnly, awaitingApproval } of streams) streamOwners.set(answerId, { slug: incoming.slug, conv: proxy, origin, root: syncLibraryRoot ?? undefined, contextOnly, awaitingApproval })
   if (select || activeConversation.value?.id === adopted.id) {
     activeConversation.value = proxy
     if (select) { activeAnswerTabs.value = {}; void nextTick(() => scrollToBottom(true)) }
@@ -2122,6 +2132,7 @@ async function streamAnswerImpl(
       const p = event.payload
       if (!p?.requestId || !p.preview) return
       pendingWrites.value = [...pendingWrites.value, { requestId: p.requestId, preview: p.preview, answerId: answer.id }]
+      broadcastStreamUpdate(answer.id)
     },
   )
   unlisteners.set(`${answer.id}-confirm`, unlistenConfirm)
@@ -2819,7 +2830,8 @@ onUnmounted(() => {
             <div class="history-title-row">
               <span class="history-title">
                 <Icon v-if="conv.branch" class="history-branch-icon" icon="fluent:branch-fork-24-regular" width="12" height="12" />
-                <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" title="正在生成" />
+                <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" :class="{ 'awaiting-approval': awaitingApprovalConvIds.has(conv.id) }"
+                  :title="t(awaitingApprovalConvIds.has(conv.id) ? 'chat.statusAwaitingApproval' : 'chat.statusGenerating')" />
                 <span v-else-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
                 {{ conv.title }}
               </span>
@@ -3433,7 +3445,8 @@ onUnmounted(() => {
                 <div class="history-title-row">
                   <span class="history-title">
                     <Icon v-if="conv.branch" class="history-branch-icon" icon="fluent:branch-fork-24-regular" width="12" height="12" />
-                    <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" title="正在生成" />
+                    <span v-if="generatingConvIds.has(conv.id)" class="conv-pulse" :class="{ 'awaiting-approval': awaitingApprovalConvIds.has(conv.id) }"
+                      :title="t(awaitingApprovalConvIds.has(conv.id) ? 'chat.statusAwaitingApproval' : 'chat.statusGenerating')" />
                     <span v-else-if="isCacheWarm(conv.id)" class="conv-cache-dot" :title="keepaliveTitle" />
                     {{ conv.title }}
                   </span>
@@ -3463,9 +3476,7 @@ onUnmounted(() => {
          being teleported to the body, which is what made it cover the window. -->
     <div v-if="previewImage" class="attachment-lightbox" @click.self="closePreview">
       <img :src="previewImage" class="lightbox-image" alt="" />
-      <button class="lightbox-close" title="关闭" @click="closePreview">
-        <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
-      </button>
+      <ImagePreviewActions :src="previewImage" @close="closePreview" />
     </div>
     <div v-if="previewVideo" class="attachment-lightbox" @click.self="closePreview">
       <video :src="previewVideo" class="lightbox-video" controls autoplay></video>
@@ -4771,7 +4782,7 @@ onUnmounted(() => {
   word-break: break-word;
 }
 
-/* Green while generating, blue while the idle conversation's cache is warm. */
+/* Orange while awaiting approval, green while generating, blue for warm cache. */
 .conv-pulse,
 .conv-cache-dot {
   display: inline-block;
@@ -4783,11 +4794,13 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 .conv-pulse {
-  background: var(--status-generating);
+  --conv-pulse-color: var(--status-generating);
+  background: var(--conv-pulse-color);
   animation: conv-breathe 1.5s ease-in-out infinite;
 }
+.conv-pulse.awaiting-approval { --conv-pulse-color: var(--status-awaiting-approval); }
 @keyframes conv-breathe {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--status-generating) 55%, transparent); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--conv-pulse-color) 55%, transparent); }
   50% { opacity: 0.45; box-shadow: 0 0 0 4px transparent; }
 }
 .conv-cache-dot {

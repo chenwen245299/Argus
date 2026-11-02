@@ -43,6 +43,7 @@ use crate::highlight_groups::{collapse_highlights, MarkOrigin};
 use crate::models::{AgentMark, Highlight, HighlightTombstone};
 use crate::paper;
 use super::passage_anchors::{locate_anchor, locate_passage};
+use super::note_images::{self, PreparedImage};
 
 /// The write tool's name, shared by the declaration, the dispatcher and the
 /// confirmation UI so they cannot drift apart.
@@ -89,6 +90,7 @@ pub enum PendingWrite {
         tool: String, slug: String, paper_id: String, paper_title: String,
         before: crate::models::NoteSnapshot,
         after: Option<(String, String)>,
+        images: Vec<PreparedImage>,
     },
     RestoreNote {
         slug: String, paper_id: String, paper_title: String,
@@ -96,11 +98,13 @@ pub enum PendingWrite {
     },
     CreateNote {
         slug: String,
+        paper_id: String,
         /// Resolved from the library at parse time, for the dialog. The user
         /// approves "a note on *this paper*", not on a slug they cannot read.
         paper_title: String,
         title: String,
         content: String,
+        images: Vec<PreparedImage>,
     },
     MarkPassages {
         tool: String,
@@ -227,6 +231,9 @@ pub struct WritePreview {
     pub changes: Vec<MarkChange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note_before: Option<crate::models::NoteSnapshot>,
+    /// Only the approval UI receives pixels; saved Markdown contains relative links.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub note_images: Vec<note_images::ImagePreview>,
 }
 
 impl PendingWrite {
@@ -250,7 +257,9 @@ impl PendingWrite {
                     return Ok(Self::RestoreNote { slug, paper_id: meta.id, paper_title: meta.title, deleted });
                 }
                 let before = paper::note_snapshot(root, &slug, &id)?;
+                let mut images = vec![];
                 let after = if name == UPDATE_NOTE_TOOL {
+                    if args.get("images").is_some() && args.get("content").is_none() { return Err("images requires the complete replacement content.".into()); }
                     if args.get("title").is_none() && args.get("content").is_none() { return Err("Provide title and/or content to update.".into()); }
                     let title = match args.get("title") {
                         Some(value) => value.as_str().ok_or("title must be a string.")?.replace(['\r', '\n', '\t'], " ").trim().to_string(),
@@ -265,9 +274,14 @@ impl PendingWrite {
                         return Err("Use a nonempty title (at most 120 characters) and content of at most 50,000 characters.".into());
                     }
                     if title == before.note.title && content == before.content { return Err("The note is unchanged.".into()); }
+                    let content = if args.get("content").is_some() {
+                        let (content, prepared) = note_images::prepare(root, args, &content)?;
+                        images = prepared;
+                        content
+                    } else { content };
                     Some((title, content))
                 } else { None };
-                Ok(Self::ChangeNote { tool: name.into(), slug, paper_id: meta.id, paper_title: meta.title, before, after })
+                Ok(Self::ChangeNote { tool: name.into(), slug, paper_id: meta.id, paper_title: meta.title, before, after, images })
             }
             CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL => {
                 let slug = str_arg(args, "slug")?;
@@ -399,12 +413,15 @@ impl PendingWrite {
                 // the paper the note would land on.
                 let meta = paper::read_meta(root, &slug)
                     .map_err(|_| format!("Paper '{slug}' was not found in this library."))?;
+                let (content, images) = note_images::prepare(root, args, &content)?;
 
                 Ok(PendingWrite::CreateNote {
                     slug,
+                    paper_id: meta.id,
                     paper_title: meta.title,
                     title,
                     content,
+                    images,
                 })
             }
             other => Err(format!("unknown write tool: {other}")),
@@ -415,29 +432,34 @@ impl PendingWrite {
     pub fn preview(&self, root: &str) -> WritePreview {
         match self {
             Self::Arxiv(pending) => pending.preview(),
-            Self::ChangeNote { tool, slug, paper_title, before, after, .. } => WritePreview {
+            Self::ChangeNote { tool, slug, paper_title, before, after, images, .. } => WritePreview {
                 tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
                 note_title: after.as_ref().map(|a| a.0.clone()).unwrap_or_else(|| before.note.title.clone()),
                 content: after.as_ref().map(|a| a.1.clone()).unwrap_or_else(|| before.content.clone()),
                 note_before: after.as_ref().map(|_| before.clone()), duplicate_title: false,
+                note_images: note_images::previews(images),
                 passages: vec![], recommendations: vec![], keep_duplicate_copies: false, changes: vec![],
             },
             Self::RestoreNote { slug, paper_title, deleted, .. } => WritePreview {
                 tool: RESTORE_NOTE_TOOL.into(), slug: slug.clone(), paper_title: paper_title.clone(),
                 note_title: deleted.snapshot.note.title.clone(), content: deleted.snapshot.content.clone(),
                 note_before: None, duplicate_title: false, passages: vec![], recommendations: vec![], keep_duplicate_copies: false, changes: vec![],
+                note_images: vec![],
             },
             PendingWrite::CreateNote {
                 slug,
                 paper_title,
                 title,
                 content,
+                images,
+                ..
             } => WritePreview {
                 tool: CREATE_NOTE_TOOL.to_string(),
                 slug: slug.clone(),
                 paper_title: paper_title.clone(),
                 note_title: title.clone(),
                 content: content.clone(),
+                note_images: note_images::previews(images),
                 duplicate_title: paper::list_notes(root, slug).iter().any(|n| &n.title == title),
                 passages: Vec::new(),
                 recommendations: Vec::new(), keep_duplicate_copies: false, changes: Vec::new(), note_before: None,
@@ -445,6 +467,7 @@ impl PendingWrite {
             Self::MarkPassages { tool, slug, paper_title, highlights, .. } => WritePreview {
                 tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
                 note_title: String::new(), content: String::new(), duplicate_title: false,
+                note_images: vec![],
                 recommendations: Vec::new(), keep_duplicate_copies: false, changes: Vec::new(), note_before: None,
                 passages: highlights.iter().map(|h| Passage { page: h.page, text: h.text.clone(),
                     color: h.color.clone(), style: h.style.clone(), note: h.note.clone(),
@@ -453,6 +476,7 @@ impl PendingWrite {
             Self::ChangeMarks { tool, slug, paper_title, changes, .. } => WritePreview {
                 tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
                 note_title: String::new(), content: String::new(), duplicate_title: false,
+                note_images: vec![],
                 recommendations: Vec::new(), keep_duplicate_copies: false,
                 passages: Vec::new(), changes: changes.clone(), note_before: None,
             },
@@ -466,10 +490,12 @@ impl PendingWrite {
     pub fn execute(&self, root: &str) -> Result<serde_json::Value, String> {
         match self {
             Self::Arxiv(_) => Err("Recommendation writes require the approved async import/delete dispatcher.".into()),
-            Self::ChangeNote { slug, paper_id, before, after, .. } => {
+            Self::ChangeNote { slug, paper_id, before, after, images, .. } => {
                 if paper::read_meta(root, slug)?.id != *paper_id { return Err("Paper changed since the preview.".into()); }
                 if let Some((title, content)) = after {
-                    let note = paper::update_note_checked(root, slug, before, title, content)?;
+                    note_images::validate_sources(root, images)?;
+                    let assets: Vec<_> = images.iter().map(|i| i.asset.clone()).collect();
+                    let note = paper::update_note_checked_with_assets(root, slug, Some(paper_id), before, title, content, &assets)?;
                     Ok(serde_json::json!({"updated": true, "slug": slug, "note_id": note.id, "title": note.title}))
                 } else {
                     let deleted = paper::delete_note_checked(root, slug, before)?;
@@ -498,11 +524,15 @@ impl PendingWrite {
             }
             PendingWrite::CreateNote {
                 slug,
+                paper_id,
                 title,
                 content,
+                images,
                 ..
             } => {
-                let note = paper::create_note_with(root, slug, title, content)?;
+                note_images::validate_sources(root, images)?;
+                let assets: Vec<_> = images.iter().map(|i| i.asset.clone()).collect();
+                let note = paper::create_note_with_assets(root, slug, Some(paper_id), title, content, &assets)?;
                 Ok(serde_json::json!({
                     "created": true,
                     "slug": slug,

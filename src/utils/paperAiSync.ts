@@ -10,6 +10,8 @@ export const PAPER_AI_SYNC_INTERVAL_MS = 250
 export interface PaperAiStreamInfo {
   answerId: string
   contextOnly?: boolean
+  /** Transient indicator only; approval controls stay with the request owner. */
+  awaitingApproval?: boolean
 }
 
 interface Scope {

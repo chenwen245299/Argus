@@ -57,6 +57,7 @@ import { openAddSnippetModal } from '../stores/snippetLibrary'
 import { useSpeechStore } from '../stores/speech'
 import { pdfSpeechText } from '../utils/speechPages'
 import { renderSelectableTextLayer } from '../utils/pdfTextLayer'
+import { pdfDocumentCacheKey, pdfPageCacheKey, readPdfPageCache, writePdfPageCache, deletePdfPageCache, cachePdfCanvas } from '../utils/pdfPageCache'
 import { spokenSentences, locateSentences, sentenceAt, lineBands, type SpokenSentence, type TextRange } from '../utils/speechFollow'
 import {
   spansFromTextLayer, selectedTextBySpan, planFurnitureDropReport, keptSelectionTextAcrossPages,
@@ -304,6 +305,11 @@ const pinnedUntil = new Map<number, number>()
 const waiters = new Map<number, { promise: Promise<void>; resolve: () => void; giveUp: ReturnType<typeof setTimeout> }>()
 // Bitmap pixels each rendered page holds (feeds the memory budget).
 const pagePixelsHeld = new Map<number, number>()
+const pageLastUsed = new Map<number, number>()
+// Include worker/image decode time: a scanned page can be much slower than the
+// vector papers the old fixed look-ahead was measured on.
+let recentRenderMs = 250
+let documentCacheKey: string | null = null
 // Pages whose pdf.js operator list is still cached (see renderPage: kept while the page is near).
 const opListPages = new Set<number>()
 // The pdf.js text content of every rendered page, with the page box it was laid out on. The text layer
@@ -1800,6 +1806,8 @@ async function loadPdf() {
     const uint8 = new Uint8Array(bytes)
     // Type 3 fonts render blank in pdf.js; those PDFs use the PDFium raster path.
     rasterFallback.value = pdfUsesType3(uint8)
+    // Start before getDocument transfers uint8.buffer to the PDF.js worker.
+    const cacheKeyTask = pdfDocumentCacheKey(uint8, `page-v1:${pdfjsLib.version}:${rasterFallback.value ? 'pdfium' : 'pdfjs'}`)
     // ONE SWITCH. Set it to false to get exactly the pixels the previous release drew.
     // true  = pdf.js keeps the page canvases GPU-backed (without it pdf.js asks for
     //         `willReadFrequently`, i.e. software canvases, and putting a finished 7 MP page on
@@ -1836,6 +1844,7 @@ async function loadPdf() {
       iccUrl: '/pdfjs/iccs/',
     })
     const doc = await loadingTask.promise
+    documentCacheKey = await cacheKeyTask
     pdfDoc.value = doc
     pageTextSources.clear() // text of a previous document must never feed this one's text layers
     reader.setPdfDoc(doc, slug)
@@ -2009,6 +2018,7 @@ function teardownRenderScheduling() {
   hiddenViewers.delete(viewerKey)
   for (const url of pageObjectUrls.values()) URL.revokeObjectURL(url)
   pageObjectUrls.clear()
+  for (const idx of [...renderedPages.value]) unrenderPage(idx)
   settleAllWaiters()
 }
 
@@ -2047,14 +2057,17 @@ function reconcile() {
     viewportHeight: c.clientHeight,
     direction: scrollTracker.direction,
     speed: scrollTracker.speed(now),
+    renderTimeMs: recentRenderMs,
     rendered: renderedPages.value,
     stale,
     inFlight: startedRenders,
     queued: new Set(wantQueue),
     pinned: activePins(now),
+    lastUsed: pageLastUsed,
     pagePixels: pagePixelsFor,
     budgetPixels: ACTIVE_BUDGET_PIXELS,
   })
+  for (const i of plan.visible) pageLastUsed.set(i, now)
   // Running work first (so a page both cancelled and evicted is torn down once), then the
   // pages to throw away. Queued work that left the render zone is dropped by rebuilding the
   // queue from the plan below.
@@ -2072,12 +2085,9 @@ function reconcile() {
   for (const i of [...failedRenders.keys()]) if (!z || i < z.first || i > z.last) failedRenders.delete(i)
   wantQueue.length = 0
   for (const i of plan.render) if ((failedRenders.get(i) ?? 0) < 2) wantQueue.push(i)
-  // The parsed pages (and their decoded images) are kept for the pages on screen and their
-  // neighbours only: that is what a zoom re-renders first. Keeping them at all costs about
-  // 130 MB of peak memory in a 12-page fling of a figure-heavy paper (measured), so nothing is
-  // held for pages nobody is waiting on.
-  const vis = plan.visible
-  releaseOpListsOutside(vis.length ? { first: vis[0] - 1, last: vis[vis.length - 1] + 1 } : null)
+  // Keep decoded images for the affordable look-ahead too. Cleaning a prefetched
+  // scan before it is reached makes the first zoom decode the whole page again.
+  releaseOpListsExcept(new Set(plan.ready))
   pumpRenderQueue()
 }
 
@@ -2085,9 +2095,13 @@ function pumpRenderQueue() {
   if (renderingTornDown || !pdfDoc.value || !isViewerShown()) return
   while (wantQueue.length) {
     const idx = wantQueue[0]
-    // A page somebody waits on may take one slot more than the cap, so it never queues
-    // behind prefetching.
-    const cap = MAX_CONCURRENT_RENDERS + (isPinned(idx, performance.now()) ? 1 : 0)
+    // One urgent page may overtake two slow prefetches. Scrolling into a missing
+    // page is just as urgent as an explicit jump; neither should wait for two
+    // off-screen pages' text/annotation layers to finish.
+    const c = containerRef.value
+    const g = pageGeometry.value
+    const visible = !!c && g.tops[idx] < c.scrollTop + c.clientHeight && g.tops[idx] + g.heights[idx] > c.scrollTop
+    const cap = MAX_CONCURRENT_RENDERS + (visible || isPinned(idx, performance.now()) ? 1 : 0)
     if (startedRenders.size >= cap) break
     wantQueue.shift()
     // Already up to date (settle whoever waited), or an earlier render of it is still unwinding
@@ -2112,6 +2126,7 @@ function settleAllWaiters() {
 
 function startRender(idx: number) {
   startedRenders.add(idx)
+  const startedAt = performance.now()
   const p = renderPage(idx)
   inflightRenders.set(idx, p)
   void p.finally(() => {
@@ -2121,10 +2136,14 @@ function startRender(idx: number) {
     renderOutcome.delete(idx)
     // A page that keeps failing is left alone instead of being retried every frame; a cancelled
     // one is simply wanted again if the plan still wants it.
-    if (outcome === 'ok') failedRenders.delete(idx)
-    else if (outcome !== 'aborted') failedRenders.set(idx, (failedRenders.get(idx) ?? 0) + 1)
+    if (outcome === 'ok') {
+      failedRenders.delete(idx)
+      recentRenderMs = Math.min(2000, Math.max(performance.now() - startedAt, recentRenderMs * 0.8))
+    } else if (outcome !== 'aborted') failedRenders.set(idx, (failedRenders.get(idx) ?? 0) + 1)
     if (isPageFresh(idx) || (failedRenders.get(idx) ?? 0) >= 2 || renderingTornDown) settleWaiter(idx)
-    pumpRenderQueue()
+    // Replan from the current scroll position before starting anything else.
+    // A completion can beat the scroll event's RAF; pumping the old queue here
+    // used to spend the freed slot on a page the reader had already passed.
     scheduleReconcile()
   })
 }
@@ -2140,14 +2159,20 @@ function abortRender(idx: number, discard: boolean) {
 
 /** pdf.js keeps a page's parsed operator list until told to let go; free it for pages that are not near. */
 function releaseOpList(idx: number) {
+  // Keep it tracked until the active render settles; its finally block must
+  // still be able to release a partially decoded page after cancellation.
+  if (renderingPages.has(idx)) return
   if (!opListPages.delete(idx)) return
   const doc = pdfDoc.value
   if (!doc) return
-  void doc.getPage(idx + 1).then(p => p.cleanup()).catch(() => { /* document went away */ })
+  void doc.getPage(idx + 1).then(p => {
+    // A new render may have claimed this page while getPage was pending.
+    if (pdfDoc.value === doc && !opListPages.has(idx) && !renderingPages.has(idx)) p.cleanup()
+  }).catch(() => { /* document went away */ })
 }
 
-function releaseOpListsOutside(zone: { first: number; last: number } | null) {
-  for (const i of [...opListPages]) if (!zone || i < zone.first || i > zone.last) releaseOpList(i)
+function releaseOpListsExcept(keep: ReadonlySet<number> | null) {
+  for (const i of [...opListPages]) if (!keep?.has(i)) releaseOpList(i)
 }
 
 function releasePageObjectUrl(idx: number) {
@@ -2206,7 +2231,7 @@ function heldPixels(keep: Set<number> | null): number {
 function trimHidden(level: HiddenLevel) {
   hiddenLevel = level
   // A background tab keeps bitmaps (they are what makes switching back instant), not parsed pages.
-  releaseOpListsOutside(null)
+  releaseOpListsExcept(null)
   const keep = hiddenKeepFor(level)
   for (const i of [...renderedPages.value]) if (!keep.has(i)) unrenderPage(i)
 }
@@ -2239,7 +2264,7 @@ function isCommandMissing(e: unknown, command: string): boolean {
  */
 async function fetchRasterPage(
   idx: number, scenScale: number, dpr: number, pxW: number, pxH: number,
-): Promise<{ src: string; objectUrl: string | null }> {
+): Promise<{ src: string; objectUrl: string | null; blob: Blob | null }> {
   if (rasterBinaryAvailable === null && rasterProbe) await rasterProbe
   if (rasterBinaryAvailable !== false) {
     try {
@@ -2251,8 +2276,9 @@ async function fetchRasterPage(
       const bytes = rasterBytes(raw)
       if (bytes) {
         rasterBinaryAvailable = true
-        const url = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }))
-        return { src: url, objectUrl: url }
+        const blob = new Blob([bytes], { type: 'image/png' })
+        const url = URL.createObjectURL(blob)
+        return { src: url, objectUrl: url, blob }
       }
       rasterBinaryAvailable = false // a payload nobody can use: stop asking
     } catch (e) {
@@ -2265,7 +2291,7 @@ async function fetchRasterPage(
     slug: props.slug, page: idx + 1, dpi: Math.round(72 * scenScale * dpr),
     width: pxW, height: pxH,
   })
-  return { src: `data:image/png;base64,${b64}`, objectUrl: null }
+  return { src: `data:image/png;base64,${b64}`, objectUrl: null, blob: null }
 }
 
 async function renderPage(idx: number) {
@@ -2298,10 +2324,11 @@ async function renderPage(idx: number) {
   // whatever scale is now current, and the next render replaces it properly.
   // (A render the scheduler discards takes even that down: the page is being evicted.)
   let committedCanvas: HTMLElement | null = null
+  let pendingCanvas: HTMLCanvasElement | null = null
   // The object URL of a rasterised page's image, until the image is in the DOM and owns it.
   let newObjectUrl: string | null = null
   const cleanupAppended = () => {
-    appended.forEach(n => { if (n !== committedCanvas || ctl.discard) n.remove() })
+    appended.forEach(n => { if (n !== committedCanvas || ctl.discard) removePageContent(n) })
     if (newObjectUrl) { URL.revokeObjectURL(newObjectUrl); newObjectUrl = null }
     if (committedCanvas && !ctl.discard) rescalePageDom(idx, scale.value)
   }
@@ -2323,6 +2350,10 @@ async function renderPage(idx: number) {
     const cssH = Math.round(logicalVp.height)
     const pxW = Math.max(1, Math.round(cssW * dpr))
     const pxH = Math.max(1, Math.round(cssH * dpr))
+    const bitmapKey = pdfPageCacheKey(documentCacheKey, idx, pxW, pxH)
+    let cacheHit = false
+    let rasterBlob: Blob | null = null
+    let bitmapRenderMs = 0
 
     // The page's visual layer. Normally pdf.js renders vector-crisp to a canvas.
     // But some PDFs use fonts pdf.js can't render (Type 3 figure fonts → the text
@@ -2331,10 +2362,33 @@ async function renderPage(idx: number) {
     // also dodges WebKit's canvas size cap. Either way the text/highlight/
     // annotation layers below are pdf.js's, so selection and highlights still work.
     let contentEl: HTMLElement | null = null
-    if (rasterFallback.value) {
+    const cached = await readPdfPageCache(bitmapKey)
+    if (superseded()) { bail(); return }
+    if (cached) {
       try {
-        const { src, objectUrl } = await fetchRasterPage(idx, scenScale, dpr, pxW, pxH)
+        newObjectUrl = URL.createObjectURL(cached)
+        const img = new Image()
+        img.className = 'pdf-canvas'
+        img.draggable = false
+        img.src = newObjectUrl
+        await img.decode()
+        if (img.naturalWidth !== pxW || img.naturalHeight !== pxH) throw new Error('Cached PDF page size mismatch')
+        img.style.width = `${cssW}px`
+        img.style.height = `${cssH}px`
+        contentEl = img
+        cacheHit = true
+      } catch {
+        URL.revokeObjectURL(newObjectUrl!)
+        newObjectUrl = null
+        void deletePdfPageCache(bitmapKey)
+      }
+      if (superseded()) { bail(); return }
+    }
+    if (!contentEl && rasterFallback.value) {
+      try {
+        const { src, objectUrl, blob } = await fetchRasterPage(idx, scenScale, dpr, pxW, pxH)
         newObjectUrl = objectUrl
+        rasterBlob = blob
         if (superseded()) { bail(); return }
         const img = new Image()
         img.className = 'pdf-canvas'
@@ -2363,6 +2417,7 @@ async function renderPage(idx: number) {
       // costs a half-painted canvas that must be removed whenever the render is cancelled, and a
       // page that shows text it cannot select yet.)
       const canvas = document.createElement('canvas')
+      pendingCanvas = canvas
       canvas.className = 'pdf-canvas'
       canvas.width = pxW
       canvas.height = pxH
@@ -2371,6 +2426,10 @@ async function renderPage(idx: number) {
 
       // Draw the page to fill the bitmap exactly — what pdf.js's own viewer does: the
       // logical viewport plus an output transform with a separate factor per axis.
+      // Track partial/cancelled renders too: they may already have decoded a
+      // large scan even though they never make it into renderedPages.
+      opListPages.add(idx)
+      const bitmapStarted = performance.now()
       const task = page.render({
         canvas,
         viewport: logicalVp,
@@ -2378,6 +2437,7 @@ async function renderPage(idx: number) {
       })
       pageRenderTasks.set(idx, task)
       await task.promise
+      bitmapRenderMs = performance.now() - bitmapStarted
       pageRenderTasks.delete(idx)
       contentEl = canvas
     }
@@ -2390,7 +2450,8 @@ async function renderPage(idx: number) {
     el.appendChild(contentEl)
     appended.push(contentEl)
     committedCanvas = contentEl
-    stale.forEach(n => n.remove())
+    pendingCanvas = null
+    stale.forEach(removePageContent)
     // The previous image (if any) is gone from the DOM, so its object URL can go too.
     releasePageObjectUrl(idx)
     if (newObjectUrl) { pageObjectUrls.set(idx, newObjectUrl); newObjectUrl = null }
@@ -2515,14 +2576,20 @@ async function renderPage(idx: number) {
     // Measured in WKWebView, re-rendering the two visible pages after one zoom step took 10-20 ms
     // a page instead of 78-91 ms on two figure-heavy papers (golkar 20 against 91 ms, hero 10
     // against 78 ms; feng 97 against 129 ms).
-    // It is kept while the page is on screen or next to it and released by releaseOpListsOutside /
+    // It is kept in the affordable render zone and released by releaseOpListsExcept /
     // unrenderPage once it is not.
     opListPages.add(idx)
     renderOutcome.set(idx, 'ok')
+    if (!cacheHit) {
+      // Cheap vector pages are faster to draw than to PNG-encode/read again.
+      if (contentEl instanceof HTMLCanvasElement && bitmapRenderMs >= 80) cachePdfCanvas(bitmapKey, contentEl)
+      else if (rasterBlob && contentEl instanceof HTMLImageElement && contentEl.naturalWidth === pxW && contentEl.naturalHeight === pxH) void writePdfPageCache(bitmapKey, rasterBlob)
+    }
     // The window moved to another display while this page was rendering: the plan sees the page
     // as stale now and asks for it again.
     if (dpr !== (window.devicePixelRatio || 1)) scheduleReconcile()
   } catch (e) {
+    cleanupAppended()
     // RenderingCancelledException is expected when a zoom cancels in-flight work.
     if ((e as { name?: string })?.name !== 'RenderingCancelledException') {
       console.error(`renderPage(${idx}) failed:`, e)
@@ -2531,12 +2598,24 @@ async function renderPage(idx: number) {
       renderOutcome.set(idx, 'aborted')
     }
   } finally {
+    // Detached/cancelled canvases otherwise keep their large GPU backing stores
+    // until WebKit's next GC, far beyond the scheduler's bitmap budget.
+    if (pendingCanvas) { pendingCanvas.width = 0; pendingCanvas.height = 0 }
     if (newObjectUrl) URL.revokeObjectURL(newObjectUrl)
     // The scheduler discarded this render after it had already replaced the page's content.
     if (ctl.discard && committedCanvas) unrenderPage(idx)
     if (renderCtls.get(idx) === ctl) renderCtls.delete(idx)
     pageRenderTasks.delete(idx)
     renderingPages.delete(idx)
+    if (renderOutcome.get(idx) !== 'ok') releaseOpList(idx)
+  }
+}
+
+function removePageContent(node: Node) {
+  node.parentNode?.removeChild(node)
+  if (node instanceof HTMLCanvasElement) { node.width = 0; node.height = 0 }
+  if (node instanceof Element) {
+    node.querySelectorAll('canvas').forEach(canvas => { canvas.width = 0; canvas.height = 0 })
   }
 }
 
@@ -2544,11 +2623,12 @@ function unrenderPage(idx: number) {
   const el = pageRefs.value[idx]
   if (!el) return
   // Keep the placeholder size — only remove rendered children
-  while (el.firstChild) el.removeChild(el.firstChild)
+  while (el.firstChild) removePageContent(el.firstChild)
   releasePageObjectUrl(idx)
   pageRenderScales.delete(idx)
   pageRenderDprs.delete(idx)
   pagePixelsHeld.delete(idx)
+  pageLastUsed.delete(idx)
   pageTextSources.delete(idx)
   releaseOpList(idx)
   const next = new Set(renderedPages.value)

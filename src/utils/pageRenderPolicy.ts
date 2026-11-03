@@ -12,9 +12,9 @@
 //    the direction of travel (1.5 - 2.5 viewports ahead, faster scrolling reaches further)
 //    and keeps one viewport behind. A fixed 600 px margin - less than ONE page at 189 % zoom
 //    - could only ever start a page when it was already about to be seen.
-//  - KEEP ZONE: the render zone plus a wide extra ring. A page is thrown away only when it
-//    leaves the keep zone, so a page right at the edge of the render zone cannot flap between
-//    "evicted" and "rendering again" as the scroll position wobbles around that edge.
+//  - KEEP ZONE: unfinished work outside this ring can be cancelled. Completed bitmaps stay
+//    cached until the pixel budget needs their space, so scrolling back does not decode a scan
+//    again merely because it left the viewport. Old scales are still discarded outside the zone.
 //  - PRIORITY: visible pages first, then the side the user is heading to, then the other side.
 //    Every page in the zone used to start at once in whatever order the observer reported
 //    them, so the page actually on screen could queue behind a prefetch.
@@ -22,8 +22,8 @@
 //    zone (nobody is waiting for it); work already running is only cancelled once its page
 //    leaves the keep zone (it is part-way done and the user may well scroll back).
 //  - BUDGET: bitmaps are the memory that matters. If the keep zone holds more pixels than the
-//    budget the farthest pages go first - never a visible page, never one inside the render
-//    zone, never one somebody explicitly asked for (`pinned`), never one whose render is running.
+//    budget old pages go first. Affordable prefetches reserve space; visible pages,
+//    explicit jumps (`pinned`) and running renders are never evicted underneath their users.
 
 export interface PageGeometry {
   /** Top edge of every page in scroll-content coordinates (CSS px), ascending. */
@@ -43,8 +43,12 @@ export interface PolicyTuning {
   /** Look-ahead below / above the viewport when there is no direction (idle, just opened, jumped). */
   idleBelowVh: number
   idleAboveVh: number
-  /** Extra viewports around the render zone inside which a page is NOT thrown away. */
+  /** Extra viewports around the render zone before unfinished work is cancelled. */
   keepMarginVh: number
+  /** Whole pages prepared ahead even when zoom makes a page taller than the viewport. */
+  aheadPages: number
+  /** Upper bound on latency-based look-ahead, in viewports. */
+  maxAheadVh: number
   /** A viewport shorter than this (px) is treated as this tall (a collapsing pane must not shrink the zone to nothing). */
   minViewportPx: number
 }
@@ -57,6 +61,8 @@ export const DEFAULT_TUNING: PolicyTuning = {
   idleBelowVh: 1.5,
   idleAboveVh: 1,
   keepMarginVh: 2,
+  aheadPages: 2,
+  maxAheadVh: 8,
   minViewportPx: 300,
 }
 
@@ -68,6 +74,8 @@ export interface RenderPolicyInput {
   direction: -1 | 0 | 1
   /** Absolute scroll speed in px per ms (0 when idle). */
   speed: number
+  /** Recent page render time, used to start slow scanned pages before they become visible. */
+  renderTimeMs?: number
   /** Pages whose DOM is complete, at whatever scale. */
   rendered: ReadonlySet<number>
   /** The subset of `rendered` that was built for another scale / devicePixelRatio. */
@@ -78,9 +86,11 @@ export interface RenderPolicyInput {
   queued?: ReadonlySet<number>
   /** Pages somebody explicitly asked for (jump target, search hit): rendered, never cancelled or evicted. */
   pinned?: ReadonlySet<number>
+  /** Last time each completed page was visible; oldest unused bitmaps are evicted first. */
+  lastUsed?: ReadonlyMap<number, number>
   /** Bitmap pixels a page costs (what it holds when rendered, or will hold once it is). */
   pagePixels: (page: number) => number
-  /** Most bitmap pixels the viewer may hold. Never forces out visible / render-zone / pinned pages. */
+  /** Most bitmap pixels the viewer may hold. Visible / pinned pages are protected; prefetches must fit. */
   budgetPixels: number
   tuning?: Partial<PolicyTuning>
 }
@@ -93,6 +103,8 @@ export interface PageRange {
 export interface RenderPlan {
   /** Pages intersecting the viewport, ascending. */
   visible: number[]
+  /** Visible/pinned pages and affordable neighbours whose decoded resources are worth keeping. */
+  ready: number[]
   /** Pages to start, best first. Excludes pages that are fresh or already running. */
   render: number[]
   /** Queued pages that left the render zone: forget them. */
@@ -103,7 +115,7 @@ export interface RenderPlan {
   evict: number[]
   zone: PageRange | null
   keep: PageRange | null
-  /** Bitmap pixels held (rendered + in flight) once this plan is carried out. */
+  /** Bitmap pixels reserved (rendered + in flight + prepared pages) after eviction. */
   retainedPixels: number
 }
 
@@ -162,7 +174,7 @@ function overlapWith(g: PageGeometry, i: number, y0: number, y1: number): number
 }
 
 const EMPTY_PLAN: RenderPlan = {
-  visible: [], render: [], dropQueued: [], cancelInFlight: [], evict: [], zone: null, keep: null, retainedPixels: 0,
+  visible: [], ready: [], render: [], dropQueued: [], cancelInFlight: [], evict: [], zone: null, keep: null, retainedPixels: 0,
 }
 
 /** The render zone and the keep zone around a scroll position, in page-index ranges. */
@@ -173,6 +185,7 @@ export function zonesFor(
   direction: -1 | 0 | 1,
   speed: number,
   tuning: Partial<PolicyTuning> = {},
+  renderTimeMs = 0,
 ): { visible: PageRange | null; zone: PageRange | null; keep: PageRange | null } {
   const t = { ...DEFAULT_TUNING, ...tuning }
   const vh = Math.max(viewportHeight, t.minViewportPx)
@@ -190,11 +203,25 @@ export function zonesFor(
     behindPx = t.behindVh * vh
   }
   const down = direction >= 0
-  const zoneTop = vTop - (down ? behindPx : aheadPx)
-  const zoneBottom = vBottom + (down ? aheadPx : behindPx)
+  // A fixed number of viewports is too short for a zoomed scanned book. Include
+  // complete next pages and enough travel time for two slow decodes. The policy
+  // below admits prefetches only while they fit the existing bitmap budget.
+  aheadPx = Math.min(t.maxAheadVh * vh, Math.max(aheadPx, speed * Math.min(2000, Math.max(0, renderTimeMs)) * 2))
+  let zoneTop = vTop - (down ? behindPx : aheadPx)
+  let zoneBottom = vBottom + (down ? aheadPx : behindPx)
+  const visible = pageRangeIn(g, vTop, vBottom)
+  if (visible && t.aheadPages > 0) {
+    if (down) {
+      const last = Math.min(g.tops.length - 1, visible.last + t.aheadPages)
+      zoneBottom = Math.max(zoneBottom, g.tops[last] + g.heights[last])
+    } else {
+      const first = Math.max(0, visible.first - t.aheadPages)
+      zoneTop = Math.min(zoneTop, g.tops[first])
+    }
+  }
   const keepPx = t.keepMarginVh * vh
   return {
-    visible: pageRangeIn(g, vTop, vBottom),
+    visible,
     zone: pageRangeIn(g, zoneTop, zoneBottom),
     keep: pageRangeIn(g, zoneTop - keepPx, zoneBottom + keepPx),
   }
@@ -217,7 +244,7 @@ export function planPageRender(input: RenderPolicyInput): RenderPlan {
   const vBottom = input.scrollTop + input.viewportHeight
 
   const { visible: vis, zone, keep } = zonesFor(
-    g, input.scrollTop, input.viewportHeight, input.direction, input.speed, input.tuning,
+    g, input.scrollTop, input.viewportHeight, input.direction, input.speed, input.tuning, input.renderTimeMs,
   )
   const inRange = (r: PageRange | null, i: number) => !!r && i >= r.first && i <= r.last
   const visible: number[] = []
@@ -228,11 +255,11 @@ export function planPageRender(input: RenderPolicyInput): RenderPlan {
   const wanted: { page: number; rank: number; dist: number }[] = []
   const needs = (i: number) => (!input.rendered.has(i) || stale.has(i)) && !inFlight.has(i)
   for (const i of pinned) {
-    if (i >= 0 && i < n && needs(i)) wanted.push({ page: i, rank: 0, dist: 0 })
+    if (i >= 0 && i < n) wanted.push({ page: i, rank: 0, dist: 0 })
   }
   if (zone) {
     for (let i = zone.first; i <= zone.last; i++) {
-      if (pinned.has(i) || !needs(i)) continue
+      if (pinned.has(i)) continue
       if (inRange(vis, i)) {
         // The page covering most of the screen first; ties go to the side of travel.
         const share = overlapWith(g, i, vTop, vBottom)
@@ -246,9 +273,21 @@ export function planPageRender(input: RenderPolicyInput): RenderPlan {
   }
   wanted.sort((a, b) => a.rank - b.rank || a.dist - b.dist || (down ? a.page - b.page : b.page - a.page))
 
+  // Reserve space for the pages about to be drawn as well as existing canvases.
+  // Wider look-ahead must not turn a small viewport at high zoom into an
+  // unbounded allocation. Only visible/pinned/running pages may exceed the cap.
+  const ready = new Set<number>([...visible, ...pinned].filter(i => i >= 0 && i < n))
+  for (const i of inFlight) if (inRange(keep, i) || pinned.has(i)) ready.add(i)
+  let reserved = [...ready].reduce((sum, i) => sum + input.pagePixels(i), 0)
+  for (const { page } of wanted) {
+    if (ready.has(page)) continue
+    const pixels = input.pagePixels(page)
+    if (reserved + pixels <= input.budgetPixels) { ready.add(page); reserved += pixels }
+  }
+
   // ── what to forget ───────────────────────────────────────────────────────────────
   const dropQueued: number[] = []
-  for (const i of queued) if (!inRange(zone, i) && !pinned.has(i)) dropQueued.push(i)
+  for (const i of queued) if (!ready.has(i)) dropQueued.push(i)
   const cancelInFlight: number[] = []
   for (const i of inFlight) if (!inRange(keep, i) && !pinned.has(i)) cancelInFlight.push(i)
 
@@ -259,9 +298,8 @@ export function planPageRender(input: RenderPolicyInput): RenderPlan {
   const evictSet = new Set<number>()
   for (const i of input.rendered) {
     if (pinned.has(i) || inRange(vis, i) || inFlight.has(i)) continue
-    if (!inRange(keep, i)) evictSet.add(i)
     // A stale page outside the render zone is only a stretched bitmap nobody is looking at.
-    else if (stale.has(i) && !inRange(zone, i)) evictSet.add(i)
+    if (stale.has(i) && !ready.has(i)) evictSet.add(i)
   }
 
   // ── memory budget ────────────────────────────────────────────────────────────────
@@ -269,11 +307,12 @@ export function planPageRender(input: RenderPolicyInput): RenderPlan {
   const holding: number[] = []
   for (const i of input.rendered) if (!evictSet.has(i)) { retained += input.pagePixels(i); holding.push(i) }
   for (const i of inFlight) if (!input.rendered.has(i) && !cancelInFlight.includes(i)) retained += input.pagePixels(i)
+  for (const i of ready) if (!input.rendered.has(i) && !inFlight.has(i)) retained += input.pagePixels(i)
   if (retained > input.budgetPixels) {
     const candidates = holding
-      .filter(i => !pinned.has(i) && !inRange(zone, i) && !inRange(vis, i) && !inFlight.has(i))
-      .map(i => ({ page: i, dist: distanceTo(g, i, vTop, vBottom) }))
-      .sort((a, b) => b.dist - a.dist || b.page - a.page)
+      .filter(i => !ready.has(i) && !inFlight.has(i))
+      .map(i => ({ page: i, used: input.lastUsed?.get(i) ?? -Infinity, dist: distanceTo(g, i, vTop, vBottom) }))
+      .sort((a, b) => a.used - b.used || b.dist - a.dist || b.page - a.page)
     for (const c of candidates) {
       if (retained <= input.budgetPixels) break
       evictSet.add(c.page)
@@ -283,7 +322,8 @@ export function planPageRender(input: RenderPolicyInput): RenderPlan {
 
   return {
     visible,
-    render: wanted.map(w => w.page),
+    ready: [...ready],
+    render: wanted.filter(w => ready.has(w.page) && needs(w.page)).map(w => w.page),
     dropQueued,
     cancelInFlight,
     evict: [...evictSet].sort((a, b) => a - b),

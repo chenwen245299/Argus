@@ -326,6 +326,7 @@ pub fn create_note(root: &str, slug: &str) -> Result<Note, String> {
 ///
 /// The title only ever lands in `index.json`; the file on disk is named after a
 /// fresh uuid, so nothing here can be steered at another path.
+#[cfg(test)]
 pub fn create_note_with(root: &str, slug: &str, title: &str, content: &str) -> Result<Note, String> {
     create_note_with_assets(root, slug, None, title, content, &[])
 }
@@ -403,6 +404,7 @@ pub fn upsert_note_by_title(
     Ok(note)
 }
 
+#[cfg(test)]
 pub fn save_note(root: &str, slug: &str, note_id: &str, content: &str) -> Result<(), String> {
     save_note_if_current(root, slug, note_id, content, None)
 }
@@ -470,6 +472,7 @@ fn update_note_unlocked(root: &str, slug: &str, before: &NoteSnapshot, title: &s
     Ok(updated)
 }
 
+#[cfg(test)]
 pub fn update_note_checked(root: &str, slug: &str, before: &NoteSnapshot, title: &str, content: &str) -> Result<Note, String> {
     update_note_checked_with_assets(root, slug, None, before, title, content, &[])
 }

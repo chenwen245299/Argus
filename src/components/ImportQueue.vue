@@ -20,8 +20,18 @@ function positionPanel() {
     '--queue-list-height': `${Math.max(80, window.innerHeight - top - 80)}px`,
   }
 }
-onMounted(() => window.addEventListener('resize', positionPanel))
-onBeforeUnmount(() => window.removeEventListener('resize', positionPanel))
+function onOutsidePointerDown(event: PointerEvent) {
+  const details = menu.value
+  if (details?.open && !event.composedPath().includes(details)) details.open = false
+}
+onMounted(() => {
+  window.addEventListener('resize', positionPanel)
+  document.addEventListener('pointerdown', onOutsidePointerDown, true)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', positionPanel)
+  document.removeEventListener('pointerdown', onOutsidePointerDown, true)
+})
 const finished = computed(() => imports.jobs.length - imports.activeCount)
 const failed = computed(() => imports.jobs.filter(j => j.status === 'error').length)
 const labels: Record<ImportStatus, string> = {

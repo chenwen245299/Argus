@@ -2140,6 +2140,8 @@ A bare `find_papers` keyword sweep across the whole library is the last resort, 
 - `get_paper_fulltext` to read the extracted text, paged with `offset` — pull the slices you need rather than the whole paper at once.
 - `get_note` and `get_highlights` for what the user wrote or marked themselves. Often the best answer to "what did I think about this".
 
+Standalone Markdown notes appear in the same collections with `file_type: "md"`. Their primary body is read only through `read_library_note`, which requires explicit user approval of the requested slice. Use `create_library_note`, `update_library_note` and `delete_library_note` for these primary documents, each with user approval. They also support separate attachment notes through the ordinary paper-note writing tools; read those with `read_library_note` and `note_id`, also requiring approval. Markdown marking uses the ordinary approved marking tools with page:1, unique exact source excerpts from an approved read, and no PDF anchors or page inspection. Fulltext/PDF tools cannot read the primary body. Keep existing content when extending a note; refusal, timeout or cancellation means stop.
+
 ## The snippet collection
 
 - `search_snippets` searches the user's snippet collection (素材库): excerpts they saved from papers, with their own notes and tags. It is a plain substring match.
@@ -2213,6 +2215,22 @@ fn configured_agent_system_prompt(settings: &crate::mcp::client::AgentSettings) 
 fn paper_context_block(root: &str, slug: &str) -> Option<String> {
     let detail = crate::mcp::tools::get_paper(root, slug).ok()?;
     let json = serde_json::to_string_pretty(&detail).ok()?;
+    if detail.file_type == "md" {
+        return Some(format!(
+            "The user has opened this standalone Markdown note in the centre editor. Their question \
+             is about it unless they say otherwise. This is metadata from `get_paper` for slug \
+             `{slug}`; it does not contain the note body:\n\n{json}\n\n\
+             Read the requested body with `read_library_note` only after the user's explicit \
+             approval of that tool's exact preview. Use `update_library_note` or `delete_library_note` \
+             for this document and `create_library_note` for another standalone note, always with \
+             approval. Separate attachment notes use create/update/delete/restore_paper_note; \
+             read them with read_library_note and note_id, also with approval. Annotations use \
+             create_paper_highlights/create_paper_annotations with page:1 and exact unique \
+             Markdown source excerpts from an approved read; no PDF anchors or inspection. \
+             Paper-attachment note tools and PDF/fulltext tools do not access the primary body. \
+             A refusal, timeout or cancellation means stop, never retry automatically."
+        ));
+    }
     Some(format!(
         "The user is reading this paper right now, and their question is about it unless they \
          say otherwise. This is the output of `get_paper` for slug `{slug}` — do not call that \
@@ -2293,12 +2311,16 @@ fn format_pinned_block(entries: &[&crate::models::PaperIndexEntry]) -> Option<St
         return None;
     }
     let lines: Vec<String> = entries.iter().map(|e| pinned_paper_line(e)).collect();
+    let note_guidance = if entries.iter().any(|e| e.file_type.as_deref() == Some("md")) {
+        " Entries marked [md] are standalone notes: read them with read_library_note only after \
+         explicit user approval; use the library_note tools for changes, also with approval."
+    } else { "" };
     Some(format!(
         "The user has pinned these papers to this conversation. Treat each question as being \
          about them unless the user clearly asks about something else, and read them before \
          answering: `get_paper_fulltext` for the text, `view_paper_page` for figures and tables, \
          `get_note` and `get_highlights` for what the user wrote. Bring in other papers from the \
-         library only when the user asks for that.\n\n{}",
+         library only when the user asks for that.{note_guidance}\n\n{}",
         lines.join("\n")
     ))
 }
@@ -3097,6 +3119,15 @@ async fn run_confirmed_write(
     let mut result = tokio::task::spawn_blocking(move || pending.execute(&root_owned))
         .await
         .map_err(|e| format!("write task failed: {e}"))??;
+    if result["library_note"] == true {
+        let action = if result["deleted"] == true { "deleted" } else if result["updated"] == true { "updated" } else { "created" };
+        if let Some(slug) = result["slug"].as_str() {
+            let root_owned = root.to_string(); let slug_owned = slug.to_string();
+            let _ = tokio::task::spawn_blocking(move || crate::search::index_paper(&root_owned, &slug_owned)).await;
+            crate::library_notes::notify(app, root, slug, action);
+            if action == "deleted" { close_paper_ai_window(app, slug); }
+        }
+    }
     if let Some(note_id) = result.get("note_id").and_then(|n| n.as_str()) {
         let root_owned = root.to_string();
         let slug = preview.slug.clone();
@@ -3837,6 +3868,24 @@ mod agent_tests {
         assert_eq!(Some(block), paper_context_block(&root, "a-paper"));
         // A paper that is not there yields nothing rather than a broken card.
         assert!(paper_context_block(&root, "no-such-paper").is_none());
+    }
+
+    #[test]
+    fn standalone_note_context_names_approved_tools_without_including_the_body() {
+        let lib = crate::library_notes::tests::Library::new();
+        let note = lib.note();
+        let block = paper_context_block(&lib.root, &note.slug).unwrap();
+        assert!(block.contains(&note.title));
+        assert!(!block.contains("保留正文与公式"));
+        for name in ["read_library_note", "create_library_note", "update_library_note", "delete_library_note"] {
+            assert!(block.contains(name), "{block}");
+        }
+        assert!(block.contains("explicit approval"));
+        let mut entry = index_entry(&note.slug, &note.title, &[]);
+        entry.file_type = Some("md".into());
+        let pinned = format_pinned_block(&[&entry]).unwrap();
+        assert!(pinned.contains("read_library_note"));
+        assert!(pinned.contains("[md]"));
     }
 
     fn index_entry(slug: &str, title: &str, authors: &[&str]) -> crate::models::PaperIndexEntry {

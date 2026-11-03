@@ -6,7 +6,7 @@ import { useI18n } from 'vue-i18n'
 import { storeToRefs } from 'pinia'
 import { RecycleScroller } from 'vue-virtual-scroller'
 import { invoke } from '@tauri-apps/api/core'
-import { save as dialogSave } from '@tauri-apps/plugin-dialog'
+import { save as dialogSave, confirm as dialogConfirm } from '@tauri-apps/plugin-dialog'
 import { useLibraryStore } from '../stores/library'
 import { useSelectionStore } from '../stores/selection'
 import { useReaderStore } from '../stores/reader'
@@ -24,6 +24,8 @@ import CollectionCascadeMenu from './CollectionCascadeMenu.vue'
 import { titleInitialCaps } from '../utils/text'
 import { noteBadgeStyle } from '../utils/noteBadges'
 import { filterRecentlyRead, recentPapersVersion } from '../utils/recentPapers'
+import { createLibraryNote, creatingLibraryNote } from '../utils/libraryNotes'
+import { reuseItemArray } from '../utils/paperIndex'
 import { badgesFromRank, isUnpublishedVenue } from '../utils/rankBadges'
 import { useRanksStore } from '../stores/ranks'
 import type { Collection, Note, PaperIndexEntry, PaperMeta, SortField, SortDir } from '../types'
@@ -440,7 +442,7 @@ function onColContextMenu(col: { sortField?: SortField }) {
 }
 
 function onGlobalPointerDown(e: PointerEvent) {
-  if (!ctxMenu.value) return
+  if (!ctxMenu.value && !blankCtx.value) return
   const target = e.target as HTMLElement | null
   if (target?.closest('.ctx-menu')) return
   closeCtx()
@@ -488,7 +490,7 @@ async function refreshCollectionPapers(id: string | null) {
   // the canvasNoteLoadSeq pattern below); harmless while sync, safe if this
   // ever becomes async again.
   if (seq !== collectionLoadSeq) return
-  collectionPapers.value = papers
+  collectionPapers.value = reuseItemArray(collectionPapers.value, papers)
 }
 
 watch(() => selection.activeCollectionId, (id) => refreshCollectionPapers(id ?? null), { immediate: true })
@@ -519,16 +521,17 @@ const filtered = computed<PaperIndexEntry[]>(() => {
   return list
 })
 
-const sorted = computed(() => {
+const sorted = computed<PaperIndexEntry[]>((previous) => {
   // "Recently Read" is strictly ordered by last-open time (via filterRecentlyRead
   // in `filtered`). Never apply the column sort here — the default `added_at` sort
   // would otherwise mask recency and keep newly-opened papers from moving to top.
-  if (selection.activeNav === 'recent') return filtered.value
-  if (!sortField.value) return [...filtered.value]
-  return [...filtered.value].sort((a, b) => {
+  if (selection.activeNav === 'recent') return reuseItemArray(previous, filtered.value)
+  if (!sortField.value) return reuseItemArray(previous, [...filtered.value])
+  const next = [...filtered.value].sort((a, b) => {
     const cmp = compareValue(a, b)
     return sortDir.value === 'asc' ? cmp : -cmp
   })
+  return reuseItemArray(previous, next)
 })
 
 const canvasNoteTitles = ref<Record<string, string[]>>({})
@@ -752,6 +755,7 @@ async function positionContextMenu() {
 
 async function openCtx(e: MouseEvent, item: PaperIndexEntry) {
   e.preventDefault()
+  closeCtx()
   // Right-clicking a row outside the current multi-selection collapses the
   // selection to just that row; right-clicking a member keeps the whole set.
   if (!(selection.selectedSlugs.length > 1 && selection.selectedSlugs.includes(item.slug))) {
@@ -760,7 +764,19 @@ async function openCtx(e: MouseEvent, item: PaperIndexEntry) {
   ctxMenu.value = { x: e.clientX, y: e.clientY, item, showColls: false, tagInput: '', constrained: false }
   await positionContextMenu()
 }
-function closeCtx() { ctxMenu.value = null }
+const blankCtx = ref<{ x: number; y: number } | null>(null)
+function openBlankCtx(event: MouseEvent) {
+  if ((event.target as HTMLElement).closest('.paper-row,.search-hit,.header-shell,.ctx-menu,button,input,textarea')) return
+  event.preventDefault()
+  closeCtx()
+  blankCtx.value = { x: Math.max(8, Math.min(event.clientX, window.innerWidth - 240)), y: Math.max(8, Math.min(event.clientY, window.innerHeight - 80)) }
+}
+function closeCtx() { ctxMenu.value = null; blankCtx.value = null }
+async function newMarkdownNote() {
+  closeCtx()
+  try { await createLibraryNote(selection.activeCollectionId) }
+  catch (error) { showError(String(error)) }
+}
 
 // Papers whose highlights and notes the export dialog is open for; null = closed.
 const exportSlugs = ref<string[] | null>(null)
@@ -782,6 +798,8 @@ const ctxTargets = computed<PaperIndexEntry[]>(() => {
   return [ctxMenu.value.item]
 })
 const ctxIsMulti = computed(() => ctxTargets.value.length > 1)
+const ctxPdfCount = computed(() => ctxTargets.value.filter(p => !isEbookFileType(p.file_type)).length)
+const ctxDocumentTargets = computed(() => ctxTargets.value.filter(p => p.file_type !== 'md'))
 
 function openRelatedFromCtx() {
   if (!ctxMenu.value) return
@@ -938,6 +956,16 @@ async function setReadingStatus(item: PaperIndexEntry, status: string) {
 
 async function deletePaper(item: PaperIndexEntry) {
   closeCtx()
+  if (item.file_type === 'md') {
+    if (!await dialogConfirm(t('libraryNote.deleteConfirm', { title: item.title }), { title: t('libraryNote.delete'), kind: 'warning' })) return
+    try {
+      const expected = await invoke<import('../types').LibraryNoteSnapshot>('get_library_note', { slug: item.slug, expectedRoot: library.currentPath })
+      await invoke('delete_library_note', { expected, expectedRoot: library.currentPath })
+      reader.closeTab(item.slug)
+      await Promise.all([library.refresh(), collectionsStore.load()])
+    } catch (error) { showError(String(error)) }
+    return
+  }
   if (!confirm(`${t('paper.deleteConfirm').replace('{title}', item.title)}`)) return
   try {
     await invoke('delete_paper', { slug: item.slug })
@@ -961,11 +989,19 @@ async function openPaperInFinder(item: PaperIndexEntry) {
 }
 
 async function copyPaperPdf(item: PaperIndexEntry) {
+  await copyPaperPdfs([item])
+}
+
+async function copyPaperPdfs(items: PaperIndexEntry[]) {
+  const slugs = [...new Set(items.filter(p => !isEbookFileType(p.file_type)).map(p => p.slug))]
+  const root = library.currentPath
   closeCtx()
+  if (!slugs.length) return
   try {
-    await invoke('copy_paper_pdf', { slug: item.slug })
+    const n = await invoke<number>('copy_paper_pdfs', { slugs, expectedRoot: root })
+    if (root === library.currentPath) showNotice(t('paper.pdfCopied', { n }))
   } catch (e: unknown) {
-    showError(String(e))
+    if (root === library.currentPath) showError(String(e))
   }
 }
 
@@ -1317,7 +1353,7 @@ async function runBatchOp(
 }
 
 async function vectorizeBatch() {
-  const targets = ctxTargets.value
+  const targets = ctxDocumentTargets.value
   closeCtx()
   if (batchBusy()) return
   await ragStore.load()
@@ -1337,7 +1373,7 @@ async function vectorizeBatch() {
 }
 
 async function analyzeBatch() {
-  const targets = ctxTargets.value.filter(p => !p.status.ai_summary_done && !isAiSummaryActive(p.slug))
+  const targets = ctxDocumentTargets.value.filter(p => !p.status.ai_summary_done && !isAiSummaryActive(p.slug))
   closeCtx()
   if (!targets.length) return
   // AI analysis runs through the same per-paper streaming path as single-paper
@@ -1365,7 +1401,7 @@ async function analyzeBatch() {
 }
 
 async function reExtractBatch() {
-  const targets = ctxTargets.value
+  const targets = ctxDocumentTargets.value
   closeCtx()
   if (batchBusy()) return
   await runBatchOp(t('batch.extract'), targets, async (item) => {
@@ -1374,7 +1410,7 @@ async function reExtractBatch() {
 }
 
 async function abstractBatch() {
-  const targets = ctxTargets.value
+  const targets = ctxDocumentTargets.value
   closeCtx()
   if (batchBusy()) return
   await runBatchOp(t('batch.abstract'), targets, async (item) => {
@@ -1449,7 +1485,7 @@ async function deleteBatch() {
 </script>
 
 <template>
-  <div class="paper-list" @click="closeCtx(); showColPicker = false">
+  <div class="paper-list" @click="closeCtx(); showColPicker = false" @contextmenu="openBlankCtx">
 
     <!-- ── Action error toast ─────────────────────────────────────────────── -->
     <Transition name="err-toast">
@@ -1679,7 +1715,7 @@ async function deleteBatch() {
                 </div>
                 <div v-else-if="col.id === 'year'" class="row-cell row-year">{{ item.year ?? '—' }}</div>
                 <div v-else-if="col.id === 'added_at'" class="row-cell row-date">{{ formatDate(item.added_at) }}</div>
-                <div v-else-if="col.id === 'status'" class="row-right"><StatusBadges :status="item.status" :has-bibtex="item.has_bibtex" /></div>
+                <div v-else-if="col.id === 'status'" class="row-right"><StatusBadges v-if="item.file_type !== 'md'" :status="item.status" :has-bibtex="item.has_bibtex" /></div>
                 <div v-else-if="col.id === 'tags'" class="row-cell row-tags">
                   <template v-if="item.tags && item.tags.length > 0">
                     <span
@@ -1732,6 +1768,11 @@ async function deleteBatch() {
 
     <!-- ── Context menu ──────────────────────────────────────────────────── -->
     <Teleport to="body">
+      <div v-if="blankCtx" class="ctx-menu" :style="{ left: blankCtx.x + 'px', top: blankCtx.y + 'px' }" @click.stop>
+        <button class="ctx-item" :disabled="creatingLibraryNote || (!!selection.activeCollectionId && !canImportIntoActiveCollection)" @click="newMarkdownNote">
+          {{ t('libraryNote.newMarkdown') }}
+        </button>
+      </div>
       <div
         v-if="ctxMenu"
         ref="ctxMenuEl"
@@ -1743,6 +1784,10 @@ async function deleteBatch() {
         <!-- ── Multi-selection menu: actions apply to every selected paper ── -->
         <template v-if="ctxIsMulti">
           <div class="ctx-multi-header">{{ t('batch.selectedCount', { n: ctxTargets.length }) }}</div>
+          <button class="ctx-item" :disabled="ctxPdfCount === 0" @click="copyPaperPdfs(ctxTargets)">
+            {{ t('paper.copyPdfs', { n: ctxPdfCount }) }}
+          </button>
+          <div class="ctx-sep" />
           <div class="ctx-item-group" @mouseenter="ctxMenu!.showColls = true" @mouseleave="ctxMenu!.showColls = false">
             <button class="ctx-item has-sub">
               {{ t('collections.addToColl') }}
@@ -1791,13 +1836,13 @@ async function deleteBatch() {
             </button>
           </div>
           <div class="ctx-sep" />
-          <button class="ctx-item" @click="reExtractBatch">{{ t('extraction.reExtract') }}</button>
+          <button class="ctx-item" :disabled="!ctxDocumentTargets.length" @click="reExtractBatch">{{ t('extraction.reExtract') }}</button>
           <div class="ctx-sep" />
-          <button class="ctx-item" @click="analyzeBatch">{{ t('paper.summarizeAi') }}</button>
-          <button class="ctx-item" @click="abstractBatch">{{ t('paper.extractAbstractAi') }}</button>
+          <button class="ctx-item" :disabled="!ctxDocumentTargets.length" @click="analyzeBatch">{{ t('paper.summarizeAi') }}</button>
+          <button class="ctx-item" :disabled="!ctxDocumentTargets.length" @click="abstractBatch">{{ t('paper.extractAbstractAi') }}</button>
           <template v-if="ragStore.isConfigured">
             <div class="ctx-sep" />
-            <button class="ctx-item" @click="vectorizeBatch">{{ t('batch.vectorize') }}</button>
+            <button class="ctx-item" :disabled="!ctxDocumentTargets.length" @click="vectorizeBatch">{{ t('batch.vectorize') }}</button>
           </template>
           <div class="ctx-sep" />
           <button class="ctx-item" @click="exportAnnotations(ctxTargets.map(p => p.slug))">
@@ -1807,6 +1852,18 @@ async function deleteBatch() {
           <button class="ctx-item danger" @click="deleteBatch">{{ t('paper.delete') }}</button>
         </template>
 
+        <template v-else-if="ctxMenu!.item.file_type === 'md'">
+          <button class="ctx-item" @click="openInReader(ctxMenu!.item); closeCtx()">{{ t('libraryNote.open') }}</button>
+          <div class="ctx-item-group" @mouseenter="ctxMenu!.showColls = true" @mouseleave="ctxMenu!.showColls = false">
+            <button class="ctx-item has-sub">{{ t('collections.addToColl') }}<Icon icon="fluent:chevron-right-24-regular" width="12" height="12" style="margin-left:auto" /></button>
+            <CollectionCascadeMenu v-if="ctxMenu.showColls" :collections="contextMenuRootCollections" @select="addToCollection" />
+          </div>
+          <button v-if="selection.activeNav.startsWith('collection:')" class="ctx-item" @click="removeFromCurrentCollection">{{ t('collections.removeFromColl') }}</button>
+          <button class="ctx-item" @click="openPaperInFinder(ctxMenu!.item)">{{ t('paper.openInFinder') }}</button>
+          <button class="ctx-item" @click="exportAnnotations([ctxMenu!.item.slug])">{{ t('annotationExport.menu') }}</button>
+          <div class="ctx-sep" />
+          <button class="ctx-item danger" @click="deletePaper(ctxMenu!.item)">{{ t('libraryNote.delete') }}</button>
+        </template>
         <!-- ── Single-paper menu ─────────────────────────────────────────── -->
         <template v-else>
         <div class="ctx-item-group" @mouseenter="ctxMenu!.showColls = true" @mouseleave="ctxMenu!.showColls = false">

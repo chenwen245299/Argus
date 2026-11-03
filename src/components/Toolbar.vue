@@ -7,6 +7,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useLibraryStore } from '../stores/library'
 import ImportQueue from './ImportQueue.vue'
+import { createLibraryNote, creatingLibraryNote } from '../utils/libraryNotes'
 import { useImportStore } from '../stores/import'
 import { useSelectionStore } from '../stores/selection'
 import { usePaperTasksStore, type AiSummaryJob } from '../stores/paperTasks'
@@ -252,6 +253,13 @@ const rightReserveStyle = computed(() => ({
 // ── Import dropdown menu ─────────────────────────────────────────────────────
 const showImportMenu = ref(false)
 const showStatsMenu = ref(false)
+const newNoteError = ref('')
+async function chooseNewNote() {
+  showImportMenu.value = false
+  newNoteError.value = ''
+  try { await createLibraryNote(selection.activeCollectionId) }
+  catch (error) { newNoteError.value = String(error) }
+}
 
 function toggleImportMenu() {
   if (showImportMenu.value) {
@@ -1035,6 +1043,7 @@ onUnmounted(() => {
 
     <!-- Import status -->
     <ImportQueue />
+    <div v-if="newNoteError" class="import-error-toast" @click="newNoteError = ''">{{ newNoteError }}</div>
 
     <!-- Import error toast -->
     <div
@@ -1091,7 +1100,7 @@ onUnmounted(() => {
     <div v-if="library.currentPath" class="import-wrap">
       <button
         class="btn-outline"
-        :disabled="activeJobs > 0 || !canImport"
+        :disabled="!library.currentPath"
         :title="importTitle"
         @click="toggleImportMenu"
       >
@@ -1103,13 +1112,17 @@ onUnmounted(() => {
       <!-- Dropdown: choose import method -->
       <Transition name="toolbar-dropdown">
         <div v-if="showImportMenu" class="import-menu">
-          <button class="import-menu-item" :title="t('import.btnTitle')" @click="chooseFileImport">
+          <button class="import-menu-item" :disabled="activeJobs > 0 || !canImport" :title="importTitle" @click="chooseFileImport">
             <Icon icon="fluent:document-arrow-down-24-regular" width="15" height="15" />
             {{ t('import.fileImportBtn') }}
           </button>
-          <button class="import-menu-item" :title="t('import.urlImportTitle')" @click="chooseUrlImport">
+          <button class="import-menu-item" :disabled="activeJobs > 0 || !canImport" :title="t('import.urlImportTitle')" @click="chooseUrlImport">
             <Icon icon="fluent:link-24-regular" width="15" height="15" />
             {{ t('import.urlImportBtn') }}
+          </button>
+          <button class="import-menu-item" :disabled="creatingLibraryNote || (!!selection.activeCollectionId && !canImportIntoActiveCollection)" @click="chooseNewNote">
+            <Icon icon="fluent:document-add-24-regular" width="15" height="15" />
+            {{ t('libraryNote.new') }}
           </button>
         </div>
       </Transition>

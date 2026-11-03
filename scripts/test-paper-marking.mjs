@@ -88,15 +88,16 @@ test('paper and library chat forward the approved color list against the exact q
     const ast = ts.createSourceFile(path, script, ts.ScriptTarget.Latest, true)
     const fn = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name.text === 'answerWrite').getText(ast)
     for (const approved of [true, false]) {
-      const pending = { requestId: 'colored-request', preview: { passages: [{ color: '#FFEB3B' }] } }
-      const queue = ref([pending, { requestId: 'next-request' }]), calls = []
-      const answer = new Function('currentWrite', 'pendingWrites', 'invoke', ts.transpileModule(`${fn}\nreturn answerWrite;`, {
+      const pending = { requestId: 'colored-request', answerId: 'colored-answer', preview: { passages: [{ color: '#FFEB3B' }] } }
+      const queue = ref([pending, { requestId: 'next-request' }]), calls = [], broadcasts = []
+      const answer = new Function('currentWrite', 'pendingWrites', 'invoke', 'broadcastStreamUpdate', ts.transpileModule(`${fn}\nreturn answerWrite;`, {
         compilerOptions: { target: ts.ScriptTarget.ES2021 },
-      }).outputText)({ value: pending }, queue, async (command, args) => calls.push({ command, args }))
+      }).outputText)({ value: pending }, queue, async (command, args) => calls.push({ command, args }), id => broadcasts.push(id))
       answer(approved, ['#90CAF9'])
       assert.deepEqual(calls, [{ command: 'resolve_agent_write', args: { requestId: 'colored-request', approved, passageColors: approved ? ['#90CAF9'] : null } }])
       assert.equal(queue.value[0].requestId, 'next-request')
       assert.equal(pending.preview.passages[0].color, '#FFEB3B')
+      assert.deepEqual(broadcasts, path.includes('AiTab') ? ['colored-answer'] : [])
     }
   }
 })

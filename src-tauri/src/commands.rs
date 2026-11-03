@@ -130,8 +130,8 @@ pub async fn load_library_cache(
 }
 
 #[tauri::command]
-pub async fn scan_library(state: State<'_, LibraryRoot>) -> Result<Vec<PaperIndexEntry>, String> {
-    let root = get_root(&state)?;
+pub async fn scan_library(expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<Vec<PaperIndexEntry>, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
     // Blocking IO: a 5000-paper library takes ~0.5s even on the cached path, and
     // running that inline would park one of the async runtime's workers — the same
     // pool that carries in-flight AI streaming. Hand it to the blocking pool.
@@ -281,6 +281,43 @@ fn note_root(state: &State<'_, LibraryRoot>, expected_root: Option<&str>) -> Res
 }
 
 #[tauri::command]
+pub async fn create_library_note(collection_id: Option<String>, title: String, content: String, expected_root: Option<String>, state: State<'_, LibraryRoot>, app: tauri::AppHandle) -> Result<crate::library_notes::Snapshot, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    let worker_root = root.clone();
+    let note = tokio::task::spawn_blocking(move || crate::library_notes::create(&worker_root, collection_id.as_deref(), &title, &content)).await.map_err(|e| e.to_string())??;
+    let index_root = root.clone(); let index_slug = note.slug.clone();
+    tokio::task::spawn_blocking(move || refresh_search_index(&index_root, &index_slug));
+    crate::library_notes::notify(&app, &root, &note.slug, "created");
+    Ok(note)
+}
+
+#[tauri::command]
+pub async fn get_library_note(slug: String, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<crate::library_notes::Snapshot, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || crate::library_notes::read(&root, &slug)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn save_library_note(expected: crate::library_notes::Snapshot, title: String, content: String, expected_root: Option<String>, state: State<'_, LibraryRoot>, app: tauri::AppHandle) -> Result<crate::library_notes::Snapshot, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    let worker_root = root.clone();
+    let note = tokio::task::spawn_blocking(move || crate::library_notes::update(&worker_root, &expected, &title, &content)).await.map_err(|e| e.to_string())??;
+    refresh_search_index(&root, &note.slug);
+    crate::library_notes::notify(&app, &root, &note.slug, "updated");
+    Ok(note)
+}
+
+#[tauri::command]
+pub async fn delete_library_note(expected: crate::library_notes::Snapshot, expected_root: Option<String>, state: State<'_, LibraryRoot>, app: tauri::AppHandle) -> Result<(), String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    let worker_root = root.clone(); let slug = expected.slug.clone();
+    tokio::task::spawn_blocking(move || crate::library_notes::delete(&worker_root, &expected)).await.map_err(|e| e.to_string())??;
+    crate::library_notes::notify(&app, &root, &slug, "deleted");
+    copilot::close_paper_ai_window(&app, &slug);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn list_notes(slug: String, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<Vec<Note>, String> {
     let root = note_root(&state, expected_root.as_deref())?;
     tokio::task::spawn_blocking(move || paper::list_notes(&root, &slug)).await.map_err(|e| e.to_string())
@@ -394,14 +431,19 @@ pub async fn save_note_asset(
     slug: String,
     ext: String,
     data: String,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<String, String> {
     use base64::Engine;
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|e| format!("Invalid image data: {e}"))?;
-    paper::write_note_asset(&root, &slug, &ext, &bytes)
+    tokio::task::spawn_blocking(move || {
+        let meta = paper::read_meta(&root, &slug)?;
+        if meta.file_type.as_deref() == Some("md") { crate::library_notes::write_asset(&root, &slug, &ext, &bytes) }
+        else { paper::write_note_asset(&root, &slug, &ext, &bytes) }
+    }).await.map_err(|e| e.to_string())?
 }
 
 /// Read-aloud audio this paper already has for one chunk (see `speech_cache`), as a
@@ -479,9 +521,10 @@ pub async fn delete_note(slug: String, note_id: String, expected_root: Option<St
 #[tauri::command]
 pub async fn get_highlights(
     slug: String,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<Vec<Highlight>, String> {
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
     Ok(paper::read_highlights(&root, &slug))
 }
 
@@ -490,10 +533,16 @@ pub async fn save_highlights(
     slug: String,
     highlights: Vec<Highlight>,
     tombstones: Option<Vec<crate::models::HighlightTombstone>>,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<(), String> {
-    let root = get_root(&state)?;
-    paper::save_highlights_merged(&root, &slug, highlights, tombstones.unwrap_or_default())
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        let namespace = paper::namespace_lock(&root);
+        let _guard = namespace.lock().unwrap_or_else(|e| e.into_inner());
+        paper::read_meta(&root, &slug)?;
+        paper::save_highlights_merged(&root, &slug, highlights, tombstones.unwrap_or_default())
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1215,6 +1264,17 @@ pub async fn delete_paper(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     let root = note_root(&state, expected_root.as_deref())?;
+    if paper::read_meta(&root, &slug).is_ok_and(|meta| meta.file_type.as_deref() == Some("md")) {
+        let worker_root = root.clone(); let worker_slug = slug.clone();
+        tokio::task::spawn_blocking(move || {
+            let note = crate::library_notes::read(&worker_root, &worker_slug)?;
+            if expected_id.as_deref().is_some_and(|id| id != note.id) { return Err("Note identity changed".into()); }
+            crate::library_notes::delete(&worker_root, &note)
+        }).await.map_err(|e| e.to_string())??;
+        crate::library_notes::notify(&app, &root, &slug, "deleted");
+        copilot::close_paper_ai_window(&app, &slug);
+        return Ok(());
+    }
     let root_c = root.clone();
     let slug_c = slug.clone();
     let meta = tauri::async_runtime::spawn_blocking(move || {
@@ -1266,19 +1326,18 @@ pub async fn open_paper_folder(slug: String, state: State<'_, LibraryRoot>) -> R
     reveal_path_in_finder(&dir.to_string_lossy())
 }
 
-/// Copy the paper PDF itself to the system clipboard, so it can be pasted in Finder.
+/// Copy actual PDF files in one operation, including multi-selection.
 #[tauri::command]
-pub async fn copy_paper_pdf(slug: String, state: State<'_, LibraryRoot>) -> Result<(), String> {
-    let root = get_root(&state)?;
-    let path = metadata::find_pdf_in_dir(&root, &slug);
-    if !path.exists() {
-        return Err(format!("PDF file not found: {}", path.display()));
-    }
+pub async fn copy_paper_pdfs(slugs: Vec<String>, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<usize, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || crate::file_clipboard::copy_pdfs(&root, &slugs))
+        .await.map_err(|e| e.to_string())?
+}
 
-    let path = path
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve PDF path: {e}"))?;
-    copy_file_to_clipboard(path.to_string_lossy().to_string())
+/// Retain the single-file command for existing callers.
+#[tauri::command]
+pub async fn copy_paper_pdf(slug: String, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<(), String> {
+    copy_paper_pdfs(vec![slug], expected_root, state).await.map(|_| ())
 }
 
 /// Run the full metadata fetch cascade for a slug and return the updated meta.
@@ -4016,75 +4075,6 @@ pub fn open_in_finder(path: String, state: State<'_, LibraryRoot>) -> Result<(),
         return Err("Refused: path is outside the library".to_string());
     }
     reveal_path_in_finder(&path)
-}
-
-fn copy_file_to_clipboard(path: String) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        // Escape characters that could break out of the AppleScript string literal.
-        // Newlines and CRs are especially important: they terminate the current
-        // `osascript -e` statement and allow injection of a second command.
-        let escaped = path
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\0', "");
-        let script = format!("set the clipboard to (POSIX file \"{}\")", escaped);
-        let output = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()
-            .map_err(|e| e.to_string())?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if err.is_empty() {
-            "Failed to copy PDF file".to_string()
-        } else {
-            err
-        });
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        // Put the file itself on the clipboard as a CF_HDROP file-drop list (what
-        // Explorer pastes as the actual file), mirroring the macOS branch above.
-        // The path is handed to PowerShell through an environment variable rather
-        // than interpolated into the script text, so a path containing quotes or
-        // newlines can't break out of the string and inject a second command.
-        // CREATE_NO_WINDOW (0x0800_0000) keeps a console window from flashing.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let output = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-STA",
-                "-Command",
-                "Set-Clipboard -LiteralPath $env:ARGUS_CLIP_PATH",
-            ])
-            .env("ARGUS_CLIP_PATH", &path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| e.to_string())?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if err.is_empty() {
-            "Failed to copy PDF file".to_string()
-        } else {
-            err
-        });
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = path;
-        Err("Copying files to clipboard is currently only supported on macOS and Windows".to_string())
-    }
 }
 
 // ── M9: Canvas ────────────────────────────────────────────────────────────────

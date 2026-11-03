@@ -23,11 +23,13 @@ mod deepseek;
 mod ebook;
 mod exa;
 mod extraction;
+mod file_clipboard;
 mod fsutil;
 mod highlight_groups;
 mod highlight_text;
 mod holidays;
 mod library;
+mod library_notes;
 mod llm;
 mod mcp;
 mod media;
@@ -205,6 +207,11 @@ pub fn run() {
             commands::set_reading_status,
             commands::delete_paper,
             commands::copy_paper_pdf,
+            commands::copy_paper_pdfs,
+            commands::create_library_note,
+            commands::get_library_note,
+            commands::save_library_note,
+            commands::delete_library_note,
             commands::open_paper_folder,
             commands::read_pdf_bytes,
             commands::render_page_png,

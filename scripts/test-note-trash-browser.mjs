@@ -1,6 +1,7 @@
 // Real note surfaces, with a small editor stand-in and local desktop/disk mocks.
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { fileURLToPath } from 'node:url'
 import { mkdir } from 'node:fs/promises'
 import { createServer } from 'vite'
 import vue from '@vitejs/plugin-vue'
@@ -14,11 +15,11 @@ const mocks={
   '@tauri-apps/api/window': `export const getCurrentWindow=()=>({label:'main'});`,
   '@tauri-apps/api/webviewWindow': `export const getCurrentWebviewWindow=()=>({label:'note-window-test',setTitle:async()=>{},onCloseRequested:async()=>()=>{}});`,
 }
-const editor=`import {defineComponent,h,ref} from 'vue';export default defineComponent({props:['initialContent'],emits:['change'],setup(props,{emit,expose}){const text=ref(props.initialContent);expose({setContent:value=>{text.value=value;return true}});return()=>h('textarea',{class:'mock-editor',value:text.value,onInput:event=>{text.value=event.target.value;emit('change',text.value)},style:'width:100%;height:100%;box-sizing:border-box;background:transparent;color:inherit;padding:16px;resize:none;border:0'})}});`
+const editorPath=fileURLToPath(new URL('./fixtures/note-editor-mock.mjs',import.meta.url))
 before(async()=>{
-  server=await createServer({configFile:false,root:new URL('../',import.meta.url).pathname,appType:'custom',plugins:[{
-    name:'notes-desktop-mocks',enforce:'pre',resolveId:(source,importer)=>source in mocks?'\0mock:'+source:source.endsWith('/VditorEditor.vue')||source==='../VditorEditor.vue'?'\0mock-editor.js':null,
-    load:id=>id==='\0mock-editor.js'?editor:id.startsWith('\0mock:')?mocks[id.slice(6)]:null,
+  server=await createServer({configFile:false,root:new URL('../',import.meta.url).pathname,appType:'custom',cacheDir:'node_modules/.vite-note-trash-test',plugins:[{
+    name:'notes-desktop-mocks',enforce:'pre',resolveId:source=>source in mocks?'\0mock:'+source:source.endsWith('/VditorEditor.vue')||source==='../VditorEditor.vue'?editorPath:null,
+    load:id=>id.startsWith('\0mock:')?mocks[id.slice(6)]:null,
   },vue()],optimizeDeps:{entries:['src/components/tabs/NotesTab.vue','src/views/NoteWindowView.vue']},server:{host:'127.0.0.1',port:0},logLevel:'error'})
   server.middlewares.use(async(req,res,next)=>{
     if(!req.url.startsWith('/__note-test'))return next()

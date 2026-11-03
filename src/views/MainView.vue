@@ -39,6 +39,7 @@ import SpeechHost from '../components/SpeechHost.vue'
 // code-split so the main window paints before any of them download.
 const PdfViewer = defineAsyncComponent(() => import('../components/PdfViewer.vue'))
 const EbookViewer = defineAsyncComponent(() => import('../components/EbookViewer.vue'))
+const MarkdownNoteView = defineAsyncComponent(() => import('../components/MarkdownNoteView.vue'))
 const CanvasPanel = defineAsyncComponent(() => import('../components/CanvasPanel.vue'))
 const SettingsModal = defineAsyncComponent(() => import('../components/SettingsModal.vue'))
 const WelcomeOnboarding = defineAsyncComponent(() => import('../components/WelcomeOnboarding.vue'))
@@ -253,7 +254,8 @@ function activePaperInfo() {
   }
 }
 const livePdfSlugs = computed(() => liveViewerSlugs.value.filter(s => !isEbookFileType(fileTypeFor(s))))
-const liveEbookSlugs = computed(() => liveViewerSlugs.value.filter(s => isEbookFileType(fileTypeFor(s))))
+const liveEbookSlugs = computed(() => liveViewerSlugs.value.filter(s => fileTypeFor(s) !== 'md' && isEbookFileType(fileTypeFor(s))))
+const liveMarkdownSlugs = computed(() => liveViewerSlugs.value.filter(s => fileTypeFor(s) === 'md'))
 
 // Which workspace the centre shows is decided entirely by the active tab, so
 // these are derived, never assigned. They used to be independent refs that every
@@ -640,6 +642,7 @@ let unlistenOpenPaper: UnlistenFn | null = null
 let unlistenLibraryPaperAdded: UnlistenFn | null = null
 let unlistenRagSettingsChanged: UnlistenFn | null = null
 let unlistenNotesChanged: UnlistenFn | null = null
+let unlistenLibraryNotesChanged: UnlistenFn | null = null
 let unlistenHighlightsAdded: UnlistenFn | null = null
 let unlistenHighlightsChanged: UnlistenFn | null = null
 let mainFocusRetryTimer: number | null = null
@@ -701,6 +704,10 @@ onMounted(async () => {
     if (payload.root !== libraryStore.currentPath) return
     window.dispatchEvent(new CustomEvent('argus-canvas-notes-updated', { detail: { slug: payload.slug } }))
     if (payload.action !== 'expired') void libraryStore.refresh()
+  })
+  unlistenLibraryNotesChanged = await listen<{ root: string; slug: string }>('library-notes-changed', ({ payload }) => {
+    if (payload.root !== libraryStore.currentPath) return
+    void Promise.all([libraryStore.refresh(), collectionsStore.load()])
   })
 
   unlistenHighlightsAdded = await listen<{ root: string; slug: string; highlights: import('../types').Highlight[] }>('paper-highlights-added', ({ payload }) => {
@@ -799,6 +806,7 @@ onUnmounted(() => {
   unlistenRagSettingsChanged?.()
   unlistenHighlightsAdded?.()
   unlistenNotesChanged?.()
+  unlistenLibraryNotesChanged?.()
   unlistenHighlightsChanged?.()
 })
 
@@ -1080,6 +1088,13 @@ watch(
           class="center-fill"
           :right-sidebar-open="rightSidebarVisible"
           @toggle-right-sidebar="rightSidebarVisible = !rightSidebarVisible"
+        />
+        <MarkdownNoteView
+          v-for="s in liveMarkdownSlugs"
+          v-show="s === readerStore.activeSlug"
+          :key="`markdown:${libraryStore.currentPath}:${s}`"
+          :slug="s"
+          class="center-fill"
         />
         <!-- Non-PDF center views (shown only when no PDF tab is active) -->
         <template v-if="!readerStore.activeSlug">

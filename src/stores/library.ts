@@ -6,6 +6,7 @@ import type { LibraryConfig, PaperIndexEntry } from '../types'
 import { useReaderStore } from './reader'
 import { useRanksStore } from './ranks'
 import { useActivityStore } from './activity'
+import { reconcilePaperIndex } from '../utils/paperIndex'
 
 export const useLibraryStore = defineStore('library', () => {
   const currentPath = ref<string | null>(null)
@@ -20,6 +21,7 @@ export const useLibraryStore = defineStore('library', () => {
   // plus a flag requesting a trailing re-run for requests that arrived mid-refresh.
   let refreshPromise: Promise<void> | null = null
   let refreshPending = false
+  let committedPaperRevision = 0
 
   const allTags = computed(() => {
     const set = new Set<string>()
@@ -181,24 +183,23 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   async function _backgroundScan() {
-    if (!currentPath.value) return
-    isRefreshing.value = true
-    try {
-      const fresh = await invoke<PaperIndexEntry[]>('scan_library')
-      papers.value = fresh
-      const reader = useReaderStore()
-      const slugs = new Set(fresh.map(p => p.slug))
-      reader.pruneStaleTabs(slugs)
-    } catch (e) {
-      console.error('[library] background scan failed:', e)
-    } finally {
-      isRefreshing.value = false
-      isLoading.value = false
-    }
+    // Share the same serialized path as watcher/focus/timer refreshes.
+    await refresh()
   }
 
   function removePaper(slug: string) {
     papers.value = papers.value.filter(p => p.slug !== slug)
+  }
+
+  /** Publish a completed backend write immediately, without waiting for a full scan. */
+  function applyCommittedPaper(entry: PaperIndexEntry, expectedRoot: string) {
+    if (currentPath.value !== expectedRoot) return
+    committedPaperRevision++
+    const next = [...papers.value]
+    const index = next.findIndex(p => p.slug === entry.slug)
+    if (index < 0) next.push(entry)
+    else next[index] = entry
+    papers.value = reconcilePaperIndex(papers.value, next)
   }
 
   // ── Related papers (manual, bidirectional links) ──────────────────────────
@@ -256,18 +257,29 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   async function _doRefresh(): Promise<void> {
+    const root = currentPath.value
+    const revision = committedPaperRevision
     isRefreshing.value = true
     try {
-      const fresh = await invoke<PaperIndexEntry[]>('scan_library')
-      papers.value = fresh
+      const fresh = await invoke<PaperIndexEntry[]>('scan_library', { expectedRoot: root })
+      if (root !== currentPath.value) return
+      if (revision !== committedPaperRevision) {
+        // A scan already in flight can predate a successful creation. Do not
+        // remove its new row or prune its just-opened tab with the old snapshot.
+        refreshPending = true
+        return
+      }
+      papers.value = reconcilePaperIndex(papers.value, fresh)
       const reader = useReaderStore()
       const slugs = new Set(fresh.map(p => p.slug))
       reader.pruneStaleTabs(slugs)
     } catch (e) {
-      error.value = String(e)
+      if (root === currentPath.value) error.value = String(e)
     } finally {
-      isRefreshing.value = false
-      isLoading.value = false
+      if (root === currentPath.value) {
+        isRefreshing.value = false
+        isLoading.value = false
+      }
     }
   }
 
@@ -311,6 +323,7 @@ export const useLibraryStore = defineStore('library', () => {
     pickAndOpen,
     openLibrary,
     removePaper,
+    applyCommittedPaper,
     refresh,
     relatedPopover,
     openRelatedPopover,

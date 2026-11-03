@@ -15,12 +15,22 @@ export interface PaperMeta {
   canvas_notes?: string[]
   import_source?: string
   cite_count?: number
-  /** Main document format: absent/"pdf" for papers, or "epub" | "mobi" | "azw3" | "fb2" | "txt". */
+  /** Main document format: absent/"pdf", ebook formats, or "md" for a standalone note. */
   file_type?: string
   /** User-curated related papers (bidirectional): the `id` of each linked paper. */
   related_ids?: string[]
   /** Cached journal/venue ranking from easyScholar (SCI 分区, 中科院, CCF, IF, …). */
   journal_rank?: JournalRank
+}
+
+export interface LibraryNoteSnapshot {
+  slug: string
+  id: string
+  title: string
+  content: string
+  collectionId: string | null
+  collectionName: string
+  createdAt: string
 }
 
 export interface JournalRank {
@@ -77,7 +87,7 @@ export interface Rect {
 
 export interface Highlight {
   id: string
-  /** PDF: 1-based page number. Ebooks: 1-based chapter (spine) index. */
+  /** PDF: page; ebooks: chapter (spine) index; Markdown: 1. All are 1-based. */
   page: number
   rects: Rect[]
   text: string
@@ -93,7 +103,7 @@ export interface Highlight {
    *  opts out and keeps the original line breaks — for a list, code or an equation.
    *  Absent = merged, so it is only ever written when the user asks for the breaks. */
   keep_line_breaks?: boolean
-  /** Ebook-only reflow-safe anchor (char offsets into the sanitized chapter DOM text). */
+  /** Reflow-safe anchor for ebooks and Markdown (UTF-16 offsets into visible DOM text). */
   start_offset?: number
   end_offset?: number
   anchor_prefix?: string
@@ -165,7 +175,7 @@ export interface PaperIndexEntry {
   has_bibtex?: boolean | null
 }
 
-/** True when a paper's main document is an ebook rather than a PDF. */
+/** True for non-PDF documents. Standalone "md" notes use MarkdownNoteView, not EbookViewer. */
 export function isEbookFileType(fileType?: string | null): boolean {
   return !!fileType && fileType !== 'pdf'
 }

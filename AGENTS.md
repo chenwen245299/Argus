@@ -288,6 +288,84 @@ nonempty, uncancelled answer in a guided conversation, or when the user checks
 transient. Storage and a local change event synchronize open windows. Keep
 implementation and persistence rules out of the feature announcement copy.
 
+**Standalone Markdown notes.** `library_notes.rs` creates ordinary library
+entries with `file_type: "md"`, their own UUID/slug and a plain primary body at
+`notes/note.md`. They use the existing collection assignment/move/index and tab
+identity, but `MainView` routes them to `MarkdownNoteView`, excluding them from
+PDF and ebook viewers. Blank-area right click and the Import dropdown share
+`utils/libraryNotes.ts`; double-click opens the centre editor. The editor reuses
+Vditor, TeX, clipboard and relative `notes/assets/` images. Creation publishes
+the persisted snapshot through
+`library.applyCommittedPaper` and `collections.applyCommittedPaperAssignment`,
+opens the editor and releases the creation flag immediately. Reconcile the
+library/collections in the background; never keep creation busy while waiting
+for a whole-library scan. Confirmed-paper revisions reject scans started before
+a local commit, and collection load revisions reject old membership snapshots,
+so late reads cannot hide a new note or prune its tab. Unnamed creations use
+available numbered titles; each still has an independent UUID/slug and duplicate
+titles remain supported. Search indexing after native creation is background
+blocking-pool work, not part of the creation response. Its single-line reader
+header uses the same `--content-header-height`, title alignment and controls as
+the PDF viewer: read aloud, citation/related views, edit/done, text zoom, search
+and the shared six-color annotation palette. The collection path is in the title
+tooltip; there is no Back button or second metadata row. Saved nonempty notes
+open ready for reading/annotation; new blank notes and retained dirty drafts open
+in the editor. The primary editor passes `hideToolbar` to VditorEditor so formatting
+buttons and their reserved space stay hidden even on hover; Markdown shortcuts,
+pasting and find still work. Scope the editor/draft
+by root and slug, keep the editor in a positioned flex container, serialize
+autosaves and verify the complete saved snapshot. Capture native input before
+Vditor's debounced callback so external updates cannot erase fresh keystrokes;
+retain conflicts/drafts locally, flush on close, and never resurrect a deleted
+note. Clean views adopt `library-notes-changed`; dirty views keep their drafts.
+Deletes back up the entire entry and assets under `.argus/library-note-trash/`
+before removing the live assignment. Primary bodies are separate from paper
+attachment notes and extracted fulltext.
+
+The app-only `read_library_note`, `create_library_note`, `update_library_note`
+and `delete_library_note` all go through the existing approval dispatcher,
+**including reads**, as requested by the user. Titles/slugs/collection ids are
+discoverable through the normal library tools; the note body and file path are
+not exposed by ordinary fulltext/path tools. Approvals show the requested read
+slice, full new body, before/after update or exact deletion. Saved identity,
+body/title and location are rechecked; rejection/cancellation never executes.
+External MCP never declares these tools. Do not route standalone notes through
+paper extraction/analysis/vectorization batches. Their primary Markdown body
+stays distinct from attached notes: ordinary `NotesTab` (including its standalone
+window, pinning and Recently Deleted) works under the document's slug, and the
+ordinary approved paper-note writing tools create/update/delete/restore these
+attachments. AI attachment reads use `read_library_note` with `note_id` and exact
+snapshot approval; `get_note` cannot bypass that gate.
+The active-document and pinned-document AI context identifies Markdown notes,
+includes metadata only, and directs the model to the approval-gated tools.
+Reopening a conflicted draft retains its original base until explicit reload;
+never silently rebase it onto a newer saved body. Regressions: Rust
+`library_notes` / `mcp::library_note_tools` and
+`scripts/test-library-notes-browser.mjs` (real list, toolbar, Vditor and approval
+cards; mocked local library IO).
+
+`MarkdownNoteReader` annotates both the rendered reader and the live Vditor body
+(provided by `VditorEditor`'s `ready` event); editing never disables annotation. It
+reuses the ordinary reader highlight store, sidebar, tombstones, AI events,
+translation/Ask AI/snippet actions and export. Annotations never enter Markdown
+source: a sibling overlay paints editor marks, with mutation/resize/ancestor-scroll
+observers updating positions. Capture-phase mouse selection survives Vditor's
+event handlers. Selecting a popup color or a header color after selecting text
+creates a mark; header colors otherwise select the next color. Search also paints
+an overlay without changing source or losing undo. `markdownAnchors.ts` indexes
+visible DOM text (excluding KaTeX MathML, Vditor syntax markers and controls),
+saves UTF-16 offsets plus exact quote/context, and relocates only
+unambiguous excerpts after edits. Missing originals keep their sidebar records
+without painting unrelated text. Markdown headings power Sections and its jumps;
+never send Markdown through ebook regeneration or another tab's cached PDF.
+AI marking uses the ordinary approved marking tools with `page: 1` and exact,
+unique Markdown-source excerpts from an approved read, with no PDF anchors.
+The full primary snapshot is checked under the notes/namespace locks before
+appending; existing-mark changes retain provenance and stale-preview protections.
+Markdown highlight IO captures the library root and rejects writes to deleted
+entries. The ordinary AI tab and standalone AI window retain independent scoped
+conversations just as for papers.
+
 **Automatic user memory.** `user_memory.rs` keeps one knowledge profile shared
 across libraries, with a durable app-data `user_memory.json` cache. Memory facts,
 evidence, manual corrections/protection and deletions also travel with the
@@ -503,6 +581,22 @@ Stores live in `src/stores/` and use the Composition API style (`defineStore('id
 | `speech.ts` | Read-aloud: configured speech provider/model/options, the speech capabilities from `list_media_capabilities`, `read()` and its state — see *Media generation and read-aloud* |
 | `thinking.ts` | The user's thinking-mode switch and reasoning level, shared by paper AI and library chat, saved per device in localStorage (`argus:thinking-preference`) and synchronized across windows through storage events. Reopening panels, conversations or the app must restore the choice |
 
+**Stable library refresh.** The 60-second disk reconcile remains enabled for
+cloud changes missed by file watching. Startup scans, focus, watcher and manual
+refreshes share the serialized `library.refresh()` path. `utils/paperIndex.ts`
+patches changed fields on existing reactive rows with the same slug/UUID and
+retains the array when membership/order is unchanged, comparing complete values
+rather than metadata mtime alone. `PaperList` also retains equal collection and
+sorted row sequences: replacing an unchanged `RecycleScroller.items` recycles
+all visible views and causes periodic flashing. Real imports, removals, renames,
+status and tag changes still propagate; scans capture/check `expectedRoot` so
+old libraries cannot replace the current list or prune its tabs. Canvas metadata
+watchers observe the needed fields explicitly because rows now update in place.
+Regressions: `scripts/test-paper-index.mjs` and
+`scripts/test-library-refresh-browser.mjs` (real list/scroller/stores, simulated
+timer polls, mock disk, DOM mutations, multi-selection, large scrolled lists,
+real edits/membership changes and library-switch races).
+
 **Reasoning disclosure.** The 思考过程 body is collapsed by default in every
 chat surface, including during streaming and when loading saved answers. Only
 an explicit click opens it. Streaming updates must preserve that manual choice;
@@ -523,6 +617,20 @@ root-checked setter writes atomically under the collections lock and emits
 another device. Load revisions discard outdated reads after a save/library
 switch. Regressions: `collections::tests` and
 `scripts/test-collection-pins-browser.mjs` (local mocked library).
+
+**Copy PDF files.** `PaperList.vue` offers the existing single-file action and
+a multi-selection action with the PDF count. Mixed selections exclude ebook
+formats; an all-ebook selection disables the action. Capture all target slugs
+and the library root before closing the menu, then invoke `copy_paper_pdfs`
+once (never one clipboard write per paper). `file_clipboard.rs` resolves the
+nested library once, validates all paths before touching the clipboard and
+deduplicates canonical files. macOS writes an array of file URLs through
+NSPasteboard; Windows passes a JSON path array to PowerShell's literal-path
+file copy. Paths are data/arguments, never interpolated into script source.
+The original `copy_paper_pdf` command delegates to the same implementation.
+Regressions: `scripts/test-copy-pdfs.mjs` and `cargo test --lib file_clipboard`;
+the macOS integration test uses a private named pasteboard, never the user's
+system clipboard.
 
 **AI model settings across windows.** Successful provider/model/default edits
 emit `ai-settings-changed` with the library root after persistence. Each window's
@@ -1338,7 +1446,9 @@ Two engines draw a page, and **a page's bitmap is always derived from its CSS bo
 
 *What gets rendered, and when* is decided by the pure module `src/utils/pageRenderPolicy.ts` (unit-testable without a browser); `PdfViewer.vue` carries the plan out. It replaced an IntersectionObserver with a fixed 600 px margin, which had three real problems: a hidden tab (`v-show` → `display:none`) made every page report "out of view" and **wiped the whole tab**, so each switch back re-rendered everything from white; 600 px is less than one page at 189 % so pages started rendering only when about to be seen; and the same threshold evicted, so pages flapped.
 
-- The render zone is measured in viewports and leans in the direction of travel; a wider keep zone plus a pixel budget (100 MP for the visible viewer, 64 MP for all background tabs together) decides eviction. Pages are rendered by priority (visible, then ahead, then behind) through a queue of two, work that has not started is dropped when its page leaves the zone, running pdf.js tasks are cancelled outside the keep zone, and **a page whose render is in flight is never evicted** (it would finish into an empty wrapper and be marked fresh).
+- The render zone leans in the direction of travel, includes two whole pages ahead at high zoom, and expands with measured page latency/scroll speed. Prefetches reserve space within the existing 100 MP visible-viewer budget; completed bitmaps remain cached until space is needed, evicting least-recently-viewed pages first. The wider keep zone determines cancellation of unfinished work, rather than immediately evicting completed pages. Pages render by priority (visible, then ahead, then behind) through a queue of two; one urgent visible/pinned page can overtake those slots. Completions replan before pumping, never start an old scroll position's queue. Running tasks are cancelled outside the keep zone, and **a page whose render is in flight is never evicted**. Background tabs still share 64 MP.
+- `utils/pdfPageCache.ts` retains expensive rendered pages as lossless PNG blobs in device-local IndexedDB (512 MiB / 400 entries, LRU), independent of the library and its sync. The key includes SHA-256 of the exact original PDF bytes (start hashing before PDF.js transfers them), PDF.js/render-path version, page index and exact bitmap dimensions. Cache hits still build fresh PDF.js text/highlight/link layers; selection and edits must never be baked into cached pixels. Cheap vector pages skip PNG encoding. Storage/encoding runs outside render completion, reads have a 120 ms deadline, and blocked/unavailable databases or corrupt/wrong-sized images fall back to the normal renderer. No original PDF is rewritten. Keep the `(scale,dpr)` freshness checks and exact CSS-box × dpr bitmap dimensions on cache hits too.
+- Explicitly zero removed, superseded and cancelled canvas backing stores, including detached canvases; merely removing their DOM nodes can retain large GPU allocations until WebKit GC. Track partially decoded operator lists as well as successful renders, and do not let an asynchronous cleanup reclaim a page a new render has claimed. Regressions: `scripts/test-page-render-policy.mjs` and `scripts/test-pdf-scroll-browser.mjs` (real viewer/worker, synthetic PDFs; optional `ARGUS_TEST_PDF` for a local scanned book).
 - A hidden viewer plans nothing and keeps its canvases. On show it restores the scroll position first, then re-checks every mounted page against `(scale, dpr)` (a zoom while hidden leaves a stretched stale bitmap otherwise) and renders only what is missing. A tab that finishes loading while hidden defers `fitWidth` / `restorePosition` until it is shown (`scrollTop` cannot be set on a `display:none` box).
 - `renderingPages`, `inflightRenders` and the generation counter keep their meaning; never clear `renderingPages`.
 - **pdf.js must run on whatever WebKit the Mac has.** A Tauri window is the system WKWebView, so

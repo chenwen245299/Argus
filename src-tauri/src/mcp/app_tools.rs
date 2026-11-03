@@ -68,6 +68,7 @@ pub fn is_write_tool(name: &str) -> bool {
     matches!(name, CREATE_NOTE_TOOL | UPDATE_NOTE_TOOL | DELETE_NOTE_TOOL | RESTORE_NOTE_TOOL | CREATE_HIGHLIGHTS_TOOL | CREATE_ANNOTATIONS_TOOL
         | UPDATE_MARKS_TOOL | REMOVE_MARKS_TOOL)
         || super::arxiv_tools::is_write(name)
+        || super::library_note_tools::requires_approval(name)
         || crate::canvas_edit::is_edit_tool(name)
 }
 
@@ -85,6 +86,8 @@ const MAX_CONTENT_CHARS: usize = 50_000;
 /// user says yes.
 #[derive(Debug, Clone)]
 pub enum PendingWrite {
+    LibraryNote(super::library_note_tools::Pending),
+    MarkdownPassages { tool: String, document: crate::library_notes::Snapshot, highlights: Vec<crate::models::Highlight> },
     Arxiv(super::arxiv_tools::PendingArxivWrite),
     ChangeNote {
         tool: String, slug: String, paper_id: String, paper_title: String,
@@ -243,6 +246,9 @@ impl PendingWrite {
     /// it can fix the arguments and try again, and the user is never shown a
     /// dialog for a call that was malformed.
     pub fn parse(root: &str, name: &str, args: &serde_json::Value) -> Result<Self, String> {
+        if super::library_note_tools::requires_approval(name) {
+            return super::library_note_tools::Pending::parse(root, name, args).map(Self::LibraryNote);
+        }
         if super::arxiv_tools::is_write(name) {
             return super::arxiv_tools::PendingArxivWrite::parse(root, name, args).map(Self::Arxiv);
         }
@@ -295,6 +301,9 @@ impl PendingWrite {
                     return Err("Provide 1–30 passages in one call.".into());
                 }
                 let meta = paper::read_meta(root, &slug)?;
+                if meta.file_type.as_deref() == Some("md") {
+                    return parse_markdown_passages(root, name, &slug, passages, &batch_color);
+                }
                 if meta.file_type.as_deref().is_some_and(|t| t != "pdf") {
                     return Err("These tools currently mark PDF passages only.".into());
                 }
@@ -431,6 +440,7 @@ impl PendingWrite {
     /// What to show the user. Derived from `self`, never from the raw arguments.
     pub fn preview(&self, root: &str) -> WritePreview {
         match self {
+            Self::LibraryNote(pending) => pending.preview(),
             Self::Arxiv(pending) => pending.preview(),
             Self::ChangeNote { tool, slug, paper_title, before, after, images, .. } => WritePreview {
                 tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
@@ -464,6 +474,13 @@ impl PendingWrite {
                 passages: Vec::new(),
                 recommendations: Vec::new(), keep_duplicate_copies: false, changes: Vec::new(), note_before: None,
             },
+            Self::MarkdownPassages { tool, document, highlights } => WritePreview {
+                tool: tool.clone(), slug: document.slug.clone(), paper_title: document.title.clone(),
+                note_title: String::new(), content: String::new(), duplicate_title: false,
+                note_images: vec![], recommendations: vec![], keep_duplicate_copies: false, changes: vec![], note_before: None,
+                passages: highlights.iter().map(|h| Passage { page: 1, text: h.text.clone(), color: h.color.clone(),
+                    style: h.style.clone(), note: h.note.clone(), anchor: None, end_anchor: None }).collect(),
+            },
             Self::MarkPassages { tool, slug, paper_title, highlights, .. } => WritePreview {
                 tool: tool.clone(), slug: slug.clone(), paper_title: paper_title.clone(),
                 note_title: String::new(), content: String::new(), duplicate_title: false,
@@ -489,6 +506,11 @@ impl PendingWrite {
     /// reached after the user approved this exact value.
     pub fn execute(&self, root: &str) -> Result<serde_json::Value, String> {
         match self {
+            Self::LibraryNote(pending) => pending.execute(root),
+            Self::MarkdownPassages { document, highlights, .. } => {
+                let saved = crate::library_notes::append_marks(root, document, highlights.clone())?;
+                Ok(serde_json::json!({"saved":true,"slug":document.slug,"highlights":saved}))
+            }
             Self::Arxiv(_) => Err("Recommendation writes require the approved async import/delete dispatcher.".into()),
             Self::ChangeNote { slug, paper_id, before, after, images, .. } => {
                 if paper::read_meta(root, slug)?.id != *paper_id { return Err("Paper changed since the preview.".into()); }
@@ -550,7 +572,7 @@ impl PendingWrite {
         let Some(colors) = colors else { return Ok(()); };
         let normalized = colors.iter().map(|c| normalize_mark_color(c)).collect::<Result<Vec<_>, _>>()?;
         match self {
-            Self::MarkPassages { highlights, .. } => {
+            Self::MarkPassages { highlights, .. } | Self::MarkdownPassages { highlights, .. } => {
                 if colors.len() != highlights.len() { return Err("Color choices must match the previewed passages.".into()); }
                 for (highlight, color) in highlights.iter_mut().zip(normalized) { highlight.color = color; }
             }
@@ -584,7 +606,7 @@ fn parse_mark_changes(root: &str, name: &str, args: &serde_json::Value) -> Resul
         return Err(format!("Provide 1–{MAX_MARK_CHANGES} {key} in one call."));
     }
     let meta = paper::read_meta(root, &slug)?;
-    if meta.file_type.as_deref().is_some_and(|t| t != "pdf") {
+    if meta.file_type.as_deref().is_some_and(|t| t != "pdf" && t != "md") {
         return Err("These tools currently change PDF marks only.".into());
     }
     let records = paper::read_highlights(root, &slug);
@@ -654,6 +676,33 @@ fn parse_mark_changes(root: &str, name: &str, args: &serde_json::Value) -> Resul
         return Err(format!("Nothing was changed; the entire batch needs correction. Valid entry indices: {valid:?}. Keep those unchanged.\n{}", failures.join("\n")));
     }
     Ok(PendingWrite::ChangeMarks { tool: name.into(), slug, paper_id: meta.id, paper_title: meta.title, changes })
+}
+
+fn parse_markdown_passages(root: &str, tool: &str, slug: &str, passages: &[serde_json::Value], batch_color: &str) -> Result<PendingWrite, String> {
+    let document = crate::library_notes::read(root, slug)?;
+    let mut highlights = Vec::new();
+    for raw in passages {
+        let mut raw = raw.clone();
+        if raw.get("color").is_none() { raw["color"] = batch_color.into(); }
+        let p: Passage = serde_json::from_value(raw).map_err(|e| e.to_string())?;
+        if p.page != 1 || p.anchor.is_some() || p.end_anchor.is_some() || p.text.trim().is_empty() || p.text.chars().count() > 10000 {
+            return Err("Markdown annotations use page:1 and an exact, unique excerpt from the approved read_library_note result; PDF anchors are unavailable".into());
+        }
+        if !["highlight", "underline"].contains(&p.style.as_str()) { return Err("Use highlight or underline".into()); }
+        if p.note.as_ref().is_some_and(|n| n.chars().count() > 10000)
+            || (tool == CREATE_ANNOTATIONS_TOOL && p.note.as_ref().map_or(true, |n| n.trim().is_empty()))
+            || (tool == CREATE_HIGHLIGHTS_TOOL && p.note.is_some()) {
+            return Err("Annotations require a nonempty note of at most 10,000 characters; highlights do not take a note".into());
+        }
+        if document.content.find(&p.text).is_none() || document.content.find(&p.text) != document.content.rfind(&p.text) {
+            return Err("Markdown excerpt is missing or ambiguous; read the approved source and include enough exact context".into());
+        }
+        let created_at = chrono::Utc::now().to_rfc3339();
+        highlights.push(crate::models::Highlight { id:uuid::Uuid::new_v4().to_string(), page:1, rects:vec![], text:p.text,
+            color:normalize_mark_color(&p.color)?, style:p.style, note:p.note, agent:Some(AgentMark { revision:created_at.clone() }),
+            created_at, updated_at:None, start_offset:None, end_offset:None, anchor_prefix:None, anchor_suffix:None, keep_line_breaks:Some(true) });
+    }
+    Ok(PendingWrite::MarkdownPassages { tool:tool.into(), document, highlights })
 }
 
 /// Apply approved changes under the highlights lock. The selection must still

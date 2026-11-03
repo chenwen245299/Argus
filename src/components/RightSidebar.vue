@@ -44,11 +44,14 @@ const canvasStore = useCanvasStore()
 const chatCanvasId = ref<string | null>(null)
 watch(() => canvasStore.activeCanvasId, (id) => { if (id) chatCanvasId.value = id }, { immediate: true })
 
-watch(activePaperSlug, async (slug) => {
+let metaRevision = 0
+watch([activePaperSlug, () => library.currentPath, () => library.papers.find(p => p.slug === activePaperSlug.value)?.title], async ([slug, root]) => {
+  const revision = ++metaRevision
   meta.value = null
   if (!slug) return
   try {
-    meta.value = await invoke<PaperMeta>('get_paper_meta', { slug })
+    const loaded = await invoke<PaperMeta>('get_paper_meta', { slug, expectedRoot: root })
+    if (revision === metaRevision && root === library.currentPath && slug === activePaperSlug.value) meta.value = loaded
   } catch (e) {
     console.error('Failed to load meta:', e)
   }
@@ -72,6 +75,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  metaRevision++
   window.removeEventListener('argus-paper-meta-updated', onExternalMetaUpdated)
 })
 

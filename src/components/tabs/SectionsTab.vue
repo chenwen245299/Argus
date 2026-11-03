@@ -3,11 +3,14 @@ import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useReaderStore } from '../../stores/reader'
 import { useLibraryStore } from '../../stores/library'
 import { computeSections, detectSectionsForSlug } from '../../utils/sections'
 import type { PaperSections } from '../../types'
 import { isEbookFileType } from '../../types'
+import { renderMarkdown } from '../../utils/renderMarkdown'
+import type { LibraryNoteSnapshot } from '../../types'
 
 const props = defineProps<{ slug: string }>()
 
@@ -25,36 +28,53 @@ const isEbook = computed(() =>
       ?? library.papers.find(p => p.slug === props.slug)?.file_type
   )
 )
+const isMarkdown = computed(() => (reader.tabs.find(tb => tb.slug === props.slug)?.fileType
+  ?? library.papers.find(p => p.slug === props.slug)?.file_type) === 'md')
 
 const data = ref<PaperSections | null>(null)
 const loading = ref(false)
 const detecting = ref(false)
 const splitting = ref(false)
 const error = ref('')
+let revision = 0, unlisten: UnlistenFn | undefined
 
 async function load(slug: string) {
+  const version = ++revision, root = library.currentPath
   data.value = null
   error.value = ''
   if (!slug) return
   loading.value = true
   try {
-    data.value = await invoke<PaperSections | null>('get_sections', { slug })
+    let result: PaperSections | null
+    if (isMarkdown.value) {
+      const note = await invoke<LibraryNoteSnapshot>('get_library_note', { slug, expectedRoot: root })
+      const el = document.createElement('div'); el.innerHTML = renderMarkdown(note.content)
+      result = { source: 'heuristic', generated_at: new Date().toISOString(), sections: Array.from(el.querySelectorAll('h1,h2,h3,h4,h5,h6')).map((h, i) => ({ title: h.textContent ?? '', level: Number(h.tagName[1]), page: i + 1 })) }
+    } else result = await invoke<PaperSections | null>('get_sections', { slug })
+    if (version === revision && root === library.currentPath && slug === props.slug) data.value = result
   } catch (e) {
-    error.value = String(e)
+    if (version === revision && root === library.currentPath) error.value = String(e)
   } finally {
-    loading.value = false
+    if (version === revision) loading.value = false
   }
 }
 
-watch(() => props.slug, (slug) => load(slug), { immediate: true })
+watch([() => props.slug, () => library.currentPath, isMarkdown], ([slug]) => load(slug), { immediate: true })
 
 function onSectionsUpdated(e: Event) {
   const detail = (e as CustomEvent<{ slug: string }>).detail
   if (detail?.slug === props.slug) load(props.slug)
 }
 
-onMounted(() => window.addEventListener('argus-sections-updated', onSectionsUpdated))
-onBeforeUnmount(() => window.removeEventListener('argus-sections-updated', onSectionsUpdated))
+onMounted(async () => {
+  window.addEventListener('argus-sections-updated', onSectionsUpdated)
+  const release = await listen<{ root: string; slug: string }>('library-notes-changed', ({ payload }) => {
+    if (isMarkdown.value && payload.root === library.currentPath && payload.slug === props.slug) void load(props.slug)
+  })
+  if (disposed) release(); else unlisten = release
+})
+let disposed = false
+onBeforeUnmount(() => { disposed = true; revision++; unlisten?.(); window.removeEventListener('argus-sections-updated', onSectionsUpdated) })
 
 function jumpTo(page: number) {
   if (page <= 0) return
@@ -75,6 +95,7 @@ async function runDetect() {
   detecting.value = true
   error.value = ''
   try {
+    if (isMarkdown.value) { await load(props.slug); return }
     if (isEbook.value) {
       data.value = await invoke<PaperSections>('regen_ebook_sections', { slug: props.slug })
       window.dispatchEvent(new CustomEvent('argus-sections-updated', { detail: { slug: props.slug } }))
@@ -141,7 +162,7 @@ function sourceLabel(source: string): string {
             <Icon v-else icon="fluent:arrow-sync-24-regular" width="13" height="13" />
             {{ detecting ? t('sectionsTab.detecting') : t('sectionsTab.reDetect') }}
           </button>
-          <button class="ai-split-btn" :disabled="splitting" @click="runAiSplit">
+          <button v-if="!isMarkdown" class="ai-split-btn" :disabled="splitting" @click="runAiSplit">
             <span v-if="splitting" class="spinner" />
             <Icon v-else icon="fluent:sparkle-24-regular" width="13" height="13" />
             {{ splitting ? t('sectionsTab.aiSplitting') : t('sectionsTab.aiReSplit') }}
@@ -176,7 +197,7 @@ function sourceLabel(source: string): string {
           <Icon v-else icon="fluent:arrow-sync-24-regular" width="14" height="14" />
           {{ detecting ? t('sectionsTab.detecting') : t('sectionsTab.detect') }}
         </button>
-        <button class="ai-split-btn" :disabled="splitting" @click="runAiSplit">
+        <button v-if="!isMarkdown" class="ai-split-btn" :disabled="splitting" @click="runAiSplit">
           <span v-if="splitting" class="spinner" />
           <Icon v-else icon="fluent:sparkle-24-regular" width="14" height="14" />
           {{ splitting ? t('sectionsTab.aiSplitting') : t('sectionsTab.aiSplit') }}

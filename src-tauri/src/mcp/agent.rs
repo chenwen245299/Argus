@@ -172,6 +172,15 @@ fn app_only_tools() -> Vec<AgentTool> {
         note_change_tool(app_tools::UPDATE_NOTE_TOOL), note_change_tool(app_tools::DELETE_NOTE_TOOL),
         note_change_tool(app_tools::RESTORE_NOTE_TOOL), deleted_notes_tool()];
     for tool in &mut tools {
+        if matches!(tool.name.as_str(), app_tools::CREATE_NOTE_TOOL | app_tools::UPDATE_NOTE_TOOL | app_tools::DELETE_NOTE_TOOL | app_tools::RESTORE_NOTE_TOOL) {
+            tool.description.push_str(" Also supports attachment notes on standalone Markdown documents (file_type md). These are separate from the primary document: use library_note tools for its primary body; read attachments with read_library_note {slug,note_id}, also requiring approval.");
+        }
+        if matches!(tool.name.as_str(), app_tools::CREATE_HIGHLIGHTS_TOOL | app_tools::CREATE_ANNOTATIONS_TOOL) {
+            tool.description.push_str(" For standalone Markdown documents (file_type md), first use read_library_note with user approval instead of PDF inspection. Use page:1 and a unique exact Markdown-source excerpt in text; omit PDF anchor/end_anchor. A separate exact annotation preview requires user approval; source changes invalidate it.");
+        }
+        if matches!(tool.name.as_str(), app_tools::UPDATE_MARKS_TOOL | app_tools::REMOVE_MARKS_TOOL) {
+            tool.description.push_str(" Also supports standalone Markdown annotations using ids from get_highlights, with the same approval, stale-preview and AI-only retraction rules.");
+        }
         if matches!(tool.name.as_str(), app_tools::CREATE_NOTE_TOOL | app_tools::UPDATE_NOTE_TOOL) {
             tool.description.push_str(super::note_images::INSTRUCTIONS);
             tool.description.push_str(IMAGE_LAYOUT_GUIDANCE);
@@ -185,6 +194,7 @@ fn app_only_tools() -> Vec<AgentTool> {
                 "description":"PDF pages/crops to save as permanent note images. Each id must be referenced in content. Requires content when updating."});
         }
     }
+    tools.extend(super::library_note_tools::tools());
     tools
 }
 

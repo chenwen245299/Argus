@@ -137,7 +137,8 @@ pub fn leading_words(text: &str, limit: usize) -> String {
 /// of similar-looking lines. Flattened into one blob, a CV is indistinguishable
 /// from a paper, which is how the first work listed on a CV ends up recorded as
 /// the document's own title.
-pub fn leading_lines(text: &str, word_limit: usize) -> String {
+#[cfg(test)]
+fn leading_lines(text: &str, word_limit: usize) -> String {
     const MAX_CHARS: usize = 12_000;
     let mut out = String::new();
     let mut words = 0usize;

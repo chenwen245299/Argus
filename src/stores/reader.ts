@@ -87,6 +87,7 @@ export const useReaderStore = defineStore('reader', () => {
   // them across a synced library (union-by-id merge would otherwise resurrect a
   // highlight another machine still has). Cleared when the tab's state is freed.
   const highlightTombstones = ref<Record<string, HighlightTombstone[]>>({})
+  const highlightRoots = new Map<string, string>()
   const readingStateBySlug  = ref<Record<string, ReadingState | null>>({})
   // Transient commands aimed at the currently-active viewer.
   const scrollToHighlightId = ref<string | null>(null)
@@ -112,6 +113,7 @@ export const useReaderStore = defineStore('reader', () => {
   // Free a tab's cached per-slug state. Called when the viewer instance is
   // actually destroyed (evicted from KeepAlive / closed) or its paper is gone.
   function discardTabState(slug: string) {
+    highlightRoots.delete(slug)
     if (slug in highlightsBySlug.value) {
       const next = { ...highlightsBySlug.value }; delete next[slug]; highlightsBySlug.value = next
     }
@@ -547,6 +549,7 @@ export const useReaderStore = defineStore('reader', () => {
         slug,
         highlights: highlightsBySlug.value[slug] ?? [],
         tombstones: highlightTombstones.value[slug] ?? [],
+        expectedRoot: highlightRoots.get(slug),
       })
     } catch (e) {
       console.error('Failed to save highlights:', e)
@@ -629,11 +632,12 @@ export const useReaderStore = defineStore('reader', () => {
    * in an editor with unsaved keystrokes, and clobbering those loses work that
    * was never on disk to begin with.
    */
-  async function reloadFromDisk(slug: string) {
+  async function reloadFromDisk(slug: string, expectedRoot?: string) {
     if (!tabs.value.some(t => t.slug === slug)) return
+    if (expectedRoot) highlightRoots.set(slug, expectedRoot)
     try {
       const [hl, rs] = await Promise.all([
-        invoke<Highlight[]>('get_highlights', { slug }),
+        invoke<Highlight[]>('get_highlights', { slug, expectedRoot }),
         invoke<ReadingState | null>('get_reading_state', { slug }),
       ])
       // Keep local deletes whose tombstone may not have landed on disk yet, so a

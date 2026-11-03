@@ -27,7 +27,9 @@ const props = defineProps<{
 const emit = defineEmits<{ approve: [colors?: string[]]; reject: [] }>()
 
 const { t } = useI18n()
-const noteAction = computed(() => ({ update_paper_note: 'Update', delete_paper_note: 'Delete', restore_paper_note: 'Restore' } as Record<string, string>)[props.preview.tool])
+const libraryNote = computed(() => ['read_library_note', 'create_library_note', 'update_library_note', 'delete_library_note'].includes(props.preview.tool))
+const noteAction = computed(() => ({ update_paper_note: 'Update', delete_paper_note: 'Delete', restore_paper_note: 'Restore',
+  read_library_note: 'Read', create_library_note: 'Create', update_library_note: 'Update', delete_library_note: 'Delete' } as Record<string, string>)[props.preview.tool])
 const recommendationAction = computed(() => props.preview.recommendations?.length
   ? (props.preview.tool === 'delete_arxiv_recommendations' ? 'delete' : 'import') : null)
 const changeAction = computed(() => props.preview.changes?.length
@@ -75,7 +77,7 @@ function approve() {
     </dl>
     <dl v-else class="wc-fields">
       <div class="wc-field">
-        <dt>{{ t('writeConfirm.paper') }}</dt>
+        <dt>{{ t(libraryNote ? 'libraryNote.folder' : 'writeConfirm.paper') }}</dt>
         <dd :title="preview.slug">{{ preview.paperTitle }}</dd>
       </div>
       <div v-if="!marking" class="wc-field">
@@ -85,7 +87,7 @@ function approve() {
       <div class="wc-field">
         <dt>{{ t('writeConfirm.location') }}</dt>
         <dd class="wc-location">
-          {{ marking ? preview.slug : noteAction ? t(noteAction === 'Delete' ? 'writeConfirm.noteTrashLocation' : 'writeConfirm.noteExistingLocation') : t('writeConfirm.locationValue', { paper: preview.paperTitle }) }}
+          {{ libraryNote ? preview.paperTitle : marking ? preview.slug : noteAction ? t(noteAction === 'Delete' ? 'writeConfirm.noteTrashLocation' : 'writeConfirm.noteExistingLocation') : t('writeConfirm.locationValue', { paper: preview.paperTitle }) }}
         </dd>
       </div>
     </dl>
@@ -203,11 +205,11 @@ function approve() {
     </div>
 
     <div class="wc-actions">
-      <span class="wc-hint">{{ t(noteAction ? `writeConfirm.note${noteAction}Hint` : recommendationAction ? 'writeConfirm.arxivHint' : changeAction ? `writeConfirm.${changeAction}Hint` : 'writeConfirm.hint') }}</span>
+      <span class="wc-hint">{{ t(libraryNote && noteAction === 'Delete' ? 'libraryNote.aiDeleteHint' : noteAction ? `writeConfirm.note${noteAction}Hint` : recommendationAction ? 'writeConfirm.arxivHint' : changeAction ? `writeConfirm.${changeAction}Hint` : 'writeConfirm.hint') }}</span>
       <button class="wc-btn" @click="emit('reject')">{{ t(noteAction || recommendationAction ? 'writeConfirm.arxivReject' : changeAction ? `writeConfirm.${changeAction}Reject` : 'writeConfirm.reject') }}</button>
       <button class="wc-btn primary" :class="{ danger: noteAction === 'Delete' || recommendationAction === 'delete' || changeAction === 'remove' }" @click="approve">
         <Icon icon="fluent:checkmark-24-regular" width="13" height="13" />
-        {{ t(noteAction ? `writeConfirm.note${noteAction}Approve` : recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Approve` : changeAction ? `writeConfirm.${changeAction}Approve` : 'writeConfirm.approve') }}
+        {{ t(libraryNote && noteAction === 'Delete' ? 'libraryNote.delete' : noteAction ? `writeConfirm.note${noteAction}Approve` : recommendationAction ? `writeConfirm.arxiv${recommendationAction === 'delete' ? 'Delete' : 'Import'}Approve` : changeAction ? `writeConfirm.${changeAction}Approve` : 'writeConfirm.approve') }}
       </button>
     </div>
   </div>

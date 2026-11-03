@@ -2309,7 +2309,7 @@ onUnmounted(() => {
 })
 
 // Refresh nodes when library papers change (validity)
-watch(() => library.papers, () => {
+watch(() => library.papers.map(p => ({ id: p.id, slug: p.slug, title: p.title, authors: [...p.authors], year: p.year })), () => {
   nodes.value = nodes.value.map(n => {
     if (n.type !== 'paper') return n
     const paper = paperById(n.data.paperId)

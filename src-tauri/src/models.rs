@@ -193,7 +193,7 @@ impl Default for ReadingState {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Highlight {
     pub id: String,
-    /// PDF: 1-based page number. Ebooks: 1-based chapter (spine) index.
+    /// PDF: page; ebooks: chapter (spine) index; Markdown: 1. All are 1-based.
     pub page: u32,
     pub rects: Vec<Rect>,
     pub text: String,
@@ -208,8 +208,8 @@ pub struct Highlight {
     pub updated_at: Option<String>,
     #[serde(default = "default_highlight_style")]
     pub style: String,
-    /// Ebook-only reflow-safe anchor: character offsets into the sanitized
-    /// chapter DOM's text content, plus short context for fuzzy re-anchoring.
+    /// Ebook/Markdown reflow-safe anchor: UTF-16 offsets into visible DOM text,
+    /// plus short context for exact, unambiguous re-anchoring.
     /// Always None for PDF highlights.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_offset: Option<u32>,

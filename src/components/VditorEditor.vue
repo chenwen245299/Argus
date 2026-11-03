@@ -6,11 +6,13 @@ import { installNoteClipboard } from '../utils/noteClipboard'
 
 const props = defineProps<{
   initialContent: string
+  /** Hide the formatting bar while retaining Markdown and keyboard editing. */
+  hideToolbar?: boolean
   /** Persist a pasted image and return the URL to render it by. Without this,
    *  Vditor falls back to inlining the file as a base64 `data:` URI. */
   imageUploader?: (file: File) => Promise<string | null>
 }>()
-const emit = defineEmits<{ change: [markdown: string] }>()
+const emit = defineEmits<{ change: [markdown: string]; ready: [root: HTMLElement] }>()
 
 const containerEl = ref<HTMLDivElement | null>(null)
 let vd: VditorType | null = null
@@ -121,6 +123,8 @@ onMounted(async () => {
     after() {
       if (destroyed || !containerEl.value) return
       removeClipboardHandlers = installNoteClipboard(containerEl.value)
+      const root = getEditorRoot()
+      if (root) emit('ready', root)
       requestAnimationFrame(() => {
         if (content && vd?.getValue().trim() === '') {
           vd.setValue(content, true)
@@ -251,7 +255,7 @@ function setContent(markdown: string): boolean {
   return true
 }
 
-defineExpose({ setContent })
+defineExpose({ setContent, getContent: () => vd?.getValue() ?? null })
 
 function closeFind() {
   clearHighlights()
@@ -290,7 +294,7 @@ function onFindKeydown(e: KeyboardEvent) {
 </script>
 
 <template>
-  <div class="vditor-wrapper" @keydown="onWrapperKeydown">
+  <div class="vditor-wrapper" :class="{ 'without-toolbar': hideToolbar }" @keydown="onWrapperKeydown">
     <!-- Find bar -->
     <Transition name="find-bar">
       <div v-if="findVisible" class="find-bar">
@@ -337,6 +341,9 @@ function onFindKeydown(e: KeyboardEvent) {
   inset: 0;
   overflow-y: auto;
 }
+
+.without-toolbar :deep(.vditor-toolbar) { display: none !important; }
+.without-toolbar :deep(.vditor) { border: 0; border-radius: 0; }
 
 /* Find bar */
 /* Image-paste failure, dismissed by clicking it. Sits below the find bar so the

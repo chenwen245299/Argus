@@ -1364,7 +1364,7 @@ onUnmounted(() => {
 })
 
 // Watch for library papers changes to update node validity
-watch(() => library.papers, () => {
+watch(() => library.papers.map(p => ({ id: p.id, slug: p.slug, title: p.title, authors: [...p.authors], year: p.year })), () => {
   nodes.value = nodes.value.map(n => {
     // Only paper nodes carry library-backed metadata; leave annotation nodes
     // (text / shape / line) untouched so their data isn't clobbered.

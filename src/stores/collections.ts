@@ -178,6 +178,16 @@ export const useCollectionsStore = defineStore('collections', () => {
     }
   }
 
+  /** The backend already persisted this assignment; publish it without another read. */
+  function applyCommittedPaperAssignment(paperId: string, collectionId: string | null, expectedRoot: string) {
+    if (library.currentPath !== expectedRoot) return
+    loadRevision++ // Earlier reads must not hide a newly committed member.
+    const current = file.value.assignments.filter(a => a.paper_id === paperId)
+    if (collectionId && current.length === 1 && current[0].collection_id === collectionId) return
+    file.value.assignments = file.value.assignments.filter(a => a.paper_id !== paperId)
+    if (collectionId) file.value.assignments.push({ paper_id: paperId, collection_id: collectionId })
+  }
+
   async function create(name: string, parentId?: string): Promise<Collection | null> {
     try {
       const col = await invoke<Collection>('create_collection', {
@@ -295,6 +305,7 @@ export const useCollectionsStore = defineStore('collections', () => {
     canReceivePapers,
     listAllPapersInTree,
     load,
+    applyCommittedPaperAssignment,
     create,
     rename,
     moveCollection,

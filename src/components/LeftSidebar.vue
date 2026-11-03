@@ -1950,8 +1950,8 @@ onUnmounted(() => {
   padding-bottom: 8px;
 }
 
-.pinned-collections { flex-shrink: 0; padding: 4px 0 6px; border-bottom: 1px solid var(--border-subtle); }
-.pinned-collections-heading { display: flex; align-items: center; gap: 5px; padding: 2px 15px 4px; font-size: 10px; font-weight: 500; color: var(--text-tertiary); }
+.pinned-collections { flex-shrink: 0; padding: 3px 0 4px; border-bottom: 1px solid var(--border-subtle); }
+.pinned-collections-heading { display: flex; align-items: center; gap: 5px; padding: 2px 15px; font-size: 10px; font-weight: 500; color: var(--text-tertiary); }
 .pinned-collections-list { max-height: min(28vh, 210px); overflow-y: auto; overflow-x: hidden; }
 .collection-pin-error { flex-shrink: 0; margin: 5px 15px; font-size: 11px; color: var(--text-secondary); }
 

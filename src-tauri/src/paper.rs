@@ -105,7 +105,13 @@ pub async fn reserve_import_dir(root: &str, base: &str) -> Result<PathBuf, Strin
 }
 
 fn collect_paper_dirs(dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("Read {}: {e}", dir.display()))?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Imports/collection moves may relocate a child after its parent was
+        // enumerated. One disappearing child must not fail the entire scan.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("Read {}: {e}", dir.display())),
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -150,6 +156,23 @@ pub fn write_meta(root: &str, slug: &str, meta: &PaperMeta) -> Result<(), String
     let content = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("Failed to serialize meta: {e}"))?;
     atomic_write(&path, &content)
+}
+
+/// Use the paths from one traversal. Resolving every nested slug again here
+/// turns deleting/skipping a paper into a quadratic number of directory reads.
+pub fn purge_related_links(root: &str, deleted_id: &str) -> Result<Vec<String>, String> {
+    let mut changed = Vec::new();
+    for (slug, dir) in list_paper_dirs(root)? {
+        let path = dir.join("meta.json");
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(mut meta) = serde_json::from_str::<PaperMeta>(&text) else { continue };
+        if meta.id == deleted_id || !meta.related_ids.iter().any(|id| id == deleted_id) { continue; }
+        meta.related_ids.retain(|id| id != deleted_id);
+        let content = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
+        atomic_write(&path, &content)?;
+        changed.push(slug);
+    }
+    Ok(changed)
 }
 
 // ── Notes ─────────────────────────────────────────────────────────────────────
@@ -1001,6 +1024,30 @@ mod duplicate_import_tests {
         let paths: std::collections::HashSet<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         assert_eq!(paths.len(), 8);
         assert!(paths.iter().all(|p| p.is_dir()));
+    }
+
+    #[test]
+    fn related_link_cleanup_preserves_unrelated_nested_metadata_and_malformed_records() {
+        let lib = Library::new();
+        let original = lib.seed("original");
+        let related = lib.seed("related");
+        let unrelated = lib.seed("unrelated");
+        let id = read_meta(&lib.0, &original).unwrap().id;
+        let parent = crate::collections::create_collection(&lib.0, "Books".into(), None).unwrap();
+        let child = crate::collections::create_collection(&lib.0, "Nested".into(), Some(parent.id)).unwrap();
+        let mut meta = read_meta(&lib.0, &related).unwrap();
+        meta.related_ids = vec![id.clone(), "keep-this-id".into()];
+        write_meta(&lib.0, &related, &meta).unwrap();
+        crate::collections::move_paper_to_collection(&lib.0, &meta.id, &child.id).unwrap();
+        let untouched = std::fs::read(paper_dir(&lib.0, &unrelated).join("meta.json")).unwrap();
+        let broken = papers_dir(&lib.0).join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("meta.json"), b"malformed metadata").unwrap();
+        assert_eq!(purge_related_links(&lib.0, &id).unwrap(), vec![related.clone()]);
+        assert_eq!(read_meta(&lib.0, &related).unwrap().related_ids, vec!["keep-this-id"]);
+        assert_eq!(std::fs::read(paper_dir(&lib.0, &unrelated).join("meta.json")).unwrap(), untouched);
+        assert_eq!(std::fs::read(broken.join("meta.json")).unwrap(), b"malformed metadata");
+        assert!(purge_related_links(&lib.0, &id).unwrap().is_empty());
     }
 }
 

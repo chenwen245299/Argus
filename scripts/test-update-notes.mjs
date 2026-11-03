@@ -11,8 +11,14 @@ const errors = []
 const mocks = {
   '@tauri-apps/api/core': `export const invoke = (command, args) => window.__test.invoke(command, args);`,
   '@tauri-apps/api/app': `export const getVersion = async () => { window.__test.versionReads++; return '0.109.0'; };`,
+  '@tauri-apps/api/event': `export const listen = async (name, handler) => {
+    const handlers = window.__test.listeners.get(name) || new Set();
+    window.__test.listeners.set(name, handlers); handlers.add(handler);
+    return () => handlers.delete(handler);
+  };`,
   '@tauri-apps/plugin-updater': `export const check = () => {
     window.__test.checks++;
+    if (window.__test.checkError) return Promise.reject(new Error(window.__test.checkError));
     return window.__test.holdCheck ? new Promise(resolve => window.__test.pendingCheck = resolve) : Promise.resolve(window.__test.offer);
   };`,
   '@tauri-apps/plugin-process': `export const relaunch = async () => window.__test.relaunched = true;`,
@@ -31,14 +37,23 @@ before(async () => {
     if (!req.url.startsWith('/__update-test')) return next()
     const html = `<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><div id="app"></div>
       <script type="module">
-      import { createApp } from 'vue'; import { createI18n } from 'vue-i18n';
+      import { createApp, h, ref } from 'vue'; import { createI18n } from 'vue-i18n'; import { createPinia } from 'pinia';
       import { addCollection } from '@iconify/vue'; import fluent from '@iconify-json/fluent/icons.json';
       import UpdatePrompt from '/src/components/UpdatePrompt.vue';
+      import AboutSettings from '/src/components/settings/AboutSettings.vue';
+      import { useSettingsStore } from '/src/stores/settings.ts';
+      import { useNativeUpdateMenu } from '/src/composables/useNativeUpdateMenu.ts';
       import * as store from '/src/stores/update.ts';
       import { zh, en } from '/src/i18n/locales.ts';
       import '/src/assets/main.css'; import '/src/assets/themes.css';
       const test = window.__test = { ...store, requests: [], checks: 0, versionReads: 0,
+        listeners: new Map(), aboutOpened: 0,
+        pendingNativeCheck: new URLSearchParams(location.search).has('pending'),
+        emitNativeCheck() { for (const handler of test.listeners.get('argus-check-for-updates') || []) handler({ payload: null }); },
+        requestNativeCheck() { test.pendingNativeCheck = true; test.emitNativeCheck(); },
         invoke(command, args) {
+          if (command === 'take_update_check_request') { const pending = test.pendingNativeCheck; test.pendingNativeCheck = false; return Promise.resolve(pending); }
+          if (command === 'get_library_size') return Promise.reject('No library open');
           if (command === 'get_update_release_notes') return new Promise((resolve, reject) => test.requests.push({ args, resolve, reject }));
           return Promise.resolve();
         },
@@ -46,8 +61,15 @@ before(async () => {
           downloadAndInstall: callback => { test.downloadCallback = callback; return new Promise(resolve => test.downloadDone = resolve); } },
       };
       addCollection(fluent);
-      createApp(UpdatePrompt).use(createI18n({ legacy: false,
-        locale: new URLSearchParams(location.search).get('locale') || 'zh', messages: { zh, en } })).mount('#app');
+      const app = createApp({ setup() {
+        const showAbout = ref(false);
+        useNativeUpdateMenu(() => { test.aboutOpened++; showAbout.value = true; });
+        return () => h('main', [showAbout.value ? h(AboutSettings) : null, h(UpdatePrompt)]);
+      }});
+      app.use(createPinia()).use(createI18n({ legacy: false,
+        locale: new URLSearchParams(location.search).get('locale') || 'zh', messages: { zh, en } }));
+      test.settings = useSettingsStore(); test.settings.settings.auto_check_updates = false;
+      test.unmount = () => app.unmount(); app.mount('#app');
       test.mounted = true;
       </script>`
     res.setHeader('Content-Type', 'text/html; charset=utf-8')
@@ -61,8 +83,8 @@ before(async () => {
   await page.route('**/*', route => route.request().url().startsWith(origin) ? route.continue() : route.abort())
 })
 after(async () => { await browser?.close(); await server?.close() })
-async function open(locale = 'zh') {
-  await page.goto(`${origin}/__update-test?locale=${locale}`)
+async function open(locale = 'zh', pending = false) {
+  await page.goto(`${origin}/__update-test?locale=${locale}${pending ? '&pending=1' : ''}`)
   await page.waitForFunction(() => window.__test?.mounted)
 }
 const history = Array.from({ length: 6 }, (_, index) => ({
@@ -192,5 +214,45 @@ test('all versions remain expanded in a scrollable body with the install footer 
   const install = await page.getByRole('button', { name: '立即更新' }).boundingBox()
   assert.ok(install.y + install.height < 650)
   if (process.env.ARGUS_TEST_OUTPUT_DIR) await page.screenshot({ path: `${process.env.ARGUS_TEST_OUTPUT_DIR}/update-six-releases-narrow.png` })
+  assert.deepEqual(errors, [])
+})
+
+test('a native menu request queued before mount opens About and the update prompt once, even without a library or automatic checks', async () => {
+  await open('en', true)
+  await page.locator('.about-settings').waitFor()
+  await page.getByRole('dialog').waitFor()
+  assert.equal(await page.evaluate(() => window.__test.checks), 1)
+  assert.equal(await page.evaluate(() => window.__test.aboutOpened), 1)
+  await page.evaluate(() => window.__test.emitNativeCheck())
+  assert.equal(await page.evaluate(() => window.__test.checks), 1)
+  await resolveHistory()
+  await page.evaluate(() => window.__test.unmount())
+  assert.equal(await page.evaluate(() => window.__test.listeners.get('argus-check-for-updates').size), 0)
+})
+
+test('native menu checks show current-version and failure feedback in About without requiring a library', async () => {
+  await open()
+  await page.evaluate(() => { window.__test.offer = null; window.__test.requestNativeCheck() })
+  await page.locator('.about-settings .latest-tip').waitFor()
+  assert.equal(await page.evaluate(() => window.__test.checks), 1)
+  assert.equal(await page.getByRole('dialog').count(), 0)
+  await page.evaluate(() => { window.__test.checkError = 'Offline'; window.__test.requestNativeCheck() })
+  await page.locator('.about-settings .error-msg').getByText('检查失败：Offline').waitFor()
+  assert.equal(await page.evaluate(() => window.__test.checks), 2)
+})
+
+test('repeated native menu clicks share an active check and do not start another check or install during download', async () => {
+  await open()
+  await page.evaluate(() => { window.__test.holdCheck = true; window.__test.requestNativeCheck() })
+  await page.locator('.about-settings .btn-check[disabled]').waitFor()
+  await page.evaluate(() => window.__test.requestNativeCheck())
+  assert.equal(await page.evaluate(() => window.__test.checks), 1)
+  await page.evaluate(() => window.__test.pendingCheck(window.__test.offer))
+  await page.getByRole('dialog').waitFor()
+  await page.getByRole('button', { name: '立即更新', exact: true }).click()
+  await page.locator('.rn-progress-wrap').waitFor()
+  await page.evaluate(() => window.__test.requestNativeCheck())
+  assert.equal(await page.evaluate(() => window.__test.checks), 1)
+  assert.equal(await page.evaluate(() => window.__test.updateStore.state), 'downloading')
   assert.deepEqual(errors, [])
 })

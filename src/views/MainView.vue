@@ -18,6 +18,7 @@ import { useSelectionStore } from '../stores/selection'
 import { useCanvasStore } from '../stores/canvas'
 import { useRagStore } from '../stores/rag'
 import { useReadingWindowFocus } from '../composables/useReadingWindowFocus'
+import { useNativeUpdateMenu } from '../composables/useNativeUpdateMenu'
 import { useActivityStore } from '../stores/activity'
 import { switchToTranslationsTab, askAiText } from '../stores/translationHistory'
 import { pendingSnippet, initSnippetStore, libraries as snippetLibraries } from '../stores/snippetLibrary'
@@ -544,6 +545,10 @@ function onOpenSettingsEvent(event: Event) {
   settingsSection.value = section
   showSettings.value = true
 }
+
+useNativeUpdateMenu(() => {
+  window.dispatchEvent(new CustomEvent('argus-open-settings', { detail: { section: 'about' } }))
+})
 
 // ── Keyboard shortcuts ─────────────────────────────────────────────────────────
 function onKeydown(e: KeyboardEvent) {
@@ -1151,22 +1156,12 @@ watch(
     <WelcomeOnboarding v-if="showOnboarding" @close="dismissOnboarding" />
     <GuidedReadingIntro :ready="guidedReadingIntroReady && !showOnboarding && !showSettings" />
 
-    <!-- Unified settings modal -->
-    <SettingsModal
-      v-if="showSettings"
-      :initial-section="settingsSection ?? (settingsAiSection ? 'ai' : undefined)"
-      @close="showSettings = false; settingsAiSection = false; settingsSection = undefined"
-    />
-
     <!-- Add to Snippet Library modal -->
     <AddSnippetModal
       v-if="pendingSnippet"
       :pending="pendingSnippet"
       @close="pendingSnippet = null"
     />
-
-    <!-- Global update-available prompt (auto checks fire even when settings is closed) -->
-    <UpdatePrompt />
 
     <!-- Read aloud: the floating mini-player and the "no speech model yet" prompt -->
     <SpeechHost />
@@ -1177,6 +1172,14 @@ watch(
     <!-- Citation graph modal (opened from the viewer toolbar) -->
     <CitationGraphModal />
   </div>
+
+  <!-- Native update checks also work before a library is opened. -->
+  <SettingsModal
+    v-if="showSettings"
+    :initial-section="settingsSection ?? (settingsAiSection ? 'ai' : undefined)"
+    @close="showSettings = false; settingsAiSection = false; settingsSection = undefined"
+  />
+  <UpdatePrompt />
 </template>
 
 <style scoped>

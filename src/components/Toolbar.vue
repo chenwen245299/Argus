@@ -6,6 +6,7 @@ import { storeToRefs } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useLibraryStore } from '../stores/library'
+import ImportQueue from './ImportQueue.vue'
 import { useImportStore } from '../stores/import'
 import { useSelectionStore } from '../stores/selection'
 import { usePaperTasksStore, type AiSummaryJob } from '../stores/paperTasks'
@@ -396,34 +397,6 @@ function submitUrl() {
   importStore.clearUrlError()
   importStore.importPaperUrl(url, collectionId)
   closeUrlPopover()
-}
-
-const importStatusLabel = computed(() => {
-  const jobs = importStore.jobs
-  if (!jobs.length) return ''
-  const active = jobs.filter(j => j.status !== 'done' && j.status !== 'error')
-  if (active.length) {
-    const first = active[0]
-    const suffix = active.length > 1 ? ` (${active.length})` : ''
-    const label = importStageLabel(first.status)
-    if (label) return label + suffix
-  }
-  return ''
-})
-
-function importStageLabel(status: string): string {
-  switch (status) {
-    case 'downloading': return t('import.downloading')
-    case 'importing': return t('import.importing')
-    case 'queued': return t('import.queued')
-    case 'extracting': return t('import.extracting')
-    case 'ai_meta': return t('import.aiMeta')
-    case 'renaming': return t('import.renaming')
-    case 'fetching_meta': return t('import.fetchingMeta')
-    case 'fetching_refs': return t('import.fetchingRefs')
-    case 'ranking': return t('import.ranking')
-    default: return ''
-  }
 }
 
 function onSearchInput(event: Event) {
@@ -1061,10 +1034,7 @@ onUnmounted(() => {
     </div>
 
     <!-- Import status -->
-    <div v-if="importStatusLabel" class="import-status">
-      <span class="spinner" />
-      <span>{{ importStatusLabel }}</span>
-    </div>
+    <ImportQueue />
 
     <!-- Import error toast -->
     <div
@@ -1513,16 +1483,6 @@ onUnmounted(() => {
   border-radius: 50%;
   flex-shrink: 0;
   animation: spin 0.75s linear infinite;
-}
-
-/* Import status */
-.import-status {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: var(--font-size-xs);
-  color: var(--text-tertiary);
-  flex-shrink: 0;
 }
 
 .import-error-toast {

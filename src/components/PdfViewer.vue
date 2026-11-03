@@ -1828,6 +1828,12 @@ async function loadPdf() {
       standardFontDataUrl: '/pdfjs/standard_fonts/',
       cMapUrl: '/pdfjs/cmaps/',
       cMapPacked: true,
+      // JPEG 2000 scans and JBIG2 masks need the external image decoders.
+      // Without them PDF.js resolves render() after silently dropping images.
+      // Absolute URLs also let decoder fallback import() requests bypass Vite's
+      // source-module rewriting for files served directly from public/.
+      wasmUrl: new URL('/pdfjs/wasm/', window.location.href).href,
+      iccUrl: '/pdfjs/iccs/',
     })
     const doc = await loadingTask.promise
     pdfDoc.value = doc

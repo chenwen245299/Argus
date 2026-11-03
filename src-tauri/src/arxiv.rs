@@ -766,6 +766,18 @@ pub fn find_duplicate(
     title: &str,
     exclude_slug: Option<&str>,
 ) -> Option<DuplicateHit> {
+    find_duplicate_excluding(root, arxiv_id, doi, title, exclude_slug, &[])
+}
+
+/// Pending copies in the same import queue cannot serve as retained originals.
+pub(crate) fn find_duplicate_excluding(
+    root: &str,
+    arxiv_id: Option<&str>,
+    doi: Option<&str>,
+    title: &str,
+    exclude_slug: Option<&str>,
+    exclude_slugs: &[String],
+) -> Option<DuplicateHit> {
     let cand_arxiv_base = arxiv_id
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -775,7 +787,7 @@ pub fn find_duplicate(
     let mut title_hit = None;
     let entries = crate::paper::list_paper_dirs(root).ok()?;
     for (slug, path) in entries {
-        if exclude_slug == Some(slug.as_str()) {
+        if exclude_slug == Some(slug.as_str()) || exclude_slugs.contains(&slug) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(path.join("meta.json")) else {

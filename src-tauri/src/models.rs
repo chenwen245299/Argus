@@ -535,6 +535,39 @@ Do not invent headings that are not present, and do not emit the same heading tw
 }
 
 pub fn default_metadata_ai_prompt() -> String {
+    r#"Extract bibliographic metadata for THIS document from the supplied opening pages,
+page images (when present), embedded ebook metadata and text with original line breaks.
+
+Rules:
+- Identify the document itself. Never take titles/authors from a reference list,
+  advertisement, series list, table of contents or quoted publication.
+- For a book, compare its cover, title page and copyright page. Preserve the
+  original-language full title/subtitle. Separate authors from translators and
+  series editors. Use the book's own publication year and publisher.
+- Use document_type="book" for books, "paper" for a single academic paper/preprint,
+  and "other" for CVs, slide decks, manuals and lists of publications.
+- For books, DOI/arxiv_id are null and venue is the publisher. For "other", year,
+  venue, DOI and arxiv_id are null. For papers, use their own publication evidence.
+- Do not guess. Unknown fields are null. The filename and embedded metadata are
+  hints; the document's own title/copyright pages take priority.
+- Set needs_more_pages=true and title_confidence="low" or "medium" if the pages
+  do not establish this document's actual title or authors. More opening pages
+  may be supplied once, up to ten. At ten, keep unknown fields null.
+
+Reply with a JSON code block in exactly this format:
+
+```json
+{"document_type": "book", "title": "...", "authors": ["First Last"], "year": 2024, "venue": "Publisher or journal", "doi": null, "arxiv_id": null, "title_confidence": "high", "needs_more_pages": false}
+```
+
+File name: {filename}
+
+Text:
+{text}"#
+        .replace("Rules:\n", &format!("Rules:\n{}\n", crate::publication::METADATA_PUBLICATION_RULES))
+}
+
+pub fn legacy_metadata_ai_prompt_v2() -> String {
     r#"Extract bibliographic metadata for the document the text below was taken from.
 The text is the beginning of that document, with its original line breaks.
 
@@ -591,6 +624,8 @@ pub fn is_legacy_metadata_ai_prompt(prompt: &str) -> bool {
     let p = prompt.trim();
     // The very first shape asked for an abstract field that no longer exists.
     p.contains("a concise paper abstract") || p == legacy_metadata_ai_prompt_v1().trim()
+        || p == legacy_metadata_ai_prompt_v2().trim()
+        || p == legacy_metadata_ai_prompt_v2().replace(&format!("{}\n", crate::publication::METADATA_PUBLICATION_RULES), "").trim()
 }
 
 pub fn default_ai_summary_prompt() -> String {

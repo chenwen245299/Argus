@@ -154,9 +154,10 @@ pub async fn list_papers(state: State<'_, LibraryRoot>) -> Result<Vec<PaperIndex
 #[tauri::command]
 pub async fn get_paper_meta(
     slug: String,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<PaperMeta, String> {
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
     paper::read_meta(&root, &slug)
 }
 
@@ -847,9 +848,51 @@ pub async fn pick_pdf_files(app: tauri::AppHandle) -> Result<Vec<String>, String
 #[tauri::command]
 pub async fn import_pdf(
     source_path: String,
+    collection_id: Option<String>,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<String, String> {
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || import_pdf_file(&root, &source_path, collection_id))
+        .await.map_err(|e| e.to_string())?
+}
+
+/// Roll back only the newly reserved copy when local persistence or assignment
+/// fails. A failed import must not leave an unfiled, half-written library entry.
+struct PendingLocalImport {
+    root: String,
+    slug: String,
+    reserved_dir: std::path::PathBuf,
+    id: String,
+    committed: bool,
+}
+
+impl PendingLocalImport {
+    fn new(root: &str, slug: &str, dir: &std::path::Path, id: uuid::Uuid) -> Self {
+        Self { root: root.into(), slug: slug.into(), reserved_dir: dir.into(), id: id.to_string(), committed: false }
+    }
+}
+
+impl Drop for PendingLocalImport {
+    fn drop(&mut self) {
+        if self.committed { return; }
+        let dir = paper::find_paper_dir(&self.root, &self.slug).unwrap_or_else(|| self.reserved_dir.clone());
+        // A completed metadata record must still have the identity we reserved.
+        if let Ok(meta) = paper::read_meta(&self.root, &self.slug) {
+            if meta.id != self.id { return; }
+        } else if dir != self.reserved_dir { return; }
+        let _ = search::remove_paper(&self.root, &self.slug);
+        let _ = collections::purge_paper(&self.root, &self.id);
+        if dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) { eprintln!("[import] rollback {}: {e}", dir.display()); }
+        }
+    }
+}
+
+fn import_pdf_file(root: &str, source_path: &str, collection_id: Option<String>) -> Result<String, String> {
+    if let Some(cid) = collection_id.as_deref().filter(|c| !c.trim().is_empty()) {
+        collections::ensure_collection_can_receive_papers(root, cid)?;
+    }
 
     let id = uuid::Uuid::new_v4();
     let temp_slug = format!("importing_{}", id.simple());
@@ -867,16 +910,14 @@ pub async fn import_pdf(
         .to_string();
 
     // Create paper directory
-    let paper_dir = paper::reserve_import_dir(&root, &temp_slug).await?;
+    let paper_dir = paper::reserve_paper_dir(root, &temp_slug)?;
     let temp_slug = paper_dir.file_name().unwrap().to_string_lossy().to_string();
+    let mut pending = PendingLocalImport::new(root, &temp_slug, &paper_dir, id);
 
-    // Copy PDF (non-blocking) — named after the sanitized original file stem
+    // This entire function runs on the blocking pool.
     let pdf_filename = format!("{}.pdf", metadata::sanitize_filename(&title));
     let dest = paper_dir.join(&pdf_filename);
-    let source_path_c = source_path.clone();
-    tauri::async_runtime::spawn_blocking(move || std::fs::copy(&source_path_c, &dest))
-        .await
-        .map_err(|e| e.to_string())?
+    std::fs::copy(&source_path, &dest)
         .map_err(|e| format!("Cannot copy PDF: {e}"))?;
 
     // Write initial meta.json
@@ -901,12 +942,16 @@ pub async fn import_pdf(
         related_ids: Vec::new(),
         journal_rank: None,
     };
-    paper::write_meta(&root, &temp_slug, &meta)?;
+    paper::write_meta(root, &temp_slug, &meta)?;
 
     // Create companion files (notes.md, highlights.json, .status.json)
-    paper::ensure_paper_files(&root, &temp_slug);
-    refresh_search_index(&root, &temp_slug);
+    paper::ensure_paper_files(root, &temp_slug);
+    refresh_search_index(root, &temp_slug);
 
+    if let Some(cid) = collection_id.filter(|c| !c.trim().is_empty()) {
+        collections::move_paper_to_collection(root, &id.to_string(), &cid)?;
+    }
+    pending.committed = true;
     Ok(temp_slug)
 }
 
@@ -943,11 +988,17 @@ pub async fn pick_import_files(app: tauri::AppHandle) -> Result<Vec<String>, Str
 pub async fn import_ebook(
     source_path: String,
     collection_id: Option<String>,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<String, String> {
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || import_ebook_file(&root, &source_path, collection_id))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn import_ebook_file(root: &str, source_path: &str, collection_id: Option<String>) -> Result<String, String> {
     if let Some(cid) = collection_id.as_deref().filter(|c| !c.trim().is_empty()) {
-        collections::ensure_collection_can_receive_papers(&root, cid)?;
+        collections::ensure_collection_can_receive_papers(root, cid)?;
     }
 
     let src = std::path::PathBuf::from(&source_path);
@@ -956,11 +1007,7 @@ pub async fn import_ebook(
 
     // Parse fully before creating anything — a broken/DRM'd book must not
     // leave a half-imported folder behind.
-    let src_c = src.clone();
-    let parsed =
-        tauri::async_runtime::spawn_blocking(move || ebook::parse(&src_c, format))
-            .await
-            .map_err(|e| e.to_string())??;
+    let parsed = ebook::parse(&src, format)?;
 
     let id = uuid::Uuid::new_v4();
     let temp_slug = format!("importing_{}", id.simple());
@@ -979,8 +1026,9 @@ pub async fn import_ebook(
         parsed.meta.title.trim().to_string()
     };
 
-    let paper_dir = paper::reserve_import_dir(&root, &temp_slug).await?;
+    let paper_dir = paper::reserve_paper_dir(root, &temp_slug)?;
     let temp_slug = paper_dir.file_name().unwrap().to_string_lossy().to_string();
+    let mut pending = PendingLocalImport::new(root, &temp_slug, &paper_dir, id);
 
     // Copy the book file, named after the sanitized title with its original extension.
     let lower_name = filename.to_ascii_lowercase();
@@ -1000,10 +1048,7 @@ pub async fn import_ebook(
     }
     let book_filename = format!("{stem}.{ext}");
     let dest = paper_dir.join(&book_filename);
-    let source_path_c = source_path.clone();
-    tauri::async_runtime::spawn_blocking(move || std::fs::copy(&source_path_c, &dest))
-        .await
-        .map_err(|e| e.to_string())?
+    std::fs::copy(&source_path, &dest)
         .map_err(|e| format!("Cannot copy ebook: {e}"))?;
 
     // meta.json straight from the book's own metadata — no online lookup.
@@ -1028,43 +1073,39 @@ pub async fn import_ebook(
         related_ids: Vec::new(),
         journal_rank: None,
     };
-    paper::write_meta(&root, &temp_slug, &meta)?;
-    paper::ensure_paper_files(&root, &temp_slug);
+    paper::write_meta(root, &temp_slug, &meta)?;
+    paper::ensure_paper_files(root, &temp_slug);
 
     // Chapter structure from the book's own TOC.
     if let Some(secs) = ebook::sections_from(&parsed) {
-        let _ = sections::write_sections(&root, &temp_slug, &secs);
+        sections::write_sections(root, &temp_slug, &secs)?;
     }
 
     // Fulltext + status flag (search/RAG/AI all read fulltext.txt).
     let fulltext = ebook::fulltext_from(&parsed);
     if !fulltext.trim().is_empty() {
-        let ft_path = paper::paper_dir(&root, &temp_slug).join("fulltext.txt");
-        if crate::fsutil::atomic_write_str(&ft_path, &fulltext).is_ok() {
-            let mut status = paper::read_status_for(&root, &temp_slug);
-            status.text_extracted = true;
-            status.last_updated = chrono::Utc::now().to_rfc3339();
-            let _ = paper::write_status(&root, &temp_slug, &status);
-        }
+        let ft_path = paper::paper_dir(root, &temp_slug).join("fulltext.txt");
+        crate::fsutil::atomic_write_str(&ft_path, &fulltext)?;
     }
+    let mut status = paper::read_status_for(root, &temp_slug);
+    status.metadata_fetched = true;
+    status.text_extracted = !fulltext.trim().is_empty();
+    status.last_updated = chrono::Utc::now().to_rfc3339();
+    paper::write_status(root, &temp_slug, &status)?;
 
     // Canonical folder name (title-based).
-    let root_c = root.clone();
-    let temp_c = temp_slug.clone();
-    let final_slug =
-        tauri::async_runtime::spawn_blocking(move || metadata::rename_folder(&root_c, &temp_c))
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|_| temp_slug.clone());
+    let final_slug = metadata::rename_folder(root, &temp_slug).unwrap_or_else(|_| temp_slug.clone());
+    pending.slug = final_slug.clone();
     if final_slug != temp_slug {
-        let _ = search::remove_paper(&root, &temp_slug);
+        let _ = search::remove_paper(root, &temp_slug);
     }
-    refresh_search_index(&root, &final_slug);
+    refresh_search_index(root, &final_slug);
 
     if let Some(cid) = collection_id.filter(|c| !c.trim().is_empty()) {
-        collections::move_paper_to_collection(&root, &id.to_string(), &cid)?;
+        collections::move_paper_to_collection(root, &id.to_string(), &cid)?;
     }
 
+    pending.committed = true;
     Ok(final_slug)
 }
 
@@ -1168,49 +1209,45 @@ pub async fn regen_ebook_sections(
 #[tauri::command]
 pub async fn delete_paper(
     slug: String,
+    expected_id: Option<String>,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let root = get_root(&state)?;
-    let dir = paper::paper_dir(&root, &slug);
-    if !dir.exists() {
-        return Err(format!("Paper directory not found: {}", slug));
+    let root = note_root(&state, expected_root.as_deref())?;
+    let root_c = root.clone();
+    let slug_c = slug.clone();
+    let meta = tauri::async_runtime::spawn_blocking(move || {
+        let dir = paper::paper_dir(&root_c, &slug_c);
+        if !dir.exists() { return Err(format!("Paper directory not found: {slug_c}")); }
+        let meta = paper::read_meta(&root_c, &slug_c).ok();
+        if expected_id.as_deref().is_some_and(|id| meta.as_ref().map(|m| m.id.as_str()) != Some(id)) {
+            return Err("The imported copy changed before it could be removed".into());
+        }
+        Ok(meta)
+    }).await.map_err(|e| e.to_string())??;
+    if let Some(meta) = &meta {
+        let _ = rag::delete_paper_chunks(&root, &meta.id).await;
     }
-    // Remove from search index before deleting the directory
-    let _ = search::remove_paper(&root, &slug);
-    // Remove RAG vector chunks (and its collection membership) so neither the
-    // vector DB nor collections.json accumulates stale data pointing at a paper
-    // that no longer exists. Library-level records — token usage and the
-    // activity log — live outside the paper folder and are intentionally kept.
-    if let Ok(meta) = paper::read_meta(&root, &slug) {
-        let deleted_id = meta.id.clone();
-        let _ = rag::delete_paper_chunks(&root, &deleted_id).await;
-        let _ = collections::purge_paper(&root, &deleted_id);
-        let _ = writing::purge_paper(&root, &deleted_id);
-        // Drop this paper's id from every other paper's related_ids so no
-        // dangling manual "related paper" links point at a paper that's gone.
-        if let Ok(dirs) = paper::list_paper_dirs(&root) {
-            for (other_slug, _) in dirs {
-                if other_slug == slug {
-                    continue;
-                }
-                if let Ok(mut other) = paper::read_meta(&root, &other_slug) {
-                    let before = other.related_ids.len();
-                    other.related_ids.retain(|id| id != &deleted_id);
-                    if other.related_ids.len() != before {
-                        let _ = paper::write_meta(&root, &other_slug, &other);
-                        refresh_search_index(&root, &other_slug);
-                    }
-                }
+    let slug_c = slug.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        if let Some(expected) = &meta {
+            if paper::read_meta(&root, &slug_c).ok().map(|m| m.id) != Some(expected.id.clone()) {
+                return Err("The paper changed before deletion".into());
             }
         }
-    }
-    // Drop any cached parsed ebook so its Arc doesn't outlive the paper
-    ebook::evict_from_cache(&slug);
-    // Removing the folder also deletes the paper's per-paper conversation
-    // history (chat.json, ai_conversations.json), notes, highlights, sections,
-    // reading state and extracted fulltext.
-    std::fs::remove_dir_all(&dir).map_err(|e| format!("Cannot delete paper: {e}"))?;
+        let _ = search::remove_paper(&root, &slug_c);
+        if let Some(meta) = meta {
+            let _ = collections::purge_paper(&root, &meta.id);
+            let _ = writing::purge_paper(&root, &meta.id);
+            if let Ok(changed) = paper::purge_related_links(&root, &meta.id) {
+                for other_slug in changed { refresh_search_index(&root, &other_slug); }
+            }
+        }
+        ebook::evict_from_cache(&slug_c);
+        std::fs::remove_dir_all(paper::paper_dir(&root, &slug_c))
+            .map_err(|e| format!("Cannot delete paper: {e}"))
+    }).await.map_err(|e| e.to_string())??;
     // All deletion entry points (including batch deletion) share this command.
     // Close only this paper's AI window, and only after deletion succeeds.
     copilot::close_paper_ai_window(&app, &slug);
@@ -1248,11 +1285,17 @@ pub async fn copy_paper_pdf(slug: String, state: State<'_, LibraryRoot>) -> Resu
 #[tauri::command]
 pub async fn fetch_metadata(
     slug: String,
+    allow_title_search: Option<bool>,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<PaperMeta, String> {
-    let root = get_root(&state)?;
-    let meta = metadata::fetch_and_apply(&root, &slug, &app).await?;
+    let root = note_root(&state, expected_root.as_deref())?;
+    let meta = if allow_title_search == Some(false) {
+        metadata::fetch_and_apply_with_title_search(&root, &slug, &app, false).await?
+    } else {
+        metadata::fetch_and_apply(&root, &slug, &app).await?
+    };
     refresh_search_index(&root, &slug);
     Ok(meta)
 }
@@ -1263,9 +1306,10 @@ pub async fn fetch_metadata(
 #[tauri::command]
 pub async fn fetch_citation_count(
     slug: String,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<PaperMeta, String> {
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
     let update = metadata::fetch_semantic_scholar_meta(&root, &slug).await?;
     let mut meta = crate::paper::read_meta(&root, &slug)?;
     let mut changed = false;
@@ -1335,9 +1379,10 @@ pub async fn get_library_citers(
 #[tauri::command]
 pub async fn fetch_references(
     slug: String,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<Vec<crate::models::CitationRef>, String> {
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
     let mut refs = metadata::fetch_references(&root, &slug).await?;
     metadata::match_references_to_library(&root, &mut refs);
     Ok(refs)
@@ -1400,13 +1445,27 @@ pub async fn semantic_scholar_key_status(state: State<'_, LibraryRoot>) -> Resul
 #[tauri::command]
 pub async fn extract_metadata_ai(
     slug: String,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<PaperMeta, String> {
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
     let meta = metadata::fetch_metadata_with_ai(&root, &slug, &app).await?;
     refresh_search_index(&root, &slug);
     Ok(meta)
+}
+
+#[tauri::command]
+pub async fn extract_import_metadata(
+    slug: String,
+    expected_root: Option<String>,
+    state: State<'_, LibraryRoot>,
+    app: tauri::AppHandle,
+) -> Result<metadata::ImportMetadata, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    let result = metadata::identify_document(&root, &slug, &app).await?;
+    refresh_search_index(&root, &slug);
+    Ok(result)
 }
 
 /// Extract first-page text from a paper's PDF (useful for manual inspection / AI calls).
@@ -1428,9 +1487,10 @@ pub async fn extract_first_page_text(
 #[tauri::command]
 pub async fn rename_paper_folder(
     slug: String,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
 ) -> Result<String, String> {
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
     let root_c = root.clone();
     let slug_c = slug.clone();
     let new_slug =
@@ -1729,8 +1789,8 @@ pub async fn get_writing_folder_path(state: State<'_, LibraryRoot>) -> Result<St
 // ── M4: Full-text extraction ──────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn extract_fulltext(slug: String, state: State<'_, LibraryRoot>) -> Result<(), String> {
-    let root = get_root(&state)?;
+pub async fn extract_fulltext(slug: String, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<(), String> {
+    let root = note_root(&state, expected_root.as_deref())?;
     let s = settings::read_settings(&root);
     let root_c = root.clone();
     let slug_c = slug.clone();
@@ -3839,10 +3899,11 @@ pub async fn import_paper_url(
     url: String,
     collection_id: String,
     force: Option<bool>,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
     app: tauri::AppHandle,
 ) -> Result<ImportResult, String> {
-    let root = get_root(&state)?;
+    let root = note_root(&state, expected_root.as_deref())?;
     collections::ensure_collection_can_receive_papers(&root, &collection_id)?;
     url_import::import_by_url(&root, &url, &collection_id, &app, force.unwrap_or(false)).await
 }
@@ -3867,17 +3928,18 @@ pub async fn import_arxiv_url(
 #[tauri::command]
 pub async fn find_duplicate_paper(
     slug: String,
+    exclude_slugs: Option<Vec<String>>,
+    expected_root: Option<String>,
     state: State<'_, LibraryRoot>,
-) -> Result<Option<crate::arxiv::DuplicateHit>, String> {
-    let root = get_root(&state)?;
-    let meta = paper::read_meta(&root, &slug)?;
-    Ok(arxiv::find_duplicate(
-        &root,
-        meta.arxiv_id.as_deref(),
-        meta.doi.as_deref(),
-        &meta.title,
-        Some(&slug),
-    ))
+) -> Result<Option<serde_json::Value>, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let meta = paper::read_meta(&root, &slug)?;
+        Ok(arxiv::find_duplicate_excluding(
+            &root, meta.arxiv_id.as_deref(), meta.doi.as_deref(), &meta.title, Some(&slug),
+            &exclude_slugs.unwrap_or_default(),
+        ).map(|hit| serde_json::json!({ "existingSlug": hit.slug, "title": hit.title, "incomingId": meta.id })))
+    }).await.map_err(|e| e.to_string())?
 }
 
 // ── Shell / Finder ────────────────────────────────────────────────────────────
@@ -4653,4 +4715,109 @@ pub async fn exa_save_settings(
 pub async fn disarm_cache_keepalive(app: tauri::AppHandle) -> Result<(), String> {
     crate::cache_keepalive::disarm_and_announce(&app);
     Ok(())
+}
+
+#[cfg(test)]
+mod local_import_tests {
+    use super::*;
+    struct Fixture { dir: std::path::PathBuf, root: String, collection: String }
+    impl Fixture {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("argus-local-import-{}", uuid::Uuid::new_v4()));
+            let library = dir.join("library");
+            std::fs::create_dir_all(library.join(".argus")).unwrap();
+            let root = library.to_string_lossy().to_string();
+            let parent = collections::create_collection(&root, "Books".into(), None).unwrap();
+            let collection = collections::create_collection(&root, "Reading".into(), Some(parent.id)).unwrap().id;
+            Self { dir, root, collection }
+        }
+        fn source(&self, name: &str, bytes: &[u8]) -> String {
+            let path = self.dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path.to_string_lossy().into()
+        }
+    }
+    impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); } }
+
+    #[test]
+    fn local_import_batch_preserves_all_uuids_files_and_collection_assignments() {
+        let f = Fixture::new();
+        let mut threads = Vec::new();
+        for index in 0..16 {
+            let root = f.root.clone();
+            let collection = f.collection.clone();
+            let path = if index % 2 == 0 { f.source(&format!("论文{index}.pdf"), b"%PDF-1.7 original content") }
+                else { f.source(&format!("图书{index}.txt"), "第一章 开始\n书籍正文。\n第二章 后续\n完整内容。".as_bytes()) };
+            threads.push(std::thread::spawn(move || {
+                if index % 2 == 0 { import_pdf_file(&root, &path, Some(collection)).unwrap() }
+                else { import_ebook_file(&root, &path, Some(collection)).unwrap() }
+            }));
+        }
+        let slugs: std::collections::HashSet<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(slugs.len(), 16);
+        let entries = collections::list_papers_in_collection(&f.root, &f.collection).unwrap();
+        assert_eq!(entries.len(), 16);
+        assert_eq!(entries.iter().map(|p| &p.id).collect::<std::collections::HashSet<_>>().len(), 16);
+        for slug in slugs {
+            let meta = paper::read_meta(&f.root, &slug).unwrap();
+            let dir = paper::paper_dir(&f.root, &slug);
+            if ebook::is_ebook_file_type(meta.file_type.as_deref()) {
+                assert!(paper::read_status_for(&f.root, &slug).metadata_fetched);
+                assert!(paper::read_status_for(&f.root, &slug).text_extracted);
+                assert!(std::fs::read_to_string(dir.join("fulltext.txt")).unwrap().contains("完整内容"));
+            } else {
+                assert_eq!(std::fs::read(metadata::find_pdf_in_dir(&f.root, &slug)).unwrap(), b"%PDF-1.7 original content");
+            }
+        }
+    }
+
+    #[test]
+    fn local_import_failure_rolls_back_reserved_folders_and_does_not_hide_a_book_outside_its_collection() {
+        let f = Fixture::new();
+        let missing = f.dir.join("missing.pdf").to_string_lossy().to_string();
+        assert!(import_pdf_file(&f.root, &missing, Some(f.collection.clone())).is_err());
+        assert!(paper::list_paper_dirs(&f.root).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(paper::papers_dir(&f.root)).unwrap().count(), 1, "only the Books collection remains");
+        let broken = f.source("broken.epub", b"not a ZIP archive");
+        assert!(import_ebook_file(&f.root, &broken, Some(f.collection.clone())).is_err());
+        let pdf = f.source("valid.pdf", b"%PDF-1.7 preserved original");
+        assert!(import_pdf_file(&f.root, &pdf, Some("missing-collection".into())).is_err());
+        assert!(paper::list_paper_dirs(&f.root).unwrap().is_empty());
+        assert_eq!(std::fs::read(&pdf).unwrap(), b"%PDF-1.7 preserved original");
+    }
+
+    #[test]
+    fn local_import_supports_long_multibyte_book_titles() {
+        let f = Fixture::new();
+        // Embedded EPUB/FB2 titles may be much longer than their source filename.
+        let title = "中华人民共和国经济社会发展历史研究与未来展望".repeat(15);
+        let safe = metadata::sanitize_filename(&title);
+        assert!(safe.len() <= 200 && safe.len() > 190);
+        let path = f.source(&format!("{safe}.pdf"), b"%PDF-1.7 long Chinese name");
+        let slug = import_pdf_file(&f.root, &path, Some(f.collection.clone())).unwrap();
+        assert!(metadata::find_pdf_in_dir(&f.root, &slug).exists());
+        assert_eq!(collections::list_papers_in_collection(&f.root, &f.collection).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_local_import_rolls_back_after_canonical_rename_and_collection_move() {
+        let f = Fixture::new();
+        let source = f.source("original.txt", "图书内容。".as_bytes());
+        let original = import_ebook_file(&f.root, &source, Some(f.collection.clone())).unwrap();
+        let meta = paper::read_meta(&f.root, &original).unwrap();
+        {
+            let dir = paper::reserve_paper_dir(&f.root, "temporary-copy").unwrap();
+            let id = uuid::Uuid::new_v4();
+            let mut pending = PendingLocalImport::new(&f.root, "temporary-copy", &dir, id);
+            let mut copy = meta.clone(); copy.id = id.to_string();
+            paper::write_meta(&f.root, "temporary-copy", &copy).unwrap();
+            let renamed = metadata::rename_folder(&f.root, "temporary-copy").unwrap();
+            pending.slug = renamed.clone();
+            collections::move_paper_to_collection(&f.root, &copy.id, &f.collection).unwrap();
+            // Simulate a late persistence error: the uncommitted guard drops.
+        }
+        assert_eq!(paper::list_paper_dirs(&f.root).unwrap().len(), 1);
+        assert_eq!(paper::read_meta(&f.root, &original).unwrap().id, meta.id);
+        assert_eq!(collections::read_collections(&f.root).assignments.len(), 1);
+    }
 }

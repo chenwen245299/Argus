@@ -257,6 +257,8 @@ pub fn create_collection(
 
 pub fn rename_collection(root: &str, id: &str, new_name: String) -> Result<(), String> {
     let _g = lock_collections();
+    let namespace = paper::namespace_lock(root);
+    let _namespace = namespace.lock().unwrap_or_else(|e| e.into_inner());
     let mut file = read_collections(root);
 
     // Capture the old folder path BEFORE updating the name.
@@ -297,6 +299,8 @@ pub fn set_collection_pinned(root: &str, id: &str, pinned: bool) -> Result<(), S
 
 pub fn move_collection(root: &str, id: &str, new_parent_id: Option<String>) -> Result<(), String> {
     let _g = lock_collections();
+    let namespace = paper::namespace_lock(root);
+    let _namespace = namespace.lock().unwrap_or_else(|e| e.into_inner());
     let mut file = read_collections(root);
 
     if !file.collections.iter().any(|c| c.id == id) {
@@ -394,6 +398,8 @@ pub fn set_collection_emoji(root: &str, id: &str, emoji: Option<String>) -> Resu
 /// Delete a collection and cascade-remove all descendants and their assignments.
 pub fn delete_collection(root: &str, id: &str) -> Result<(), String> {
     let _g = lock_collections();
+    let namespace = paper::namespace_lock(root);
+    let _namespace = namespace.lock().unwrap_or_else(|e| e.into_inner());
     let mut file = read_collections(root);
     if !file.collections.iter().any(|c| c.id == id) {
         return Err(format!("Collection {id} not found"));
@@ -565,6 +571,8 @@ pub fn move_paper_to_collection(
     collection_id: &str,
 ) -> Result<(), String> {
     let _g = lock_collections();
+    let namespace = paper::namespace_lock(root);
+    let _namespace = namespace.lock().unwrap_or_else(|e| e.into_inner());
     let mut file = read_collections(root);
 
     ensure_collection_can_receive_papers_in_file(&file, collection_id)?;

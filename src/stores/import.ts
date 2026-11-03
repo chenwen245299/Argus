@@ -13,7 +13,7 @@ import { i18n } from '../i18n'
 import { confirmDuplicateImport } from '../utils/duplicateImport'
 
 /** A paper already in the library that matches the one being imported. */
-interface DuplicateHit { existingSlug: string; title: string }
+interface DuplicateHit { existingSlug: string; title: string; incomingId?: string }
 /** Result of a duplicate-aware import command (import_paper_url). */
 interface ImportOutcome { status: 'imported' | 'duplicate'; slug?: string; existingSlug?: string; title?: string }
 
@@ -31,6 +31,30 @@ export const useImportStore = defineStore('import', () => {
   const jobs = ref<ImportJob[]>([])
   const lastUrlError = ref<string | null>(null)
   const lastDuplicate = ref<DuplicateNotice | null>(null)
+
+  function checkRoot(root: string | null) {
+    if (useLibraryStore().currentPath !== root) throw new Error(i18n.global.t('import.libraryChanged'))
+  }
+
+  function scopedInvoke<T>(root: string | null, command: string, args: Record<string, unknown>): Promise<T> {
+    checkRoot(root)
+    return invoke<T>(command, { ...args, expectedRoot: root })
+  }
+
+  // Copying a batch must not wait for a full-library scan after every file.
+  // Refresh both lists together, coalescing completions that land in one burst.
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined
+  let refreshRoot: string | null = null
+  function scheduleRefresh(root: string | null) {
+    if (useLibraryStore().currentPath !== root) return
+    refreshRoot = root
+    if (refreshTimer) return
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined
+      if (useLibraryStore().currentPath !== refreshRoot) return
+      void Promise.allSettled([useCollectionsStore().load(), useLibraryStore().refresh()])
+    }, 150)
+  }
 
   function _addJob(slug: string, filename: string): ImportJob {
     const job: ImportJob = {
@@ -55,12 +79,7 @@ export const useImportStore = defineStore('import', () => {
     const job = jobs.value.find(j => j.slug === oldSlug)
     if (job) {
       job.slug = newSlug
-      job.id = newSlug
     }
-  }
-
-  function _removeJob(slug: string) {
-    jobs.value = jobs.value.filter(j => j.slug !== slug && j.id !== slug)
   }
 
   /**
@@ -69,23 +88,22 @@ export const useImportStore = defineStore('import', () => {
    * collection membership — is removed by `delete_paper`, so a rejected import
    * leaves nothing behind, and the user is told which paper it matched.
    */
-  async function _abortAsDuplicate(slug: string, source: string, dup: DuplicateHit) {
-    const library = useLibraryStore()
+  async function _abortAsDuplicate(slug: string, source: string, dup: DuplicateHit, root: string | null) {
     const selection = useSelectionStore()
-    const collections = useCollectionsStore()
+    _setStatus(slug, 'skipping')
     try {
-      await invoke('delete_paper', { slug })
+      await scopedInvoke(root, 'delete_paper', { slug, ...(dup.incomingId ? { expectedId: dup.incomingId } : {}) })
     } catch {
       _setStatus(slug, 'error', i18n.global.t('import.duplicateCleanupFailed'))
       return
     }
-    _removeJob(slug)
+    _setStatus(slug, 'skipped')
+    if (useLibraryStore().currentPath !== root) return
     lastDuplicate.value = { title: dup.title, existingSlug: dup.existingSlug, source }
     // Only follow the user's focus: during a batch import the selection must not
     // jump around for every rejected file.
     if (selection.selectedSlug === slug && dup.existingSlug) selection.selectPaper(dup.existingSlug)
-    await collections.load()
-    await library.refresh()
+    scheduleRefresh(root)
   }
 
   const EBOOK_EXT_RE = /\.(epub|mobi|azw3|azw|fb2|txt|zip)$/i
@@ -99,163 +117,179 @@ export const useImportStore = defineStore('import', () => {
     return true
   }
 
-  /**
-   * Import a single ebook file path. The whole pipeline (parse → copy →
-   * metadata from the book itself → sections → fulltext → index → rename)
-   * runs inside the `import_ebook` command; no online metadata fetch.
-   */
-  async function importEbookFile(sourcePath: string, collectionId: string) {
-    const filename = sourcePath.split(/[/\\]/).pop() ?? sourcePath
-    const library = useLibraryStore()
-    const selection = useSelectionStore()
-    const collections = useCollectionsStore()
+  // Local file persistence is independent of AI and duplicate decisions.
+  interface LocalImportTask {
+    sourcePath: string
+    collectionId: string
+    root: string | null
+    jobId: string
+    resolve: () => void
+  }
+  const fileQueue: LocalImportTask[] = []
+  let fileWorkers = 0
+  const FILE_CONCURRENCY = 2
+  const copyWaiters: (() => void)[] = []
+  const pendingDuplicates = new Map<string | null, Set<string>>()
+  let duplicateWork: Promise<void> = Promise.resolve()
 
-    const jobId = `ebook_${crypto.randomUUID()}`
-    let currentSlug = jobId
-    _addJob(jobId, filename)
-    try {
-      const finalSlug = await invoke<string>('import_ebook', { sourcePath, collectionId })
-      currentSlug = finalSlug
-      _updateSlug(jobId, finalSlug)
-      // The ebook's metadata is embedded, so it's known right after import — check
-      // for a duplicate before keeping it.
-      const dup = await invoke<DuplicateHit | null>('find_duplicate_paper', { slug: finalSlug })
-      if (dup && !await confirmDuplicateImport(dup.title)) {
-        await _abortAsDuplicate(finalSlug, filename, dup)
-        return
+  function pendingFor(root: string | null) {
+    let pending = pendingDuplicates.get(root)
+    if (!pending) pendingDuplicates.set(root, pending = new Set())
+    return pending
+  }
+
+  function waitForCopies() {
+    return fileWorkers ? new Promise<void>(resolve => copyWaiters.push(resolve)) : Promise.resolve()
+  }
+
+  function checkDuplicateAndFinish(slug: string, source: string, root: string | null, finish: () => Promise<void>) {
+    // Decisions (including cleanup) are ordered, while parsing/copying proceeds.
+    // An undecided copy cannot be another file's "original": skipping both
+    // sides of such a match used to remove every copy of a new same-title book.
+    const work = duplicateWork.then(async () => {
+      let dup: DuplicateHit | null
+      do {
+        await waitForCopies()
+        dup = await scopedInvoke<DuplicateHit | null>(root, 'find_duplicate_paper', {
+          slug, excludeSlugs: [...pendingFor(root)],
+        })
+      } while (fileWorkers)
+      if (dup) {
+        _setStatus(slug, 'awaiting_duplicate')
+        const keep = await confirmDuplicateImport(dup.title, source)
+        checkRoot(root)
+        if (!keep) {
+          await _abortAsDuplicate(slug, source, dup, root)
+          pendingFor(root).delete(slug)
+          return
+        }
       }
-      _setStatus(finalSlug, 'done')
-      await collections.load()
-      await library.refresh()
-      selection.selectPaper(finalSlug)
-    } catch (e) {
-      _setStatus(currentSlug, 'error', String(e))
+      await finish()
+      pendingFor(root).delete(slug)
+    })
+    duplicateWork = work.catch(() => {})
+    return work
+  }
+
+  async function runFileWorker() {
+    fileWorkers++
+    try {
+      while (fileQueue.length) {
+        const task = fileQueue.shift()!
+        const { sourcePath, collectionId, root, jobId } = task
+        let cur = jobId
+        let deferred = false
+        try {
+          _setStatus(cur, 'importing')
+          const ebook = EBOOK_EXT_RE.test(sourcePath)
+          const slug = await scopedInvoke<string>(root, ebook ? 'import_ebook' : 'import_pdf', { sourcePath, collectionId })
+          _updateSlug(cur, slug)
+          cur = slug
+          pendingFor(root).add(slug)
+          checkRoot(root)
+          scheduleRefresh(root)
+          useSelectionStore().selectPaper(slug)
+          if (ebook) {
+            // Releasing the copy/parse slot before asking is essential: pending
+            // duplicate choices must not prevent the remaining books importing.
+            deferred = true
+            _setStatus(slug, 'queued')
+            enqueueMetadata(slug, true, root, true, task.resolve)
+          } else {
+            _setStatus(slug, 'queued')
+            enqueueMetadata(slug, true, root)
+          }
+        } catch (e) {
+          _setStatus(cur, 'error', String(e))
+        } finally {
+          if (!deferred) task.resolve()
+        }
+      }
+    } finally {
+      fileWorkers--
+      if (!fileWorkers) copyWaiters.splice(0).forEach(resolve => resolve())
     }
   }
 
   /**
-   * Import a single PDF file path.
-   * Pipeline: copy → move to collection → fetch_metadata → rename → extract.
+   * Register a PDF/ebook, then copy and assign it before background recognition.
    * A collectionId is required so every imported paper belongs to a category.
-   * Ebook paths are routed to their own (fully backend-side) pipeline.
+   * Ebooks are parsed locally; PDF fulltext/OCR follows identification.
    */
-  async function importFile(sourcePath: string, collectionId: string) {
+  function importFile(sourcePath: string, collectionId: string): Promise<void> {
     if (!collectionId || !canImportIntoCollection(collectionId)) {
-      return
+      return Promise.resolve()
     }
-
-    if (EBOOK_EXT_RE.test(sourcePath)) {
-      await importEbookFile(sourcePath, collectionId)
-      return
-    }
-
     const filename = sourcePath.split(/[/\\]/).pop() ?? sourcePath
-    const library = useLibraryStore()
-    const selection = useSelectionStore()
-    const collections = useCollectionsStore()
-
-    // 1. Copy PDF + create scaffold
-    let tempSlug: string
-    try {
-      tempSlug = await invoke<string>('import_pdf', { sourcePath })
-    } catch (e) {
-      const phantom = `err_${Date.now()}`
-      _addJob(phantom, filename)
-      _setStatus(phantom, 'error', String(e))
-      return
-    }
-
-    _addJob(tempSlug, filename)
-    // Immediately refresh so the paper appears in the list. With the trailing
-    // refresh guard in the library store this awaits a scan that includes the
-    // just-imported paper.
-    await library.refresh()
-
-    // Locate the freshly-imported paper's id. It should be present after the
-    // refresh above; fall back to invoke in case the scan raced the copy.
-    let tempPaperId = library.papers.find(p => p.slug === tempSlug)?.id ?? null
-    if (!tempPaperId) {
-      try {
-        const entry = await invoke<PaperMeta>('get_paper_meta', { slug: tempSlug })
-        tempPaperId = entry?.id ?? null
-      } catch {
-        // Fallback unavailable — skip the move; the paper still imported fine.
-      }
-    }
-    if (tempPaperId) {
-      await collections.movePaper(tempPaperId, collectionId)
-    }
-
-    // The paper now exists in the library and is selectable. Everything else —
-    // AI metadata, Semantic Scholar venue/references, easyScholar ranking — runs
-    // asynchronously in the background so the import UI never blocks.
-    _setStatus(tempSlug, 'queued')
-    selection.selectPaper(tempSlug)
-    enqueueMetadata(tempSlug, true)
+    const jobId = `file_${crypto.randomUUID()}`
+    _addJob(jobId, filename)
+    _setStatus(jobId, 'queued')
+    const done = new Promise<void>(resolve => fileQueue.push({ sourcePath, collectionId,
+      root: useLibraryStore().currentPath, jobId, resolve }))
+    if (fileWorkers < FILE_CONCURRENCY) void runFileWorker()
+    return done
   }
 
   // ── Background metadata pipeline ──────────────────────────────────────────
-  // Papers are processed one at a time (a shared FIFO queue) so we never fire a
-  // burst of Semantic Scholar / easyScholar requests in parallel and trip their
-  // rate limits, even when many files are imported at once.
-  // Every import path (local PDF, URL/link, arXiv recommendation) runs the same
-  // full pipeline: fulltext + AI-metadata extraction + rename, followed by the
-  // online enrichment (Semantic Scholar venue/references + easyScholar rank).
-  // `checkDuplicate` is set only for local PDFs, whose title/authors aren't known
-  // until AI extraction below — URL/arXiv paths already dedup at import time.
-  const metaQueue: { slug: string; checkDuplicate: boolean }[] = []
-  let metaRunning = false
+  // Two metadata workers and a serial enrichment queue keep slow citation/OCR
+  // work out of the identification path. Only papers receive scholarly enrichment.
+  const metaQueue: { slug: string; checkDuplicate: boolean; root: string | null; ebook: boolean; settled?: () => void }[] = []
+  let metaWorkers = 0
+  const enrichmentQueue: { slug: string; root: string | null; isPaper: boolean }[] = []
+  let enrichmentRunning = false
 
-  function enqueueMetadata(slug: string, checkDuplicate = false) {
-    metaQueue.push({ slug, checkDuplicate })
-    if (!metaRunning) void runMetaWorker()
+  function enqueueMetadata(slug: string, checkDuplicate = false, root = useLibraryStore().currentPath, ebook = false, settled?: () => void) {
+    if (checkDuplicate) pendingFor(root).add(slug)
+    metaQueue.push({ slug, checkDuplicate, root, ebook, settled })
+    if (metaWorkers < 2) void runMetaWorker()
   }
 
   async function runMetaWorker() {
-    metaRunning = true
+    metaWorkers++
     try {
       while (metaQueue.length) {
-        const { slug, checkDuplicate } = metaQueue.shift()!
-        await runMetadataPipeline(slug, checkDuplicate)
+        const { slug, checkDuplicate, root, ebook, settled } = metaQueue.shift()!
+        try {
+          await runMetadataPipeline(slug, checkDuplicate, root, ebook, settled)
+        } catch (e) {
+          _setStatus(slug, 'error', String(e))
+          settled?.()
+        }
       }
     } finally {
-      metaRunning = false
+      metaWorkers--
     }
   }
 
-  // Order (per the paper's lifecycle): fulltext → AI metadata → rename →
-  // Semantic Scholar (venue + references) → easyScholar (venue rank, cache-aware).
-  // Every step is best-effort; a failure never aborts the rest.
-  async function runMetadataPipeline(slug: string, checkDuplicate = false) {
-    const library = useLibraryStore()
-    const readerStore = useReaderStore()
-    const selection = useSelectionStore()
-    const ranks = useRanksStore()
-    const settings = useSettingsStore()
+  // Opening pages → metadata → duplicate choice → rename → background fulltext
+  // and paper-only enrichment. Optional failures retain the copied document.
+  async function runMetadataPipeline(slug: string, checkDuplicate: boolean, root: string | null, ebook: boolean, settled?: () => void) {
+    checkRoot(root)
+    const cur = slug
 
-    let cur = slug
-
-    // 0. Fulltext + search index (prerequisite for AI metadata extraction).
-    _setStatus(cur, 'extracting')
-    try {
-      await invoke('extract_fulltext', { slug: cur })
-      await invoke('index_paper_search', { slug: cur })
-      window.dispatchEvent(new CustomEvent('argus-paper-fulltext-updated', { detail: { slug: cur } }))
-    } catch { /* non-fatal */ }
-
-    // 1. AI metadata (title/authors/year/venue from the PDF). When AI is not
-    //    configured or fails, fall back to the id/title-based online lookup so
-    //    non-AI setups still get metadata.
+    // Identify from five opening pages (ten only when needed). Full-book OCR
+    // must never delay recognizing the rest of a batch, or run for skipped PDFs.
     _setStatus(cur, 'ai_meta')
     let aiOk = false
+    let isPaper = false
     try {
-      const meta = await invoke<PaperMeta>('extract_metadata_ai', { slug: cur })
+      const result = await scopedInvoke<{ meta: PaperMeta; isPaper: boolean; isBook: boolean }>(root, 'extract_import_metadata', { slug: cur })
+      checkRoot(root)
+      const meta = result.meta
+      isPaper = result.isPaper
       window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug: cur, meta } }))
       aiOk = true
-    } catch { /* AI unavailable / no fulltext / error */ }
-    if (!aiOk) {
+    } catch (e) {
+      const job = jobs.value.find(j => j.slug === cur)
+      if (job) job.warning = i18n.global.t('import.metadataRetained', { error: String(e) })
+    }
+    if (!aiOk && !ebook) {
       try {
-        const meta = await invoke<PaperMeta>('fetch_metadata', { slug: cur })
+        // A loose title search can replace a book's name with an unrelated
+        // journal article. Fallback accepts identifiers printed in the PDF only.
+        const meta = await scopedInvoke<PaperMeta>(root, 'fetch_metadata', { slug: cur, allowTitleSearch: false })
+        checkRoot(root)
+        isPaper = !!(meta.doi || meta.arxiv_id)
         window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug: cur, meta } }))
       } catch { /* non-fatal */ }
     }
@@ -267,29 +301,27 @@ export const useImportStore = defineStore('import', () => {
     //     independent copy or skip it — see `_abortAsDuplicate`.
     if (checkDuplicate) {
       const source = jobs.value.find(j => j.slug === cur)?.filename ?? cur
-      let dup: DuplicateHit | null = null
-      try {
-        dup = await invoke<DuplicateHit | null>('find_duplicate_paper', { slug: cur })
-      } catch { /* lookup failed — metadata remains best-effort */ }
-      if (dup) {
-        let keep: boolean
-        try {
-          keep = await confirmDuplicateImport(dup.title)
-        } catch {
-          _setStatus(cur, 'error', i18n.global.t('import.duplicatePromptFailed'))
-          return
-        }
-        if (!keep) {
-          await _abortAsDuplicate(cur, source, dup)
-          return
-        }
-      }
+      _setStatus(cur, 'awaiting_duplicate')
+      void checkDuplicateAndFinish(cur, source, root, () => finishMetadata(cur, root, isPaper, ebook))
+        .catch(e => _setStatus(cur, 'error', String(e)))
+        .finally(() => settled?.())
+      return
     }
+    await finishMetadata(cur, root, isPaper, ebook)
+    settled?.()
+  }
+
+  async function finishMetadata(slug: string, root: string | null, isPaper: boolean, ebook: boolean) {
+    checkRoot(root)
+    const readerStore = useReaderStore()
+    const selection = useSelectionStore()
+    let cur = slug
 
     // 2. Rename the folder to the canonical title-based slug.
     _setStatus(cur, 'renaming')
     try {
-      const newSlug = await invoke<string>('rename_paper_folder', { slug: cur })
+      const newSlug = await scopedInvoke<string>(root, 'rename_paper_folder', { slug: cur })
+      checkRoot(root)
       if (newSlug !== cur) {
         readerStore.replacePaperSlug(cur, newSlug)
         if (selection.selectedSlug === cur) selection.selectPaper(newSlug)
@@ -298,16 +330,66 @@ export const useImportStore = defineStore('import', () => {
       }
     } catch { /* non-fatal */ }
 
+    checkRoot(root)
+    scheduleRefresh(root)
+    if (ebook) {
+      _setStatus(cur, 'done')
+      return
+    }
+    _setStatus(cur, 'queued')
+    enrichmentQueue.push({ slug: cur, root, isPaper })
+    if (!enrichmentRunning) void runEnrichmentWorker()
+  }
+
+  async function runEnrichmentWorker() {
+    enrichmentRunning = true
+    try {
+      while (enrichmentQueue.length) {
+        const { slug, root, isPaper } = enrichmentQueue.shift()!
+        try {
+          await enrichPaper(slug, root, isPaper)
+        } catch (e) {
+          _setStatus(slug, 'error', String(e))
+        }
+      }
+    } finally {
+      enrichmentRunning = false
+    }
+  }
+
+  async function enrichPaper(cur: string, root: string | null, isPaper: boolean) {
+    checkRoot(root)
+    const ranks = useRanksStore()
+    const settings = useSettingsStore()
+
+    _setStatus(cur, 'extracting')
+    try {
+      await scopedInvoke(root, 'extract_fulltext', { slug: cur })
+      checkRoot(root)
+      window.dispatchEvent(new CustomEvent('argus-paper-fulltext-updated', { detail: { slug: cur } }))
+    } catch (e) {
+      const job = jobs.value.find(j => j.slug === cur)
+      if (job) job.warning = [job.warning, i18n.global.t('import.fulltextIncomplete', { error: String(e) })].filter(Boolean).join('\n')
+    }
+    checkRoot(root)
+    if (!isPaper) {
+      _setStatus(cur, 'done')
+      scheduleRefresh(root)
+      return
+    }
+
     // 3. Semantic Scholar — backfill venue/DOI/citation count, then references.
     _setStatus(cur, 'fetching_meta')
     let meta: PaperMeta | null = null
     try {
-      meta = await invoke<PaperMeta>('fetch_citation_count', { slug: cur })
+      meta = await scopedInvoke<PaperMeta>(root, 'fetch_citation_count', { slug: cur })
+      checkRoot(root)
       window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug: cur, meta } }))
     } catch { /* non-fatal */ }
     _setStatus(cur, 'fetching_refs')
     try {
-      await invoke('fetch_references', { slug: cur })
+      await scopedInvoke(root, 'fetch_references', { slug: cur })
+      checkRoot(root)
       window.dispatchEvent(new CustomEvent('argus-references-updated', { detail: { slug: cur } }))
     } catch { /* non-fatal */ }
 
@@ -316,15 +398,18 @@ export const useImportStore = defineStore('import', () => {
     _setStatus(cur, 'ranking')
     try {
       if (!settings.loaded) await settings.load()
+      checkRoot(root)
       if (settings.easyscholarConfigured) {
-        if (!meta) meta = await invoke<PaperMeta>('get_paper_meta', { slug: cur })
+        if (!meta) meta = await scopedInvoke<PaperMeta>(root, 'get_paper_meta', { slug: cur })
+        checkRoot(root)
         const venue = meta?.venue?.trim()
         if (venue) await ranks.fetchRank(venue)
       }
     } catch { /* non-fatal */ }
 
+    checkRoot(root)
     _setStatus(cur, 'done')
-    await library.refresh()
+    scheduleRefresh(root)
   }
 
   /**
@@ -337,6 +422,7 @@ export const useImportStore = defineStore('import', () => {
     }
 
     const library = useLibraryStore()
+    const root = library.currentPath
     const selection = useSelectionStore()
     const collections = useCollectionsStore()
 
@@ -361,6 +447,7 @@ export const useImportStore = defineStore('import', () => {
       importing: 'importing',
     }
     const onBackendProgress = (e: { payload?: { status?: string } }) => {
+      if (library.currentPath !== root) return
       const mapped = e.payload?.status ? backendStatus[e.payload.status] : undefined
       if (!mapped) return
       const j = jobs.value.find(x => x.id === jobId)
@@ -373,7 +460,7 @@ export const useImportStore = defineStore('import', () => {
     } catch { /* progress events are best-effort */ }
 
     try {
-      let res = await invoke<ImportOutcome>('import_paper_url', {
+      let res = await scopedInvoke<ImportOutcome>(root, 'import_paper_url', {
         url: url.trim(),
         collectionId,
       })
@@ -382,36 +469,41 @@ export const useImportStore = defineStore('import', () => {
       // after the user opts into a new, independent copy.
       let acceptedDuplicate = false
       if (res.status === 'duplicate') {
-        if (await confirmDuplicateImport(res.title ?? url.trim())) {
+        _setStatus(jobId, 'awaiting_duplicate')
+        if (await confirmDuplicateImport(res.title ?? url.trim(), url.trim())) {
           acceptedDuplicate = true
-          res = await invoke<ImportOutcome>('import_paper_url', { url: url.trim(), collectionId, force: true })
+          res = await scopedInvoke<ImportOutcome>(root, 'import_paper_url', { url: url.trim(), collectionId, force: true })
           if (res.status !== 'imported' || !res.slug) throw new Error('Duplicate import did not create a separate paper')
         } else {
-          _removeJob(jobId)
+          checkRoot(root)
+          _setStatus(jobId, 'skipped')
           lastDuplicate.value = {
             title: res.title ?? url.trim(),
             existingSlug: res.existingSlug ?? '',
             source: url.trim(),
           }
           await library.refresh()
+          checkRoot(root)
           if (res.existingSlug) selection.selectPaper(res.existingSlug)
           return
         }
       }
 
-      const finalSlug = res.slug ?? jobId
+      if (res.status !== 'imported' || !res.slug) throw new Error('Import did not return a paper identity')
+      const finalSlug = res.slug
+      checkRoot(root)
 
       // Update job with real slug
       const j = jobs.value.find(j => j.id === jobId)
       if (j) {
         j.slug = finalSlug
-        j.id = finalSlug
         j.status = 'queued'
       }
 
       // Reload collections so the new assignment is visible in the collection view
       await collections.load()
       await library.refresh()
+      checkRoot(root)
       selection.selectPaper(finalSlug)
 
       // Run the full metadata pipeline in the background — the same AI-metadata
@@ -419,7 +511,7 @@ export const useImportStore = defineStore('import', () => {
       // import, so link imports end up with identical metadata coverage. The
       // duplicate check runs again unless the user already accepted a copy:
       // AI extraction may correct a scraped title into one that does match.
-      enqueueMetadata(finalSlug, !acceptedDuplicate)
+      enqueueMetadata(finalSlug, !acceptedDuplicate, root)
     } catch (e) {
       const j = jobs.value.find(j => j.id === jobId)
       if (j) {
@@ -445,22 +537,20 @@ export const useImportStore = defineStore('import', () => {
     enqueueMetadata(slug)
   }
 
-  /** Import multiple files, one at a time (to avoid API rate limiting). */
+  /** Register the entire batch immediately; local IO uses a bounded shared pool. */
   async function importFiles(paths: string[], collectionId: string) {
     if (!collectionId || !canImportIntoCollection(collectionId)) {
       return
     }
 
-    for (const p of paths) {
-      await importFile(p, collectionId)
-    }
+    await Promise.allSettled(paths.map(p => importFile(p, collectionId)))
   }
 
   function clearDone() {
-    jobs.value = jobs.value.filter(j => j.status !== 'done')
+    jobs.value = jobs.value.filter(j => !['done', 'skipped', 'error'].includes(j.status))
   }
 
-  const activeCount = computed(() => jobs.value.filter(j => j.status !== 'done' && j.status !== 'error').length)
+  const activeCount = computed(() => jobs.value.filter(j => !['done', 'skipped', 'error'].includes(j.status)).length)
 
   function clearUrlError() { lastUrlError.value = null }
   function clearDuplicateNotice() { lastDuplicate.value = null }

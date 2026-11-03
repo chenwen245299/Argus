@@ -1049,6 +1049,40 @@ command; testing it as a boolean skips the user's decision. A dialog failure
 does not approve a known duplicate. Cleanup failure stays an error and must
 not report that the new copy was removed.
 
+**Batch imports and book metadata.** `stores/import.ts` registers every dropped
+file before starting work. One shared pool bounds local copy/ebook parsing to
+two tasks across overlapping drops; a separate two-worker metadata queue does
+not wait for duplicate decisions, full-book extraction/OCR or serial scholarly
+enrichment. All local file persistence (including classification) runs on the
+blocking pool. Failed persistence/assignment rolls back only its reserved UUID;
+queued commands carry `expectedRoot` and stop after a library switch. Collection
+moves share the paper namespace lock with reservations/renames. List refreshes
+are coalesced, and `ImportQueue.vue` retains per-file completion, skips, errors
+and nonfatal metadata/fulltext warnings with stable job ids.
+Duplicate lookup/choice/cleanup is ordered separately. Lookup excludes undecided
+copies from that window, so same-batch copies cannot name one another as the
+original and all get discarded. Native dialogs are serialized and show the
+incoming filename. Skipping invokes the existing delete path; related-link
+cleanup reuses paths from one traversal and runs off the async runtime.
+
+`metadata::identify_document` serves automatic and manual recognition. It sends
+five opening PDF page images plus bounded page text to a vision-capable model;
+uncertain/missing titles request ten pages once, never an unbounded scan. Text-only
+models receive page text. EPUB and other reflowable books use their cover resources
+and the first five/ten spine sections, since they have no fixed PDF pages.
+`metadata_evidence.rs` labels actual page/section coverage and rendering failures;
+images are transient request data, bounded to a 1600-pixel edge and a byte budget.
+No full-book OCR is required before identification. Book/title/copyright evidence
+takes priority over filename hints, series/catalog entries and cited works. A
+confirmed book keeps its own year/publisher and skips scholarly title/citation/
+reference enrichment; uncertain results retain the saved name and show a warning.
+Automatic fallback disables loose title searches. The prior two built-in metadata
+prompts migrate by exact identity; custom prompts remain. Filename truncation is
+UTF-8-byte bounded, so long Chinese names fit filesystem component limits.
+Regressions: `scripts/test-duplicate-import.mjs`,
+`scripts/test-import-batch-browser.mjs`, Rust `local_import_tests`,
+`metadata_evidence::tests`, metadata identity tests and `duplicate_import_tests`.
+
 **Prompt-cache keepalive (`cache_keepalive.rs`).** An agent turn sends a large
 prefix (the system prompt, every tool schema — external servers' too — and the
 conversation), and providers with automatic prefix caching bill a repeat of it
@@ -1318,6 +1352,19 @@ Two engines draw a page, and **a page's bitmap is always derived from its CSS bo
   window. When upgrading pdf.js, keep both and rerun
   `node --test scripts/test-readable-stream-iterator.mjs`.
 - `PDF_ENABLE_HWA` (next to `getDocument`) makes pdf.js use accelerated canvases: far less main-thread compositing per page, text pixel-identical, vector line art antialiased slightly differently. Set it to `false` for bit-identical output with the old software canvases.
+- Both PDF.js document entry points (`PdfViewer.vue` and `sections.ts`) configure
+  `wasmUrl` and `iccUrl` alongside fonts/cmaps. JPEG 2000 page images and JBIG2
+  masks require the shipped decoders: absent resources make `page.render()`
+  resolve with blank images, even when the PDF and its OCR text are intact.
+  Keep `wasmUrl` absolute (`new URL(..., window.location.href).href`), so Vite
+  does not rewrite the decoder's fallback `import()` into a forbidden source
+  import from `public/`. `setup-pdfjs-assets.js` copies `wasm/` (including JS
+  fallbacks/licenses) and `iccs/` as well as fonts/cmaps at install, dev and both
+  build entries. Do not rely on a previously populated public folder.
+  Regression: `scripts/test-pdf-image-codecs.mjs` uses the real viewer options
+  and PDF.js worker with a generated JPEG 2000 pattern, checks WASM/JS fallback
+  pixels and shipped resource versions; optional `ARGUS_TEST_PDF` checks a local
+  scanned PDF's cover/body without modifying or committing that file.
 - A visible page must retain selectable text even if PDF.js's font/layout path
   fails. `utils/pdfTextLayer.ts` keeps the normal layer when its text and boxes
   are complete; rejected, hung (1.5 s) or empty layouts recover from the PDF's
@@ -1935,6 +1982,14 @@ The store caches history for five minutes and rejects stale results from a
 superseded check. History loading does not change the installer or download
 state; the signed updater manifest remains the sole installation source.
 No release-workflow changes or separate changelog maintenance are needed.
+
+**macOS update menu.** `app_menu.rs` extends Tauri's default Argus menu with
+“Check for Updates…” immediately below About. It focuses/recreates the main
+window and retains a pending request until that window consumes it.
+`useNativeUpdateMenu` opens Settings → About and runs the existing manual check,
+so checking/latest/error feedback and release notes are visible even without an
+open library. Other windows never own an updater request. Regression coverage
+is included in `scripts/test-update-notes.mjs`.
 
 ### macOS install note
 

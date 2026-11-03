@@ -2,6 +2,7 @@ mod activity;
 mod ai_manager;
 mod ai_summary;
 mod annotations;
+mod app_menu;
 mod arxiv;
 mod arxiv_pdf_cache;
 mod arxiv_scheduler;
@@ -31,6 +32,7 @@ mod llm;
 mod mcp;
 mod media;
 mod metadata;
+mod metadata_evidence;
 mod mimo;
 mod mimo_media;
 mod minimax;
@@ -102,6 +104,9 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(LibraryRoot(Mutex::new(None)))
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            app_menu::install(app)?;
+
             #[cfg(target_os = "windows")]
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_decorations(false);
@@ -153,6 +158,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            app_menu::take_update_check_request,
             // ── M0-M3: Library management ──
             commands::pick_library_folder,
             commands::open_library,
@@ -225,6 +231,7 @@ pub fn run() {
             commands::set_semantic_scholar_key,
             commands::semantic_scholar_key_status,
             commands::extract_metadata_ai,
+            commands::extract_import_metadata,
             commands::extract_first_page_text,
             commands::rename_paper_folder,
             // ── M4: Settings ──

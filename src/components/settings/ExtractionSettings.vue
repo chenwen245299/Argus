@@ -9,7 +9,37 @@ const settingsStore = useSettingsStore()
 const aiStore = useAiStore()
 
 // Must match the Rust `default_metadata_ai_prompt()` in src-tauri/src/models.rs.
-const DEFAULT_METADATA_AI_PROMPT = `Extract bibliographic metadata for the document the text below was taken from.
+const DEFAULT_METADATA_AI_PROMPT = `Extract bibliographic metadata for THIS document from the supplied opening pages,
+page images (when present), embedded ebook metadata and text with original line breaks.
+
+Rules:
+- Identify the document itself. Never take titles/authors from a reference list,
+  advertisement, series list, table of contents or quoted publication.
+- For a book, compare its cover, title page and copyright page. Preserve the
+  original-language full title/subtitle. Separate authors from translators and
+  series editors. Use the book's own publication year and publisher.
+- Use document_type="book" for books, "paper" for a single academic paper/preprint,
+  and "other" for CVs, slide decks, manuals and lists of publications.
+- For books, DOI/arxiv_id are null and venue is the publisher. For "other", year,
+  venue, DOI and arxiv_id are null. For papers, use their own publication evidence.
+- Do not guess. Unknown fields are null. The filename and embedded metadata are
+  hints; the document's own title/copyright pages take priority.
+- Set needs_more_pages=true and title_confidence="low" or "medium" if the pages
+  do not establish this document's actual title or authors. More opening pages
+  may be supplied once, up to ten. At ten, keep unknown fields null.
+
+Reply with a JSON code block in exactly this format:
+
+\`\`\`json
+{"document_type": "book", "title": "...", "authors": ["First Last"], "year": 2024, "venue": "Publisher or journal", "doi": null, "arxiv_id": null, "title_confidence": "high", "needs_more_pages": false}
+\`\`\`
+
+File name: {filename}
+
+Text:
+{text}`
+
+const LEGACY_METADATA_AI_PROMPT_V2 = `Extract bibliographic metadata for the document the text below was taken from.
 The text is the beginning of that document, with its original line breaks.
 
 Rules:
@@ -158,6 +188,7 @@ function normalizeMetadataPrompt(prompt?: string) {
   const trimmed = prompt?.trim()
   return !trimmed
     || trimmed === LEGACY_METADATA_AI_PROMPT_V1.trim()
+    || trimmed === LEGACY_METADATA_AI_PROMPT_V2.trim()
     || trimmed.includes('a concise paper abstract')
     || trimmed.includes('- abstract: string or null')
     || trimmed.includes('No markdown, no code blocks')

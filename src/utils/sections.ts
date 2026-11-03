@@ -239,6 +239,8 @@ export async function detectSectionsForSlug(slug: string): Promise<PaperSections
     standardFontDataUrl: '/pdfjs/standard_fonts/',
     cMapUrl: '/pdfjs/cmaps/',
     cMapPacked: true,
+    wasmUrl: new URL('/pdfjs/wasm/', window.location.href).href,
+    iccUrl: '/pdfjs/iccs/',
   }).promise
   try {
     return await computeSections(doc)

@@ -35,7 +35,7 @@ const emojiIcon = computed(() => fluentReady.value ? fluentIconFor(emoji.value) 
       @click="$emit('select', collection)"
     >
       <span class="shortcut-emoji" aria-hidden="true">
-        <Icon v-if="emojiIcon" :icon="emojiIcon" width="15" height="15" />
+        <Icon v-if="emojiIcon" :icon="emojiIcon" width="13" height="13" />
         <template v-else>{{ emoji }}</template>
       </span>
       <span class="shortcut-label">
@@ -51,7 +51,7 @@ const emojiIcon = computed(() => fluentReady.value ? fluentIconFor(emoji.value) 
       :disabled="collections.isPinPending(collection.id)"
       @click.stop="$emit('togglePin', collection)"
     >
-      <Icon icon="fluent:pin-16-filled" width="13" height="13" />
+      <Icon icon="fluent:pin-16-filled" width="12" height="12" />
     </button>
   </div>
 </template>
@@ -60,8 +60,8 @@ const emojiIcon = computed(() => fluentReady.value ? fluentIconFor(emoji.value) 
 .pinned-collection-row {
   display: flex;
   align-items: center;
-  margin: 2px 6px;
-  border-radius: var(--radius-md);
+  margin: 1px 6px;
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
   transition: background 0.12s, color 0.12s;
 }
@@ -71,28 +71,28 @@ const emojiIcon = computed(() => fluentReady.value ? fluentIconFor(emoji.value) 
 .pinned-collection-open {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex: 1;
   min-width: 0;
-  padding: 6px 0 6px 9px;
+  padding: 4px 0 4px 9px;
   text-align: left;
   color: inherit;
 }
-.shortcut-emoji { display: flex; align-items: center; justify-content: center; flex: 0 0 15px; font-size: 13px; }
-.shortcut-label { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 1px; }
+.shortcut-emoji { display: flex; align-items: center; justify-content: center; flex: 0 0 13px; font-size: 12px; }
+.shortcut-label { display: flex; flex: 1; min-width: 0; flex-direction: column; }
 .shortcut-name, .shortcut-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.shortcut-name { font-size: 13px; line-height: 18px; }
+.shortcut-name { font-size: 12px; line-height: 16px; }
 .active .shortcut-name { font-weight: 500; }
-.shortcut-path { font-size: 10px; line-height: 14px; color: var(--text-tertiary); }
-.shortcut-count { flex-shrink: 0; min-width: 20px; padding: 1px 6px; border-radius: var(--radius-pill); font-size: 10px; text-align: center; background: var(--bg-hover); color: var(--text-secondary); }
+.shortcut-path { font-size: 10px; line-height: 12px; color: var(--text-tertiary); }
+.shortcut-count { flex-shrink: 0; min-width: 18px; padding: 0 5px; border-radius: var(--radius-pill); font-size: 10px; line-height: 14px; text-align: center; background: var(--bg-hover); color: var(--text-secondary); }
 .active .shortcut-count { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
 .shortcut-unpin {
   display: flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 24px;
-  height: 24px;
-  margin: 0 3px;
+  flex: 0 0 22px;
+  height: 22px;
+  margin: 0 2px;
   color: var(--accent);
   opacity: 0.65;
   border-radius: var(--radius-sm);

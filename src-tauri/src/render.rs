@@ -98,6 +98,34 @@ pub fn render_pdf_page_png(pdf_path: &Path, page: u32, dpi: u32) -> Result<Vec<u
     }
 }
 
+/// Bounded images for bibliographic recognition; never allocate reader-sized
+/// bitmaps for a batch's ten-page metadata previews.
+pub fn render_metadata_page_png(pdf_path: &Path, page: u32) -> Result<Vec<u8>, String> {
+    render_with_pdfium(pdf_path, page, Target::Fit(1600)).or_else(|pdfium_err| {
+        render_with_pdftoppm(pdf_path, page, &["-scale-to".into(), "1600".into()])
+            .map_err(|e| format!("{pdfium_err} · {e}"))
+    })
+}
+
+/// Read just the front matter through the same cached document used to render
+/// its images, avoiding a second full-PDF parse for each large scanned book.
+pub fn metadata_page_texts(pdf_path: &Path, limit: usize) -> Result<(usize, Vec<String>), String> {
+    let path = pdf_path.to_path_buf();
+    run_on_pdfium(move |pdfium, cache| {
+        let key = DocKey::of(&path)?;
+        let (result, _) = cache.with_doc(pdfium, &key, |doc| {
+            let total = doc.pages().len() as usize;
+            let texts = (0..limit.min(total)).map(|index| {
+                doc.pages().get(index as u16).ok().and_then(|page| page.text().ok().map(|text| {
+                    text.all().chars().take(1800).collect::<String>()
+                })).unwrap_or_default()
+            }).collect();
+            (total, texts)
+        })?;
+        Ok(result)
+    })?
+}
+
 // ── PDFium (bundled, the normal path) ─────────────────────────────────────────
 
 /// Character boxes in the reader's scale-1, top-left viewport coordinates.
@@ -209,6 +237,8 @@ enum Target {
     Size(u32, u32),
     /// The page scaled from PDF user space (72 DPI) to this resolution.
     Dpi(u32),
+    /// Fit the longest edge, preserving the page's aspect ratio.
+    Fit(u32),
 }
 
 /// Pin a DPI request to a pixel size when it would be too big, once the page's own
@@ -218,6 +248,13 @@ enum Target {
 /// that is left as a DPI one renders at exactly the size tested here. Saturating
 /// float-to-int casts keep absurd page sizes and DPIs from wrapping.
 fn resolve_target(page_width_pt: f32, page_height_pt: f32, target: Target) -> Target {
+    if let Target::Fit(edge) = target {
+        let scale = edge as f64 / (page_width_pt.max(page_height_pt).max(1.0) as f64);
+        return Target::Size(
+            (page_width_pt as f64 * scale).round().max(1.0) as u32,
+            (page_height_pt as f64 * scale).round().max(1.0) as u32,
+        );
+    }
     let Target::Dpi(dpi) = target else {
         return target;
     };
@@ -236,6 +273,7 @@ impl Target {
         match self {
             Target::Size(w, h) => PdfRenderConfig::new().set_target_size(w as Pixels, h as Pixels),
             Target::Dpi(dpi) => PdfRenderConfig::new().scale_page_by_factor(dpi as f32 / 72.0),
+            Target::Fit(_) => unreachable!("fit is resolved using page dimensions"),
         }
     }
 }
@@ -921,6 +959,7 @@ mod tests {
             match super::resolve_target(pw, ph, Target::Dpi(dpi)) {
                 Target::Size(w, h) => assert!(w >= 1 && h >= 1 && w as u64 * h as u64 <= max, "{pw}x{ph}@{dpi} -> {w}x{h}"),
                 Target::Dpi(_) => {}
+                Target::Fit(_) => panic!("DPI resolution must not return a fit request"),
             }
         }
     }

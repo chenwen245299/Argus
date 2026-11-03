@@ -222,6 +222,9 @@ export type ImportStatus =
   | 'fetching_meta'
   | 'fetching_refs'
   | 'ranking'
+  | 'awaiting_duplicate'
+  | 'skipping'
+  | 'skipped'
   | 'done'
   | 'error'
 
@@ -231,6 +234,7 @@ export interface ImportJob {
   filename: string
   status: ImportStatus
   error?: string
+  warning?: string
 }
 
 export type SortField = 'title' | 'year' | 'added_at' | 'authors' | 'venue' | 'cite_count'

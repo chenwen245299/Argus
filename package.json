@@ -4,8 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/setup-pdfjs-assets.js",
     "dev": "vite",
+    "prebuild": "node scripts/setup-pdfjs-assets.js",
     "build": "vue-tsc --noEmit && vite build",
+    "prebuild:fast": "node scripts/setup-pdfjs-assets.js",
     "build:fast": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",

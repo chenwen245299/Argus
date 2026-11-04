@@ -25,7 +25,7 @@ tauri-plugin-store = "2"
 tauri-plugin-window-state = "2"
 tauri-plugin-http = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 semver = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -47,6 +47,9 @@ base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 roxmltree = "0.20"
 encoding_rs = "0.8"
+cfb = "0.7.3"
+# Keep the existing zip 2 / older toolchain compatibility for legacy XLS reads.
+calamine = { version = "0.26.1", features = ["dates"] }
 mobi = "0.8"
 notify = "8.2.0"
 # MCP server exposed to external agents (Claude Code / Claude Desktop). Runs as

@@ -9,9 +9,10 @@ import type { ChatContentPart, ImageDetail } from '../types'
 
 export interface Attachment {
   id: string
-  type: 'image' | 'pdf' | 'video' | 'audio'
+  type: 'image' | 'pdf' | 'video' | 'audio' | 'word' | 'powerpoint' | 'excel' | 'json'
   name: string
   dataUrl: string
+  format?: LocalDocumentFormat
   /**
    * DeepSeek image fidelity. Unset means full resolution; `low` rescales to
    * 512x512, which costs roughly a third of the tokens. Other providers ignore
@@ -42,7 +43,34 @@ const VIDEO_EXT = /\.(mp4|mov|mkv|avi)$/i
 const AUDIO_MIME = /^audio\/(mpeg|mp3|wav|x-wav|wave|vnd\.wave)$/i
 const AUDIO_EXT = /\.(mp3|wav)$/i
 
-export const ATTACHMENT_ACCEPT = 'image/*,.pdf,.mp4,.mov,.mkv,.avi,.mp3,.wav'
+export type OfficeFormat = 'doc' | 'docx' | 'ppt' | 'pptx' | 'xls' | 'xlsx' | 'csv' | 'tsv'
+export type LocalDocumentFormat = OfficeFormat | 'json'
+const OFFICE_MIME: Record<string, OfficeFormat> = {
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-powerpoint': 'ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'text/csv': 'csv', 'application/csv': 'csv', 'text/comma-separated-values': 'csv', 'text/tab-separated-values': 'tsv',
+}
+export function officeFormatFor(file: Pick<File, 'name' | 'type'>): OfficeFormat | null {
+  const extension = file.name.split('.').pop()?.toLowerCase()
+  if (extension && ['doc','docx','ppt','pptx','xls','xlsx','csv','tsv'].includes(extension)) return extension as OfficeFormat
+  return OFFICE_MIME[file.type.toLowerCase()] ?? null
+}
+export function isOfficeAttachment(att: Pick<Attachment, 'type'>): boolean {
+  return att.type === 'word' || att.type === 'powerpoint' || att.type === 'excel'
+}
+export function isLocalDocumentAttachment(att: Pick<Attachment, 'type'>): boolean {
+  return isOfficeAttachment(att) || att.type === 'json'
+}
+export function attachmentIcon(att: Pick<Attachment, 'type'>): string {
+  if (att.type === 'json') return 'fluent:code-24-regular'
+  return att.type === 'powerpoint' ? 'fluent:slide-text-24-regular'
+    : att.type === 'excel' ? 'fluent:table-24-regular' : 'fluent:document-text-24-regular'
+}
+export const ATTACHMENT_ACCEPT = 'image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.tsv,.json,application/json,.mp4,.mov,.mkv,.avi,.mp3,.wav'
 
 /**
  * Ceiling on an inline video, well under the 50 MB MiniMax allows and the 128 MB
@@ -58,6 +86,9 @@ export const ATTACHMENT_ACCEPT = 'image/*,.pdf,.mp4,.mov,.mkv,.avi,.mp3,.wav'
 export const MAX_INLINE_VIDEO_BYTES = 15 * 1024 * 1024
 export const MAX_INLINE_VIDEO_MB = Math.round(MAX_INLINE_VIDEO_BYTES / (1024 * 1024))
 
+/** Local PDF parsing/rendering and conversation storage ceiling. No upload. */
+export const MAX_LOCAL_PDF_BYTES = 64 * 1024 * 1024
+
 /**
  * Ceiling on an inline sound clip.
  *
@@ -72,7 +103,10 @@ export const MAX_INLINE_AUDIO_MB = Math.round(MAX_INLINE_AUDIO_BYTES / (1024 * 1
 /** The attachment kind for a picked file, or null when it is not one we take. */
 export function attachmentTypeFor(file: File): Attachment['type'] | null {
   if (file.type.startsWith('image/')) return 'image'
-  if (file.type === 'application/pdf') return 'pdf'
+  if (file.type === 'application/pdf' || (!file.type && /\.pdf$/i.test(file.name))) return 'pdf'
+  if (/\.json$/i.test(file.name) || /^(application|text)\/(json|[a-z0-9.+-]+\+json)$/i.test(file.type)) return 'json'
+  const format = officeFormatFor(file)
+  if (format) return format === 'doc' || format === 'docx' ? 'word' : format === 'ppt' || format === 'pptx' ? 'powerpoint' : 'excel'
   // A file dragged in from some file managers arrives with an empty `type`, so
   // the extension is the fallback rather than the primary test.
   if (VIDEO_MIME.test(file.type) || (!file.type && VIDEO_EXT.test(file.name))) return 'video'
@@ -84,6 +118,7 @@ export function attachmentTypeFor(file: File): Attachment['type'] | null {
 function limitFor(type: Attachment['type']): number | null {
   if (type === 'video') return MAX_INLINE_VIDEO_BYTES
   if (type === 'audio') return MAX_INLINE_AUDIO_BYTES
+  if (type === 'pdf' || isLocalDocumentAttachment({ type })) return MAX_LOCAL_PDF_BYTES
   return null
 }
 
@@ -121,6 +156,10 @@ export function readAttachmentFile(file: File): Promise<AttachmentRead> | null {
         type === 'image' ? 'pasted-image.png'
         : type === 'video' ? 'clip.mp4'
         : type === 'audio' ? 'clip.wav'
+        : type === 'word' ? 'document.docx'
+        : type === 'powerpoint' ? 'presentation.pptx'
+        : type === 'excel' ? 'workbook.xlsx'
+        : type === 'json' ? 'data.json'
         : 'pasted-file.pdf'
       resolve({
         status: 'ok',
@@ -129,12 +168,12 @@ export function readAttachmentFile(file: File): Promise<AttachmentRead> | null {
           type,
           name: file.name || fallback,
           dataUrl: reader.result as string,
+          ...(officeFormatFor(file) ? { format: officeFormatFor(file)! } : {}),
         },
       })
     }
     // A read failure is not a size problem, and reporting it as one sends the
-    // user off trimming a file that was never too big — an image or a PDF has no
-    // size limit here at all, so the "limit" would have been invented.
+    // user off trimming a file that was never too big.
     reader.onerror = () => resolve({ status: 'unreadable', name: file.name || 'file' })
     reader.readAsDataURL(file)
   })
@@ -144,11 +183,7 @@ export function readAttachmentFile(file: File): Promise<AttachmentRead> | null {
 export function buildContentParts(text: string, atts?: Attachment[]): ChatContentPart[] {
   const parts: ChatContentPart[] = [{ type: 'text', text }]
   for (const att of atts ?? []) {
-    // An exhaustive switch rather than a trailing `else`: the old shape sent an
-    // unrecognised kind as a PDF `file` block, which is a well-formed request the
-    // model simply cannot read — no error anywhere, just a clip the model never
-    // heard. A kind added later now falls through to `default` and is dropped
-    // loudly instead.
+    // Keep attachment kinds explicit, including PDFs handled only by local tools.
     switch (att.type) {
       case 'image':
         parts.push({
@@ -162,8 +197,20 @@ export function buildContentParts(text: string, atts?: Attachment[]): ChatConten
       case 'audio':
         parts.push({ type: 'input_audio', input_audio: { data: att.dataUrl } })
         break
+      case 'json':
+        parts.push({ type: 'local_document', id: att.id, filename: att.name, format: 'json', data_url: att.dataUrl })
+        break
+      case 'word':
+      case 'powerpoint':
+      case 'excel':
+        parts.push({ type: 'local_document', id: att.id, filename: att.name,
+          format: att.format ?? officeFormatFor({ name: att.name, type: '' }) ?? (att.type === 'word' ? 'docx' : att.type === 'powerpoint' ? 'pptx' : 'xlsx'),
+          data_url: att.dataUrl })
+        break
       case 'pdf':
-        parts.push({ type: 'file', file: { filename: att.name, file_data: att.dataUrl } })
+        // Internal IPC only. Rust stores the PDF locally and exposes a reading
+        // tool; neither this block nor the PDF bytes reach the model API.
+        parts.push({ type: 'local_pdf', id: att.id, filename: att.name, data_url: att.dataUrl })
         break
       default: {
         // Exhaustiveness check: adding a kind to `Attachment['type']` without a

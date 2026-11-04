@@ -1122,10 +1122,25 @@ pub enum ChatContentPart {
     /// signal. Only a model tagged `audio` is offered the attachment.
     #[serde(rename = "input_audio")]
     InputAudio { input_audio: InputAudioData },
-    /// An attachment carried either inline (`file`, OpenRouter/Kimi-style base64
-    /// `file_data`) or by reference (`file_id`, DeepSeek's Files API handle).
-    /// Both providers spell the block `{"type": "file", …}`, so the two payloads
-    /// share one variant and each is omitted when absent.
+    /// Internal IPC/checkpoint reference. PDF bytes stay local; outgoing
+    /// requests replace this with a description of the local reading tool.
+    #[serde(rename = "local_pdf")]
+    LocalPdf {
+        id: String,
+        filename: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data_url: Option<String>,
+    },
+    #[serde(rename = "local_document")]
+    LocalDocument {
+        id: String,
+        filename: String,
+        format: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data_url: Option<String>,
+    },
+    /// Legacy inline attachments are accepted for history migration only.
+    /// file_id remains available for DeepSeek's image Files API.
     #[serde(rename = "file")]
     File {
         #[serde(default, skip_serializing_if = "Option::is_none")]

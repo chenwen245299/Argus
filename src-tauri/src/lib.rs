@@ -14,6 +14,9 @@ mod canvas_edit;
 mod canvas_enhance;
 mod chat_context;
 mod chat_images;
+mod chat_attachments;
+mod json_documents;
+mod office_documents;
 mod note_trash;
 mod collections;
 mod commands;
@@ -326,6 +329,7 @@ pub fn run() {
             commands::save_library_conversation,
             commands::delete_library_conversation,
             commands::read_chat_image,
+            commands::read_office_attachment_preview,
             commands::copy_chat_branch_images,
             // ── M7: RAG Settings ──
             commands::get_rag_settings,

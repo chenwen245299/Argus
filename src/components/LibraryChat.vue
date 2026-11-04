@@ -46,8 +46,10 @@ import type {
 } from '../types'
 
 const emit = defineEmits<{ 'open-settings': [section?: 'ai' | 'agent'] }>()
+import OfficeAttachmentPreview from './OfficeAttachmentPreview.vue'
+
 import {
-  ATTACHMENT_ACCEPT, buildContentParts, readAttachmentFile, type Attachment,
+  ATTACHMENT_ACCEPT, buildContentParts, readAttachmentFile, isLocalDocumentAttachment, attachmentIcon, type Attachment,
 } from '../utils/attachments'
 
 const { t } = useI18n()
@@ -565,6 +567,7 @@ const attachments = ref<Attachment[]>([])
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const previewImage = ref<string | null>(null)
 const previewPdf = ref<string | null>(null)
+const previewOffice = ref<Attachment | null>(null)
 const previewVideo = ref<string | null>(null)
 const previewAudio = ref<string | null>(null)
 /** Why the last picked file was refused (currently only an oversized clip). */
@@ -1612,8 +1615,8 @@ function chatHistoryFromMessages(messages: LibraryUiMessage[], conversationId?: 
   for (const m of messages) {
     if (m.role === 'user') {
       // Keep attachments inside the user message so they travel with the
-      // conversation history. Each PDF only needs to be uploaded once; later
-      // turns can reference it via the prior messages.
+      // conversation history. PDFs are registered locally for tool reads;
+      // later turns retain their local references, without API file uploads.
       if (m.attachments?.length) {
         history.push({ role: 'user', content: buildContentParts(m.content, m.attachments) })
       } else {
@@ -1962,9 +1965,9 @@ function addAttachmentFromFile(file: File) {
     } else if (res.status === 'unreadable') {
       attachmentError.value = t('chat.attachmentUnreadable', { name: res.name })
     } else {
-      // Video and audio are capped for different reasons, so each says its own.
+      // Each attachment kind explains its own size limit.
       attachmentError.value = t(
-        res.type === 'audio' ? 'chat.audioTooLarge' : 'chat.videoTooLarge',
+        isLocalDocumentAttachment({ type: res.type }) ? 'chat.officeTooLarge' : res.type === 'pdf' ? 'chat.pdfTooLarge' : res.type === 'audio' ? 'chat.audioTooLarge' : 'chat.videoTooLarge',
         { name: res.name, mb: res.limitMb },
       )
     }
@@ -2006,14 +2009,17 @@ function previewAttachment(att: Attachment) {
     previewVideo.value = att.dataUrl
   } else if (att.type === 'audio') {
     previewAudio.value = att.dataUrl
-  } else {
+  } else if (att.type === 'pdf') {
     previewPdf.value = att.dataUrl
+  } else if (isLocalDocumentAttachment(att)) {
+    previewOffice.value = att
   }
 }
 
 function closePreview() {
   previewImage.value = null
   previewPdf.value = null
+  previewOffice.value = null
   previewVideo.value = null
   previewAudio.value = null
 }
@@ -2761,6 +2767,7 @@ onMounted(async () => {
   // per-library data when the active library changes — otherwise it would show
   // (and, worse, save) the previous library's conversations against the new one.
   unlistenLibraryChanged = await listen('library-changed', async () => {
+    closePreview()
     // First, so that anything already in flight is barred from writing: the
     // backend has already switched roots, and a stream that settles after this
     // point would file the old library's conversation under the new one.
@@ -3079,7 +3086,7 @@ onUnmounted(() => {
                       @click="previewAttachment(att)"
                     >
                       <img v-if="att.type === 'image'" :src="att.dataUrl" class="user-attachment-thumb" alt="" />
-                      <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
+                      <Icon :icon="attachmentIcon(att)" v-else width="14" height="14" />
                       <span class="user-attachment-name">{{ att.name }}</span>
                     </button>
                   </div>
@@ -3453,8 +3460,9 @@ onUnmounted(() => {
                 <img v-if="att.type === 'image'" :src="att.dataUrl" class="attachment-thumb" alt="" />
                 <Icon v-else-if="att.type === 'video'" icon="fluent:video-clip-24-regular" width="14" height="14" />
                 <Icon v-else-if="att.type === 'audio'" icon="fluent:music-note-2-24-regular" width="14" height="14" />
-                <Icon v-else icon="fluent:document-24-regular" width="14" height="14" />
-                <span class="attachment-name">{{ att.name }}</span>
+                <Icon :icon="attachmentIcon(att)" v-else width="14" height="14" />
+                <button v-if="isLocalDocumentAttachment(att)" class="attachment-name office-attachment-open" @click="previewAttachment(att)">{{ att.name }}</button>
+              <span v-else class="attachment-name">{{ att.name }}</span>
                 <button
                   v-if="att.type === 'image'"
                   class="attachment-detail"
@@ -3749,6 +3757,7 @@ onUnmounted(() => {
         <Icon icon="fluent:dismiss-24-regular" width="16" height="16" />
       </button>
     </div>
+    <OfficeAttachmentPreview v-if="previewOffice" :attachment="previewOffice" :expected-root="conversationLibraryRoot" @close="closePreview" />
     <div v-if="previewPdf" class="attachment-lightbox pdf-lightbox" @click.self="closePreview">
       <iframe :src="previewPdf" class="lightbox-pdf" frameborder="0"></iframe>
       <button class="lightbox-close" @click="closePreview">
@@ -5464,6 +5473,9 @@ onUnmounted(() => {
   border-radius: 4px;
   flex-shrink: 0;
 }
+.office-attachment-open { border: 0; padding: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; font: inherit; }
+.office-attachment-open:hover { text-decoration: underline; }
+
 .attachment-name {
   overflow: hidden;
   text-overflow: ellipsis;

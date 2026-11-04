@@ -58,12 +58,12 @@ export function contextPercent(usage: ContextUsage): number {
 /** Match backend media estimates without scanning inline base64 blobs. */
 export function withContextDraft(usage: ContextUsage, text: string, attachments: Attachment[] = []): ContextUsage {
   const media = attachments.reduce((n, attachment) => n + (attachment.type === 'image'
-    ? attachment.detail === 'low' ? 85 : 2048 : attachment.type === 'pdf' ? 4096 : 8192), 0)
+    ? attachment.detail === 'low' ? 85 : 2048 : ['pdf','word','powerpoint','excel','json'].includes(attachment.type) ? 150 + estimateContextText(attachment.name || '') : 8192), 0)
   const draft = text || attachments.length ? estimateContextText(text) + 4 + (attachments.length ? 4 : 0) + media : 0
   const usedTokens = usage.usedTokens + draft
   return { ...usage, usedTokens, remainingTokens: Math.max(0, usage.contextWindow - usedTokens),
     messageTokens: usage.messageTokens + draft, estimated: usage.estimated || draft > 0,
-    mediaEstimated: usage.mediaEstimated || attachments.length > 0 }
+    mediaEstimated: usage.mediaEstimated || attachments.some(attachment => !['pdf','word','powerpoint','excel','json'].includes(attachment.type)) }
 }
 
 export function applyContextCheckpoint<T extends { id: string }>(

@@ -27,7 +27,7 @@ pub mod app_tools;
 pub(crate) mod library_note_tools;
 pub(crate) mod arxiv_tools;
 pub mod client;
-mod paper_images;
+pub(crate) mod paper_images;
 pub(crate) mod note_images;
 mod passage_anchors;
 mod server;

@@ -37,6 +37,7 @@ pub async fn for_request(
 }
 
 fn resolve(root: &str, mut messages: Vec<Value>, vision: bool) -> Result<Vec<Value>, String> {
+    crate::chat_attachments::for_request(&mut messages);
     let mut loaded = HashMap::new();
     for message in &mut messages {
         let Some(parts) = message["content"].as_array_mut() else {

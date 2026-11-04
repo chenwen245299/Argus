@@ -969,6 +969,52 @@ knowledge-source selector and always sends `knowledgeSource: "agent"`,
   exact text are stable across window sync/save/reload and included in checkpoint
   fingerprints. These changes do not backfill missing old tool payloads or
   automatically read paper sections the model never fetched.
+- **Chat document attachments stay local.** Paper AI (sidebar/standalone) and
+  library chat use `utils/attachments.ts`'s internal `local_pdf` and
+  `local_document` parts. `chat_attachments.rs` stages immutable originals
+  before context measurement, preserving PDFs under `.argus/chat-pdfs/` and
+  Office/JSON/CSV/TSV originals under `.argus/chat-documents/`. Its app-only readers
+  are scoped to exact attachment references in the current answer's history;
+  no tool accepts a path or imports documents into the paper library.
+  `read_pdf_attachment` supports Unicode-paged text and 1–4 PDF page images
+  through the existing evidence pipeline; text-only models get text mode only.
+  `read_word_attachment` reads `.docx` paragraphs/tables and related notes, or
+  Word 97–2003 `.doc` current piece-table text. `read_powerpoint_attachment`
+  reads `.pptx` slides in relationship order with notes/cached chart data, or
+  PowerPoint 97–2003 `.ppt` via the latest UserEdit/persist directory and live
+  slide list. Legacy PPT notes are associated by slide id; never scan dead
+  records or infer slide order from file offsets. `read_excel_attachment`
+  supports `.xlsx`, Excel 97–2003 `.xls`, CSV and TSV, with exact addresses,
+  sheet/range selection, Unicode text paging, formulas and saved caches.
+  Formulas are never recalculated; missing/stale caches remain explicit.
+  CSV/TSV preserve literal strings (including leading zeros and formula-looking
+  fields), quoted delimiters/newlines and UTF-8/BOM, UTF-16 or GB18030 text.
+  `read_json_attachment` (`json_documents.rs`) reads `.json` through RFC 6901
+  pointers, with paged object/array structure or Unicode slices of exact source
+  values. Its bounded RawValue parsing retains large integers/decimals and
+  original escapes rather than materializing them as floating-point values.
+  Pointer lookups reject duplicate keys, invalid escapes and ambiguous indices;
+  structure pages preserve source order. JSON is validated before local staging,
+  with 64 MiB and 128-level nesting limits. File paths/URLs/commands in data are
+  never followed or executed. JSON previews display the source as plain text.
+  Modern Office parsing uses bounded ZIP/XML without extraction or external
+  relationship fetches. Legacy CFB streams are bounded; XLS dense allocations
+  are screened before Calamine parsing. No Office app, macro, program or link
+  runs. These readers do not reproduce Office layouts, pictures or animations.
+  `OfficeAttachmentPreview.vue` uses root-checked app-only
+  `read_office_attachment_preview`; Excel previews switch sheets and page rows
+  and columns. Library changes close previews and discard late results.
+  Original UI attachments remain portable in conversation JSON; checkpoints
+  retain exact id/filename/format references after compaction. Legacy inline
+  `file` parts migrate locally. Agent/plain/compaction/keepalive requests send
+  only filename/id/tool notices and tool results, never original document bytes
+  or provider file blocks. Models without tools receive an explicit limitation.
+  The old OpenRouter inline-PDF path is removed; DeepSeek image file-id
+  references remain separate. Each document is capped at 64 MiB.
+  Regressions: Rust `chat_attachments`, `office_documents`, `chat_context`,
+  `copilot`, `llm` and `mcp`; `scripts/test-pdf-attachments.mjs`,
+  `scripts/test-office-attachments.mjs`, `scripts/test-json-csv-attachments.mjs`
+  and the chat-history/queue regressions.
 - **Usage is summed, not emitted per round.** `stream_with_tools` returns a
   `TurnUsage` instead of emitting one; the loop folds them and calls
   `llm::emit_usage` once at the end. Emitting per round both showed a cost strip
@@ -2215,4 +2261,4 @@ extend `LUNAR_HOLIDAYS` (HKO conversion tables) when it runs out.
 
 ---
 
-*Last updated: 2026-10-31. Keep this file in sync with major architectural changes.*
+*Last updated: 2026-11-04. Keep this file in sync with major architectural changes.*

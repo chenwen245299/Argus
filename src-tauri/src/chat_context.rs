@@ -35,6 +35,8 @@ fn content_tokens(content: &Value) -> usize {
                         2048
                     }
                 }
+                Some("local_pdf" | "local_document") => estimate_text(&crate::chat_attachments::description(p)) + 4,
+                Some("file") if crate::chat_attachments::is_local(p) => estimate_text(&crate::chat_attachments::description(p)) + 4,
                 Some("file") => 4096,
                 Some("input_audio" | "video_url") => 8192,
                 _ => 256,
@@ -186,7 +188,7 @@ pub fn measure(
         media_estimated: messages.iter().any(|m| {
             m["content"]
                 .as_array()
-                .is_some_and(|parts| parts.iter().any(|p| p["type"] != "text"))
+                .is_some_and(|parts| parts.iter().any(|p| p["type"] != "text" && !crate::chat_attachments::is_local(p)))
         }),
         can_compact: compact_range(messages, policy.retain).is_some_and(|(start, end)| {
             messages[start..end]
@@ -309,6 +311,7 @@ fn transcript_text(messages: &[Value]) -> String {
         let content = if let Some(s) = m["content"].as_str() { s.to_string() }
         else { m["content"].as_array().map(|parts| parts.iter().map(|p| {
             if p["type"] == "text" { p["text"].as_str().unwrap_or_default().to_string() }
+            else if crate::chat_attachments::is_local(p) { crate::chat_attachments::description(p) }
             else { format!("[Earlier {} attachment; pixels/audio omitted. Filename: {}. \
                 Preserve only observations already recorded in the conversation.]",
                 p["type"].as_str().unwrap_or("media"), p["file"]["filename"].as_str().unwrap_or("unnamed")) }
@@ -352,7 +355,8 @@ fn commit_summary(
         return Err("Compaction summary exceeded its budget.".into());
     }
     let before: usize = messages[start..end].iter().map(message_tokens).sum();
-    let replacement = checkpoint(summary.trim());
+    let mut replacement = checkpoint(summary.trim());
+    crate::chat_attachments::retain_in_summary(&messages[start..end], &mut replacement);
     if message_tokens(&replacement) >= before {
         return Err("Compaction did not reduce context size.".into());
     }
@@ -465,6 +469,23 @@ mod tests {
     use super::*;
     fn msg(role: &str, text: &str) -> Value {
         json!({"role":role,"content":text})
+    }
+    #[test]
+    fn pdf_references_survive_actual_compaction_and_count_only_as_descriptors() {
+        let reference = json!({"type":"local_pdf","id":"pdf-0123456789abcdef0123456789abcdef","filename":"supplement.pdf"});
+        let mut messages = vec![msg("system", "rules"), json!({"role":"user","content":[
+            {"type":"text","text":"Read the attached supplement. ".repeat(200)}, reference.clone()]}),
+            msg("assistant", &"Verified local PDF evidence. ".repeat(200)), msg("user", "What about page 1?")];
+        commit_summary(&mut messages, 1, 3, "Verified evidence from the attached supplement.", 1000, None).unwrap();
+        assert_eq!(messages[1]["content"][1], reference);
+        let before = message_tokens(&messages[1]);
+        let mut outbound = messages.clone();
+        crate::chat_attachments::for_request(&mut outbound);
+        assert_eq!(before, message_tokens(&outbound[1]));
+        let usage = measure(&messages, &[], Policy::for_model(&provider(None), "m"), &provider(None), "m", None);
+        assert!(!usage.media_estimated);
+        assert!(!transcript_text(&messages).contains("base64"));
+        assert!(transcript_text(&messages).contains("read_pdf_attachment"));
     }
     #[test]
     fn volatile_memory_never_becomes_persisted_conversation_evidence() {

@@ -7,6 +7,18 @@ use tauri::Emitter;
 
 use crate::models::{AiModel, AiProvider, ChatContent, ChatContentPart, ChatMessage};
 
+fn local_attachment_request_messages(messages: &[ChatMessage]) -> Result<std::borrow::Cow<'_, [ChatMessage]>, String> {
+    if !messages.iter().any(|m| matches!(&m.content, ChatContent::Parts(parts) if parts.iter().any(|p|
+        matches!(p, ChatContentPart::LocalPdf { .. } | ChatContentPart::LocalDocument { .. } | ChatContentPart::File { file: Some(_), .. })))) {
+        return Ok(std::borrow::Cow::Borrowed(messages));
+    }
+    let mut messages: Vec<serde_json::Value> = messages.iter().map(|m| serde_json::json!(m)).collect();
+    crate::chat_attachments::for_request(&mut messages);
+    messages.into_iter().map(serde_json::from_value).collect::<Result<Vec<ChatMessage>, _>>()
+        .map(std::borrow::Cow::Owned)
+        .map_err(|e| format!("Prepare local PDF request: {e}"))
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Non-streaming chat completion. Returns the full response text.
@@ -98,6 +110,8 @@ pub async fn chat_completion(
     messages: &[ChatMessage],
     source: &str,
 ) -> Result<String, String> {
+    let messages = local_attachment_request_messages(messages)?;
+    let messages = messages.as_ref();
     if is_ollama(provider) {
         chat_ollama(provider, api_key, model, messages, source).await
     } else if is_anthropic_protocol(provider) {
@@ -124,6 +138,8 @@ pub async fn chat_completion_stream(
     cancel: Option<Arc<AtomicBool>>,
     web_search: bool,
 ) -> Result<String, String> {
+    let messages = local_attachment_request_messages(messages)?;
+    let messages = messages.as_ref();
     // DeepSeek's web search lives on a different protocol (its Responses API), so
     // it takes its own path. Qwen's, by contrast, is just an `enable_search` flag
     // on the ordinary /chat/completions body, so it stays on the openai-compat
@@ -186,37 +202,6 @@ pub async fn chat_completion_stream(
         )
         .await
     }
-}
-
-/// Like `chat_completion_stream` but for providers that accept an inline PDF.
-/// Currently only OpenRouter supports OpenAI-compatible `file` content parts.
-pub async fn chat_completion_stream_with_pdf(
-    provider: &AiProvider,
-    api_key: &str,
-    model: &str,
-    messages: &[ChatMessage],
-    event_name: &str,
-    app: &tauri::AppHandle,
-    use_reasoning: bool,
-    reasoning_effort: Option<&str>,
-    source: &str,
-    pdf_path: &std::path::Path,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<String, String> {
-    stream_with_pdf_injected(
-        provider,
-        api_key,
-        model,
-        messages,
-        event_name,
-        app,
-        use_reasoning,
-        reasoning_effort,
-        source,
-        pdf_path,
-        cancel,
-    )
-    .await
 }
 
 /// Fetch available models from the provider.
@@ -645,370 +630,6 @@ fn parse_embedding_data(data: &[serde_json::Value]) -> Result<Vec<Vec<f32>>, Str
     }
 
     Ok(vecs)
-}
-
-// ── OpenAI-compatible providers with inline PDF ───────────────────────────────
-
-/// Build the `messages` array with the PDF injected as a `file` content block
-/// into the first user message. Works for OpenRouter and Kimi.
-fn build_messages_with_pdf(
-    messages: &[ChatMessage],
-    pdf_path: &std::path::Path,
-) -> Vec<serde_json::Value> {
-    use base64::Engine;
-
-    let file_block = std::fs::read(pdf_path).ok().map(|bytes| {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let filename = pdf_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("paper.pdf");
-        serde_json::json!({
-            "type": "file",
-            "file": {
-                "filename": filename,
-                "file_data": format!("data:application/pdf;base64,{b64}")
-            }
-        })
-    });
-
-    let first_user_idx = messages.iter().position(|m| m.role == "user");
-
-    messages
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            if Some(i) == first_user_idx {
-                if let Some(ref fb) = file_block {
-                    let content = match &m.content {
-                        ChatContent::Text(s) => {
-                            serde_json::json!([{"type": "text", "text": s.as_str()}, fb])
-                        }
-                        ChatContent::Parts(parts) => {
-                            let mut arr = serde_json::to_value(parts)
-                                .ok()
-                                .and_then(|v| v.as_array().cloned())
-                                .unwrap_or_default();
-                            arr.push(fb.clone());
-                            serde_json::Value::Array(arr)
-                        }
-                    };
-                    return serde_json::json!({"role": "user", "content": content});
-                }
-            }
-            serde_json::json!({"role": m.role, "content": &m.content})
-        })
-        .collect()
-}
-
-async fn stream_with_pdf_injected(
-    provider: &AiProvider,
-    api_key: &str,
-    model: &str,
-    messages: &[ChatMessage],
-    event_name: &str,
-    app: &tauri::AppHandle,
-    use_reasoning: bool,
-    reasoning_effort: Option<&str>,
-    source: &str,
-    pdf_path: &std::path::Path,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<String, String> {
-    let client = build_client()?;
-    let url = format!(
-        "{}/chat/completions",
-        provider.base_url.trim_end_matches('/')
-    );
-
-    let msgs = if pdf_path.exists() {
-        build_messages_with_pdf(messages, pdf_path)
-    } else {
-        messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": &m.content}))
-            .collect()
-    };
-
-    let is_openrouter = provider.base_url.to_lowercase().contains("openrouter");
-    let is_kimi = provider.kind == "kimi"
-        || provider.base_url.to_lowercase().contains("moonshot.cn")
-        || provider.base_url.to_lowercase().contains("api.kimi.com");
-    let is_kimi_k2 = is_kimi && model.starts_with("kimi-k2");
-    let is_kimi_for_coding = is_kimi && model == "kimi-for-coding";
-
-    let mut body = serde_json::json!({
-        "model": model,
-        "messages": msgs,
-        "stream": true,
-        "stream_options": {"include_usage": true}
-    });
-
-    if is_openrouter || (is_kimi && !is_kimi_for_coding) {
-        body["usage"] = serde_json::json!({"include": true});
-    }
-
-    if is_openrouter {
-        crate::openrouter::apply_reasoning_off(&mut body, model, use_reasoning);
-        let order: Vec<&str> = provider
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .map(|m| m.provider_order.iter().map(|s| s.as_str()).collect())
-            .unwrap_or_default();
-        if !order.is_empty() {
-            body["provider"] = serde_json::json!({ "order": order, "allow_fallbacks": false });
-        }
-    }
-
-    // Same server tools as an ordinary chat: reading a paper is exactly where a
-    // model is likely to want to look something up.
-    let server_tools = crate::openrouter::server_tool_defs(provider, model);
-    if !server_tools.is_empty() {
-        body["tools"] = serde_json::json!(server_tools);
-        body["max_tool_calls"] = serde_json::json!(crate::openrouter::max_tool_calls(provider));
-    }
-
-    if use_reasoning || is_kimi_k2 {
-        if is_openrouter {
-            body["reasoning"] = serde_json::json!({
-                "effort": reasoning_effort.unwrap_or("high"),
-                "exclude": false
-            });
-        } else if is_kimi_k2 {
-            // Kimi K2.* series requires thinking enabled and fixed sampling params.
-            body["thinking"] = serde_json::json!({"type": "enabled"});
-            body["temperature"] = serde_json::json!(1.0);
-            body["top_p"] = serde_json::json!(0.95);
-            body["n"] = serde_json::json!(1);
-            body["presence_penalty"] = serde_json::json!(0.0);
-            body["frequency_penalty"] = serde_json::json!(0.0);
-        } else if is_kimi_for_coding {
-            // Kimi Code subscription model supports thinking but does not require it.
-            body["thinking"] = serde_json::json!({"type": "enabled"});
-        }
-    }
-
-    if crate::soclaas::is_soclaas(provider) {
-        crate::soclaas::apply_reasoning(&mut body, provider, model, use_reasoning, reasoning_effort);
-    }
-
-    let is_kimi_coding_endpoint = provider.base_url.to_lowercase().contains("api.kimi.com");
-    let mut req = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json");
-    if is_kimi_coding_endpoint {
-        req = req.header("User-Agent", "KimiCLI/1.5");
-        // reqwest's bytes_stream() does not decompress gzip. Kimi Code may return
-        // a gzipped SSE stream, so ask for identity encoding to keep it plain text.
-        req = req.header("Accept-Encoding", "identity");
-    }
-    let resp = crate::cancel::until_cancelled(
-        cancel.as_ref(),
-        send_chat_with_soclaas_retry(req, provider, &body, false),
-    )
-    .await
-    .ok_or("cancelled")??;
-
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(friendly_error(status, &text));
-    }
-
-    let reasoning_event = format!("{event_name}-reasoning");
-    let mut stream = resp.bytes_stream();
-    let mut byte_buf: Vec<u8> = Vec::new();
-    let mut buf = String::new();
-    // Non-SSE lines, kept in case the "stream" is a plain JSON error body.
-    let mut stray = String::new();
-    let mut accumulated = String::new();
-    let mut input_tokens: u64 = 0;
-    let mut output_tokens: u64 = 0;
-    let mut cache_hit_tokens: u64 = 0;
-    let mut cost_usd: Option<f64> = None;
-    let mut usage_emitted = false;
-    let mut trace = crate::openrouter::ServerToolTrace::default();
-
-    'stream: while let Some(chunk) = crate::cancel::until_cancelled(cancel.as_ref(), stream.next())
-        .await
-        .flatten()
-    {
-        // Backend cancellation: if the user pressed stop, break out of the loop.
-        // Dropping `stream`/`resp` on scope exit closes the HTTP connection so the
-        // provider stops generating (and billing). Return the partial text.
-        if let Some(flag) = &cancel {
-            if flag.load(Ordering::SeqCst) {
-                break;
-            }
-        }
-        let bytes = chunk.map_err(|e| format!("Stream read error: {}", describe_stream_error(&e)))?;
-        byte_buf.extend_from_slice(&bytes);
-        // Decode only up to the last complete UTF-8 boundary; keep the trailing
-        // incomplete bytes (a multi-byte char split across chunks) for next round.
-        let valid_up_to = match std::str::from_utf8(&byte_buf) {
-            Ok(s) => s.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        if valid_up_to > 0 {
-            // Safe: bytes[..valid_up_to] is guaranteed valid UTF-8.
-            buf.push_str(unsafe { std::str::from_utf8_unchecked(&byte_buf[..valid_up_to]) });
-            byte_buf.drain(..valid_up_to);
-        }
-
-        loop {
-            match buf.find('\n') {
-                None => break,
-                Some(pos) => {
-                    let line = buf[..pos].trim_end_matches('\r').to_string();
-                    buf.drain(..pos + 1);
-
-                    if let Some(data) = line.strip_prefix("data:") {
-                        let data = data.trim_start();
-                        if data == "[DONE]" {
-                            if !usage_emitted {
-                                emit_stream_usage(
-                                    app,
-                                    event_name,
-                                    input_tokens,
-                                    output_tokens,
-                                    input_tokens.saturating_add(output_tokens),
-                                    cost_usd,
-                                    cache_hit_tokens,
-                                );
-                            }
-                            crate::token_usage::record_full(
-                                source,
-                                &provider.id,
-                                model,
-                                input_tokens,
-                                output_tokens,
-                                cost_usd,
-                                cache_hit_tokens,
-                            );
-                            let _ =
-                                app.emit(event_name, serde_json::json!({"delta":"","done":true}));
-                            return Ok(accumulated);
-                        }
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                            // Same as `stream_openai_compat`: an error sent as an
-                            // event must not end the stream as an empty success.
-                            if let Some(err) = provider_error_in_body(&json) {
-                                if accumulated.is_empty() {
-                                    return Err(err);
-                                }
-                                let notice = interrupted_notice(&err);
-                                let _ = app.emit(event_name, serde_json::json!({"delta": &notice, "done": false}));
-                                accumulated.push_str(&notice);
-                                break 'stream;
-                            }
-                            if let Some(usage) = json.get("usage").filter(|v| !v.is_null()) {
-                                if let Some(v) = usage["prompt_tokens"].as_u64() {
-                                    input_tokens = v;
-                                }
-                                if let Some(v) = usage["completion_tokens"].as_u64() {
-                                    output_tokens = v;
-                                }
-                                if let Some(v) = usage["prompt_cache_hit_tokens"]
-                                    .as_u64()
-                                    // OpenAI / Kimi / OpenRouter report them here…
-                                    .or_else(|| {
-                                        usage["prompt_tokens_details"]["cached_tokens"].as_u64()
-                                    })
-                                    // …and StepFun's worked examples put the same
-                                    // figure at the top level instead. Reading only
-                                    // the nested path would report every hit as zero.
-                                    .or_else(|| usage["cached_tokens"].as_u64())
-                                {
-                                    // DeepSeek reports cache hits at the first path.
-                                    cache_hit_tokens = v;
-                                }
-                                if let Some(v) = usage_cost_usd(usage) {
-                                    cost_usd = Some(v);
-                                }
-                                let total_tokens = usage["total_tokens"]
-                                    .as_u64()
-                                    .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
-                                emit_stream_usage(
-                                    app,
-                                    event_name,
-                                    input_tokens,
-                                    output_tokens,
-                                    total_tokens,
-                                    cost_usd,
-                                    cache_hit_tokens,
-                                );
-                                usage_emitted = true;
-                                trace.absorb_usage(usage);
-                            }
-                            trace.absorb(&json["choices"][0]["delta"]);
-                            let content_delta = json["choices"][0]["delta"]["content"]
-                                .as_str()
-                                .unwrap_or("");
-                            let reasoning_delta = json["choices"][0]["delta"]["reasoning_content"]
-                                .as_str()
-                                .or_else(|| json["choices"][0]["delta"]["reasoning"].as_str())
-                                .or_else(|| json["choices"][0]["delta"]["thinking"].as_str())
-                                .unwrap_or("");
-
-                            if !content_delta.is_empty() {
-                                accumulated.push_str(content_delta);
-                                let _ = app.emit(
-                                    event_name,
-                                    serde_json::json!({"delta": content_delta, "done": false}),
-                                );
-                            } else if is_kimi_for_coding && !reasoning_delta.is_empty() {
-                                // kimi-for-coding emits its response as reasoning_content by default.
-                                accumulated.push_str(reasoning_delta);
-                                let _ = app.emit(
-                                    event_name,
-                                    serde_json::json!({"delta": reasoning_delta, "done": false}),
-                                );
-                            } else if !reasoning_delta.is_empty() {
-                                let _ = app.emit(
-                                    &reasoning_event,
-                                    serde_json::json!({"delta": reasoning_delta, "done": false}),
-                                );
-                            }
-                        }
-                    } else {
-                        keep_stray_line(&mut stray, &line);
-                    }
-                }
-            }
-        }
-    }
-
-    let cancelled = cancel.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
-    if accumulated.is_empty() && !cancelled {
-        if let Some(err) = stray_body_error(&stray, &buf) {
-            return Err(err);
-        }
-    }
-
-    crate::token_usage::record_full(
-        source,
-        &provider.id,
-        model,
-        input_tokens,
-        output_tokens,
-        cost_usd,
-        cache_hit_tokens,
-    );
-    if !usage_emitted {
-        emit_stream_usage(
-            app,
-            event_name,
-            input_tokens,
-            output_tokens,
-            input_tokens.saturating_add(output_tokens),
-            cost_usd,
-            cache_hit_tokens,
-        );
-    }
-    emit_server_tool_trace(app, event_name, &trace);
-    let _ = app.emit(event_name, serde_json::json!({"delta":"","done":true}));
-    Ok(accumulated)
 }
 
 // ── OpenAI-compatible ─────────────────────────────────────────────────────────
@@ -1943,6 +1564,8 @@ fn to_ollama_message(m: &ChatMessage) -> serde_json::Value {
                     // dropped rather than mangled into the text.
                     ChatContentPart::VideoUrl { .. }
                     | ChatContentPart::InputAudio { .. }
+                    | ChatContentPart::LocalPdf { .. }
+                | ChatContentPart::LocalDocument { .. }
                     | ChatContentPart::File { .. } => {}
                 }
             }
@@ -3443,6 +3066,8 @@ fn to_anthropic_content(content: &ChatContent) -> Vec<serde_json::Value> {
                 // same way.
                 ChatContentPart::VideoUrl { .. }
                 | ChatContentPart::InputAudio { .. }
+                | ChatContentPart::LocalPdf { .. }
+                | ChatContentPart::LocalDocument { .. }
                 | ChatContentPart::File { .. } => None,
             })
             .collect(),
@@ -4998,6 +4623,9 @@ pub async fn touch_prompt_cache(
     messages: &[serde_json::Value],
     tools: &[serde_json::Value],
 ) -> Result<u64, String> {
+    let mut prepared = messages.to_vec();
+    crate::chat_attachments::for_request(&mut prepared);
+    let messages = prepared.as_slice();
     let client = build_client()?;
     let url = format!(
         "{}/chat/completions",
@@ -5153,19 +4781,11 @@ async fn stream_tool_request(
     let is_zhipu = crate::zhipu::is_zhipu(provider);
     let is_minimax = crate::minimax::is_minimax(provider);
 
-    // The agent replays its whole transcript each round, so page renders fed
-    // back by `view_paper_page` pass through here too and get the same limits
-    // check (and, when they are large, the same move to the Files API). Only
-    // DeepSeek pays for the copy — everyone else keeps using the caller's slice.
-    let prepared;
-    let messages: &[serde_json::Value] = if is_deepseek(provider) {
-        prepared =
-            crate::deepseek::prepare_chat_messages(provider, api_key, model, messages.to_vec())
-                .await?;
-        &prepared
-    } else {
-        messages
-    };
+    // Local PDF content is always replaced before any provider adapter runs.
+    let mut prepared = messages.to_vec();
+    crate::chat_attachments::for_request(&mut prepared);
+    let prepared = prepare_deepseek_messages(provider, api_key, model, prepared).await?;
+    let messages = prepared.as_slice();
 
     let is_stepfun = crate::stepfun::is_stepfun(provider);
     if is_stepfun {
@@ -6119,6 +5739,40 @@ mod soclaas_request_tests {
 
     fn rejection() -> Value {
         json!({"error": "Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low."})
+    }
+
+    #[tokio::test]
+    async fn pdf_attachments_never_reach_real_http_request_bodies() {
+        let (url, server) = gateway(vec![(200, json!({"choices":[{"message":{"content":"OK"}}]})),
+            (200, json!({"usage":{"prompt_tokens":1}}))]).await;
+        let messages: Vec<ChatMessage> = serde_json::from_value(json!([{"role":"user","content":[
+            {"type":"text","text":"Read this"},
+            {"type":"local_pdf","id":"pdf-0123456789abcdef0123456789abcdef","filename":"supplement.pdf","data_url":"data:application/pdf;base64,JVBERi0="},
+            {"type":"file","file":{"filename":"legacy.pdf","file_data":"data:application/pdf;base64,JVBERi0="}},
+            {"type":"local_document","id":"docx-0123456789abcdef0123456789abcdef","filename":"report.docx","format":"docx","data_url":"data:application/octet-stream;base64,OFFICE-PRIVATE-BYTES"},
+            {"type":"local_document","id":"ppt-0123456789abcdef0123456789abcdef","filename":"slides.ppt","format":"ppt","data_url":"data:application/octet-stream;base64,LEGACY-PRIVATE-BYTES"},
+            {"type":"local_document","id":"xls-0123456789abcdef0123456789abcdef","filename":"values.xls","format":"xls","data_url":"data:application/octet-stream;base64,XLS-PRIVATE-BYTES"},
+            {"type":"local_document","id":"json-0123456789abcdef0123456789abcdef","filename":"data.json","format":"json","data_url":"data:application/json;base64,JSON-PRIVATE-BYTES"},
+            {"type":"local_document","id":"csv-0123456789abcdef0123456789abcdef","filename":"table.csv","format":"csv","data_url":"data:text/csv;base64,CSV-PRIVATE-BYTES"}
+        ]}])).unwrap();
+        let provider = provider("openai_compatible", &url);
+        assert_eq!(chat_completion(&provider, "test-key", "test-model", &messages, "test").await.unwrap(), "OK");
+        let raw: Vec<Value> = messages.iter().map(|m| json!(m)).collect();
+        touch_prompt_cache(&provider, "test-key", "test-model", &raw, &[]).await.unwrap();
+        for request in server.await.unwrap() {
+            let body = request.to_string();
+            for forbidden in ["data:application/pdf", "JVBERi0=", "file_data", "local_pdf", "local_document", "data_url", "OFFICE-PRIVATE-BYTES", "LEGACY-PRIVATE-BYTES", "XLS-PRIVATE-BYTES", "JSON-PRIVATE-BYTES", "CSV-PRIVATE-BYTES"] {
+                assert!(!body.contains(forbidden), "{body}");
+            }
+            assert!(body.contains("read_pdf_attachment") && body.contains("supplement.pdf") && body.contains("legacy.pdf"));
+            assert!(body.contains("read_word_attachment") && body.contains("read_powerpoint_attachment") && body.contains("read_excel_attachment") && body.contains("read_json_attachment") && body.contains("table.csv"));
+        }
+        let prepared = local_attachment_request_messages(&messages).unwrap();
+        let anthropic = to_anthropic_content(&prepared[0].content);
+        let ollama = to_ollama_message(&prepared[0]);
+        assert!(json!(anthropic).to_string().contains("read_pdf_attachment"));
+        assert!(ollama.to_string().contains("read_pdf_attachment"));
+        assert!(serde_json::to_string(&messages).unwrap().contains("data:application/pdf"), "original history remains intact");
     }
 
     #[tokio::test]

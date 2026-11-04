@@ -451,7 +451,10 @@ export type ChatContentPart =
    * URI's media type and has no `format` field.
    */
   | { type: 'input_audio'; input_audio: { data: string } }
-  /** An attachment sent inline (OpenRouter / Kimi accept base64 PDFs this way). */
+  /** Internal local-tool attachment. Never sent as a provider content block. */
+  | { type: 'local_pdf'; id: string; filename: string; data_url?: string }
+  | { type: 'local_document'; id: string; filename: string; format: 'doc' | 'docx' | 'ppt' | 'pptx' | 'xls' | 'xlsx' | 'csv' | 'tsv' | 'json'; data_url?: string }
+  /** Legacy history only; converted to a local PDF before requests. */
   | { type: 'file'; file: { filename: string; file_data: string } }
   /** An attachment sent by reference to DeepSeek's Files API. */
   | { type: 'file'; file_id: string }

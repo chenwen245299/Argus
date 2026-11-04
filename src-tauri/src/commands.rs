@@ -2740,7 +2740,7 @@ pub async fn extract_abstract_ai(
 //
 // `chat_with_paper` / `chat_with_paper_event` are the pre-agent paper chat: the
 // caller picked how much of the paper to inject (metadata / summary / sections /
-// full text / the PDF itself) and the backend built that context. The paper AI
+// full text) and the backend built that context. The paper AI
 // panel now runs in agent mode instead — it sends `chat_with_library` with a
 // `paper_slug`, gets the paper's `get_paper` card in the system prompt, and the
 // model fetches whatever else it needs. Nothing in the app calls the two
@@ -2778,7 +2778,6 @@ pub async fn chat_with_paper_event(
     use_reasoning: Option<bool>,
     reasoning_effort: Option<String>,
     context_mode: Option<String>,
-    use_pdf: Option<bool>,
     section_titles: Option<Vec<String>>,
     request_id: Option<String>,
     web_search: Option<bool>,
@@ -2800,7 +2799,6 @@ pub async fn chat_with_paper_event(
         use_reasoning.unwrap_or(false),
         reasoning_effort.as_deref(),
         context_mode.as_deref().unwrap_or("fulltext"),
-        use_pdf.unwrap_or(false),
         &section_titles,
         cancel,
         web_search.unwrap_or(false),
@@ -2931,6 +2929,31 @@ pub async fn read_chat_image(
     tokio::task::spawn_blocking(move || copilot::read_conversation_image(&root, &conversation_id, &file))
         .await
         .map_err(|e| format!("Read chat image task: {e}"))?
+}
+
+/// Preview only a user-provided local document attachment; no arbitrary file paths.
+#[tauri::command]
+pub async fn read_office_attachment_preview(
+    attachment: serde_json::Value, expected_root: String, offset: Option<usize>,
+    view: Option<String>, sheet: Option<String>, start_row: Option<u32>, start_column: Option<u32>,
+    state: State<'_, LibraryRoot>,
+) -> Result<serde_json::Value, String> {
+    let root = get_root(&state)?;
+    if root != expected_root { return Err("Library changed".into()); }
+    if attachment["type"] != "local_document" { return Err("Expected a local document attachment.".into()); }
+    tokio::task::spawn_blocking(move || {
+        let mut messages = vec![serde_json::json!({"role":"user","content":[attachment]})];
+        crate::chat_attachments::stage(&root, &mut messages)?;
+        let part = &messages[0]["content"][0];
+        let format = crate::chat_attachments::Format::parse(part["format"].as_str().unwrap_or_default())?;
+        let mut args = serde_json::json!({"attachment_id":part["id"],"offset":offset.unwrap_or(0),"max_chars":16000,"view":view.unwrap_or_else(||"text".into())});
+        if matches!(format, crate::chat_attachments::Format::Xls | crate::chat_attachments::Format::Xlsx | crate::chat_attachments::Format::Csv | crate::chat_attachments::Format::Tsv) {
+            if let Some(sheet) = sheet { args["sheet"] = serde_json::json!(sheet); }
+            args["start_row"] = serde_json::json!(start_row.unwrap_or(1));
+            args["start_column"] = serde_json::json!(start_column.unwrap_or(1));
+        }
+        crate::chat_attachments::Attachments::from_messages(&messages).call_tool(&root, format.read_tool(), &args, false)
+    }).await.map_err(|e| format!("Read Office attachment preview: {e}"))?
 }
 
 /// Give a branch independent copies of the immutable images in its context.

@@ -601,3 +601,137 @@ for(const mode of ['sidebar','standalone','library']){
     assert.deepEqual(errors,[])
   })
 }
+
+for (const mode of ['sidebar', 'standalone', 'library']) {
+  test(`${mode}: PDF attachments stay on the local-tool path through queue, follow-up and regeneration`, async () => {
+    await page.setViewportSize({width:1100,height:840}); await open(mode)
+    await send('First question'); await count(1)
+    await page.locator('input[type=file]').first().setInputFiles({
+      name:'supplement.pdf',mimeType:'application/pdf',buffer:Buffer.from('%PDF-1.4 local fixture'),
+    })
+    await page.locator('.composer .attachment-chip').waitFor()
+    await send('Read this supplement')
+    assert.equal(await page.locator('.queue-item').count(),1)
+    await finish(0,'First response'); await count(2)
+    const parts=(await history(1)).at(-1).content
+    const pdf=parts.find(p=>p.type==='local_pdf')
+    assert.equal(pdf.filename,'supplement.pdf')
+    assert.match(pdf.data_url,/^data:application\/pdf;base64,/)
+    assert(!parts.some(p=>p.type==='file'))
+    await finish(1,'Supplement response')
+    await page.getByText('Supplement response',{exact:true}).waitFor()
+    await send('Continue with page 2'); await count(3)
+    const followup=(await history(2)).flatMap(m=>Array.isArray(m.content)?m.content:[])
+    assert.deepEqual(followup.find(p=>p.type==='local_pdf'),pdf)
+    await finish(2,'Page two response')
+    await page.getByText('Page two response',{exact:true}).waitFor()
+    await page.getByText('Page two response',{exact:true}).hover()
+    await page.getByRole('button',{name:'重新生成',exact:true}).last().click(); await count(4)
+    const regenerated=(await history(3)).flatMap(m=>Array.isArray(m.content)?m.content:[])
+    assert.deepEqual(regenerated.find(p=>p.type==='local_pdf'),pdf)
+    assert(!regenerated.some(p=>p.type==='file'))
+    await finish(3,'Regenerated PDF response')
+    assert.deepEqual(errors,[])
+  })
+}
+
+for(const mode of ['sidebar','standalone','library']){
+  test(`${mode}: new and legacy Office attachments preview locally and survive queues, follow-ups, regeneration and reload`,async()=>{
+    await page.setViewportSize({width:1100,height:840});await open(mode)
+    await send('First question');await count(1)
+    const files=[['report.doc','application/msword'],['report.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+      ['slides.ppt','application/vnd.ms-powerpoint'],['slides.pptx','application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+      ['values.xls','application/vnd.ms-excel'],['values.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],['values.csv','text/csv']]
+    await page.locator('input[type=file]').first().setInputFiles(files.map(([name,mimeType])=>({name,mimeType,buffer:Buffer.from('local test '+name)})))
+    await page.waitForFunction(()=>document.querySelectorAll('.composer .attachment-chip').length===7)
+    await page.evaluate(()=>{const t=window.__test,original=t.invoke;t.invoke=(command,args)=>command==='read_office_attachment_preview'?Promise.resolve({text:'Local document preview 中文 <script>literal</script>'}):original(command,args)})
+    await page.locator('.office-attachment-open').first().click()
+    await page.getByRole('dialog',{name:'report.doc',exact:true}).waitFor()
+    await page.getByText('Local document preview 中文 <script>literal</script>',{exact:true}).waitFor()
+    assert.equal(await page.locator('.office-preview script').count(),0)
+    await page.locator('.office-preview').getByRole('button',{name:'关闭',exact:true}).click()
+    await send('Read these documents');assert.equal(await page.locator('.queue-item').count(),1)
+    await finish(0,'First response');await count(2)
+    const parts=(await history(1)).at(-1).content.filter(p=>p.type==='local_document')
+    assert.deepEqual(parts.map(p=>p.format),['doc','docx','ppt','pptx','xls','xlsx','csv'])
+    assert(parts.every(p=>p.data_url.startsWith('data:')))
+    await finish(1,'Office response');await page.getByText('Office response',{exact:true}).waitFor()
+    await send('Continue reading');await count(3)
+    assert.deepEqual((await history(2)).flatMap(m=>Array.isArray(m.content)?m.content:[]).filter(p=>p.type==='local_document'),parts)
+    await finish(2,'Office followup');await page.getByText('Office followup',{exact:true}).waitFor()
+    await page.getByText('Office followup',{exact:true}).hover();await page.getByRole('button',{name:'重新生成',exact:true}).last().click();await count(4)
+    assert.deepEqual((await history(3)).flatMap(m=>Array.isArray(m.content)?m.content:[]).filter(p=>p.type==='local_document'),parts)
+    await finish(3,'Regenerated office response');await page.getByText('Regenerated office response',{exact:true}).waitFor()
+    await page.waitForFunction(()=>window.__test.saved.some(s=>JSON.stringify(s.args).includes('Regenerated office response')))
+    await page.evaluate(mode=>{const saves=window.__test.saved.filter(s=>s.command===(mode==='library'?'save_library_conversation':'save_paper_ai_conversations'));const save=[...saves].reverse().find(s=>JSON.stringify(s.args).includes('Regenerated office response'));sessionStorage.setItem('steered-conversation',JSON.stringify(mode==='library'?[save.args.conversation]:save.args.conversations))},mode)
+    await page.goto(`${origin}/__queue-test?mode=${mode}&replay-steered=1`)
+    await page.getByText('Regenerated office response',{exact:true}).waitFor()
+    assert.equal(await page.locator('.user-attachment').count(),7)
+    await send('Read the saved files');await count(1)
+    assert.deepEqual((await history(0)).flatMap(m=>Array.isArray(m.content)?m.content:[]).filter(p=>p.type==='local_document'),parts)
+    await finish(0,'Reopened files response')
+    assert.deepEqual(errors,[])
+  })
+}
+
+test('Office spreadsheet preview selects worksheets, pages the grid and closes on a library switch',async()=>{
+  await page.setViewportSize({width:420,height:640});await open('library')
+  await page.locator('input[type=file]').first().setInputFiles({name:'values.xlsx',mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',buffer:Buffer.from('mock workbook')})
+  await page.locator('.office-attachment-open').waitFor()
+  await page.evaluate(()=>{const t=window.__test,original=t.invoke;t.invoke=(command,args)=>{
+    if(command!=='read_office_attachment_preview')return original(command,args)
+    if(args.view==='overview')return Promise.resolve({sheets:[{name:'Data'},{name:'Other'}]})
+    t.previewArgs=args
+    return Promise.resolve({text:JSON.stringify({cell:'A'+args.startRow,value:args.sheet+' row '+args.startRow})+'\n',range:'A'+args.startRow+':T'+(args.startRow+49),next_row:args.startRow===1?51:null,next_column:null})
+  }})
+  await page.locator('.office-attachment-open').click()
+  await page.getByRole('dialog',{name:'values.xlsx',exact:true}).waitFor()
+  await page.getByText('A1: Data row 1',{exact:true}).waitFor()
+  await page.getByLabel('工作表',{exact:true}).selectOption('Other')
+  await page.getByText('A1: Other row 1',{exact:true}).waitFor()
+  await page.getByRole('button',{name:'下一组行',exact:true}).click()
+  await page.getByText('A51: Other row 51',{exact:true}).waitFor()
+  const box=await page.locator('.office-preview').boundingBox();assert(box.x>=0&&box.x+box.width<=421)
+  const args=await page.evaluate(()=>window.__test.previewArgs);assert.equal(args.sheet,'Other');assert.equal(args.startRow,51);assert.equal(args.expectedRoot,'/mock-library')
+  await page.evaluate(()=>window.__test.emit('library-changed','/different-library'))
+  await page.getByRole('dialog').waitFor({state:'detached'})
+})
+
+for(const mode of ['sidebar','standalone','library']){
+  test(`${mode}: JSON and CSV attachments preview locally and survive queue, follow-up, regeneration and reload`,async()=>{
+    await page.setViewportSize({width:1100,height:840});await open(mode)
+    await send('Original question');await count(1)
+    const jsonSource='{"precise":123456789012345678901234567890,"中文":"<script>literal</script>"}'
+    await page.locator('input[type=file]').first().setInputFiles([
+      {name:'data.JSON',mimeType:'application/json',buffer:Buffer.from(jsonSource)},
+      {name:'table.csv',mimeType:'application/csv',buffer:Buffer.from('name,value\n"中文, test",000123\n')},
+    ])
+    await page.waitForFunction(()=>document.querySelectorAll('.composer .attachment-chip').length===2)
+    await page.evaluate(source=>{const t=window.__test,original=t.invoke;t.invoke=(command,args)=>command==='read_office_attachment_preview'?Promise.resolve({text:source,next_offset:null}):original(command,args)},jsonSource)
+    await page.locator('.office-attachment-open').filter({hasText:'data.JSON'}).click()
+    const dialog=page.getByRole('dialog',{name:'data.JSON',exact:true});await dialog.waitFor()
+    assert.equal(await dialog.locator('pre').innerText(),jsonSource)
+    assert.equal(await dialog.locator('script').count(),0)
+    assert.equal(await dialog.locator('select').count(),0)
+    await dialog.getByRole('button',{name:'关闭',exact:true}).click()
+    await send('Read these JSON and CSV files');assert.equal(await page.locator('.queue-item').count(),1)
+    await finish(0,'First answer');await count(2)
+    const parts=(await history(1)).at(-1).content.filter(p=>p.type==='local_document')
+    assert.deepEqual(parts.map(p=>p.format),['json','csv'])
+    assert.equal(Buffer.from(parts[0].data_url.split(',')[1],'base64').toString(),jsonSource)
+    await finish(1,'Data response');await page.getByText('Data response',{exact:true}).waitFor()
+    await send('Continue reading');await count(3)
+    assert.deepEqual((await history(2)).flatMap(m=>Array.isArray(m.content)?m.content:[]).filter(p=>p.type==='local_document'),parts)
+    await finish(2,'Data followup');await page.getByText('Data followup',{exact:true}).waitFor()
+    await page.getByText('Data followup',{exact:true}).hover();await page.getByRole('button',{name:'重新生成',exact:true}).last().click();await count(4)
+    assert.deepEqual((await history(3)).flatMap(m=>Array.isArray(m.content)?m.content:[]).filter(p=>p.type==='local_document'),parts)
+    await finish(3,'Regenerated data response');await page.getByText('Regenerated data response',{exact:true}).waitFor()
+    await page.waitForFunction(()=>window.__test.saved.some(s=>JSON.stringify(s.args).includes('Regenerated data response')))
+    await page.evaluate(mode=>{const saves=window.__test.saved.filter(s=>s.command===(mode==='library'?'save_library_conversation':'save_paper_ai_conversations'));const save=[...saves].reverse().find(s=>JSON.stringify(s.args).includes('Regenerated data response'));sessionStorage.setItem('steered-conversation',JSON.stringify(mode==='library'?[save.args.conversation]:save.args.conversations))},mode)
+    await page.goto(`${origin}/__queue-test?mode=${mode}&replay-steered=1`)
+    await page.getByText('Regenerated data response',{exact:true}).waitFor();assert.equal(await page.locator('.user-attachment').count(),2)
+    await send('Read the saved data');await count(1)
+    assert.deepEqual((await history(0)).flatMap(m=>Array.isArray(m.content)?m.content:[]).filter(p=>p.type==='local_document'),parts)
+    await finish(0,'Saved data response');assert.deepEqual(errors,[])
+  })
+}

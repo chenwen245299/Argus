@@ -74,6 +74,7 @@ pub fn tools() -> Vec<AgentTool> {
         })
         .chain(app_only_tools())
         .chain(super::arxiv_tools::declarations())
+        .chain(crate::chat_attachments::tools())
         .chain(std::iter::once(send_paper_image_tool()))
         .collect()
 }
@@ -463,6 +464,9 @@ fn ok<T: Serialize>(value: T) -> Result<serde_json::Value, String> {
 /// Blocking file and SQLite work, so callers must keep this off the async
 /// runtime's worker threads — `copilot` wraps it in `spawn_blocking`.
 pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if crate::chat_attachments::is_tool(name) {
+        return Err("Document attachments require the active conversation's scoped reading tool.".into());
+    }
     if app_tools::is_write_tool(name) {
         return Err(format!(
             "'{name}' changes the library and cannot be run here — it must go through \
@@ -699,6 +703,10 @@ mod tests {
         }
         assert!(!server::tool_declarations().iter().any(|t| t.name == SEND_PAPER_IMAGE_TOOL));
         assert!(tools().iter().any(|t| t.name == SEND_PAPER_IMAGE_TOOL));
+        for tool in crate::chat_attachments::tools() {
+            assert!(!server::tool_declarations().iter().any(|t| t.name == tool.name));
+            assert!(tools().iter().any(|t| t.name == tool.name));
+        }
     }
 
     /// And the reverse: nothing dispatchable that is not declared, which would

@@ -8,7 +8,7 @@ let server, browser, page, origin
 const errors = []
 const mocks = {
   '@tauri-apps/api/core': `export const invoke=(name,args)=>window.__test.invoke(name,args);export const convertFileSrc=p=>p;export const isTauri=()=>false;`,
-  '@tauri-apps/api/event': `export const listen=async(name,handler)=>{const set=window.__test.listeners.get(name)||new Set();window.__test.listeners.set(name,set);set.add(handler);return()=>set.delete(handler)};export const emit=async(name,payload)=>window.__test.emit(name,payload);export const emitTo=emit;`,
+  '@tauri-apps/api/event': `export const listen=async(name,handler)=>{const set=window.__test.listeners.get(name)||new Set();window.__test.listeners.set(name,set);set.add(handler);return()=>set.delete(handler)};export const emit=async(name,payload)=>window.__test.emit(name,payload);export const emitTo=async(target,name,payload)=>window.__test.emit(name,payload);`,
   '@tauri-apps/plugin-dialog': `export const confirm=async()=>window.__test.confirm;export const save=async()=>null;export const open=async()=>null;`,
   '@tauri-apps/api/window': `export const getCurrentWindow=()=>({label:'main',onResized:async()=>()=>{},onFocusChanged:async()=>()=>{},isFocused:async()=>true});export class Window{static async getByLabel(){return null}}`,
   '@tauri-apps/api/webviewWindow': `export const getCurrentWebviewWindow=()=>({label:'main'});export class WebviewWindow{static async getByLabel(){return null}}`,
@@ -26,13 +26,13 @@ before(async()=>{
       <script type="module">
       import{createApp,h,ref}from'vue';import{createPinia}from'pinia';import{addCollection}from'@iconify/vue';import fluent from'@iconify-json/fluent/icons.json';
       import PaperList from'/src/components/PaperList.vue';import Toolbar from'/src/components/Toolbar.vue';import MarkdownNoteView from'/src/components/MarkdownNoteView.vue';import WriteConfirmCard from'/src/components/WriteConfirmCard.vue';
-      import RightSidebar from'/src/components/RightSidebar.vue';
+      import RightSidebar from'/src/components/RightSidebar.vue';import NoteReferencePicker from'/src/components/NoteReferencePicker.vue';import NoteWindowView from'/src/views/NoteWindowView.vue';
       import{useLibraryStore}from'/src/stores/library.ts';import{useCollectionsStore}from'/src/stores/collections.ts';import{useReaderStore}from'/src/stores/reader.ts';import{useSelectionStore}from'/src/stores/selection.ts';import{useAiStore}from'/src/stores/ai.ts';
       import{i18n}from'/src/i18n/index.ts';import'/src/assets/main.css';import'/src/assets/themes.css';import'vue-virtual-scroller/dist/vue-virtual-scroller.css';addCollection(fluent);
       const realStores=new URLSearchParams(location.search).has('realStores');
       const now=new Date().toISOString(),notes=new Map(),preview=ref(null),sidebarTab=ref('notes'),showSidebar=ref(false),attachments=new Map(),highlights=new Map(),chats=new Map();
-      const t=window.__test={notes,attachments,highlights,confirm:true,listeners:new Map(),calls:[],root:'/mock-library',holdSave:false,holdScans:false,pendingScans:[],failCreate:false,
-        emit(name,payload){for(const handler of t.listeners.get(name)||[])handler({payload})},
+      const t=window.__test={references:[{id:'ref-alpha',slug:'alpha-paper',citeKey:'Alpha2025',title:'Host Guest Phosphorescence Mechanisms',authors:['Author A'],year:2025,fileType:null},{id:'ref-host',slug:'host-paper',citeKey:'Host2026',title:'A different method paper',authors:['Author B'],year:2026,fileType:null},{id:'ref-second',slug:'second-paper',citeKey:'Alpha2025',title:'Second paper with the same citation key',authors:[],year:2024,fileType:null},{id:'ref-keyless',slug:'keyless-paper',citeKey:null,title:'NoKey [special] title',authors:[],year:null,fileType:null}],opens:[],paperMetas:new Map(),notes,attachments,highlights,confirm:true,listeners:new Map(),calls:[],root:'/mock-library',holdSave:false,holdScans:false,pendingScans:[],failCreate:false,
+        emit(name,payload){if(name==='argus-open-paper')t.opens.push(payload);for(const handler of t.listeners.get(name)||[])handler({payload})},
         async invoke(name,args){t.calls.push({name,args:args?JSON.parse(JSON.stringify(args)):args});
           if(args?.expectedRoot&&args.expectedRoot!==t.root)throw new Error('Library changed');
           if(name==='create_library_note'){if(t.failCreate)throw new Error('Mock creation failed');const slug='note_'+(notes.size+1),note={slug,id:slug,title:args.title,content:args.content,collectionId:args.collectionId,collectionName:'图书 / 读书笔记',createdAt:now};notes.set(slug,note);t.collectionFile.assignments.push({paper_id:slug,collection_id:args.collectionId});t.emit('library-notes-changed',{root:t.root,slug,action:'created'});return {...note}}
@@ -44,6 +44,8 @@ before(async()=>{
           }
           if(name==='get_collections')return JSON.parse(JSON.stringify(t.collectionFile));
           if(name==='get_current_library')return t.root;
+          if(name==='list_note_reference_papers'){if(t.holdReferences)return new Promise(resolve=>t.resolveReferences=()=>resolve(structuredClone(t.references)));return structuredClone(t.references)}
+          if(name==='resolve_note_reference'){const paper=t.references.find(p=>p.id===args.paperId);if(!paper)throw new Error('Referenced paper was deleted');if(t.holdResolve)return new Promise(resolve=>t.resolveReference=()=>resolve({...paper}));return {...paper}}
           if(name==='list_notes')return (attachments.get(args.slug)||[]).map(({content,...meta})=>meta);
           if(name==='list_deleted_notes')return [];
           if(name==='create_note'){const n={id:crypto.randomUUID(),title:'新建笔记',content:'',created_at:now,updated_at:now};attachments.set(args.slug,[...(attachments.get(args.slug)||[]),n]);return {...n}}
@@ -58,7 +60,14 @@ before(async()=>{
           if(name==='chat_with_library')return '这是当前独立笔记的模拟 AI 回复。';
           if(name==='get_canvas_note_titles_map')return {};
           if(name==='list_papers_in_collection')return t.entries();
-          if(name==='get_paper_meta')return {...notes.get(args.slug),authors:[],tags:[],file_type:'md'};
+          if(name==='get_paper_meta')return t.paperMetas.get(args.slug)||t.entries().find(n=>n.slug===args.slug);
+          if(name==='get_cached_references'||name==='fetch_references')return [];
+          if(name==='get_fulltext')return '';
+          if(name==='save_library_note_metadata'){
+            const note=notes.get(args.slug);if(!note)throw new Error('Note no longer exists');
+            const saved={...note,title:args.title,tags:args.tags,reading_status:args.readingStatus};notes.set(args.slug,saved);
+            t.emit('library-notes-changed',{root:t.root,slug:args.slug,action:'updated'});return t.entries().find(n=>n.slug===args.slug);
+          }
           if(name==='get_arxiv_status')return {fetching:false,analyzing:false};
           if(name==='get_ai_settings')return t.aiSettings;
           if(name==='get_settings')return {};
@@ -68,9 +77,10 @@ before(async()=>{
         }};
       window.__TAURI_INTERNALS__={invoke:(name,args)=>t.invoke(name,args)};
       t.collectionFile={collections:[{id:'top',name:'图书',parent_id:null,created_at:now},{id:'leaf',name:'读书笔记',parent_id:'top',created_at:now}],assignments:[]};
-      t.entries=()=>[...notes.values()].map(n=>({slug:n.slug,id:n.id,title:n.title,authors:[],tags:[],added_at:n.createdAt,reading_status:'unread',file_type:'md',status:{text_extracted:false,metadata_fetched:false,ai_summary_done:false,vectorized:false}}));
-      const pinia=createPinia();const app=createApp({setup(){return()=>h('div',{class:'workspace'},[
-        h(Toolbar),h('div',{class:'workarea'},[h('div',{class:'centre'},[t.reader.activeSlug?h(MarkdownNoteView,{slug:t.reader.activeSlug,key:t.reader.activeSlug}):h(PaperList)]),showSidebar.value?h('div',{class:'test-sidebar'},[h(RightSidebar,{activeTab:sidebarTab.value})]):null]),
+      t.entries=()=>[...notes.values()].map(n=>({slug:n.slug,id:n.id,title:n.title,authors:[],tags:n.tags||[],added_at:n.createdAt,original_filename:'note.md',reading_status:n.reading_status||'unread',file_type:'md',status:{text_extracted:false,metadata_fetched:false,ai_summary_done:false,vectorized:false}}));
+      const popout=new URLSearchParams(location.search).has('noteWindow');
+      const pinia=createPinia();const app=createApp({setup(){return()=>popout?h('div',{class:'workspace'},[h(NoteReferencePicker),h(NoteWindowView)]):h('div',{class:'workspace'},[
+        h(NoteReferencePicker),h(Toolbar),h('div',{class:'workarea'},[h('div',{class:'centre'},[t.reader.activeSlug?h(MarkdownNoteView,{slug:t.reader.activeSlug,key:t.reader.activeSlug}):h(PaperList)]),showSidebar.value?h('div',{class:'test-sidebar'},[h(RightSidebar,{activeTab:sidebarTab.value})]):null]),
         preview.value?h('div',{class:'approval'},[h(WriteConfirmCard,{preview:preview.value,onApprove:()=>{t.approvals++;preview.value=null},onReject:()=>{t.rejections++;preview.value=null}})]):null])}});
       app.use(pinia);app.use(i18n);t.library=useLibraryStore(pinia);t.reader=useReaderStore(pinia);t.selection=useSelectionStore(pinia);
       t.library.currentPath=t.root;t.library.isLoading=false;if(!realStores)t.library.refresh=async()=>{t.library.papers=t.entries()};
@@ -81,7 +91,7 @@ before(async()=>{
       t.setSidebar=tab=>{sidebarTab.value=tab;showSidebar.value=true};
       t.back=()=>t.reader.closePaper();t.approvals=0;t.rejections=0;t.preview=tool=>{const note=notes.values().next().value;preview.value={tool,slug:note.slug,paperTitle:note.collectionName,noteTitle:note.title,content:tool==='update_library_note'?'修改后的正文':note.content,duplicateTitle:false,noteBefore:tool==='update_library_note'?{id:note.id,title:note.title,content:note.content,created_at:now,updated_at:now}:undefined}};
       t.external=content=>{const note=notes.values().next().value;note.content=content;t.emit('library-notes-changed',{root:t.root,slug:note.slug,action:'updated'})};
-      t.setLocale=locale=>i18n.global.locale.value=locale;app.mount('#app');t.ready=true;
+      t.setLocale=locale=>i18n.global.locale.value=locale;if(popout){attachments.set('source-paper',[{id:'pop-note',title:'独立笔记窗口',content:'',created_at:now,updated_at:now}]);localStorage.setItem('argus:note-window:main',JSON.stringify({slug:'source-paper',noteId:'pop-note',title:'独立笔记窗口',root:t.root}))}app.mount('#app');t.ready=true;
       </script>`))
   })
   await server.listen();origin='http://127.0.0.1:'+server.httpServer.address().port
@@ -163,9 +173,9 @@ test('typing during an in-flight save drains the latest draft in order',async()=
   await page.waitForFunction(()=>window.__test.notes.get('note_1').content.includes('保存期间继续输入的第二版'))
   await page.locator('.save-note[title="已保存"]').waitFor()
 })
-test('all standalone-note approval cards identify the operation, show content and require a click',async()=>{
+test('standalone-note write approval cards identify the operation, show content and require a click',async()=>{
   for(const [tool,title,button] of [
-    ['read_library_note','AI 想读取这篇笔记','允许读取'],['create_library_note','AI 想新建独立笔记','确认新建'],
+    ['create_library_note','AI 想新建独立笔记','确认新建'],
     ['update_library_note','AI 想修改这篇笔记','确认修改'],['delete_library_note','AI 想删除这篇笔记','删除笔记'],
   ]){
     await page.evaluate(tool=>window.__test.preview(tool),tool)
@@ -176,7 +186,7 @@ test('all standalone-note approval cards identify the operation, show content an
     await page.locator('.approval').getByRole('button',{name:button,exact:true}).click()
     assert.equal(await page.evaluate(()=>window.__test.approvals),before+1)
   }
-  await page.evaluate(()=>window.__test.preview('read_library_note'))
+  await page.evaluate(()=>window.__test.preview('create_library_note'))
   const before=await page.evaluate(()=>window.__test.approvals)
   await page.locator('.approval').getByRole('button',{name:'取消',exact:true}).click()
   assert.equal(await page.evaluate(()=>window.__test.approvals),before)
@@ -384,4 +394,278 @@ test('real stores: a failed creation does not add a row or prevent a subsequent 
   await create.click();await editor()
   assert.equal(await page.evaluate(()=>window.__test.notes.size),1)
   assert.deepEqual(errors,[])
+})
+
+
+test('note metadata sidebar has no paper fields or paper IO, and edits metadata without overwriting the primary body',async()=>{
+  await open();
+  await page.locator('.import-wrap > button').click();await page.getByRole('button',{name:'新建笔记',exact:true}).click();await editor();
+  await (await editor()).fill('需要保留的笔记正文。');await page.getByRole('button',{name:'完成编辑',exact:true}).click();
+  await page.locator('.md-reading-body').waitFor();
+  await page.evaluate(()=>{window.__test.calls.length=0;window.__test.setSidebar('metadata')});
+  const sidebar=page.locator('.meta-tab');await sidebar.getByText('note.md',{exact:true}).waitFor();
+  assert.deepEqual(await sidebar.locator('.label').allTextContents(),['标题','标签','阅读状态','添加时间','文件名']);
+  assert.equal(await sidebar.getByRole('button').count(),1);
+  const forbidden=['get_fulltext','get_cached_references','fetch_references','fetch_citation_count','extract_metadata_ai','extract_abstract_ai','save_fulltext'];
+  assert.deepEqual(await page.evaluate(list=>window.__test.calls.filter(c=>list.includes(c.name)),forbidden),[]);
+  await sidebar.getByRole('button',{name:'编辑',exact:true}).click();
+  assert.deepEqual(await sidebar.locator('.label').allTextContents(),['标题','标签','阅读状态','添加时间','文件名']);
+  await sidebar.locator('input').first().fill('侧栏改名后的笔记');
+  await sidebar.getByPlaceholder('标签名').fill('重点');await sidebar.getByPlaceholder('标签名').press('Enter');
+  await sidebar.getByRole('button',{name:'阅读中',exact:true}).click();
+  await page.evaluate(()=>window.__test.external('侧栏编辑期间刚保存的新正文。'));
+  await sidebar.getByRole('button',{name:'保存',exact:true}).click();
+  await page.waitForFunction(()=>window.__test.notes.get('note_1').title==='侧栏改名后的笔记');
+  await sidebar.getByText('侧栏改名后的笔记',{exact:true}).waitFor();
+  const note=await page.evaluate(()=>window.__test.notes.get('note_1'));
+  assert.equal(note.content,'侧栏编辑期间刚保存的新正文。');assert.deepEqual(note.tags,['重点']);assert.equal(note.reading_status,'reading');
+  await page.waitForFunction(()=>document.querySelector('.note-header .toolbar-title')?.value==='侧栏改名后的笔记');
+  await page.locator('.md-reading-body').filter({hasText:'侧栏编辑期间刚保存的新正文。'}).waitFor();
+  assert.deepEqual(await page.evaluate(list=>window.__test.calls.filter(c=>list.includes(c.name)),forbidden),[]);
+  if(process.env.ARGUS_TEST_OUTPUT_DIR){const{mkdir}=await import('node:fs/promises');await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/note-metadata-sidebar.png'})}
+})
+
+test('switching from a note to a paper restores paper metadata, and switching back stops paper requests',async()=>{
+  await page.evaluate(()=>{
+    const t=window.__test;
+    t.paperMetas.set('paper-fixture',{id:'paper-fixture',title:'论文示例',authors:['Example Author'],year:2026,venue:'arXiv',doi:'10.1234/example',arxiv_id:'2611.00001',cite_count:12,tags:[],reading_status:'unread',added_at:new Date().toISOString()});
+    t.reader.showList();t.selection.selectPaper('paper-fixture');
+  });
+  const sidebar=page.locator('.meta-tab');await sidebar.getByText('Example Author',{exact:true}).waitFor();
+  await sidebar.getByText('引用量',{exact:true}).waitFor();await sidebar.getByText('BibTeX',{exact:true}).waitFor();
+  assert.equal(await sidebar.locator('.references-field').count(),1);
+  await page.evaluate(()=>{const t=window.__test;t.calls.length=0;t.selection.selectPaper('note_1')});
+  await sidebar.getByText('note.md',{exact:true}).waitFor();
+  assert.equal(await sidebar.locator('.references-field,.bibtex-field,.fulltext-field').count(),0);
+  assert.deepEqual(await sidebar.locator('.label').allTextContents(),['标题','标签','阅读状态','添加时间','文件名']);
+  assert.deepEqual(await page.evaluate(()=>window.__test.calls.filter(c=>['get_fulltext','get_cached_references','fetch_references','fetch_citation_count'].includes(c.name)&&c.args?.slug==='note_1')),[]);
+  assert.deepEqual(errors,[]);
+})
+
+test('note statistics count formatted prose, CJK and Unicode without Markdown syntax or image URLs',async()=>{
+  await open();
+  const result=await page.evaluate(async()=>{
+    const {noteText,textStatistics}=await import('/src/utils/noteStatistics.ts');
+    const markdown='# 中文笔记\n\nHello **world** 2026。\n\n> 第二段[重点](https://example.test/hidden-url)\n\n![](https://example.test/figure.svg)\n\n<!-- ignored comment -->\n\n<script>unsafe()</script>';
+    const text=noteText(markdown);
+    return {text,statistics:textStatistics(text),empty:textStatistics(noteText('')),symbols:textStatistics('😀 👩‍🔬 é'),separatedSymbols:textStatistics('🇦 🇧'),punctuation:textStatistics('…'),list:textStatistics(noteText('- first\n- second')),code:noteText('`let x = 1`'),table:noteText('| A | B |\n|---|---|\n| 一 | 二 |')};
+  });
+  assert.match(result.text,/中文笔记/);assert.doesNotMatch(result.text,/https:|\*\*|unsafe|ignored|<script/);
+  assert.equal(result.statistics.words,12);assert.equal(result.statistics.characters,24);assert.equal(result.statistics.paragraphs,3);
+  assert.equal(result.empty.words,0);assert.equal(result.empty.characters,0);assert.equal(result.empty.readingMinutes,0);
+  assert.equal(result.symbols.characters,3);assert.equal(result.separatedSymbols.characters,2);assert.equal(result.punctuation.words,0);
+  assert.equal(result.list.words,2);assert.equal(result.list.paragraphs,2);
+  assert.equal(result.code,'let x = 1');assert.match(result.table,/A\tB/);
+})
+
+test('bottom status bar updates while editing, tracks save state and shows selection statistics in reading and editing',async()=>{
+  await open();await page.locator('.import-wrap > button').click();await page.getByRole('button',{name:'新建笔记',exact:true}).click();await editor();
+  const bar=page.locator('.note-status-bar');await bar.getByText('0 字',{exact:true}).waitFor();
+  await page.evaluate(()=>window.__test.holdSave=true);
+  await (await editor()).fill('中文笔记 Hello world 2026。\n\n第二段重点与链接');
+  await bar.getByText('15 字',{exact:true}).waitFor();await bar.getByText('27 字符',{exact:true}).waitFor();
+  await bar.locator('.note-save-state.unsaved').waitFor();
+  await page.locator('.save-note').click();await bar.locator('.note-save-state.saving').waitFor();
+  await page.waitForFunction(()=>typeof window.__test.releaseSave==='function');
+  await page.evaluate(()=>{window.__test.holdSave=false;window.__test.releaseSave()});
+  await bar.locator('.note-save-state.saved').waitFor();
+  await bar.getByRole('button',{name:'笔记统计',exact:true}).click();
+  const popover=bar.locator('.note-statistics-popover');await popover.waitFor();
+  assert.equal(await popover.locator('dl > div').filter({hasText:'段落数'}).locator('dd').textContent(),'2');
+  await page.keyboard.press('Escape');await popover.waitFor({state:'hidden'});
+  await selectReadingText('中文笔记','.markdown-note .vditor-ir .vditor-reset');
+  await bar.getByText('选中 4 / 共 15 字',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'完成编辑',exact:true}).click();await page.locator('.md-reading-body').waitFor();
+  await bar.getByText('15 字',{exact:true}).waitFor();
+  await selectReadingText('中文笔记');await bar.getByText('选中 4 / 共 15 字',{exact:true}).waitFor();
+  await bar.getByRole('button',{name:'笔记统计',exact:true}).click();
+  assert.equal(await popover.locator('dl > div').filter({hasText:'选中字数'}).locator('dd').textContent(),'4');
+  assert.equal(await popover.locator('dl > div').filter({hasText:'选中字符数'}).locator('dd').textContent(),'4');
+  const geometry=await bar.evaluate(el=>{const footer=el.getBoundingClientRect(),view=el.closest('.markdown-note').getBoundingClientRect(),body=document.querySelector('.md-note-reading').getBoundingClientRect();return {bottom:footer.bottom,parentBottom:view.bottom,contentBottom:body.bottom,top:footer.top}});
+  assert(Math.abs(geometry.bottom-geometry.parentBottom)<2);assert(geometry.contentBottom<=geometry.top+1);
+  await page.keyboard.press('Escape');
+  await page.evaluate(()=>window.__test.setLocale('en'));await bar.getByRole('button',{name:'Document statistics',exact:true}).waitFor();
+  assert.match(await bar.textContent(),/words/);await page.evaluate(()=>window.__test.setLocale('zh'));
+  await page.evaluate(()=>{window.getSelection()?.removeAllRanges();document.documentElement.dataset.theme='midnight'});
+  if(process.env.ARGUS_TEST_OUTPUT_DIR){const{mkdir}=await import('node:fs/promises');await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/note-status-dark.png'})}
+  await page.evaluate(()=>document.documentElement.dataset.theme='light');
+  await bar.getByRole('button',{name:'笔记统计',exact:true}).click();
+  if(process.env.ARGUS_TEST_OUTPUT_DIR)await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/note-status-light.png'});
+  await page.keyboard.press('Escape');
+  // The centre can shrink independently when the right sidebar opens.
+  await page.setViewportSize({width:1000,height:700});await page.evaluate(()=>window.__test.setSidebar('metadata'));
+  await page.locator('.meta-tab').getByText('note.md',{exact:true}).waitFor();
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+  const narrow=await bar.evaluate(el=>{const box=el.getBoundingClientRect();return {width:box.width,bottom:box.bottom,viewport:innerHeight,overflow:el.scrollWidth>el.clientWidth,children:[...el.querySelectorAll('.note-status-metrics,.note-status-document')].map(child=>child.getBoundingClientRect().right<=box.right)}});
+  assert.equal(narrow.overflow,false);assert(narrow.children.every(Boolean));assert(Math.abs(narrow.bottom-narrow.viewport)<2,JSON.stringify(narrow));
+  assert.equal(await page.locator('.workspace').count(),1);
+  if(process.env.ARGUS_TEST_OUTPUT_DIR)await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/note-status-narrow.png'});
+  await page.setViewportSize({width:1400,height:900});assert.deepEqual(errors,[]);
+})
+
+test('save conflicts keep the status bar honest and retain draft statistics',async()=>{
+  await page.evaluate(()=>window.__test.setLocale('zh'));await editor();
+  await (await editor()).fill('保留草稿');
+  await page.evaluate(()=>window.__test.external('外部保存的正文'));
+  await page.locator('.save-note').click();
+  const bar=page.locator('.note-status-bar');await bar.locator('.note-save-state.error').waitFor();
+  await bar.getByText('4 字',{exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>window.__test.notes.get('note_1').content),'外部保存的正文');
+  assert.match(await (await editor()).textContent(),/保留草稿/);
+})
+
+
+async function newReferenceNote() {
+  await open();await page.evaluate(()=>localStorage.clear());await page.locator('.import-wrap > button').click();await page.getByRole('button',{name:'新建笔记',exact:true}).click();return editor();
+}
+async function typeReference(input,query='') {
+  await input.pressSequentially('/',{delay:25});await page.locator('.note-reference-command').waitFor();
+  await input.press('Tab');await page.locator('.note-reference-search').waitFor();
+  await page.locator('.note-reference-search').fill(query.trimStart());
+  await page.waitForFunction(()=>!document.querySelector('.note-reference-feedback[role="status"]')?.textContent.includes('正在读取'));
+}
+test('/ref slash suggestion opens on one character, uses a real search box and shows titles instead of citation keys',async()=>{
+  const input=await newReferenceNote();await input.fill('参见 ');await input.press('End');await input.pressSequentially('/');
+  const command=page.locator('.note-reference-command');await command.waitFor();assert.match(await command.textContent(),/\/ref/);
+  assert.equal(await page.locator('.note-reference-search').count(),0);
+  assert.equal(await page.evaluate(()=>window.__test.calls.filter(c=>c.name==='list_note_reference_papers').length),0);
+  if(process.env.ARGUS_TEST_OUTPUT_DIR){const{mkdir}=await import('node:fs/promises');await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.locator('.note-reference-popup').screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/ref-command.png'})}
+  await command.click();const search=page.getByRole('combobox',{name:'搜索文献标题'});await search.waitFor();
+  assert.equal(await search.evaluate(element=>element===document.activeElement),true);
+  const heading=await page.locator('.note-reference-heading').boundingBox(),box=await search.boundingBox();assert(box.y>=heading.y+heading.height);
+  await search.fill('Host Guest');await page.locator('.note-reference-option').filter({hasText:'Host Guest Phosphorescence Mechanisms'}).waitFor();
+  assert.equal(await page.locator('.note-reference-option').count(),1);
+  assert(!await page.locator('.note-reference-popup').textContent().then(text=>text.includes('Alpha2025')));
+  assert.equal(await input.textContent(),'参见 /');
+  if(process.env.ARGUS_TEST_OUTPUT_DIR)await page.locator('.note-reference-popup').screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/ref-title-search.png'});
+  await page.locator('.note-reference-option').click();
+  await page.waitForFunction(()=>window.__test.notes.get('note_1')?.content.includes('[Host Guest Phosphorescence Mechanisms](#argus-paper=ref-alpha)'));
+})
+test('/ref full command focuses popup search, IME Enter does not insert, and Escape restores the original draft caret',async()=>{
+  const input=await newReferenceNote();await input.pressSequentially('/ref',{delay:30});
+  const search=page.locator('.note-reference-search');await search.waitFor();await search.fill('A different method');
+  await page.locator('.note-reference-option').waitFor();
+  await search.evaluate(element=>element.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',isComposing:true,bubbles:true,cancelable:true})));
+  assert.equal(await search.count(),1);assert.equal(await input.textContent(),'/ref');
+  await search.press('Escape');await page.locator('.note-reference-popup').waitFor({state:'hidden'});
+  assert.equal(await input.evaluate(element=>element===document.activeElement),true);assert.equal(await input.textContent(),'/ref');
+  await input.pressSequentially(' 后续正文');assert.match(await input.textContent(),/\/ref 后续正文/);
+  assert.equal(await page.locator('.note-reference-popup').count(),0);assert.equal(await input.evaluate(element=>element===document.activeElement),true);
+})
+test('/ref starts from a slash command, searches inside the popup and inserts a title at the original caret with undo',async()=>{
+  const input=await newReferenceNote();await input.fill('前文 ');await page.waitForTimeout(900);await input.press('End');await typeReference(input,' Host');
+  const rows=page.locator('.note-reference-option');assert.equal(await rows.count(),2);
+  assert.match(await rows.first().textContent(),/A different method paper/);assert(!await rows.first().textContent().then(text=>text.includes('Host2026')));
+  assert.match(await input.textContent(),/前文 \/$/);assert(!await input.textContent().then(text=>text.includes('Host')));
+  assert.equal(await page.locator('.note-reference-search').evaluate(input=>input===document.activeElement),true);
+  await page.locator('.note-reference-search').press('Enter');await page.locator('.note-reference-popup').waitFor({state:'hidden'});
+  await page.waitForFunction(()=>window.__test.notes.get('note_1')?.content.includes('#argus-paper=ref-host'));
+  const saved=await page.evaluate(()=>window.__test.notes.get('note_1').content);assert.match(saved,/前文/);assert.match(saved,/\[A different method paper\]\(#argus-paper=ref-host\)/);assert(!saved.includes('/ref'));
+  // Vditor commits its own undo snapshot on an 800 ms debounce.
+  await page.waitForTimeout(900);await input.press('ControlOrMeta+z');await page.waitForFunction(()=>!window.__test.notes.get('note_1')?.content.includes('#argus-paper=ref-host'));
+  assert.match(await input.textContent(),/前文/);
+})
+test('/ref shows paper titles without citation keys, selects by keyboard and opens the current paper by stable id',async()=>{
+  const input=await newReferenceNote();await typeReference(input,' Alpha');
+  const rows=page.locator('.note-reference-option');assert.equal(await rows.count(),2);assert.match(await rows.nth(1).textContent(),/Second paper/);
+  assert(!await rows.allTextContents().then(texts=>texts.join('').includes('Alpha2025')));
+  await page.locator('.note-reference-search').press('ArrowDown');await page.locator('.note-reference-search').press('Tab');await page.locator('.note-reference-popup').waitFor({state:'hidden'});
+  await page.waitForFunction(()=>window.__test.notes.get('note_1')?.content.includes('#argus-paper=ref-second'));
+  await page.evaluate(()=>window.__test.references.find(p=>p.id==='ref-second').slug='renamed-after-insertion');
+  await page.getByRole('button',{name:'完成编辑',exact:true}).click();const link=page.locator('.md-reading-body a[href="#argus-paper=ref-second"]');await link.waitFor();await link.click();
+  await page.waitForFunction(()=>window.__test.opens.length===1);
+  assert.deepEqual(await page.evaluate(()=>window.__test.opens[0]),{slug:'renamed-after-insertion',title:'Second paper with the same citation key',root:'/mock-library'});
+  assert(!await page.evaluate(()=>window.__test.calls.some(c=>c.name==='open_url')));
+  await goToList();await page.locator('.paper-row').first().dblclick();await page.locator('.md-reading-body a[href="#argus-paper=ref-second"]').waitFor();
+})
+test('/ref matches titles without BibTeX keys and clicks open directly in the editable Vditor view',async()=>{
+  const input=await newReferenceNote();await typeReference(input,' NoKey');
+  await page.locator('.note-reference-option').click();await page.locator('.note-reference-popup').waitFor({state:'hidden'});
+  await page.waitForFunction(()=>window.__test.notes.get('note_1')?.content.includes('#argus-paper=ref-keyless'));
+  const body=await page.evaluate(()=>window.__test.notes.get('note_1').content);assert.match(body,/NoKey/);assert.match(body,/special/);
+  await input.press('ArrowRight');await input.press('ArrowRight');
+  await page.locator('.vditor-ir__link').filter({hasText:'NoKey'}).click();await page.waitForFunction(()=>window.__test.opens.length===1);
+  assert.equal(await page.evaluate(()=>window.__test.opens[0].slug),'keyless-paper');
+})
+test('/ref supports attached notes and dismisses safely on Escape, missing matches and late library results',async()=>{
+  await newReferenceNote();await page.evaluate(()=>window.__test.setSidebar('notes'));await page.locator('.notes-tab .new-btn').click();
+  const input=page.locator('.notes-tab .vditor-ir [contenteditable="true"]');await input.waitFor();await typeReference(input,' Alpha');await page.locator('.note-reference-search').press('Escape');
+  await page.locator('.note-reference-popup').waitFor({state:'hidden'});await input.press('ArrowLeft');await input.press('ArrowRight');assert.equal(await page.locator('.note-reference-popup').count(),0);
+  await input.press('ControlOrMeta+a');await input.press('Backspace');await typeReference(input,' no-such-key');
+  await page.getByText('没有匹配的论文，试试其他标题关键词。',{exact:true}).waitFor();await page.locator('.note-reference-search').press('Escape');
+  await input.press('ControlOrMeta+a');await input.press('Backspace');await typeReference(input,' Alpha');await page.locator('.note-reference-search').press('Enter');
+  await page.waitForFunction(()=>window.__test.attachments.get('note_1')?.[0]?.content.includes('#argus-paper=ref-alpha'));
+  const primary=await page.evaluate(()=>window.__test.notes.get('note_1').content);assert.equal(primary,'');
+  await page.evaluate(()=>window.__test.holdReferences=true);await input.fill('后续 /ref');
+  await page.waitForFunction(()=>typeof window.__test.resolveReferences==='function');
+  await page.evaluate(()=>{const t=window.__test;t.root='/new-library';t.emit('library-changed','/new-library');t.resolveReferences()});
+  await page.locator('.note-reference-popup').waitFor({state:'hidden'});assert.deepEqual(errors,[]);
+})
+
+test('/ref works in the independent note window, persists on reload and opens the referenced paper',async()=>{
+  await page.goto(origin+'/__library-notes?noteWindow=1');await page.waitForFunction(()=>window.__test?.ready);
+  const input=page.locator('.note-window .vditor-ir [contenteditable="true"]');await input.waitFor();await typeReference(input,' Host2026');
+  await page.locator('.note-reference-search').press('Enter');await page.locator('.note-reference-popup').waitFor({state:'hidden'});
+  await page.waitForFunction(()=>window.__test.attachments.get('source-paper')?.[0]?.content.includes('#argus-paper=ref-host'));
+  await page.evaluate(()=>window.__test.emit('note-window-data-main',{slug:'source-paper',noteId:'pop-note',title:'独立笔记窗口',root:window.__test.root}));
+  const link=page.locator('.note-window .vditor-ir__link').filter({hasText:'A different method paper'});await link.waitFor();await link.click();
+  await page.waitForFunction(()=>window.__test.opens.length===1);assert.equal(await page.evaluate(()=>window.__test.opens[0].slug),'host-paper');
+})
+test('/ref works inside annotation textareas, Escape keeps the draft, and pointer selection does not blur or save prematurely',async()=>{
+  const input=await newReferenceNote();await input.fill('可以添加引用批注的正文。');await page.getByRole('button',{name:'完成编辑',exact:true}).click();
+  await page.locator('.md-reading-body').waitFor();await selectReadingText('引用批注');await page.locator('.md-selection').getByRole('button',{name:'批注',exact:true}).click();
+  const annotation=page.locator('.md-annotation-editor textarea');await annotation.waitFor();await annotation.fill('说明 ');await annotation.press('End');await typeReference(annotation,' Alpha');
+  await page.locator('.note-reference-search').press('Escape');await page.locator('.note-reference-popup').waitFor({state:'hidden'});assert.equal(await annotation.count(),1);assert.match(await annotation.inputValue(),/说明/);
+  await annotation.press('ControlOrMeta+a');await annotation.press('Backspace');await annotation.fill('说明 /ref Host');await page.locator('.note-reference-popup').waitFor();
+  await page.locator('.note-reference-option').first().click();await page.locator('.note-reference-popup').waitFor({state:'hidden'});
+  assert.equal(await annotation.count(),1);assert.match(await annotation.inputValue(),/\[A different method paper\]\(#argus-paper=ref-host\)/);
+  await page.locator('.md-annotation-editor').getByRole('button',{name:'保存',exact:true}).click();
+  await page.waitForFunction(()=>window.__test.highlights.get('note_1')?.[0]?.note?.includes('#argus-paper=ref-host'));
+  await page.evaluate(()=>window.__test.setSidebar('highlights'));const link=page.locator('.hl-note a[href="#argus-paper=ref-host"]');await link.waitFor();await link.click();
+  await page.waitForFunction(()=>window.__test.opens.length===1);
+})
+test('/ref handles empty results and deleted papers without wrong navigation, and the popup fits narrow dark windows',async()=>{
+  const input=await newReferenceNote();await typeReference(input,' Alpha');
+  await page.setViewportSize({width:680,height:500});await page.evaluate(()=>document.documentElement.dataset.theme='midnight');
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+  const rect=await page.locator('.note-reference-popup').boundingBox();assert(rect.x>=0&&rect.x+rect.width<=681);assert(rect.y>=0&&rect.y+rect.height<=501);
+  if(process.env.ARGUS_TEST_OUTPUT_DIR){const{mkdir}=await import('node:fs/promises');await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+'/ref-picker-dark-narrow.png'})}
+  await page.locator('.note-reference-search').press('Enter');await page.locator('.note-reference-popup').waitFor({state:'hidden'});await page.getByRole('button',{name:'完成编辑',exact:true}).click();
+  await page.evaluate(()=>window.__test.references=[]);await page.locator('.md-reading-body a[href="#argus-paper=ref-alpha"]').click();
+  await page.locator('.note-reference-toast').filter({hasText:'无法打开引用论文'}).waitFor();assert.equal(await page.evaluate(()=>window.__test.opens.length),0);
+  await page.setViewportSize({width:1400,height:900});assert.deepEqual(errors,[]);
+})
+
+test('/ref renders safe portable links in plain note previews and ignores invalid reference URLs',async()=>{
+  await newReferenceNote();
+  const state=await page.evaluate(async()=>{
+    const {renderReferenceText,referenceMarkdown,referenceId}=await import('/src/utils/paperReferences.ts');
+    const paper=window.__test.references.find(p=>p.id==='ref-keyless');
+    const source=referenceMarkdown(paper),html=renderReferenceText('正文 '+source+' <img src=x onerror=alert(1)>');
+    const element=document.createElement('div');element.id='plain-note-test';element.innerHTML=html;document.body.append(element);
+    return {source,label:element.querySelector('a')?.textContent,images:element.querySelectorAll('img').length,invalid:referenceId('#argus-paper=%zz'),space:referenceId('#argus-paper=bad%20id')};
+  });
+  assert.equal(state.label,'NoKey [special] title');assert.equal(state.images,0);assert.equal(state.invalid,null);assert.equal(state.space,null);
+  await page.locator('#plain-note-test a').click();await page.waitForFunction(()=>window.__test.opens.length===1);assert.equal(await page.evaluate(()=>window.__test.opens[0].slug),'keyless-paper');
+})
+test('/ref cancelled insertions cannot overwrite new typing or block the next lookup',async()=>{
+  const input=await newReferenceNote();await typeReference(input,' Alpha');await page.evaluate(()=>window.__test.holdResolve=true);await page.locator('.note-reference-search').press('Enter');
+  await page.waitForFunction(()=>typeof window.__test.resolveReference==='function');
+  await page.locator('.note-reference-search').press('Escape');await page.locator('.note-reference-popup').waitFor({state:'hidden'});
+  await input.press('ControlOrMeta+a');await input.press('Backspace');await input.fill('新草稿 /ref Host');await page.locator('.note-reference-popup').waitFor();
+  await page.evaluate(()=>{window.__test.holdResolve=false;window.__test.resolveReference()});
+  await page.locator('.note-reference-option').filter({hasText:'A different method paper'}).click();await page.locator('.note-reference-popup').waitFor({state:'hidden'});
+  await page.waitForFunction(()=>window.__test.notes.get('note_1')?.content.includes('#argus-paper=ref-host'));
+  const source=await page.evaluate(()=>window.__test.notes.get('note_1').content);assert.match(source,/新草稿/);assert(!source.includes('#argus-paper=ref-alpha'));assert.deepEqual(errors,[]);
+})
+
+test('/ref uses the last trigger, supports adjacent Chinese and slash keys, and ignores ordinary textareas and URLs',async()=>{
+  await newReferenceNote();
+  const state=await page.evaluate(async()=>{
+    const {getReferenceTrigger}=await import('/src/utils/noteReferenceTrigger.ts');
+    const input=document.createElement('textarea');input.dataset.noteReferences='';document.body.append(input);
+    const results=['/ref Alpha','参见/ref Alpha','/ref Old /ref Host','https://ref Alpha','/ref 2026/Hybrid:title'].map(value=>{input.value=value;input.focus();input.setSelectionRange(value.length,value.length);return getReferenceTrigger()?.query??null});
+    input.removeAttribute('data-note-references');input.value='/ref Alpha';input.setSelectionRange(10,10);const unmarked=getReferenceTrigger();input.remove();return {results,unmarked};
+  });
+  assert.deepEqual(state.results,['Alpha','Alpha','Host',null,'2026/Hybrid:title']);assert.equal(state.unmarked,null);
 })

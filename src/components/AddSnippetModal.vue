@@ -257,7 +257,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown, true))
 
         <!-- Note -->
         <div class="field-label">{{ t('snippets.note') }}</div>
-        <textarea
+        <textarea data-note-references
           v-model="note"
           class="note-input"
           :placeholder="t('snippets.notePlaceholder')"

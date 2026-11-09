@@ -686,7 +686,7 @@ fn parse_markdown_passages(root: &str, tool: &str, slug: &str, passages: &[serde
         if raw.get("color").is_none() { raw["color"] = batch_color.into(); }
         let p: Passage = serde_json::from_value(raw).map_err(|e| e.to_string())?;
         if p.page != 1 || p.anchor.is_some() || p.end_anchor.is_some() || p.text.trim().is_empty() || p.text.chars().count() > 10000 {
-            return Err("Markdown annotations use page:1 and an exact, unique excerpt from the approved read_library_note result; PDF anchors are unavailable".into());
+            return Err("Markdown annotations use page:1 and an exact, unique excerpt from the read_library_note result; PDF anchors are unavailable".into());
         }
         if !["highlight", "underline"].contains(&p.style.as_str()) { return Err("Use highlight or underline".into()); }
         if p.note.as_ref().is_some_and(|n| n.chars().count() > 10000)

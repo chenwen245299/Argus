@@ -3,6 +3,9 @@ import hljs from 'highlight.js/lib/common'
 import DOMPurify from 'dompurify'
 import katex from 'katex'
 import { invoke } from '@tauri-apps/api/core'
+import { protectSvgBlocks, svgPreviewUrl } from './svgPreview'
+import { svgStringToPngBlob } from './svgToPng'
+import { installPaperReferenceNavigation } from './paperReferences'
 
 // DOMPurify's default URI policy blocks `blob:`, which is how a note's pasted
 // images are rendered (see utils/noteAssets.ts) — without this they'd be
@@ -34,6 +37,7 @@ let handlersInstalled = false
 function installMarkdownHandlers() {
   if (handlersInstalled || typeof document === 'undefined') return
   handlersInstalled = true
+  installPaperReferenceNavigation()
 
   document.addEventListener('click', (event) => {
     const target = event.target as HTMLElement | null
@@ -56,6 +60,20 @@ function installMarkdownHandlers() {
     if (!button) return
 
     const action = button.dataset.mdAction
+    if (action === 'copy-svg-image') {
+      const image = button.closest('.svg-code-block')?.querySelector<HTMLImageElement>('.svg-preview-image')
+      if (!image?.src.startsWith('data:image/svg+xml;charset=utf-8,')) return
+      const source = decodeURIComponent(image.src.slice(image.src.indexOf(',') + 1))
+      // Start the clipboard write in the click's user gesture; WebKit can lose
+      // permission if it starts only after asynchronous image decoding.
+      try {
+        const item = new ClipboardItem({ 'image/png': svgStringToPngBlob(source) })
+        navigator.clipboard.write([item]).then(() => {
+          button.title = '已复制'
+        }).catch(() => { button.title = '复制失败，请重试' })
+      } catch { button.title = '复制失败，请重试' }
+      return
+    }
     if (action === 'copy-code') {
       const code = button.closest('.md-code-block')?.querySelector('code')
       const text = code?.textContent ?? ''
@@ -82,6 +100,15 @@ function escapeHtmlAttr(s: string): string {
 
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function renderSvgBlock(source: string): string {
+  const url = svgPreviewUrl(source)
+  const highlighted = hljs.highlight(source, { language: 'xml' }).value
+  const preview = url ? `<div class="svg-preview-area"><img class="svg-preview-image" src="${escapeHtmlAttr(url)}" alt="SVG 图示" /></div>` : ''
+  return `<div class="md-code-block svg-code-block"><div class="md-code-header"><span class="md-code-lang">svg</span>${url
+    ? `<button class="svg-toggle-btn" data-md-action="toggle-svg-source" type="button">查看代码</button><button class="md-copy-btn" data-md-action="copy-svg-image" title="复制图片" type="button">${COPY_ICON}</button>`
+    : `<button class="md-copy-btn" data-md-action="copy-code" type="button">${COPY_ICON}</button>`}</div>${preview}<pre class="svg-source-pre"${url ? ' style="display:none"' : ''}><code class="hljs xml">${highlighted}</code></pre></div>`
 }
 
 // Some saved answers put TeX-like formulas in backticks instead of math
@@ -133,11 +160,9 @@ marked.use({
     },
     code(token: Tokens.Code): string {
       const { text, lang } = token
-      if (lang === 'svg') {
-        const clean = DOMPurify.sanitize(text, { USE_PROFILES: { svg: true, svgFilters: true } })
-        const highlighted = hljs.highlight(text, { language: 'xml' }).value
-        return `<div class="md-code-block svg-code-block"><div class="md-code-header"><span class="md-code-lang">svg</span><button class="svg-toggle-btn" data-md-action="toggle-svg-source" type="button">查看代码</button><button class="md-copy-btn" data-action="copy-svg-image" title="复制图片" type="button">${COPY_ICON}</button></div><div class="svg-preview-area">${clean}</div><pre class="svg-source-pre" style="display:none"><code class="hljs xml">${highlighted}</code></pre></div>`
-      }
+      const language = (lang ?? '').split(/\s/)[0].toLowerCase()
+      if (language === 'svg' || (['', 'xml', 'html'].includes(language)
+        && /^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(text))) return renderSvgBlock(text)
       const validLang = lang && hljs.getLanguage(lang) ? lang : 'plaintext'
       const highlighted = hljs.highlight(text, { language: validLang }).value
       return `<div class="md-code-block"><div class="md-code-header"><span class="md-code-lang">${escapeHtml(validLang)}</span><button class="md-copy-btn" data-md-action="copy-code" type="button">${COPY_ICON}</button></div><pre><code class="hljs ${escapeHtmlAttr(validLang)}">${highlighted}</code></pre></div>`
@@ -162,15 +187,35 @@ export function renderMarkdown(content: string): string {
   try {
     installMarkdownHandlers()
     const codeBlocks: string[] = []
-    let md = content.replace(/```[\s\S]*?```/g, (m) => {
-      codeBlocks.push(m)
-      return `<!--CODE_BLOCK_${codeBlocks.length - 1}-->`
-    })
+    // Protect complete Markdown fences, including tildes and longer backticks.
+    // SVG-looking examples inside other languages must remain source code.
+    let md = '', lastFence = 0
+    for (const match of content.matchAll(/^ {0,3}(`{3,}|~{3,})[^\n]*\n/gm)) {
+      if (match.index! < lastFence) continue
+      const fence = match[1]
+      const closing = new RegExp(`^ {0,3}${fence[0]}{${fence.length},}[\\t ]*(?:\\n|$)`, 'gm')
+      closing.lastIndex = match.index! + match[0].length
+      const end = closing.exec(content)
+      const until = end ? end.index + end[0].length : content.length
+      codeBlocks.push(content.slice(match.index!, until))
+      md += content.slice(lastFence, match.index!) + `<!--CODE_BLOCK_${codeBlocks.length - 1}-->\n`
+      lastFence = until
+    }
+    md += content.slice(lastFence)
 
     const inlineCodes: string[] = []
     md = md.replace(/(`+)([\s\S]*?)\1(?!`)/g, (m) => {
       inlineCodes.push(m)
       return `<!--INLINE_CODE_${inlineCodes.length - 1}-->`
+    })
+
+    const svgBlocks: string[] = []
+    md = protectSvgBlocks(md, source => {
+      // Backticks inside an SVG label are literal text, while an entire SVG
+      // shown inside an inline-code span must remain an example.
+      source = source.replace(/<!--INLINE_CODE_(\d+)-->/g, (_, i) => inlineCodes[+i] ?? '')
+      svgBlocks.push(renderSvgBlock(source))
+      return `\n\n<!--SVG_BLOCK_${svgBlocks.length - 1}-->\n\n`
     })
 
     const displayMaths: string[] = []
@@ -204,7 +249,7 @@ export function renderMarkdown(content: string): string {
     }
 
     let html = marked.parse(md) as string
-    if (typeof html !== 'string') return content
+    if (typeof html !== 'string') return escapeHtml(content)
 
     html = html.replace(/<!--DISPLAY_MATH_(\d+)-->/g, (_, i) => {
       const tex = displayMaths[+i] ?? ''
@@ -232,6 +277,8 @@ export function renderMarkdown(content: string): string {
       return marked.parseInline(inlineCodes[+i] ?? '') as string
     })
 
+    html = html.replace(/<!--SVG_BLOCK_(\d+)-->/g, (_, i) => svgBlocks[+i] ?? '')
+
     return DOMPurify.sanitize(html, {
       ADD_ATTR: ['data-action', 'data-md-action', 'target', 'rel', 'title', 'type', 'encoding'],
       // `semantics`/`annotation` carry KaTeX's original TeX source; without them
@@ -245,7 +292,7 @@ export function renderMarkdown(content: string): string {
       FORCE_BODY: false,
     })
   } catch {
-    return content
+    return escapeHtml(content)
   }
 }
 

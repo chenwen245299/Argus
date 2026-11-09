@@ -146,6 +146,7 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "calamine",
+ "cc",
  "cfb",
  "chrono",
  "encoding_rs",

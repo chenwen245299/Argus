@@ -2,6 +2,7 @@
 import { ref, computed, nextTick, Teleport } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
+import { renderReferenceText } from '../utils/paperReferences'
 import {
   libraries,
   snippets,
@@ -322,14 +323,14 @@ async function commitTags(s: Snippet) {
               <!-- Note cell -->
               <td class="col-note" @click.stop>
                 <!-- Editing mode -->
-                <textarea
+                <textarea data-note-references
                   v-if="editingNoteId === s.id"
                   :id="`note-input-${s.id}`"
                   v-model="editNoteValue"
                   class="note-input"
                   rows="2"
                   @keydown="onNoteKeydown($event, s)"
-                  @blur="commitNote(s)"
+                  @blur="event => { if (!(event.relatedTarget as Element | null)?.closest('.note-reference-popup')) commitNote(s) }"
                 />
                 <!-- View mode -->
                 <span
@@ -338,7 +339,8 @@ async function commitTags(s: Snippet) {
                   :class="{ placeholder: !s.note }"
                   :title="t('snippetLibrary.editNote')"
                   @click="startEditNote(s)"
-                >{{ s.note || t('snippetLibrary.addNote') }}</span>
+                  v-html="renderReferenceText(s.note || t('snippetLibrary.addNote'))"
+                />
               </td>
 
               <!-- Delete -->

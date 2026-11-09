@@ -174,10 +174,10 @@ fn app_only_tools() -> Vec<AgentTool> {
         note_change_tool(app_tools::RESTORE_NOTE_TOOL), deleted_notes_tool()];
     for tool in &mut tools {
         if matches!(tool.name.as_str(), app_tools::CREATE_NOTE_TOOL | app_tools::UPDATE_NOTE_TOOL | app_tools::DELETE_NOTE_TOOL | app_tools::RESTORE_NOTE_TOOL) {
-            tool.description.push_str(" Also supports attachment notes on standalone Markdown documents (file_type md). These are separate from the primary document: use library_note tools for its primary body; read attachments with read_library_note {slug,note_id}, also requiring approval.");
+            tool.description.push_str(" Also supports attachment notes on standalone Markdown documents (file_type md). These are separate from the primary document: use library_note tools for its primary body; read attachments with read_library_note {slug,note_id} directly without confirmation.");
         }
         if matches!(tool.name.as_str(), app_tools::CREATE_HIGHLIGHTS_TOOL | app_tools::CREATE_ANNOTATIONS_TOOL) {
-            tool.description.push_str(" For standalone Markdown documents (file_type md), first use read_library_note with user approval instead of PDF inspection. Use page:1 and a unique exact Markdown-source excerpt in text; omit PDF anchor/end_anchor. A separate exact annotation preview requires user approval; source changes invalidate it.");
+            tool.description.push_str(" For standalone Markdown documents (file_type md), first use read_library_note directly without confirmation instead of PDF inspection. Use page:1 and a unique exact Markdown-source excerpt in text; omit PDF anchor/end_anchor. A separate exact annotation preview requires user approval; source changes invalidate it.");
         }
         if matches!(tool.name.as_str(), app_tools::UPDATE_MARKS_TOOL | app_tools::REMOVE_MARKS_TOOL) {
             tool.description.push_str(" Also supports standalone Markdown annotations using ids from get_highlights, with the same approval, stale-preview and AI-only retraction rules.");
@@ -477,6 +477,7 @@ pub fn call(root: &str, name: &str, args: &serde_json::Value) -> Result<serde_js
         return super::arxiv_tools::call(root, name, args);
     }
     match name {
+        super::library_note_tools::READ => super::library_note_tools::read(root, args),
         app_tools::LIST_DELETED_NOTES_TOOL => {
             let slug = args.get("slug").and_then(|s| s.as_str()).ok_or("slug must be a string")?;
             ok(serde_json::json!({"notes": crate::paper::list_deleted_notes(root, slug)?}))

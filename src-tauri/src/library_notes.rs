@@ -1,6 +1,6 @@
 //! Independent Markdown documents in the ordinary collection tree. The primary
-//! body is not a paper attachment or extracted fulltext: AI reads it only via
-//! the dedicated approval-gated tool.
+//! body is not a paper attachment or extracted fulltext: AI reads it directly via
+//! the dedicated read_library_note tool; changes require approval.
 use crate::{collections, fsutil, models::PaperMeta, paper};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
@@ -125,6 +125,25 @@ pub fn update(root: &str, expected: &Snapshot, title: &str, content: &str) -> Re
     Ok(Snapshot { title: meta.title, content: content.into(), ..current })
 }
 
+/// Manual sidebar edits affect only note metadata, never the primary body.
+pub fn update_metadata(root: &str, slug: &str, expected: &PaperMeta, title: &str, tags: Vec<String>, reading_status: &str) -> Result<PaperMeta, String> {
+    validate(title, "")?;
+    if !matches!(reading_status, "unread" | "reading" | "read") { return Err("Invalid reading status".into()); }
+    let _guard = lock();
+    let namespace = paper::namespace_lock(root);
+    let _namespace = namespace.lock().unwrap_or_else(|e| e.into_inner());
+    read_unlocked(root, slug)?;
+    let mut current = paper::read_meta(root, slug)?;
+    if current.id != expected.id || current.title != expected.title || current.tags != expected.tags || current.reading_status != expected.reading_status {
+        return Err("Note metadata changed; reload before saving.".into());
+    }
+    current.title = title.trim().into();
+    current.tags = tags;
+    current.reading_status = reading_status.into();
+    paper::write_meta(root, slug, &current)?;
+    Ok(current)
+}
+
 pub fn delete(root: &str, expected: &Snapshot) -> Result<(), String> {
     let _guard = lock();
     let original; let backup;
@@ -211,6 +230,42 @@ pub(crate) mod tests {
         assert_eq!(read(&lib.root, &saved.slug).unwrap(), saved);
         assert!(delete(&lib.root, &before).is_err());
         assert!(!std::path::Path::new(&lib.root).join(".argus/library-note-trash").exists());
+    }
+    #[test]
+    fn metadata_edits_keep_new_body_and_links_and_reject_stale_or_deleted_entries() {
+        let lib = Library::new(); let note = lib.note();
+        let before = paper::read_meta(&lib.root, &note.slug).unwrap();
+        let body = update(&lib.root, &note, &note.title, "刚刚自动保存的正文").unwrap();
+        let mut latest = paper::read_meta(&lib.root, &note.slug).unwrap();
+        latest.related_ids = vec!["related-paper".into()];
+        paper::write_meta(&lib.root, &note.slug, &latest).unwrap();
+        let saved = update_metadata(&lib.root, &note.slug, &before, "侧栏新标题", vec!["学习".into()], "reading").unwrap();
+        assert_eq!(saved.related_ids, latest.related_ids);
+        assert_eq!(saved.tags, vec!["学习"]);
+        assert_eq!(saved.reading_status, "reading");
+        let current = read(&lib.root, &note.slug).unwrap();
+        assert_eq!(current.content, body.content);
+        assert_eq!(current.title, "侧栏新标题");
+        assert!(update_metadata(&lib.root, &note.slug, &before, "过期编辑", vec![], "read").is_err());
+        assert!(update_metadata(&lib.root, &note.slug, &saved, "", vec![], "read").is_err());
+        assert!(update_metadata(&lib.root, &note.slug, &saved, "标题", vec![], "invalid").is_err());
+        delete(&lib.root, &current).unwrap();
+        assert!(update_metadata(&lib.root, &note.slug, &saved, "已删除笔记", vec![], "read").is_err());
+        assert!(read(&lib.root, &note.slug).is_err());
+    }
+    #[test]
+    fn svg_assets_round_trip_for_standalone_and_attached_notes() {
+        let lib = Library::new(); let note = lib.note();
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><rect width="20" height="10" fill="#123456"/></svg>"##;
+        let path = write_asset(&lib.root, &note.slug, "svg", svg).unwrap();
+        assert!(path.ends_with(".svg"));
+        assert_eq!(paper::read_note_asset(&lib.root, &note.slug, path.strip_prefix("assets/").unwrap()).unwrap(), svg);
+        let mut meta = paper::read_meta(&lib.root, &note.slug).unwrap(); meta.file_type = None;
+        paper::write_meta(&lib.root, &note.slug, &meta).unwrap();
+        let path = paper::write_note_asset(&lib.root, &note.slug, "svg", svg).unwrap();
+        assert_eq!(paper::read_note_asset(&lib.root, &note.slug, path.strip_prefix("assets/").unwrap()).unwrap(), svg);
+        assert!(paper::read_note_asset(&lib.root, &note.slug, "../escape.svg").is_err());
+        assert!(paper::write_note_asset(&lib.root, &note.slug, "html", svg).is_err());
     }
     #[test]
     fn approved_delete_retains_body_and_assets_in_a_backup_and_removes_the_live_entry() {

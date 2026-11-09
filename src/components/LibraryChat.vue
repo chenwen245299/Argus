@@ -13,7 +13,7 @@ import { beginChatRun, applyRunUsage, conversationChatRuns, legacyChatRun, recor
 import { applyContextCheckpoint, estimateContextText, withContextDraft, historyFingerprint,
   type ContextCheckpoint, type ContextUsage, type PreparedContext } from '../utils/chatContext'
 import { useChatSendQueue, useChatQueueEditor, type QueuedChatMessage } from '../utils/chatSendQueue'
-import { useChatScrollResize } from '../utils/chatScrollResize'
+import { useChatScroll } from '../utils/chatScroll'
 import { storeToRefs } from 'pinia'
 import { Icon } from '@iconify/vue'
 import { useI18n } from 'vue-i18n'
@@ -33,8 +33,6 @@ import ChatPageImage from './ChatPageImage.vue'
 import ChatAnswerBody from './ChatAnswerBody.vue'
 import ImagePreviewActions from './ImagePreviewActions.vue'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../types/chatImages'
-import { svgStringToPngBlob } from '../utils/svgToPng'
-import { copyPngBlobToClipboard } from '../utils/clipboard'
 import { sortPapersByRecentAccess } from '../utils/recentPapers'
 import { serveAddPapersToChat } from '../utils/chatPapers'
 import { estimateCostCny } from '../utils/modelPricing'
@@ -594,7 +592,8 @@ function isGenerating(convId: string | null | undefined) {
 /** Busy state of the conversation on screen. */
 const loading = computed(() => isGenerating(activeConvId.value))
 const messagesEl = ref<HTMLElement | null>(null)
-useChatScrollResize(messagesEl)
+const { pauseFollowing, scrollToBottom } = useChatScroll(messagesEl)
+watch(activeConvId, () => scrollToBottom(true))
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const selectedModel = ref<ModelSelection | null>(null)
 const modelMenuOpen = ref(false)
@@ -1170,6 +1169,7 @@ function scrollToMessage(id: string) {
   if (!container) return
   const el = container.querySelector<HTMLElement>(`[data-msg-id="${CSS.escape(id)}"]`)
   if (!el) return
+  pauseFollowing()
   const top = container.scrollTop + el.getBoundingClientRect().top - container.getBoundingClientRect().top - 12
   container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
 }
@@ -1927,21 +1927,6 @@ function persistActive() {
 
 // ── Messaging ─────────────────────────────────────────────────────────────────
 
-// Coalesced to one scroll per animation frame. Reading `scrollHeight` forces a
-// synchronous layout of the whole (very tall) message list, so calling this per
-// streamed token cost more than the render it followed. rAF also runs after
-// Vue has patched the DOM, so the height it reads is the new one.
-let scrollFramePending = false
-function scrollToBottom() {
-  if (scrollFramePending) return
-  scrollFramePending = true
-  requestAnimationFrame(() => {
-    scrollFramePending = false
-    const el = messagesEl.value
-    if (el) el.scrollTop = el.scrollHeight
-  })
-}
-
 function autoResize() {
   const el = textareaEl.value
   if (!el) return
@@ -2152,7 +2137,7 @@ async function runAssistantRequestImpl(
   const cacheReported = !!ai.settings.providers.find(p => p.id === sel?.providerId)?.base_url.toLowerCase().includes('deepseek')
   activeRequestIds.set(target.id, requestId)
   stoppedTargetIds.delete(target.id)
-  scrollToBottom()
+  if (activeConvId.value === conv.id) scrollToBottom()
 
   // All listeners for this request are tracked under target.id so a later
   // request (or unmount / stop) can tear down exactly this request's listeners.
@@ -2544,6 +2529,7 @@ function sendMessage(immediate = false) {
   input.value = ''
   attachments.value = []
   nextTick(autoResize)
+  if (immediate || !composerBusy.value) scrollToBottom(true)
   if (immediate) messageQueue.steer(item)
   else messageQueue.enqueue(item)
 }
@@ -2682,18 +2668,6 @@ function handleKeydown(e: KeyboardEvent) {
     e.preventDefault(); queueEditor.cancel(); return
   }
   if (e.key === 'Enter' && !e.shiftKey && !isIMEActive(e)) { e.preventDefault(); sendMessage(e.metaKey || e.ctrlKey) }
-}
-
-function onMsgContainerClick(e: MouseEvent) {
-  const btn = (e.target as HTMLElement).closest('[data-action]') as HTMLElement | null
-  if (!btn) return
-  if (btn.dataset.action === 'copy-svg-image') {
-    const svgEl = btn.closest('.svg-preview-area')?.querySelector('svg')
-    if (svgEl) {
-      const svgStr = new XMLSerializer().serializeToString(svgEl)
-      svgStringToPngBlob(svgStr).then(copyPngBlobToClipboard).catch(() => {})
-    }
-  }
 }
 
 function closeModelMenu(e: MouseEvent) {
@@ -3005,7 +2979,7 @@ onUnmounted(() => {
             {{ navTip.preview }}
           </div>
         </Teleport>
-        <div ref="messagesEl" class="messages" @click="onMsgContainerClick">
+        <div ref="messagesEl" class="messages" tabindex="0">
           <ChatBranchOrigin v-if="activeConv?.branch" :branch="activeConv.branch"
             :parent-available="!!branchParent" :parent-title="branchParent?.title" @open="openBranchParent" />
 

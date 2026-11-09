@@ -893,7 +893,7 @@ pub fn get_paper_fulltext(
     // Fail loudly on an unknown slug rather than returning an empty slice that
     // reads like "this paper has no text".
     let meta = paper::read_meta(root, slug)?;
-    if meta.file_type.as_deref() == Some("md") { return Err("Use read_library_note with explicit user approval for standalone notes".into()); }
+    if meta.file_type.as_deref() == Some("md") { return Err("Use read_library_note to read standalone notes directly".into()); }
     let full = extraction::read_fulltext(root, slug);
 
     let total = full.chars().count();
@@ -918,7 +918,7 @@ pub fn get_paper_fulltext(
 /// result is expensive and mostly unusable.
 pub fn get_document_path(root: &str, slug: &str) -> Result<DocumentLocation, String> {
     let meta = paper::read_meta(root, slug)?;
-    if meta.file_type.as_deref() == Some("md") { return Err("Standalone note file access requires read_library_note and user approval".into()); }
+    if meta.file_type.as_deref() == Some("md") { return Err("Use read_library_note to read standalone notes directly; raw document paths are unavailable".into()); }
     let file_type = file_type_of(&meta);
 
     let path = if ebook::is_ebook_file_type(meta.file_type.as_deref()) {
@@ -1027,7 +1027,7 @@ pub fn render_paper_pages(
 
 pub fn get_note(root: &str, slug: &str, note_id: Option<&str>) -> Result<NoteContent, String> {
     let meta = paper::read_meta(root, slug)?;
-    if meta.file_type.as_deref() == Some("md") { return Err("Use read_library_note {slug,note_id} with explicit user approval for attachment notes on Markdown documents; omit note_id to read the primary body".into()); }
+    if meta.file_type.as_deref() == Some("md") { return Err("Use read_library_note {slug,note_id} to read attachment notes on Markdown documents directly; omit note_id to read the primary body".into()); }
     let notes = paper::list_notes(root, slug);
     if notes.is_empty() {
         return Err(format!("Paper '{slug}' has no notes."));

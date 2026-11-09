@@ -730,7 +730,8 @@ onMounted(async () => {
     void ragStore.loadStoreInfo()
   })
 
-  unlistenOpenPaper = await listen<{ slug: string; title?: string }>('argus-open-paper', (event) => {
+  unlistenOpenPaper = await listen<{ slug: string; title?: string; root?: string }>('argus-open-paper', (event) => {
+    if (event.payload?.root && event.payload.root !== libraryStore.currentPath) return
     const slug = event.payload?.slug
     if (!slug) return
     const paper = libraryStore.papers.find(p => p.slug === slug)

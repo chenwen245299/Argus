@@ -3,11 +3,14 @@ import { onMounted, onBeforeUnmount, ref, nextTick, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import type VditorType from 'vditor'
 import { installNoteClipboard } from '../utils/noteClipboard'
+import { installPaperReferenceNavigation } from '../utils/paperReferences'
+import { registerWritingToolsEditor } from '../utils/writingTools'
 
 const props = defineProps<{
   initialContent: string
   /** Hide the formatting bar while retaining Markdown and keyboard editing. */
   hideToolbar?: boolean
+  libraryRoot?: string | null
   /** Persist a pasted image and return the URL to render it by. Without this,
    *  Vditor falls back to inlining the file as a base64 `data:` URI. */
   imageUploader?: (file: File) => Promise<string | null>
@@ -18,6 +21,7 @@ const containerEl = ref<HTMLDivElement | null>(null)
 let vd: VditorType | null = null
 let destroyed = false
 let removeClipboardHandlers: (() => void) | null = null
+let removeWritingTools: (() => void) | null = null
 
 function normalizeDisplayMathDelimiters(markdown: string) {
   const blocks: string[] = []
@@ -63,7 +67,7 @@ function toFiles(input: ArrayLike<PastedItem>): File[] {
 
 /** Save each pasted image, then insert a link to it at the cursor. */
 async function handlePastedFiles(input: ArrayLike<PastedItem>) {
-  const images = toFiles(input).filter(f => f.type.startsWith('image/'))
+  const images = toFiles(input).filter(f => f.type.startsWith('image/') || (!f.type && /\.svg$/i.test(f.name)))
   if (!images.length || !props.imageUploader) return
   uploadError.value = ''
   for (const file of images) {
@@ -82,6 +86,7 @@ async function handlePastedFiles(input: ArrayLike<PastedItem>) {
 }
 
 onMounted(async () => {
+  installPaperReferenceNavigation()
   // Vditor (JS + CSS) is heavyweight — load it when an editor actually mounts
   // instead of in every window's startup bundle.
   const [{ default: Vditor }] = await Promise.all([
@@ -124,7 +129,31 @@ onMounted(async () => {
       if (destroyed || !containerEl.value) return
       removeClipboardHandlers = installNoteClipboard(containerEl.value)
       const root = getEditorRoot()
-      if (root) emit('ready', root)
+      if (root) {
+        removeWritingTools = registerWritingToolsEditor(root, {
+          read(range) {
+            const fragment = document.createElement('div')
+            fragment.append(range.cloneContents())
+            return vd!.vditor.lute.VditorIRDOM2Md(fragment.innerHTML).trim()
+          },
+          value: () => vd!.getValue(),
+          scope: () => props.libraryRoot,
+          replace(range, markdown) {
+            root.focus({ preventScroll: true })
+            const selection = window.getSelection()
+            selection?.removeAllRanges(); selection?.addRange(range)
+            // This is one deliberate edit, independent of Vditor's 800 ms
+            // typing debounce. Immediate Cmd+Z must undo the whole replacement.
+            vd!.vditor.undo?.addToUndoStack(vd!.vditor)
+            vd!.insertMD(markdown)
+            vd!.vditor.undo?.addToUndoStack(vd!.vditor)
+            // Vditor owns the undo stack; notify autosave immediately rather
+            // than waiting for its debounced Markdown callback.
+            emit('change', vd!.getValue())
+          },
+        })
+        emit('ready', root)
+      }
       requestAnimationFrame(() => {
         if (content && vd?.getValue().trim() === '') {
           vd.setValue(content, true)
@@ -140,6 +169,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   destroyed = true
   removeClipboardHandlers?.()
+  removeWritingTools?.()
   vd?.destroy()
   vd = null
   clearHighlights()
@@ -294,7 +324,7 @@ function onFindKeydown(e: KeyboardEvent) {
 </script>
 
 <template>
-  <div class="vditor-wrapper" :class="{ 'without-toolbar': hideToolbar }" @keydown="onWrapperKeydown">
+  <div class="vditor-wrapper" :class="{ 'without-toolbar': hideToolbar }" :data-note-library-root="libraryRoot ?? undefined" @keydown="onWrapperKeydown">
     <!-- Find bar -->
     <Transition name="find-bar">
       <div v-if="findVisible" class="find-bar">

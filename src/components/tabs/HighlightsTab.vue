@@ -131,7 +131,7 @@ function colorStyle(color: string, alpha = 0.35): string {
           <div v-if="hl.note" class="hl-note" v-html="noteHtml(hl.note)" />
 
           <div v-if="editingNoteId === hl.id" class="note-editor">
-            <textarea
+            <textarea data-note-references
               v-model="editingNoteValue"
               class="note-input"
               rows="2"

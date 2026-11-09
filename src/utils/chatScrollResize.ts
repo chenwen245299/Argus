@@ -12,7 +12,9 @@ export function useChatScrollResize(messages: Ref<HTMLElement | null>, followBot
       const follow = followBottom?.() ?? scroller.scrollHeight - scroller.scrollTop - previousHeight < 48
       previousHeight = scroller.clientHeight
       if (follow) void nextTick(() => {
-        if (!disposed && scroller === messages.value) scroller.scrollTop = scroller.scrollHeight
+        // User input can pause following after measurement but before Vue's
+        // queued callback. Recheck intent rather than applying a stale decision.
+        if (!disposed && scroller === messages.value && (followBottom?.() ?? true)) scroller.scrollTop = scroller.scrollHeight
       })
     }
     const observer = new ResizeObserver(measure)

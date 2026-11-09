@@ -735,3 +735,98 @@ for(const mode of ['sidebar','standalone','library']){
     await finish(0,'Saved data response');assert.deepEqual(errors,[])
   })
 }
+
+const scrollFrames = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+async function streamText(index, text) {
+  await page.evaluate(({index,text}) => {const t=window.__test;t.emit(t.requests[index].args.eventName,{delta:text,done:false})}, {index,text})
+  await page.waitForFunction(text => document.querySelector('.messages')?.textContent.includes(text), text.trim())
+  await scrollFrames()
+}
+async function isAtBottom() {
+  await page.waitForFunction(() => {const el=document.querySelector('.messages');return el.scrollHeight-el.scrollTop-el.clientHeight<=2})
+}
+for (const mode of ['library','sidebar','standalone']) {
+  test(`${mode}: streaming respects manual scrolling, pending frames and resize, then resumes at bottom`,async()=>{
+    await page.setViewportSize({width:1100,height:840});await open(mode)
+    if(mode==='standalone')await page.locator('.test-panel').evaluate(el=>el.style.width='100%')
+    await send('先保留一段长历史');await count(1)
+    await finish(0,'# 历史答案\n\n'+Array.from({length:35},(_,i)=>`历史段落 ${i}：这些内容需要在生成下一条答案时自由查看。`).join('\n\n'))
+    await page.getByText('历史段落 34：这些内容需要在生成下一条答案时自由查看。',{exact:true}).waitFor()
+    await send('继续生成，请保留滚动位置');await count(2)
+    await streamText(1,Array.from({length:25},(_,i)=>`生成段落 ${i}：这是不断增加的新内容。`).join('\n\n'))
+    const messages=page.locator('.messages')
+    await isAtBottom()
+    const before=await messages.evaluate(el=>el.scrollTop)
+    await messages.hover({position:{x:100,y:100}});await page.mouse.wheel(0,-24)
+    await page.waitForFunction(before=>document.querySelector('.messages').scrollTop<before-10,before)
+    await scrollFrames()
+    const nearBottom=await messages.evaluate(el=>({top:el.scrollTop,gap:el.scrollHeight-el.scrollTop-el.clientHeight}))
+    assert(nearBottom.gap<120,'a small upward gesture must release following even inside the old bottom threshold')
+    await streamText(1,'\n\n小幅向上滚动后继续生成。\n\n'+ '新增段落。\n\n'.repeat(15))
+    assert(Math.abs(await messages.evaluate(el=>el.scrollTop)-nearBottom.top)<2,'new streamed text must not pull a reader back to bottom')
+
+    // Already queued stream rAF work must also respect input arriving in the
+    // same event turn, before the browser has emitted a scroll event.
+    await messages.evaluate(el=>el.scrollTop=el.scrollHeight);await isAtBottom();await scrollFrames()
+    const beforePending=await messages.evaluate(el=>el.scrollTop)
+    await page.evaluate(()=>{
+      const t=window.__test;t.emit(t.requests[1].args.eventName,{delta:'\n\n待执行滚动回归。\n\n'+'排队的新内容。\n\n'.repeat(15),done:false})
+      document.querySelector('.messages').dispatchEvent(new WheelEvent('wheel',{deltaY:-1,bubbles:true}))
+    })
+    await page.waitForFunction(()=>document.querySelector('.messages').textContent.includes('待执行滚动回归。'));await scrollFrames()
+    assert(Math.abs(await messages.evaluate(el=>el.scrollTop)-beforePending)<2,'an upward intent cancels queued scrolling before native movement')
+
+    await messages.evaluate(el=>el.scrollTop=120);await scrollFrames()
+    const readingTop=await messages.evaluate(el=>el.scrollTop)
+    await page.evaluate(()=>{
+      const t=window.__test,e=t.requests[1].args.eventName;
+      t.emit(e+'-reasoning',{delta:'后台仍在推理。',done:false})
+      t.emit(e+'-agent',{phase:'tool',tool:'get_paper',arguments:{slug:'paper'}})
+      t.emit(e+'-agent',{phase:'result',tool:'get_paper',ok:true,preview:'工具结果已完成'})
+      t.emit(e+'-confirm',{requestId:'scroll-approval',preview:{tool:'create_paper_note',slug:'paper',paperTitle:'论文',noteTitle:'滚动测试',content:'审批高度变化不应拉动历史。',duplicateTitle:false}})
+    })
+    await page.locator('.write-confirm').waitFor();await scrollFrames()
+    assert(Math.abs(await messages.evaluate(el=>el.scrollTop)-readingTop)<2,'reasoning, tools and approval resizing preserve history position')
+    await page.setViewportSize({width:1100,height:720});await scrollFrames()
+    assert(Math.abs(await messages.evaluate(el=>el.scrollTop)-readingTop)<2,'window resizing preserves history position')
+    await page.evaluate(()=>{const t=window.__test;t.emit(t.requests[1].args.eventName+'-confirm-close',{requestId:'scroll-approval'})})
+    await page.locator('.write-confirm').waitFor({state:'hidden'})
+    await streamText(1,'\n\n窗口缩放后仍在生成。')
+    assert(Math.abs(await messages.evaluate(el=>el.scrollTop)-readingTop)<2)
+
+    await messages.focus();await page.keyboard.press('Home');
+    await page.waitForFunction(()=>document.querySelector('.messages').scrollTop<=1,null,{timeout:3000});await scrollFrames()
+    const keyboardTop=await messages.evaluate(el=>el.scrollTop)
+    await streamText(1,'\n\n键盘翻阅历史时仍在生成。')
+    assert(Math.abs(await messages.evaluate(el=>el.scrollTop)-keyboardTop)<2,'keyboard navigation pauses following')
+    await page.keyboard.press('End');await isAtBottom();await scrollFrames()
+    await streamText(1,'\n\n手动回到底部后继续跟随。\n\n'+'底部新增内容。\n\n'.repeat(12));await isAtBottom()
+
+    await messages.evaluate(el=>el.scrollTop=120);await scrollFrames()
+    const beforeFinish=await messages.evaluate(el=>el.scrollTop)
+    await streamText(1,'\n\n# 最终答案\n\n'+'生成完成后也不能改变用户的位置。\n\n'.repeat(50));await finish(1)
+    await page.getByText('最终答案',{exact:true}).waitFor();await scrollFrames()
+    assert(Math.abs(await messages.evaluate(el=>el.scrollTop)-beforeFinish)<2,'final Markdown rendering never forces a scrolled-up reader to bottom')
+    assert.deepEqual(errors,[])
+    if(process.env.ARGUS_TEST_OUTPUT_DIR){await mkdir(process.env.ARGUS_TEST_OUTPUT_DIR,{recursive:true});await page.screenshot({path:process.env.ARGUS_TEST_OUTPUT_DIR+`/${mode}-stream-scroll.png`})}
+  })
+}
+
+for(const mode of ['library','sidebar','standalone']) {
+  test(`${mode}: starting the next queued answer preserves a reader's paused position`,async()=>{
+    await page.setViewportSize({width:1100,height:840});await open(mode)
+    if(mode==='standalone')await page.locator('.test-panel').evaluate(el=>el.style.width='100%')
+    await send('长历史');await count(1)
+    await finish(0,Array.from({length:40},(_,i)=>`已保存的历史第 ${i} 段。`).join('\n\n'))
+    await page.getByText('已保存的历史第 39 段。',{exact:true}).waitFor()
+    await send('正在生成');await count(2);await streamText(1,'生成中的内容。\n\n'.repeat(20));await isAtBottom()
+    await send('排队的下一条');await page.locator('.queue-item').waitFor()
+    const messages=page.locator('.messages')
+    await messages.evaluate(el=>{el.dispatchEvent(new WheelEvent('wheel',{deltaY:-40,bubbles:true}));el.scrollTop=120});await scrollFrames()
+    const before=await messages.evaluate(el=>el.scrollTop)
+    await finish(1);await count(3);await page.locator('.queue-item').waitFor({state:'hidden'});await scrollFrames()
+    assert(Math.abs(await messages.evaluate(el=>el.scrollTop)-before)<2,'automatically draining the queue must not reset manual scrolling')
+    await streamText(2,'排队的回答继续增加。\n\n'.repeat(15));assert(Math.abs(await messages.evaluate(el=>el.scrollTop)-before)<2)
+    await finish(2);assert.deepEqual(errors,[])
+  })
+}

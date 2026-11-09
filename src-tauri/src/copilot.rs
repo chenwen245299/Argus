@@ -1988,7 +1988,7 @@ A bare `find_papers` keyword sweep across the whole library is the last resort, 
 - `get_paper_fulltext` to read the extracted text, paged with `offset` — pull the slices you need rather than the whole paper at once.
 - `get_note` and `get_highlights` for what the user wrote or marked themselves. Often the best answer to "what did I think about this".
 
-Standalone Markdown notes appear in the same collections with `file_type: "md"`. Their primary body is read only through `read_library_note`, which requires explicit user approval of the requested slice. Use `create_library_note`, `update_library_note` and `delete_library_note` for these primary documents, each with user approval. They also support separate attachment notes through the ordinary paper-note writing tools; read those with `read_library_note` and `note_id`, also requiring approval. Markdown marking uses the ordinary approved marking tools with page:1, unique exact source excerpts from an approved read, and no PDF anchors or page inspection. Fulltext/PDF tools cannot read the primary body. Keep existing content when extending a note; refusal, timeout or cancellation means stop.
+Standalone Markdown notes appear in the same collections with `file_type: "md"`. Their primary body is read only through `read_library_note`, which reads the requested slice directly without user confirmation. Use `create_library_note`, `update_library_note` and `delete_library_note` for these primary documents, each with user approval. They also support separate attachment notes through the ordinary paper-note writing tools; read those directly with `read_library_note` and `note_id`, without confirmation. Markdown marking uses the ordinary approved marking tools with page:1, unique exact source excerpts from a read_library_note result, and no PDF anchors or page inspection. Fulltext/PDF tools cannot read the primary body. Keep existing content when extending a note; refusal, timeout or cancellation means stop.
 
 ## The snippet collection
 
@@ -2068,13 +2068,13 @@ fn paper_context_block(root: &str, slug: &str) -> Option<String> {
             "The user has opened this standalone Markdown note in the centre editor. Their question \
              is about it unless they say otherwise. This is metadata from `get_paper` for slug \
              `{slug}`; it does not contain the note body:\n\n{json}\n\n\
-             Read the requested body with `read_library_note` only after the user's explicit \
-             approval of that tool's exact preview. Use `update_library_note` or `delete_library_note` \
+             Read the requested body directly with `read_library_note`; no user confirmation \
+             is required for reading. Use `update_library_note` or `delete_library_note` \
              for this document and `create_library_note` for another standalone note, always with \
              approval. Separate attachment notes use create/update/delete/restore_paper_note; \
-             read them with read_library_note and note_id, also with approval. Annotations use \
+             read them directly with read_library_note and note_id, without confirmation. Annotations use \
              create_paper_highlights/create_paper_annotations with page:1 and exact unique \
-             Markdown source excerpts from an approved read; no PDF anchors or inspection. \
+             Markdown source excerpts from a read_library_note result; no PDF anchors or inspection. \
              Paper-attachment note tools and PDF/fulltext tools do not access the primary body. \
              A refusal, timeout or cancellation means stop, never retry automatically."
         ));
@@ -2160,8 +2160,8 @@ fn format_pinned_block(entries: &[&crate::models::PaperIndexEntry]) -> Option<St
     }
     let lines: Vec<String> = entries.iter().map(|e| pinned_paper_line(e)).collect();
     let note_guidance = if entries.iter().any(|e| e.file_type.as_deref() == Some("md")) {
-        " Entries marked [md] are standalone notes: read them with read_library_note only after \
-         explicit user approval; use the library_note tools for changes, also with approval."
+        " Entries marked [md] are standalone notes: read them directly with read_library_note \
+         without user confirmation; use the library_note tools for changes, with explicit approval."
     } else { "" };
     Some(format!(
         "The user has pinned these papers to this conversation. Treat each question as being \
@@ -3742,7 +3742,7 @@ mod agent_tests {
     }
 
     #[test]
-    fn standalone_note_context_names_approved_tools_without_including_the_body() {
+    fn standalone_note_context_allows_direct_reads_and_approved_changes_without_inlining_the_body() {
         let lib = crate::library_notes::tests::Library::new();
         let note = lib.note();
         let block = paper_context_block(&lib.root, &note.slug).unwrap();
@@ -3751,12 +3751,15 @@ mod agent_tests {
         for name in ["read_library_note", "create_library_note", "update_library_note", "delete_library_note"] {
             assert!(block.contains(name), "{block}");
         }
-        assert!(block.contains("explicit approval"));
+        assert!(block.contains("no user confirmation"));
+        assert!(block.contains("always with approval"));
         let mut entry = index_entry(&note.slug, &note.title, &[]);
         entry.file_type = Some("md".into());
         let pinned = format_pinned_block(&[&entry]).unwrap();
         assert!(pinned.contains("read_library_note"));
         assert!(pinned.contains("[md]"));
+        assert!(pinned.contains("without user confirmation"));
+        assert!(pinned.contains("with explicit approval"));
     }
 
     fn index_entry(slug: &str, title: &str, authors: &[&str]) -> crate::models::PaperIndexEntry {

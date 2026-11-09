@@ -11,6 +11,7 @@ import { useSpeechStore } from '../stores/speech'
 import { HIGHLIGHT_COLORS } from '../utils/highlightColors'
 import VditorEditor from './VditorEditor.vue'
 import MarkdownNoteReader from './MarkdownNoteReader.vue'
+import NoteStatusBar from './NoteStatusBar.vue'
 import { toDisplayMarkdown, toStoredMarkdown, savePastedImage } from '../utils/noteAssets'
 import type { LibraryNoteSnapshot } from '../types'
 
@@ -47,6 +48,8 @@ function openCitationGraph(event: MouseEvent) {
   library.openCitationGraph(props.slug, { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 })
 }
 const dirty = computed(() => !!saved.value && (pendingInput.value || title.value !== saved.value.title || content.value !== saved.value.content))
+const statisticsRoot = computed(() => reading.value ? annotationRef.value?.getRoot() ?? null : editorRoot.value)
+const saveState = computed(() => deleted.value ? 'deleted' : error.value ? 'error' : saving.value ? 'saving' : dirty.value ? 'unsaved' : 'saved')
 const draftKey = `argus:library-note-draft:${encodeURIComponent(root ?? '')}:${props.slug}`
 let timer: ReturnType<typeof setTimeout> | undefined
 let unlisten: UnlistenFn | undefined
@@ -227,10 +230,11 @@ defineExpose({ closeToList: () => reader.showList() })
     </div>
     <MarkdownNoteReader v-if="loaded && reading" ref="annotationRef" :slug="props.slug" :markdown="readingMarkdown" v-model:color="color" v-model:mark-style="markStyle" :font-size="fontSize" />
     <div v-else-if="loaded" class="note-editor" @input.capture="onEditorInput">
-      <VditorEditor ref="editorRef" :key="editorKey" hide-toolbar :initial-content="initial" :image-uploader="file => savePastedImage(props.slug, file, root)" @change="onContentChange" @ready="editorRoot = $event" />
+      <VditorEditor ref="editorRef" :key="editorKey" hide-toolbar :library-root="root" :initial-content="initial" :image-uploader="file => savePastedImage(props.slug, file, root)" @change="onContentChange" @ready="editorRoot = $event" />
       <MarkdownNoteReader ref="annotationRef" editing :editor-root="editorRoot" :slug="props.slug" :markdown="content" v-model:color="color" v-model:mark-style="markStyle" :font-size="fontSize" />
     </div>
     <p v-else class="note-loading">{{ t('libraryNote.loading') }}</p>
+    <NoteStatusBar v-if="loaded" :markdown="content" :text-root="statisticsRoot" :active="reader.activeSlug === props.slug" :save-state="saveState" :save-error="error" />
   </section>
 </template>
 

@@ -23,6 +23,7 @@ import 'highlight.js/styles/github.css'
 import { addIcon } from '@iconify/vue'
 import { i18n } from './i18n'
 import { installMarkdownCopy } from './utils/copyAsMarkdown'
+import { installTextContextMenu } from './utils/writingTools'
 import App from './App.vue'
 import './assets/main.css'
 // Theme palettes must load after main.css so [data-theme] rules win at equal specificity.
@@ -32,11 +33,7 @@ import './assets/themes.css'
 // flattened glyphs the HTML happens to contain (see utils/copyAsMarkdown).
 installMarkdownCopy()
 
-// Suppress browser's native right-click menu everywhere except text inputs.
-document.addEventListener('contextmenu', (e) => {
-  const tag = (e.target as HTMLElement).tagName
-  if (tag !== 'INPUT' && tag !== 'TEXTAREA') e.preventDefault()
-})
+installTextContextMenu()
 
 
 // Custom app icon: the original hand-drawn translate glyph (language-neutral —

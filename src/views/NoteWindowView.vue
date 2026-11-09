@@ -231,6 +231,7 @@ onBeforeUnmount(async () => {
       <VditorEditor
         ref="editorRef"
         :key="editorKey"
+        :library-root="noteRoot"
         :initial-content="content"
         :image-uploader="uploadNoteImage"
         @change="onContentChange"

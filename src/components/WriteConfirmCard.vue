@@ -27,9 +27,9 @@ const props = defineProps<{
 const emit = defineEmits<{ approve: [colors?: string[]]; reject: [] }>()
 
 const { t } = useI18n()
-const libraryNote = computed(() => ['read_library_note', 'create_library_note', 'update_library_note', 'delete_library_note'].includes(props.preview.tool))
+const libraryNote = computed(() => ['create_library_note', 'update_library_note', 'delete_library_note'].includes(props.preview.tool))
 const noteAction = computed(() => ({ update_paper_note: 'Update', delete_paper_note: 'Delete', restore_paper_note: 'Restore',
-  read_library_note: 'Read', create_library_note: 'Create', update_library_note: 'Update', delete_library_note: 'Delete' } as Record<string, string>)[props.preview.tool])
+  create_library_note: 'Create', update_library_note: 'Update', delete_library_note: 'Delete' } as Record<string, string>)[props.preview.tool])
 const recommendationAction = computed(() => props.preview.recommendations?.length
   ? (props.preview.tool === 'delete_arxiv_recommendations' ? 'delete' : 'import') : null)
 const changeAction = computed(() => props.preview.changes?.length

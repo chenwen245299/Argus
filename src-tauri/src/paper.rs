@@ -632,10 +632,9 @@ pub fn prune_deleted_notes(root: &str, slug: &str, now: chrono::DateTime<chrono:
 // and the notes still resolve. Absolute paths (or an inlined data: URI) would
 // not survive the move.
 
-/// Extensions we're willing to write and hand back to a webview `<img>`. SVG is
-/// deliberately absent — it can carry script, and these bytes come from whatever
-/// happened to be on the clipboard.
-const NOTE_ASSET_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+/// Extensions stored as note images. The frontend sanitizes SVG on import and
+/// read, then displays it through an isolated image URL, never inline SVG DOM.
+const NOTE_ASSET_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "svg"];
 
 /// Cap on a single pasted image. Large enough for a retina screenshot, small
 /// enough that a stray paste can't wedge the editor or bloat the library.

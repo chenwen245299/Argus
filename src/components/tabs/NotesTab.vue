@@ -605,6 +605,7 @@ function fmtDate(iso: string) {
         <VditorEditor
           ref="editorRef"
           :key="editorKey"
+          :library-root="editorRoot"
           :initial-content="loadedContent"
           :image-uploader="uploadNoteImage"
           @change="onContentChange"

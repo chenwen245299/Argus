@@ -145,7 +145,8 @@ async function onSlugChanged(newSlug: string) {
       <template v-else>
         <div v-show="paperTab !== 'ai'" class="tab-content">
           <MetadataTab
-            v-if="paperTab === 'metadata'"
+            v-if="paperTab === 'metadata' && meta"
+            :key="`${library.currentPath}:${activePaperSlug}`"
             :slug="activePaperSlug"
             :meta="meta"
             @saved="onMetaSaved"

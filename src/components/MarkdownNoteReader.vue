@@ -143,6 +143,7 @@ function outside(event: PointerEvent) {
 }
 function onScroll() { selected.value = null; queuePaint() }
 function onKey(event: KeyboardEvent) {
+  if (event.key === 'Escape' && document.querySelector('.note-reference-popup')) return
   if (event.key === 'Escape') { selected.value = null; editingId.value = null; closeFind() }
   const target = event.target instanceof HTMLElement ? event.target : null
   if (active.value && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f'
@@ -201,7 +202,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('scroll', onScroll, true)
   window.removeEventListener('mouseup', selectText, true); window.removeEventListener('keydown', onKey, true); window.removeEventListener('keyup', onKeySelection)
 })
-defineExpose({ openFind, highlight: (chosenColor: string) => { color.value = chosenColor; addMark(false, chosenColor) }, getText: () => root.value ? markdownTextIndex(root.value).text : '' })
+defineExpose({ openFind, highlight: (chosenColor: string) => { color.value = chosenColor; addMark(false, chosenColor) }, getText: () => root.value ? markdownTextIndex(root.value).text : '', getRoot: () => root.value })
 </script>
 
 <template>
@@ -238,7 +239,7 @@ defineExpose({ openFind, highlight: (chosenColor: string) => { color.value = cho
       <div v-if="editingId && active" class="md-annotation-editor">
         <div class="md-mark-colors"><button v-for="c in HIGHLIGHT_COLORS" :key="c.value" :title="t(c.labelKey)" :style="{ background: c.value }" :class="{ chosen: color === c.value }" @click="color = c.value" /></div>
         <button @click="style = style === 'highlight' ? 'underline' : 'highlight'">{{ t(style === 'highlight' ? 'libraryNote.highlight' : 'libraryNote.underline') }}</button>
-        <textarea v-model="note" :aria-label="t('hl.notePlaceholder')" :placeholder="t('hl.notePlaceholder')" @keydown.ctrl.enter="saveAnnotation" @keydown.meta.enter="saveAnnotation" />
+        <textarea data-note-references v-model="note" :aria-label="t('hl.notePlaceholder')" :placeholder="t('hl.notePlaceholder')" @keydown.ctrl.enter="saveAnnotation" @keydown.meta.enter="saveAnnotation" />
         <button @click="saveAnnotation">{{ t('hl.save') }}</button><button @click="editingId = null">{{ t('hl.cancel') }}</button>
         <button @click="reader.removeHighlight(editingId!); editingId = null">{{ t('hl.delete') }}</button>
       </div>

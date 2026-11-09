@@ -37,7 +37,7 @@ const template = compileTemplate({ source: descriptor.template.content, filename
     `const {${names.replace(/\bas\b/g, ':')}} = window.Vue;`)
   .replace('export function render', 'function render')
 const component = `(() => { ${script}\n${template}\ncomponent.render = render; window.MermaidBlock = component; })();`
-const pngHelper = transpile(await readFile(new URL('../src/utils/svgToPng.ts', import.meta.url), 'utf8')).replace('export function', 'function')
+const pngHelper = transpile(await readFile(new URL('../src/utils/svgToPng.ts', import.meta.url), 'utf8')).replace(/export function/g, 'function')
 const styles = descriptor.styles[0].content.replace(/:deep\(([^)]+)\)/g, '$1')
 const files = new Map([
   ['/vue.js', await readFile(new URL('../node_modules/vue/dist/vue.global.prod.js', import.meta.url))],

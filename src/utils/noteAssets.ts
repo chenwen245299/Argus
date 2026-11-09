@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { svgPreviewUrl } from './svgPreview'
 
 // Images pasted into a note are written to `<paper>/notes/assets/` and the
 // markdown stores the RELATIVE path (`assets/x.png`), which is what keeps a
@@ -25,6 +26,19 @@ const HTML_IMAGE_RE = /(<img\b[^>]*?\bsrc=")([^"]+)(")/g
 
 const ASSET_PREFIX = 'assets/'
 
+/** Validate actual SVG XML, then share the isolated SVG preview sanitizer. */
+function sanitizedSvgBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  const source = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  const doc = new DOMParser().parseFromString(source, 'image/svg+xml')
+  if (doc.documentElement.localName !== 'svg' || doc.querySelector('parsererror')) {
+    throw new Error('Invalid SVG image')
+  }
+  // Serializing just the root drops XML declarations, comments and doctypes.
+  const url = svgPreviewUrl(new XMLSerializer().serializeToString(doc.documentElement))
+  if (!url) throw new Error('Invalid SVG image')
+  return new TextEncoder().encode(decodeURIComponent(url.slice(url.indexOf(',') + 1)))
+}
+
 function assetKey(slug: string, relPath: string) {
   return `${slug}\u0000${relPath}`
 }
@@ -41,9 +55,10 @@ async function assetToBlobUrl(slug: string, relPath: string): Promise<string | n
   const name = relPath.slice(ASSET_PREFIX.length)
   try {
     const b64 = await invoke<string>('read_note_asset', { slug, name })
-    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
+    let bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
     const ext = name.split('.').pop()?.toLowerCase() ?? 'png'
-    const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`
+    const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'svg' ? 'image/svg+xml' : `image/${ext}`
+    if (ext === 'svg') bytes = sanitizedSvgBytes(bytes)
     const url = URL.createObjectURL(new Blob([bytes], { type: mime }))
     blobByPath.set(key, url)
     pathByBlob.set(url, relPath)
@@ -104,8 +119,11 @@ function extFor(file: File): string | null {
     'image/jpeg': 'jpg',
     'image/gif': 'gif',
     'image/webp': 'webp',
+    'image/svg+xml': 'svg',
   }
-  return map[file.type] ?? null
+  const mime = file.type.toLowerCase().split(';')[0].trim()
+  // Some drag sources omit MIME; only recognize SVG by name in that case.
+  return map[mime] ?? (!mime && /\.svg$/i.test(file.name) ? 'svg' : null)
 }
 
 /**
@@ -116,8 +134,9 @@ export async function savePastedImage(slug: string, file: File, expectedRoot?: s
   const ext = extFor(file)
   if (!ext) return null   // not an image type we store
 
+  if (!file.size || file.size > 20 * 1024 * 1024) throw new Error('Image is empty or exceeds 20 MB')
   const buffer = await file.arrayBuffer()
-  const bytes = new Uint8Array(buffer)
+  const bytes = ext === 'svg' ? sanitizedSvgBytes(new Uint8Array(buffer)) : new Uint8Array(buffer)
   // Chunked so a large image can't blow the argument limit of String.fromCharCode.
   let binary = ''
   const CHUNK = 0x8000
@@ -131,7 +150,7 @@ export async function savePastedImage(slug: string, file: File, expectedRoot?: s
     data: btoa(binary),
     expectedRoot,
   })
-  const url = URL.createObjectURL(new Blob([bytes], { type: file.type }))
+  const url = URL.createObjectURL(new Blob([bytes], { type: ext === 'svg' ? 'image/svg+xml' : file.type }))
   blobByPath.set(assetKey(slug, relPath), url)
   pathByBlob.set(url, relPath)
   return url

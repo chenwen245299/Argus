@@ -29,6 +29,9 @@ const reader = useReaderStore()
 const selection = useSelectionStore()
 const ranks = useRanksStore()
 const paperTasks = usePaperTasksStore()
+const isStandaloneNote = computed(() => props.meta?.file_type === 'md')
+const editBase = ref<PaperMeta | null>(null)
+const editError = ref('')
 
 // ── References (Semantic Scholar citation list) ─────────────────────────────────
 const references = ref<CitationRef[]>([])
@@ -49,6 +52,7 @@ const referencesInLibrary = computed(() =>
   references.value.filter(r => r.library_slug).length)
 
 async function loadCachedReferences() {
+  if (isStandaloneNote.value || !props.meta) return
   if (!props.slug) { references.value = []; return }
   try {
     references.value = await invoke<CitationRef[]>('get_cached_references', { slug: props.slug })
@@ -58,6 +62,7 @@ async function loadCachedReferences() {
 }
 
 async function fetchReferences() {
+  if (isStandaloneNote.value || !props.meta) return
   if (!props.slug || referencesFetching.value) return
   referencesFetching.value = true
   referencesError.value = ''
@@ -75,6 +80,7 @@ const refsAutoAttempted = new Set<string>()
 
 // Auto-fetch references on paper open when there's no cache yet.
 async function maybeAutoFetchReferences() {
+  if (isStandaloneNote.value || !props.meta) return
   if (!props.slug) return
   await loadCachedReferences()
   if (references.value.length) return              // cache hit — nothing to do
@@ -113,6 +119,7 @@ const rankStatusKind = ref<'ok' | 'warn' | 'error'>('ok')
 const s2AutoAttempted = new Set<string>()
 
 async function fetchJournalRank(manual = false) {
+  if (isStandaloneNote.value || !props.meta) return
   const venue = props.meta?.venue?.trim()
   if (!venue || isUnpublishedVenue(venue)) return
   journalRankFetching.value = true
@@ -139,6 +146,7 @@ async function fetchJournalRank(manual = false) {
 // Auto-fetch on paper open when the venue isn't cached yet and a key is set.
 // The venue cache persists across sessions, so a known venue never re-queries.
 async function maybeAutoFetchRank() {
+  if (isStandaloneNote.value || !props.meta) return
   const venue = props.meta?.venue?.trim()
   if (!venue) return
   if (isUnpublishedVenue(venue)) return
@@ -183,6 +191,8 @@ const sourceSaving = ref(false)
 function startEdit() {
   if (!props.meta) return
   sourceEditing.value = false
+  editError.value = ''
+  editBase.value = JSON.parse(JSON.stringify(props.meta))
   draft.value = JSON.parse(JSON.stringify(props.meta)) // deep clone
   draft.value!.import_source = importSource(draft.value!.import_source, draft.value!.arxiv_id)
   editing.value = true
@@ -190,6 +200,8 @@ function startEdit() {
 
 function cancelEdit() {
   draft.value = null
+  editBase.value = null
+  editError.value = ''
   editing.value = false
 }
 
@@ -197,12 +209,23 @@ async function saveEdit() {
   if (!props.slug || !draft.value) return
   saving.value = true
   try {
-    draft.value.import_source = importSource(draft.value.import_source, draft.value.arxiv_id)
-    await invoke('save_paper_meta', { slug: props.slug, meta: draft.value })
-    emit('saved', { ...draft.value })
+    editError.value = ''
+    if (isStandaloneNote.value) {
+      const updated = await invoke<PaperMeta>('save_library_note_metadata', {
+        slug: props.slug, expected: editBase.value, title: draft.value.title,
+        tags: draft.value.tags, readingStatus: draft.value.reading_status,
+        expectedRoot: library.currentPath,
+      })
+      emit('saved', updated)
+    } else {
+      draft.value.import_source = importSource(draft.value.import_source, draft.value.arxiv_id)
+      await invoke('save_paper_meta', { slug: props.slug, meta: draft.value })
+      emit('saved', { ...draft.value })
+    }
     editing.value = false
     draft.value = null
   } catch (e) {
+    editError.value = String(e)
     console.error('Failed to save meta:', e)
   } finally {
     saving.value = false
@@ -317,6 +340,7 @@ const citeCountFetching = ref(false)
 const citeCountInputRef = ref<HTMLInputElement | null>(null)
 
 async function fetchCiteCount() {
+  if (isStandaloneNote.value || !props.meta) return
   if (!props.slug) return
   citeCountFetching.value = true
   try {
@@ -336,6 +360,7 @@ async function fetchCiteCount() {
 // completed. Guarded per session so an unresolved paper isn't re-queried on
 // every open.
 async function maybeAutoFetchCiteMeta() {
+  if (isStandaloneNote.value || !props.meta) return
   if (!props.slug || !props.meta) return
   const m = props.meta
   const needs =
@@ -355,7 +380,7 @@ async function maybeAutoFetchCiteMeta() {
 // first; when it backfills the venue, the venue dep re-fires this and the rank
 // lookup then picks it up.
 watch(
-  () => [props.slug, props.meta?.venue, props.meta?.doi, props.meta?.cite_count] as const,
+  () => [props.slug, props.meta?.venue, props.meta?.doi, props.meta?.cite_count, props.meta?.file_type] as const,
   // Sequenced (not concurrent): the two meta writes could clobber each other,
   // and the two Semantic Scholar calls (cite meta + references) are serialized to
   // ease rate limits. Cite first also lets a backfilled venue feed the rank lookup.
@@ -447,6 +472,7 @@ const renaming = ref(false)
 const renameOk = ref(false)
 
 async function renameFolder() {
+  if (isStandaloneNote.value || !props.meta) return
   if (!props.slug) return
   renaming.value = true
   renameOk.value = false
@@ -468,6 +494,7 @@ async function renameFolder() {
 const aiMetaRunning = computed(() => !!props.slug && paperTasks.aiMetaSlug === props.slug)
 
 async function refetchMetaAi() {
+  if (isStandaloneNote.value || !props.meta) return
   if (!props.slug || aiMetaRunning.value) return
   const slug = props.slug
   paperTasks.setAiMetaTask(slug)
@@ -497,7 +524,7 @@ const fulltextError = ref('')
 const fulltextTextareaRef = ref<HTMLTextAreaElement | null>(null)
 
 async function loadFulltext(slug: string | null) {
-  if (!slug) { fulltext.value = ''; return }
+  if (!slug || !props.meta || isStandaloneNote.value) { fulltext.value = ''; return }
   fulltextLoading.value = true
   try {
     fulltext.value = await invoke<string>('get_fulltext', { slug })
@@ -522,6 +549,7 @@ function cancelFulltextEdit() {
 }
 
 async function saveFulltext() {
+  if (isStandaloneNote.value || !props.meta) return
   if (!props.slug) return
   fulltextSaving.value = true
   fulltextError.value = ''
@@ -541,7 +569,7 @@ async function saveFulltext() {
   }
 }
 
-watch(() => props.slug, (slug) => loadFulltext(slug), { immediate: true })
+watch(() => [props.slug, props.meta?.file_type] as const, ([slug]) => loadFulltext(slug), { immediate: true })
 
 function onFulltextUpdated(e: Event) {
   const slug = (e as CustomEvent<{ slug?: string }>).detail?.slug
@@ -582,6 +610,7 @@ const abstractExtracting = ref(false)
 const abstractError = ref('')
 
 async function extractAbstract() {
+  if (isStandaloneNote.value || !props.meta) return
   if (!props.slug) return
   abstractExtracting.value = true
   abstractError.value = ''
@@ -609,10 +638,10 @@ async function extractAbstract() {
       <div class="action-bar">
         <template v-if="!editing">
           <button class="act-btn primary" @click="startEdit">{{ t('metaEdit.edit') }}</button>
-          <button class="act-btn" :disabled="aiMetaRunning" @click="refetchMetaAi">
+          <button v-if="!isStandaloneNote" class="act-btn" :disabled="aiMetaRunning" @click="refetchMetaAi">
             {{ aiMetaRunning ? t('metaEdit.refetchMetaIng') : t('metaEdit.refetchMeta') }}
           </button>
-          <button class="act-btn" :disabled="renaming" @click="renameFolder">
+          <button v-if="!isStandaloneNote" class="act-btn" :disabled="renaming" @click="renameFolder">
             <template v-if="renaming">{{ t('metaEdit.renaming') }}</template>
             <template v-else-if="renameOk">✓ {{ t('metaEdit.renameOk') }}</template>
             <template v-else>{{ t('metaEdit.renameFolder') }}</template>
@@ -625,21 +654,23 @@ async function extractAbstract() {
         </template>
       </div>
 
+      <div v-if="editError" class="fulltext-error" role="alert">{{ editError }}</div>
+
       <!-- ── READ VIEW ─────────────────────────────────── -->
       <template v-if="!editing">
         <div class="field">
           <div class="label">{{ t('meta.title') }}</div>
           <div class="value">{{ meta.title }}</div>
         </div>
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.authors') }}</div>
           <div class="value">{{ meta.authors.join('; ') || '—' }}</div>
         </div>
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.year') }}</div>
           <div class="value">{{ meta.year ?? '—' }}</div>
         </div>
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label venue-label-row">
             <span>{{ t('meta.venue') }}</span>
             <button
@@ -672,17 +703,17 @@ async function extractAbstract() {
             <a class="rank-hint-link" @click.stop.prevent="openEasyScholarSettings">{{ t('meta.rankNoKeyAction') }}</a>
           </div>
         </div>
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.doi') }}</div>
           <div class="value mono">{{ meta.doi || '—' }}</div>
         </div>
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.arxivId') }}</div>
           <div class="value mono">{{ meta.arxiv_id || '—' }}</div>
         </div>
 
         <!-- Citation count -->
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label cite-count-label-row">
             <span>{{ t('meta.citeCount') }}</span>
             <div class="cite-count-actions">
@@ -747,7 +778,7 @@ async function extractAbstract() {
         </div>
 
         <!-- BibTeX -->
-        <div class="field bibtex-field">
+        <div v-if="!isStandaloneNote" class="field bibtex-field">
           <div class="label bibtex-label-row">
             <span>BibTeX</span>
             <div class="section-actions">
@@ -800,7 +831,7 @@ async function extractAbstract() {
         </div>
 
         <!-- Abstract (AI-generated) -->
-        <div class="field abstract-field">
+        <div v-if="!isStandaloneNote" class="field abstract-field">
           <div class="label abstract-label-row">
             <span>{{ t('meta.abstract') }}</span>
             <div class="section-actions">
@@ -827,7 +858,7 @@ async function extractAbstract() {
         </div>
 
         <!-- Full text -->
-        <div class="field fulltext-field">
+        <div v-if="!isStandaloneNote" class="field fulltext-field">
           <div class="label fulltext-label-row">
             <span>{{ t('meta.fulltext') }}</span>
             <div class="section-actions">
@@ -877,7 +908,7 @@ async function extractAbstract() {
         </div>
 
         <!-- Source (来源) -->
-        <div class="field source-field">
+        <div v-if="!isStandaloneNote" class="field source-field">
           <div class="label source-label-row">
             <span>{{ t('list.source') }}</span>
             <button
@@ -915,7 +946,7 @@ async function extractAbstract() {
         </div>
 
         <!-- References (Semantic Scholar) — placed after 来源 -->
-        <div class="field references-field">
+        <div v-if="!isStandaloneNote" class="field references-field">
           <div class="label cite-count-label-row">
             <span>
               {{ t('meta.references') }}
@@ -962,7 +993,7 @@ async function extractAbstract() {
           <input v-model="draft.title" class="input" type="text" />
         </div>
 
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.authors') }}</div>
           <div v-for="(_, i) in draft.authors" :key="i" class="array-row">
             <input
@@ -976,7 +1007,7 @@ async function extractAbstract() {
           <button class="add-btn" @click="addAuthor">+ {{ t('metaEdit.addAuthor') }}</button>
         </div>
 
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.year') }}</div>
           <input
             v-model.number="draft.year"
@@ -988,12 +1019,12 @@ async function extractAbstract() {
           />
         </div>
 
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.venue') }}</div>
           <input v-model="draft.venue" class="input" type="text" />
         </div>
 
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.citeCount') }}</div>
           <input
             v-model.number="draft.cite_count"
@@ -1004,12 +1035,12 @@ async function extractAbstract() {
           />
         </div>
 
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.doi') }}</div>
           <input v-model="draft.doi" class="input mono" type="text" placeholder="10.xxxx/…" />
         </div>
 
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('meta.arxivId') }}</div>
           <input v-model="draft.arxiv_id" class="input mono" type="text" placeholder="YYMM.NNNNN" />
         </div>
@@ -1059,7 +1090,7 @@ async function extractAbstract() {
           </div>
         </div>
 
-        <div class="field">
+        <div v-if="!isStandaloneNote" class="field">
           <div class="label">{{ t('list.source') }}</div>
           <div class="source-btns">
             <button

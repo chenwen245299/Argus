@@ -200,6 +200,33 @@ reconcile canonical records, including deletions, while retaining live objects,
 drafts, selected conversations and model tabs. Focus refresh and session restore
 repair missed notifications. Shared record types live in `types/paperAi.ts`.
 
+**Paper references in notes.** `NoteReferencePicker.vue` is hosted once per
+window by `App.vue`. `/` immediately suggests the `/ref` command for all Vditor note
+editors (standalone documents, attached notes and note windows) and marked
+annotation/snippet textareas. Enter/Tab/click selects the command and opens a
+caret-anchored picker with its own focused search input below the heading;
+typing the complete `/ref` also opens it. Search text stays in the popup, not
+the note. Candidates and new reference labels show paper titles, with authors/
+year as secondary information; citation keys remain searchable but are not
+shown. Duplicate keys remain separate candidates. The app-only `list_note_reference_papers` and
+`resolve_note_reference` read current metadata on the blocking pool with an
+expected library root; standalone Markdown entries are not paper candidates.
+`note_references.rs` skips BibTeX macros/comments when extracting keys and
+resolves unique paper ids across moves/renames, refusing deleted/ambiguous ids.
+Selections insert ordinary `[Paper title](#argus-paper=<encoded stable paper id>)`
+Markdown through the native input path, retaining undo, autosave and drafts;
+there is no absolute path or transient URL. Before inserting, recheck the
+library, original editor snapshot and frozen trigger range; dismissals and late responses cannot
+insert elsewhere. Picker navigation handles arrows/Enter/Tab/Escape and IME
+without submitting a parent annotation. Escape returns the caret to the source;
+PDF/ebook/snippet editors retain their drafts while focus is in the search input,
+and note popups ignore clicks inside the picker. Reference navigation is shared
+by Vditor and rendered Markdown, validates/looks up ids, and emits the existing
+`argus-open-paper` event to main with root validation. It never navigates the
+WebView or sends internal references to `open_url`. Snippet note previews render
+only these reference links while retaining ordinary text. Regressions: Rust
+`note_references` and `/ref` cases in `test-library-notes-browser.mjs`.
+
 **Note clipboard compatibility.** `VditorEditor.vue` installs
 `utils/noteClipboard.ts` after editor initialization, on the editable elements
 themselves. Vditor stops copy/cut propagation and writes an empty `text/html`
@@ -207,6 +234,26 @@ flavor alongside valid Markdown text. Removing that empty flavor lets native
 rich-text applications such as PowerPoint consume the text instead of pasting
 nothing. Keep Vditor's original Markdown/TeX conversion and cut deletion; do not
 replace these with flattened selection text or an asynchronous clipboard write.
+
+**macOS Writing Tools.** Right-clicking a contained note-editor or AI-answer
+selection uses `utils/writingTools.ts` and the app-only `system_writing_tools`
+command. `macos_writing_tools.m` passes the captured text into a native TextKit 2
+`NSTextView` with complete Writing Tools support (macOS 15.2+), avoiding WebKit's
+`pre` exclusions and attributed-selection conversion. It uses public AppKit,
+not a model API. Hardware/system availability controls the menu item; it is not
+a guarantee that Apple Intelligence is enabled or its models are ready. Native
+text input menus and feature-specific context menus retain their normal behavior.
+Vditor supplies its own Markdown/TeX selection conversion and insertion/undo
+stack. Explicit Copy & Replace copies the reviewed result and only replaces the
+original range when the editor identity, library, complete Markdown and selected
+text still match; stale results remain on the clipboard for manual recovery.
+AI answers are copy-only and never change saved model history. Cancellation
+does not touch the clipboard or note; closing the parent cancels the native
+sheet. The native editor is transient and performs no library writes. Tests:
+`scripts/test-writing-tools-browser.mjs` (real Vditor, Chrome and system WKWebView;
+mocked model result) and `scripts/test-writing-tools-native.mjs` (real native
+panel with a private named pasteboard). These run without Apple Intelligence;
+actual proofreading/rewriting still needs a supported, enabled Mac.
 
 **Note changes and Recently Deleted.** The app-only `update_paper_note`,
 `delete_paper_note` and `restore_paper_note` use the existing write-approval
@@ -321,23 +368,53 @@ note. Clean views adopt `library-notes-changed`; dirty views keep their drafts.
 Deletes back up the entire entry and assets under `.argus/library-note-trash/`
 before removing the live assignment. Primary bodies are separate from paper
 attachment notes and extracted fulltext.
+`NoteStatusBar.vue` stays below the scrolling reader/editor and shows live word/
+character counts, selection counts, approximate reading time and the actual save
+state. Its expandable panel adds characters with spaces and paragraph counts.
+`noteStatistics.ts` uses an isolated Markdown lexer (no chat renderer, network or
+source mutation), excludes formatting and image targets, counts CJK characters
+individually and other words together, and uses grapheme counts where available.
+Selection text reuses annotation text exclusions in both modes; outside selections
+and inactive documents cannot affect it. Count updates are debounced independently
+of autosave. Failed/conflicted saves retain draft statistics and show the error
+state. The footer wraps/hides secondary metrics in narrow panes and uses theme
+tokens and both locales. Browser coverage: `test-library-notes-browser.mjs`.
 
-The app-only `read_library_note`, `create_library_note`, `update_library_note`
-and `delete_library_note` all go through the existing approval dispatcher,
-**including reads**, as requested by the user. Titles/slugs/collection ids are
-discoverable through the normal library tools; the note body and file path are
-not exposed by ordinary fulltext/path tools. Approvals show the requested read
-slice, full new body, before/after update or exact deletion. Saved identity,
-body/title and location are rechecked; rejection/cancellation never executes.
+The metadata sidebar keeps title, tags, reading status, added time and filename
+for standalone notes. Paper-only fields/actions and automatic Semantic Scholar,
+rank and extracted-fulltext reads are disabled. Manual note metadata edits use
+`save_library_note_metadata`, checking the library, identity and edited fields
+under the note/namespace locks while preserving the current body and links;
+`library-notes-changed` updates clean views and retains dirty primary drafts.
+
+Note image assets support SVG in both standalone and attached notes. On import
+and read, `noteAssets.ts` validates SVG XML and uses the shared SVG-only sanitizer;
+it removes scripts, HTML and external hrefs and displays an isolated image URL.
+Saved Markdown retains `assets/*.svg`, never blob URLs or image bytes. Malformed
+SVG is rejected before saving; raster formats retain their existing behavior.
+Regressions: library-note Rust tests, `test-note-images-browser.mjs` and
+`test-library-notes-browser.mjs`.
+
+The app-only `read_library_note` reads standalone Markdown notes directly without
+user approval, including attachment notes when `note_id` is provided. It uses
+the normal read-only agent dispatcher, validates the exact slug/note id, and
+returns bounded Unicode-character slices (default 12,000, maximum 50,000).
+`create_library_note`, `update_library_note` and `delete_library_note` still use
+the approval dispatcher. Titles/slugs/collection ids are discoverable through
+the normal library tools; the note body and file path are not exposed by ordinary
+fulltext/path tools. Write approvals show the full new body, before/after update
+or exact deletion. Saved identity, body/title and location are rechecked;
+rejection/cancellation never executes.
 External MCP never declares these tools. Do not route standalone notes through
 paper extraction/analysis/vectorization batches. Their primary Markdown body
 stays distinct from attached notes: ordinary `NotesTab` (including its standalone
 window, pinning and Recently Deleted) works under the document's slug, and the
 ordinary approved paper-note writing tools create/update/delete/restore these
-attachments. AI attachment reads use `read_library_note` with `note_id` and exact
-snapshot approval; `get_note` cannot bypass that gate.
+attachments. AI attachment reads use `read_library_note` with `note_id` directly;
+`get_note` directs the app agent to that document-aware reader.
 The active-document and pinned-document AI context identifies Markdown notes,
-includes metadata only, and directs the model to the approval-gated tools.
+includes metadata only, and directs the model to read directly and request
+approval for changes.
 Reopening a conflicted draft retains its original base until explicit reload;
 never silently rebase it onto a newer saved body. Regressions: Rust
 `library_notes` / `mcp::library_note_tools` and
@@ -359,7 +436,7 @@ unambiguous excerpts after edits. Missing originals keep their sidebar records
 without painting unrelated text. Markdown headings power Sections and its jumps;
 never send Markdown through ebook regeneration or another tab's cached PDF.
 AI marking uses the ordinary approved marking tools with `page: 1` and exact,
-unique Markdown-source excerpts from an approved read, with no PDF anchors.
+unique Markdown-source excerpts from a `read_library_note` result, with no PDF anchors.
 The full primary snapshot is checked under the notes/namespace locks before
 appending; existing-mark changes retain provenance and stale-preview protections.
 Markdown highlight IO captures the library root and rejects writes to deleted
@@ -466,6 +543,18 @@ them. Do not loosen the sanitizer to admit HTML inside the SVG. The root option
 takes precedence over deprecated `flowchart.htmlLabels`; diagram directives and
 frontmatter must not override it.
 
+**Chat SVGs.** `renderMarkdown.ts` protects raw SVG blocks before Markdown/math
+parsing, including nested SVG and indented content after blank lines. Raw SVGs
+and SVG/xml/html code fences share `svgPreview.ts`: SVG-only DOMPurify (no HTML
+or `foreignObject`), fragment-only hrefs, then an isolated SVG image so CSS and
+reused definition IDs cannot affect the app or other diagrams. Do not put the
+sanitized SVG back inline in the Markdown DOM. `svgToPng.ts` resolves viewport
+dimensions from absolute sizes/viewBox, bounds raster memory and supplies PNG
+copying. The shared Markdown click handler starts its promise-backed clipboard
+write in the user gesture for WebKit. Source viewing/copy keeps the original;
+incomplete SVG falls back to readable code. Browser regressions:
+`scripts/test-svg-rendering.mjs`, plus math and Mermaid suites.
+
 **Chat formulas.** `utils/renderMarkdown.ts` uses KaTeX for delimited math and
 also recovers clearly mathematical inline-code snippets in older answers
 (e.g. `q*_{t+1}` or `min_{a∈A} G_t(a)`). Ordinary identifiers, commands, paths,
@@ -498,7 +587,16 @@ cannot show through beside or below the input card. The viewport meets the input
 area without a top padding band. `utils/chatScrollResize.ts`
 uses ResizeObserver to follow the bottom as the viewport resizes for
 queue/edit/attachment and write-approval height, while preserving a reader's
-scrolled-up position.
+scrolled-up position. Library chat, paper sidebar and standalone paper AI share
+`utils/chatScroll.ts`: stream updates follow only while the reader remains at
+the bottom. An upward wheel/touch gesture, keyboard navigation, scrollbar drag
+or message-rail jump pauses immediately and cancels pending animation frames.
+A small upward gesture near the bottom must not re-enable following; returning
+to the actual bottom resumes it. Stream completion, reasoning/tool updates,
+queue/approval resize, automatically starting the next queued answer and window
+resize respect the paused position. Resize callbacks recheck intent after nextTick. Conversation switches and explicit new
+sends may request the bottom; background requests cannot reset visible scrolling.
+Regressions: streaming-scroll and composer cases in `test-chat-queue-browser.mjs`.
 Each window owns its pending queue; messages are scoped to their original
 conversation/paper/library. Stop pauses the queue until Resume, a new send or
 Steer; deletion, library switches and unmount clear the relevant pending rows.

@@ -25,8 +25,6 @@ import { useSettingsStore } from '../../stores/settings'
 import { useThinkingStore } from '../../stores/thinking'
 import { soclaasReasoningEfforts, resolveReasoningEffort, standardReasoningLevel } from '../../utils/reasoning'
 import { useReaderStore } from '../../stores/reader'
-import { svgStringToPngBlob } from '../../utils/svgToPng'
-import { copyPngBlobToClipboard } from '../../utils/clipboard'
 import { beginDragSelectionGuard, endDragSelectionGuard } from '../../utils/dragSelectionGuard'
 import type {
   ChatContentPart, ChatMessage, ImageDetail, PaperMeta, AgentWritePreview, ServerToolTrace,
@@ -39,7 +37,7 @@ import GuidedReadingButton from '../GuidedReadingButton.vue'
 import { BUILTIN_GUIDED_READING_ID, type GuidedReadingPreset } from '../../types/guidedReading'
 import ChatMessageQueue from '../ChatMessageQueue.vue'
 import { useChatSendQueue, useChatQueueEditor, type QueuedChatMessage } from '../../utils/chatSendQueue'
-import { useChatScrollResize } from '../../utils/chatScrollResize'
+import { useChatScroll } from '../../utils/chatScroll'
 import { guidedReadingRequestHistory, isGuidedReadingPrompt, markGuidedReadingExperienced } from '../../utils/guidedReading'
 import { SEND_PAPER_IMAGE_TOOL, type AgentStepImage } from '../../types/chatImages'
 import { buildToolExchangeMessages } from '../../utils/agentHistory'
@@ -117,6 +115,7 @@ const input = ref('')
 const attachments = ref<Attachment[]>([])
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const messagesEl = ref<HTMLElement | null>(null)
+const { pauseFollowing, scrollToBottom } = useChatScroll(messagesEl)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const selectedModelKeys = ref<string[]>([])
 const showModelMenu = ref(false)
@@ -1037,7 +1036,7 @@ function openConversation(id: string, messageId?: string) {
   activeConversation.value = liveConversationById(id) ?? cloneConversation(conv)
   activeAnswerTabs.value = {}
   showHistory.value = false
-  if (messageId) stickToBottom.value = false
+  if (messageId) pauseFollowing()
   nextTick(() => {
     if (messageId) scrollToMessage(messageId)
     else scrollToBottom(true)
@@ -1648,6 +1647,7 @@ async function sendMessage(immediate = false) {
     slug, root: syncLibraryRoot, conv, text, files, models: [...selectedModels.value] }
   input.value = ''
   attachments.value = []
+  if (immediate || !composerBusy.value) scrollToBottom(true)
   if (immediate) messageQueue.steer(item)
   else messageQueue.enqueue(item)
   nextTick(() => { resizeTextarea(); textareaEl.value?.focus() })
@@ -1659,6 +1659,7 @@ async function startGuidedReading(preset: GuidedReadingPreset) {
   guidedReadingStarting.value = true
   try {
     startNewConversation(true)
+    scrollToBottom(true)
     activeConversation.value!.source = 'guidedReading'
     // Send the preset directly. The user's unfinished draft and files stay put.
     await submitQuestion(slug, preset.prompt, [], undefined, selectedModels.value,
@@ -1694,7 +1695,7 @@ async function submitQuestion(slug: string, text: string, files: Attachment[], t
   conv.title = firstUserTitle(conv.nodes) || conv.title
   persistConversationFor(slug, conv)
   void nextTick(() => {
-    if (activeConversation.value?.id === conv.id) { resizeTextarea(); scrollToBottom(true) }
+    if (activeConversation.value?.id === conv.id) { resizeTextarea(); scrollToBottom() }
   })
 
   const history = buildHistoryUntil(conv, group.id)
@@ -2364,18 +2365,6 @@ function answerSpeed(answer: AssistantAnswer) {
   return speed > 0 ? `~${speed} tok/s` : ''
 }
 
-function onMsgContainerClick(e: MouseEvent) {
-  const btn = (e.target as HTMLElement).closest('[data-action]') as HTMLElement | null
-  if (!btn) return
-  if (btn.dataset.action === 'copy-svg-image') {
-    const svgEl = btn.closest('.svg-preview-area')?.querySelector('svg')
-    if (svgEl) {
-      const svgStr = new XMLSerializer().serializeToString(svgEl)
-      svgStringToPngBlob(svgStr).then(copyPngBlobToClipboard).catch(() => {})
-    }
-  }
-}
-
 // ── Composer height ───────────────────────────────────────────────────────────
 // The box auto-grows with the text up to 6 lines, but the user can also drag its
 // top edge to pick a height outright. The popup window and the sidebar tab are
@@ -2476,29 +2465,6 @@ function handleKeydown(e: KeyboardEvent) {
   }
 }
 
-// ── Follow-the-stream scrolling ───────────────────────────────────────────────
-// Whether new streamed text should pull the view down. This is tracked from the
-// user's own scrolling rather than re-measured at render time: an answer that is
-// still streaming changes the container's height constantly, so a distance-from-
-// bottom check taken right after a DOM patch can read a height that is about to
-// change again and yank the user back down. Once they scroll up they stay put
-// until they come back to the bottom themselves.
-const stickToBottom = ref(true)
-useChatScrollResize(messagesEl, () => stickToBottom.value)
-const STICK_THRESHOLD_PX = 120
-
-function onMessagesScroll() {
-  const el = messagesEl.value
-  if (!el) return
-  stickToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < STICK_THRESHOLD_PX
-}
-
-/** Scrolling up is an explicit "let me read" — release immediately, don't wait
- *  for the scroll event, which a mid-stream height change could contradict. */
-function onMessagesWheel(e: WheelEvent) {
-  if (e.deltaY < 0) stickToBottom.value = false
-}
-
 /** One tool call's arguments, shortened for the trail line. Mirrors the library
  *  chat's summary so the two panels read the same. */
 function summarizeToolArgs(args: unknown): string {
@@ -2510,16 +2476,6 @@ function summarizeToolArgs(args: unknown): string {
       return `${k}: ${text.length > 40 ? text.slice(0, 40) + '…' : text}`
     })
     .join(', ')
-}
-
-function scrollToBottom(force = false) {
-  if (force) stickToBottom.value = true
-  nextTick(() => {
-    const el = messagesEl.value
-    if (!el) return
-    if (!stickToBottom.value) return
-    el.scrollTop = el.scrollHeight
-  })
 }
 
 // Left-rail message navigation: one tick per user message, hover previews the
@@ -2535,6 +2491,7 @@ function scrollToMessage(id: string) {
   if (!container) return
   const el = container.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`)
   if (!el) return
+  pauseFollowing()
   const top = container.scrollTop + el.getBoundingClientRect().top - container.getBoundingClientRect().top - 12
   container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
 }
@@ -2967,9 +2924,7 @@ onUnmounted(() => {
           ref="messagesEl"
           class="messages"
           :class="{ 'messages--no-floating-model': activeConversationIsMetadataExtraction }"
-          @click="onMsgContainerClick"
-          @scroll.passive="onMessagesScroll"
-          @wheel.passive="onMessagesWheel"
+          tabindex="0"
         >
         <ChatBranchOrigin v-if="activeConversation?.branch" :branch="activeConversation.branch"
           :parent-available="!!branchParent" :parent-title="branchParent?.title" @open="openBranchParent" />

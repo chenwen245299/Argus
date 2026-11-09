@@ -162,6 +162,18 @@ pub async fn get_paper_meta(
 }
 
 #[tauri::command]
+pub async fn list_note_reference_papers(expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<Vec<crate::note_references::ReferencePaper>, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || crate::note_references::list(&root)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn resolve_note_reference(paper_id: String, expected_root: Option<String>, state: State<'_, LibraryRoot>) -> Result<crate::note_references::ReferencePaper, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    tokio::task::spawn_blocking(move || crate::note_references::resolve(&root, &paper_id)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn save_paper_meta(
     slug: String,
     mut meta: PaperMeta,
@@ -305,6 +317,16 @@ pub async fn save_library_note(expected: crate::library_notes::Snapshot, title: 
     refresh_search_index(&root, &note.slug);
     crate::library_notes::notify(&app, &root, &note.slug, "updated");
     Ok(note)
+}
+
+#[tauri::command]
+pub async fn save_library_note_metadata(slug: String, expected: PaperMeta, title: String, tags: Vec<String>, reading_status: String, expected_root: Option<String>, state: State<'_, LibraryRoot>, app: tauri::AppHandle) -> Result<PaperMeta, String> {
+    let root = note_root(&state, expected_root.as_deref())?;
+    let worker_root = root.clone(); let worker_slug = slug.clone();
+    let meta = tokio::task::spawn_blocking(move || crate::library_notes::update_metadata(&worker_root, &worker_slug, &expected, &title, tags, &reading_status)).await.map_err(|e| e.to_string())??;
+    refresh_search_index(&root, &slug);
+    crate::library_notes::notify(&app, &root, &slug, "updated");
+    Ok(meta)
 }
 
 #[tauri::command]

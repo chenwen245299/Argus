@@ -680,11 +680,13 @@ let noteDragOrigin = false
 let pressInPopup = false
 
 function onWindowMouseDown(e: MouseEvent) {
+  if ((e.target as Element).closest?.('.note-reference-popup')) return
   noteDragOrigin = !!(e.target as HTMLElement).closest?.('.hl-note-popup')
   pressInPopup = !!(e.target as HTMLElement).closest?.('.hl-note-popup, .hl-color-popup, .sel-popup')
 }
 
 function onWindowMouseUp(e: MouseEvent) {
+  if ((e.target as Element).closest?.('.note-reference-popup')) return
   // A drag that STARTED in the note popup is a text selection inside it — the
   // release often lands outside, and dismissing there would tear down the very
   // text the user is selecting (and with it the selection they meant to copy).
@@ -1679,13 +1681,13 @@ defineExpose({ closeToList: handleBack })
         <div v-if="hlNoteText" class="hl-note-text" v-html="hlNoteHtml" />
         <span v-else class="hl-note-placeholder">{{ t('pdf.notePlaceholder') }}</span>
       </div>
-      <textarea
+      <textarea data-note-references
         v-else
         ref="noteTextareaRef"
         v-model="hlNoteText"
         class="hl-note-textarea"
         :placeholder="t('pdf.notePlaceholder')"
-        @blur="saveNote(); hlNoteEditing = false"
+        @blur="event => { if ((event.relatedTarget as Element | null)?.closest('.note-reference-popup')) return; saveNote(); hlNoteEditing = false }"
         @keydown.esc.stop="saveNote(); hlNoteEditing = false"
         @keydown.meta.enter.stop="saveNote(); hlNoteEditing = false"
       />

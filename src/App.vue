@@ -7,6 +7,7 @@ import { useLibraryStore } from './stores/library'
 import { useArxivStore } from './stores/arxiv'
 import { useSettingsStore } from './stores/settings'
 import { startAutoUpdateSchedule, stopAutoUpdateSchedule } from './stores/update'
+import NoteReferencePicker from './components/NoteReferencePicker.vue'
 
 // Async views: each window label renders exactly one view, so code-split them.
 // This keeps every window from loading all other windows' code (pdfjs, vue-flow,
@@ -74,6 +75,7 @@ onMounted(async () => {
     <AnnotationPrintView v-else-if="windowLabel === 'annotation-print'" />
     <NoteWindowView v-else-if="windowLabel.startsWith('note-window')" />
     <MainView v-else />
+    <NoteReferencePicker />
   </div>
 </template>
 

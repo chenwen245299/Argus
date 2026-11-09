@@ -263,7 +263,8 @@ table.md-image-grid img { width: 100%; max-width: 100%; height: auto; object-fit
   justify-content: center;
   background: var(--bg-primary);
 }
-.svg-code-block .svg-preview-area svg { max-width: 100%; height: auto; }
+/* Author-provided SVG colors need a paper canvas even in a dark app theme. */
+.svg-code-block .svg-preview-image { display: block; max-width: 100%; height: auto; min-width: 0; background: #fff; }
 .svg-source-pre { margin: 0; }
 
 /* KaTeX display math: wide formulas scroll horizontally, but the block must be
@@ -282,3 +283,6 @@ table.md-image-grid img { width: 100%; max-width: 100%; height: auto; object-fit
 /* hljs: transparent background so code blocks use our own bg.
    Per-theme dark-mode hljs palettes live in themes.css. */
 .hljs { background: transparent !important; }
+
+/* Library references in otherwise plain-text snippet notes. */
+.note-paper-reference { color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }

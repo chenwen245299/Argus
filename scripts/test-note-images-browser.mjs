@@ -22,7 +22,7 @@ before(async () => {
       <style>body{margin:0;padding:20px;box-sizing:border-box}#app{max-width:620px}.editor{height:600px}</style><script type="module">
       import{createApp,h,ref,nextTick}from'vue';import{createI18n}from'vue-i18n';
       import Card from'/src/components/WriteConfirmCard.vue';import Editor from'/src/components/VditorEditor.vue';
-      import{toDisplayMarkdown,toStoredMarkdown}from'/src/utils/noteAssets.ts';import{zh,en}from'/src/i18n/locales.ts';
+      import{toDisplayMarkdown,toStoredMarkdown,savePastedImage}from'/src/utils/noteAssets.ts';import{zh,en}from'/src/i18n/locales.ts';
       import'/src/assets/main.css';import'/src/assets/themes.css';
       const canvas=document.createElement('canvas');canvas.width=600;canvas.height=240;
       const ctx=canvas.getContext('2d');ctx.fillStyle='#edf3f9';ctx.fillRect(0,0,600,240);
@@ -40,16 +40,20 @@ before(async () => {
         invoke(command,args){calls.push({command,args});if(command==='read_note_asset'){
           if(test.delayRead)return new Promise(resolve=>test.resolveRead=()=>resolve(png.split(',')[1]));
           const value=disk.get(args.name);return value?Promise.resolve(value):Promise.reject('Missing image');}
+          if(command==='save_note_asset'){const path='assets/upload-'+calls.length+'.'+args.ext;disk.set(path.slice(7),args.data);return Promise.resolve(path)}
           return Promise.resolve(null);},
         async reopen(){display.value=await toDisplayMarkdown('paper',draft.value);mode.value='editor'},
         async freshPreview(value){mode.value='preview';preview.value=value;await nextTick()},
         hide(){visible.value=false},
         setDisk(name){disk.set(name,png.split(',')[1])},
+        async startUpload(){mode.value='preview';await nextTick();display.value='';draft.value='';mode.value='editor'},
+        async freshAssetRead(markdown){const fresh=await import('/src/utils/noteAssets.ts?fresh-svg');mode.value='preview';await nextTick();display.value=await fresh.toDisplayMarkdown('paper',markdown);mode.value='editor'},
+        setSvg(name,source){disk.set(name,btoa(unescape(encodeURIComponent(source))))},
         stored(){return toStoredMarkdown(draft.value)},
       };
       createApp({setup(){return()=>visible.value?(mode.value==='preview'?h(Card,{preview:preview.value,
         onApprove:()=>{decisions.push('approved');for(const image of preview.value.noteImages||[])disk.set(image.path.slice(7),image.dataUrl.split(',')[1]);draft.value=preview.value.content;test.reopen()},
-        onReject:()=>decisions.push('rejected')}):h('div',{class:'editor'},[h(Editor,{initialContent:display.value,onChange:value=>draft.value=toStoredMarkdown(value)})])):null}})
+        onReject:()=>decisions.push('rejected')}):h('div',{class:'editor'},[h(Editor,{initialContent:display.value,imageUploader:file=>savePastedImage('paper',file,'/mock-library'),onChange:value=>draft.value=toStoredMarkdown(value)})])):null}})
         .use(createI18n({legacy:false,locale:'zh',messages:{zh,en}})).mount('#app');test.ready=true;
     </script>`))
   })
@@ -176,5 +180,51 @@ for (const rows of [1, 2]) {
     await page.setViewportSize({ width: 780, height: 800 })
   })
 }
+
+
+const svgFixture = `<?xml version="1.0" encoding="UTF-8"?>
+<!-- Exported diagram -->
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="120" viewBox="0 0 320 120" onload="window.svgExecuted=true">
+<defs><linearGradient id="paint"><stop stop-color="#2563eb"/><stop offset="1" stop-color="#2563eb"/></linearGradient><circle id="dot" r="10" fill="#22c55e"/></defs>
+<rect width="320" height="120" fill="url(#paint)"/><use href="#dot" x="200" y="60"/><text x="20" y="60">矢量笔记图</text>
+<script>window.svgExecuted=true</script><foreignObject><div xmlns="http://www.w3.org/1999/xhtml">unsafe</div></foreignObject><image href="https://example.test/remote.png"/>
+</svg>`
+async function pasteSvg(source, name='diagram.svg', type='image/svg+xml') {
+  await page.locator('.vditor-ir [contenteditable="true"]').evaluate((editor,{source,name,type})=>{
+    const transfer=new DataTransfer();transfer.items.add(new File([source],name,{type}));
+    editor.focus();editor.dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:transfer}));
+  },{source,name,type})
+}
+async function svgImageState() {
+  return page.locator('.vditor-ir img').evaluate(async img=>{
+    await img.decode();const canvas=document.createElement('canvas');canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;
+    const ctx=canvas.getContext('2d');ctx.drawImage(img,0,0);
+    return {width:img.naturalWidth,height:img.naturalHeight,source:await (await fetch(img.src)).text(),pixel:[...ctx.getImageData(10,10,1,1).data],dot:[...ctx.getImageData(200,60,1,1).data]};
+  })
+}
+test('pasted SVG is sanitized, remains vector, and renders again from stored assets in the real editor',async()=>{
+  await open();await page.evaluate(()=>window.__test.startUpload());
+  await page.locator('.vditor-ir [contenteditable="true"]').waitFor();await pasteSvg(svgFixture);
+  await page.locator('.vditor-ir img').waitFor();
+  let state=await svgImageState();assert.deepEqual([state.width,state.height],[320,120]);
+  assert.deepEqual(state.pixel,[37,99,235,255]);assert.deepEqual(state.dot,[34,197,94,255]);
+  assert.match(state.source,/矢量笔记图/);assert.doesNotMatch(state.source,/<script|onload|foreignObject|https:\/\/example/);
+  assert.equal(await page.evaluate(()=>window.svgExecuted),undefined);
+  await page.waitForFunction(()=>window.__test.stored().includes('.svg'));
+  const stored=await page.evaluate(()=>window.__test.stored());assert.match(stored,/assets\/upload-\d+\.svg/);assert.doesNotMatch(stored,/blob:|data:/);
+  const save=await page.evaluate(()=>window.__test.calls.find(c=>c.command==='save_note_asset'));assert.equal(save.args.ext,'svg');assert.equal(save.args.expectedRoot,'/mock-library');
+  await page.evaluate(markdown=>window.__test.freshAssetRead(markdown),stored);await page.locator('.vditor-ir img').waitFor();
+  state=await svgImageState();assert.deepEqual(state.pixel,[37,99,235,255]);assert.deepEqual(state.dot,[34,197,94,255]);
+  assert(await page.evaluate(()=>window.__test.calls.some(c=>c.command==='read_note_asset'&&c.args.name.endsWith('.svg'))));
+})
+test('invalid SVG is rejected before saving an asset, and existing raw SVG assets are sanitized on read',async()=>{
+  await open();await page.evaluate(()=>window.__test.startUpload());await page.locator('.vditor-ir [contenteditable="true"]').waitFor();
+  await pasteSvg('<svg xmlns="http://www.w3.org/2000/svg"><rect></svg>');
+  await page.getByText('Error: Invalid SVG image',{exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>window.__test.calls.filter(c=>c.command==='save_note_asset').length),0);
+  await page.evaluate(async source=>{window.__test.setSvg('external.svg',source);await window.__test.freshAssetRead('![](assets/external.svg)')},svgFixture);
+  await page.locator('.vditor-ir img').waitFor();const state=await svgImageState();
+  assert.doesNotMatch(state.source,/<script|onload|foreignObject|https:\/\/example/);assert.deepEqual(state.pixel,[37,99,235,255]);
+})
 
 test('no browser errors', () => assert.deepEqual(errors, []))

@@ -18,6 +18,7 @@ mod chat_attachments;
 mod json_documents;
 mod office_documents;
 mod note_trash;
+mod note_references;
 mod collections;
 mod commands;
 mod copilot;
@@ -71,6 +72,7 @@ mod update_notes;
 mod watcher;
 mod write_confirm;
 mod writing;
+mod writing_tools;
 mod zhipu;
 
 use std::sync::Mutex;
@@ -164,6 +166,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_menu::take_update_check_request,
+            writing_tools::system_writing_tools,
             // ── M0-M3: Library management ──
             commands::pick_library_folder,
             commands::open_library,
@@ -173,6 +176,8 @@ pub fn run() {
             commands::list_papers,
             // ── M0-M3: Single paper ──
             commands::get_paper_meta,
+            commands::list_note_reference_papers,
+            commands::resolve_note_reference,
             commands::save_paper_meta,
             commands::delete_tag,
             commands::add_related_paper,
@@ -214,6 +219,7 @@ pub fn run() {
             commands::create_library_note,
             commands::get_library_note,
             commands::save_library_note,
+            commands::save_library_note_metadata,
             commands::delete_library_note,
             commands::open_paper_folder,
             commands::read_pdf_bytes,

@@ -254,6 +254,16 @@ sheet. The native editor is transient and performs no library writes. Tests:
 mocked model result) and `scripts/test-writing-tools-native.mjs` (real native
 panel with a private named pasteboard). These run without Apple Intelligence;
 actual proofreading/rewriting still needs a supported, enabled Mac.
+`build.rs` explicitly links the active native compiler's `libclang_rt.osx.a`,
+queried from that compiler rather than a fixed Xcode path. `@available` emits
+`__isPlatformVersionAtLeast`; Clang-linked UI tests and some Rust std versions
+can mask a missing runtime, while Rust release links with `-nodefaultlibs` fail.
+`node --test scripts/test-writing-tools-link.mjs` compiles the production module
+and native build directives through a minimal no-std Rust executable with release
+LTO for both ARM64 and Intel. Keep the runtime link and existing deployment
+targets; raising the minimum OS is not a fix for missing compiler support.
+The link test needs both Rust targets installed (`rustup target add
+aarch64-apple-darwin x86_64-apple-darwin`) and uses only temporary build files.
 
 **Note changes and Recently Deleted.** The app-only `update_paper_note`,
 `delete_paper_note` and `restore_paper_note` use the existing write-approval

@@ -7,10 +7,13 @@ const { chromium } = await import(process.env.ARGUS_TEST_PLAYWRIGHT || 'playwrig
 let server, browser, page, origin
 const errors = []
 const mocks = {
+  // The sidebar keeps chat mounted in the background; metadata tests do not
+  // need a model session. List, metadata panel, sidebar and tab bar remain real.
+  './tabs/AnalysisTab.vue': `export default {render:()=>null};`,
   '@tauri-apps/api/core': `export const invoke=(name,args)=>window.__test.invoke(name,args);export const convertFileSrc=p=>p;export const isTauri=()=>false;`,
   '@tauri-apps/api/event': `export const listen=async(name,handler)=>{const set=window.__test.listeners.get(name)||new Set();window.__test.listeners.set(name,set);set.add(handler);return()=>set.delete(handler)};export const emit=async(name,payload)=>window.__test.emit(name,payload);export const emitTo=emit;`,
   '@tauri-apps/api/window': `export const getCurrentWindow=()=>({label:'main'});export class Window{static async getByLabel(){return null}}`,
-  '@tauri-apps/api/webviewWindow': `export const getCurrentWebviewWindow=()=>({label:'main'});export class WebviewWindow{static async getByLabel(){return null}}`,
+  '@tauri-apps/api/webviewWindow': `export const getCurrentWebviewWindow=()=>({label:'main',isFullscreen:async()=>false,onResized:async()=>()=>{}});export class WebviewWindow{static async getByLabel(){return null}}`,
   '@tauri-apps/plugin-dialog': `export const confirm=async()=>false;export const save=async()=>null;export const open=async()=>null;`,
 }
 before(async()=>{
@@ -21,16 +24,19 @@ before(async()=>{
     if(!req.url.startsWith('/__refresh-test'))return next()
     res.setHeader('Content-Type','text/html; charset=utf-8')
     res.end(await server.transformIndexHtml(req.url,`<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><div id="app"></div>
-      <style>html,body,#app{margin:0;height:100%;overflow:hidden}.paper-list{height:100%}</style><script type="module">
+      <style>html,body,#app{margin:0;height:100%;overflow:hidden}.paper-list{height:100%}.test-workspace{height:100%;display:flex;flex-direction:column}.test-main{flex:1;min-height:0;display:flex}.test-main>.paper-list{flex:1;min-width:0}.test-main>.right-sidebar{width:360px;flex-shrink:0}</style><script type="module">
       import{createApp,h,nextTick}from'vue';import{createPinia}from'pinia';import{addCollection}from'@iconify/vue';import fluent from'@iconify-json/fluent/icons.json';
       import PaperList from'/src/components/PaperList.vue';import{useLibraryStore}from'/src/stores/library.ts';import{useCollectionsStore}from'/src/stores/collections.ts';import{useSelectionStore}from'/src/stores/selection.ts';
       import{useReaderStore}from'/src/stores/reader.ts';
+      const metadataMode=new URLSearchParams(location.search).has('metadata');
+      const RightSidebar=metadataMode?(await import('/src/components/RightSidebar.vue')).default:null;
+      const TabBar=metadataMode?(await import('/src/components/TabBar.vue')).default:null;
       import{i18n}from'/src/i18n/index.ts';import'/src/assets/main.css';import'vue-virtual-scroller/dist/vue-virtual-scroller.css';addCollection(fluent);
       const clone=x=>JSON.parse(JSON.stringify(x));
       const row=i=>({slug:'paper-'+i,id:'id-'+i,title:'Research paper '+i,authors:['Author '+i],tags:[],added_at:new Date(2026,0,i+1).toISOString(),reading_status:'unread',year:2026,has_bibtex:false,meta_mtime:1,status:{text_extracted:true,metadata_fetched:true,ai_summary_done:false,vectorized:false,last_updated:'2026-01-01'}});
       const polls=[],realInterval=window.setInterval.bind(window);
       window.setInterval=(fn,ms,...args)=>{if(ms===60000){polls.push(fn);return realInterval(()=>{},ms)}return realInterval(fn,ms,...args)};
-      const t=window.__test={root:'/mock-library',disk:Array.from({length:12},(_,i)=>row(i)),row,listeners:new Map(),calls:[],hold:false,releases:[],
+      const t=window.__test={root:'/mock-library',disk:Array.from({length:12},(_,i)=>row(i)),row,listeners:new Map(),calls:[],hold:false,releases:[],metas:new Map(),holdSave:false,failSave:false,
         collectionFile:{collections:[{id:'top',name:'图书'},{id:'current',name:'阅读',parent_id:'top'},{id:'other',name:'其他',parent_id:'top'}],assignments:Array.from({length:12},(_,i)=>({paper_id:'id-'+i,collection_id:i<8?'current':'other'}))},
         emit(name,payload){for(const fn of t.listeners.get(name)||[])fn({payload})},
         async invoke(name,args){t.calls.push({name,args});
@@ -41,11 +47,23 @@ before(async()=>{
           if(name==='get_canvas_note_titles_map')return {};
           if(name==='get_current_library')return t.root;
           if(name==='get_activity_log')return {version:2,devices:{},days:{}};
+          if(name==='get_paper_meta')return clone(t.metas.get(args.slug));
+          if(name==='save_paper_meta'){
+            const saved=clone(args.meta);if(t.holdSave)await new Promise(resolve=>t.releaseSave=resolve);
+            if(t.failSave)throw new Error('Mock metadata save failed');
+            t.metas.set(args.slug,saved);const entry=t.disk.find(p=>p.slug===args.slug);Object.assign(entry,{title:saved.title,authors:saved.authors,tags:saved.tags,year:saved.year,venue:saved.venue,reading_status:saved.reading_status,has_bibtex:!!saved.bibtex?.trim()});return null;
+          }
+          if(name==='get_cached_references'||name==='fetch_references')return [];
+          if(name==='get_fulltext')return '';
+          if(name==='get_settings')return {};
+          if(name==='get_venue_ranks')return {};
+          if(name==='copy_paper_pdfs')return args.slugs.length;
           return null;
         }};
-      const pinia=createPinia(),app=createApp({render:()=>h(PaperList)});app.use(pinia);app.use(i18n);
+      t.disk.forEach(p=>t.metas.set(p.slug,{...clone(p),venue:'Test Venue',doi:'10.1234/mock',cite_count:1,bibtex:'',related_ids:[]}));
+      const pinia=createPinia(),app=createApp({render:()=>metadataMode?h('div',{class:'test-workspace'},[h(TabBar),h('div',{class:'test-main'},[h(PaperList),h(RightSidebar,{activeTab:'metadata'})])]):h(PaperList)});app.use(pinia);app.use(i18n);
       t.library=useLibraryStore(pinia);t.collections=useCollectionsStore(pinia);t.selection=useSelectionStore(pinia);t.reader=useReaderStore(pinia);
-      await t.library.openLibrary(t.root);await t.collections.load();t.selection.selectNav('collection:current');app.mount('#app');
+      await t.library.openLibrary(t.root);await t.collections.load();t.selection.selectNav('collection:current');if(metadataMode)t.reader.openPaper('paper-7','Research paper 7');app.mount('#app');
       t.settle=async()=>{await nextTick();await new Promise(resolve=>setTimeout(resolve,0));await new Promise(requestAnimationFrame)};
       t.poll=async()=>{for(const fn of polls)fn();await t.settle()};
       t.observe=()=>{
@@ -65,7 +83,7 @@ before(async()=>{
   await page.route('**/*',r=>r.request().url().startsWith(origin)?r.continue():r.abort())
 })
 after(async()=>{await browser?.close();await server?.close()})
-async function open(){await page.goto(origin+'/__refresh-test');await page.waitForFunction(()=>window.__test?.ready).catch(async e=>{console.log(await page.evaluate(()=>({text:document.body.innerText,test:window.__test?{calls:window.__test.calls,root:window.__test.library?.currentPath,error:window.__test.library?.error}:null})));throw e});await page.locator('.paper-row').first().waitFor();await page.evaluate(()=>window.__test.settle())}
+async function open(metadata=false){await page.goto(origin+'/__refresh-test'+(metadata?'?metadata=1':''));await page.waitForFunction(()=>window.__test?.ready).catch(async e=>{console.log(await page.evaluate(()=>({text:document.body.innerText,test:window.__test?{calls:window.__test.calls,root:window.__test.library?.currentPath,error:window.__test.library?.error}:null})));throw e});await page.locator('.paper-row').first().waitFor();await page.evaluate(()=>window.__test.settle())}
 
 test('idle reconciliation keeps unchanged rows, selection and DOM untouched',async()=>{
   await open()
@@ -131,5 +149,86 @@ test('a late scan from the previous library cannot replace or prune the newly op
     return {slugs:t.library.papers.map(p=>p.slug),tabs:t.reader.tabs.map(p=>p.slug),refreshing:t.library.isRefreshing}
   })
   assert.deepEqual(result.slugs,['new-library-paper']);assert.deepEqual(result.tabs,['new-library-paper']);assert.equal(result.refreshing,false)
+  assert.deepEqual(errors,[])
+})
+
+test('saving the sidebar title updates the real list and tab before scans finish, and an older scan cannot revert it',async()=>{
+  await open(true)
+  const sidebar=page.locator('.meta-tab')
+  await sidebar.locator('.action-bar').getByRole('button',{name:'编辑',exact:true}).click()
+  await sidebar.locator('input').first().fill('Course-project-doc')
+  await page.evaluate(async()=>{
+    const t=window.__test;t.selection.selectPaper('paper-7');
+    t.originalList=t.library.papers;t.originalRow=t.library.papers.find(p=>p.slug==='paper-7');
+    t.originalRow.status.vectorized=true;t.originalRow.related_ids=['new-link'];
+    t.hold=true;t.scanning=t.library.refresh();await t.settle()
+  })
+  await sidebar.locator('.action-bar').getByRole('button',{name:'保存',exact:true}).click()
+  await sidebar.getByText('Course-project-doc',{exact:true}).waitFor()
+  await page.locator('.row-title').filter({hasText:'Course-Project-Doc'}).waitFor()
+  await page.locator('.tab-title').filter({hasText:'Course-Project-Doc'}).waitFor()
+  const immediate=await page.evaluate(()=>{
+    const t=window.__test,p=t.library.papers.find(p=>p.slug==='paper-7');
+    return {sameList:t.originalList===t.library.papers,sameRow:t.originalRow===p,vectorized:p.status.vectorized,links:p.related_ids,selected:t.selection.selectedSlug,scans:t.releases.length}
+  })
+  assert.equal(immediate.sameList,true);assert.equal(immediate.sameRow,true);assert.equal(immediate.vectorized,true)
+  assert.deepEqual(immediate.links,['new-link']);assert.equal(immediate.selected,'paper-7');assert.equal(immediate.scans,1)
+  await page.evaluate(async()=>{const t=window.__test;t.releases.shift()();await t.settle()})
+  assert.equal(await page.evaluate(()=>window.__test.library.papers.find(p=>p.slug==='paper-7').title),'Course-project-doc')
+  assert.equal(await page.locator('.tab-paper .tab-title').textContent(),'Course-Project-Doc')
+  await page.evaluate(async()=>{const t=window.__test;t.hold=false;t.releases.shift()();await t.scanning;await t.settle()})
+  assert.equal(await page.locator('.row-title').filter({hasText:'Course-Project-Doc'}).count(),1)
+  assert.deepEqual(errors,[])
+})
+
+test('pending and failed metadata saves keep the list and tab on the saved title',async()=>{
+  await open(true)
+  const sidebar=page.locator('.meta-tab')
+  await sidebar.locator('.action-bar').getByRole('button',{name:'编辑',exact:true}).click()
+  await sidebar.locator('input').first().fill('Unsaved title')
+  await page.evaluate(()=>{const t=window.__test;t.holdSave=true;t.failSave=true})
+  await sidebar.locator('.action-bar').getByRole('button',{name:'保存',exact:true}).click()
+  await page.waitForFunction(()=>!!window.__test.releaseSave)
+  assert.equal(await page.locator('.tab-paper .tab-title').textContent(),'Research Paper 7')
+  assert.equal(await page.locator('.row-title').filter({hasText:'Unsaved Title'}).count(),0)
+  await page.evaluate(()=>window.__test.releaseSave())
+  await sidebar.getByRole('alert').filter({hasText:'Mock metadata save failed'}).waitFor()
+  assert.equal(await page.locator('.tab-paper .tab-title').textContent(),'Research Paper 7')
+  assert.equal(await sidebar.locator('input').first().inputValue(),'Unsaved title')
+  assert.equal(await page.evaluate(()=>window.__test.library.papers.find(p=>p.slug==='paper-7').title),'Research paper 7')
+  assert.deepEqual(errors,[])
+})
+
+test('real multi-selection and context-menu clicks copy every selected PDF in one request',async()=>{
+  await open()
+  const rows=page.locator('.paper-row')
+  await rows.nth(0).click()
+  await rows.nth(2).click({modifiers:['Meta']})
+  await rows.nth(4).click({modifiers:['Meta']})
+  assert.equal(await page.locator('.paper-row.selected').count(),3)
+  await rows.nth(2).click({button:'right'})
+  await page.getByRole('button',{name:'复制 PDF 文件（3）',exact:true}).click()
+  const copied=await page.evaluate(()=>window.__test.calls.filter(c=>c.name==='copy_paper_pdfs'))
+  assert.deepEqual(copied,[{name:'copy_paper_pdfs',args:{slugs:['paper-7','paper-5','paper-3'],expectedRoot:'/mock-library'}}])
+  assert.equal(await page.locator('.paper-row.selected').count(),3)
+  assert.deepEqual(errors,[])
+})
+
+test('clicking list whitespace clears all selected rows and resets the Shift-selection anchor',async()=>{
+  await open()
+  const rows=page.locator('.paper-row')
+  await rows.nth(0).click()
+  await rows.nth(2).click({modifiers:['Shift']})
+  assert.equal(await page.locator('.paper-row.selected').count(),3)
+  await rows.nth(1).click({button:'right'})
+  await page.getByRole('button',{name:'复制 PDF 文件（3）',exact:true}).waitFor()
+  const scroller=page.locator('.scroller'),box=await scroller.boundingBox(),last=await rows.last().boundingBox()
+  assert(box.y+box.height-20>last.y+last.height,'click must land in the empty area below the rows')
+  await scroller.click({position:{x:20,y:box.height-20}})
+  assert.equal(await page.locator('.ctx-menu').count(),0)
+  assert.equal(await page.locator('.paper-row.selected').count(),0)
+  assert.deepEqual(await page.evaluate(()=>({slugs:window.__test.selection.selectedSlugs,primary:window.__test.selection.selectedSlug})),{slugs:[],primary:null})
+  await rows.nth(2).click({modifiers:['Shift']})
+  assert.equal(await page.locator('.paper-row.selected').count(),1,'a cleared selection must not reuse the previous range anchor')
   assert.deepEqual(errors,[])
 })

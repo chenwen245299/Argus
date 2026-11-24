@@ -45,9 +45,11 @@ const chatCanvasId = ref<string | null>(null)
 watch(() => canvasStore.activeCanvasId, (id) => { if (id) chatCanvasId.value = id }, { immediate: true })
 
 let metaRevision = 0
+let metaScope: { slug: string | null; root: string | null } | null = null
 watch([activePaperSlug, () => library.currentPath, () => library.papers.find(p => p.slug === activePaperSlug.value)?.title], async ([slug, root]) => {
   const revision = ++metaRevision
-  meta.value = null
+  if (metaScope?.slug !== slug || metaScope?.root !== root) meta.value = null
+  metaScope = { slug, root }
   if (!slug) return
   try {
     const loaded = await invoke<PaperMeta>('get_paper_meta', { slug, expectedRoot: root })
@@ -58,9 +60,14 @@ watch([activePaperSlug, () => library.currentPath, () => library.papers.find(p =
 }, { immediate: true })
 
 
-async function onMetaSaved(updatedMeta: PaperMeta) {
-  meta.value = updatedMeta
-  await library.refresh()
+function onMetaSaved(updatedMeta: PaperMeta, slug: string, root: string | null) {
+  if (root !== library.currentPath) return
+  library.applyCommittedMetadata(slug, updatedMeta, root)
+  if (slug === activePaperSlug.value && meta.value?.id === updatedMeta.id) {
+    metaRevision++
+    meta.value = updatedMeta
+  }
+  void library.refresh()
 }
 
 function onExternalMetaUpdated(e: Event) {

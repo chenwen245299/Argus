@@ -19,7 +19,9 @@ fn file_mtime(path: &Path) -> u64 {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        // Edits within one second must invalidate the metadata cache too.
+        // Old second-based cache entries naturally miss once after upgrading.
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
         .unwrap_or(0)
 }
 
@@ -189,6 +191,67 @@ pub fn scan_library(root: &str) -> Result<Vec<PaperIndexEntry>, String> {
     }
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::fs::{File, FileTimes};
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    struct TestLibrary(PathBuf);
+    impl TestLibrary {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("argus-meta-cache-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join(".argus")).unwrap();
+            std::fs::create_dir_all(root.join("papers/paper")).unwrap();
+            Self(root)
+        }
+        fn root(&self) -> &str { self.0.to_str().unwrap() }
+        fn write_title(&self, title: &str, nanos: u32) {
+            let meta = serde_json::from_value(serde_json::json!({
+                "id": "test-id", "title": title, "authors": ["Author"], "tags": [],
+                "added_at": "2026-01-01T00:00:00Z", "reading_status": "unread", "import_source": "file"
+            })).unwrap();
+            paper::write_meta(self.root(), "paper", &meta).unwrap();
+            let path = self.0.join("papers/paper/meta.json");
+            File::options().write(true).open(path).unwrap().set_times(
+                FileTimes::new().set_modified(UNIX_EPOCH + Duration::new(1_800_000_000, nanos))
+            ).unwrap();
+        }
+    }
+    impl Drop for TestLibrary {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn rapid_title_edits_invalidate_warm_metadata_cache() {
+        let lib = TestLibrary::new();
+        let mut last_stamp = 0;
+        for (title, nanos) in [("Title A", 100_000_000), ("Title B", 200_000_000), ("Title C", 200_500_000)] {
+            // Same-sized titles, all within one second (the last two within
+            // one millisecond), with a warm persisted index between each edit.
+            lib.write_title(title, nanos);
+            let fresh = scan_library(lib.root()).unwrap();
+            assert_eq!(fresh.len(), 1);
+            assert_eq!(fresh[0].title, title);
+            assert_ne!(fresh[0].meta_mtime, last_stamp);
+            last_stamp = fresh[0].meta_mtime;
+            assert_eq!(scan_library(lib.root()).unwrap()[0].title, title);
+        }
+    }
+
+    #[test]
+    fn legacy_second_precision_cache_is_rebuilt() {
+        let lib = TestLibrary::new();
+        lib.write_title("Current title", 100_000_000);
+        let mut cached = scan_library(lib.root()).unwrap();
+        cached[0].title = "Outdated title".into();
+        cached[0].meta_mtime = 1_800_000_000;
+        std::fs::write(lib.0.join(".argus/index.json"), serde_json::to_string(&IndexFile { papers: cached }).unwrap()).unwrap();
+        assert_eq!(scan_library(lib.root()).unwrap()[0].title, "Current title");
+    }
 }
 
 #[cfg(test)]

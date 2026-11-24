@@ -291,8 +291,8 @@ pub struct PaperIndexEntry {
     pub added_at: String,
     #[serde(default = "default_reading_status_entry")]
     pub reading_status: String,
-    /// Unix seconds of meta.json when last indexed — used by incremental scan to skip unchanged files.
-    /// Old index.json files deserialize this as 0, causing a one-time re-read to populate it.
+    /// Unix nanoseconds of meta.json when last indexed; an opaque incremental-cache stamp.
+    /// Legacy second-based or missing (0) stamps cause a one-time metadata re-read.
     #[serde(default)]
     pub meta_mtime: u64,
     /// Import source: "file" | "arxiv" | "url". None for legacy entries (inferred on frontend).

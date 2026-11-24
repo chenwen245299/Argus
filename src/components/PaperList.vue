@@ -612,6 +612,15 @@ const dragGhostPos  = ref({ x: 0, y: 0 })
 // Anchor row for Shift+click range selection.
 let selectionAnchorSlug: string | null = null
 
+function onListClick(e: MouseEvent) {
+  closeCtx()
+  showColPicker.value = false
+  const target = e.target as Element | null
+  if (target?.closest('.paper-row,.search-hit,.header-shell,.search-header,.action-error-toast,button,input,textarea,select,a,[contenteditable]')) return
+  selection.selectPaper(null)
+  selectionAnchorSlug = null
+}
+
 function onRowClick(e: MouseEvent, item: PaperIndexEntry) {
   // Shift+click → select the contiguous range from the anchor (in list order).
   if (e.shiftKey && selectionAnchorSlug) {
@@ -1485,7 +1494,7 @@ async function deleteBatch() {
 </script>
 
 <template>
-  <div class="paper-list" @click="closeCtx(); showColPicker = false" @contextmenu="openBlankCtx">
+  <div class="paper-list" @click="onListClick" @contextmenu="openBlankCtx">
 
     <!-- ── Action error toast ─────────────────────────────────────────────── -->
     <Transition name="err-toast">

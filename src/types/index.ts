@@ -163,6 +163,7 @@ export interface PaperIndexEntry {
   status: PaperStatus
   added_at: string
   reading_status: string
+  /** Opaque backend cache stamp; do not use as a JavaScript date or write it back. */
   meta_mtime?: number
   import_source?: string
   cite_count?: number

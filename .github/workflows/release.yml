@@ -1,4 +1,9 @@
 name: Release App
+run-name: Release ${{ github.event.inputs.tag || github.ref_name }}
+
+# Keep the commit message short. Put the full Markdown notes in a separate file:
+#   git tag -a vX.Y.Z --cleanup=verbatim -F <release-notes-file>
+#   git push origin vX.Y.Z
 
 on:
   push:
@@ -6,8 +11,8 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      version:
-        description: '版本号（不含 v 前缀，如 1.2.0）'
+      tag:
+        description: '已推送的注释标签（如 v1.2.0），更新日志取自标签正文'
         required: true
         type: string
 
@@ -18,58 +23,56 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_id: ${{ steps.create-release.outputs.result }}
-      release_body: ${{ steps.tag-message.outputs.message }}
-      tag_name: ${{ steps.tag-name.outputs.tag }}
+      release_body: ${{ steps.release-notes.outputs.notes }}
+      tag_name: ${{ steps.release-notes.outputs.tag }}
+      version: ${{ steps.release-notes.outputs.version }}
+      commit_sha: ${{ steps.release-notes.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Determine tag name
-        id: tag-name
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Get tag message
-        id: tag-message
-        shell: bash
-        run: |
-          TAG_NAME=${{ steps.tag-name.outputs.tag }}
-          MESSAGE=$(git tag -l --format='%(contents)' "$TAG_NAME")
-          if [ -z "$MESSAGE" ]; then
-            MESSAGE="See commit history for changes."
-          fi
-          {
-            echo "message<<EOF"
-            echo "$MESSAGE"
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
+      - name: Read annotated tag and release notes
+        id: release-notes
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        with:
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { readReleaseTag } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/scripts/release-notes.mjs`).href);
+            const release = readReleaseTag(process.env.RELEASE_TAG);
+            for (const [key, value] of Object.entries(release)) core.setOutput(key, value);
 
       - name: Create release
         id: create-release
         uses: actions/github-script@v7
         env:
-          RELEASE_BODY: ${{ steps.tag-message.outputs.message }}
-          TAG_NAME: ${{ steps.tag-name.outputs.tag }}
+          RELEASE_BODY: ${{ steps.release-notes.outputs.notes }}
+          TAG_NAME: ${{ steps.release-notes.outputs.tag }}
+          COMMIT_SHA: ${{ steps.release-notes.outputs.sha }}
+          PRERELEASE: ${{ steps.release-notes.outputs.prerelease }}
         with:
           script: |
             const tagName = process.env.TAG_NAME;
-            const { data } = await github.rest.repos.createRelease({
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+            const releases = await github.paginate(github.rest.repos.listReleases, { ...repo, per_page: 100 });
+            const existing = releases.find(release => release.tag_name === tagName);
+            if (existing && !existing.draft) throw new Error(`${tagName} is already published. Use a new version tag.`);
+            const params = {
               owner: context.repo.owner,
               repo: context.repo.repo,
               tag_name: tagName,
               name: tagName,
               body: process.env.RELEASE_BODY,
               draft: true,
-              prerelease: false,
-              target_commitish: context.sha,
-            })
-            return data.id
+              prerelease: process.env.PRERELEASE === 'true',
+              target_commitish: process.env.COMMIT_SHA,
+            };
+            const { data } = existing
+              ? await github.rest.repos.updateRelease({ ...params, release_id: existing.id })
+              : await github.rest.repos.createRelease(params);
+            return data.id;
 
   build-tauri:
     needs: create-release
@@ -91,6 +94,8 @@ jobs:
       CARGO_HTTP_CHECK_REVOKE: "false"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.commit_sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -110,9 +115,9 @@ jobs:
 
       - name: Sync version and enable bundle
         shell: bash
+        env:
+          VERSION: ${{ needs.create-release.outputs.version }}
         run: |
-          TAG=${{ needs.create-release.outputs.tag_name }}
-          VERSION=${TAG#v}
           tmp=$(mktemp)
           jq --arg v "$VERSION" '.version = $v | .bundle.active = true | .bundle.createUpdaterArtifacts = true' src-tauri/tauri.conf.json > "$tmp" && mv "$tmp" src-tauri/tauri.conf.json
 
@@ -153,6 +158,8 @@ jobs:
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           releaseBody: ${{ needs.create-release.outputs.release_body }}
+          tagName: ${{ needs.create-release.outputs.tag_name }}
+          releaseDraft: true
 
   publish-release:
     permissions:
@@ -164,7 +171,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            github.rest.repos.updateRelease({
+            await github.rest.repos.updateRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
               release_id: ${{ needs.create-release.outputs.release_id }},

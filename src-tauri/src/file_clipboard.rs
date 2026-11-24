@@ -56,6 +56,13 @@ function copyFiles(paths, pasteboard) {
     paths.forEach(function(path) { urls.addObject($.NSURL.fileURLWithPath($(path))); });
     pasteboard.clearContents;
     if (!pasteboard.writeObjects(urls)) throw new Error('Failed to copy PDF files');
+    // Keep independent file URLs for Finder, and put the complete file list
+    // on the first item for receivers that only consume that item's formats.
+    // Relying on macOS to synthesize this list works for whole-board readers
+    // but leaves first-item readers with only the first PDF.
+    if (!pasteboard.setPropertyListForType($(paths), $.NSFilenamesPboardType)) {
+        throw new Error('Failed to copy the complete PDF file list');
+    }
 }
 function run(argv) { copyFiles(argv, $.NSPasteboard.generalPasteboard); }
 "#;
@@ -192,17 +199,18 @@ mod tests {
     }
     #[cfg(target_os = "macos")]
     #[test]
-    fn native_pasteboard_contains_eight_independent_file_items() {
+    fn native_pasteboard_contains_all_files_in_modern_and_compatible_formats() {
         // A private named pasteboard verifies actual macOS file representations
         // without reading or changing the user's system clipboard.
         let lib = Library::new();
         let paths: Vec<_> = (0..8)
-            .map(|i| lib.add(&format!("paper-{i}"), "中文 [x] \"quoted\".pdf"))
+            .map(|i| lib.add(&format!("paper-{i}"), &format!("中文 [x] \"quoted\"-{i}.pdf")))
             .collect();
         let script = format!(
             r#"{MAC_SCRIPT}
 function run(argv) {{
     var pb = $.NSPasteboard.pasteboardWithUniqueName;
+    var receiver = $.NSPasteboard.pasteboardWithUniqueName;
     try {{
         copyFiles(argv, pb);
         var result = [], items = pb.pasteboardItems;
@@ -210,21 +218,39 @@ function run(argv) {{
             var url = items.objectAtIndex(i).stringForType('public.file-url');
             result.push(ObjC.unwrap($.NSURL.URLWithString(url).path));
         }}
-        return JSON.stringify(result);
-    }} finally {{ pb.releaseGlobally; }}
+        var filenames = ObjC.deepUnwrap(pb.propertyListForType($.NSFilenamesPboardType)) || [];
+        // Some attachment receivers consume only the first pasteboard item.
+        // Copy that item's actual representations to an isolated reader to
+        // verify its file-list fallback still describes the entire selection.
+        var first = items.objectAtIndex(0), firstCopy = $.NSPasteboardItem.alloc.init;
+        for (var j = 0; j < first.types.count; j++) {{
+            var type = first.types.objectAtIndex(j);
+            firstCopy.setDataForType(first.dataForType(type), type);
+        }}
+        receiver.writeObjects($.NSArray.arrayWithObject(firstCopy));
+        var firstItemFilenames = ObjC.deepUnwrap(receiver.propertyListForType($.NSFilenamesPboardType)) || [];
+        return JSON.stringify({{fileUrls: result, filenames: filenames, firstItemFilenames: firstItemFilenames}});
+    }} finally {{ receiver.releaseGlobally; pb.releaseGlobally; }}
 }}"#
         );
-        let output = Command::new("osascript")
-            .args(["-l", "JavaScript", "-e", &script])
-            .args(&paths)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let copied: Vec<PathBuf> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(copied, paths);
+        for n in [1, 3, 8] {
+            let selected = &paths[..n];
+            let output = Command::new("osascript")
+                .args(["-l", "JavaScript", "-e", &script])
+                .args(selected)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let copied: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(copied["fileUrls"], serde_json::json!(selected));
+            assert_eq!(copied["filenames"], serde_json::json!(selected),
+                "Apps reading the compatible file list must receive every selected PDF");
+            assert_eq!(copied["firstItemFilenames"], serde_json::json!(selected),
+                "Apps consuming the first clipboard item must receive the complete file list too");
+        }
     }
 }

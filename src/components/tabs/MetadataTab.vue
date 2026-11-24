@@ -18,7 +18,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  saved: [meta: PaperMeta]
+  saved: [meta: PaperMeta, slug: string, root: string | null]
   slugChanged: [newSlug: string]
 }>()
 
@@ -207,20 +207,22 @@ function cancelEdit() {
 
 async function saveEdit() {
   if (!props.slug || !draft.value) return
+  const slug = props.slug, root = library.currentPath
+  const pending: PaperMeta = JSON.parse(JSON.stringify(draft.value))
   saving.value = true
   try {
     editError.value = ''
     if (isStandaloneNote.value) {
       const updated = await invoke<PaperMeta>('save_library_note_metadata', {
-        slug: props.slug, expected: editBase.value, title: draft.value.title,
-        tags: draft.value.tags, readingStatus: draft.value.reading_status,
-        expectedRoot: library.currentPath,
+        slug, expected: editBase.value, title: pending.title,
+        tags: pending.tags, readingStatus: pending.reading_status,
+        expectedRoot: root,
       })
-      emit('saved', updated)
+      emit('saved', updated, slug, root)
     } else {
-      draft.value.import_source = importSource(draft.value.import_source, draft.value.arxiv_id)
-      await invoke('save_paper_meta', { slug: props.slug, meta: draft.value })
-      emit('saved', { ...draft.value })
+      pending.import_source = importSource(pending.import_source, pending.arxiv_id)
+      await invoke('save_paper_meta', { slug, meta: pending })
+      emit('saved', { ...pending }, slug, root)
     }
     editing.value = false
     draft.value = null
@@ -268,11 +270,12 @@ function cancelSourceEdit() {
 
 async function saveSource() {
   if (!props.slug || !props.meta) return
+  const slug = props.slug, root = library.currentPath
   sourceSaving.value = true
   try {
     const updated: PaperMeta = { ...props.meta, import_source: sourceDraft.value }
-    await invoke('save_paper_meta', { slug: props.slug, meta: updated })
-    emit('saved', updated)
+    await invoke('save_paper_meta', { slug, meta: updated })
+    emit('saved', updated, slug, root)
     sourceEditing.value = false
   } catch (e) {
     console.error('Failed to save source:', e)
@@ -300,11 +303,12 @@ function cancelBibtexEdit() {
 
 async function saveBibtex() {
   if (!props.slug || !props.meta) return
+  const slug = props.slug, root = library.currentPath
   bibtexSaving.value = true
   try {
     const updated: PaperMeta = { ...props.meta, bibtex: bibtexDraft.value.trim() || undefined }
-    await invoke('save_paper_meta', { slug: props.slug, meta: updated })
-    emit('saved', updated)
+    await invoke('save_paper_meta', { slug, meta: updated })
+    emit('saved', updated, slug, root)
     bibtexEditing.value = false
     bibtexDraft.value = ''
   } catch (e) {
@@ -342,12 +346,13 @@ const citeCountInputRef = ref<HTMLInputElement | null>(null)
 async function fetchCiteCount() {
   if (isStandaloneNote.value || !props.meta) return
   if (!props.slug) return
+  const slug = props.slug, root = library.currentPath
   citeCountFetching.value = true
   try {
     // Backend fetches from Semantic Scholar: sets the citation count and
     // backfills DOI / venue when those are empty.
-    const updated = await invoke<PaperMeta>('fetch_citation_count', { slug: props.slug })
-    emit('saved', updated)
+    const updated = await invoke<PaperMeta>('fetch_citation_count', { slug })
+    emit('saved', updated, slug, root)
   } catch (e) {
     console.error('Failed to fetch citation count:', e)
   } finally {
@@ -405,6 +410,7 @@ function cancelCiteCountEdit() {
 
 async function saveCiteCount() {
   if (!props.slug || !props.meta) return
+  const slug = props.slug, root = library.currentPath
   citeCountSaving.value = true
   try {
     const val = citeCountDraft.value
@@ -412,8 +418,8 @@ async function saveCiteCount() {
       ...props.meta,
       cite_count: (val != null && val >= 0) ? Math.floor(val) : undefined,
     }
-    await invoke('save_paper_meta', { slug: props.slug, meta: updated })
-    emit('saved', updated)
+    await invoke('save_paper_meta', { slug, meta: updated })
+    emit('saved', updated, slug, root)
     citeCountEditing.value = false
     citeCountDraft.value = undefined
   } catch (e) {
@@ -497,12 +503,15 @@ async function refetchMetaAi() {
   if (isStandaloneNote.value || !props.meta) return
   if (!props.slug || aiMetaRunning.value) return
   const slug = props.slug
+  const root = library.currentPath
   paperTasks.setAiMetaTask(slug)
   window.dispatchEvent(new CustomEvent('argus-switch-sidebar-tab', { detail: { tab: 'ai' } }))
   try {
     const updated = await invoke<PaperMeta>('extract_metadata_ai', { slug })
-    emit('saved', updated)
-    window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug, meta: updated } }))
+    emit('saved', updated, slug, root)
+    if (root === library.currentPath) {
+      window.dispatchEvent(new CustomEvent('argus-paper-meta-updated', { detail: { slug, meta: updated } }))
+    }
   } catch (e) {
     console.error('AI metadata extraction failed:', e)
   } finally {
@@ -612,14 +621,15 @@ const abstractError = ref('')
 async function extractAbstract() {
   if (isStandaloneNote.value || !props.meta) return
   if (!props.slug) return
+  const slug = props.slug, root = library.currentPath
   abstractExtracting.value = true
   abstractError.value = ''
   try {
     const updated = await invoke<PaperMeta>(
       'extract_abstract_ai',
-      { slug: props.slug, providerId: null, modelId: null },
+      { slug, providerId: null, modelId: null },
     )
-    emit('saved', updated)
+    emit('saved', updated, slug, root)
   } catch (e) {
     abstractError.value = String(e)
   } finally {

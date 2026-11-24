@@ -700,10 +700,19 @@ all visible views and causes periodic flashing. Real imports, removals, renames,
 status and tag changes still propagate; scans capture/check `expectedRoot` so
 old libraries cannot replace the current list or prune its tabs. Canvas metadata
 watchers observe the needed fields explicitly because rows now update in place.
+Metadata saves publish their scoped, committed fields through
+`library.applyCommittedMetadata` immediately and update existing paper-tab titles;
+background scans started before that commit are discarded. Preserve independent
+status/related-link state and row identities. `MetadataTab` saved events carry the
+original slug/root so late results cannot update a different paper or library.
+The backend metadata cache uses nanosecond mtimes, invalidating legacy second-based
+stamps once and detecting rapid consecutive edits within the same second.
 Regressions: `scripts/test-paper-index.mjs` and
 `scripts/test-library-refresh-browser.mjs` (real list/scroller/stores, simulated
 timer polls, mock disk, DOM mutations, multi-selection, large scrolled lists,
-real edits/membership changes and library-switch races).
+real edits/membership changes, immediate sidebar/list/tab updates, failed saves
+and library-switch races), plus Rust `library::cache_tests` for rapid edits and
+legacy cache migration.
 
 **Reasoning disclosure.** The 思考过程 body is collapsed by default in every
 chat surface, including during streaming and when loading saved answers. Only
@@ -732,13 +741,18 @@ formats; an all-ebook selection disables the action. Capture all target slugs
 and the library root before closing the menu, then invoke `copy_paper_pdfs`
 once (never one clipboard write per paper). `file_clipboard.rs` resolves the
 nested library once, validates all paths before touching the clipboard and
-deduplicates canonical files. macOS writes an array of file URLs through
-NSPasteboard; Windows passes a JSON path array to PowerShell's literal-path
+deduplicates canonical files. macOS writes independent file URLs through
+NSPasteboard and explicitly places the complete `NSFilenamesPboardType` list on
+the first item: some attachment receivers consume only that item, so the OS's
+whole-board synthesized list is insufficient. Windows passes a JSON path array to PowerShell's literal-path
 file copy. Paths are data/arguments, never interpolated into script source.
 The original `copy_paper_pdf` command delegates to the same implementation.
-Regressions: `scripts/test-copy-pdfs.mjs` and `cargo test --lib file_clipboard`;
-the macOS integration test uses a private named pasteboard, never the user's
-system clipboard.
+Regressions: `scripts/test-copy-pdfs.mjs`, the real click/selection/menu cases in
+`scripts/test-library-refresh-browser.mjs`, and `cargo test --lib file_clipboard`.
+The macOS integration test uses private named pasteboards, never the user's
+system clipboard, and checks 1/3/8 distinct files through whole-board and
+first-item readers. Clicking list whitespace clears the complete selection and
+its Shift-range anchor; row, header and menu interactions retain their behavior.
 
 **AI model settings across windows.** Successful provider/model/default edits
 emit `ai-settings-changed` with the library root after persistence. Each window's
@@ -2213,15 +2227,33 @@ test counts in the release-note body. Always deliver the complete Markdown
 source in a single fenced `markdown` code block so the user can copy it directly,
 rather than only rendering the formatted release note in chat.
 
+**Commit message and release commands.** Keep the commit message to one sentence
+on one line, without a body or bullet points, in its own `text` code block.
+Release notes are separate from the commit message. Save the complete Markdown
+notes to a separate file (by default `/tmp/argus-release-notes.md`) and provide
+exactly two command lines in their own `bash` code block:
+`git tag -a <version> --cleanup=verbatim -F <release-notes-file>`, then
+`git push origin <version>`. Use the user-specified version; never invent one.
+Do not add `cd`, `git add`, `git commit`, or branch-push commands unless asked;
+the user handles committing separately.
+
 The release pipeline is defined in `.github/workflows/release.yml`.
 
-1. **Trigger:** Push a tag `v*` or run the workflow manually with a version string.
-2. **Create release:** A draft GitHub Release is created from the tag message.
+1. **Trigger:** Push an annotated version tag `v*`, or manually select an existing
+   pushed annotated tag. `scripts/release-notes.mjs` validates the SemVer tag,
+   rejects missing/lightweight tags and empty notes, and reads the tag's own
+   complete Markdown annotation, excluding signature blocks. Commit messages
+   are never used as release notes. Regression: `node --test scripts/test-release-notes.mjs`.
+2. **Create release:** A draft GitHub Release is created from the tag annotation.
+   Failed runs reuse an existing draft; published versions are not overwritten.
+   Version suffixes such as `-beta.1` produce prereleases.
 3. **Build:** Tauri builds run on `macos-latest` and `windows-latest`.
+   - Both jobs check out the exact commit resolved from the tag, including manual runs.
    - The workflow patches `tauri.conf.json` with the release version and enables bundling / updater artifacts.
-   - Windows removes `node_modules`/`package-lock.json` and regenerates `icon.ico` if needed.
-   - `npm install` runs, which triggers the Vditor postinstall script.
+   - Windows regenerates `icon.ico` if needed.
+   - `npm ci` installs the committed lock file and runs postinstall setup.
    - `tauri-apps/tauri-action@v0` builds and uploads installers.
+   - The same tag notes populate the release body and updater manifest.
    - Required secrets: `GITHUB_TOKEN`, `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 4. **Publish:** The draft release is marked as published.
 

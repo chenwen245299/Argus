@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { LibraryConfig, PaperIndexEntry } from '../types'
+import type { LibraryConfig, PaperIndexEntry, PaperMeta } from '../types'
 import { useReaderStore } from './reader'
 import { useRanksStore } from './ranks'
 import { useActivityStore } from './activity'
@@ -202,6 +202,31 @@ export const useLibraryStore = defineStore('library', () => {
     papers.value = reconcilePaperIndex(papers.value, next)
   }
 
+  /** Metadata saves should be visible before a potentially slow library scan. */
+  function applyCommittedMetadata(slug: string, meta: PaperMeta, expectedRoot: string | null) {
+    if (!expectedRoot || currentPath.value !== expectedRoot) return
+    const entry = papers.value.find(p => p.slug === slug && p.id === meta.id)
+    if (!entry) return
+    applyCommittedPaper({
+      ...entry,
+      title: meta.title,
+      authors: [...meta.authors],
+      year: meta.year,
+      venue: meta.venue,
+      tags: [...meta.tags],
+      added_at: meta.added_at,
+      reading_status: meta.reading_status,
+      import_source: meta.import_source,
+      cite_count: meta.cite_count,
+      file_type: meta.file_type,
+      has_bibtex: !!meta.bibtex?.trim(),
+      // Status and related links have separate writers; a metadata draft may
+      // predate their latest changes. Keep the current index values.
+    }, expectedRoot)
+    const tab = useReaderStore().tabs.find(t => t.slug === slug)
+    if (tab) tab.title = meta.title
+  }
+
   // ── Related papers (manual, bidirectional links) ──────────────────────────
   // Which paper's "related" popover is open, and where to anchor it. `anchor`
   // null = center on screen (right-click entry); a point = anchor near it
@@ -264,8 +289,8 @@ export const useLibraryStore = defineStore('library', () => {
       const fresh = await invoke<PaperIndexEntry[]>('scan_library', { expectedRoot: root })
       if (root !== currentPath.value) return
       if (revision !== committedPaperRevision) {
-        // A scan already in flight can predate a successful creation. Do not
-        // remove its new row or prune its just-opened tab with the old snapshot.
+        // A scan already in flight can predate a completed local write. Do not
+        // overwrite its metadata or prune a just-opened tab with the old snapshot.
         refreshPending = true
         return
       }
@@ -324,6 +349,7 @@ export const useLibraryStore = defineStore('library', () => {
     openLibrary,
     removePaper,
     applyCommittedPaper,
+    applyCommittedMetadata,
     refresh,
     relatedPopover,
     openRelatedPopover,

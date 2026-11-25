@@ -53,7 +53,6 @@ jobs:
         env:
           RELEASE_BODY: ${{ steps.release-notes.outputs.notes }}
           TAG_NAME: ${{ steps.release-notes.outputs.tag }}
-          COMMIT_SHA: ${{ steps.release-notes.outputs.sha }}
           PRERELEASE: ${{ steps.release-notes.outputs.prerelease }}
         with:
           script: |
@@ -70,8 +69,9 @@ jobs:
               body: process.env.RELEASE_BODY,
               draft: true,
               prerelease: process.env.PRERELEASE === 'true',
-              target_commitish: process.env.COMMIT_SHA,
             };
+            // The verified tag already exists. A historical target_commitish
+            // unnecessarily requires workflow-write permission from GitHub.
             const { data } = existing
               ? await github.rest.repos.updateRelease({ ...params, release_id: existing.id })
               : await github.rest.repos.createRelease(params);

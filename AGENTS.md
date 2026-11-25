@@ -2252,6 +2252,11 @@ The release pipeline is defined in `.github/workflows/release.yml`.
 2. **Create release:** A draft GitHub Release is created from the tag annotation.
    Failed runs reuse an existing draft; published versions are not overwritten.
    Version suffixes such as `-beta.1` produce prereleases.
+   The tag is already verified, so create/update requests omit `target_commitish`;
+   passing an older commit whose workflow differs from `main` can require
+   workflow-write permission that `GITHUB_TOKEN` cannot obtain. Builds still
+   use the exact commit resolved from the tag. Regression:
+   `node --test scripts/test-release-workflow.mjs`.
 3. **Build:** Tauri builds run on `macos-latest` and `windows-latest`.
    - Both jobs check out the exact commit resolved from the tag, including manual runs.
    - The workflow patches `tauri.conf.json` with the release version and enables bundling / updater artifacts.

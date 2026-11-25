@@ -30,6 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # The event SHA can be the peeled commit. Default checkout then
+          # overwrites the annotated tag with that commit, losing its notes.
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
           fetch-depth: 0
 
       - name: Read annotated tag and release notes

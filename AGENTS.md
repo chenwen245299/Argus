@@ -2244,6 +2244,11 @@ The release pipeline is defined in `.github/workflows/release.yml`.
    rejects missing/lightweight tags and empty notes, and reads the tag's own
    complete Markdown annotation, excluding signature blocks. Commit messages
    are never used as release notes. Regression: `node --test scripts/test-release-notes.mjs`.
+   The notes job explicitly checks out `refs/tags/<selected-tag>`: default
+   checkout can otherwise replace the runner's annotated tag with the event's
+   peeled commit. To retry a run created with an older workflow, start a fresh
+   manual run on `main` with the existing tag; re-running an old run retains
+   its original workflow.
 2. **Create release:** A draft GitHub Release is created from the tag annotation.
    Failed runs reuse an existing draft; published versions are not overwritten.
    Version suffixes such as `-beta.1` produce prereleases.
